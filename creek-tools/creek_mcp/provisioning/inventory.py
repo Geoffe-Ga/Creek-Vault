@@ -31,7 +31,6 @@ from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from datetime import datetime
 
 
@@ -52,7 +51,9 @@ class MetricQuality(StrEnum):
     The Fly Machines API exposes apps, volumes and Machines — not egress and
     not billing. Any figure Creek reports must therefore say which of these it
     is, so an operator reconciling an invoice knows what to compare. A silent
-    zero for an unavailable meter is the failure this enum exists to prevent.
+    zero for an unavailable meter is the failure this enum exists to prevent:
+    a resource whose meter could not be read must not be indistinguishable
+    from one that was read and found compliant.
     """
 
     EXACT = "exact"
@@ -66,9 +67,14 @@ class ProviderResource:
 
     ``provider_allocation_id`` is the surrogate the durable store already holds,
     derived from the provider's own naming, never from inverting a digest and
-    never from Machine metadata. ``state_since`` is the instant the provider
-    last reported this state, which is what makes "running beyond policy"
-    measurable without Creek observing every start and stop itself.
+    never from Machine metadata.
+
+    ``last_modified_at`` is Fly's ``updated_at``: the last time *anything* about
+    the resource changed, which any provider-side write resets. It is therefore
+    a **lower bound** on how long the resource has held its current state, and
+    it is named for what it holds rather than for what a reader might wish it
+    meant. ``last_modified_quality`` says whether it could be read at all, so a
+    resource with no readable meter is never mistaken for a compliant one.
     """
 
     resource_class: ProviderResourceClass
@@ -78,11 +84,29 @@ class ProviderResource:
     region: str | None = None
     size_gb: int | None = None
     size_bytes: int | None = None
-    state_since: datetime | None = None
+    last_modified_at: datetime | None = None
+    last_modified_quality: MetricQuality = MetricQuality.UNAVAILABLE
+
+
+@dataclass(frozen=True, slots=True)
+class InventorySnapshot:
+    """One enumeration pass, carrying whether it managed to see everything.
+
+    Partiality is part of the value rather than an exception, because the two
+    are not interchangeable. An enumeration that failed halfway has still
+    *observed* real billable resources, and throwing them away turns a partial
+    read into an empty one — a report that reads as a clean fleet. Carrying
+    ``complete`` instead lets orphan, duplicate and running detection run over
+    what was seen, while the one inference that requires completeness (an
+    allocation whose resources are absent) stays suppressed.
+    """
+
+    resources: tuple[ProviderResource, ...]
+    complete: bool
 
 
 class ProviderInventory(Protocol):
     """A read-only enumeration capability over one provider account."""
 
-    def list_resources(self) -> Sequence[ProviderResource]:
-        """Return every resource this account is currently billed for."""
+    def list_resources(self) -> InventorySnapshot:
+        """Return what this account is billed for, and whether that is all."""

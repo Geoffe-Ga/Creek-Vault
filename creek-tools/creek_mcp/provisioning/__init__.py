@@ -1,6 +1,7 @@
 """Authenticated asynchronous vault-provisioning control plane (#1768)."""
 
 from creek_mcp.provisioning.inventory import (
+    InventorySnapshot,
     MetricQuality,
     ProviderInventory,
     ProviderResource,
@@ -32,6 +33,7 @@ __all__ = [
     "FleetReconciler",
     "FleetReconciliationError",
     "FleetReconciliationReport",
+    "InventorySnapshot",
     "JobOperation",
     "JobState",
     "MetricQuality",

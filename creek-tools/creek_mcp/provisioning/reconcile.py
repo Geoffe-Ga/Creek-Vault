@@ -30,6 +30,23 @@ otherwise identical reports differ.
 plaintext activation id that ``FlyProviderDriver`` writes into Machine metadata
 is never read, never selected by the operator store queries, and has no field
 here that could hold it.
+
+Four judgement calls, stated so they are known gaps rather than silent ones.
+
+1. ``MISSING_PROVIDER_RESOURCE`` is decided at **app granularity**: an
+   allocation whose app is still listed is not reported, even if the volume or
+   Machine underneath it has vanished. A volume that disappears under a live
+   app is therefore invisible to this pass.
+2. ``_missing`` skips allocations whose operation is ``delete``. A deletion in
+   flight is not a resource still expected to exist; it is reported as
+   ``DELETION_UNCONFIRMED`` once it ages past the window.
+3. ``_duplicates`` and ``_running`` only consider allocations the store still
+   holds. An orphan's second volume is reported once, as an orphan, rather than
+   twice.
+4. ``RUNNING_BEYOND_POLICY`` measures from Fly's ``updated_at``, a **lower
+   bound** on uptime that any provider write resets. Machines whose meter
+   cannot be read at all are not silently treated as compliant: they are named
+   in :attr:`FleetReconciliationReport.unmetered_running`.
 """
 
 from __future__ import annotations
@@ -41,7 +58,7 @@ from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Final
 
 from creek_mcp.provisioning.driver import ProviderError
-from creek_mcp.provisioning.inventory import ProviderResourceClass
+from creek_mcp.provisioning.inventory import MetricQuality, ProviderResourceClass
 from creek_mcp.provisioning.models import JobOperation
 
 if TYPE_CHECKING:
@@ -105,11 +122,18 @@ class FleetDivergence:
 
 @dataclass(frozen=True, slots=True)
 class FleetReconciliationReport:
-    """A deterministic, content-free snapshot of one reconciliation pass."""
+    """A deterministic, content-free snapshot of one reconciliation pass.
+
+    ``unmetered_running`` names the live allocations holding a Machine that is
+    running but whose uptime meter could not be read. They are neither reported
+    as compliant nor as divergent, because neither is known — and an operator
+    who cannot see them has no way to tell the difference.
+    """
 
     mode: ReconcileMode
     inventory_complete: bool
     divergences: tuple[FleetDivergence, ...]
+    unmetered_running: tuple[str, ...]
     observed_at: datetime = field(compare=False)
 
 
@@ -176,15 +200,23 @@ class FleetReconciler:
             mode=ReconcileMode.REPORT_ONLY,
             inventory_complete=complete,
             divergences=tuple(sorted(divergences, key=_sort_key)),
+            unmetered_running=self._unmetered(resources, live),
             observed_at=now,
         )
 
     def _snapshot(self) -> tuple[tuple[ProviderResource, ...], bool]:
-        """Read the inventory, treating an unavailable provider as incomplete."""
+        """Read the inventory, keeping whatever a partial pass did observe.
+
+        A boundary that raises rather than reporting partiality is still
+        handled, because ``ProviderInventory`` is an injected Protocol and a
+        third-party implementation may do so — but nothing is inferred from
+        the resulting emptiness beyond ``complete`` being False.
+        """
         try:
-            return tuple(self._inventory.list_resources()), True
+            snapshot = self._inventory.list_resources()
         except ProviderError:
             return (), False
+        return snapshot.resources, snapshot.complete
 
     @staticmethod
     def _orphans(
@@ -275,6 +307,26 @@ class FleetReconciler:
                 subject=allocation.provider_allocation_id,
             )
 
+    @staticmethod
+    def _unmetered(
+        resources: Sequence[ProviderResource],
+        live: set[str],
+    ) -> tuple[str, ...]:
+        """Name live allocations whose running Machine has no readable meter."""
+        return tuple(
+            sorted(
+                {
+                    resource.provider_allocation_id
+                    for resource in resources
+                    if resource.provider_allocation_id is not None
+                    and resource.provider_allocation_id in live
+                    and resource.resource_class is ProviderResourceClass.MACHINE
+                    and resource.state in _RUNNING_STATES
+                    and resource.last_modified_quality is not MetricQuality.EXACT
+                }
+            )
+        )
+
     def _running(
         self,
         resources: Sequence[ProviderResource],
@@ -301,14 +353,22 @@ class FleetReconciler:
     def _is_running_beyond(resource: ProviderResource, deadline: datetime) -> bool:
         """Return whether *resource* has billed for CPU since before *deadline*.
 
-        A Machine whose state predates the deadline is reported; one the
-        provider gives no timestamp for is not, because Fly's proxy may start a
-        Machine with no Creek call to observe and guessing how long it has run
-        would put a fabricated duration into an operator's report.
+        The measure is a **lower bound**, not the true uptime.
+        ``last_modified_at`` is Fly's ``updated_at``, which any provider-side
+        write resets, so a Machine that has run for a week but was touched an
+        hour ago reads as an hour old. The window can therefore under-report;
+        it cannot over-report, which is the safe direction for a signal an
+        operator acts on. Parsing Fly's ``events[]`` for the true transition is
+        deliberately out of scope here.
+
+        A Machine the provider gives no readable timestamp for is not reported,
+        because guessing how long it has run would put a fabricated duration
+        into an operator's report — those Machines are surfaced instead through
+        :attr:`FleetReconciliationReport.unmetered_running`.
         """
         return (
             resource.resource_class is ProviderResourceClass.MACHINE
             and resource.state in _RUNNING_STATES
-            and resource.state_since is not None
-            and resource.state_since <= deadline
+            and resource.last_modified_at is not None
+            and resource.last_modified_at <= deadline
         )

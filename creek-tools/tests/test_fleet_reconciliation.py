@@ -24,7 +24,7 @@ import dataclasses
 import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import Final, cast
 
 import httpx
 import pytest
@@ -36,11 +36,13 @@ from creek_mcp.provisioning.driver import (
     ProviderError,
 )
 from creek_mcp.provisioning.inventory import (
+    InventorySnapshot,
+    MetricQuality,
     ProviderInventory,
     ProviderResource,
     ProviderResourceClass,
 )
-from creek_mcp.provisioning.models import JobOperation, JobState
+from creek_mcp.provisioning.models import FailureReason, JobOperation, JobState
 from creek_mcp.provisioning.reconcile import (
     DivergenceKind,
     FleetDivergence,
@@ -58,8 +60,9 @@ from tests.provisioning_secret_support import (
     assert_content_free,
 )
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
+_RECONCILE_SOURCE: Final[str] = (
+    Path(__file__).resolve().parents[1] / "creek_mcp" / "provisioning" / "reconcile.py"
+).read_text(encoding="utf-8")
 
 _NOW = datetime(2026, 9, 8, 4, tzinfo=UTC)
 _ORG = "creek-vaults"
@@ -78,16 +81,19 @@ class _UnclassifiableInventory:
         """Attribute the bogus resource to an allocation the store knows."""
         self._surrogate = surrogate
 
-    def list_resources(self) -> Sequence[ProviderResource]:
+    def list_resources(self) -> InventorySnapshot:
         """Return one resource carrying a class no Creek allocation can hold."""
-        return [
-            ProviderResource(
-                resource_class=cast("ProviderResourceClass", "gpu"),
-                provider_id="gpu-1",
-                provider_allocation_id=self._surrogate,
-                state="stopped",
-            )
-        ]
+        return InventorySnapshot(
+            resources=(
+                ProviderResource(
+                    resource_class=cast("ProviderResourceClass", "gpu"),
+                    provider_id="gpu-1",
+                    provider_allocation_id=self._surrogate,
+                    state="stopped",
+                ),
+            ),
+            complete=True,
+        )
 
 
 def _surrogate(activation_id: str) -> str:
@@ -218,7 +224,7 @@ def test_apps_outside_the_prefix_or_organization_never_enter_the_inventory(
         "network": "n/a",
     }
 
-    resources = driver.list_resources()
+    resources = driver.list_resources().resources
     report = _reconcile(store, driver)
 
     assert {resource.provider_id for resource in resources} == {
@@ -242,7 +248,7 @@ def test_snapshots_are_enumerated_because_fly_bills_them_separately(
 
     snapshots = [
         resource
-        for resource in driver.list_resources()
+        for resource in driver.list_resources().resources
         if resource.resource_class is ProviderResourceClass.SNAPSHOT
     ]
 
@@ -259,9 +265,11 @@ def test_an_incomplete_inventory_never_reports_every_allocation_as_missing(
     store, api, _ = _provisioned(tmp_path)
     driver = build_driver(api)
     api.fail_once("GET", "/v1/apps")
+    baseline = len(api.requests)
 
     report = _reconcile(store, driver)
 
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
     assert report.inventory_complete is False
     assert report.divergences == ()
 
@@ -273,9 +281,11 @@ def test_a_vanished_app_is_reported_missing_once_the_inventory_is_complete(
     store, api, _ = _provisioned(tmp_path)
     driver = build_driver(api)
     api.apps.clear()
+    baseline = len(api.requests)
 
     report = _reconcile(store, driver)
 
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
     assert report.inventory_complete is True
     assert report.divergences == (
         FleetDivergence(
@@ -304,6 +314,7 @@ def test_a_failed_delete_stays_visible_until_the_provider_confirms_removal(
     store.request_delete(job.job_id, "adepthood", now=_NOW)
     api.fail_once("DELETE", "/machines/machine-1")
     worker.run_once(now=_NOW)
+    baseline = len(api.requests)
 
     settled = store.get(job.job_id, "adepthood")
     report = _reconcile(store, driver, now=_NOW + timedelta(hours=1))
@@ -318,6 +329,7 @@ def test_a_failed_delete_stays_visible_until_the_provider_confirms_removal(
             subject=f"fly-{_surrogate(_LIVE_ACTIVATION)}",
         ),
     )
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
 
 
 def test_a_second_billable_volume_under_one_allocation_is_reported(
@@ -337,6 +349,7 @@ def test_a_second_billable_volume_under_one_allocation_is_reported(
             "state": "created",
         }
     )
+    baseline = len(api.requests)
 
     report = _reconcile(store, driver)
 
@@ -347,6 +360,7 @@ def test_a_second_billable_volume_under_one_allocation_is_reported(
         "vol-1",
         "vol-2",
     }
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
 
 
 def test_a_machine_running_past_the_window_is_reported_but_never_stopped(
@@ -371,20 +385,37 @@ def test_a_machine_running_past_the_window_is_reported_but_never_stopped(
             provider_id="machine-1",
         ),
     )
+    assert report.unmetered_running == ()
     assert {method for method, _ in api.requests[baseline:]} == {"GET"}
 
 
-def test_a_machine_the_provider_gives_no_timestamp_for_is_not_guessed_at(
+def test_a_machine_with_no_readable_meter_is_surfaced_not_assumed_compliant(
     tmp_path: Path,
 ) -> None:
-    """Fly's proxy can start a Machine unobserved; a duration is never invented."""
+    """An unreadable uptime meter is reported as unreadable, never as compliant.
+
+    Fly's proxy can start a Machine with no Creek call to observe, so a
+    duration is never invented. Silently omitting the Machine would be the
+    other failure: an operator would see a clean report and have no way to tell
+    a compliant Machine from one nobody could measure.
+    """
     store, api, _ = _provisioned(tmp_path)
     driver = build_driver(api)
-    api.machines[f"creek-vault-{_surrogate(_LIVE_ACTIVATION)}"][0]["state"] = "started"
+    machine = api.machines[f"creek-vault-{_surrogate(_LIVE_ACTIVATION)}"][0]
+    machine["state"] = "started"
+    baseline = len(api.requests)
 
+    observed = driver.list_resources()
     report = _reconcile(store, driver)
 
+    assert [
+        resource.last_modified_quality
+        for resource in observed.resources
+        if resource.resource_class is ProviderResourceClass.MACHINE
+    ] == [MetricQuality.UNAVAILABLE]
     assert report.divergences == ()
+    assert report.unmetered_running == (f"fly-{_surrogate(_LIVE_ACTIVATION)}",)
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
 
 
 def test_the_fake_driver_also_satisfies_the_inventory_capability(
@@ -406,6 +437,8 @@ def test_the_fake_driver_also_satisfies_the_inventory_capability(
         "fake-orphaned-allocation"
     }
     assert store.get_allocation(job.job_id, "adepthood") is not None
+    assert driver.delete_count == 0
+    assert driver.allocation_count == 1
 
 
 def test_an_unclassifiable_resource_class_raises_instead_of_escaping_the_report(
@@ -436,38 +469,74 @@ def test_reconciliation_thresholds_must_make_a_divergence_observable() -> None:
         )
 
 
-def test_the_reconciler_has_no_repair_path_anywhere_in_the_module() -> None:
-    """Report-only is a ruling, so the mutating calls must not exist at all.
-
-    Decision 6 binds resource removal to revoking the consumer credential, and
-    ``FlySecretManager.revoke`` is keyed on the activation id — a SHA-256
-    preimage of the only name an orphan has. An automatic repair would destroy
-    billable resources while leaving a live credential issued, which is
-    strictly worse than the orphan it was cleaning up.
-
-    The check walks the module's syntax tree rather than its text, so prose
-    that *names* the forbidden operations cannot satisfy or break it.
-    """
-    tree = ast.parse(
-        (
-            Path(__file__).resolve().parents[1]
-            / "creek_mcp"
-            / "provisioning"
-            / "reconcile.py"
-        ).read_text(encoding="utf-8")
-    )
-    called = {
-        node.func.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+_RECONCILE_IMPORTS: Final[frozenset[str]] = frozenset(
+    {
+        "annotations",
+        "defaultdict",
+        "dataclass",
+        "field",
+        "timedelta",
+        "StrEnum",
+        "unique",
+        "TYPE_CHECKING",
+        "Final",
+        "ProviderError",
+        "MetricQuality",
+        "ProviderResourceClass",
+        "JobOperation",
+        "Callable",
+        "Iterator",
+        "Sequence",
+        "datetime",
+        "ProviderInventory",
+        "ProviderResource",
+        "OperatorAllocationView",
+        "ProvisioningStore",
     }
+)
+"""Every name reconcile.py may import. All of them are read-only or inert."""
+
+_MUTATING_OPERATIONS: Final[frozenset[str]] = frozenset(
+    {"provision", "delete", "start", "stop", "delete_orphan"}
+)
+
+
+def test_the_reconciler_module_can_reach_no_mutating_operation() -> None:
+    """A syntax-level bound on what the report-only module could possibly call.
+
+    This test proves a *bound*, not the behaviour, and the distinction matters
+    because a blocklist of method names is trivially evaded. It closes three
+    escapes together: an attribute call (``driver.delete(...)``), a bare-name
+    call to something imported from elsewhere (``from .repair import purge``),
+    and a dynamic call (``getattr(driver, "delete")(...)``). The exact import
+    set is the load-bearing half — a mutating helper cannot be reached from
+    this module without an import, and no import may appear that is not listed.
+
+    The *behavioural* guarantee — that a real reconciliation pass issues only
+    GETs and destroys nothing — comes from the wire assertions carried by every
+    reconcile test in this module, and from the fake driver's delete counter.
+    Neither claim is sufficient alone.
+    """
+    tree = ast.parse(_RECONCILE_SOURCE)
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom | ast.Import)
+        for alias in node.names
+    }
+    calls = [node.func for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    called_attributes = {node.attr for node in calls if isinstance(node, ast.Attribute)}
+    called_names = {node.id for node in calls if isinstance(node, ast.Name)}
     referenced = {
         node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
     }
 
     assert list(ReconcileMode) == [ReconcileMode.REPORT_ONLY]
-    assert called.isdisjoint({"provision", "delete", "start", "stop"})
-    assert "delete_orphan" not in called | referenced
+    assert imported == _RECONCILE_IMPORTS
+    assert called_attributes.isdisjoint(_MUTATING_OPERATIONS)
+    assert called_names.isdisjoint(_MUTATING_OPERATIONS)
+    assert referenced.isdisjoint(_MUTATING_OPERATIONS)
+    assert called_names.isdisjoint({"getattr", "setattr", "eval", "exec", "__import__"})
 
 
 def _protocol_methods(protocol: type) -> set[str]:
@@ -496,25 +565,48 @@ def test_a_negative_unconfirmed_window_is_refused(tmp_path: Path) -> None:
 class _MalformedAppListing(FakeFlyAPI):
     """Serve an org listing that answers 200 with the wrong body shape."""
 
+    @classmethod
+    def of(cls, api: FakeFlyAPI) -> _MalformedAppListing:
+        """Wrap an already-provisioned account so its state is preserved."""
+        corrupted = cls()
+        corrupted.apps = api.apps
+        corrupted.volumes = api.volumes
+        corrupted.machines = api.machines
+        corrupted.snapshots = api.snapshots
+        corrupted.requests = api.requests
+        return corrupted
+
     def handle(self, request: httpx.Request) -> httpx.Response:
         """Corrupt only the org listing, leaving every other route intact."""
         if request.url.path == "/v1/apps" and request.method == "GET":
+            self.requests.append((request.method, request.url.path))
             return httpx.Response(200, json={"apps": "not-a-list"}, request=request)
         return super().handle(request)
+
+
+class _FailingInventory:
+    """An injected inventory boundary that raises rather than reporting."""
+
+    def list_resources(self) -> InventorySnapshot:
+        """Refuse the read the way a third-party implementation might."""
+        raise ProviderError(FailureReason.PROVIDER_UNAVAILABLE, retryable=True)
 
 
 def test_a_malformed_org_listing_is_an_unavailable_provider_not_an_empty_fleet(
     tmp_path: Path,
 ) -> None:
     """A 200 whose body is the wrong shape must not read as "nothing exists"."""
-    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
-    driver = build_driver(_MalformedAppListing())
+    store, api, _ = _provisioned(tmp_path)
+    driver = build_driver(_MalformedAppListing.of(api))
+    baseline = len(api.requests)
 
+    observed = driver.list_resources()
     report = _reconcile(store, driver)
 
-    with pytest.raises(ProviderError):
-        driver.list_resources()
+    assert observed == InventorySnapshot(resources=(), complete=False)
     assert report.inventory_complete is False
+    assert report.divergences == ()
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
 
 
 def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
@@ -543,12 +635,15 @@ def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
     )
     api.volumes[app_name].append({"id": "vol-bare"})
     api.snapshots[(app_name, "vol-bare")].append({"id": "snap-bare", "size": "large"})
+    baseline = len(api.requests)
 
-    resources = {resource.provider_id: resource for resource in driver.list_resources()}
+    observed = driver.list_resources()
+    resources = {resource.provider_id: resource for resource in observed.resources}
     report = _reconcile(store, driver)
 
-    assert resources["machine-offsetless"].state_since is None
-    assert resources["machine-unparseable"].state_since is None
+    for machine in ("machine-offsetless", "machine-unparseable", "machine-bare"):
+        assert resources[machine].last_modified_at is None
+        assert resources[machine].last_modified_quality is MetricQuality.UNAVAILABLE
     assert resources["machine-bare"].state == "unknown"
     assert resources["machine-bare"].region is None
     assert resources["vol-bare"].size_gb is None
@@ -556,3 +651,275 @@ def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
     assert {divergence.kind for divergence in report.divergences} == {
         DivergenceKind.ORPHAN_PROVIDER_RESOURCE
     }
+    assert observed.complete is True
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
+
+
+def test_a_repeatedly_reclaimed_stuck_delete_still_ages_past_the_window(
+    tmp_path: Path,
+) -> None:
+    """A re-claim must not reset the clock the staleness window measures.
+
+    ``claim_next`` rewrites ``updated_at`` on every claim, so a delete that
+    hangs, loses its lease and is re-claimed keeps pushing that column forward.
+    Predicating staleness on it means the most expensive divergence — a delete
+    stuck mid-flight with the volume still billing — never ages past the
+    window, and ``_missing``'s DELETE skip removes the only other backstop.
+    """
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    api = FakeFlyAPI()
+    driver = build_driver(api)
+    worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
+    job = store.submit(_LIVE_ACTIVATION, "adepthood-user-001", "adepthood", now=_NOW)
+    worker.run_once(now=_NOW)
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    app_name = f"creek-vault-{_surrogate(_LIVE_ACTIVATION)}"
+    for hour in (1, 2):
+        assert store.claim_next(now=_NOW + timedelta(hours=hour)) is not None
+        api.machines[app_name].clear()
+
+    report = _reconcile(store, driver, now=_NOW + timedelta(hours=2, minutes=1))
+
+    assert report.divergences == (
+        FleetDivergence(
+            kind=DivergenceKind.DELETION_UNCONFIRMED,
+            subject=f"fly-{_surrogate(_LIVE_ACTIVATION)}",
+        ),
+    )
+
+
+def test_a_destroyed_volume_left_by_a_disk_restore_is_not_a_duplicate(
+    tmp_path: Path,
+) -> None:
+    """Fly's own restore flow leaves a destroyed volume beside the live one.
+
+    ``fly volumes destroy`` then ``fly volumes create --snapshot-id`` leaves two
+    rows under one app and bills for one. Counting both raises a duplicate-cost
+    divergence for a fleet that is costing exactly what it should, and a false
+    positive on a cost alarm is how operators learn to ignore the alarm.
+    """
+    store, api, _ = _provisioned(tmp_path)
+    driver = build_driver(api)
+    app_name = f"creek-vault-{_surrogate(_LIVE_ACTIVATION)}"
+    api.volumes[app_name][0]["state"] = "destroyed"
+    api.volumes[app_name].append(
+        {
+            "id": "vol-2",
+            "name": f"fly-{_surrogate(_LIVE_ACTIVATION)}-vault",
+            "region": "iad",
+            "size_gb": 5,
+            "encrypted": True,
+            "state": "created",
+        }
+    )
+    api.machines[app_name].append({"id": "machine-2", "state": "destroyed"})
+
+    observed = driver.list_resources()
+    report = _reconcile(store, driver)
+
+    assert report.divergences == ()
+    assert {
+        resource.provider_id
+        for resource in observed.resources
+        if resource.resource_class
+        in {ProviderResourceClass.VOLUME, ProviderResourceClass.MACHINE}
+    } == {"vol-2", "machine-1"}
+
+
+def test_a_machine_running_inside_the_window_is_not_reported(
+    tmp_path: Path,
+) -> None:
+    """The configured window is load-bearing, not decoration.
+
+    Without this case the whole ``max_continuous_running`` threshold can be
+    ignored — inverting the deadline arithmetic still leaves the positive test
+    green, because a Machine started a day ago is on the far side of the
+    comparison either way.
+    """
+    store, api, _ = _provisioned(tmp_path)
+    driver = build_driver(api)
+    machine = api.machines[f"creek-vault-{_surrogate(_LIVE_ACTIVATION)}"][0]
+    machine["state"] = "started"
+    machine["updated_at"] = (_NOW - timedelta(hours=1)).isoformat()
+
+    report = _reconcile(store, driver)
+
+    assert _POLICY.max_continuous_running == timedelta(hours=6)
+    assert report.divergences == ()
+    assert report.unmetered_running == ()
+
+
+def test_a_delete_that_failed_inside_the_window_is_not_yet_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """A delete gets its configured grace period before it is called stuck."""
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    api = FakeFlyAPI()
+    driver = build_driver(api)
+    worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
+    job = store.submit(_LIVE_ACTIVATION, "adepthood-user-001", "adepthood", now=_NOW)
+    worker.run_once(now=_NOW)
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    api.fail_once("DELETE", "/machines/machine-1")
+    worker.run_once(now=_NOW)
+
+    report = _reconcile(store, driver, now=_NOW + timedelta(minutes=1))
+
+    assert _POLICY.unconfirmed_deletion_after == timedelta(minutes=15)
+    assert report.divergences == ()
+
+
+def test_a_delete_still_in_flight_past_the_window_is_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """The 'deleting' arm of the predicate carries its own weight.
+
+    A delete claimed by a worker that then vanished parks in ``deleting`` with
+    a live allocation row, and narrowing the predicate to ``failed`` alone
+    leaves that case entirely unreported.
+    """
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    api = FakeFlyAPI()
+    driver = build_driver(api)
+    job = store.submit(_LIVE_ACTIVATION, "adepthood-user-001", "adepthood", now=_NOW)
+    ProvisioningWorker(store, driver, FakeOneTimeHandoff()).run_once(now=_NOW)
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+
+    settled = store.get(job.job_id, "adepthood")
+    report = _reconcile(store, driver, now=_NOW + timedelta(hours=1))
+
+    assert settled is not None
+    assert settled.state is JobState.DELETING
+    assert report.divergences == (
+        FleetDivergence(
+            kind=DivergenceKind.DELETION_UNCONFIRMED,
+            subject=f"fly-{_surrogate(_LIVE_ACTIVATION)}",
+        ),
+    )
+
+
+def test_a_confirmed_delete_leaves_nothing_for_reconciliation_to_find(
+    tmp_path: Path,
+) -> None:
+    """``deleted_at IS NULL`` is the fence that retires a settled allocation.
+
+    Every other test in this module reconciles a fleet that was never
+    successfully torn down, so dropping the clause changes nothing they can
+    see. Here the teardown succeeds: the allocation must leave
+    ``live_allocations`` and the provider must show nothing left to bill.
+    """
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    api = FakeFlyAPI()
+    driver = build_driver(api)
+    worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
+    job = store.submit(_LIVE_ACTIVATION, "adepthood-user-001", "adepthood", now=_NOW)
+    worker.run_once(now=_NOW)
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    assert worker.run_once(now=_NOW) is True
+    baseline = len(api.requests)
+
+    settled = store.get(job.job_id, "adepthood")
+    report = _reconcile(store, driver, now=_NOW + timedelta(days=7))
+
+    assert settled is not None
+    assert settled.state is JobState.DELETED
+    assert store.live_allocations() == []
+    assert store.count_allocations(active_only=True) == 0
+    assert report.divergences == ()
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
+
+
+def test_two_passes_at_different_instants_still_compare_equal(
+    tmp_path: Path,
+) -> None:
+    """``observed_at`` is excluded from equality, and that is worth proving.
+
+    Drawing both passes from one frozen clock would make the idempotence claim
+    true for the wrong reason: the timestamps would be equal anyway, so
+    removing ``field(compare=False)`` would change nothing.
+    """
+    store, api, _ = _provisioned(tmp_path)
+    driver = build_driver(api)
+    orphan = _plant_orphan(api, _ORPHAN_ACTIVATION)
+
+    first = _reconcile(store, driver, now=_NOW)
+    second = _reconcile(store, driver, now=_NOW + timedelta(days=3))
+
+    assert first.observed_at != second.observed_at
+    assert first == second
+    assert {divergence.subject for divergence in first.divergences} == {orphan}
+
+
+def test_many_snapshots_under_one_allocation_are_not_a_duplicate(
+    tmp_path: Path,
+) -> None:
+    """Snapshots are unbounded by design; only Machines and volumes are not.
+
+    ``_duplicates`` filters to live allocations before classifying, so without
+    this case the SNAPSHOT arm of the closed classification is never reached
+    at all and could return either answer unnoticed.
+    """
+    store, api, _ = _provisioned(tmp_path)
+    driver = build_driver(api)
+    app_name = f"creek-vault-{_surrogate(_LIVE_ACTIVATION)}"
+    api.snapshots[(app_name, "vol-1")].extend(
+        [
+            {"id": "snap-1", "size": 4096},
+            {"id": "snap-2", "size": 8192},
+            {"id": "snap-3", "size": 16384},
+        ]
+    )
+    baseline = len(api.requests)
+
+    observed = driver.list_resources()
+    report = _reconcile(store, driver)
+
+    assert [
+        resource.provider_id
+        for resource in observed.resources
+        if resource.resource_class is ProviderResourceClass.SNAPSHOT
+    ] == ["snap-1", "snap-2", "snap-3"]
+    assert report.divergences == ()
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
+
+
+def test_a_partial_enumeration_still_reports_what_it_did_observe(
+    tmp_path: Path,
+) -> None:
+    """A failure part-way through must not read as a clean fleet.
+
+    Discarding everything on the first ``ProviderError`` turns a partial read
+    into an empty one, and an empty report is indistinguishable from a fleet
+    with no divergences at all — while the orphan that was already seen keeps
+    billing.
+    """
+    store, api, _ = _provisioned(tmp_path)
+    driver = build_driver(api)
+    orphan = _plant_orphan(api, _ORPHAN_ACTIVATION)
+    machines_path = f"/v1/apps/creek-vault-{_surrogate(_LIVE_ACTIVATION)}/machines"
+    baseline = len(api.requests)
+
+    api.fail_once("GET", machines_path)
+    observed = driver.list_resources()
+    api.fail_once("GET", machines_path)
+    report = _reconcile(store, driver)
+
+    assert observed.complete is False
+    assert report.inventory_complete is False
+    assert {divergence.subject for divergence in report.divergences} == {orphan}
+    assert DivergenceKind.MISSING_PROVIDER_RESOURCE not in {
+        divergence.kind for divergence in report.divergences
+    }
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}
+
+
+def test_an_inventory_boundary_that_raises_is_still_handled(
+    tmp_path: Path,
+) -> None:
+    """The Protocol is injected, so a third party may raise instead of report."""
+    store, _, _ = _provisioned(tmp_path)
+
+    report = _reconcile(store, _FailingInventory())
+
+    assert report.inventory_complete is False
+    assert report.divergences == ()

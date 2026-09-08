@@ -241,7 +241,7 @@ def test_v2_database_migrates_authenticated_ownership_without_data_loss(
     assert job is not None
     assert job.requester_identity == "adepthood"
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
         assert connection.execute(
             "SELECT requester_identity FROM provisioning_activation_ids"
         ).fetchone() == ("adepthood",)
@@ -470,3 +470,46 @@ def test_delete_is_idempotent_and_remains_durable_until_a_worker_claims_it(
     assert first.state is JobState.DELETING
     assert claim is not None
     assert claim.job.state is JobState.DELETING
+
+
+def test_a_stuck_delete_survives_the_v4_migration_with_a_usable_clock(
+    tmp_path: Path,
+) -> None:
+    """A delete already stuck when delete_requested_at landed stays visible.
+
+    The column is written only by ``request_delete``, so a database upgraded
+    while a delete was mid-flight would hold NULL for exactly the row fleet
+    reconciliation most needs to see. The migration backfills from updated_at,
+    which is a worse clock but a real one, so the upgrade itself cannot hide a
+    billing resource (#1769).
+    """
+    database = tmp_path / "provisioning.sqlite3"
+    stamp = _NOW.isoformat(timespec="microseconds")
+    store = ProvisioningStore(database)
+    job = store.submit("activation-stuck", "adepthood-user-001", "adepthood", now=_NOW)
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute(
+            "INSERT INTO provisioning_allocations "
+            "(allocation_id, job_id, requester_identity, consumer_identity, "
+            "provider_allocation_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "alloc-stuck",
+                job.job_id,
+                "adepthood",
+                "adepthood-user-001",
+                "fly-x",
+                stamp,
+            ),
+        )
+        # Return the row to its pre-migration shape: the column exists but was
+        # never written, because the delete predates it.
+        connection.execute("UPDATE provisioning_jobs SET delete_requested_at = NULL")
+        connection.commit()
+
+    reopened = ProvisioningStore(database)
+    stale = reopened.unconfirmed_deletions(
+        timedelta(minutes=15), now=_NOW + timedelta(hours=1)
+    )
+
+    assert [view.provider_allocation_id for view in stale] == ["fly-x"]

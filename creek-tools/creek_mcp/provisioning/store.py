@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
-_SCHEMA_VERSION: Final[int] = 3
+_SCHEMA_VERSION: Final[int] = 4
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
 MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS provisioning_jobs (
     lease_token TEXT,
     lease_expires_at TEXT,
     attested_confidential INTEGER,
+    delete_requested_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK (state IN (
@@ -194,6 +195,17 @@ class ProvisioningStore:
                 "ADD COLUMN attested_confidential INTEGER "
                 "CHECK (attested_confidential IS NULL "
                 "OR attested_confidential IN (0, 1))"
+            )
+        if "delete_requested_at" not in table_columns["provisioning_jobs"]:
+            connection.execute(
+                "ALTER TABLE provisioning_jobs ADD COLUMN delete_requested_at TEXT"
+            )
+            # Backfill from updated_at rather than leaving NULL: a delete that
+            # was already stuck when this column landed must not become
+            # invisible to reconciliation because of the upgrade itself.
+            connection.execute(
+                "UPDATE provisioning_jobs SET delete_requested_at = updated_at "
+                "WHERE operation = 'delete' AND delete_requested_at IS NULL"
             )
         for table, migration in _REQUESTER_MIGRATIONS.items():
             if "requester_identity" not in table_columns[table]:
@@ -498,15 +510,22 @@ class ProvisioningStore:
             row = self._owned_job(connection, job_id, requester_identity)
             if row["state"] in {JobState.DELETING.value, JobState.DELETED.value}:
                 return self._from_row(row)
+            # delete_requested_at is written here and NOWHERE else. It is the
+            # only clock reconciliation can trust: updated_at is rewritten by
+            # every claim_next lease and by every _settle_claim, so a delete
+            # that hangs, loses its lease and is re-claimed would keep pushing
+            # its own staleness deadline forward and never age past the window.
+            # The early return above makes this transition happen at most once.
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                 "retry_count = 0, retryable = 0, failure_reason = NULL, "
                 "attested_confidential = NULL, "
-                "lease_token = NULL, "
+                "lease_token = NULL, delete_requested_at = ?, "
                 "lease_expires_at = NULL, updated_at = ? WHERE job_id = ?",
                 (
                     JobState.DELETING.value,
                     JobOperation.DELETE.value,
+                    _timestamp(instant),
                     _timestamp(instant),
                     job_id,
                 ),
@@ -732,7 +751,7 @@ class ProvisioningStore:
         "provisioning_allocations.job_id, "
         "provisioning_allocations.consumer_identity, "
         "provisioning_jobs.state, provisioning_jobs.operation, "
-        "provisioning_jobs.updated_at "
+        "provisioning_jobs.updated_at, provisioning_jobs.delete_requested_at "
         "FROM provisioning_allocations JOIN provisioning_jobs USING (job_id) "
     )
 
@@ -754,6 +773,19 @@ class ProvisioningStore:
     ) -> list[OperatorAllocationView]:
         """Return deletions the provider has not confirmed within *older_than*.
 
+        Staleness is measured from ``delete_requested_at``, which only
+        ``request_delete`` ever writes. ``updated_at`` cannot be used: every
+        ``claim_next`` lease and every ``_settle_claim`` rewrites it, so a
+        delete that hangs and is re-claimed pushes its own deadline forward
+        indefinitely and never ages past the window — while the Machine it
+        already destroyed removes the ``_missing`` backstop, leaving a billing
+        volume nothing can see.
+
+        A row whose ``delete_requested_at`` is somehow still NULL falls back to
+        ``updated_at`` through COALESCE. That is the weaker clock, but a weak
+        clock reports a stuck delete late; a NULL would never report it at all,
+        and this query's whole purpose is that nothing billing goes unseen.
+
         The predicate covers state ``failed`` as well as ``deleting``, and that
         arm is load-bearing rather than defensive. ``record_failure`` settles
         through ``_settle_claim(state=FAILED)``, which never reaches the branch
@@ -773,7 +805,8 @@ class ProvisioningStore:
                 + "WHERE provisioning_allocations.deleted_at IS NULL "
                 "AND provisioning_jobs.operation = ? "
                 "AND provisioning_jobs.state IN (?, ?) "
-                "AND provisioning_jobs.updated_at <= ? "
+                "AND COALESCE(provisioning_jobs.delete_requested_at, "
+                "provisioning_jobs.updated_at) <= ? "
                 "ORDER BY provisioning_allocations.provider_allocation_id",
                 (
                     JobOperation.DELETE.value,
