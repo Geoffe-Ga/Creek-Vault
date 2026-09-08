@@ -26,7 +26,11 @@ from creek.author.models import (
     OntologyParadox,
     WalkStats,
 )
-from creek.classify.privacy_filter import PrivacyTierOverride, tier_within_override
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    tier_of,
+    tier_within_override,
+)
 from creek.classify.rules import RuleClassifier
 from creek.classify.weighted import WeightedDimension
 from creek.generate.paradox import OPPOSITE_CONFIDENCE_PAIRS, OPPOSITE_PHASE_PAIRS
@@ -146,11 +150,16 @@ def fragment_tier_map(
         override: The privacy admission ceiling (matches the gather override).
 
     Returns:
-        A mapping of admitted fragment id to its :class:`PrivacyTier`.
+        A mapping of admitted fragment id to its :class:`PrivacyTier` —
+        genuine members, read through
+        :func:`~creek.classify.privacy_filter.tier_of` rather than off the
+        model attribute, which ``use_enum_values=True`` leaves a plain
+        ``str`` (#1752). Behaviour-neutral for
+        :func:`creek.author.conductor.run_desk`, whose membership check is
+        by value; what it repairs is this function's own annotation.
     """
     return {
-        fragment.id: fragment.privacy_tier
-        for fragment, _ in _load_corpus(vault, override)
+        fragment.id: tier_of(fragment) for fragment, _ in _load_corpus(vault, override)
     }
 
 

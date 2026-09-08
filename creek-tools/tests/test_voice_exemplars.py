@@ -1841,6 +1841,15 @@ class TestUntieredFragmentsAreRefused:
     consent gate (``_eligible_register``) reads the **validated model**, where
     an absent key has already become Pydantic's ``unclassified`` default.
 
+    The consent gate reads that model canonically as of #1743 — through
+    :func:`~creek.classify.privacy_filter.tier_of` rather than comparing the
+    bare attribute — which changes nothing here. The two gates still read
+    two different *sources*, and that is the split this class is about: no
+    reader of the validated model can recover the missing-key case, because
+    the default has already been applied by the time it sees one. A tier the
+    enum does not recognise is now refused by the consent gate as well, but
+    ``unclassified`` is recognised, so it is still admitted (AC2 below).
+
     At :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL` — the
     collector's constructor default, and what a bare ``creek report`` resolves
     to — the ceiling gate short-circuits to ``True``. Only the model-reading

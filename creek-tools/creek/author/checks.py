@@ -203,10 +203,25 @@ def _as_tier(value: PrivacyTier) -> PrivacyTier:
 
     :class:`~creek.models.Fragment` is configured with ``use_enum_values=True``,
     so Pydantic hands back the plain ``str`` behind the member even though the
-    annotation says ``PrivacyTier``. Left as a ``str`` it misses every
-    :data:`_TIER_RANK` lookup — the gate would then fail closed at the most
-    restrictive rank for *every* cited fragment — and rendering the finding
-    would raise on the missing ``.value``.
+    annotation says ``PrivacyTier``.
+
+    Corrected by #1752: an earlier version of this docstring claimed a bare
+    ``str`` "misses every :data:`_TIER_RANK` lookup". It does not.
+    :class:`~creek.models.PrivacyTier` is a ``StrEnum``, so a member and its
+    own value hash and compare equal, and every rank lookup *hits* for a
+    recognised string. That false premise is exactly what makes ``is`` and
+    ``==`` look interchangeable across this codebase, which is how four tier
+    gates came to be written with the wrong one.
+
+    The real reasons to coerce here are that the finding renderer reads
+    ``cited.tier.value``, which a bare ``str`` has no attribute for, and that
+    the annotation must not lie about what the dataclass holds. It keeps
+    **raising** on a tier the enum does not recognise, deliberately: the
+    return is rendered into a HARD leak finding, so a fail-closed default
+    would state a *false* tier in the output of the gate whose whole job is
+    telling the truth about cited tiers, and :func:`_fragment_rank` already
+    fails closed via ``.get(tier, _MOST_RESTRICTIVE_RANK)`` — the raise is
+    the only remaining signal that the data is corrupt at all.
 
     Args:
         value: A ``privacy_tier`` as loaded from a fragment's frontmatter.

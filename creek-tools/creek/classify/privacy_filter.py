@@ -249,6 +249,18 @@ def tier_within_override(
     ``UNCLASSIFIED`` ranks with ``PERSONAL`` (#876), so an untiered fragment
     needs an explicit ``personal`` ceiling to be admitted.
 
+    Ranks through :func:`tier_sensitivity` rather than indexing
+    :data:`_TIER_RANK` directly (#1752). The bare index raised ``KeyError``
+    across a caller's boundary for a tier the table has never heard of, and
+    two callers hand it the raw model attribute — ``creek.author.agents``
+    and ``creek_mcp.tools.wheel`` — so this repairs both without touching
+    either file. The outcome for an unrecognised tier is *not* blanket
+    refusal: it ranks 2, the same rank as ``intimate``, so it is refused at
+    ceilings ``open`` and ``personal`` and **admitted** at ceiling
+    ``intimate``. That is the codebase's "unknown reads as intimate"
+    convention, and ``ALL`` still returns ``True`` early — admission is not
+    routing, and INTIMATE enforcement lives in the routing gate.
+
     Args:
         tier: The fragment's privacy tier.
         override: The admission ceiling, or ``None`` for ``OPEN``.
@@ -259,7 +271,7 @@ def tier_within_override(
     effective = override or PrivacyTierOverride.OPEN
     if effective is PrivacyTierOverride.ALL:
         return True
-    return _TIER_RANK[tier] <= _OVERRIDE_RANK[effective]
+    return tier_sensitivity(tier) <= _OVERRIDE_RANK[effective]
 
 
 def _effective_tier(fragment: Fragment) -> PrivacyTier:
@@ -390,11 +402,22 @@ def fragment_tier(fragment: Fragment, raw: dict[str, object]) -> PrivacyTier:
 
     Returns:
         ``PrivacyTier.INTIMATE`` when ``privacy_tier`` is absent from
-        *raw*, else the fragment's own classified tier.
+        *raw*, else the fragment's own classified tier — always a genuine
+        :class:`~creek.models.PrivacyTier` **member**. The present tier is
+        read through :func:`tier_of` rather than off the model attribute,
+        which is a plain ``str`` at runtime (``Fragment`` sets
+        ``use_enum_values=True``), so this function's own annotation was a
+        lie every consumer inherited: ``_walk_source_tiers``,
+        :func:`build_ancestor_index` and
+        ``creek.compile.engine._routing_tier_for`` all declared
+        ``PrivacyTier`` while holding bare strings, and a bare string is
+        ``==`` a member but never ``is`` one (#1752). Delegating rather
+        than inlining a second guard is what makes the two halves of this
+        fail-closed reading unable to drift.
     """
     if "privacy_tier" not in raw:
         return PrivacyTier.INTIMATE
-    return fragment.privacy_tier
+    return tier_of(fragment)
 
 
 def raw_privacy_tier(raw: Mapping[str, object]) -> PrivacyTier:

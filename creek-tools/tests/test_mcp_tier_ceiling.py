@@ -233,7 +233,10 @@ def test_routing_tier_picks_the_more_sensitive_signal(
 
 
 @pytest.mark.parametrize("ceiling", list(TierCeiling))
-@pytest.mark.parametrize("content_tier", [*PrivacyTier, None])
+@pytest.mark.parametrize(
+    "content_tier",
+    [*PrivacyTier, *(t.value for t in PrivacyTier), "super-secret", None],
+)
 def test_routing_tier_answers_only_in_routing_vocabulary(
     ceiling: TierCeiling,
     content_tier: PrivacyTier | None,
@@ -258,10 +261,22 @@ def test_routing_tier_answers_only_in_routing_vocabulary(
     fourth key, and the exhaustive product is what stops a future tier from
     slipping into the routing vocabulary unexamined.
 
+    Extended by #1752 to the **string** form of every tier, plus an
+    unrecognised one. The enum-only product was green over a broken
+    ``_routable_tier``: ``Fragment`` sets ``use_enum_values=True``, so the
+    tier a production caller actually hands in is a plain ``str``, and the
+    identity comparison the normalisation was written with never matched it.
+    The assertion is a *value* membership, so the recognised strings pass
+    while ``'unclassified'`` and ``'super-secret'`` red until the
+    normalisation coerces. The sibling identity table above is deliberately
+    **not** extended with strings — its ``is`` would break on them for a
+    reason that is about the assertion, not the invariant.
+
     Args:
         ceiling: The caller's declared ceiling.
-        content_tier: Every ``PrivacyTier``, plus ``None`` for raw
-            caller-supplied text that carries no classification.
+        content_tier: Every ``PrivacyTier``, every tier's ``str`` value, an
+            unrecognised tier string, plus ``None`` for raw caller-supplied
+            text that carries no classification.
     """
     expected_vocabulary = set(CEILING_ROUTING_TIER.values()) | {
         PrivacyTier.OPEN,
