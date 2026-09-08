@@ -106,6 +106,55 @@ to locate the originating commit for any reference below.
 
 ### Fixed
 
+- **Token-boundary snapping is now O(S log R), and its justification is no
+  longer false (#946).** `Redactor._snap_to_candidate_runs` compared every
+  span against every candidate run and rebuilt that run list from its own
+  full regex sweep of the content, which `_collect_high_entropy_spans` had
+  already made — so a token-dense file paid a quadratic scan plus a redundant
+  pass on every `redact --apply`. The run list is now built once per
+  `redact_content` call, in `Redactor._candidate_runs`, and threaded to both
+  consumers; each span edge is placed with a single `bisect.bisect_right`
+  over the run starts. On 2000 spans across 2000 runs the ordering-comparison
+  count falls from 12,001,999 to 51,905, with output pinned byte-identical
+  across all four snap geometries. `false_positive_allowlist` membership is
+  now tested against a `frozenset` snapshot taken in `__init__` on **both**
+  `Redactor` and `RedactionScanner`, removing an O(allowlist) scan per match
+  and per run and making scan/apply allowlist parity true by construction.
+  Behaviour is unchanged: no input redacted before this change survives it.
+
+  **The stale justification.** Four places justified snapping by claiming
+  that the `_AWS_EXAMPLE_KEY` fixture + `"a" * 14` has "no clearing 20-character
+  window". Its best window, at offset 1, measures 3.821928 against the 3.70
+  default bar, so the entropy detector covers that fixture on its own and the
+  tests naming snapping in their docstrings pass with the guard deleted —
+  verified by stubbing `_snap_to_candidate_runs` to `return spans`, which
+  leaves every behavioural test green. All four copies are corrected, the
+  fixture's measurements are now pinned by a test, and new fixtures that are
+  genuinely inert to both entropy gates at the default confidence were added
+  to defend the guard.
+
+  **ADR-0014 records the refusal** of #946's ITEM 1, the request to exempt
+  `phone_number`, `ssn`, `ipv4`, `ipv6` and `email` from snapping: it does
+  not fix the reported prose over-redaction (both of the issue's examples are
+  already redacted whole by the entropy detector, at 4.002268 and 4.201841
+  bits/char), and it is fail-open —
+  `deadbeefdeadbeefdead-555-123-4567` is inert to both entropy gates at the
+  shipped default, so the exemption would leave a 20-character opaque token
+  in cleartext.
+
+  **Docs corrected.** `false_positive_allowlist` is exact whole-string
+  equality — against the whole *maximal* candidate run for the entropy
+  detector and for snapping — not the "substrings that suppress a match in
+  surrounding context" the configuration reference claimed; an allowlisted
+  run is also exempt from widening, and an entry lapses once the string is
+  glued to further `[A-Za-z0-9+/=_-]` characters. `exclude_patterns` is exact
+  path-*component* membership, not "path globs", and the YAML sample showed
+  `.git/` and `node_modules/` with trailing slashes that can never equal a
+  `Path.parts` element — a config copied from the docs excluded nothing. The
+  scanner's matching behaviour is deliberately unchanged: accepting globs
+  would walk fewer files. The stale `#900` reference in the scan/apply parity
+  note is dropped (closed by 50833a56); the `#946` half stands.
+
 - **Ollama readiness now requires the configured model, not merely a running
   daemon (#1761).** The availability probe previously treated any successful
   `/api/tags` response as ready, so a healthy Ollama process with only other

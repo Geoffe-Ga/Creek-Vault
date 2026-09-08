@@ -297,8 +297,8 @@ redaction:
     - .txt
     - .json
   exclude_patterns:
-    - .git/
-    - node_modules/
+    - .git
+    - node_modules
   min_confidence: 0.6
   replacement_template: "[REDACTED:{name}]"
 ```
@@ -307,10 +307,10 @@ redaction:
 |-----------------------------|------------------------|-------|
 | `enabled`                   | `true`                 | Master switch. |
 | `dry_run`                   | `false`                | When `true`, `--apply` plans but doesn't write. |
-| `custom_patterns`           | `{}`                   | Extra regex name → pattern map merged with built-ins. |
-| `false_positive_allowlist`  | `[]`                   | Substrings that, when present in the surrounding context, suppress a match. |
+| `custom_patterns`           | `{}`                   | Extra regex name → pattern map merged with built-ins. Token-boundary snapping only recognises `[A-Za-z0-9+/=_-]` runs, so a *bounded* pattern over an alphabet containing `.`, `~` or `%` can match a prefix and leave the rest outside the backstop — prefer an unbounded trailing quantifier. A zero-width pattern matching inside a run redacts the whole run. |
+| `false_positive_allowlist`  | `[]`                   | **Exact whole-string** matches to excuse — not substrings, and not a context test. For the high-entropy detector and for snapping the comparison is against the whole maximal candidate run, so an allowlisted run is also exempt from [widening](redaction.md#what---apply-does) and an entry stops applying once the string is glued to further `[A-Za-z0-9+/=_-]` characters. |
 | `supported_extensions`      | (text)                 | File extensions the scanner walks. |
-| `exclude_patterns`          | (vcs)                  | Path globs to skip. |
+| `exclude_patterns`          | (vcs)                  | **Exact path-component names** to skip — a file is excluded when any element of its path equals an entry. Not globs and not fragments: `.git` works, `.git/` and `*.git` never match a path element and so exclude nothing. |
 | `min_confidence`            | `0.6`                  | Threshold for the generic high-entropy detector; range `[0.0, 1.0]`. Higher demands more entropy before flagging. |
 | `replacement_template`      | `"[REDACTED:{name}]"`  | Marker template for `--apply`. Must contain the `{name}` placeholder; other placeholders are rejected at config-load time. |
 
