@@ -43,10 +43,13 @@ of them was asserted in this docstring and implemented nowhere):
   and is a deliberate departure from ``reflect``, which appends
   unconditionally at the top of the call — :func:`compile_tool`
   explains why compile cannot do the same.
-- **The gate and the engine share one fragment loader.** Both read the
-  vault through :func:`creek.vault.reader.iter_vault_fragments`, so the
-  two can never disagree about which files exist or which of them are
-  fragments (see :func:`_survey_sources`).
+- **The gate and the engine share one fragment *walk*.**
+  :func:`compile_tool` loads a
+  :class:`~creek.classify.privacy_filter.FragmentCorpus` once, per call,
+  and hands the same snapshot to the gate and to the engine, so the two
+  can never disagree about which files exist, which of them are fragments,
+  or what tier any of them carries — nor can a concurrent writer land
+  between them (#930; see :func:`_survey_sources`).
 
 **Idempotency semantics (audit-dedup only).** The wrapper fingerprints
 the target file after each compile and stamps the hash under
@@ -66,7 +69,7 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, cast
 
-from creek.classify.privacy_filter import ancestry_tiers
+from creek.classify.privacy_filter import FragmentCorpus, ancestry_tiers
 from creek.compile.engine import TARGET_KINDS, compile_to_vault
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import (
@@ -189,7 +192,7 @@ class _SourceGate(NamedTuple):
 
 
 def _survey_sources(
-    vault_path: Path, fragment_ids: list[str], ceiling: TierCeiling
+    corpus: FragmentCorpus, fragment_ids: list[str], ceiling: TierCeiling
 ) -> _SourceGate:
     """Survey the requested source fragments for an admission decision.
 
@@ -197,29 +200,44 @@ def _survey_sources(
     :class:`_SourceGate`, not a bool, so ``if _survey_sources(...)`` would be
     vacuously true; the caller must branch on ``.above_ceiling`` explicitly.
 
-    The vault is walked through
-    :func:`creek.vault.reader.iter_vault_fragments` — the exact function
-    :func:`creek.compile.engine._load_fragments_for_compile` calls — so the set
-    of files this gate inspects and the set the engine would compile are
-    identical *by construction*. A bespoke ``frontmatter.load`` walk would
-    diverge: :func:`creek.vault.reader.try_load_fragment` rejects files whose
-    ``type`` is not ``fragment`` and files that fail ``Fragment`` schema
-    validation, both of which a raw scan happily reads. That divergence would
-    create a class of file one side sees and the other does not — precisely the
-    bug class this gate exists to prevent. A file the shared loader skips
+    The gate ranks a :class:`~creek.classify.privacy_filter.FragmentCorpus`
+    — one snapshot of ``01-Fragments`` taken through
+    :func:`creek.vault.reader.iter_vault_fragments`, the exact function
+    :func:`creek.compile.engine._load_fragments_for_compile` uses — and
+    ``compile_tool`` hands that same object to the engine, so the set of
+    files this gate inspects and the set the engine compiles are identical
+    *by construction*. A bespoke ``frontmatter.load`` walk would diverge:
+    :func:`creek.vault.reader.try_load_fragment` rejects files whose ``type``
+    is not ``fragment`` and files that fail ``Fragment`` schema validation,
+    both of which a raw scan happily reads. That divergence would create a
+    class of file one side sees and the other does not — precisely the bug
+    class this gate exists to prevent. A file the shared loader skips
     (unreadable, non-fragment, schema-invalid) is invisible to gate and engine
     alike, and so fails closed to the engine's "not found".
 
-    That parity is by construction but not instantaneous: the gate walks the
-    vault, returns, and the engine then walks it again. A concurrent writer that
-    *raises* a fragment's tier inside that window (``creek classify``, the
-    ``creek.classify`` MCP tool, a text editor) would be **admitted** under the
-    pre-write tier. #962 closed the *routing* half of that window and only that
-    half: the engine now derives its routing tier from the fragments it has in
-    hand, so no window separates the tier a call is routed by from the bytes it
-    sends. The admission half above is unchanged — this walk still precedes the
-    engine's — and closing it still means handing the loaded fragments to the
-    engine, tracked as a follow-up along with eliminating the duplicated walk.
+    Since #930 that parity is also *instantaneous*, which it was not. The
+    gate used to walk the vault, return, and let the engine walk it again;
+    a concurrent writer that *raised* a fragment's tier inside that window
+    (``creek classify``, the ``creek.classify`` MCP tool, a text editor)
+    was **admitted** under the pre-write tier. #962 had closed the *routing*
+    half of that window — the engine derives its routing tier from the
+    fragments it has in hand — and one corpus for both halves closes the
+    admission half: there is no longer an interval between the bytes ranked
+    here and the bytes compiled, because they are the same bytes.
+
+    The counterpart, stated rather than hidden: the compiled page is now
+    written from bytes read at gate time, so *any* write landing between the
+    gate and the write is compiled in its pre-write form. For a tier *raise*
+    that is the safe direction — admission and content can no longer
+    disagree, which is the whole point. For a **deletion or a redaction** it
+    is not a safety win at all: bytes the author removed mid-compile are
+    still compiled into the page, exactly as they were when the gate ranked
+    them. That is a narrower window than the pre-#930 two-walk version, not a
+    closed one, and re-fetching here would not close it either — it would
+    only move the race and reopen the admission half. Callers who need a
+    deletion to take effect immediately must not have an in-flight compile;
+    the durable remedy is :mod:`creek.purge`, which cleans references under
+    ``02-Threads`` and ``03-Eddies`` after the fact.
 
     Admission is decided by :func:`creek_mcp.tier_ceiling.write_tier_allowed`
     rather than the :func:`~creek_mcp.tier_ceiling.tier_allowed` it delegates
@@ -233,7 +251,8 @@ def _survey_sources(
     would silently desync if ``ALL``'s semantics ever changed.
 
     Args:
-        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        corpus: The snapshot of ``<vault>/01-Fragments`` this call was
+            gated on, and the one the engine will compile from.
         fragment_ids: The ids the caller asked to compile. An id with no
             matching fragment in the vault is **not** a violation — it falls
             through to the engine's ``ValueError("Fragment(s) not found in
@@ -276,7 +295,7 @@ def _survey_sources(
     # never read the same file's tier two different ways. Compile takes the
     # ancestry-aware variant (#931) because compile — alone among the survey's
     # callers — renders an admitted fragment's ancestors into its prompt.
-    tiers = ancestry_tiers(vault_path, fragment_ids)
+    tiers = ancestry_tiers(corpus, fragment_ids)
     return _SourceGate(
         above_ceiling=any(not write_tier_allowed(tier, ceiling) for tier in tiers),
     )
@@ -352,9 +371,11 @@ def compile_tool(
     # It sits *below* the two argument-validation refusals above because
     # neither ordering leaks — those checks read only caller-supplied input and
     # touch no vault state, so they can answer nothing about the corpus. The
-    # tiebreaker is cost asymmetry: this gate is a full ``01-Fragments`` walk,
-    # so gating first would let any caller force a 35k-file parse with a
-    # syntactically invalid call.
+    # tiebreaker is cost asymmetry: the walk below is a full ``01-Fragments``
+    # parse, so loading first would let any caller force a 35k-file parse with
+    # a syntactically invalid call. Since #930 that walk is this function's own
+    # line rather than something the gate does on its way past, and it stays
+    # here, below the argument checks, for exactly that reason.
     #
     # It sits *above* everything that follows, because each of those steps
     # hands the source fragments somewhere the caller is not admitted to:
@@ -400,7 +421,13 @@ def compile_tool(
     # one field the log persists verbatim — is omitted, as are ``created_path``
     # and ``created_tier`` (nothing was created). ``target_title`` is omitted
     # too: caller free text, irrelevant to a refusal.
-    gate = _survey_sources(vault_path, fragment_ids, privacy_tier_ceiling)
+    # One walk per call, and the same one twice over (#930). The gate ranked
+    # this corpus and the engine compiles it below, so a concurrent tier-raise
+    # can no longer be admitted under its pre-write tier — there is no interval
+    # between the two reads to land in. It is loaded here and not inside the
+    # gate because the engine needs the same object; see ``_survey_sources``.
+    corpus = FragmentCorpus.load(vault_path / "01-Fragments")
+    gate = _survey_sources(corpus, fragment_ids, privacy_tier_ceiling)
     if gate.above_ceiling:
         MCPAuditLog(vault_path).append(
             tool=TOOL_NAME,
@@ -424,6 +451,7 @@ def compile_tool(
             target_kind=kind,
             target_id=target_id,
             target_title=target_title,
+            corpus=corpus,
             # The engine supplies the *content* tier, from the fragments it
             # loaded; this wrapper reconciles it against the ceiling the caller
             # declared, taking the more sensitive of the two. That

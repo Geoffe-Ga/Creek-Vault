@@ -35,7 +35,7 @@ from creek.audit import AuditLog
 from creek.care.guardrail import CARE_POLICY
 from creek.classify.privacy_filter import (
     AncestorIndex,
-    build_ancestor_index,
+    FragmentCorpus,
     fragment_tier,
     max_source_tier,
 )
@@ -393,6 +393,7 @@ def compile_to_vault(
     target_title: str,
     llm_factory: CompileLLMFactory,
     level_policy: LevelPolicy = "leaves",
+    corpus: FragmentCorpus | None = None,
 ) -> Path:
     """Compile *fragment_ids* into a compiled-layer page on disk.
 
@@ -424,6 +425,18 @@ def compile_to_vault(
             fragments. Passed through to :func:`compile_fragments`;
             defaults to ``"leaves"``. It deliberately does not narrow the
             routing tier; see :func:`_routing_tier_for`.
+        corpus: An already-walked snapshot of ``<vault>/01-Fragments`` to
+            compile from, or ``None`` to walk it here. Optional, and
+            keyword-only like everything else in this signature, because
+            the ``creek compile`` CLI has no gate above it and nothing to
+            share: it calls with no corpus and this function walks once,
+            exactly as before. ``creek_mcp.tools.compile`` does have a gate
+            above it, and passing the corpus that gate ranked is what
+            makes admission and compilation read the same bytes rather
+            than two walks a moment apart (#930). A corpus rooted anywhere
+            but this *vault_path*'s ``01-Fragments`` would compile one
+            vault's fragments into another's page, so callers pass the one
+            they gated with.
 
     Returns:
         The path of the written compiled-layer page.
@@ -442,7 +455,11 @@ def compile_to_vault(
             credential — propagates untouched for the same reason: the
             engine takes no view on how a client is built.
     """
-    pairs_with_raw, ancestors = _load_fragments_for_compile(vault_path, fragment_ids)
+    pairs_with_raw, ancestors = _load_fragments_for_compile(
+        vault_path,
+        fragment_ids,
+        corpus=corpus,
+    )
     tier = _routing_tier_for(pairs_with_raw, ancestors.chain_tiers(fragment_ids))
     llm = llm_factory(tier)
     target_path = _resolve_target_path(vault_path, target_kind, target_id)
@@ -687,6 +704,8 @@ def _render_body(title: str, claims: list[dict[str, object]]) -> str:
 def _load_fragments_for_compile(
     vault_path: Path,
     fragment_ids: list[str],
+    *,
+    corpus: FragmentCorpus | None = None,
 ) -> tuple[list[tuple[Fragment, str, dict[str, object]]], AncestorIndex]:
     """Load the requested fragments from the vault and preserve order.
 
@@ -713,9 +732,21 @@ def _load_fragments_for_compile(
     ``test_compile_to_vault_walks_the_vault_exactly_once`` pins the single
     walk so a future lane cannot quietly reintroduce the second one.
 
+    When *corpus* is ``None`` the walk happens here, through **this
+    module's** binding of :func:`creek.vault.reader.iter_vault_fragments`
+    rather than through :meth:`~creek.classify.privacy_filter.FragmentCorpus.load`,
+    which would move it onto ``privacy_filter``'s binding and quietly turn
+    that pin into a counter of zero — a test that passes for the wrong
+    reason. The snapshot is built around those records instead, so both
+    branches hand the rest of this function one corpus.
+
     Args:
         vault_path: Vault root; fragments are read from ``01-Fragments``.
         fragment_ids: The ids to load, in the order the caller wants them.
+        corpus: A snapshot a caller has already walked — the MCP wrapper's
+            admission gate ranked one and passes it, so gate and engine
+            compile the same bytes (#930) — or ``None`` to walk here, which
+            is the ``creek compile`` CLI path.
 
     Returns:
         A ``(triples, ancestor_index)`` pair: one ``(fragment, body, raw)``
@@ -725,21 +756,21 @@ def _load_fragments_for_compile(
     Raises:
         ValueError: If any requested id has no matching fragment.
     """
-    requested = fragment_ids.copy()
-    records = iter_vault_fragments(vault_path / "01-Fragments")
-    by_id: dict[str, tuple[Fragment, str, dict[str, object]]] = {
-        fragment.id: (fragment, body, raw)
-        for _path, fragment, body, raw in records
-        if fragment.id in requested
-    }
-    ancestors = build_ancestor_index(
-        (fragment, raw) for _path, fragment, _body, raw in records
+    fragments_root = vault_path / "01-Fragments"
+    loaded = (
+        corpus
+        if corpus is not None
+        else FragmentCorpus(
+            root=fragments_root,
+            records=tuple(iter_vault_fragments(fragments_root)),
+        )
     )
-    missing = [fid for fid in requested if fid not in by_id]
+    by_id = loaded.by_id
+    missing = [fid for fid in fragment_ids if fid not in by_id]
     if missing:
         msg = f"Fragment(s) not found in vault: {', '.join(missing)}"
         raise ValueError(msg)
-    return [by_id[fid] for fid in requested], ancestors
+    return [by_id[fid] for fid in fragment_ids], loaded.ancestors
 
 
 def _resolve_target_path(
