@@ -5,10 +5,23 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
+
+from creek_mcp.provisioning.inventory import (
+    InventorySnapshot,
+    ProviderResource,
+    ProviderResourceClass,
+)
 
 if TYPE_CHECKING:
     from creek_mcp.provisioning.models import FailureReason, ProvisioningJob
+
+_FAKE_RESOURCE_CLASSES: Final[tuple[ProviderResourceClass, ...]] = (
+    ProviderResourceClass.APP,
+    ProviderResourceClass.MACHINE,
+    ProviderResourceClass.VOLUME,
+)
+"""What one fake allocation consists of, mirroring Decision 3's one-of-each."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +90,7 @@ class FakeProviderDriver:
         self._allocations: dict[str, ProviderAllocation] = {}
         self._failures: list[ProviderError] = []
         self._deleted: set[str] = set()
+        self._orphans: set[str] = set()
         self._delete_count = 0
         self.last_failure: ProviderError | None = None
 
@@ -128,6 +142,46 @@ class FakeProviderDriver:
                 return
             self._deleted.add(job.job_id)
             self._delete_count += 1
+
+    def adopt_orphan(self, provider_allocation_id: str) -> None:
+        """Plant provider state the durable store has never recorded (#1769).
+
+        Fleet reconciliation's hardest case is a resource the control plane
+        cannot name — a create that billed before its row was written, or a
+        delete that half-succeeded. A store-free seam is the only way to build
+        that arrangement without corrupting the store to fake it.
+        """
+        with self._lock:
+            self._orphans.add(provider_allocation_id)
+
+    def list_resources(self) -> InventorySnapshot:
+        """Enumerate every allocation this fake account still bills for.
+
+        Satisfies :class:`~creek_mcp.provisioning.inventory.ProviderInventory`.
+        Read-only by construction: it mutates nothing, so a reconciliation pass
+        driven by this fake cannot repair anything either. The fake account is
+        always fully readable, so the snapshot is always complete.
+        """
+        with self._lock:
+            live = {
+                allocation.allocation_id
+                for job_id, allocation in self._allocations.items()
+                if job_id not in self._deleted
+            }
+            surrogates = sorted(live | self._orphans)
+        return InventorySnapshot(
+            resources=tuple(
+                ProviderResource(
+                    resource_class=resource_class,
+                    provider_id=f"{surrogate}-{resource_class.value}",
+                    provider_allocation_id=surrogate,
+                    state="stopped",
+                )
+                for surrogate in surrogates
+                for resource_class in _FAKE_RESOURCE_CLASSES
+            ),
+            complete=True,
+        )
 
 
 class FakeOneTimeHandoff:

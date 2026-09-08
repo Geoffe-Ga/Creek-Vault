@@ -24,6 +24,7 @@ from creek_mcp.provisioning.models import (
     FailureReason,
     JobOperation,
     JobState,
+    OperatorAllocationView,
     ProvisioningAllocation,
     ProvisioningJob,
 )
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
-_SCHEMA_VERSION: Final[int] = 3
+_SCHEMA_VERSION: Final[int] = 4
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
 MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS provisioning_jobs (
     lease_token TEXT,
     lease_expires_at TEXT,
     attested_confidential INTEGER,
+    delete_requested_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK (state IN (
@@ -163,19 +165,46 @@ class ProvisioningStore:
     """Own durable idempotency, state transitions, and worker leases in SQLite."""
 
     def __init__(self, database: Path) -> None:
-        """Initialize *database* and its uniqueness constraints idempotently."""
+        """Initialize *database* and its uniqueness constraints idempotently.
+
+        Three phases, and the middle one is a transaction on purpose. Table and
+        trigger creation are ``IF NOT EXISTS`` and re-run harmlessly on every
+        open, so they self-heal after a crash. The migration does not: it
+        rewrites existing rows, and a crash between an ALTER and its backfill
+        would strand them. So the ALTER, the backfill and the version stamp
+        commit together — the stamp is what tells the next open the backfill is
+        done, and it must never land without it. ``sqlite3.executescript``
+        commits any open transaction before running, so the schema and index
+        scripts stay outside that fence rather than silently breaking it.
+        """
         self._database = database.resolve()
         self._database.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
+        with self._connect(write=True) as connection:
             self._migrate_schema(connection)
+            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        with self._connect() as connection:
             self._install_requester_guards(connection)
             connection.executescript(_OWNERSHIP_INDEXES)
-            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @staticmethod
     def _migrate_schema(connection: sqlite3.Connection) -> None:
-        """Upgrade pre-v3 databases without weakening their ownership boundary."""
+        """Upgrade an older database without weakening its ownership boundary.
+
+        Column additions are gated on the column being absent, because an ALTER
+        cannot be repeated. Backfills are gated on ``PRAGMA user_version``
+        instead, and the difference is what makes a half-applied upgrade heal.
+        Gating a backfill on column absence makes a crash between the ALTER and
+        the UPDATE permanent: the column exists forever after, so the backfill
+        can never run again and every pre-existing row keeps its NULL. The
+        version stamp is written by the caller inside this same transaction, so
+        a crash leaves it at the old value and the next open finishes the job.
+        Every backfill is additionally written to be idempotent, so re-running
+        one after a rollback costs nothing.
+        """
+        version_row = connection.execute("PRAGMA user_version").fetchone()
+        version = 0 if version_row is None else int(version_row[0])
         table_columns = {
             table: {
                 str(row[1])
@@ -193,6 +222,20 @@ class ProvisioningStore:
                 "ADD COLUMN attested_confidential INTEGER "
                 "CHECK (attested_confidential IS NULL "
                 "OR attested_confidential IN (0, 1))"
+            )
+        if "delete_requested_at" not in table_columns["provisioning_jobs"]:
+            connection.execute(
+                "ALTER TABLE provisioning_jobs ADD COLUMN delete_requested_at TEXT"
+            )
+        if version < _SCHEMA_VERSION:
+            # Backfill from updated_at rather than leaving NULL: a delete that
+            # was already stuck when this column landed must not become
+            # invisible to reconciliation because of the upgrade itself. Gated
+            # on the version rather than on the ALTER above, so a crash between
+            # the two is repaired on the next open instead of made permanent.
+            connection.execute(
+                "UPDATE provisioning_jobs SET delete_requested_at = updated_at "
+                "WHERE operation = 'delete' AND delete_requested_at IS NULL"
             )
         for table, migration in _REQUESTER_MIGRATIONS.items():
             if "requester_identity" not in table_columns[table]:
@@ -497,15 +540,26 @@ class ProvisioningStore:
             row = self._owned_job(connection, job_id, requester_identity)
             if row["state"] in {JobState.DELETING.value, JobState.DELETED.value}:
                 return self._from_row(row)
+            # delete_requested_at is the only clock reconciliation can trust:
+            # updated_at is rewritten by every claim_next lease and by every
+            # _settle_claim, so a delete that hangs, loses its lease and is
+            # re-claimed would keep pushing its own staleness deadline forward
+            # and never age past the window. COALESCE is what makes the column
+            # write-once, and that is deliberately not left to the early return
+            # above: it only covers 'deleting' and 'deleted', so a delete
+            # parked at 'failed' reaches this line again and must not restart
+            # its own clock. Every other site setting operation='delete'
+            # stamps it the same way.
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                 "retry_count = 0, retryable = 0, failure_reason = NULL, "
-                "attested_confidential = NULL, "
-                "lease_token = NULL, "
+                "attested_confidential = NULL, lease_token = NULL, "
+                "delete_requested_at = COALESCE(delete_requested_at, ?), "
                 "lease_expires_at = NULL, updated_at = ? WHERE job_id = ?",
                 (
                     JobState.DELETING.value,
                     JobOperation.DELETE.value,
+                    _timestamp(instant),
                     _timestamp(instant),
                     job_id,
                 ),
@@ -588,14 +642,18 @@ class ProvisioningStore:
             if job_row["state"] != JobState.AWAITING_KEY_CEREMONY.value:
                 raise CeremonyUnavailableError("key ceremony is unavailable")
             if instant >= datetime.fromisoformat(str(ceremony["expires_at"])):
+                # This transition queues a teardown, so it dates one; see
+                # request_delete for why updated_at cannot be that clock.
                 connection.execute(
                     "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                     "retry_count = 0, retryable = 0, failure_reason = NULL, "
                     "attested_confidential = NULL, lease_token = NULL, "
+                    "delete_requested_at = COALESCE(delete_requested_at, ?), "
                     "lease_expires_at = NULL, updated_at = ? WHERE job_id = ?",
                     (
                         JobState.DELETING.value,
                         JobOperation.DELETE.value,
+                        _timestamp(instant),
                         _timestamp(instant),
                         job_id,
                     ),
@@ -629,13 +687,24 @@ class ProvisioningStore:
         return completed
 
     def expire_key_ceremonies(self, *, now: datetime | None = None) -> int:
-        """Idempotently queue teardown for every incomplete expired ceremony."""
+        """Idempotently queue teardown for every incomplete expired ceremony.
+
+        This is the *unattended* teardown path: it runs on every worker tick,
+        for a consumer who never came back, by which point the Machine, the
+        encrypted volume and the allocation row all exist. It therefore dates
+        the teardown it queues, exactly as request_delete does. A row left with
+        a NULL clock would fall back onto updated_at, which every re-claim
+        resets, and neither of reconciliation's other detectors can cover it:
+        _missing skips delete operations and _orphans cannot fire while the
+        allocation row is live.
+        """
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
             cursor = connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                 "retry_count = 0, retryable = 0, failure_reason = NULL, "
                 "attested_confidential = NULL, lease_token = NULL, "
+                "delete_requested_at = COALESCE(delete_requested_at, ?), "
                 "lease_expires_at = NULL, updated_at = ? "
                 "WHERE state = ? AND job_id IN ("
                 "SELECT job_id FROM provisioning_key_ceremonies "
@@ -643,6 +712,7 @@ class ProvisioningStore:
                 (
                     JobState.DELETING.value,
                     JobOperation.DELETE.value,
+                    _timestamp(instant),
                     _timestamp(instant),
                     JobState.AWAITING_KEY_CEREMONY.value,
                     _timestamp(instant),
@@ -713,6 +783,110 @@ class ProvisioningStore:
             row = connection.execute(query).fetchone()
         assert row is not None
         return int(row[0])
+
+    # ------------------------------------------------------------------
+    # Operator-scoped fleet queries (#1769).
+    #
+    # These two are DELIBERATELY not fenced by requester_identity, in the same
+    # style as claim_next above. Fleet reconciliation runs for the operator who
+    # pays the provider invoice, not for a consumer: a requester fence would
+    # hide precisely the divergences it exists to find, because an orphaned
+    # resource has no owning requester left to ask on its behalf. Both are
+    # read-only, neither selects canonical_activation_id, and _owned_job
+    # remains the only path every consumer-facing method takes.
+    # ------------------------------------------------------------------
+
+    _OPERATOR_COLUMNS: Final[str] = (
+        "SELECT provisioning_allocations.provider_allocation_id, "
+        "provisioning_allocations.job_id, "
+        "provisioning_allocations.consumer_identity, "
+        "provisioning_jobs.state, provisioning_jobs.operation, "
+        "provisioning_jobs.updated_at, provisioning_jobs.delete_requested_at "
+        "FROM provisioning_allocations JOIN provisioning_jobs USING (job_id) "
+    )
+
+    def live_allocations(self) -> list[OperatorAllocationView]:
+        """Return every allocation the provider should still be billing for."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                self._OPERATOR_COLUMNS
+                + "WHERE provisioning_allocations.deleted_at IS NULL "
+                "ORDER BY provisioning_allocations.provider_allocation_id"
+            ).fetchall()
+        return [self._operator_view(row) for row in rows]
+
+    def unconfirmed_deletions(
+        self,
+        older_than: timedelta,
+        *,
+        now: datetime | None = None,
+    ) -> list[OperatorAllocationView]:
+        """Return deletions the provider has not confirmed within *older_than*.
+
+        Staleness is measured from ``delete_requested_at``. ``updated_at``
+        cannot serve as that clock: every
+        ``claim_next`` lease and every ``_settle_claim`` rewrites it, so a
+        delete that hangs and is re-claimed pushes its own deadline forward
+        indefinitely and never ages past the window — while the Machine it
+        already destroyed removes the ``_missing`` backstop, leaving a billing
+        volume nothing can see.
+
+        All three transitions into ``operation='delete'`` stamp that column
+        through ``COALESCE(delete_requested_at, ?)`` — ``request_delete``, the
+        expired branch of ``complete_key_ceremony``, and
+        ``expire_key_ceremonies``. The last two are the *unattended* path,
+        taken for a consumer who never completed the ceremony and whose
+        provider resources already exist, so they matter most. Write-once is
+        therefore an SQL invariant rather than an argument about which states
+        reach which line.
+
+        A row whose clock is somehow still NULL — a v3 database whose upgrade
+        has not yet run — falls back to ``updated_at`` through COALESCE. That
+        is the weaker clock, but a weak clock reports a stuck delete late; a
+        NULL would never report it at all.
+
+        The predicate covers state ``failed`` as well as ``deleting``, and that
+        arm is load-bearing rather than defensive. ``record_failure`` settles
+        through ``_settle_claim(state=FAILED)``, which never reaches the branch
+        that sets ``deleted_at``; ``_release_expired_claims`` only rescues rows
+        still holding an expired lease, and ``retry`` is requester-fenced.
+        A delete
+        whose provider call raised therefore parks forever at
+        ``state='failed'`` with a live allocation row — a Fly bill nobody is
+        watching, which is exactly what ADR-0013 Decision 6 forbids.
+        """
+        if older_than < timedelta(0):
+            raise ValueError("older_than must not be negative")
+        threshold = _timestamp((now or _utc_now()) - older_than)
+        with self._connect() as connection:
+            rows = connection.execute(
+                self._OPERATOR_COLUMNS
+                + "WHERE provisioning_allocations.deleted_at IS NULL "
+                "AND provisioning_jobs.operation = ? "
+                "AND provisioning_jobs.state IN (?, ?) "
+                "AND COALESCE(provisioning_jobs.delete_requested_at, "
+                "provisioning_jobs.updated_at) <= ? "
+                "ORDER BY provisioning_allocations.provider_allocation_id",
+                (
+                    JobOperation.DELETE.value,
+                    JobState.DELETING.value,
+                    JobState.FAILED.value,
+                    threshold,
+                ),
+            ).fetchall()
+        return [self._operator_view(row) for row in rows]
+
+    @staticmethod
+    def _operator_view(row: sqlite3.Row) -> OperatorAllocationView:
+        """Convert one operator-scoped row into its content-free projection."""
+        return OperatorAllocationView(
+            provider_allocation_id=str(row["provider_allocation_id"]),
+            job_id=str(row["job_id"]),
+            consumer_identity=str(row["consumer_identity"]),
+            state=JobState(str(row["state"])),
+            operation=JobOperation(str(row["operation"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
 
     @staticmethod
     def _release_expired_claims(connection: sqlite3.Connection, stamp: str) -> None:

@@ -15,17 +15,23 @@ import os
 import re
 import stat
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Any, Final, Never, Protocol, cast
 
 import httpx
 
 from creek_mcp.provisioning.driver import ProviderAllocation, ProviderError
+from creek_mcp.provisioning.inventory import (
+    InventorySnapshot,
+    MetricQuality,
+    ProviderResource,
+    ProviderResourceClass,
+)
 from creek_mcp.provisioning.models import FailureReason
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
-    from datetime import datetime
     from pathlib import Path
 
     from creek_mcp.provisioning.models import ProvisioningJob
@@ -44,6 +50,10 @@ _VAULT_MOUNT: Final[str] = "/vault"
 _FLY_ABSENT_STATUS: Final[int] = 404
 """Fly's upstream resource-absence response; never exposed on Creek's wire."""
 _IMMUTABLE_IMAGE_RE: Final[re.Pattern[str]] = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
+_UNREPORTED_STATE: Final[str] = "unknown"
+"""Placeholder for a resource class whose state Fly's listing omits."""
+_TERMINAL_STATES: Final[frozenset[str]] = frozenset({"destroyed"})
+"""Provider states that stop the meter, mirroring _matching_volumes' rule."""
 
 
 @unique
@@ -302,6 +312,197 @@ class FlyProviderDriver:
         )
         if self._app_exists(reference):
             self._unavailable("Fly app deletion has not converged")
+
+    def list_resources(self) -> InventorySnapshot:
+        """Enumerate every Creek-owned Fly resource this organization is billed for.
+
+        Satisfies :class:`~creek_mcp.provisioning.inventory.ProviderInventory`.
+        The call is strictly read-only: it issues GETs and nothing else, so a
+        reconciliation pass can never start, stop or destroy anything.
+
+        Attribution runs by *string suffix* off the app name, because
+        :meth:`_reference` derives that name as ``sha256(activation_id)[:24]``
+        and a digest cannot be inverted. The Machine metadata Creek writes does
+        carry the plaintext activation id, and this method deliberately never
+        reads it: doing so would put the preimage into every report.
+
+        A provider failure part-way through does not discard what was already
+        observed. One app that rate-limits costs that app's resources and sets
+        ``complete`` to False; every other app stays in the snapshot, so an
+        orphan seen before the failure is still reported. Only a failure of the
+        org listing itself yields nothing, because then nothing was seen.
+        """
+        try:
+            app_names = self._org_app_names()
+        except ProviderError:
+            return InventorySnapshot(resources=(), complete=False)
+        resources: list[ProviderResource] = []
+        complete = True
+        for app_name in app_names:
+            try:
+                resources.extend(self._app_resources(app_name))
+            except ProviderError:
+                complete = False
+        return InventorySnapshot(resources=tuple(resources), complete=complete)
+
+    def _org_app_names(self) -> list[str]:
+        """Return the organization's app names carrying Creek's allocation prefix."""
+        response = self._request(
+            "GET",
+            "/v1/apps",
+            expected=(200,),
+            params={"org_slug": self._policy.organization},
+        )
+        listing = self._object(response, "Fly app list")
+        apps = listing.get("apps")
+        if not isinstance(apps, list):
+            self._unavailable("Fly app list response was invalid")
+        prefix = f"{self._policy.app_prefix}-"
+        names = [
+            str(app.get("name", ""))
+            for app in cast("list[object]", apps)
+            if isinstance(app, dict)
+        ]
+        return sorted(name for name in names if name.startswith(prefix))
+
+    def _app_resources(self, app_name: str) -> list[ProviderResource]:
+        """Return every billable resource observed underneath one Creek app."""
+        allocation_id = self._allocation_id_for(app_name)
+        resources = [
+            ProviderResource(
+                resource_class=ProviderResourceClass.APP,
+                provider_id=app_name,
+                provider_allocation_id=allocation_id,
+                state=_UNREPORTED_STATE,
+            )
+        ]
+        machines = self._objects(
+            self._request("GET", f"/v1/apps/{app_name}/machines", expected=(200,)),
+            "Fly Machine list",
+        )
+        resources.extend(
+            self._machine_resource(machine, allocation_id)
+            for machine in machines
+            if not self._is_terminal(machine)
+        )
+        volumes = self._objects(
+            self._request("GET", f"/v1/apps/{app_name}/volumes", expected=(200,)),
+            "Fly volume list",
+        )
+        for volume in volumes:
+            if self._is_terminal(volume):
+                continue
+            resources.append(self._volume_resource(volume, allocation_id))
+            resources.extend(self._volume_snapshots(app_name, volume, allocation_id))
+        return resources
+
+    @staticmethod
+    def _is_terminal(resource: Mapping[str, Any]) -> bool:
+        """Return whether Fly has stopped billing for *resource*.
+
+        Fly's own disk-restore flow — destroy the volume, create a replacement
+        from a snapshot — leaves the destroyed row in the listing beside the
+        live one. Counting both raises a duplicate-cost divergence against a
+        fleet costing exactly what it should, so the module applies the same
+        rule ``_matching_volumes`` already applies at provision time. A Machine
+        still ``destroying`` is deliberately not terminal: it is still billing.
+        """
+        return str(resource.get("state", "")) in _TERMINAL_STATES
+
+    def _allocation_id_for(self, app_name: str) -> str:
+        """Derive the allocation surrogate by suffix, never by inverting a digest."""
+        return f"fly-{app_name.removeprefix(f'{self._policy.app_prefix}-')}"
+
+    def _volume_snapshots(
+        self,
+        app_name: str,
+        volume: Mapping[str, Any],
+        allocation_id: str,
+    ) -> list[ProviderResource]:
+        """Enumerate one volume's snapshots, which Fly bills separately from it."""
+        volume_id = self._identifier(volume, "volume")
+        response = self._request(
+            "GET",
+            f"/v1/apps/{app_name}/volumes/{volume_id}/snapshots",
+            expected=(200,),
+        )
+        return [
+            ProviderResource(
+                resource_class=ProviderResourceClass.SNAPSHOT,
+                provider_id=self._identifier(snapshot, "volume snapshot"),
+                provider_allocation_id=allocation_id,
+                state=str(snapshot.get("status", _UNREPORTED_STATE)),
+                size_bytes=self._optional_int(snapshot.get("size")),
+            )
+            for snapshot in self._objects(response, "Fly snapshot list")
+        ]
+
+    @staticmethod
+    def _machine_resource(
+        machine: Mapping[str, Any],
+        allocation_id: str,
+    ) -> ProviderResource:
+        """Record one Machine without reading its plaintext activation metadata."""
+        last_modified = FlyProviderDriver._optional_instant(machine.get("updated_at"))
+        return ProviderResource(
+            resource_class=ProviderResourceClass.MACHINE,
+            provider_id=FlyProviderDriver._identifier(machine, "Machine"),
+            provider_allocation_id=allocation_id,
+            state=str(machine.get("state", _UNREPORTED_STATE)),
+            region=FlyProviderDriver._optional_text(machine.get("region")),
+            last_modified_at=last_modified,
+            last_modified_quality=(
+                MetricQuality.UNAVAILABLE
+                if last_modified is None
+                else MetricQuality.EXACT
+            ),
+        )
+
+    @staticmethod
+    def _volume_resource(
+        volume: Mapping[str, Any],
+        allocation_id: str,
+    ) -> ProviderResource:
+        """Record one volume's billable size without naming its activation."""
+        return ProviderResource(
+            resource_class=ProviderResourceClass.VOLUME,
+            provider_id=FlyProviderDriver._identifier(volume, "volume"),
+            provider_allocation_id=allocation_id,
+            state=str(volume.get("state", _UNREPORTED_STATE)),
+            region=FlyProviderDriver._optional_text(volume.get("region")),
+            size_gb=FlyProviderDriver._optional_int(volume.get("size_gb")),
+        )
+
+    @staticmethod
+    def _optional_text(value: object) -> str | None:
+        """Return one non-empty provider string, or None when it is absent."""
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _optional_int(value: object) -> int | None:
+        """Return one provider integer, rejecting the bool that subclasses it."""
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @staticmethod
+    def _optional_instant(value: object) -> datetime | None:
+        """Return one offset-bearing ``updated_at``, or None when Fly reports none.
+
+        An offsetless timestamp counts as absent rather than being anchored to
+        a zone. Fly documents RFC 3339 with an offset, so a naive value is a
+        malformed response, and picking a zone for it would put an instant
+        wrong by whole hours into an operator's report — the same class of
+        defect ``creek.time``'s anchor guard exists to prevent (#1115). A
+        divergence Creek is unsure of is not reported; it is never invented.
+        """
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed
 
     def _ensure_app(self, reference: _AllocationRef) -> Mapping[str, Any]:
         response = self._request(
@@ -572,13 +773,16 @@ class FlyProviderDriver:
         *,
         expected: Sequence[int],
         payload: Mapping[str, Any] | None = None,
+        params: Mapping[str, str] | None = None,
     ) -> httpx.Response:
         headers = {"Authorization": f"Bearer {self._credential.token}"}
         try:
-            response = (
-                self._client.request(method, path, headers=headers)
-                if payload is None
-                else self._client.request(method, path, headers=headers, json=payload)
+            response = self._client.request(
+                method,
+                path,
+                headers=headers,
+                params=params,
+                json=payload,
             )
         except httpx.HTTPError as exc:
             raise ProviderError(

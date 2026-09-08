@@ -79,3 +79,22 @@ class ClaimedJob:
     job: ProvisioningJob
     lease_token: str
     provider_allocation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorAllocationView:
+    """One requester-agnostic allocation fact, for fleet reconciliation (#1769).
+
+    Deliberately narrower than :class:`ProvisioningAllocation`: it carries the
+    provider surrogate but **not** ``canonical_activation_id``. Fleet
+    reconciliation compares surrogates against provider names, so the plaintext
+    activation id is never needed — and a field that is never selected cannot
+    leak into a report, an alert or an audit record.
+    """
+
+    provider_allocation_id: str
+    job_id: str
+    consumer_identity: str
+    state: JobState
+    operation: JobOperation
+    updated_at: datetime
