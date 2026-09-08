@@ -125,4 +125,4 @@ def test_reconciler_reports_a_provider_app_with_no_live_allocation_record(
     assert _LIVE_ACTIVATION not in rendered
     assert _ORPHAN_ACTIVATION not in rendered
     assert second == first
-    assert {method for method, _, _ in api.requests[baseline:]} == {"GET"}
+    assert {method for method, _ in api.requests[baseline:]} == {"GET"}

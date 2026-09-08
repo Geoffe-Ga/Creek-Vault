@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import httpx
 import pytest
 
 from creek_mcp.provisioning.driver import FakeOneTimeHandoff, ProviderError
@@ -18,253 +15,51 @@ from creek_mcp.provisioning.fly import (
     FlyCredentialScope,
     FlyProviderDriver,
     FlyProviderPolicy,
-    FlyRuntimeSecrets,
 )
-from creek_mcp.provisioning.models import JobOperation, JobState, ProvisioningJob
 from creek_mcp.provisioning.store import ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
+
+# The double and its canaries moved to tests/fly_api_support.py so fleet
+# reconciliation (#1769) drives the same Fly fake rather than a second copy.
+# They are re-bound to this module's original private spellings so that every
+# assertion below stays byte-identical to the pre-move revision (#1769).
+from tests.fly_api_support import (
+    CONSUMER_TOKEN as _CONSUMER_TOKEN,
+)
+from tests.fly_api_support import (
+    NOW as _NOW,
+)
+from tests.fly_api_support import (
+    PROVIDER_TOKEN as _PROVIDER_TOKEN,
+)
+from tests.fly_api_support import (
+    TLS_KEY as _TLS_KEY,
+)
+from tests.fly_api_support import (
+    FakeFlyAPI as _FakeFlyAPI,
+)
+from tests.fly_api_support import (
+    FakeSecretManager as _FakeSecretManager,
+)
+from tests.fly_api_support import (
+    build_driver as _driver,
+)
+from tests.fly_api_support import (
+    build_job as _job,
+)
+from tests.fly_api_support import (
+    only_app as _only_app,
+)
+from tests.fly_api_support import (
+    only_machine as _only_machine,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-_NOW = datetime(2026, 9, 7, 4, tzinfo=UTC)
-_PROVIDER_TOKEN = "fly-provider-secret-canary"
-_CONSUMER_TOKEN = "creek-consumer-secret-canary"
-_TLS_KEY = "tls-private-key-secret-canary"
 _RUNBOOK = (
     Path(__file__).resolve().parents[1] / "docs" / "provisioning-control-plane.md"
 )
-
-
-@dataclass
-class _FakeSecretManager:
-    """Return stable per-activation runtime secrets and record revocation."""
-
-    revoked: set[str]
-
-    def issue(self, activation_id: str, consumer_identity: str) -> FlyRuntimeSecrets:
-        """Return the same secret bundle on every retry."""
-        del activation_id
-        return FlyRuntimeSecrets(
-            consumer_credential=_CONSUMER_TOKEN,
-            consumer_registry=f"{consumer_identity}={_CONSUMER_TOKEN}\n".encode(),
-            tls_certificate=b"test-certificate",
-            tls_private_key=_TLS_KEY.encode(),
-        )
-
-    def revoke(self, activation_id: str) -> None:
-        """Record an idempotent revocation."""
-        self.revoked.add(activation_id)
-
-
-class _FakeFlyAPI:
-    """Stateful HTTP fake for the documented Fly Machines endpoints."""
-
-    def __init__(self) -> None:
-        self.apps: dict[str, dict[str, Any]] = {}
-        self.volumes: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
-        self.machines: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
-        self.requests: list[tuple[str, str]] = []
-        self.failures: dict[tuple[str, str], int] = {}
-        self.failure_body = "provider unavailable"
-
-    def fail_once(self, method: str, path_suffix: str) -> None:
-        """Return one 503 for a matching method and path suffix."""
-        self.failures[(method, path_suffix)] = 1
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        """Serve one authenticated request without a real network."""
-        assert request.headers["Authorization"] == f"Bearer {_PROVIDER_TOKEN}"
-        method = request.method
-        path = request.url.path
-        self.requests.append((method, path))
-        for key, remaining in self.failures.items():
-            if remaining and method == key[0] and path.endswith(key[1]):
-                self.failures[key] = remaining - 1
-                return httpx.Response(503, text=self.failure_body, request=request)
-        segments = path.strip("/").split("/")
-        if segments == ["v1", "apps"] and method == "POST":
-            return self._create_app(request)
-        if len(segments) >= 3 and segments[:2] == ["v1", "apps"]:
-            return self._app_request(request, segments[2:])
-        return httpx.Response(404, request=request)
-
-    def _create_app(self, request: httpx.Request) -> httpx.Response:
-        body = self._json(request)
-        app_name = str(body["app_name"])
-        if app_name in self.apps:
-            return httpx.Response(422, request=request)
-        self.apps[app_name] = {
-            "id": f"app-{len(self.apps) + 1}",
-            "name": app_name,
-            "organization": {"slug": body["org_slug"]},
-            "network": body["network"],
-        }
-        return httpx.Response(201, json=self.apps[app_name], request=request)
-
-    def _app_request(
-        self,
-        request: httpx.Request,
-        segments: list[str],
-    ) -> httpx.Response:
-        app_name = segments[0]
-        if len(segments) == 1:
-            return self._app_resource(request, app_name)
-        if app_name not in self.apps:
-            return httpx.Response(404, request=request)
-        if segments[1] == "volumes":
-            return self._volume_request(request, app_name, segments[2:])
-        if segments[1] == "machines":
-            return self._machine_request(request, app_name, segments[2:])
-        return httpx.Response(404, request=request)
-
-    def _app_resource(self, request: httpx.Request, app_name: str) -> httpx.Response:
-        if request.method == "GET":
-            app = self.apps.get(app_name)
-            return httpx.Response(
-                404 if app is None else 200,
-                json=None if app is None else app,
-                request=request,
-            )
-        if request.method == "DELETE":
-            if app_name not in self.apps:
-                return httpx.Response(404, request=request)
-            if self.volumes[app_name] or self.machines[app_name]:
-                return httpx.Response(409, request=request)
-            del self.apps[app_name]
-            return httpx.Response(202, request=request)
-        return httpx.Response(405, request=request)
-
-    def _volume_request(
-        self,
-        request: httpx.Request,
-        app_name: str,
-        segments: list[str],
-    ) -> httpx.Response:
-        if not segments and request.method == "GET":
-            return httpx.Response(200, json=self.volumes[app_name], request=request)
-        if not segments and request.method == "POST":
-            body = self._json(request)
-            volume = {
-                "id": f"vol-{len(self.volumes[app_name]) + 1}",
-                "name": body["name"],
-                "region": body["region"],
-                "size_gb": body["size_gb"],
-                "encrypted": body["encrypted"],
-                "state": "created",
-            }
-            self.volumes[app_name].append(volume)
-            return httpx.Response(200, json=volume, request=request)
-        if len(segments) == 1 and request.method == "DELETE":
-            volume_id = segments[0]
-            before = len(self.volumes[app_name])
-            self.volumes[app_name] = [
-                volume for volume in self.volumes[app_name] if volume["id"] != volume_id
-            ]
-            status = 200 if len(self.volumes[app_name]) < before else 404
-            return httpx.Response(status, request=request)
-        return httpx.Response(404, request=request)
-
-    def _machine_request(
-        self,
-        request: httpx.Request,
-        app_name: str,
-        segments: list[str],
-    ) -> httpx.Response:
-        if not segments and request.method == "GET":
-            return httpx.Response(200, json=self.machines[app_name], request=request)
-        if not segments and request.method == "POST":
-            body = self._json(request)
-            machine = {
-                "id": f"machine-{len(self.machines[app_name]) + 1}",
-                "name": body["name"],
-                "region": body["region"],
-                "state": "stopped" if body["skip_launch"] else "started",
-                "config": body["config"],
-            }
-            self.machines[app_name].append(machine)
-            return httpx.Response(200, json=machine, request=request)
-        if not segments:
-            return httpx.Response(404, request=request)
-        matched_machine: dict[str, Any] | None = None
-        for candidate in self.machines[app_name]:
-            if candidate["id"] == segments[0]:
-                matched_machine = candidate
-                break
-        if matched_machine is None:
-            return httpx.Response(404, request=request)
-        if len(segments) == 2 and request.method == "POST":
-            if segments[1] == "start":
-                matched_machine["state"] = "started"
-            elif segments[1] == "stop":
-                matched_machine["state"] = "stopped"
-            else:
-                return httpx.Response(404, request=request)
-            return httpx.Response(200, json=matched_machine, request=request)
-        if len(segments) == 1 and request.method == "DELETE":
-            self.machines[app_name].remove(matched_machine)
-            return httpx.Response(200, request=request)
-        return httpx.Response(404, request=request)
-
-    @staticmethod
-    def _json(request: httpx.Request) -> dict[str, Any]:
-        """Decode a fake request body."""
-        import json
-
-        value = json.loads(request.content)
-        assert isinstance(value, dict)
-        return value
-
-
-def _job(activation_id: str = "activation-fly-001") -> ProvisioningJob:
-    return ProvisioningJob(
-        job_id="job-fly-001",
-        activation_id=activation_id,
-        requester_identity="adepthood",
-        consumer_identity="adepthood-user-001",
-        state=JobState.PROVISIONING,
-        operation=JobOperation.CREATE,
-        attempts=1,
-        retryable=False,
-        failure_reason=None,
-        created_at=_NOW,
-        updated_at=_NOW,
-    )
-
-
-def _driver(
-    api: _FakeFlyAPI,
-    secrets: _FakeSecretManager | None = None,
-) -> FlyProviderDriver:
-    credential = FlyCredential(
-        token=_PROVIDER_TOKEN,
-        organization="creek-vaults",
-        scope=FlyCredentialScope.ORG_DEPLOY,
-        expires_at=_NOW + timedelta(days=7),
-    )
-    policy = FlyProviderPolicy(
-        organization="creek-vaults",
-        image="registry.example/creek@sha256:" + "a" * 64,
-        api_base_url="https://fly.test",
-    )
-    client = httpx.Client(
-        base_url=policy.api_base_url,
-        transport=httpx.MockTransport(api.handle),
-    )
-    return FlyProviderDriver(
-        policy, credential, secrets or _FakeSecretManager(set()), client
-    )
-
-
-def _only_app(api: _FakeFlyAPI) -> str:
-    assert len(api.apps) == 1
-    return next(iter(api.apps))
-
-
-def _only_machine(api: _FakeFlyAPI) -> dict[str, Any]:
-    machines = api.machines[_only_app(api)]
-    assert len(machines) == 1
-    return machines[0]
 
 
 def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None:
