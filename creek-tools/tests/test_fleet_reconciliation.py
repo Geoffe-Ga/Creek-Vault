@@ -26,12 +26,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import httpx
 import pytest
 
 from creek_mcp.provisioning.driver import (
     FakeOneTimeHandoff,
     FakeProviderDriver,
     ProviderDriver,
+    ProviderError,
 )
 from creek_mcp.provisioning.inventory import (
     ProviderInventory,
@@ -489,3 +491,68 @@ def test_a_negative_unconfirmed_window_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="older_than"):
         store.unconfirmed_deletions(timedelta(seconds=-1))
+
+
+class _MalformedAppListing(FakeFlyAPI):
+    """Serve an org listing that answers 200 with the wrong body shape."""
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        """Corrupt only the org listing, leaving every other route intact."""
+        if request.url.path == "/v1/apps" and request.method == "GET":
+            return httpx.Response(200, json={"apps": "not-a-list"}, request=request)
+        return super().handle(request)
+
+
+def test_a_malformed_org_listing_is_an_unavailable_provider_not_an_empty_fleet(
+    tmp_path: Path,
+) -> None:
+    """A 200 whose body is the wrong shape must not read as "nothing exists"."""
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    driver = build_driver(_MalformedAppListing())
+
+    report = _reconcile(store, driver)
+
+    with pytest.raises(ProviderError):
+        driver.list_resources()
+    assert report.inventory_complete is False
+
+
+def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
+    tmp_path: Path,
+) -> None:
+    """Fly's listings are sparse; a missing field is None, never a guess."""
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    api = FakeFlyAPI()
+    driver = build_driver(api)
+    app_name = f"creek-vault-{_surrogate(_ORPHAN_ACTIVATION)}"
+    api.apps[app_name] = {
+        "id": "app-sparse",
+        "name": app_name,
+        "organization": {"slug": _ORG},
+    }
+    api.machines[app_name].extend(
+        [
+            {
+                "id": "machine-naive",
+                "state": "started",
+                "updated_at": "2026-09-07T04:00:00",
+            },
+            {"id": "machine-unparseable", "state": "started", "updated_at": "whenever"},
+            {"id": "machine-bare"},
+        ]
+    )
+    api.volumes[app_name].append({"id": "vol-bare"})
+    api.snapshots[(app_name, "vol-bare")].append({"id": "snap-bare", "size": "large"})
+
+    resources = {resource.provider_id: resource for resource in driver.list_resources()}
+    report = _reconcile(store, driver)
+
+    assert resources["machine-naive"].state_since == datetime(2026, 9, 7, 4, tzinfo=UTC)
+    assert resources["machine-unparseable"].state_since is None
+    assert resources["machine-bare"].state == "unknown"
+    assert resources["machine-bare"].region is None
+    assert resources["vol-bare"].size_gb is None
+    assert resources["snap-bare"].size_bytes is None
+    assert {divergence.kind for divergence in report.divergences} == {
+        DivergenceKind.ORPHAN_PROVIDER_RESOURCE
+    }
