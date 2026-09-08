@@ -2426,9 +2426,12 @@ def test_compile_gate_and_engine_read_one_snapshot_not_two(
     Both halves are asserted because either alone is satisfiable by
     accident: the engine keys the LLM factory with the tier of the bytes it
     ranked, and the prompt carries the body it read. One snapshot means both
-    are the pre-write ones. The safe direction of that trade is deliberate
-    and stated in ``_survey_sources``: an edit landing mid-call is compiled
-    in its pre-edit form, and admission and content can no longer disagree.
+    are the pre-write ones. That trade is deliberate and stated in
+    ``_survey_sources``: a write landing mid-call is compiled in its
+    pre-write form. For the tier *raise* asserted here that is the safe
+    direction — admission and content can no longer disagree — though
+    ``_survey_sources`` also records that it is no safety win for a deletion
+    or a redaction, which this test does not cover.
 
     The ceiling is ``open`` so the recorded tier is the *content's*:
     :func:`creek_mcp.tier_ceiling.routing_tier` takes the more sensitive of

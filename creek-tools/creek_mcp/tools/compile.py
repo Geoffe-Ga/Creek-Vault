@@ -226,11 +226,18 @@ def _survey_sources(
     here and the bytes compiled, because they are the same bytes.
 
     The counterpart, stated rather than hidden: the compiled page is now
-    written from bytes read at gate time, so an edit landing between the
-    gate and the write is compiled in its pre-edit form. That is the safe
-    direction of the same trade — admission and content can no longer
-    disagree — and it is why the corpus is loaded by the caller rather than
-    re-fetched here.
+    written from bytes read at gate time, so *any* write landing between the
+    gate and the write is compiled in its pre-write form. For a tier *raise*
+    that is the safe direction — admission and content can no longer
+    disagree, which is the whole point. For a **deletion or a redaction** it
+    is not a safety win at all: bytes the author removed mid-compile are
+    still compiled into the page, exactly as they were when the gate ranked
+    them. That is a narrower window than the pre-#930 two-walk version, not a
+    closed one, and re-fetching here would not close it either — it would
+    only move the race and reopen the admission half. Callers who need a
+    deletion to take effect immediately must not have an in-flight compile;
+    the durable remedy is :mod:`creek.purge`, which cleans references under
+    ``02-Threads`` and ``03-Eddies`` after the fact.
 
     Admission is decided by :func:`creek_mcp.tier_ceiling.write_tier_allowed`
     rather than the :func:`~creek_mcp.tier_ceiling.tier_allowed` it delegates

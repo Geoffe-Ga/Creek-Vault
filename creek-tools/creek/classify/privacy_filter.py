@@ -745,8 +745,10 @@ class AncestorIndex:
 
     Built once per call by :func:`build_ancestor_index` from records the
     caller has *already* walked, so ranking ancestry costs no extra pass
-    over ``01-Fragments``. :func:`ancestry_tiers` is the walk-it-for-me
-    entry point for callers that have no walk of their own.
+    over ``01-Fragments``. Since #930 :func:`ancestry_tiers` takes a
+    :class:`FragmentCorpus` rather than walking for you: the caller owns the
+    single walk, and both the ceiling gate and the engine rank against those
+    same bytes.
 
     Attributes:
         entries: One :class:`_AncestorEntry` per fragment the index covers.
