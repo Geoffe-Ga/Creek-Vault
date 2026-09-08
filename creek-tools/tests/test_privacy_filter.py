@@ -17,6 +17,7 @@ from creek.audit import AuditLog
 from creek.classify import privacy_filter
 from creek.classify.privacy_filter import (
     PRIVACY_AUDIT_RELPATH,
+    FragmentCorpus,
     PrivacyTierOverride,
     ancestry_tiers,
     build_ancestor_index,
@@ -40,6 +41,7 @@ from creek.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -669,3 +671,153 @@ def test_resolved_source_tiers_keeps_the_most_sensitive_duplicate(
     assert resolved == {"frag-dup": PrivacyTier.INTIMATE}
     # And it cannot disagree with the reduction over the list-returning twin.
     assert max_source_tier(source_tiers(tmp_path, ["frag-dup"])) == resolved["frag-dup"]
+
+
+def _seed_pair(fragments_root: Path) -> None:
+    """Write an intimate ancestor and its open child under *fragments_root*.
+
+    Args:
+        fragments_root: The ``01-Fragments`` directory to seed; the files
+            land in a ``Notes`` subdirectory so the walk has to recurse.
+    """
+    notes = fragments_root / "Notes"
+    notes.mkdir(parents=True, exist_ok=True)
+    for frag_id, tier, parent in (
+        ("frag-anc", PrivacyTier.INTIMATE, None),
+        ("frag-kid", PrivacyTier.OPEN, "frag-anc"),
+    ):
+        fragment, _raw = _node(frag_id, tier=tier, parent_id=parent)
+        post = frontmatter.Post(content="body", **fragment.model_dump(mode="json"))
+        (notes / f"{frag_id}.md").write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+def _counting_loader(
+    calls: list[Path],
+) -> Callable[[Path], list[tuple[Path, Fragment, str, dict[str, object]]]]:
+    """Return a drop-in ``iter_vault_fragments`` that records the roots it walks.
+
+    Args:
+        calls: The list every walked root is appended to.
+
+    Returns:
+        A loader delegating to the real one after recording the call.
+    """
+    real = privacy_filter.iter_vault_fragments
+
+    def _counting(
+        walk_root: Path,
+    ) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
+        """Record the walked root and delegate to the real loader."""
+        calls.append(walk_root)
+        return real(walk_root)
+
+    return _counting
+
+
+def test_fragment_corpus_load_walks_the_root_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One :meth:`FragmentCorpus.load` is one pass, and the views add none.
+
+    The whole point of the snapshot is that a caller can hand the same
+    object to a gate and to the engine it guards. If reading a derived view
+    re-walked, every consumer would silently pay the pass back.
+    """
+    _seed_pair(tmp_path / "01-Fragments")
+    calls: list[Path] = []
+    monkeypatch.setattr(privacy_filter, "iter_vault_fragments", _counting_loader(calls))
+
+    corpus = FragmentCorpus.load(tmp_path / "01-Fragments")
+
+    assert calls == [tmp_path / "01-Fragments"]
+    assert {fragment.id for _path, fragment, _body, _raw in corpus.records} == {
+        "frag-anc",
+        "frag-kid",
+    }
+    assert set(corpus.by_id) == {"frag-anc", "frag-kid"}
+    assert PrivacyTier.INTIMATE in corpus.ancestors.chain_tiers(["frag-kid"])
+    assert calls == [tmp_path / "01-Fragments"]
+
+
+def test_fragment_corpus_views_are_cached_not_rebuilt(tmp_path: Path) -> None:
+    """The two derived views are built once per snapshot.
+
+    The compile path reads ``ancestors`` at the admission gate and again
+    inside the engine off one corpus; rebuilding a 35k-entry index on the
+    second read would hand back part of what loading once bought.
+    """
+    _seed_pair(tmp_path / "01-Fragments")
+    corpus = FragmentCorpus.load(tmp_path / "01-Fragments")
+
+    assert corpus.by_id is corpus.by_id
+    assert corpus.ancestors is corpus.ancestors
+
+
+def test_fragment_corpus_carries_raw_so_an_absent_tier_key_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A file with no ``privacy_tier`` key ranks ``INTIMATE`` through the corpus.
+
+    ``Fragment`` defaults the missing key and an explicit ``unclassified``
+    to the same value, so the distinction survives only in ``raw``. A
+    corpus that dropped it would turn :func:`fragment_tier`'s fail-closed
+    default into a fail-open one for every survey reducing over it.
+    """
+    notes = tmp_path / "01-Fragments" / "Notes"
+    notes.mkdir(parents=True)
+    fragment, _raw = _node("frag-bare")
+    metadata = fragment.model_dump(mode="json")
+    del metadata["privacy_tier"]
+    post = frontmatter.Post(content="body", **metadata)
+    (notes / "frag-bare.md").write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    corpus = FragmentCorpus.load(tmp_path / "01-Fragments")
+
+    _fragment, _body, raw = corpus.by_id["frag-bare"]
+    assert "privacy_tier" not in raw
+    assert corpus.ancestors.chain_tiers(["frag-bare"]) == [PrivacyTier.INTIMATE]
+
+
+def test_fragment_corpus_of_a_missing_root_is_empty_not_an_error(
+    tmp_path: Path,
+) -> None:
+    """An unseeded vault yields an empty corpus, and empty fails closed.
+
+    The shared loader returns ``[]`` rather than raising for a root that
+    does not exist, and the snapshot must not change that: a gate reducing
+    over the result reaches :func:`max_source_tier`'s ``INTIMATE`` default
+    instead of a traceback.
+    """
+    corpus = FragmentCorpus.load(tmp_path / "01-Fragments")
+
+    assert corpus.root == tmp_path / "01-Fragments"
+    assert corpus.records == ()
+    assert corpus.by_id == {}
+    assert max_source_tier(corpus.ancestors.chain_tiers(["frag-anc"])) is (
+        PrivacyTier.INTIMATE
+    )
+
+
+def test_fragment_corpus_skips_an_escaping_symlink_like_the_shared_loader(
+    tmp_path: Path,
+) -> None:
+    """#1373 containment is inherited, not re-implemented.
+
+    The snapshot exists so a gate and its engine read one set of files; a
+    bespoke scan beside ``iter_vault_fragments`` would reintroduce exactly
+    the class of file one side sees and the other does not.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fragment, _raw = _node("frag-planted")
+    post = frontmatter.Post(content="body", **fragment.model_dump(mode="json"))
+    (outside / "planted.md").write_text(frontmatter.dumps(post), encoding="utf-8")
+    notes = tmp_path / "01-Fragments" / "Notes"
+    notes.mkdir(parents=True)
+    (notes / "planted.md").symlink_to(outside / "planted.md")
+
+    corpus = FragmentCorpus.load(tmp_path / "01-Fragments")
+
+    assert corpus.records == ()
+    assert "frag-planted" not in corpus.by_id
