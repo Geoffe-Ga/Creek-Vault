@@ -520,7 +520,7 @@ def test_a_malformed_org_listing_is_an_unavailable_provider_not_an_empty_fleet(
 def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
     tmp_path: Path,
 ) -> None:
-    """Fly's listings are sparse; a missing field is None, never a guess."""
+    """Fly's listings are sparse; a missing or naive field is never guessed at."""
     store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
     api = FakeFlyAPI()
     driver = build_driver(api)
@@ -533,7 +533,7 @@ def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
     api.machines[app_name].extend(
         [
             {
-                "id": "machine-naive",
+                "id": "machine-offsetless",
                 "state": "started",
                 "updated_at": "2026-09-07T04:00:00",
             },
@@ -547,7 +547,7 @@ def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
     resources = {resource.provider_id: resource for resource in driver.list_resources()}
     report = _reconcile(store, driver)
 
-    assert resources["machine-naive"].state_since == datetime(2026, 9, 7, 4, tzinfo=UTC)
+    assert resources["machine-offsetless"].state_since is None
     assert resources["machine-unparseable"].state_since is None
     assert resources["machine-bare"].state == "unknown"
     assert resources["machine-bare"].region is None

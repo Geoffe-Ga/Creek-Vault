@@ -15,7 +15,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Any, Final, Never, Protocol, cast
 
@@ -441,14 +441,24 @@ class FlyProviderDriver:
 
     @staticmethod
     def _optional_instant(value: object) -> datetime | None:
-        """Return one timezone-aware instant, or None when Fly reports none."""
+        """Return one offset-bearing instant, or None when Fly reports none.
+
+        An offsetless timestamp counts as absent rather than being anchored to
+        a zone. Fly documents RFC 3339 with an offset, so a naive value is a
+        malformed response, and picking a zone for it would put an instant
+        wrong by whole hours into an operator's report — the same class of
+        defect ``creek.time``'s anchor guard exists to prevent (#1115). A
+        divergence Creek is unsure of is not reported; it is never invented.
+        """
         if not isinstance(value, str):
             return None
         try:
             parsed = datetime.fromisoformat(value)
         except ValueError:
             return None
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        if parsed.tzinfo is None:
+            return None
+        return parsed
 
     def _ensure_app(self, reference: _AllocationRef) -> Mapping[str, Any]:
         response = self._request(
