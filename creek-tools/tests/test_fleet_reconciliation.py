@@ -29,6 +29,7 @@ from typing import Final, cast
 import httpx
 import pytest
 
+from creek_mcp.provisioning.ceremony import KEY_CEREMONY_TTL
 from creek_mcp.provisioning.driver import (
     FakeOneTimeHandoff,
     FakeProviderDriver,
@@ -500,22 +501,31 @@ _MUTATING_OPERATIONS: Final[frozenset[str]] = frozenset(
     {"provision", "delete", "start", "stop", "delete_orphan"}
 )
 
+_DYNAMIC_DISPATCH: Final[frozenset[str]] = frozenset(
+    {"getattr", "setattr", "vars", "eval", "exec", "__import__", "globals"}
+)
+"""Spellings that would reach a mutating method without naming it."""
 
-def test_the_reconciler_module_can_reach_no_mutating_operation() -> None:
-    """A syntax-level bound on what the report-only module could possibly call.
 
-    This test proves a *bound*, not the behaviour, and the distinction matters
-    because a blocklist of method names is trivially evaded. It closes three
-    escapes together: an attribute call (``driver.delete(...)``), a bare-name
-    call to something imported from elsewhere (``from .repair import purge``),
-    and a dynamic call (``getattr(driver, "delete")(...)``). The exact import
-    set is the load-bearing half — a mutating helper cannot be reached from
-    this module without an import, and no import may appear that is not listed.
+def test_the_reconciler_module_trips_on_the_spellings_of_a_repair_path() -> None:
+    """A tripwire over the common spellings, not a proof, and not presented as one.
 
-    The *behavioural* guarantee — that a real reconciliation pass issues only
-    GETs and destroys nothing — comes from the wire assertions carried by every
-    reconcile test in this module, and from the fake driver's delete counter.
-    Neither claim is sufficient alone.
+    What it actually enforces: no attribute call, bare-name call or attribute
+    reference in ``reconcile.py`` names a mutating provider operation; no
+    dynamic-dispatch builtin is called; and the module's import set is exactly
+    the listed read-only names, so a mutating helper cannot be reached from
+    another module without failing this test first.
+
+    What it cannot enforce: attribute access has spellings this does not
+    enumerate (``__getattribute__`` reached through a variable, an operator
+    dunder, a string fed to a callable obtained some other way), and no
+    syntax-level check closes that set. Treating this as a proof would be the
+    overclaim the review caught.
+
+    The behavioural guarantee lives on the wire instead: every reconcile test
+    in this module asserts the pass issued nothing but GETs, and the fake
+    driver's teardown counter stays at zero. That is what actually holds the
+    report-only constraint; this test is the cheap early warning in front of it.
     """
     tree = ast.parse(_RECONCILE_SOURCE)
     imported = {
@@ -536,7 +546,10 @@ def test_the_reconciler_module_can_reach_no_mutating_operation() -> None:
     assert called_attributes.isdisjoint(_MUTATING_OPERATIONS)
     assert called_names.isdisjoint(_MUTATING_OPERATIONS)
     assert referenced.isdisjoint(_MUTATING_OPERATIONS)
-    assert called_names.isdisjoint({"getattr", "setattr", "eval", "exec", "__import__"})
+    assert called_names.isdisjoint(_DYNAMIC_DISPATCH)
+    assert referenced.isdisjoint(
+        _DYNAMIC_DISPATCH | {"__getattr__", "__getattribute__"}
+    )
 
 
 def _protocol_methods(protocol: type) -> set[str]:
@@ -923,3 +936,110 @@ def test_an_inventory_boundary_that_raises_is_still_handled(
 
     assert report.inventory_complete is False
     assert report.divergences == ()
+
+
+def _hammer_claims(
+    store: ProvisioningStore, since: datetime, minutes: tuple[int, ...]
+) -> None:
+    """Claim the queued teardown repeatedly, as a crash-looping worker would."""
+    for minute in minutes:
+        assert store.claim_next(now=since + timedelta(minutes=minute)) is not None
+
+
+def test_an_expired_ceremony_teardown_gets_a_clock_a_reclaim_cannot_move(
+    tmp_path: Path,
+) -> None:
+    """The unattended teardown path needs the same stable clock as request_delete.
+
+    ``expire_key_ceremonies`` runs on every worker tick and moves a job to
+    ``deleting``/``delete`` for a consumer who never completed the ceremony —
+    by which point the Machine, the encrypted volume and the allocation row all
+    exist. If that transition leaves ``delete_requested_at`` NULL the row falls
+    back onto ``updated_at``, the very clock every re-claim resets, so a
+    teardown that never converges is never reported. Neither other detector can
+    cover it: ``_missing`` skips delete operations and ``_orphans`` cannot fire
+    while the allocation row is live.
+    """
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    api = FakeFlyAPI()
+    driver = build_driver(api)
+    store.submit(_LIVE_ACTIVATION, "adepthood-user-001", "adepthood", now=_NOW)
+    ProvisioningWorker(store, driver, FakeOneTimeHandoff()).run_once(now=_NOW)
+    expired_at = _NOW + KEY_CEREMONY_TTL + timedelta(seconds=1)
+
+    assert store.expire_key_ceremonies(now=expired_at) == 1
+    _hammer_claims(store, expired_at, (30, 40, 50))
+    report = _reconcile(store, driver, now=expired_at + timedelta(minutes=51))
+
+    assert report.divergences == (
+        FleetDivergence(
+            kind=DivergenceKind.DELETION_UNCONFIRMED,
+            subject=f"fly-{_surrogate(_LIVE_ACTIVATION)}",
+        ),
+    )
+
+
+def test_a_second_delete_request_does_not_restart_a_failed_deletes_clock(
+    tmp_path: Path,
+) -> None:
+    """A repeatedly-requested delete must not keep resetting its own deadline.
+
+    ``request_delete`` returns early only for ``deleting`` and ``deleted``. A
+    delete parked at ``failed`` therefore accepts a fresh request, and if that
+    rewrites the clock the row ages from the newest request rather than from
+    the first — so a delete that fails, is re-requested, and fails again never
+    reaches the window at all.
+    """
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    api = FakeFlyAPI()
+    driver = build_driver(api)
+    worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
+    job = store.submit(_LIVE_ACTIVATION, "adepthood-user-001", "adepthood", now=_NOW)
+    worker.run_once(now=_NOW)
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    api.fail_once("DELETE", "/machines/machine-1")
+    worker.run_once(now=_NOW)
+    settled = store.get(job.job_id, "adepthood")
+
+    store.request_delete(job.job_id, "adepthood", now=_NOW + timedelta(hours=10))
+    report = _reconcile(store, driver, now=_NOW + timedelta(hours=10, minutes=1))
+
+    assert settled is not None
+    assert settled.state is JobState.FAILED
+    assert report.divergences == (
+        FleetDivergence(
+            kind=DivergenceKind.DELETION_UNCONFIRMED,
+            subject=f"fly-{_surrogate(_LIVE_ACTIVATION)}",
+        ),
+    )
+
+
+def test_unmetered_machines_are_ordered_and_stable_across_passes(
+    tmp_path: Path,
+) -> None:
+    """More than one unreadable meter must sort deterministically and repeat.
+
+    A single-element tuple cannot distinguish a sorted result from an
+    accidental one, and drawing both passes from one clock cannot show that the
+    set survives a clock that moved.
+    """
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    api = FakeFlyAPI()
+    driver = build_driver(api)
+    worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
+    surrogates = []
+    for index, activation in enumerate((_LIVE_ACTIVATION, "activation-C")):
+        store.submit(activation, f"adepthood-user-{index:03d}", "adepthood", now=_NOW)
+        assert worker.run_once(now=_NOW) is True
+        app_name = f"creek-vault-{_surrogate(activation)}"
+        api.machines[app_name][0]["state"] = "started"
+        surrogates.append(f"fly-{_surrogate(activation)}")
+
+    first = _reconcile(store, driver, now=_NOW)
+    second = _reconcile(store, driver, now=_NOW + timedelta(days=2))
+
+    assert len(surrogates) == 2
+    assert first.unmetered_running == tuple(sorted(surrogates))
+    assert second.unmetered_running == first.unmetered_running
+    assert first == second
+    assert first.divergences == ()

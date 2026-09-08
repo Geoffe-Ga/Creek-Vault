@@ -26,6 +26,7 @@ from creek.confidential.keyvault import (
 )
 from creek_mcp.httpapi.provisioning import build_provisioning_app
 from creek_mcp.provisioning.ceremony import (
+    KEY_CEREMONY_TTL,
     KEY_CEREMONY_VERSION,
     AttestationStatement,
     CeremonyConflictError,
@@ -39,7 +40,7 @@ from creek_mcp.provisioning.ceremony import (
     attestation_signed_payload,
 )
 from creek_mcp.provisioning.driver import FakeOneTimeHandoff, FakeProviderDriver
-from creek_mcp.provisioning.models import JobState
+from creek_mcp.provisioning.models import JobOperation, JobState
 from creek_mcp.provisioning.store import ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
 from creek_mcp.remote_auth import ConsumerTokenVerifier
@@ -614,3 +615,41 @@ def test_the_control_plane_clock_defaults_to_real_wall_clock_time(
 
     assert challenge_response.status_code == 200
     assert completed.status_code == 200
+
+
+def test_an_expired_completion_stamps_the_teardown_clock(tmp_path: Path) -> None:
+    """The expiry branch queues a teardown, so it must date that teardown.
+
+    ``complete_key_ceremony`` moves the job to ``deleting``/``delete`` when the
+    submission arrives after the challenge lapsed. Fleet reconciliation dates a
+    stuck teardown from ``delete_requested_at`` (#1769), and a transition that
+    leaves it NULL falls back onto ``updated_at`` — the clock every worker
+    re-claim resets — so the teardown could never age past its window.
+    """
+    store, job_id = _awaiting_store(tmp_path)
+    challenge = store.get_key_ceremony(job_id, "adepthood")
+    submission = _for_challenge(_vector_submission(), challenge)
+    lapsed = _NOW + KEY_CEREMONY_TTL + timedelta(seconds=1)
+
+    with pytest.raises(CeremonyExpiredError):
+        store.complete_key_ceremony(
+            job_id,
+            "adepthood",
+            submission,
+            attested_confidential=False,
+            before_settle=None,
+            now=lapsed,
+        )
+
+    # A crash-looping worker re-claims the teardown, rewriting updated_at each
+    # time. Only a clock that transition wrote can survive that.
+    assert store.claim_next(now=lapsed + timedelta(minutes=30)) is not None
+    assert store.claim_next(now=lapsed + timedelta(minutes=40)) is not None
+    torn_down = store.get(job_id, "adepthood")
+    stale = store.unconfirmed_deletions(
+        timedelta(minutes=15),
+        now=lapsed + timedelta(minutes=41),
+    )
+    assert torn_down is not None
+    assert torn_down.operation is JobOperation.DELETE
+    assert [view.job_id for view in stale] == [job_id]

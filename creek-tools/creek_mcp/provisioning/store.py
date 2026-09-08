@@ -165,19 +165,46 @@ class ProvisioningStore:
     """Own durable idempotency, state transitions, and worker leases in SQLite."""
 
     def __init__(self, database: Path) -> None:
-        """Initialize *database* and its uniqueness constraints idempotently."""
+        """Initialize *database* and its uniqueness constraints idempotently.
+
+        Three phases, and the middle one is a transaction on purpose. Table and
+        trigger creation are ``IF NOT EXISTS`` and re-run harmlessly on every
+        open, so they self-heal after a crash. The migration does not: it
+        rewrites existing rows, and a crash between an ALTER and its backfill
+        would strand them. So the ALTER, the backfill and the version stamp
+        commit together — the stamp is what tells the next open the backfill is
+        done, and it must never land without it. ``sqlite3.executescript``
+        commits any open transaction before running, so the schema and index
+        scripts stay outside that fence rather than silently breaking it.
+        """
         self._database = database.resolve()
         self._database.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
+        with self._connect(write=True) as connection:
             self._migrate_schema(connection)
+            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        with self._connect() as connection:
             self._install_requester_guards(connection)
             connection.executescript(_OWNERSHIP_INDEXES)
-            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @staticmethod
     def _migrate_schema(connection: sqlite3.Connection) -> None:
-        """Upgrade pre-v3 databases without weakening their ownership boundary."""
+        """Upgrade an older database without weakening its ownership boundary.
+
+        Column additions are gated on the column being absent, because an ALTER
+        cannot be repeated. Backfills are gated on ``PRAGMA user_version``
+        instead, and the difference is what makes a half-applied upgrade heal.
+        Gating a backfill on column absence makes a crash between the ALTER and
+        the UPDATE permanent: the column exists forever after, so the backfill
+        can never run again and every pre-existing row keeps its NULL. The
+        version stamp is written by the caller inside this same transaction, so
+        a crash leaves it at the old value and the next open finishes the job.
+        Every backfill is additionally written to be idempotent, so re-running
+        one after a rollback costs nothing.
+        """
+        version_row = connection.execute("PRAGMA user_version").fetchone()
+        version = 0 if version_row is None else int(version_row[0])
         table_columns = {
             table: {
                 str(row[1])
@@ -200,9 +227,12 @@ class ProvisioningStore:
             connection.execute(
                 "ALTER TABLE provisioning_jobs ADD COLUMN delete_requested_at TEXT"
             )
+        if version < _SCHEMA_VERSION:
             # Backfill from updated_at rather than leaving NULL: a delete that
             # was already stuck when this column landed must not become
-            # invisible to reconciliation because of the upgrade itself.
+            # invisible to reconciliation because of the upgrade itself. Gated
+            # on the version rather than on the ALTER above, so a crash between
+            # the two is repaired on the next open instead of made permanent.
             connection.execute(
                 "UPDATE provisioning_jobs SET delete_requested_at = updated_at "
                 "WHERE operation = 'delete' AND delete_requested_at IS NULL"
@@ -510,17 +540,21 @@ class ProvisioningStore:
             row = self._owned_job(connection, job_id, requester_identity)
             if row["state"] in {JobState.DELETING.value, JobState.DELETED.value}:
                 return self._from_row(row)
-            # delete_requested_at is written here and NOWHERE else. It is the
-            # only clock reconciliation can trust: updated_at is rewritten by
-            # every claim_next lease and by every _settle_claim, so a delete
-            # that hangs, loses its lease and is re-claimed would keep pushing
-            # its own staleness deadline forward and never age past the window.
-            # The early return above makes this transition happen at most once.
+            # delete_requested_at is the only clock reconciliation can trust:
+            # updated_at is rewritten by every claim_next lease and by every
+            # _settle_claim, so a delete that hangs, loses its lease and is
+            # re-claimed would keep pushing its own staleness deadline forward
+            # and never age past the window. COALESCE is what makes the column
+            # write-once, and that is deliberately not left to the early return
+            # above: it only covers 'deleting' and 'deleted', so a delete
+            # parked at 'failed' reaches this line again and must not restart
+            # its own clock. Every other site setting operation='delete'
+            # stamps it the same way.
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                 "retry_count = 0, retryable = 0, failure_reason = NULL, "
-                "attested_confidential = NULL, "
-                "lease_token = NULL, delete_requested_at = ?, "
+                "attested_confidential = NULL, lease_token = NULL, "
+                "delete_requested_at = COALESCE(delete_requested_at, ?), "
                 "lease_expires_at = NULL, updated_at = ? WHERE job_id = ?",
                 (
                     JobState.DELETING.value,
@@ -608,14 +642,18 @@ class ProvisioningStore:
             if job_row["state"] != JobState.AWAITING_KEY_CEREMONY.value:
                 raise CeremonyUnavailableError("key ceremony is unavailable")
             if instant >= datetime.fromisoformat(str(ceremony["expires_at"])):
+                # This transition queues a teardown, so it dates one; see
+                # request_delete for why updated_at cannot be that clock.
                 connection.execute(
                     "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                     "retry_count = 0, retryable = 0, failure_reason = NULL, "
                     "attested_confidential = NULL, lease_token = NULL, "
+                    "delete_requested_at = COALESCE(delete_requested_at, ?), "
                     "lease_expires_at = NULL, updated_at = ? WHERE job_id = ?",
                     (
                         JobState.DELETING.value,
                         JobOperation.DELETE.value,
+                        _timestamp(instant),
                         _timestamp(instant),
                         job_id,
                     ),
@@ -649,13 +687,24 @@ class ProvisioningStore:
         return completed
 
     def expire_key_ceremonies(self, *, now: datetime | None = None) -> int:
-        """Idempotently queue teardown for every incomplete expired ceremony."""
+        """Idempotently queue teardown for every incomplete expired ceremony.
+
+        This is the *unattended* teardown path: it runs on every worker tick,
+        for a consumer who never came back, by which point the Machine, the
+        encrypted volume and the allocation row all exist. It therefore dates
+        the teardown it queues, exactly as request_delete does. A row left with
+        a NULL clock would fall back onto updated_at, which every re-claim
+        resets, and neither of reconciliation's other detectors can cover it:
+        _missing skips delete operations and _orphans cannot fire while the
+        allocation row is live.
+        """
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
             cursor = connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                 "retry_count = 0, retryable = 0, failure_reason = NULL, "
                 "attested_confidential = NULL, lease_token = NULL, "
+                "delete_requested_at = COALESCE(delete_requested_at, ?), "
                 "lease_expires_at = NULL, updated_at = ? "
                 "WHERE state = ? AND job_id IN ("
                 "SELECT job_id FROM provisioning_key_ceremonies "
@@ -663,6 +712,7 @@ class ProvisioningStore:
                 (
                     JobState.DELETING.value,
                     JobOperation.DELETE.value,
+                    _timestamp(instant),
                     _timestamp(instant),
                     JobState.AWAITING_KEY_CEREMONY.value,
                     _timestamp(instant),
@@ -773,25 +823,34 @@ class ProvisioningStore:
     ) -> list[OperatorAllocationView]:
         """Return deletions the provider has not confirmed within *older_than*.
 
-        Staleness is measured from ``delete_requested_at``, which only
-        ``request_delete`` ever writes. ``updated_at`` cannot be used: every
+        Staleness is measured from ``delete_requested_at``. ``updated_at``
+        cannot serve as that clock: every
         ``claim_next`` lease and every ``_settle_claim`` rewrites it, so a
         delete that hangs and is re-claimed pushes its own deadline forward
         indefinitely and never ages past the window — while the Machine it
         already destroyed removes the ``_missing`` backstop, leaving a billing
         volume nothing can see.
 
-        A row whose ``delete_requested_at`` is somehow still NULL falls back to
-        ``updated_at`` through COALESCE. That is the weaker clock, but a weak
-        clock reports a stuck delete late; a NULL would never report it at all,
-        and this query's whole purpose is that nothing billing goes unseen.
+        All three transitions into ``operation='delete'`` stamp that column
+        through ``COALESCE(delete_requested_at, ?)`` — ``request_delete``, the
+        expired branch of ``complete_key_ceremony``, and
+        ``expire_key_ceremonies``. The last two are the *unattended* path,
+        taken for a consumer who never completed the ceremony and whose
+        provider resources already exist, so they matter most. Write-once is
+        therefore an SQL invariant rather than an argument about which states
+        reach which line.
+
+        A row whose clock is somehow still NULL — a v3 database whose upgrade
+        has not yet run — falls back to ``updated_at`` through COALESCE. That
+        is the weaker clock, but a weak clock reports a stuck delete late; a
+        NULL would never report it at all.
 
         The predicate covers state ``failed`` as well as ``deleting``, and that
         arm is load-bearing rather than defensive. ``record_failure`` settles
         through ``_settle_claim(state=FAILED)``, which never reaches the branch
         that sets ``deleted_at``; ``_release_expired_claims`` only rescues rows
-        still holding an expired lease, ``expire_key_ceremonies`` only touches
-        ``awaiting_key_ceremony``, and ``retry`` is requester-fenced. A delete
+        still holding an expired lease, and ``retry`` is requester-fenced.
+        A delete
         whose provider call raised therefore parks forever at
         ``state='failed'`` with a live allocation row — a Fly bill nobody is
         watching, which is exactly what ADR-0013 Decision 6 forbids.

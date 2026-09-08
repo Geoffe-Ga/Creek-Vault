@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
+_ONE_HOUR = timedelta(hours=1)
 
 
 @pytest.fixture
@@ -472,44 +473,157 @@ def test_delete_is_idempotent_and_remains_durable_until_a_worker_claims_it(
     assert claim.job.state is JobState.DELETING
 
 
-def test_a_stuck_delete_survives_the_v4_migration_with_a_usable_clock(
-    tmp_path: Path,
-) -> None:
-    """A delete already stuck when delete_requested_at landed stays visible.
+_PRE_V4_SCHEMA = """
+CREATE TABLE provisioning_jobs (
+    job_id TEXT PRIMARY KEY,
+    canonical_activation_id TEXT NOT NULL,
+    requester_identity TEXT NOT NULL,
+    consumer_identity TEXT NOT NULL,
+    state TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    retryable INTEGER NOT NULL DEFAULT 0,
+    failure_reason TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
+    attested_confidential INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE provisioning_allocations (
+    allocation_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE REFERENCES provisioning_jobs(job_id),
+    requester_identity TEXT NOT NULL,
+    consumer_identity TEXT NOT NULL,
+    provider_allocation_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+CREATE TABLE provisioning_activation_ids (
+    activation_id TEXT PRIMARY KEY,
+    requester_identity TEXT NOT NULL,
+    consumer_identity TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES provisioning_jobs(job_id)
+);
+PRAGMA user_version = 3;
+"""
+"""The v3 provisioning_jobs shape: no delete_requested_at column at all."""
 
-    The column is written only by ``request_delete``, so a database upgraded
-    while a delete was mid-flight would hold NULL for exactly the row fleet
-    reconciliation most needs to see. The migration backfills from updated_at,
-    which is a worse clock but a real one, so the upgrade itself cannot hide a
-    billing resource (#1769).
-    """
-    database = tmp_path / "provisioning.sqlite3"
-    stamp = _NOW.isoformat(timespec="microseconds")
-    store = ProvisioningStore(database)
-    job = store.submit("activation-stuck", "adepthood-user-001", "adepthood", now=_NOW)
-    store.request_delete(job.job_id, "adepthood", now=_NOW)
+_PRE_V4_JOBS = (
+    ("job-deleting", "deleting", "delete", None),
+    ("job-failed-delete", "failed", "delete", None),
+    ("job-done", "deleted", "delete", "settled"),
+    ("job-live", "ready", "create", None),
+)
+
+
+def _seed_pre_v4(database: Path, stamp: str) -> None:
+    """Write one real v3 database holding every delete disposition."""
     with closing(sqlite3.connect(database)) as connection:
-        connection.execute(
-            "INSERT INTO provisioning_allocations "
-            "(allocation_id, job_id, requester_identity, consumer_identity, "
-            "provider_allocation_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                "alloc-stuck",
-                job.job_id,
-                "adepthood",
-                "adepthood-user-001",
-                "fly-x",
-                stamp,
-            ),
-        )
-        # Return the row to its pre-migration shape: the column exists but was
-        # never written, because the delete predates it.
-        connection.execute("UPDATE provisioning_jobs SET delete_requested_at = NULL")
+        connection.executescript(_PRE_V4_SCHEMA)
+        for index, (job_id, state, operation, deleted_at) in enumerate(_PRE_V4_JOBS):
+            connection.execute(
+                "INSERT INTO provisioning_jobs (job_id, canonical_activation_id, "
+                "requester_identity, consumer_identity, state, operation, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    f"activation-{job_id}",
+                    "adepthood",
+                    f"adepthood-user-{index:03d}",
+                    state,
+                    operation,
+                    stamp,
+                    stamp,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO provisioning_allocations (allocation_id, job_id, "
+                "requester_identity, consumer_identity, provider_allocation_id, "
+                "created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"alloc-{job_id}",
+                    job_id,
+                    "adepthood",
+                    f"adepthood-user-{index:03d}",
+                    f"fly-{job_id}",
+                    stamp,
+                    stamp if deleted_at else None,
+                ),
+            )
         connection.commit()
 
-    reopened = ProvisioningStore(database)
-    stale = reopened.unconfirmed_deletions(
-        timedelta(minutes=15), now=_NOW + timedelta(hours=1)
-    )
 
-    assert [view.provider_allocation_id for view in stale] == ["fly-x"]
+def _delete_clocks(database: Path) -> dict[str, str | None]:
+    """Return every job's delete_requested_at as the database actually holds it."""
+    with closing(sqlite3.connect(database)) as connection:
+        return {
+            str(row[0]): None if row[1] is None else str(row[1])
+            for row in connection.execute(
+                "SELECT job_id, delete_requested_at FROM provisioning_jobs"
+            )
+        }
+
+
+def test_a_v3_database_backfills_every_delete_clock_on_upgrade(
+    tmp_path: Path,
+) -> None:
+    """The real ALTER and backfill run, and a stuck delete stays reportable.
+
+    A delete already in flight when this column landed must not become
+    invisible to fleet reconciliation because of the upgrade itself (#1769).
+    ``updated_at`` is the weaker clock, but it is a real one; NULL would drop
+    the row out of the predicate entirely.
+    """
+    database = tmp_path / "provisioning-v3.sqlite3"
+    stamp = _NOW.isoformat(timespec="microseconds")
+    _seed_pre_v4(database, stamp)
+
+    store = ProvisioningStore(database)
+    stale = store.unconfirmed_deletions(timedelta(minutes=15), now=_NOW + _ONE_HOUR)
+
+    assert _delete_clocks(database) == {
+        "job-deleting": stamp,
+        "job-failed-delete": stamp,
+        "job-done": stamp,
+        "job-live": None,
+    }
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+    assert sorted(view.job_id for view in stale) == [
+        "job-deleting",
+        "job-failed-delete",
+    ]
+
+
+def test_a_migration_that_crashed_after_its_alter_heals_on_the_next_open(
+    tmp_path: Path,
+) -> None:
+    """A half-applied upgrade must complete itself, not strand every clock.
+
+    Deploy restarts are exactly when migrations run. Gating the backfill on the
+    column being absent would make a crash between the ALTER and the UPDATE
+    permanent: the column exists forever after, so the backfill never runs
+    again and every pre-existing delete keeps a NULL clock. Gating on
+    ``user_version`` instead makes the upgrade self-healing, because the
+    version stamp only lands once the backfill has committed.
+    """
+    database = tmp_path / "provisioning-halfway.sqlite3"
+    stamp = _NOW.isoformat(timespec="microseconds")
+    _seed_pre_v4(database, stamp)
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute(
+            "ALTER TABLE provisioning_jobs ADD COLUMN delete_requested_at TEXT"
+        )
+        connection.commit()
+
+    assert _delete_clocks(database)["job-deleting"] is None
+    store = ProvisioningStore(database)
+    stale = store.unconfirmed_deletions(timedelta(minutes=15), now=_NOW + _ONE_HOUR)
+
+    assert _delete_clocks(database)["job-deleting"] == stamp
+    assert sorted(view.job_id for view in stale) == [
+        "job-deleting",
+        "job-failed-delete",
+    ]
