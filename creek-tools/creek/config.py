@@ -824,10 +824,58 @@ class RedactionConfig(BaseModel):
     """If ``True``, report redactions but do not apply them."""
 
     custom_patterns: dict[str, str] = Field(default_factory=dict)
-    """Extra regex patterns (name -> pattern) for the scanner."""
+    """Extra regex patterns (name -> pattern) for the scanner.
+
+    Merged with the built-in patterns; the name becomes the marker name
+    that ``--apply`` splices in.
+
+    One boundary is worth knowing before relying on a custom pattern to
+    remove a whole secret. Token-boundary snapping — the backstop that
+    widens a match to the surrounding token so nothing is ever left
+    half-redacted (issue #909) — recognises tokens as runs of
+    ``[A-Za-z0-9+/=_-]``. A custom pattern whose alphabet includes ``.``,
+    ``~`` or ``%`` and whose quantifier is *bounded* can therefore match
+    a prefix of the real value and stop, with the remainder outside every
+    candidate run and so outside the backstop. Prefer an unbounded
+    trailing quantifier, or a trailing ``(?![A-Za-z0-9+/=_-])``, exactly
+    as the shipped ``jwt`` and ``discord_bot_token`` patterns do — which
+    is why no leak is constructible from the built-in set.
+
+    In the other direction, a **zero-width** custom pattern (pure
+    lookaround) that matches strictly inside a candidate run has both its
+    edges snapped outward and so redacts the *whole* run. That is more
+    redaction rather than less, and therefore fail-closed, but it is
+    surprising if the pattern was meant only to mark a position.
+    """
 
     false_positive_allowlist: list[str] = Field(default_factory=list)
-    """Strings that should never be flagged as PII."""
+    """Strings that should never be flagged as PII.
+
+    Matching is **exact string equality**, never a substring or context
+    test: an entry suppresses a finding only when the *whole* matched
+    string equals it. For the generic high-entropy detector and for
+    token-boundary snapping the comparison is against the whole
+    **maximal candidate run** (``[A-Za-z0-9+/=_-]{20,}``), not against
+    the regex hit inside it.
+
+    That gives allowlisting a second, deliberate effect: an allowlisted
+    run is exempt from token-boundary **widening**. A regex match that
+    falls inside such a run redacts only its own span and leaves the rest
+    of the token in cleartext — normally impossible, since #909 exists to
+    stop exactly that. It is the supported way to reopen a half-redaction
+    within one token when the surrounding text is known-safe (pinned by
+    ``tests/test_redact.py::TestHighEntropyOverlapLeak::
+    test_allowlisted_run_not_snapped``), and it is the reason an entry
+    here should be as narrow as the value it excuses.
+
+    Because the key is the whole maximal run, an entry silently stops
+    applying once the allowlisted string is glued to further
+    ``[A-Za-z0-9+/=_-]`` characters: ``HIGH_ENTROPY_CANDIDATE`` matches
+    maximally, so the run grows, byte-equality fails and the exemption
+    lapses. The direction is *more* redaction, so it fails closed — but a
+    token that was excused in one file can be redacted in another purely
+    because of what it is adjacent to.
+    """
 
     supported_extensions: list[str] = Field(
         default_factory=lambda: [
@@ -846,7 +894,14 @@ class RedactionConfig(BaseModel):
     exclude_patterns: list[str] = Field(
         default_factory=lambda: [".git", "node_modules"],
     )
-    """Directory name patterns to exclude from recursive scanning."""
+    """Path components to exclude from recursive scanning.
+
+    Despite the field name these are **not** globs or fragments. A file is
+    skipped when any element of its path equals an entry exactly
+    (``any(excl in file_path.parts ...)``), so ``.git`` excludes the
+    directory while ``.git/`` and ``*.git`` never equal a path element
+    and exclude nothing at all.
+    """
 
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     """Confidence threshold for the generic high-entropy secret detector.

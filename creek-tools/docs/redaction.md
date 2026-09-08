@@ -55,10 +55,10 @@ Configuration in `RedactionConfig`:
 |-----------------------------|--------|
 | `enabled`                   | Master switch. |
 | `dry_run`                   | When `true`, `--apply` plans but never modifies a source file. It still appends dry-run-marked entries to the audit log. |
-| `custom_patterns`           | Extra regex name → pattern map merged with built-ins. |
-| `false_positive_allowlist`  | Strings whose presence cancels a match (test fixtures, sample keys). |
+| `custom_patterns`           | Extra regex name → pattern map merged with built-ins. See [the snapping boundary](#what---apply-does) for the two shapes that sit outside the #909 backstop. |
+| `false_positive_allowlist`  | **Exact whole-string** matches to excuse (test fixtures, sample keys) — not substrings and not a context test. For the entropy detector and for snapping the comparison is against the whole maximal candidate run, which also makes an allowlisted run exempt from widening. |
 | `supported_extensions`      | File extensions the scanner walks. |
-| `exclude_patterns`          | Path/dir name fragments to skip (`.git`, `node_modules`). |
+| `exclude_patterns`          | **Exact path-component names** to skip (`.git`, `node_modules`). A file is excluded when any element of its path equals an entry — not a glob, and not a fragment, so a trailing slash matches nothing. |
 | `min_confidence`            | Generic high-entropy threshold; `0.0` flags any base64url-ish ≥20 chars, `1.0` requires near-random. Default `0.6` (3.7 bits/char), governing both the whole-run and the sub-run window gate — see [What `--apply` does](#what---apply-does). |
 | `replacement_template`      | Marker template used by `--apply`; must contain `{name}`. Default `[REDACTED:{name}]`. |
 
@@ -137,14 +137,33 @@ For every match found by the scan:
    filler to a genuine secret can no longer drag the whole-run average
    below the bar and hide it from either `--scan` or `--apply`. Snapping
    is the threshold-independent backstop beneath both entropy gates, for
-   runs that clear neither: an AWS example key followed by fourteen
-   repeats of a single character measures 3.14 bits/char whole-run and
-   has no clearing 20-character window, so the entropy detector
-   contributes no span at all — only snapping keeps a regex match that
-   covers just the key half from leaving that tail in cleartext (issue
-   #909). Strings on `false_positive_allowlist` are exempt from this
+   runs that clear neither: `deadbeefdeadbeefdead-555-123-4567` is one
+   33-character run measuring 3.327090 bits/char whole-run with a best
+   20-character window of 3.346439, so both gates are inert at every
+   `min_confidence` above 0.4232196723355077 — the default 0.6 included —
+   and the entropy detector contributes no span at all. `phone_number`
+   matches only the trailing twelve characters, so without snapping a
+   20-character opaque token survives in cleartext (issue #909). Because
+   the rule is boundary-driven it is deliberately not scoped to a subset
+   of detectors: a "self-delimiting" pattern is bounded against bisecting
+   *its own* value, which says nothing about the rest of the run.
+   Exempting such detectors was proposed and refused — see
+   [ADR-0014](architecture/ADR/0014-token-boundary-snapping-is-not-detector-scoped.md).
+   Strings on `false_positive_allowlist` are exempt from this
    widening — a regex match inside such a string still redacts only its
-   own span. A marker rendered from `replacement_template` for a name in
+   own span. That exemption keys on the whole *maximal* run, so it lapses
+   once the allowlisted string is glued to further `[A-Za-z0-9+/=_-]`
+   characters (fail-closed, but surprising). Snapping recognises tokens
+   as runs of that same class, which bounds it: a `custom_patterns` regex
+   with a *bounded* quantifier over an alphabet containing `.`, `~` or
+   `%` can match a prefix and leave the remainder outside every candidate
+   run and so outside the backstop, while a zero-width custom match
+   strictly inside a run has both edges snapped outward and redacts the
+   whole run. Neither shape is reachable from the shipped patterns —
+   `jwt`'s final segment is unbounded and `discord_bot_token` ends in
+   `(?![A-Za-z0-9_-])`, so both are forced to their run's edge.
+
+   A marker rendered from `replacement_template` for a name in
    the active pattern set is likewise inert to every detector at every
    `min_confidence`, so `--apply` is idempotent and re-running it can
    never nest markers into `[REDACTED:[REDACTED:...]]` (issue #945). That
@@ -261,7 +280,9 @@ secrets being redacted. The type is the forensic value; the message is the leak.
 
 `match_counts` is **what the scan found in this file** — not a count of
 substitutions actually performed. Scan/apply parity is a separate open gap
-(#900, #946).
+(#946): token-boundary snapping makes `--apply` redact more than
+`match_counts` reports. (#900, the mirror-image gap where `--apply` left a
+credential `--scan` had reported, was closed by 50833a56.)
 
 ### Durability
 
@@ -284,7 +305,7 @@ governs the next run. `false_positive_allowlist` entries were the one class
 of value it could never touch — the allowlist check is exact-string
 membership, so the scanner declines the match before the redactor sees it —
 but `exclude_patterns` tokens, custom `patterns`, paths and comments were
-all in scope. An entry like `backups-AKIAIOSFODNN7EXAMPLE` became
+all in scope. An entry like `backups-<a 20-character high-entropy token>` became
 `[REDACTED:high_entropy_string]`, and losing an exclusion *widens* what the
 next run walks.
 
