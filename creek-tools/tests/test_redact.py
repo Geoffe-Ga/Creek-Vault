@@ -3186,8 +3186,12 @@ class TestSnapCostAndCorrectness:
         the configuration in which the #909 backstop matters most.
 
         With 2000 runs each carrying one bisecting match, HEAD's nested
-        loop takes two ordering comparisons per (span, run) pair:
-        ``assert 8000000 < 400000``. A bisect over the run starts takes
+        loop costs ``assert 12001999 < 400000`` — measured, not derived.
+        It is more than the two comparisons per (span, run) pair a naive
+        reading predicts: the chained ``run_start < offset < run_end``
+        evaluates its second operand whenever the first holds, which is
+        roughly half the pairs, and the merge sort adds the remainder.
+        A bisect over the run starts takes
         O(log R) per edge, comfortably inside a budget of
         ``100 * (spans + runs)`` that leaves room for the merge sort.
         """
