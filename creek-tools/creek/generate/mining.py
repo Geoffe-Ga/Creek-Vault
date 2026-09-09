@@ -62,7 +62,7 @@ from creek.models import (
     VoiceRegister,
 )
 from creek.vault.links import read_header_meta
-from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -371,17 +371,45 @@ def _load_fragments(
     :func:`~creek.classify.privacy_filter.filter_fragments_by_tier`; the
     default policy excludes intimate fragments and replaces personal
     bodies with title-only summaries.
+
+    **The walk goes through the shared loader** (#1789), and that is the whole
+    point of this function's shape. It used to be a bespoke
+    ``sorted(root.rglob("*.md"))`` scan, which meant it did not inherit the
+    #1373 containment guard: a ``.md`` file under ``01-Fragments/`` that is a
+    symlink resolving OUTSIDE the vault was read here, its body rendered into
+    the mined seed and — through
+    :func:`creek.generate.drafts._load_fragments_by_id` — into the draft
+    prompt. Meanwhile
+    :func:`creek.classify.privacy_filter.source_tiers`, the survey that
+    decides which provider that prompt may reach, walks
+    :func:`~creek.vault.reader.iter_vault_fragments` and therefore **skipped**
+    the same file, so it contributed no tier at all. The component that
+    decides whether content may be routed never saw the file that got routed,
+    and the divergence ran the unsafe way.
+
+    Reading through the shared loader closes it by construction rather than by
+    a second copy of the predicate — the drift :mod:`creek._containment`
+    exists to prevent. The tier the planted file declares is beside the point:
+    the guard that would have excluded it never ran, so an ``open`` tier
+    leaked exactly as freely as an ``intimate`` one would have.
+
+    The ``raw`` frontmatter the loader also returns is deliberately dropped.
+    :func:`~creek.classify.privacy_filter.fragment_tier`'s absent-key
+    fail-closed path is the only reader that needs it, and it is reached from
+    the corpus-side callers, not from here: this loader feeds
+    :func:`~creek.classify.privacy_filter.filter_fragments_by_tier`, which
+    takes ``(fragment, body)`` and never consults ``raw``.
+
+    Args:
+        root: ``<vault>/01-Fragments``.
+        privacy_override: The admission ceiling, or ``None`` for the default.
+
+    Returns:
+        The admitted ``(fragment, body)`` pairs, in vault walk order.
     """
-    if not root.exists():
-        return []
-    collected: list[tuple[Fragment, str]] = []
-    for md_file in sorted(root.rglob("*.md")):
-        post = _safe_post(md_file)
-        if post is None:
-            continue
-        fragment = _validate_fragment(post, md_file)
-        if fragment is not None:
-            collected.append((fragment, post.content))
+    collected = [
+        (fragment, body) for _path, fragment, body, _raw in iter_vault_fragments(root)
+    ]
     return list(filter_fragments_by_tier(collected, override=privacy_override))
 
 
