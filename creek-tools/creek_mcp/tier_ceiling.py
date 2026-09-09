@@ -211,16 +211,38 @@ def _routable_tier(content_tier: PrivacyTier) -> PrivacyTier:
     ``test_routing_tier_answers_only_in_routing_vocabulary`` in
     ``tests/test_mcp_tier_ceiling.py`` pins it.
 
+    **Coerces before it compares** (#1752). ``Fragment`` is configured with
+    ``use_enum_values=True``, so every production producer of this argument
+    — ``creek.classify.privacy_filter.fragment_tier`` and the reductions
+    over it — hands in a plain ``str`` despite the ``PrivacyTier``
+    annotation. An identity comparison never matched it, so an ordinary
+    ``privacy_tier: unclassified`` note routed as the literal string
+    ``'unclassified'``. Swapping ``is`` for ``==`` would have closed that
+    row and left the real hole: an *unrecognised* string takes
+    :func:`tier_sensitivity`'s fail-closed rank 2 without being INTIMATE,
+    so :func:`routing_tier`'s ``max`` returns it verbatim under any
+    sub-intimate ceiling and ``ModelRouter``'s "not intimate, or not
+    cloud" gate reads it as the least restrictive and permits cloud.
+    Coercion is what makes the vocabulary invariant hold by mechanism
+    rather than by the caller's discipline.
+
     Args:
-        content_tier: The classified tier of the content being sent.
+        content_tier: The classified tier of the content being sent, as an
+            enum member or as the bare string a validated ``Fragment``
+            actually carries.
 
     Returns:
-        ``PERSONAL`` when *content_tier* is ``unclassified``; *content_tier*
-        unchanged otherwise.
+        ``PERSONAL`` when *content_tier* is ``unclassified``; ``INTIMATE``
+        — local-only — when it is a tier the enum does not recognise; the
+        coerced member otherwise.
     """
-    if content_tier is PrivacyTier.UNCLASSIFIED:
+    try:
+        tier = PrivacyTier(content_tier)
+    except ValueError:
+        return PrivacyTier.INTIMATE
+    if tier is PrivacyTier.UNCLASSIFIED:
         return PrivacyTier.PERSONAL
-    return content_tier
+    return tier
 
 
 def routing_tier(ceiling: TierCeiling, content_tier: PrivacyTier | None) -> PrivacyTier:

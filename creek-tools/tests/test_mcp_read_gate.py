@@ -540,15 +540,19 @@ def test_the_counts_only_rationale_is_not_reused_by_a_provider_reaching_tool() -
     )
     # The rationale quotes for_tier's body verbatim. A behaviour-PRESERVING
     # refactor (a dict lookup, a match statement) would leave that quote stale
-    # and this file green, so pin the quoted source itself.
+    # and this file green, so pin the quoted source itself. #1752 moved the
+    # quote from ``is not`` to ``!=``: identical for every enum member, and an
+    # escalation for the bare ``str`` a ``Fragment`` actually carries (which
+    # satisfied ``is not`` and took the possibly-cloud classifier). The binary
+    # split the rationale turns on is unchanged.
     for_tier_src = inspect.getsource(
         importlib.import_module(
             "creek.classify.classify_engine"
         ).TierClassifiers.for_tier
     )
-    assert "if tier is not PrivacyTier.INTIMATE" in for_tier_src, (
+    assert "if tier != PrivacyTier.INTIMATE" in for_tier_src, (
         "_CLASSIFY_PROMPT_CHANNEL_RATIONALE quotes TierClassifiers.for_tier as "
-        "'if tier is not PrivacyTier.INTIMATE: return self.non_intimate', and "
+        "'if tier != PrivacyTier.INTIMATE: return self.non_intimate', and "
         "that is no longer what the source says. If for_tier was refactored "
         "without changing behaviour, update the quote. If the tier split is no "
         "longer binary, the rationale's central claim -- that PERSONAL is "

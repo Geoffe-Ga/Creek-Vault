@@ -38,6 +38,7 @@ from creek.classify.privacy_filter import (
     FragmentCorpus,
     fragment_tier,
     max_source_tier,
+    tier_of,
 )
 from creek.compile.provenance import ProvenanceEntry, merge_provenance
 from creek.hierarchy import (
@@ -507,11 +508,41 @@ def _fragment_excerpt_for_prompt(fragment: Fragment, body: str) -> str:
     never reach the LLM (FEAT-003 acceptance criterion). ``personal``
     is also reduced to a title-only summary, matching the default
     contract in :mod:`creek.classify.privacy_filter`.
+
+    The tier is read through
+    :func:`creek.classify.privacy_filter.tier_of` **once**, into a local
+    both branches share (#1742). Reading ``fragment.privacy_tier``
+    directly returned the *full body* for a tier the enum does not
+    recognise, because ``Fragment`` sets ``use_enum_values=True`` and a
+    bare string matches no member. The single binding is the mechanism,
+    not a tidiness: no input can distinguish a canonical ``personal``
+    comparison from a raw one once the ``intimate`` one is canonical
+    (``tier_of`` differs from the attribute only on the legacy ``public``
+    alias, which ``model_validate`` normalises away), so "both branches
+    are fixed" is guaranteed by there being one read rather than by a
+    test that cannot exist.
+
+    **Known residual — a keyless file still yields its body here.** A
+    fragment whose file carries no ``privacy_tier`` key at all validates
+    to the model's ``unclassified`` default, and ``tier_of`` reports
+    exactly that, so neither branch fires. Distinguishing "no key" from
+    an explicit ``unclassified`` needs the raw frontmatter, which
+    :func:`compile_to_vault` drops before :func:`compile_fragments` is
+    reached. The excerpt gate and the routing gate therefore disagree
+    about keyless fragments: :func:`_routing_tier_for` reads through
+    ``fragment_tier``, which *does* get the raw mapping, and fails the
+    whole compile closed to ``INTIMATE`` — local routing — so the body
+    never leaves the machine. Threading ``raw`` this far would change a
+    public signature for no privacy gain, and an optional keyword would
+    be a fail-open-by-omission lever on a privacy path; both are left to
+    a follow-up. ``tests/test_tier_reader_canonicalisation.py`` pins the
+    routing gate as the protection.
     """
     title = fragment.title.strip() or fragment.id
-    if fragment.privacy_tier == PrivacyTier.INTIMATE:
+    tier = tier_of(fragment)
+    if tier is PrivacyTier.INTIMATE:
         return f"[Intimate-tier summary: {title}]"
-    if fragment.privacy_tier == PrivacyTier.PERSONAL:
+    if tier is PrivacyTier.PERSONAL:
         return f"[Personal-tier summary: {title}]"
     return body
 

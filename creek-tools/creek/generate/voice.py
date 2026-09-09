@@ -71,6 +71,7 @@ from pydantic import ValidationError
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     raw_privacy_tier,
+    tier_of,
     within_ceiling,
 )
 from creek.config import VoiceAudienceWeightingConfig
@@ -366,10 +367,9 @@ def _eligible_register(
     # operator's opt-in to their *own* intimate writing.
     #
     # Compared by value, not identity: ``FragmentSource`` sets
-    # ``use_enum_values=True``, so ``author`` is a plain ``str`` at runtime
-    # — the same idiom as the privacy-tier comparison below. Deliberately
-    # not ``Authorship(...) is Authorship.SELF``, which raises on a
-    # hand-corrupted frontmatter value instead of failing closed.
+    # ``use_enum_values=True``, so ``author`` is a plain ``str`` at runtime.
+    # Deliberately not ``Authorship(...) is Authorship.SELF``, which raises
+    # on a hand-corrupted frontmatter value instead of failing closed.
     if str(fragment.source.author) != Authorship.SELF.value:
         return None
     # Voice-fidelity backstop (Issue #466): ``ai-as-user`` content is
@@ -381,7 +381,14 @@ def _eligible_register(
         return None
     if _confidence_value(fragment) not in _QUALIFYING_CONFIDENCE:
         return None
-    if not allow_intimate and str(fragment.privacy_tier) == PrivacyTier.INTIMATE.value:
+    # Read through the canonical reader (#1743). ``Fragment`` sets
+    # ``use_enum_values=True``, so the attribute is a plain ``str``; the old
+    # ``str(...) == ...value`` matched the recognised spellings but read an
+    # *unrecognised* tier as eligible, while every other gate in the codebase
+    # fails such a tier closed to INTIMATE. Not a reachable exposure — the
+    # loader writes ``raw_privacy_tier``, which always yields a real member —
+    # but a canonical-reader inconsistency, which is what the issue asks for.
+    if not allow_intimate and tier_of(fragment) is PrivacyTier.INTIMATE:
         return None
     register = _register_value(fragment)
     if register not in VOICE_REGISTERS:

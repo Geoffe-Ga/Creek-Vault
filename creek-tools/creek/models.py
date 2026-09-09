@@ -904,6 +904,17 @@ class Fragment(BaseModel):
         the sibling tests in that class pin each bypass as intended
         behaviour rather than an oversight.
 
+        The neighbouring ``use_enum_values=True`` also stays, and its
+        cost is now recorded rather than rediscovered: it leaves every
+        enum field holding a plain ``str`` behind an enum annotation, so
+        ``f.privacy_tier is PrivacyTier.X`` reads as type-safe to mypy
+        and is ``False`` at runtime. That foot-gun has produced #1489,
+        #1742, #1743 and #1752. Removing it is a repo-wide behavioural
+        change needing per-site escalate-only proof, tracked as its own
+        epic in **#1792**; until then, tier decisions read through
+        :func:`creek.classify.privacy_filter.tier_of` or
+        :func:`~creek.classify.privacy_filter.fragment_tier`.
+
         ``mode="after"`` is load-bearing rather than stylistic: a
         before-validator sees the raw input, which on the
         ``model_validate`` path can still be an offsetless ISO-8601
@@ -963,17 +974,14 @@ class Fragment(BaseModel):
         * The skill tree re-screens canonically —
           :func:`creek.generate.skills._is_snapshot_fragment` reads
           through ``tier_of`` (#1489).
-        * The voice corpus closes it too, but at a different layer:
-          ``creek.generate.voice._eligible_register`` still compares the
-          bare attribute, yet every one of its call sites is fed by
-          ``_load_fragment_with_body``, which overwrites ``privacy_tier``
-          with ``raw_privacy_tier(metadata)`` — fail-closed to INTIMATE on
-          both a missing key and an unrecognised string, the latter having
-          already been dropped by ``model_validate``. So the residual there
-          is a **canonical-reader inconsistency** (``raw_privacy_tier`` at
-          the loader rather than ``tier_of`` at the predicate), **not an
-          exposure**. Tracked by issue #1743; that file was out of scope
-          for #1489.
+        * The voice corpus re-screens canonically too, as of #1743:
+          ``creek.generate.voice._eligible_register`` reads through
+          ``tier_of``. It was the last consumer still comparing the bare
+          attribute, and it was never an exposure — every one of its call
+          sites is fed by ``_load_fragment_with_body``, which overwrites
+          ``privacy_tier`` with ``raw_privacy_tier(metadata)``, and that
+          always yields a genuine member. What #1743 closed was the
+          canonical-reader inconsistency, not a leak.
 
         So do not re-open the cycle argument in the next sweep — but do
         not read this docstring as a claim that every consumer is safe.

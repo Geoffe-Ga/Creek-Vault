@@ -509,11 +509,19 @@ class TierClassifiers:
     def for_tier(self, tier: PrivacyTier) -> LLMClassifier:
         """Return the classifier for *tier* — the local one for INTIMATE.
 
+        Compared by **value**, not identity (#1752). ``Fragment`` sets
+        ``use_enum_values=True``, so a caller reading the attribute rather
+        than :func:`~creek.classify.privacy_filter.tier_of` hands in the
+        bare string ``'intimate'``, which satisfies ``is not`` and would
+        select the non-Intimate — possibly cloud — classifier for Intimate
+        content. All three callers read canonically today, so this was safe
+        by caller discipline alone; ``!=`` makes it safe by mechanism.
+
         Raises:
             IntimateRoutingError: For an INTIMATE fragment when the config has no
                 local backend to route it to (the deferred build-time error).
         """
-        if tier is not PrivacyTier.INTIMATE:
+        if tier != PrivacyTier.INTIMATE:
             return self.non_intimate
         if self.intimate is None:
             raise self._deferred_routing_error()
