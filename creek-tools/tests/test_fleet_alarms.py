@@ -194,6 +194,19 @@ def _raised(alarms: FleetAlarms, api: FakeFlyAPI | None = None) -> tuple[Alert, 
     return alerts
 
 
+def _notified(alarms: FleetAlarms, api: FakeFlyAPI) -> tuple[Alert, ...]:
+    """Raise and deliver once, asserting the pass put nothing but GETs on the wire.
+
+    The delivering counterpart of :func:`_raised`. Both exist so the
+    report-only guarantee is carried by every provider-touching call site in
+    this module rather than by the AST tripwire, which cannot enforce it.
+    """
+    baseline = len(api.requests)
+    delivered = alarms.notify()
+    assert {method for method, _ in api.requests[baseline:]} <= {"GET"}
+    return delivered
+
+
 def _codes(alerts: tuple[Alert, ...]) -> set[AlertCode]:
     """Return the distinct codes one pass raised."""
     return {alert.code for alert in alerts}
@@ -441,6 +454,45 @@ def test_an_incomplete_enumeration_alarms_fleet_wide_rather_than_reading_clean(
     assert AlertCode.BUDGET_DEPARTURE not in _codes(raised)
 
 
+def test_a_partial_read_reports_what_it_saw_beside_what_it_could_not_see(
+    tmp_path: Path,
+) -> None:
+    """The fleet-scoped unevaluable alert does not replace the per-subject one.
+
+    One app that rate-limits costs that app, not the whole observation, so the
+    orphan that *was* enumerated still alarms — carrying ``ESTIMATED``, because
+    a partial read makes its count a lower bound. The fleet-scoped unevaluable
+    alert sits beside it saying the coverage of that code is unknown. Reporting
+    only one of the two would either hide a finding or claim the finding is all
+    there is.
+    """
+    store, api, _ = _provisioned(tmp_path)
+    orphan = _plant_orphan(api, _ORPHAN_ACTIVATION)
+    api.fail_once("GET", f"creek-vault-{_surrogate(_LIVE_ACTIVATION)}/machines")
+
+    raised = _raised(_alarms(store, build_driver(api)), api)
+
+    per_subject = [alert for alert in raised if alert.subject is not None]
+    fleet = [alert for alert in raised if alert.subject is None]
+    assert per_subject == [
+        Alert(
+            AlertCode.ORPHAN_RESOURCE,
+            orphan,
+            Meter(3, MetricQuality.ESTIMATED),
+            _NOW,
+        )
+    ]
+    assert {alert.code for alert in fleet} == {
+        AlertCode.DUPLICATE_ALLOCATION,
+        AlertCode.ORPHAN_RESOURCE,
+        AlertCode.MISSING_RESOURCE,
+        AlertCode.CONTINUOUS_RUNNING,
+    }
+    assert all(
+        alert.contributing == Meter(None, MetricQuality.UNAVAILABLE) for alert in fleet
+    )
+
+
 def test_two_duplicate_resources_under_one_allocation_raise_one_alert(
     tmp_path: Path,
 ) -> None:
@@ -609,7 +661,7 @@ def test_alerts_are_totally_ordered_and_content_free(tmp_path: Path) -> None:
     alarms = _alarms(store, build_driver(api), sink=sink)
 
     raised = _raised(alarms, api)
-    delivered = alarms.notify()
+    delivered = _notified(alarms, api)
 
     assert [(alert.code, alert.subject) for alert in raised] == [
         (AlertCode.CONTINUOUS_RUNNING, live),
@@ -678,8 +730,8 @@ def test_the_sink_declares_one_method_and_a_repeat_delivery_is_idempotent(
     sink = FakeAlertSink()
     alarms = _alarms(store, build_driver(api), sink=sink)
 
-    first = alarms.notify()
-    second = alarms.notify()
+    first = _notified(alarms, api)
+    second = _notified(alarms, api)
 
     assert _protocol_methods(AlertSink) == {"deliver"}
     assert _protocol_methods(BillingPeriodSource) == {"billing_period_usage"}
@@ -697,10 +749,15 @@ def test_a_sink_that_raises_neither_truncates_nor_corrupts_the_raised_tuple(
     sink = _RaisingAlertSink()
     alarms = _alarms(store, build_driver(api), sink=sink)
     expected = _raised(alarms, api)
+    baseline = len(api.requests)
 
     with pytest.raises(RuntimeError, match="refused delivery"):
         alarms.notify()
 
+    # This one site cannot use _notified, because it never returns; the same
+    # wire assertion is made inline so no provider-touching call in this
+    # module is exempt from it.
+    assert {method for method, _ in api.requests[baseline:]} <= {"GET"}
     assert sink.attempts == 1
     assert _raised(alarms, api) == expected
     assert len(expected) == 1
@@ -893,12 +950,14 @@ def test_the_alerts_module_trips_on_the_spellings_of_a_repair_path() -> None:
     and PR2's equivalent tripwires were both reviewed as overclaiming; this
     docstring is deliberately narrower than theirs.
 
-    The behavioural guarantee lives elsewhere and is stated in full: every
-    test in this module that alarms through the Fly fake goes through the
-    ``_raised`` helper, which asserts the pass put nothing but GETs on the
-    wire; the ``FakeProviderDriver`` test asserts a zero teardown count; and
-    ``AlertSink`` declares exactly one method, so a sink is never handed a
-    mutation capability.
+    The behavioural guarantee lives elsewhere and is true as stated: every
+    call in this module that reaches the provider goes through ``_raised`` or
+    ``_notified``, each of which asserts the pass put nothing but GETs on the
+    wire, and the one site that cannot — the sink whose ``deliver`` raises, so
+    nothing is returned — makes the same assertion inline after the exception.
+    There is no exempt call site. The ``FakeProviderDriver`` test additionally
+    asserts a zero teardown count, and ``AlertSink`` declares exactly one
+    method, so a sink is never handed a mutation capability.
     """
     tree = ast.parse(_ALERTS_SOURCE)
     imported = {
