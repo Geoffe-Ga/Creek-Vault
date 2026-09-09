@@ -644,6 +644,7 @@ def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
             },
             {"id": "machine-unparseable", "state": "started", "updated_at": "whenever"},
             {"id": "machine-bare"},
+            {"id": "machine-no-rootfs", "state": "stopped", "config": {"image": "x"}},
         ]
     )
     api.volumes[app_name].append({"id": "vol-bare"})
@@ -659,6 +660,12 @@ def test_fields_fly_omits_are_recorded_as_absent_rather_than_invented(
         assert resources[machine].last_modified_quality is MetricQuality.UNAVAILABLE
     assert resources["machine-bare"].state == "unknown"
     assert resources["machine-bare"].region is None
+    # A Machine with no ``config`` at all, and one whose config omits the
+    # ``rootfs`` key Creek itself writes, both record an absent size rather
+    # than the policy's configured default — an assumption reported as an
+    # observation is the defect this whole test exists to catch (#1769 PR2).
+    assert resources["machine-bare"].size_gb is None
+    assert resources["machine-no-rootfs"].size_gb is None
     assert resources["vol-bare"].size_gb is None
     assert resources["snap-bare"].size_bytes is None
     assert {divergence.kind for divergence in report.divergences} == {

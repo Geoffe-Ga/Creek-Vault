@@ -450,6 +450,7 @@ class FlyProviderDriver:
             provider_allocation_id=allocation_id,
             state=str(machine.get("state", _UNREPORTED_STATE)),
             region=FlyProviderDriver._optional_text(machine.get("region")),
+            size_gb=FlyProviderDriver._rootfs_size_gb(machine),
             last_modified_at=last_modified,
             last_modified_quality=(
                 MetricQuality.UNAVAILABLE
@@ -472,6 +473,44 @@ class FlyProviderDriver:
             region=FlyProviderDriver._optional_text(volume.get("region")),
             size_gb=FlyProviderDriver._optional_int(volume.get("size_gb")),
         )
+
+    @staticmethod
+    def _rootfs_size_gb(machine: Mapping[str, Any]) -> int | None:
+        """Return one Machine's billable root filesystem size, or None.
+
+        Fly bills a stopped Machine's root filesystem separately from its
+        volume (ADR-0013 Decision 4), and the figure is already in the
+        listing :meth:`list_resources` fetches — so reporting it costs no
+        extra provider call.
+
+        Two properties are deliberate rather than incidental.
+
+        *Containment.* The return type is ``int | None``, never the mapping.
+        ``config`` is the same mapping :meth:`_machine_request` writes, and it
+        carries ``metadata.creek_activation_id`` in plaintext alongside
+        ``files[]`` holding the base64 TLS private key and the consumer token
+        registry. Binding it to anything that outlives this call, or letting
+        it reach a dataclass, would put the activation preimage and key
+        material into every report, alert and audit record. One integer is
+        extracted and the mapping is dropped.
+
+        *Honesty about the source.* ``config.rootfs`` is a key Creek itself
+        writes and the enumeration reads back, **not** a documented Fly
+        Machines response field. A Machine that does not echo it is therefore
+        an expected production case, and it is recorded as absent so the
+        caller can degrade. Substituting
+        :attr:`FlyProviderPolicy.rootfs_size_gb` would make the number always
+        appear, but it is an assumption, and reporting an assumption as an
+        observation is the defect :meth:`_optional_instant` already refuses
+        for naive timestamps.
+        """
+        config = machine.get("config")
+        if not isinstance(config, dict):
+            return None
+        rootfs = config.get("rootfs")
+        if not isinstance(rootfs, dict):
+            return None
+        return FlyProviderDriver._optional_int(rootfs.get("size_gb"))
 
     @staticmethod
     def _optional_text(value: object) -> str | None:

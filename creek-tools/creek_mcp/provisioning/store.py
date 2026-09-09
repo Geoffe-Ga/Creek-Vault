@@ -798,13 +798,13 @@ class ProvisioningStore:
     # ------------------------------------------------------------------
     # Operator-scoped fleet queries (#1769).
     #
-    # These two are DELIBERATELY not fenced by requester_identity, in the same
+    # These three are DELIBERATELY not fenced by requester_identity, in the same
     # style as claim_next above. Fleet reconciliation runs for the operator who
     # pays the provider invoice, not for a consumer: a requester fence would
     # hide precisely the divergences it exists to find, because an orphaned
-    # resource has no owning requester left to ask on its behalf. Both are
-    # read-only, neither selects canonical_activation_id, and _owned_job
-    # remains the only path every consumer-facing method takes.
+    # resource has no owning requester left to ask on its behalf. All three
+    # are read-only, none of them selects canonical_activation_id, and
+    # _owned_job remains the only path every consumer-facing method takes.
     # ------------------------------------------------------------------
 
     _OPERATOR_COLUMNS: Final[str] = (
@@ -886,6 +886,42 @@ class ProvisioningStore:
                 ),
             ).fetchall()
         return [self._operator_view(row) for row in rows]
+
+    def duplicate_activation_attempts(self) -> int:
+        """Return how many activation aliases resolved onto an existing job.
+
+        ADR-0013 Decision 4 requires the control plane to report duplicate
+        allocations. They are already durable and need no new column:
+        :meth:`submit` folds a second *distinct* activation id for one live
+        requester/consumer pair onto the job that already exists while still
+        inserting its alias row, so aliases beyond the first per job are
+        exactly the attempts that would have created a second billable
+        allocation had the fold not caught them.
+
+        The figure is a **lifetime, monotonic** count rather than a rate: no
+        ``DELETE FROM provisioning_activation_ids`` exists anywhere in this
+        module, so a row once written is never removed and the count only ever
+        rises. Two things it deliberately does not count:
+
+        * A pure replay of an activation id the store already holds inserts
+          nothing, because ``submit`` returns early on the existing row. That
+          is the idempotency contract working, not a duplicate allocation.
+        * An attempt the store *refused* — ``ActivationConflictError`` for a
+          mismatched owner, or the
+          :data:`MAX_ACTIVATION_ALIASES_PER_CONSUMER` cap — leaves no durable
+          trace at all, so it is invisible here and must be reported as
+          unavailable rather than folded in as a zero.
+
+        Read-only and operator-scoped like its two neighbours above, and it
+        selects no identifier: the count is the whole result.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) - COUNT(DISTINCT job_id) "
+                "FROM provisioning_activation_ids"
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
 
     @staticmethod
     def _operator_view(row: sqlite3.Row) -> OperatorAllocationView:
