@@ -44,17 +44,18 @@ Protocol, :class:`EgressMeter`, whose shipped implementation answers
 ``UNAVAILABLE`` honestly. Enumeration and provisioning stay narrow in opposite
 directions and egress widens neither.
 
-Two known gaps, stated so they are not silent ones.
+Three known gaps, stated so they are not silent ones.
 
-1. Composing :class:`~creek_mcp.provisioning.reconcile.FleetReconciler` means
-   ``store.live_allocations()`` executes **twice** per :meth:`FleetTelemetry.observe`.
-   Both reads are read-only, but they are not one transaction, so a job that
-   settles between them makes one pass internally inconsistent. Folding them
-   would require the reconciler to accept or expose its allocations, and its
-   import surface is pinned by exact equality.
-2. Items 6 and 7 — orphan provider resources and unconfirmed deletions — are
+1. A pass reads the store once per query but is **not one transaction**: three
+   separate read-only queries run on three connections alongside the provider
+   enumeration, so fields derived from different queries can describe different
+   instants. :meth:`FleetTelemetry.observe` names which field each query feeds.
+2. ``EXACT`` means exact over Creek's *enumeration scope* — apps named
+   ``<app_prefix>-*`` in one organization — never exact over what the provider
+   bills. A Creek resource outside that scope is invisible to every meter here.
+3. Orphan resources, duplicate provider resources and unconfirmed deletions are
    counted off the reconciler's own ``divergences`` rather than re-derived, so
-   nothing downstream can disagree with the reconciler about what an orphan is.
+   nothing downstream can disagree with the reconciler about what one is.
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.inventory import (
@@ -75,17 +76,30 @@ from creek_mcp.provisioning.reconcile import (
     DivergenceKind,
     FleetReconciler,
 )
+from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     from creek_mcp.provisioning.inventory import ProviderInventory, ProviderResource
+    from creek_mcp.provisioning.models import OperatorAllocationView
     from creek_mcp.provisioning.reconcile import (
         FleetReconcilePolicy,
         FleetReconciliationReport,
     )
-    from creek_mcp.provisioning.store import ProvisioningStore
+
+_STOPPED_STATES: Final[frozenset[str]] = frozenset({"created", "stopped", "suspended"})
+"""Fly Machine states known to hold a root filesystem without billing for CPU.
+
+A **closed positive set**, deliberately not the complement of
+:data:`~creek_mcp.provisioning.reconcile._RUNNING_STATES`. Negating the running
+set classes every state Creek does not know — ``stopping``, ``replacing``, and
+whatever Fly adds next — as "stopped, and therefore billing this much rootfs",
+which is a confident claim about a Machine nobody classified. Note in
+particular that ``unknown``, the placeholder ``FlyProviderDriver`` records when
+Fly reports no state at all, is absent from both sets by design.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,9 +173,27 @@ class FleetTelemetrySnapshot:
     ``FleetReconciliationReport.observed_at`` is, so the clock cannot make two
     otherwise identical observations differ.
 
-    ``unmetered_running`` is carried verbatim from the reconciler: a running
-    Machine whose clock could not be read stays visible by name instead of
-    being folded into ``running_machine_seconds``.
+    **What EXACT means here.** ``FlyProviderDriver.list_resources`` enumerates
+    apps named ``<app_prefix>-*`` inside one organization. So ``EXACT`` means
+    "exact over the resources Creek's own enumeration scope can see", never
+    "exact over what the provider bills". A Creek-owned resource in another
+    organization, or under an app whose name lost the prefix, is outside every
+    meter below and no quality on this record will say so. Reconciling an
+    invoice means comparing against that scope, not against the account.
+
+    **Which meters are fleet-wide and which are live-fenced.** Every capacity
+    and duration meter is *fleet-wide*: it counts orphaned resources too,
+    because the operator is billed for them. ``unmetered_running`` is the one
+    field carried verbatim from the reconciler and is therefore *live-fenced* —
+    it names only live allocations. A running orphan whose clock is unreadable
+    is consequently absent from it, but it is not lost: it contributes an
+    unreadable value to ``running_machine_seconds``, which degrades per the
+    combinator rather than absorbing it as a zero.
+
+    ``unclassified_machines`` names Machines in a state that is neither known-
+    running nor known-stopped. They contribute an unreadable value to both the
+    stopped-capacity and running-duration meters rather than being silently
+    assigned to either.
     """
 
     activated_allocations: Meter
@@ -173,10 +205,12 @@ class FleetTelemetrySnapshot:
     snapshot_bytes: Meter
     egress_bytes: Meter
     duplicate_allocation_attempts: Meter
+    duplicate_provider_resources: Meter
     refused_allocation_attempts: Meter
     orphan_provider_resources: Meter
     unconfirmed_deletions: Meter
     unmetered_running: tuple[str, ...]
+    unclassified_machines: tuple[str, ...]
     inventory_complete: bool
     observed_at: datetime = field(compare=False)
 
@@ -350,6 +384,35 @@ def _elapsed_seconds(resource: ProviderResource, now: datetime) -> int | None:
     return max(0, int((now - last_modified).total_seconds()))
 
 
+def _stopped_rootfs_contribution(resource: ProviderResource) -> int | None:
+    """Return a stopped Machine's rootfs GB, or None when its state is unknown."""
+    if resource.state not in _STOPPED_STATES:
+        return None
+    return resource.size_gb
+
+
+def _unclassified_machines(inventory: InventorySnapshot) -> tuple[str, ...]:
+    """Name Machines in a state that is neither known-running nor known-stopped.
+
+    Mirrors :attr:`FleetReconciliationReport.unmetered_running`: a resource
+    Creek could not classify is surfaced by surrogate rather than folded into
+    whichever meter happens to have a negated predicate. Only the surrogate is
+    carried — the provider's state string is free text Creek does not control,
+    and this record stays content-free by construction.
+    """
+    return tuple(
+        sorted(
+            {
+                resource.provider_allocation_id
+                for resource in _of_class(inventory, ProviderResourceClass.MACHINE)
+                if resource.provider_allocation_id is not None
+                and resource.state not in _RUNNING_STATES
+                and resource.state not in _STOPPED_STATES
+            }
+        )
+    )
+
+
 def _of_class(
     inventory: InventorySnapshot,
     resource_class: ProviderResourceClass,
@@ -391,6 +454,55 @@ class _ReplayInventory:
         return self._snapshot
 
 
+class _ReplayStore(ProvisioningStore):
+    """Serve one already-read operator view, so a pass reads the store once.
+
+    The provider side already had :class:`_ReplayInventory`; this is the
+    durable side of the same problem, and it is not cosmetic.
+    ``ProvisioningStore._connect`` opens a fresh autocommit connection per
+    call and ``ProvisioningWorker`` is a concurrent writer by design, so two
+    reads inside one pass genuinely observe two committed states. A provision
+    settling between them yields a snapshot in which the same Machine is
+    attributed to a live allocation by the duration meter and to nobody by the
+    divergence meter — an internally contradictory report an operator acts on.
+
+    It subclasses rather than duck-types because ``ProvisioningStore`` is a
+    concrete class, not a Protocol, and ``FleetReconciler`` is typed on it.
+    :meth:`ProvisioningStore.__init__` is deliberately **not** called: the
+    adapter opens no database and binds no path, so every inherited mutator
+    raises :class:`AttributeError` rather than reaching SQLite. Report-only is
+    therefore a property of the object handed to the reconciler, not only of
+    the two methods it happens to call.
+    """
+
+    def __init__(
+        self,
+        allocations: list[OperatorAllocationView],
+        unconfirmed: list[OperatorAllocationView],
+    ) -> None:
+        """Hold the two operator views this pass already read."""
+        self._allocations = allocations
+        self._unconfirmed = unconfirmed
+
+    def live_allocations(self) -> list[OperatorAllocationView]:
+        """Return the live view verbatim, issuing no query."""
+        return list(self._allocations)
+
+    def unconfirmed_deletions(
+        self,
+        older_than: timedelta,
+        *,
+        now: datetime | None = None,
+    ) -> list[OperatorAllocationView]:
+        """Return the stale-deletion view verbatim, issuing no query.
+
+        The window and the instant are ignored because the caller already
+        applied both when it performed the single real read.
+        """
+        del older_than, now
+        return list(self._unconfirmed)
+
+
 class FleetTelemetry:
     """Observe what the provider is billing for, and only observe it."""
 
@@ -413,21 +525,41 @@ class FleetTelemetry:
     def observe(self) -> FleetTelemetrySnapshot:
         """Return one deterministic cost observation, having mutated nothing.
 
-        The provider is read exactly once; the reconciler runs over that same
-        frozen snapshot. Nothing durable is written, so two passes over
+        The provider is read exactly once and the reconciler runs over that
+        same frozen snapshot; the durable store is likewise read exactly once
+        per query, and the reconciler runs over :class:`_ReplayStore` rather
+        than querying again. Nothing durable is written, so two passes over
         unchanged state compare equal and a crash mid-pass leaves no residue.
+
+        **Disclosed inconsistency window.** Even so, a pass is not one
+        transaction. It issues three separate read-only queries —
+        ``live_allocations`` (feeding ``activated_allocations`` and every
+        divergence meter), ``unconfirmed_deletions`` (feeding
+        ``unconfirmed_deletions``) and ``duplicate_activation_attempts``
+        (feeding ``duplicate_allocation_attempts``) — each on its own
+        connection, alongside the one provider enumeration. A job settling
+        between any two of them makes those two fields describe different
+        instants. Closing that would require a transaction the store does not
+        expose to a reader; what is closed here is the far worse case, where
+        one query ran *twice* and two fields derived from the same query
+        disagreed inside a single snapshot.
         """
         now = self._clock()
         inventory = self._snapshot()
         allocations = self._store.live_allocations()
-        live = {allocation.provider_allocation_id for allocation in allocations}
         report = FleetReconciler(
-            self._store,
+            _ReplayStore(
+                allocations,
+                self._store.unconfirmed_deletions(
+                    self._policy.unconfirmed_deletion_after,
+                    now=now,
+                ),
+            ),
             _ReplayInventory(inventory),
             self._policy,
             clock=lambda: now,
         ).reconcile()
-        fleet_seconds, by_allocation = self._running_seconds(inventory, live, now=now)
+        fleet_seconds, by_allocation = self._running_seconds(inventory, now=now)
         return FleetTelemetrySnapshot(
             activated_allocations=Meter(len(allocations), MetricQuality.EXACT),
             provisioned_volumes=self._provisioned_volumes(inventory),
@@ -441,6 +573,10 @@ class FleetTelemetry:
                 self._store.duplicate_activation_attempts(),
                 MetricQuality.EXACT,
             ),
+            duplicate_provider_resources=_measured(
+                _divergences(report, DivergenceKind.DUPLICATE_ALLOCATION),
+                complete=inventory.complete,
+            ),
             refused_allocation_attempts=self._refused_attempts(),
             orphan_provider_resources=_measured(
                 _divergences(report, DivergenceKind.ORPHAN_PROVIDER_RESOURCE),
@@ -451,6 +587,7 @@ class FleetTelemetry:
                 MetricQuality.EXACT,
             ),
             unmetered_running=report.unmetered_running,
+            unclassified_machines=_unclassified_machines(inventory),
             inventory_complete=inventory.complete,
             observed_at=now,
         )
@@ -520,40 +657,70 @@ class FleetTelemetry:
 
     @staticmethod
     def _stopped_rootfs_gb(inventory: InventorySnapshot) -> Meter:
-        """Root filesystem capacity on Machines that are not billing for CPU."""
-        return _measured(
-            [
-                resource.size_gb
-                for resource in _of_class(inventory, ProviderResourceClass.MACHINE)
-                if resource.state not in _RUNNING_STATES
-            ],
-            complete=inventory.complete,
+        """Root filesystem capacity on Machines known to be stopped.
+
+        Never better than ``ESTIMATED``, even when every contributor was
+        readable and the enumeration completed. ``config.rootfs.size_gb`` is
+        Creek's *own request*, echoed back by the Machines listing — it is not
+        a documented Fly response field and it is not the provider's statement
+        of what it is billing. Reporting a request as ``EXACT`` would claim
+        provider confirmation this module never obtained, which is the same
+        defect as reporting an assumption as an observation.
+
+        A Machine whose state is in neither the running nor the stopped set
+        contributes an unreadable value rather than being assumed stopped, so
+        the meter degrades instead of asserting a capacity for it.
+        """
+        return _lower_bound(
+            _measured(
+                [
+                    _stopped_rootfs_contribution(resource)
+                    for resource in _of_class(inventory, ProviderResourceClass.MACHINE)
+                    if resource.state not in _RUNNING_STATES
+                ],
+                complete=inventory.complete,
+            )
         )
 
     @staticmethod
     def _running_seconds(
         inventory: InventorySnapshot,
-        live: set[str],
         *,
         now: datetime,
     ) -> tuple[Meter, tuple[AllocationMeter, ...]]:
         """Return the fleet-wide and per-allocation running lower bounds.
 
+        **Fleet-wide, deliberately not live-fenced.** Every capacity meter on
+        the snapshot counts orphaned resources, because the operator is billed
+        for them; fencing the *duration* meter to live allocations while
+        leaving capacity fleet-wide made an orphan burning CPU for a month
+        indistinguishable from a healthy idle fleet — both reported
+        ``Meter(0, ESTIMATED)`` with an empty per-allocation tuple. An orphan
+        already carries a surrogate, so it is attributed by that surrogate,
+        and the reconciler reports it as an orphan in the same pass.
+
         Both figures are ``ESTIMATED`` whenever they exist, including when
         they are 0: ``last_modified_at`` is Fly's ``updated_at``, which any
-        provider-side write resets, so the duration can only ever under-report.
-        The quality follows the meter's semantics rather than its data — a
-        quality that flipped to ``EXACT`` on a zero would claim certainty about
-        a Machine that may simply have started since the last write.
+        provider-side write resets, so the duration can only ever
+        under-report. The quality follows the meter's semantics rather than
+        its data — a quality that flipped to ``EXACT`` on a zero would claim
+        certainty about a Machine that may simply have started since the last
+        write.
+
+        A Machine whose state is in neither the running nor the stopped set
+        contributes an unreadable value, because nothing here knows whether it
+        is billing for CPU; it is named in ``unclassified_machines``.
         """
         grouped: defaultdict[str, list[int | None]] = defaultdict(list)
         for resource in _of_class(inventory, ProviderResourceClass.MACHINE):
             surrogate = resource.provider_allocation_id
-            if surrogate is None or surrogate not in live:
+            if surrogate is None or resource.state in _STOPPED_STATES:
                 continue
-            if resource.state not in _RUNNING_STATES:
-                continue
-            grouped[surrogate].append(_elapsed_seconds(resource, now))
+            grouped[surrogate].append(
+                _elapsed_seconds(resource, now)
+                if resource.state in _RUNNING_STATES
+                else None
+            )
         fleet = _lower_bound(
             _measured(
                 [value for values in grouped.values() for value in values],

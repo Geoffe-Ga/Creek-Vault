@@ -791,9 +791,9 @@ class ProvisioningStore:
     # style as claim_next above. Fleet reconciliation runs for the operator who
     # pays the provider invoice, not for a consumer: a requester fence would
     # hide precisely the divergences it exists to find, because an orphaned
-    # resource has no owning requester left to ask on its behalf. Both are
-    # read-only, neither selects canonical_activation_id, and _owned_job
-    # remains the only path every consumer-facing method takes.
+    # resource has no owning requester left to ask on its behalf. All three
+    # are read-only, none of them selects canonical_activation_id, and
+    # _owned_job remains the only path every consumer-facing method takes.
     # ------------------------------------------------------------------
 
     _OPERATOR_COLUMNS: Final[str] = (

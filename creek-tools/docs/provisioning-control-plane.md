@@ -158,7 +158,34 @@ combinator behind every provider-sourced figure applies five arms:
 | all readable and enumeration complete | `exact` |
 | zero contributors and enumeration complete | `exact` 0 — the only legitimate zero |
 
-Two figures deserve a caveat before anyone reconciles them against an invoice.
+Four caveats before anyone reconciles these against an invoice.
+
+*`exact` is scoped, not absolute.* The enumeration lists apps named
+`<app_prefix>-*` inside one organization, so `exact` means "exact over that
+scope", never "exact over what Fly bills the account". A Creek-owned resource in
+another organization, or under an app whose name lost the prefix, is outside
+every meter and no quality says so.
+
+*Stopped rootfs capacity is never better than `estimated`.* `config.rootfs.size_gb`
+is Creek's own provisioning request echoed back by the Machines listing — not a
+documented Fly response field and not Fly's statement of what it is billing.
+Reporting it as `exact` would claim a confirmation the control plane never got.
+
+*Capacity and duration are both fleet-wide; `unmetered_running` is not.* Every
+meter counts orphaned resources, because the operator is billed for them — an
+orphan burning CPU is the most expensive thing fleet reconciliation exists to
+find. `unmetered_running` comes verbatim from the reconciler and names live
+allocations only; `unclassified_machines` names Machines whose state is in
+neither the known-running nor the known-stopped set, which contribute an
+unreadable value to both meters rather than being assumed to be either.
+
+*A pass is not one transaction.* It issues three read-only store queries on
+three connections alongside one provider enumeration, so fields fed by
+different queries can describe instants milliseconds apart. Each query runs
+exactly once, which is what stops two fields derived from the *same* query
+disagreeing inside one snapshot.
+
+Two figures deserve a further caveat.
 
 *Machine seconds are instantaneous and a lower bound.* The only clock the Fly
 Machines API offers is `updated_at`, which any provider-side write resets, so a
@@ -166,8 +193,19 @@ Machine that has run for a week but was touched an hour ago reads as an hour.
 The figure is therefore always `estimated`, including when it is 0, and it
 describes this instant — it is **not** a billing-period total. An accumulated
 figure would need persisted samples and a sampler process, which is deliberately
-not in this slice. Running Machines whose clock could not be read at all are
-named in `unmetered_running` rather than folded into the number.
+not in this slice. A running Machine whose clock could not be read contributes
+an unreadable value rather than a zero, so the meter degrades; if it belongs to
+a live allocation the reconciler also names it in `unmetered_running`.
+
+*Two different things are called "duplicate".* `duplicate_allocation_attempts`
+counts activation aliases the durable store folded onto an existing job — a
+lifetime, monotonic count of attempts that were *caught* before they could
+create a second billable allocation, and a pure replay contributes nothing to
+it. `duplicate_provider_resources` is the one that costs money: a second
+Machine or volume actually billing under one allocation, counted off the
+reconciler's own `DUPLICATE_ALLOCATION` divergences. Attempts the store
+*refused* outright leave no durable trace at all and are reported as a
+permanently unavailable meter rather than as a zero.
 
 *Egress is unavailable.* Fly meters bytes out on its billing surface, not the
 Machines API. `EgressMeter` is a separate injected boundary so an operator can
@@ -189,20 +227,27 @@ Decision 4's published assumptions, from Fly.io prices dated 2026-09-06:
 |---|---|
 | `volume_gb_month` | `$0.15` (the ADR's `$0.75` for a 5 GB volume) |
 | `stopped_rootfs_gb_month` | `$0.15` per GB, times the stopped fraction |
-| `running_machine_hour` | `$0.0082` for shared-cpu-1x |
+| `running_machine_hour` | `$0.00822` for shared-cpu-1x — see below |
 | `hours_per_month` | `720` |
 | `egress_gb`, `snapshot_gb_month` | not published by the ADR; operator-supplied |
 
-At a 720-hour month those inputs reproduce four of the ADR's five published
-per-user figures exactly: `$0.90` fully stopped, `$0.94` at ten running minutes
-a day, `$1.14` at one running hour a day and `$1.86` at four running hours a day.
+Those inputs reproduce **all five** of the ADR's published per-user figures
+exactly: `$0.90` fully stopped, `$0.94` at ten running minutes a day, `$1.14` at
+one running hour a day, `$1.86` at four running hours a day and `$6.67`
+continuously started (`0.75 + 720 × 0.00822 = 6.6684`).
 
-**The ADR's fifth figure is arithmetically unreachable.** Continuously started
-comes to `$6.6540` at 720 hours and `$6.7360` at 730; the published `$6.67`
-implies 721.95 hours. The billing test pins `$6.65` and does **not** tune
-`hours_per_month` to make `$6.67` pass — doing so would smuggle a hard-coded
-business assumption into the one number nobody checks, which is precisely what
-Decision 4 forbids. Treat `$6.67` in ADR-0013 as an error pending correction.
+Two things about those inputs are assumptions rather than derivations, and are
+worth stating so nobody mistakes them for facts the ADR asserted.
+
+*The hourly rate is supplied at more precision than the ADR displays.* The ADR
+prints `$0.0082`; `0.00822` is a rate whose four-decimal display value is
+exactly that, and it is what reproduces the published totals. If Fly's true
+rate is some other value rounding to `$0.0082`, the continuous figure moves.
+
+*The 720-hour month is an assumption the first four figures cannot test.* They
+reproduce at 720, 730 and 744 alike. Only the continuous case distinguishes
+them — `$6.67` at 720, `$6.75` at 730, `$6.87` at 744 — which is why 720 is the
+value supplied.
 
 Nothing in the telemetry module compares a meter to `monthly_budget`. The budget
 is configuration this slice records so that alarms, when they land, evaluate an
