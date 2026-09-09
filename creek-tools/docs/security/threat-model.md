@@ -267,12 +267,25 @@ from most to least likely:
   any run where `generate/state.py::_read_fragment_files` refused a candidate,
   both derived-tier maps are discarded and every eddy and thread title falls
   back to the module's standing verdict for unvouched-for content, `INTIMATE`.
-  The refused file is deliberately NOT re-read for its tier: that frontmatter is
-  attacker-controlled and would declare `privacy_tier: open` to lower the
-  maximum on purpose. The `## Active eddies` and `## Active threads` sections
-  then render an explicit unevaluable note rather than the ordinary empty-state
-  placeholder, because silence in a safety surface must mean "evaluated against
-  complete evidence and found nothing" and nothing else.
+  The refused file is deliberately NOT re-read for its tier, and the reason is
+  the EMPTY case rather than the maximum: contributing to a max cannot lower it
+  (`max_source_tier([intimate, open, open, open])` is `intimate`, measured), but
+  `max_source_tier([])` answers `INTIMATE` *by policy*, so the first contributor
+  replaces that fail-closed floor with whatever it declares. Measured on an eddy
+  no in-root fragment names, feeding the refused file's declared
+  `privacy_tier: open` back in moves the derived tier `intimate -> open` and
+  renders the title at `ceiling=open` — an out-of-root file vouching for a vault
+  title, which is what the guard exists to prevent. A narrower repair (read only
+  the refused file's wikilink *targets* and contribute `INTIMATE` for each) is
+  leak-safe and strictly better on availability, and is declined on a second
+  ground: it opens the file, which breaks `iter_contained`'s
+  never-resolve-never-read contract and hangs on a link to `/dev/zero` (measured:
+  still reading after ten seconds). Recorded as a #1794 follow-up. The
+  `## Active eddies` and `## Active threads` sections render an explicit
+  unevaluable note rather than the ordinary empty-state placeholder, and the
+  `## Vault summary` eddy and thread counts carry an unevaluated marker rather
+  than a bare `0`, because a zero asserts "evaluated against complete evidence
+  and none surfaced" exactly as silence does.
 - **Audit log integrity.** Every purge and redaction-apply writes a
   structured entry to `<vault>/00-Creek-Meta/audit/`. The integrity
   story (hash chaining, tamper-evidence) is the subject of SEC-005;

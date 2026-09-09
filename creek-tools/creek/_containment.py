@@ -286,11 +286,19 @@ class SkipTally:
     reading less makes a consumer emit MORE. Such a caller needs to know that
     it read less, and this is how it finds out.
 
-    **It cannot be recovered by reading the skipped file.** A planted note's
-    ``privacy_tier`` is attacker-controlled and would simply declare ``open``
-    to lower the maximum, so re-reading it to "keep the tier evidence" is
-    strictly worse than not reading it. The only sound response to a non-zero
-    tally is to treat the whole reduction as unproven.
+    **It cannot be recovered by reading the skipped file, and the reason is
+    the empty case rather than the maximum.** Adding a contributor to a
+    maximum can only raise it, so a planted ``open`` cannot lower an eddy the
+    vault already vouches for. What it can do is supply the FIRST contributor
+    for a target nobody in-root names, replacing
+    :func:`~creek.classify.privacy_filter.max_source_tier`'s fail-closed
+    ``INTIMATE`` with the value the planted file declares — measured,
+    ``intimate -> open``, and the title renders at ``ceiling=open``. Reading
+    the file at all would also break this module's never-resolve-never-read
+    contract, which is not a stylistic one: a link to ``/dev/zero`` makes the
+    read hang. ``state._load_fragments_admitted`` records the full weighing,
+    including a narrower repair that survives the leak analysis and is
+    declined on that second ground.
 
     Attributes:
         skipped: Candidates refused so far. :func:`iter_contained` is lazy, so

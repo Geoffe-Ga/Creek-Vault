@@ -70,6 +70,7 @@ from creek.generate.mining import (
 )
 from creek.generate.state import (
     EMPTY_PLACEHOLDER,
+    UNEVALUATED_COUNT_SUFFIX,
     UNEVALUATED_NOTE,
     StateReportGenerator,
     _admitted_liminal_notes,
@@ -910,6 +911,122 @@ def test_an_unevaluable_run_stays_recoverable_at_the_narrow_ceiling(
         "re-rendering at ceiling=open did not recover a readable artifact, so "
         "one stray symlink locks the operator out of their own state report "
         "until they widen every reader's ceiling."
+    )
+
+
+def test_the_census_declares_an_unevaluated_count_instead_of_a_bare_zero(
+    tmp_path: Path,
+) -> None:
+    """A zero is an assertion, and this run cannot make it.
+
+    ``- Eddies: 0`` reads as "this vault surfaced no eddies". On a run whose
+    derived-tier gate could not be evaluated the honest statement is different,
+    and the two must not print identically — the confident-zero defect the
+    #1769 alarms lane produced two majors on, one section over. The neighbouring
+    sections carrying an explanation is mitigation, not correctness.
+
+    The fragment count deliberately does NOT take the suffix: that is the
+    listing half, where excluding a fragment that links out of the root is a
+    complete answer rather than an unevaluated one. Asserting its absence is
+    what keeps the suffix informative rather than decorative.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _mixed_membership_vault(tmp_path, escaping=True)
+
+    report = StateReportGenerator(vault, override=PrivacyTierOverride.OPEN).render()
+    summary = report.split("## Vault summary\n\n", 1)[1].split("\n\n", 1)[0]
+
+    assert f"- Eddies: 0{UNEVALUATED_COUNT_SUFFIX}" in summary, (
+        "the eddy census printed a bare zero for a run that could not "
+        f"evaluate the gate that zero came through.\n\n{summary}"
+    )
+    assert f"- Threads: 0{UNEVALUATED_COUNT_SUFFIX}" in summary, (
+        f"the thread census printed a bare zero for the same reason.\n\n{summary}"
+    )
+    assert "- Fragments: 1\n" in summary + "\n", (
+        "the fragment count took the unevaluated suffix. The listing half is "
+        f"a complete answer and marking it dilutes the marker.\n\n{summary}"
+    )
+
+
+def test_a_quiet_vault_census_still_prints_a_bare_zero(tmp_path: Path) -> None:
+    """NON-VACUITY ANCHOR for the census marker: the two states stay distinct.
+
+    A suffix on every report would carry no information at all.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+
+    report = StateReportGenerator(vault, override=PrivacyTierOverride.OPEN).render()
+
+    assert "- Eddies: 0\n" in report, (
+        "a vault with no containment skip lost its plain census count."
+    )
+    assert UNEVALUATED_COUNT_SUFFIX not in report, (
+        "a vault with no containment skip reported its census as unevaluated, "
+        "so the marker says nothing."
+    )
+
+
+def test_an_eddy_named_only_by_the_escaping_fragment_never_renders(
+    tmp_path: Path,
+) -> None:
+    """The skipped file must never become the FIRST voucher for a vault title.
+
+    This is the leak the "just keep the tier evidence" repair opens, and the
+    reason it is refused is the EMPTY case rather than the maximum. Adding a
+    contributor to a max cannot lower it — ``max_source_tier([intimate, open,
+    open, open])`` is ``intimate`` — so a planted ``open`` cannot demote an
+    eddy the vault already vouches for. But ``max_source_tier([])`` answers
+    ``INTIMATE`` *by policy*, and the first contributor replaces that floor
+    with whatever it declares. Measured on this vault: feeding the skipped
+    file's ``privacy_tier: open`` into the reduction moves ``LonelyEddy``
+    ``intimate -> open`` and renders its title at ``ceiling=open``.
+
+    Nothing in-root names ``LonelyEddy``, so the vault's own evidence about it
+    is empty and the correct answer at every ceiling below ``intimate`` is to
+    withhold. A file outside ``01-Fragments`` must not be able to change that.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = tmp_path / "vault"
+    _write(
+        vault / "03-Eddies" / "lonely.md",
+        "---\ntype: eddy\nid: eddy-9\ntitle: LonelyEddy\n"
+        "formed: 2026-01-01\ndescription: d\n---\n\nbody\n",
+    )
+    _write(vault / "01-Fragments" / "open.md", _linked_note("open-1", "open"))
+    target = _write(
+        tmp_path / "outside" / "planted.md",
+        _linked_note("planted-1", "open").replace(
+            f"[[{_EDDY_CANARY}]]",
+            "[[LonelyEddy]]",
+        ),
+    )
+    link = vault / "01-Fragments" / "alias.md"
+    link.symlink_to(target)
+
+    assert link.is_symlink(), "the fixture did not create a symlink"
+    assert "LonelyEddy" not in (vault / "01-Fragments" / "open.md").read_text(
+        encoding="utf-8",
+    ), (
+        "an in-root fragment names LonelyEddy, so the vault vouches for it "
+        "anyway and this pin cannot see the empty-case escape."
+    )
+
+    report = StateReportGenerator(vault, override=PrivacyTierOverride.OPEN).render()
+
+    assert "LonelyEddy" not in report, (
+        "an eddy whose ONLY voucher is a fragment symlinked in from outside "
+        "01-Fragments rendered its title at ceiling=open. The skipped file is "
+        "being read back for its tier, which lets out-of-root content replace "
+        "max_source_tier's fail-closed empty case."
     )
 
 

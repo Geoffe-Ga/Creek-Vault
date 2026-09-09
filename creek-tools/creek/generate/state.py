@@ -176,6 +176,25 @@ WARNING by the single emitter, and #1087 keeps the artifact from becoming a
 second, durable copy of that disclosure.
 """
 
+UNEVALUATED_COUNT_SUFFIX: str = (
+    " (unevaluated — a containment skip left this run's tier evidence incomplete)"
+)
+"""Appended to a census count the run could not evaluate against full evidence.
+
+A count is an assertion in exactly the way silence is, and it fails in exactly
+the same way: ``- Eddies: 0`` reads as "this vault surfaced no eddies", not as
+"zero cleared a gate I could not evaluate". Two runs over the same vault would
+print the identical zero for two different reasons, one of which is "I could
+not tell" — the confident-zero defect the #1769 alarms lane produced two majors
+on, one section over. "It has always meant the admitted count" is the same
+defence those zeros had.
+
+Only the eddy and thread counts take it. The fragment count and the frequency
+distribution are the LISTING half of the same load: a fragment that links out
+of the root is not a fragment this vault owns, so excluding it is a complete
+and correct answer rather than an unevaluated one.
+"""
+
 _TOP_N: int = 10
 """Cap on the number of items rendered in each list-style section."""
 
@@ -455,13 +474,36 @@ def _read_fragment_files(root: Path) -> _FragmentFiles:
     ``ceiling=open`` and ``ceiling=personal``. Hence the tally: the guard
     stays, and the reduction is marked unproven instead.
 
-    **The skipped file's tier cannot be recovered, and must not be.** The
-    obvious repair — read the escaping file anyway, just for its
-    ``privacy_tier`` and its wikilinks — is strictly worse than not reading
-    it. That frontmatter is attacker-controlled: a planted note would declare
-    ``privacy_tier: open`` and name every eddy in the vault, LOWERING the
-    derived maximum by design. There is no evidence to keep, which is why the
-    answer is "unproven" rather than "recovered".
+    **The skipped file must not be read back for its tier, and the reason is
+    the EMPTY case, not the maximum.** Contributing to a maximum cannot lower
+    it: ``max_source_tier([intimate, open, open, open])`` is ``intimate``,
+    measured, so an attacker declaring ``open`` on an eddy the vault already
+    vouches for changes nothing. The exposure is the eddy that **nothing
+    in-root names**. :func:`~creek.classify.privacy_filter.max_source_tier`
+    answers ``INTIMATE`` for an empty list *by policy* — "nobody has vouched
+    for it" — and the first contributor replaces that fail-closed floor with
+    whatever it declares. Measured on exactly that vault: feeding the skipped
+    file's declared ``privacy_tier: open`` back into the reduction moves the
+    derived tier ``intimate -> open`` and the title renders at
+    ``ceiling=open``. An out-of-root file would be vouching for a vault title,
+    which is the one thing this guard exists to prevent.
+
+    **A narrower repair exists, wins on both of those axes, and is still not
+    taken here.** Read only the skipped file's wikilink TARGETS and contribute
+    ``INTIMATE`` for each rather than believing its declared tier: ``INTIMATE``
+    can only escalate a maximum and never replaces the empty case with an
+    attacker's value, so it is leak-safe, and it is strictly better on
+    availability — measured on the same vault, an eddy the skipped file does
+    not name keeps rendering at ``ceiling=open`` where the coarse rule
+    withholds it. It is declined for a third reason, which the leak analysis
+    does not reach: it OPENS the file. :func:`creek._containment.iter_contained`
+    guarantees an escaping entry is named as walked and never resolved or read,
+    and that guarantee is load-bearing — a link to ``/dev/zero`` makes
+    ``frontmatter.load`` read for ever (measured: still reading after ten
+    seconds), so the repair hands anyone with write access to the vault a hang
+    in every consumer of the state report, which is the denial of service the
+    skip-and-log contract exists to avoid. Recorded as a #1794 follow-up with
+    that measurement rather than taken here.
 
     Args:
         root: The ``01-Fragments`` directory.
@@ -1361,12 +1403,20 @@ class StateReportGenerator:
         cannot contradict the eddy and thread sections below it, and a count
         cannot disclose the existence of content the rest of the report
         omitted.
+
+        #1794: the eddy and thread counts additionally carry
+        :data:`UNEVALUATED_COUNT_SUFFIX` when a containment skip left their
+        derived-tier gate unprovable, for the reason recorded there — an
+        unqualified ``0`` asserts "evaluated and none surfaced", which this run
+        cannot say. The fragment count does not take it; see the same constant
+        for why the listing half is a complete answer.
         """
         state = self._state
+        suffix = UNEVALUATED_COUNT_SUFFIX if state.tiers.link_tiers_unproven else ""
         body = [
             f"- Fragments: {len(state.fragments)}",
-            f"- Eddies: {len(state.eddies)}",
-            f"- Threads: {len(state.threads)}",
+            f"- Eddies: {len(state.eddies)}{suffix}",
+            f"- Threads: {len(state.threads)}{suffix}",
         ]
         # Store the enum member itself rather than ``str(member)`` — the
         # round-trip is fragile if :class:`Frequency` ever stops being a
