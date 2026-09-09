@@ -40,6 +40,8 @@ from datetime import datetime  # noqa: TC003  # used at runtime as a parameter t
 from pathlib import Path  # noqa: TC003  # plain stdlib import; no lazy benefit
 from typing import TYPE_CHECKING
 
+from creek._containment import iter_contained
+from creek.generate.compile_routing import COMPILED_PAGE_SKIP_NOUN
 from creek.generate.indexes import GENERATED_INDEX_TYPES
 from creek.lint._result import CheckResult
 from creek.vault.links import build_link_index, iter_link_sources, read_header_meta
@@ -59,12 +61,36 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:[#|][^\]]*?)?\]\]")
 
 
 def _stems_in(vault_path: Path, subdirs: tuple[str, ...]) -> list[Path]:
-    """Collect every ``*.md`` path under any of *subdirs*."""
+    """Collect every ``*.md`` path under any of *subdirs*.
+
+    **Containment (#1794).** Each subdirectory is walked through
+    :func:`creek._containment.iter_contained` and judged against ITS OWN root,
+    not against the vault, because that is the root the compiled-layer readers
+    in :mod:`creek.generate.compile_routing` judge against and two readers
+    answering to two different roots is the #1079 divergence again.
+
+    **Direction: this is the REPORTED set, so a skip emits less.** The result
+    feeds :func:`_candidate_pages`, the pages an orphan verdict may be passed
+    on; the *source* side of the check comes from
+    :func:`creek.vault.links.iter_link_sources`, a different walk this does not
+    touch. So dropping a page removes a candidate rather than removing a
+    credit, and no in-root page can be orphaned by this guard — measured
+    against the never-planted control. That distinction is the whole reason the
+    guard is safe here and NOT safe on a scanner whose corpus is the source
+    side: see ``creek.clean.hygiene``, where dropping a record makes the
+    broken-link count go UP (measured 0 -> 1) and no guard is applied.
+    """
     paths: list[Path] = []
     for sub in subdirs:
         root = vault_path / sub
         if root.is_dir():
-            paths.extend(root.rglob("*.md"))
+            paths.extend(
+                iter_contained(
+                    root,
+                    sorted(root.rglob("*.md")),
+                    what=COMPILED_PAGE_SKIP_NOUN,
+                )
+            )
     return paths
 
 

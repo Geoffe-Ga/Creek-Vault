@@ -92,7 +92,7 @@ from creek.generate.wavelength import (
 from creek.hierarchy import select_by_policy
 from creek.models import Eddy, Fragment, Frequency, Praxis, PrivacyTier, Thread
 from creek.vault.links import read_header_meta
-from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
+from creek.vault.reader import FRAGMENT_SKIP_NOUN, FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -414,7 +414,17 @@ def _load_typed_models(
     consumer of this one reads it as a **listing**:
 
     * ``## Active eddies`` / ``## Active threads`` render one row per admitted
-      record, so a skip drops a row.
+      record — but both are CAPPED at :data:`_TOP_N` and
+      ``## Suggested questions`` at five, so "a skip drops a row" is the wrong
+      rationale on a corpus larger than the cap: a skip frees a slot and the
+      next-ranked record is PROMOTED into it, carrying its own title and id.
+      That is still safe, and the reason is not the row count. Every candidate
+      is drawn from ``self._state.threads`` / ``self._state.eddies``, already
+      cut by :func:`~creek.generate.state_tiers.admit_by_derived_tier`, and
+      ``content_tiers`` covers **all** admitted records rather than only the
+      rendered ones — so the stamp is a superset of the render at every cap,
+      and the promoted row is exactly what an untampered vault would have
+      printed. Measured against that control, not asserted.
     * :meth:`StateReportGenerator._fragment_to_eddies` **intersects** each
       fragment's wikilinks with these titles, so a skip can only shrink the
       mapping and therefore only shrink ``## Hyperedges``.
@@ -562,7 +572,7 @@ def _read_fragment_files(root: Path) -> _FragmentFiles:
     for md_file in iter_contained(
         root,
         sorted(root.rglob("*.md")),
-        what="fragment",
+        what=FRAGMENT_SKIP_NOUN,
         tally=tally,
     ):
         post = _safe_post(md_file)

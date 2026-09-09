@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import frontmatter
 
+from creek._containment import iter_contained
 from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
@@ -78,6 +79,16 @@ _SCAN_DIRS: list[str] = [
     "08-Decisions",
 ]
 """Vault subdirectories to scan for tagged markdown files."""
+
+TAG_SCAN_SKIP_NOUN: str = "tagged note"
+"""Operator-facing noun for a containment skip in the tag scan (#1794).
+
+Not one of the corpus nouns the other readers use, and deliberately: this walk
+crosses all five :data:`_SCAN_DIRS` and reads any note purely for its ``tags``
+key, so what the operator lost is a tagged note rather than a thread or an
+eddy. :func:`creek._containment.iter_contained` already names the root it was
+refused from, so the line stays unambiguous about which corpus it came out of.
+"""
 
 _GROWTH_THRESHOLD: float = 0.5
 """Minimum fractional growth (50%) to flag a tag as rapidly expanding."""
@@ -236,7 +247,15 @@ class TagGardenGenerator:
             dir_path = self.vault_path / scan_dir
             if not dir_path.is_dir():
                 continue
-            for md_file in dir_path.rglob("*.md"):
+            # Unsorted, exactly as before: :func:`iter_contained` owns the
+            # containment question and leaves the caller's ordering alone, so
+            # the guard must not quietly make this walk deterministic when it
+            # was not — ``tag_fragments`` preserves discovery order.
+            for md_file in iter_contained(
+                dir_path,
+                dir_path.rglob("*.md"),
+                what=TAG_SCAN_SKIP_NOUN,
+            ):
                 ft = self._extract_tags(md_file, self.override)
                 if ft is None:
                     continue

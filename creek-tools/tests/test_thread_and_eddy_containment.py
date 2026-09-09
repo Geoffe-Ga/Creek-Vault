@@ -57,25 +57,44 @@ maximum every thread and eddy title is admitted against, so the skill tree
 starts emitting an eddy it currently withholds. That is the #1793 inversion.
 
 **Residuals this lane does NOT close**, pinned honestly rather than claimed
-away: a symlinked corpus *root* defeats every leaf guard, and hard links are
-not symlinks at all.
+away. The third is the sharpest, is pre-existing rather than introduced here,
+and is the only one this lane measured end to end:
+
+1. A symlinked corpus *root* defeats every leaf guard.
+2. Hard links are not symlinks at all.
+3. ``skills._read_all_fragments`` is a live **escalation**, not merely a
+   divergence, and calling it a divergence understates it. Measured on one
+   vault at ``ceiling=open``: an out-of-root ``open`` fragment naming an eddy
+   nothing in-root names supplies the FIRST contributor to
+   ``max_source_tier``, replacing its fail-closed ``INTIMATE`` with the value
+   the planted file declares — so the voice skill tree GAINS
+   ``lonely-eddy.SKILL.md`` on disk while ``creek state`` withholds every eddy
+   title on the same run. An out-of-root file vouching for a vault title is
+   the exact condition ``state_tiers.py`` calls a leak. It stays open because
+   the only one-line repair inverts vault B below; #1796 carries the narrower
+   one.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import pytest
 
 from creek.classify.privacy_filter import PrivacyTierOverride, max_source_tier
+from creek.config import CompostConfig
 from creek.generate import mining, skills, state
 from creek.generate.compile_routing import (
+    COMPILED_PAGE_SKIP_NOUN,
     EDDY_SKIP_NOUN,
     THREAD_SKIP_NOUN,
     compiled_source_ids,
     load_compiled_pages,
 )
+from creek.generate.compost import CompostTracker
+from creek.generate.compost_scan import run_compost_scan
 from creek.generate.drafts import (
     DraftGenerator,
     _load_eddies_by_id,
@@ -83,9 +102,14 @@ from creek.generate.drafts import (
 )
 from creek.generate.mining import IdeaMiner, IdeaSeed, MiningStrategy
 from creek.generate.state import StateReportGenerator
+from creek.generate.tags import TagGardenGenerator
+from creek.lint.checks import orphan_compiled
 from creek.models import Eddy, Praxis, PrivacyTier, Thread
+from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools.state_read import state_read_tool
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 _PLANTED_TITLE = "PLANTED-1794-TITLE"
@@ -962,24 +986,55 @@ def test_a_planted_thread_yields_no_terminus_seed(tmp_path: Path) -> None:
     )
 
 
-def test_a_planted_eddy_never_titles_a_liminal_seed(tmp_path: Path) -> None:
-    """``_seed_from_liminal`` builds its title from ``eddy.title``.
+def _liminal_vault(tmp_path: Path) -> Path:
+    """Build a liminal-cross-eddy vault whose planted eddy sorts FIRST.
 
-    So an escaping eddy that survived ``mining._load_typed`` would name itself
-    in a seed title even though the liminal corpus it was matched against is
-    entirely in-root — a second route into the same ``## Ask`` block, closed by
-    the same guard.
+    The ``aaa-`` prefix is the whole fixture. ``_best_eddy_match_unfiltered``
+    sorts by score with Python's **stable** sort, so on a tie the eddy the
+    loader yielded first wins. The module's ``zzz-`` fixture therefore made the
+    planted eddy unable to win *whatever the guard did*, and the assertion
+    below could not fail — measured, it passed against base. Sorting the
+    planted link first is what makes the seed title discriminate.
 
     Args:
         tmp_path: pytest's per-test temporary directory.
+
+    Returns:
+        The vault root.
     """
-    vault, _outside = _plant(tmp_path)
+    vault = tmp_path / "vault"
+    _write(
+        vault / "03-Eddies" / "legit.md",
+        _eddy_note(_LEGIT_EDDY_ID, _LEGIT_EDDY_TITLE, _LEGIT_DESCRIPTION),
+    )
+    planted = _write(
+        tmp_path / "outside" / "eddy.md",
+        _eddy_note("EDDY-PLANTED", _PLANTED_TITLE, _PLANTED_DESCRIPTION),
+    )
+    (vault / "03-Eddies" / "aaa-evil.md").symlink_to(planted)
     _write(
         vault / "10-Liminal" / "Unnamed" / "note.md",
         "---\ntype: fragment\nid: LIM-1\ntitle: A liminal note\n"
         "privacy_tier: open\nsource:\n  platform: journal\n"
         "captured: 2026-01-01\n---\n\nliminal body\n",
     )
+    return vault
+
+
+def test_a_planted_eddy_never_titles_a_liminal_seed(tmp_path: Path) -> None:
+    """``_seed_from_liminal`` builds its title from ``eddy.title``.
+
+    So an escaping eddy that survived ``mining._load_typed`` names itself in a
+    seed title even though the liminal corpus it was matched against is
+    entirely in-root — a second route into the same ``## Ask`` block.
+
+    The fixture is :func:`_liminal_vault` rather than :func:`_plant`, and the
+    difference is load-bearing: see that function.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _liminal_vault(tmp_path)
     miner = IdeaMiner(
         similarity_fn=lambda _a, _b: 1.0,
         similarity_liminal=0.0,
@@ -994,6 +1049,41 @@ def test_a_planted_eddy_never_titles_a_liminal_seed(tmp_path: Path) -> None:
     )
     assert not any(_PLANTED_TITLE in seed.title for seed in seeds), (
         f"an out-of-root eddy titled a seed.\n\n{[s.title for s in seeds]}"
+    )
+    assert any(_LEGIT_EDDY_TITLE in seed.title for seed in seeds), (
+        "the in-root eddy stopped titling a seed, so the guard dropped more "
+        f"than the escaping record.\n\n{[s.title for s in seeds]}"
+    )
+
+
+def test_the_mining_snapshot_itself_holds_no_escaping_record(
+    tmp_path: Path,
+) -> None:
+    """Asserted on the SNAPSHOT, which is where a call-site mutant would land.
+
+    Every other miner pin here reads a strategy's output, and
+    :func:`creek.generate.mining._load_typed`'s own docstring warns that a
+    loader-shaped pin walks straight past a guard moved to the call site.
+    Measured: leaving ``_load_typed`` guarded and rebuilding
+    ``MiningSnapshot.eddies`` from an inline unguarded walk inside
+    :func:`~creek.generate.mining._load_mining_snapshot` put the escaping eddy
+    back into the miner and every one of this module's other tests still
+    passed. This is the assertion that dies instead.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault, _outside = _plant(tmp_path)
+
+    snapshot = mining._load_mining_snapshot(vault, bypass_compiled=True)
+
+    assert [eddy.title for eddy in snapshot.eddies] == [_LEGIT_EDDY_TITLE], (
+        "an out-of-root eddy reached the mining snapshot.\n\n"
+        f"{[e.title for e in snapshot.eddies]}"
+    )
+    assert [thread.title for thread in snapshot.threads] == [_LEGIT_THREAD_TITLE], (
+        "an out-of-root thread reached the mining snapshot.\n\n"
+        f"{[t.title for t in snapshot.threads]}"
     )
 
 
@@ -1032,15 +1122,29 @@ def test_every_reader_of_one_root_admits_exactly_the_same_ids(
     by_id = (
         _load_threads_by_id(root) if type_tag == "thread" else _load_eddies_by_id(root)
     )
-    from_state = state._load_typed_models(root, type_tag=type_tag, cls=cls)
-    from_mining = mining._load_typed(root, type_tag=type_tag, cls=cls)
+    admitted = {
+        "drafts": frozenset(by_id),
+        "state": frozenset(
+            model.id
+            for model in state._load_typed_models(root, type_tag=type_tag, cls=cls)
+        ),
+        "mining": frozenset(
+            model.id for model in mining._load_typed(root, type_tag=type_tag, cls=cls)
+        ),
+        "skills": frozenset(
+            model.id
+            for model in skills._collect_typed(
+                root,
+                expected_type=type_tag,
+                model_cls=cls,
+            )
+        ),
+    }
 
-    assert set(by_id) == {model.id for model in from_state}, (
-        "the draft loader and the state report disagree about which "
-        f"{type_tag}s this root holds."
-    )
-    assert {model.id for model in from_state} == {model.id for model in from_mining}, (
-        f"the state report and the miner disagree about this root's {type_tag}s."
+    assert len(set(admitted.values())) == 1, (
+        f"the four readers of {subdir} disagree about which {type_tag}s it "
+        "holds. A corpus one tool withholds and another emits is not a "
+        f"difference of opinion, it is a leak.\n\n{admitted}"
     )
 
 
@@ -1062,22 +1166,66 @@ def test_the_generic_loaders_log_the_same_noun_as_the_by_id_loaders(
     """
     vault, _outside = _plant(tmp_path)
 
-    with caplog.at_level(logging.WARNING):
-        _load_threads_by_id(vault / "02-Threads")
-        _load_eddies_by_id(vault / "03-Eddies")
-        state._load_typed_models(vault / "02-Threads", type_tag="thread", cls=Thread)
-        state._load_typed_models(vault / "03-Eddies", type_tag="eddy", cls=Eddy)
+    def _nouns_from(reader: Callable[[], object]) -> set[str]:
+        """Return the skip nouns ONE reader emits, and only that reader's."""
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="creek._containment"):
+            reader()
+        return {
+            str(record.args[0])
+            for record in caplog.records
+            if record.name == "creek._containment" and record.args
+        }
 
-    nouns = {record.args[0] for record in caplog.records if record.args}
-    assert THREAD_SKIP_NOUN in nouns, (
-        f"no skip named the thread corpus as {THREAD_SKIP_NOUN!r}.\n\n{nouns}"
+    literal = _nouns_from(
+        lambda: (
+            _load_threads_by_id(vault / "02-Threads"),
+            _load_eddies_by_id(vault / "03-Eddies"),
+        )
     )
-    assert EDDY_SKIP_NOUN in nouns, (
-        f"no skip named the eddy corpus as {EDDY_SKIP_NOUN!r}.\n\n{nouns}"
+    derived = {
+        "state": _nouns_from(
+            lambda: (
+                state._load_typed_models(
+                    vault / "02-Threads", type_tag="thread", cls=Thread
+                ),
+                state._load_typed_models(
+                    vault / "03-Eddies", type_tag="eddy", cls=Eddy
+                ),
+            )
+        ),
+        "mining": _nouns_from(
+            lambda: (
+                mining._load_typed(vault / "02-Threads", type_tag="thread", cls=Thread),
+                mining._load_typed(vault / "03-Eddies", type_tag="eddy", cls=Eddy),
+            )
+        ),
+        "skills": _nouns_from(
+            lambda: (
+                skills._collect_typed(
+                    vault / "02-Threads", expected_type="thread", model_cls=Thread
+                ),
+                skills._collect_typed(
+                    vault / "03-Eddies", expected_type="eddy", model_cls=Eddy
+                ),
+            )
+        ),
+    }
+    compiled = _nouns_from(lambda: load_compiled_pages(vault))
+
+    expected = {THREAD_SKIP_NOUN, EDDY_SKIP_NOUN}
+    assert literal == expected, (
+        f"the by-id loaders did not name both corpora exactly.\n\n{literal}"
     )
-    assert nouns <= {THREAD_SKIP_NOUN, EDDY_SKIP_NOUN, "compiled page"}, (
-        "a reader of these two roots invented a third noun for the same "
-        f"corpus.\n\n{nouns}"
+    for name, got in derived.items():
+        assert got == expected, (
+            f"{name}'s DERIVED noun disagrees with the constants the by-id "
+            "loaders import, so the operator reads two words for one event."
+            f"\n\n{got}"
+        )
+    assert compiled == {COMPILED_PAGE_SKIP_NOUN}, (
+        "the compiled-layer reader did not name what it refused, or named "
+        f"something else.\n\n{compiled}"
     )
 
 
@@ -1273,6 +1421,18 @@ def test_the_skill_trees_fragment_walk_stays_unguarded_on_purpose(
     ``state._read_fragment_files`` carries, whose cost is filed as #1796; it is
     NOT a one-line guard, and this pin fails if someone adds one.
 
+    **What stays open in the meantime, stated rather than left implicit.** This
+    is not a tidy "the two tools disagree": it is a measured ESCALATION in the
+    skill tree's favour. On a second vault — an out-of-root ``open`` fragment
+    naming an eddy no in-root fragment names — the planted file becomes the
+    FIRST contributor to ``max_source_tier``, replacing its fail-closed
+    ``INTIMATE`` with its own declared ``open``, and
+    ``SkillTreeGenerator`` writes a SKILL file named after that eddy at
+    ``ceiling=open`` on the very run where ``creek state`` withholds every eddy
+    title. Both halves are pre-existing at the base commit — this lane neither
+    creates nor widens them — and the accepted cost of declining the one-line
+    guard is that they remain.
+
     Args:
         tmp_path: pytest's per-test temporary directory.
     """
@@ -1322,4 +1482,475 @@ def test_the_skill_trees_fragment_walk_stays_unguarded_on_purpose(
         "the skill tree emitted an eddy it previously withheld. Guarding this "
         "walk LOWERS the derived-tier maximum, which is the #1793 inversion; "
         "see this test's docstring."
+    )
+
+
+# ---------------------------------------------------------------------------
+# STEP 11 — the stamp's blind spot: ## Wavelength snapshot (round-2 blocker)
+# ---------------------------------------------------------------------------
+
+
+def _wavelength_note(frag_id: str, tier: str, phase: str, dosage: str) -> str:
+    """Return a classified fragment the wavelength snapshot aggregates.
+
+    Args:
+        frag_id: The fragment's ``id``.
+        tier: Its ``privacy_tier``.
+        phase: Its wavelength ``phase``.
+        dosage: Its wavelength ``dosage``.
+
+    Returns:
+        The complete markdown document.
+    """
+    return (
+        "---\n"
+        "type: fragment\n"
+        f"id: {frag_id}\n"
+        f"title: Fragment {frag_id}\n"
+        f"privacy_tier: {tier}\n"
+        "source:\n  platform: journal\n  kind: writing\n"
+        "captured: 2026-09-01\ncreated: 2026-09-01T00:00:00Z\n"
+        f"wavelength:\n  phase: {phase}\n  mode: inhabit\n  dosage: {dosage}\n"
+        "---\n\nA body.\n"
+    )
+
+
+def _wavelength_vault(tmp_path: Path, *, planted: bool) -> Path:
+    """Build the blocker vault, optionally with the escaping intimate fragment.
+
+    The in-root fragment is ``open``/``rising``/``medicine``; the planted one
+    is ``intimate``/``withdrawal``/``toxic``, so every figure the snapshot
+    renders — count, dominant phase, confidence and both shares — moves if the
+    walk reads it.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        planted: Whether to add the escaping fragment link.
+
+    Returns:
+        The vault root.
+    """
+    vault = tmp_path / "vault"
+    _write(
+        vault / "01-Fragments" / "open.md",
+        _wavelength_note("FRAG-OPEN", "open", "rising", "medicine"),
+    )
+    (vault / "02-Threads").mkdir(parents=True, exist_ok=True)
+    if planted:
+        target = _write(
+            tmp_path / "outside" / "intimate.md",
+            _wavelength_note("FRAG-INTIMATE", "intimate", "withdrawal", "toxic"),
+        )
+        (vault / "01-Fragments" / "zzz-evil.md").symlink_to(target)
+    return vault
+
+
+def test_the_wavelength_snapshot_agrees_with_the_census_it_sits_beside(
+    tmp_path: Path,
+) -> None:
+    """One page must not count a fragment its own census refused.
+
+    ``## Wavelength snapshot`` was the THIRD reader of ``01-Fragments`` and the
+    last unguarded one, so ``- Fragments observed: 2`` sat directly above
+    ``- Fragments: 1`` on the same rendered document — the self-disagreement
+    :mod:`creek._containment` names as the reason #1794 exists.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _wavelength_vault(tmp_path, planted=True)
+
+    document = StateReportGenerator(
+        vault,
+        today=date(2026, 9, 9),
+        override=PrivacyTierOverride.ALL,
+    ).render()
+
+    observed = [
+        line
+        for line in document.splitlines()
+        if line.startswith("- Fragments observed:")
+    ]
+    census = [line for line in document.splitlines() if line.startswith("- Fragments:")]
+    assert observed == ["- Fragments observed: 1 (last 28 days)"], (
+        f"the snapshot counted a fragment the census refused.\n\n{observed}"
+    )
+    assert census == ["- Fragments: 1"], (
+        f"the census moved instead of the snapshot.\n\n{census}"
+    )
+    assert "withdrawal" not in document, (
+        "the dominant phase was decided by an out-of-root fragment; the "
+        "phase name is attacker-controlled free text through this channel."
+    )
+
+
+def test_no_wavelength_figure_carries_information_about_a_refused_file(
+    tmp_path: Path,
+) -> None:
+    """The direction pin, and a ratio needs the control to settle it.
+
+    Every other guard in #1794 makes a listing shorter, and "emits less" is
+    then self-evident. This one feeds RATIOS: guarding it moved
+    ``Medicine share`` from ``50.0%`` **up** to ``100.0%``. Up is not by itself
+    wrong, and no assertion about the direction of a percentage could say so.
+    What settles it is the control — the same vault with the link never
+    created — and the rendered documents must be equal on every wavelength
+    line, because that is what "this figure knows nothing about the refused
+    file" means.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    prefixes = ("- Phase:", "- Mode:", "- Fragments observed:", "- Medicine share:")
+
+    def _lines(*, planted: bool) -> list[str]:
+        """Render one arm and keep its wavelength lines."""
+        vault = _wavelength_vault(tmp_path / ("p" if planted else "c"), planted=planted)
+        document = StateReportGenerator(
+            vault,
+            today=date(2026, 9, 9),
+            override=PrivacyTierOverride.ALL,
+        ).render()
+        return [line for line in document.splitlines() if line.startswith(prefixes)]
+
+    planted_lines = _lines(planted=True)
+    control_lines = _lines(planted=False)
+
+    assert planted_lines, "no wavelength line rendered, so this pin measures nothing."
+    assert planted_lines == control_lines, (
+        "a wavelength figure differs between a vault holding the escaping "
+        "link and one that never had it, so the figure carries information "
+        f"about a file the walk refused.\n\n{planted_lines}\n{control_lines}"
+    )
+
+
+def test_the_read_gate_serves_no_snapshot_built_from_an_out_of_root_file(
+    tmp_path: Path,
+) -> None:
+    """End to end through the real gate, because the stamp is what decides.
+
+    ``_content_tier`` reduces over ``_TierIndex.content_tiers``, to which
+    ``## Wavelength snapshot`` contributes **nothing**. So when this lane's
+    guard removed the last thread/eddy contributor, the stamp fell to ``open``
+    over a snapshot still aggregating an out-of-root ``intimate`` fragment, and
+    a report the base refused at ``ceiling=open`` was served. Measured, and it
+    is why ``wavelength.load_fragments_from_vault`` is guarded rather than the
+    stamp being patched: appending ``INTIMATE`` whenever ``link_tiers_unproven``
+    is ceiling-independent and would turn lane 1's recoverable outage into a
+    permanent one.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _wavelength_vault(tmp_path, planted=True)
+    thread = _write(
+        tmp_path / "outside" / "thread.md",
+        _thread_note("THREAD-PLANTED", _PLANTED_TITLE, _PLANTED_DESCRIPTION),
+    )
+    (vault / "02-Threads" / "zzz-evil.md").symlink_to(thread)
+
+    StateReportGenerator(
+        vault,
+        today=date(2026, 9, 9),
+        override=PrivacyTierOverride.ALL,
+    ).write()
+    served = state_read_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    content = str(served.get("content", ""))
+    assert served.get("status") == "ok", (
+        "the artifact is no longer readable at ceiling=open. That is not this "
+        "pin's subject, but it means the assertion below proves nothing — "
+        f"re-derive both.\n\n{served.get('status')}"
+    )
+    assert "- Fragments observed: 1 (last 28 days)" in content, (
+        f"the served snapshot counted an out-of-root fragment.\n\n{content}"
+    )
+    assert "withdrawal" not in content and "Toxic share: 0.0%" in content, (
+        "the served document carries a phase or dosage share derived from a "
+        f"file outside the vault.\n\n{content}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# STEP 12 — the capped sections, where "a skip drops a row" is not the rule
+# ---------------------------------------------------------------------------
+
+
+def test_a_skip_promotes_the_next_record_into_a_capped_section(
+    tmp_path: Path,
+) -> None:
+    """On a corpus past the cap a skip does not shorten the section, it PROMOTES.
+
+    ``## Active threads`` is capped at :data:`~creek.generate.state._TOP_N` and
+    ``## Suggested questions`` at five, so dropping the escaping record frees a
+    slot and the next-ranked in-root thread takes it — carrying its own title
+    and id, which is vault prose rather than the enum-label row the one-thread
+    fixture happens to promote.
+
+    That is not an inversion, and the control is what proves it: the guarded
+    render of the planted vault is identical to the render of the same vault
+    with the link never created, so the promoted row is exactly what an
+    untampered vault would have printed.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+
+    def _sections(*, planted: bool) -> list[str]:
+        """Render both capped sections for one arm."""
+        root = tmp_path / ("p" if planted else "c")
+        vault = root / "vault"
+        for n in range(12):
+            _write(
+                vault / "02-Threads" / f"t{n:02d}.md",
+                _thread_note(f"THREAD-{n:02d}", f"Legit thread {n:02d}", "d").replace(
+                    "fragment_count: 99", f"fragment_count: {50 - n}"
+                ),
+            )
+        if planted:
+            target = _write(
+                root / "outside" / "evil.md",
+                _thread_note("THREAD-EVIL", _PLANTED_TITLE, _PLANTED_DESCRIPTION),
+            )
+            (vault / "02-Threads" / "zzz-evil.md").symlink_to(target)
+        generator = StateReportGenerator(
+            vault,
+            today=date(2026, 9, 9),
+            override=PrivacyTierOverride.ALL,
+            current_phase="rising",
+        )
+        return [
+            generator.section_active_threads(),
+            generator.section_suggested_questions(),
+        ]
+
+    planted_sections = _sections(planted=True)
+    control_sections = _sections(planted=False)
+
+    rows = planted_sections[0].count("\n- ")
+    assert rows == 10, (
+        "the capped section did not render at its boundary, so this pin is "
+        f"not measuring a promotion.\n\n{planted_sections[0]}"
+    )
+    assert _markers_in("\n".join(planted_sections)) == [], (
+        f"out-of-root prose survived into a capped section.\n\n{planted_sections}"
+    )
+    assert planted_sections == control_sections, (
+        "a capped section differs between a vault holding the escaping link "
+        "and one that never had it, so the promotion carries information "
+        f"about the refused record.\n\n{planted_sections}\n{control_sections}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# STEP 13 — the four readers the first pass missed, three of which WRITE
+# ---------------------------------------------------------------------------
+
+_SHARED_TAG = "shared"
+
+
+def _tagged_thread(tid: str, title: str, status: str, tags: tuple[str, ...]) -> str:
+    """Return a thread note carrying *tags* and *status*.
+
+    Args:
+        tid: The thread's ``id``.
+        title: The thread's ``title``.
+        status: ``active`` or ``resolved``; the compost scan splits on it.
+        tags: Tag values for the tag garden to harvest.
+
+    Returns:
+        The complete markdown document.
+    """
+    body = "".join(f"  - {tag}\n" for tag in tags)
+    return (
+        "---\n"
+        "type: thread\n"
+        f"id: {tid}\n"
+        f"title: {title}\n"
+        f"status: {status}\n"
+        "first_seen: 2020-01-01\n"
+        "last_seen: 2020-01-01\n"
+        "fragment_count: 3\n"
+        "description: d\n"
+        f"tags:\n{body}"
+        "---\n\nbody\n"
+    )
+
+
+def _writer_vault(tmp_path: Path, *, planted: bool) -> Path:
+    """Build a vault for the three writing consumers, with or without the plant.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        planted: Whether ``02-Threads`` holds two escaping thread links.
+
+    Returns:
+        The vault root.
+    """
+    root = tmp_path / ("planted" if planted else "control")
+    vault = root / "vault"
+    _write(
+        vault / "01-Fragments" / "a.md",
+        "---\ntype: fragment\nid: FRAG-A\ntitle: Fragment A\n"
+        "privacy_tier: open\nsource:\n  platform: journal\n  kind: writing\n"
+        "captured: 2026-01-01\ncreated: 2026-01-01T00:00:00Z\n"
+        f"tags:\n  - {_SHARED_TAG}\n---\n\nA body.\n",
+    )
+    _write(
+        vault / "02-Threads" / "legit.md",
+        _tagged_thread(_LEGIT_THREAD_ID, "Legit thread", "active", (_SHARED_TAG,)),
+    )
+    (vault / "03-Eddies").mkdir(parents=True, exist_ok=True)
+    (vault / "04-Praxis").mkdir(parents=True, exist_ok=True)
+    if planted:
+        active = _write(
+            root / "outside" / "active.md",
+            _tagged_thread(
+                "THREAD-PLANTEDACTIVE",
+                _PLANTED_TITLE,
+                "active",
+                ("PLANTED-1794-TAG", _SHARED_TAG),
+            ),
+        )
+        dormant = _write(
+            root / "outside" / "dormant.md",
+            _tagged_thread("THREAD-PLANTEDDORMANT", _PLANTED_TITLE, "resolved", ("x",)),
+        )
+        (vault / "02-Threads" / "zz-active.md").symlink_to(active)
+        (vault / "02-Threads" / "zz-dormant.md").symlink_to(dormant)
+    return vault
+
+
+def test_the_compost_scan_never_materialises_an_out_of_root_thread(
+    tmp_path: Path,
+) -> None:
+    """``creek compost scan`` WRITES, so an unguarded walk is a durable leak.
+
+    ``_load_threads`` feeds :func:`~creek.generate.compost_scan.run_compost_scan`,
+    which turns a dormant thread into ``10-Liminal/Compost/<date>-<title>.md``.
+    Measured before the guard: a thread symlinked out of ``02-Threads`` was
+    written into the vault under its own out-of-root title, on the same run
+    where ``creek state`` and ``creek skills`` refused it. That is strictly
+    more durable than the SKILL-filename write this lane already cites.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _writer_vault(tmp_path, planted=True)
+
+    run_compost_scan(
+        vault,
+        similarity_fn=lambda _s: 0.0,
+        config=CompostConfig(),
+        verifier=None,
+        now=datetime(2026, 9, 9, tzinfo=UTC),
+        dry_run=False,
+    )
+
+    written = sorted(p.name for p in (vault / "10-Liminal" / "Compost").glob("*.md"))
+    assert written, (
+        "the scan wrote nothing at all, so 'no planted note' would pass for "
+        "the wrong reason."
+    )
+    assert not any(_PLANTED_TITLE in name for name in written), (
+        f"an out-of-root thread was materialised into the vault.\n\n{written}"
+    )
+
+
+def test_the_compost_report_never_lists_an_out_of_root_thread(
+    tmp_path: Path,
+) -> None:
+    """``_Compost-Report.md`` renders one row per active thread.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _writer_vault(tmp_path, planted=True)
+
+    report = CompostTracker().generate_compost_report(vault).read_text(encoding="utf-8")
+
+    assert "Legit thread" in report, (
+        f"the in-root thread stopped rendering.\n\n{report}"
+    )
+    assert _markers_in(report) == [], (
+        f"an out-of-root thread reached _Compost-Report.md.\n\n{report}"
+    )
+
+
+def test_the_tag_garden_publishes_no_tag_from_an_out_of_root_note(
+    tmp_path: Path,
+) -> None:
+    """The tag scan crosses five corpora and writes what it finds to disk.
+
+    ``creek report tags`` writes ``00-Creek-Meta/Tag-Garden.md``, which
+    ``creek lint``'s tag check then surveys at ``PrivacyTierOverride.ALL`` and
+    ``creek state`` appends verbatim under ``## Lint summary``. So a tag that
+    exists only outside the vault reached a rendered report through the same
+    ``02-Threads`` symlink this lane's other guards refuse.
+
+    **Direction needs the control, not the row count.** A shared tag whose
+    count falls from 2 to 1 tips into the "single use" orphan list, so the
+    garden can GAIN a section when a note is dropped. That is not information
+    about the refused file — the never-planted vault gains the same section —
+    which is why this asserts equality against the control rather than
+    monotonicity.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    planted = TagGardenGenerator(
+        _writer_vault(tmp_path, planted=True),
+        override=PrivacyTierOverride.ALL,
+    )
+    control = TagGardenGenerator(
+        _writer_vault(tmp_path, planted=False),
+        override=PrivacyTierOverride.ALL,
+    )
+
+    assert planted.scan_tags().tag_counts == control.scan_tags().tag_counts, (
+        "the tag scan counted an out-of-root note.\n\n"
+        f"{planted.scan_tags().tag_counts}\n{control.scan_tags().tag_counts}"
+    )
+    planted_rows = [
+        line
+        for line in planted.generate_garden().read_text(encoding="utf-8").splitlines()
+        if not line.startswith("generated:")
+    ]
+    control_rows = [
+        line
+        for line in control.generate_garden().read_text(encoding="utf-8").splitlines()
+        if not line.startswith("generated:")
+    ]
+    assert planted_rows == control_rows, (
+        "the written Tag-Garden.md differs between a vault holding the "
+        "escaping link and one that never had it."
+    )
+
+
+def test_the_orphan_check_never_reports_an_out_of_root_page(
+    tmp_path: Path,
+) -> None:
+    """``_stems_in`` builds the REPORTED set, so a skip emits less.
+
+    The distinction from ``creek.clean.hygiene`` is the whole ruling: there,
+    the corpus is the *source* side of a link survey and dropping a record
+    makes the broken-link count go UP (measured 0 -> 1), so it stays
+    unguarded. Here the corpus is the *candidate* side and a skip removes a
+    finding.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _writer_vault(tmp_path, planted=True)
+
+    findings = orphan_compiled.run(vault).findings
+
+    assert any("legit.md" in finding for finding in findings), (
+        f"the in-root page stopped being a candidate.\n\n{findings}"
+    )
+    assert not any("zz-" in finding for finding in findings), (
+        f"an out-of-root page was reported as an orphan candidate.\n\n{findings}"
     )

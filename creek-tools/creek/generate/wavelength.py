@@ -23,11 +23,12 @@ from typing import TYPE_CHECKING, Final
 import frontmatter
 from pydantic import ValidationError
 
+from creek._containment import iter_contained
 from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 from creek.hierarchy import LevelPolicy, select_by_policy
 from creek.models import Dosage, Fragment, Frequency, Mode, Phase
 from creek.time import effective_authored_date
-from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
+from creek.vault.reader import FRAGMENT_SKIP_NOUN, FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from enum import StrEnum
@@ -227,6 +228,36 @@ def load_fragments_from_vault(
             ``test_production_report_callers_always_state_an_override``
             enforces structurally.
 
+    **Containment (#1794).** The walk goes through
+    :func:`creek._containment.iter_contained`, and it is the THIRD reader of
+    ``01-Fragments`` — after :func:`creek.vault.reader.iter_vault_fragments`
+    and :func:`creek.generate.state._read_fragment_files`, both guarded — not
+    the second, as ``docs/security/threat-model.md`` said until this issue.
+
+    **It is guarded because the state report's stamp cannot see it.**
+    ``## Wavelength snapshot`` renders ``fragment_count``, the dominant
+    ``phase`` name, ``confidence`` and the medicine/toxic shares, and
+    :meth:`creek.generate.state.StateReportGenerator._content_tier` reduces over
+    ``_TierIndex.content_tiers``, to which this summary contributes **nothing**.
+    So an unguarded walk here rendered a per-tier count — which
+    :meth:`~creek.generate.state.StateReportGenerator.section_wavelength_snapshot`
+    already argues *is* content — over an out-of-root ``intimate`` fragment
+    with nothing on the stamp to answer for it, on a page whose guarded census
+    reported one fewer fragment than this line counted. Measured end to end
+    through ``creek_mcp.tools.state_read``: a report that the base refused at
+    ``ceiling=open`` was served, carrying
+    ``- Phase: **withdrawal** (confidence 0.75)`` and
+    ``- Toxic share: 75.0%`` derived entirely from files outside the vault.
+
+    **Direction, and it is not the obvious one.** Every other guard in #1794
+    makes a *listing* shorter; this one feeds RATIOS, and a share can go **up**
+    when a fragment is dropped. That is still safe, and the pin proves it the
+    only way that settles a ratio: the guarded render of a vault holding the
+    planted link is compared byte for byte against the render of the same vault
+    with the link never created. They are identical, so no figure here carries
+    information about a file the walk refused — the numbers change, and they
+    change to exactly what an untampered vault would have printed.
+
     Returns:
         Every admitted fragment, in sorted on-disk order.
     """
@@ -234,7 +265,11 @@ def load_fragments_from_vault(
     if not root.exists():
         return []
     fragments: list[Fragment] = []
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(
+        root,
+        sorted(root.rglob("*.md")),
+        what=FRAGMENT_SKIP_NOUN,
+    ):
         post = _safe_post(md_file)
         if post is None:
             continue

@@ -45,7 +45,9 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import ValidationError
 
+from creek._containment import iter_contained
 from creek.classify.privacy_filter import raw_privacy_tier
+from creek.generate.compile_routing import THREAD_SKIP_NOUN
 from creek.generate.compost import (
     CANONICAL_RELDIR,
     CompostTracker,
@@ -217,12 +219,38 @@ def _load_fragments(vault_path: Path) -> tuple[list[Fragment], dict[str, str]]:
 
 
 def _load_threads(vault_path: Path) -> list[Thread]:
-    """Load every thread under ``02-Threads``, skipping unparseable notes."""
+    """Load every thread under ``02-Threads``, skipping unparseable notes.
+
+    **Containment (#1794).** Guarded by
+    :func:`creek._containment.iter_contained`, sharing
+    :data:`~creek.generate.compile_routing.THREAD_SKIP_NOUN` with the other
+    readers of this root so the operator reads one word for one event.
+
+    This walk **writes**, which is why it could not be left for a later lane:
+    :func:`run_compost_scan` turns a dormant thread into a durable
+    ``10-Liminal/Compost/<date>-<title>.md`` note carrying the thread's title
+    and ``original_thread`` back-reference. Measured before the guard, a thread
+    symlinked out of ``02-Threads`` was materialised into the vault under its
+    own out-of-root title — while ``creek state``, ``creek draft`` and
+    ``creek skills`` had already refused the same file. That is the #1079
+    divergence completing into a written artifact.
+
+    **Direction: listed, never reduced.** Each surviving thread yields at most
+    one candidate and at most one note; ``CompostTracker``'s suppressor set
+    (``withheld_thread_titles``) is built from the *fragment* corpus, not from
+    this one, so a skip here removes candidates and suppresses nothing.
+    Measured against the control — the same vault with the link never created —
+    the written notes and the report rows are identical.
+    """
     root = vault_path / _THREADS_RELDIR
     if not root.exists():
         return []
     threads: list[Thread] = []
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(
+        root,
+        sorted(root.rglob("*.md")),
+        what=THREAD_SKIP_NOUN,
+    ):
         post = _safe_post(md_file)
         if post is None:
             continue

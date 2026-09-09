@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek._containment import iter_contained
 from creek.classify.privacy_filter import tier_of
+from creek.generate.compile_routing import THREAD_SKIP_NOUN
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import (
     Confidence,
@@ -1051,11 +1053,29 @@ class CompostTracker:
         :meth:`_load_existing_compost_notes`: the two run in one pass from
         :meth:`generate_compost_report`, and a report that dies on one bad
         thread note is no more use than one that dies on a bad compost note.
+
+        **Containment (#1794).** Guarded by
+        :func:`creek._containment.iter_contained`, which is why the glob is
+        handed to it rather than iterated directly. The glob is FLAT, not
+        ``rglob``, and that matters to the guard's reach: ``rglob``'s ``**``
+        refuses to descend a symlinked child directory, but a flat glob is
+        handed whatever the directory holds, so a symlinked *subfolder* is not
+        an issue here only because a flat glob never looks inside one.
+
+        Like :func:`creek.generate.compost_scan._load_threads` this feeds a
+        durable write — ``_Compost-Report.md`` renders each active thread as
+        ``- [[<id>|<title>]]`` — so an unguarded walk published an out-of-root
+        thread's title into the vault. Direction is a listing: one row per
+        surviving thread, measured against the never-planted control.
         """
         if not threads_dir.exists():
             return []
         active: list[tuple[str, str]] = []
-        for md_file in sorted(threads_dir.glob("*.md")):
+        for md_file in iter_contained(
+            threads_dir,
+            sorted(threads_dir.glob("*.md")),
+            what=THREAD_SKIP_NOUN,
+        ):
             try:
                 post = frontmatter.load(str(md_file))
             except FRONTMATTER_LOAD_ERRORS:
