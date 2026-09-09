@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, TypeVar
 import frontmatter
 from pydantic import BaseModel, ValidationError
 
+from creek._containment import iter_contained
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     tier_of,
@@ -753,11 +754,37 @@ def _collect_fragments(
 def _collect_typed(
     root: Path, *, expected_type: str, model_cls: type[_ModelT]
 ) -> list[_ModelT]:
-    """Load validated *model_cls* records from markdown files under *root*."""
+    """Load validated *model_cls* records from markdown files under *root*.
+
+    **Containment (#1794).** Guarded by
+    :func:`creek._containment.iter_contained`, with *expected_type* as the skip
+    noun so it can never name a corpus this call was not pointed at — the same
+    derivation :func:`creek.generate.state._load_typed_models` uses over the
+    same two roots.
+
+    That agreement is the whole reason the guard is here rather than in a later
+    lane. :mod:`creek.generate.state_tiers`' module docstring names the failure
+    exactly: *"an eddy the state report withholds at ceiling=open and the voice
+    skill tree emits is not a difference of opinion, it is a leak."* Measured
+    on one vault: before #1794 both readers admitted an eddy symlinked out of
+    ``03-Eddies``; guarding ``state`` alone left this reader emitting it, and
+    this generator does not merely render a title — it slugifies it into a
+    SKILL **filename** that ``creek.skills.refresh`` writes to disk and hands
+    back in ``skill_paths``, so the divergence would be durable.
+
+    **Direction: listed, never reduced.** Each surviving record yields at most
+    one skill file. The tier evidence these records are admitted against comes
+    from :func:`_member_tiers` over the *fragment* corpus, which this walk does
+    not touch, so a skip here removes a skill and lowers nothing.
+    """
     if not root.exists():
         return []
     collected: list[_ModelT] = []
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(
+        root,
+        sorted(root.rglob("*.md")),
+        what=expected_type,
+    ):
         model = _load_typed_model(
             md_file, expected_type=expected_type, model_cls=model_cls
         )

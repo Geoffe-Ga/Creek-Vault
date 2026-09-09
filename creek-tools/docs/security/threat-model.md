@@ -286,6 +286,66 @@ from most to least likely:
   `## Vault summary` eddy and thread counts carry an unevaluated marker rather
   than a bare `0`, because a zero asserts "evaluated against complete evidence
   and none surfaced" exactly as silence does.
+- **The `02-Threads` / `03-Eddies` walks are guarded, and the corpus has
+  seven readers rather than three (#1794).** `Thread` and `Eddy` carry **no
+  `privacy_tier` field**, so unlike a fragment there is no tier gate behind
+  these walks — the walk is the whole gate, and `title` and `description` are
+  bare `str` with no pattern and no length bound. Seven readers of those two
+  roots now share `creek._containment.iter_contained`:
+  `generate/drafts.py::_load_threads_by_id` and `::_load_eddies_by_id`,
+  `generate/state.py::_load_typed_models` (which also covers `04-Praxis`),
+  `generate/mining.py::_load_typed`, `generate/skills.py::_collect_typed`, and
+  `generate/compile_routing.py::_load_pages` and `::_load_names`. The issue
+  enumerated the first four; the last three were found by measurement and are
+  the reason the guard is worth having:
+
+  - **The compiled layer is asked first.**
+    `DraftGenerator._compose_thread_section` consults the compiled index and
+    only falls back to the frontmatter loader on a miss, so guarding the
+    fallback alone left the same planted note reachable by writing
+    `type: compiled_page` instead of `type: thread` — and that header renders
+    the page **body**, not merely a `description`.
+  - **The compiled arm was the one route not blocked from cloud egress.** A
+    frontmatter fallback fires only on a compiled miss, and the same miss is
+    reported `opaque` by `compile_routing.compiled_source_ids` off the same
+    index, which both draft surfaces fail closed to `INTIMATE` on. A planted
+    *compiled page* has no miss to report: its `provenance` is
+    attacker-chosen, so it could name an `open` fragment and clear its own
+    out-of-root body for a cloud provider. Measured
+    `opaque=False, fragment_ids=('FRAG-OPEN',)` before, `opaque=True` after.
+  - **The voice skill tree reads the same two roots.**
+    `generate/state_tiers.py` names the failure condition — "an eddy the state
+    report withholds at `ceiling=open` and the voice skill tree emits is not a
+    difference of opinion, it is a leak" — and guarding `state` alone produced
+    exactly that, measured. `generate/skills.py` slugifies an eddy title into a
+    SKILL **filename** written to disk, so the divergence would have been
+    durable.
+
+  The by-id loaders collapse **last-wins** in `sorted()` on-disk order, which
+  is what made the id an aim rather than a guess: a planted note sorting after
+  a legitimate one and declaring that record's id *replaced* it, for an id a
+  legitimate seed already names — reproduced end to end into a composed prompt,
+  with no mining step. The residuals from the `10-Liminal` entry above apply
+  here unchanged and are not closed: a **symlinked corpus root** makes every
+  leaf guard inert, and a **hard link** is invisible to any `lstat`-based
+  predicate.
+
+- **`generate/skills.py::_read_all_fragments` stays UNGUARDED, and that is a
+  ruling (#1794).** It is the last unguarded reader of `01-Fragments`, and a
+  naive guard there is the #1793 inversion rather than a fix: that corpus
+  supplies the exemplar bodies *and*, through `skills._member_tiers`, the
+  evidence every thread and eddy title is admitted against. The reduction is a
+  MAXIMUM, so dropping the refused fragment **lowers** it. Measured on a vault
+  whose only `intimate` member of an eddy is the escaping note: the skill tree
+  goes from emitting no eddy at `ceiling=open` to writing a skill file named
+  after it. The consequence is a **live divergence** with
+  `state._read_fragment_files`, which does drop it — an out-of-root fragment's
+  body is still exemplar-eligible for the skill tree. Closing it needs the
+  split-plus-unproven mechanism `state._read_fragment_files` carries, whose
+  availability cost is filed as #1796; it is not a one-line guard, and
+  `tests/test_thread_and_eddy_containment.py` pins the direction so a later
+  change cannot add one silently.
+
 - **Audit log integrity.** Every purge and redaction-apply writes a
   structured entry to `<vault>/00-Creek-Meta/audit/`. The integrity
   story (hash chaining, tamper-evidence) is the subject of SEC-005;

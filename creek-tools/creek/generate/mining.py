@@ -590,11 +590,35 @@ def _load_typed(
     type_tag: str,
     cls: type[_ModelT],
 ) -> list[_ModelT]:
-    """Load validated model instances with the given ``type`` tag."""
+    """Load validated model instances with the given ``type`` tag (#1794).
+
+    **Containment.** Guarded by :func:`creek._containment.iter_contained`,
+    with ``type_tag`` as the skip noun for the reason
+    :func:`creek.generate.state._load_typed_models` records.
+
+    **This guard does nothing for the state report, and that is not why it is
+    here.** :meth:`creek.generate.state.StateReportGenerator._mining_corpus`
+    replaces ``MiningSnapshot.threads`` / ``.eddies`` outright with the lists
+    ``state._load_typed_models`` produced, so ``## Suggested questions`` is
+    protected there, not here. What this guard protects is the *standalone*
+    miner, whose reach is a draft prompt rather than a terminal:
+    :meth:`IdeaMiner._seed_from_thread` puts ``thread.title`` verbatim into
+    :attr:`IdeaSeed.title` and ``thread.id`` into
+    :attr:`IdeaSeed.brief_description`, and
+    :meth:`IdeaMiner._seed_from_liminal` puts ``eddy.title`` into the seed
+    title — all three of which ``creek draft`` and ``creek_mcp.tools.draft``
+    interpolate into the composed prompt's ``## Ask`` block.
+
+    **Direction: listed, not reduced.** Each surviving record contributes at
+    most one candidate seed, so a skip strictly shrinks the seed list; the
+    diagnostics it also feeds are a count, a ``max(..., default=0)`` and a
+    fixed ``fallback_reason`` string, none of which carry vault prose.
+    Measured at :meth:`IdeaMiner.mine_thread_terminus`.
+    """
     if not root.exists():
         return []
     collected: list[_ModelT] = []
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(root, sorted(root.rglob("*.md")), what=type_tag):
         post = _safe_post(md_file)
         if post is None:
             continue
