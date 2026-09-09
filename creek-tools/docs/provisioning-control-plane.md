@@ -133,3 +133,77 @@ its one live job, so two API processes cannot create two billable allocations.
 Each requester/subject pair may retain at most 256 activation aliases. Existing
 aliases remain idempotent after the limit is reached; an additional distinct
 alias is rejected with `409`.
+
+## Fleet telemetry and the reference cost model
+
+`creek_mcp.provisioning.telemetry.FleetTelemetry` is a library surface, not an
+endpoint. `/control/v1` carries exactly four consumer paths and one bearer, so a
+fleet-wide aggregate served there would be cross-consumer data; telemetry is for
+the operator who pays the provider invoice and is composed in operator tooling
+instead. One `observe()` call reads the provider once, writes nothing durable,
+mutates nothing, and returns a `FleetTelemetrySnapshot` in which every figure is
+a `Meter(value, quality)`.
+
+`Meter` cannot be constructed with a value and a quality that disagree: a figure
+is present if and only if its quality is not `unavailable`. That makes the one
+failure mode worth naming impossible rather than merely discouraged — a meter
+nobody could read must never look like a meter read and found compliant. The
+combinator behind every provider-sourced figure applies five arms:
+
+| Situation | Reported |
+|---|---|
+| contributors exist, none readable | `unavailable` (no value) |
+| nothing observed and enumeration incomplete | `unavailable` (no value) |
+| some readable, or enumeration incomplete | `estimated` **lower bound** |
+| all readable and enumeration complete | `exact` |
+| zero contributors and enumeration complete | `exact` 0 — the only legitimate zero |
+
+Two figures deserve a caveat before anyone reconciles them against an invoice.
+
+*Machine seconds are instantaneous and a lower bound.* The only clock the Fly
+Machines API offers is `updated_at`, which any provider-side write resets, so a
+Machine that has run for a week but was touched an hour ago reads as an hour.
+The figure is therefore always `estimated`, including when it is 0, and it
+describes this instant — it is **not** a billing-period total. An accumulated
+figure would need persisted samples and a sampler process, which is deliberately
+not in this slice. Running Machines whose clock could not be read at all are
+named in `unmetered_running` rather than folded into the number.
+
+*Egress is unavailable.* Fly meters bytes out on its billing surface, not the
+Machines API. `EgressMeter` is a separate injected boundary so an operator can
+supply the figure from an invoice export; the shipped `UnavailableEgressMeter`
+answers honestly rather than reporting zero.
+
+### The reference cost model is a guardrail, not code
+
+ADR-0013 Decision 4 names "operations documentation and billing tests" as the
+only two homes for its reference prices, so they are recorded here and in
+`tests/test_fleet_telemetry.py` — and nowhere in `creek/` or `creek_mcp/`.
+`FleetPriceTable` has **no default on any field**: a cost cannot be produced
+without an operator supplying every price, the monthly budget, the hours-per-month
+basis and the GB-to-bytes conversion base.
+
+Decision 4's published assumptions, from Fly.io prices dated 2026-09-06:
+
+| Input | Value |
+|---|---|
+| `volume_gb_month` | `$0.15` (the ADR's `$0.75` for a 5 GB volume) |
+| `stopped_rootfs_gb_month` | `$0.15` per GB, times the stopped fraction |
+| `running_machine_hour` | `$0.0082` for shared-cpu-1x |
+| `hours_per_month` | `720` |
+| `egress_gb`, `snapshot_gb_month` | not published by the ADR; operator-supplied |
+
+At a 720-hour month those inputs reproduce four of the ADR's five published
+per-user figures exactly: `$0.90` fully stopped, `$0.94` at ten running minutes
+a day, `$1.14` at one running hour a day and `$1.86` at four running hours a day.
+
+**The ADR's fifth figure is arithmetically unreachable.** Continuously started
+comes to `$6.6540` at 720 hours and `$6.7360` at 730; the published `$6.67`
+implies 721.95 hours. The billing test pins `$6.65` and does **not** tune
+`hours_per_month` to make `$6.67` pass — doing so would smuggle a hard-coded
+business assumption into the one number nobody checks, which is precisely what
+Decision 4 forbids. Treat `$6.67` in ADR-0013 as an error pending correction.
+
+Nothing in the telemetry module compares a meter to `monthly_budget`. The budget
+is configuration this slice records so that alarms, when they land, evaluate an
+operator-set threshold rather than a number baked into the control plane.
