@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Final
 import frontmatter
 from pydantic import ValidationError
 
+from creek._containment import iter_contained
 from creek.models import CompiledPage
 from creek.vault.links import declared_names, read_header_meta
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
@@ -40,6 +41,44 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
+
+
+THREAD_SKIP_NOUN: str = "thread"
+"""Operator-facing noun for a containment skip under ``02-Threads`` (#1794).
+
+Three loaders read that one root — :func:`_load_pages` / :func:`_load_names`
+here, :func:`creek.generate.drafts._load_threads_by_id`, and the generic
+:func:`creek.generate.state._load_typed_models` /
+:func:`creek.generate.mining._load_typed`. The generic pair derive the noun
+from their own ``type_tag``, which is the same string by construction and
+cannot drift from the corpus they were pointed at;
+``test_thread_and_eddy_containment.py`` pins that the two spellings agree.
+The literal callers share this constant so the operator reads one word for one
+event whichever tool logged it.
+"""
+
+EDDY_SKIP_NOUN: str = "eddy"
+"""Operator-facing noun for a containment skip under ``03-Eddies`` (#1794).
+
+The ``03-Eddies`` twin of :data:`THREAD_SKIP_NOUN`; see there for why the
+generic loaders do not import it.
+"""
+
+PRAXIS_SKIP_NOUN: str = "praxis"
+"""Operator-facing noun for a containment skip under ``04-Praxis`` (#1794).
+
+The third corpus this issue covers, and the one the generic loaders reach
+through their own ``type_tag``; see :data:`THREAD_SKIP_NOUN` for why the
+literal callers import a constant while the generic ones derive it.
+"""
+
+COMPILED_PAGE_SKIP_NOUN: str = "compiled page"
+"""Operator-facing noun for a containment skip in the compiled layer (#1794).
+
+One noun for all three compiled roots (``02-Threads``, ``03-Eddies``,
+``06-Frequencies``) because what the operator lost is the *page*, not the
+surface it was filed under — the root is already named in the log line.
+"""
 
 
 COMPILE_GAPS_RELPATH: Path = Path("00-Creek-Meta/Processing-Log/compile-gaps.jsonl")
@@ -389,12 +428,25 @@ def _load_names(root: Path, target_kind: str) -> _NameIndex:
     Both compiled and linker-written pages are indexed here — knowing that
     ``[[Messages]]`` names a real eddy is what lets a gap be reported as
     ``uncompiled`` rather than falsely as ``missing``.
+
+    **Containment (#1794).** Guarded by
+    :func:`creek._containment.iter_contained` for the reason
+    :func:`_load_pages` records, and with the *same* root, so the two indexes
+    an escaping page could appear in are refused together: a name index that
+    still resolved an alias a dropped page claimed would send
+    :meth:`CompiledPageIndex.page_exists` on evidence
+    :meth:`CompiledPageIndex.thread` had already refused, and the compile-gap
+    reason would then read ``uncompiled`` for a page nothing in-root claims.
     """
     if not root.exists():
         return _NameIndex()
     pages = [
         (page_id, declared_names(meta))
-        for md_file in sorted(root.rglob("*.md"))
+        for md_file in iter_contained(
+            root,
+            sorted(root.rglob("*.md")),
+            what=COMPILED_PAGE_SKIP_NOUN,
+        )
         for meta in (read_header_meta(md_file),)
         for page_id in (_page_identity(meta, target_kind),)
         if page_id is not None
@@ -416,11 +468,35 @@ def _load_names(root: Path, target_kind: str) -> _NameIndex:
 
 
 def _load_pages(root: Path, target_kind: str) -> dict[str, CompiledPage]:
-    """Load every compiled page of *target_kind* under *root*."""
+    """Load every compiled page of *target_kind* under *root*.
+
+    **Containment (#1794).** This walk is guarded by
+    :func:`creek._containment.iter_contained`, and it is the *compile-first*
+    half of the thread/eddy corpus rather than an afterthought to it.
+    :meth:`creek.generate.drafts.DraftGenerator._compose_thread_section` asks
+    this index first and only falls back to
+    :func:`creek.generate.drafts._load_threads_by_id` on a miss, so guarding
+    the fallback alone would have left the primary path open to the same
+    planted note under a ``type: compiled_page`` header — and that header
+    renders strictly more: the page ``body``, not merely a ``description``.
+
+    Measured, it is also the one arm of this family that is **not** blocked
+    from cloud egress. A frontmatter fallback fires only on a compiled miss,
+    and that same miss is reported ``opaque`` by
+    :func:`compiled_source_ids` off this very index, which the draft surfaces
+    fail closed to ``INTIMATE`` on. A planted *compiled page* has no miss to
+    report: its ``provenance`` is attacker-chosen, so it can name an ``open``
+    fragment and route its own out-of-root body to a cloud provider. Dropping
+    it here restores the miss, and with it the ``opaque`` fail-closed.
+    """
     if not root.exists():
         return {}
     out: dict[str, CompiledPage] = {}
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(
+        root,
+        sorted(root.rglob("*.md")),
+        what=COMPILED_PAGE_SKIP_NOUN,
+    ):
         try:
             post = frontmatter.load(str(md_file))
         except FRONTMATTER_LOAD_ERRORS:

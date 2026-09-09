@@ -92,7 +92,7 @@ from creek.generate.wavelength import (
 from creek.hierarchy import select_by_policy
 from creek.models import Eddy, Fragment, Frequency, Praxis, PrivacyTier, Thread
 from creek.vault.links import read_header_meta
-from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
+from creek.vault.reader import FRAGMENT_SKIP_NOUN, FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -395,9 +395,58 @@ def _load_typed_models(
     DEBUG level rather than aborting the report — drift in a single
     fragment must not block the whole audit view.
 
+    **Containment (#1794).** The walk goes through
+    :func:`creek._containment.iter_contained`. This is the load-bearing walk
+    for ``creek state``'s thread and eddy sections:
+    :meth:`StateReportGenerator._mining_corpus` *replaces* the miner's threads
+    and eddies outright with the lists this function produced, so guarding
+    :func:`creek.generate.mining._load_typed` alone would not have protected
+    one line of the report.
+    :class:`~creek.models.Thread` and :class:`~creek.models.Eddy` carry no
+    ``privacy_tier`` field, so there is no tier gate behind this walk either;
+    measured at the base commit, a planted escaping note under ``02-Threads``
+    rendered its title in ``## Active threads`` and in
+    ``## Suggested questions`` at ``ceiling=open``.
+
+    **Direction, measured at every consumer, not inferred.** Unlike
+    :func:`_read_fragment_files` — whose corpus is read in two directions, and
+    where a naive guard *inverted* the property it was meant to protect — every
+    consumer of this one reads it as a **listing**:
+
+    * ``## Active eddies`` / ``## Active threads`` render one row per admitted
+      record — but both are CAPPED at :data:`_TOP_N` and
+      ``## Suggested questions`` at five, so "a skip drops a row" is the wrong
+      rationale on a corpus larger than the cap: a skip frees a slot and the
+      next-ranked record is PROMOTED into it, carrying its own title and id.
+      That is still safe, and the reason is not the row count. Every candidate
+      is drawn from ``self._state.threads`` / ``self._state.eddies``, already
+      cut by :func:`~creek.generate.state_tiers.admit_by_derived_tier`, and
+      ``content_tiers`` covers **all** admitted records rather than only the
+      rendered ones — so the stamp is a superset of the render at every cap,
+      and the promoted row is exactly what an untampered vault would have
+      printed. Measured against that control, not asserted.
+    * :meth:`StateReportGenerator._fragment_to_eddies` **intersects** each
+      fragment's wikilinks with these titles, so a skip can only shrink the
+      mapping and therefore only shrink ``## Hyperedges``.
+    * The stamp reduces :attr:`_TierIndex.content_tiers` with
+      :func:`~creek.generate.state_tiers.max_admitted_tier`, whose empty case
+      is ``OPEN``. Dropping a contributor to a maximum is the shape that
+      inverts — but not here, because the record dropped is the very thing
+      whose tier it contributed, so what remains rendered is still covered.
+      A thread's or eddy's tier is *derived* from the fragments naming it
+      (:func:`~creek.generate.state_tiers.derived_link_tiers`) and that
+      evidence is read by :func:`_read_fragment_files` over a different root,
+      which this skip does not touch.
+
     Args:
         root: Directory to walk recursively.
-        type_tag: Required ``type`` frontmatter value.
+        type_tag: Required ``type`` frontmatter value, and — because the two
+            are the same string by construction — the operator-facing noun for
+            a containment skip. Deriving the noun rather than importing
+            :data:`~creek.generate.compile_routing.THREAD_SKIP_NOUN` is what
+            keeps it from ever naming a corpus this call was not pointed at;
+            ``tests/test_thread_and_eddy_containment.py`` pins that the two
+            spellings agree.
         cls: Model class to validate each match against.
 
     Returns:
@@ -406,7 +455,7 @@ def _load_typed_models(
     if not root.exists():
         return []
     collected: list[_ModelT] = []
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(root, sorted(root.rglob("*.md")), what=type_tag):
         post = _safe_post(md_file)
         if post is None:
             continue
@@ -523,7 +572,7 @@ def _read_fragment_files(root: Path) -> _FragmentFiles:
     for md_file in iter_contained(
         root,
         sorted(root.rglob("*.md")),
-        what="fragment",
+        what=FRAGMENT_SKIP_NOUN,
         tally=tally,
     ):
         post = _safe_post(md_file)

@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek._containment import iter_contained
 from creek.classify.privacy_filter import tier_of
+from creek.generate.compile_routing import THREAD_SKIP_NOUN
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import (
     Confidence,
@@ -44,6 +46,18 @@ if TYPE_CHECKING:
     from creek.generate.compost_verifier import SupportsVerifyCompost
 
 logger = logging.getLogger(__name__)
+
+COMPOST_SKIP_NOUN: str = "compost note"
+"""Operator-facing noun for a containment skip under ``10-Liminal/Compost``.
+
+Shared by the two readers of that folder that LIST it —
+:meth:`CompostTracker._load_existing_compost_notes` here and
+:func:`creek.lint.checks.compost.run` — so the operator reads one word for one
+event whichever tool lost the note. The third reader,
+:func:`creek.generate.compost_scan.load_composted_source_ids`, is deliberately
+unguarded because its ids SUPPRESS rather than list, and so has no skip to
+name (#1794).
+"""
 
 CANONICAL_RELDIR: str = "10-Liminal/Compost"
 """Vault-relative folder holding confirmed compost notes.
@@ -1028,9 +1042,30 @@ class CompostTracker:
         note persists in ``10-Liminal/Compost/`` where it used to be
         clobbered — so this scan, which ``creek fill`` runs over the same
         folder, would newly crash on it. Same bug class as issue #1416.
+
+        **Containment (#1794), and this is the loader whose sibling shipped
+        without it.** :meth:`generate_compost_report` calls this and
+        :meth:`_load_active_threads` twenty lines apart into one rendered
+        file. Guarding only the second made ``_Compost-Report.md`` disagree
+        with itself: measured, ``## Active Threads`` refused the planted
+        thread and logged the skip while the note list above it published
+        ``- [[zz-planted|SECRET-OUT-OF-ROOT-COMPOST]]`` on the same page.
+
+        **Direction: a pure listing.** This is a private staticmethod whose
+        only consumer is :meth:`_render_report`, one row per surviving note.
+        The suppressor in this family is
+        :func:`creek.generate.compost_scan.load_composted_source_ids`, whose
+        ids are read through ``c.source_id not in seen`` — guarding THAT
+        would make ``run_compost_scan`` write MORE notes, so it stays
+        unguarded. Measured against a never-planted control, the report here
+        becomes byte-identical.
         """
         notes: list[tuple[str, str]] = []
-        for md_file in sorted(compost_dir.glob("*.md")):
+        for md_file in iter_contained(
+            compost_dir,
+            sorted(compost_dir.glob("*.md")),
+            what=COMPOST_SKIP_NOUN,
+        ):
             if md_file == report_path:
                 continue
             try:
@@ -1051,11 +1086,29 @@ class CompostTracker:
         :meth:`_load_existing_compost_notes`: the two run in one pass from
         :meth:`generate_compost_report`, and a report that dies on one bad
         thread note is no more use than one that dies on a bad compost note.
+
+        **Containment (#1794).** Guarded by
+        :func:`creek._containment.iter_contained`, which is why the glob is
+        handed to it rather than iterated directly. The glob is FLAT, not
+        ``rglob``, and that matters to the guard's reach: ``rglob``'s ``**``
+        refuses to descend a symlinked child directory, but a flat glob is
+        handed whatever the directory holds, so a symlinked *subfolder* is not
+        an issue here only because a flat glob never looks inside one.
+
+        Like :func:`creek.generate.compost_scan._load_threads` this feeds a
+        durable write — ``_Compost-Report.md`` renders each active thread as
+        ``- [[<id>|<title>]]`` — so an unguarded walk published an out-of-root
+        thread's title into the vault. Direction is a listing: one row per
+        surviving thread, measured against the never-planted control.
         """
         if not threads_dir.exists():
             return []
         active: list[tuple[str, str]] = []
-        for md_file in sorted(threads_dir.glob("*.md")):
+        for md_file in iter_contained(
+            threads_dir,
+            sorted(threads_dir.glob("*.md")),
+            what=THREAD_SKIP_NOUN,
+        ):
             try:
                 post = frontmatter.load(str(md_file))
             except FRONTMATTER_LOAD_ERRORS:

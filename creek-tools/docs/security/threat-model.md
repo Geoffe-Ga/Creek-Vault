@@ -286,6 +286,223 @@ from most to least likely:
   `## Vault summary` eddy and thread counts carry an unevaluated marker rather
   than a bare `0`, because a zero asserts "evaluated against complete evidence
   and none surfaced" exactly as silence does.
+- **The `02-Threads` / `03-Eddies` / `04-Praxis` walks are guarded, and the
+  corpus has at least FOURTEEN readers rather than the three the issue enumerates
+  (#1794).** The count was corrected twice: the issue said three, the first
+  pass measured seven, an AST census of `creek/` found four more, and focused
+  review then found two the census had missed — one because its root arrives as
+  a function parameter, one because it lives in `creek_mcp/`, outside the
+  census's declared scope. **This is a list, not an invariant**; see the
+  closing entry of this section for what is still unguarded and why the real
+  remedy is structural. `Thread` and
+  `Eddy` carry **no
+  `privacy_tier` field**, so unlike a fragment there is no tier gate behind
+  these walks — the walk is the whole gate, and `title` and `description` are
+  bare `str` with no pattern and no length bound. All fourteen now share
+  `creek._containment.iter_contained`:
+  `generate/drafts.py::_load_threads_by_id` and `::_load_eddies_by_id`,
+  `generate/state.py::_load_typed_models` (which also covers `04-Praxis`),
+  `generate/mining.py::_load_typed`, `generate/skills.py::_collect_typed`, and
+  `generate/compile_routing.py::_load_pages` and `::_load_names`,
+  `generate/compost_scan.py::_load_threads`,
+  `generate/compost.py::CompostTracker._load_active_threads`,
+  `generate/tags.py::TagGardenGenerator.scan_tags` (which crosses all five
+  `_SCAN_DIRS`), `lint/checks/orphan_compiled.py::_stems_in`,
+  `generate/compost.py::CompostTracker._load_existing_compost_notes` with its
+  `lint/checks/compost.py` twin, `creek_mcp/compiled_pages.py::_pages_under`,
+  and `generate/decisions.py::DecisionContextGatherer._iter_markdown` at its
+  `02-Threads` and `04-Praxis` call sites. The issue
+  enumerated four; the rest were found by measurement, and they are the reason
+  the guard is worth having:
+
+  - **Six of them WRITE.** `creek compost scan` materialised an out-of-root
+    thread into the vault as `10-Liminal/Compost/<date>-<title>.md`;
+    `creek fill --with-compost` listed both an out-of-root thread AND an
+    out-of-root compost note in `_Compost-Report.md`; `creek lint`'s compost
+    check counted the latter into
+    `00-Creek-Meta/Processing-Log/lint-<date>.md`; and `creek report tags`
+    published an out-of-root note's tag into `00-Creek-Meta/Tag-Garden.md`.
+    `creek state` appends the lint artifacts verbatim under `## Lint summary`,
+    so two of those writes then re-rendered inside the report. All are closed,
+    and the closure is asserted against a never-planted control rather than by
+    a marker scan — `_Compost-Report.md` in particular is built by TWO loaders
+    twenty lines apart, and guarding only one of them left a single rendered
+    file disagreeing with itself: `## Active Threads` refused the planted
+    thread while the note list above it published
+    `- [[zz-planted|SECRET-OUT-OF-ROOT-COMPOST]]`.
+
+  - **A sixth write is the decision note.**
+    `DecisionContextGatherer._find_related_threads` and `_find_relevant_praxis`
+    read `02-Threads` and `04-Praxis`, and `append_context_section` writes
+    their ids into a decision note's `## Context` as `- [[<id>]]`. Measured at
+    that writer before the guard: `- [[THREAD-PLANTED]]` and
+    `- [[PRAXIS-PLANTED]]` landed in the file on disk. Guarded, the note is
+    byte-identical to the never-planted control.
+
+  - **One of them is remote-facing and lives outside `creek/`.**
+    `creek_mcp/compiled_pages.py::_pages_under` reads `03-Eddies` and
+    `04-Praxis`, and `related_compiled` is reached by `creek.reflect` at
+    `TierCeiling.OPEN` — a member of `creek_mcp.policy.REMOTE_ADMITTED_CEILINGS`.
+    Measured: an eddy symlinked out of `03-Eddies` published its unbounded
+    `description`, including an embedded `## Ask` header, and a praxis
+    symlinked out of `04-Praxis` published its body excerpt. That module was
+    already half-guarded — its `_read_corpus` half goes through
+    `iter_vault_fragments`. It is also where this issue's own reader-agreement
+    property broke: once the `creek`-side guards landed, four readers of
+    `03-Eddies` refused the planted note while this one published it, so the
+    *disagreement* was created by the fix rather than by the bug.
+
+    **It also carries the subtlest direction result of this issue, and the one
+    most likely to mislead the next reader.** Guarding a walk can make a row
+    *appear*. `_eddy_pages` drops a title claimed by two pages as ambiguous, so
+    a planted symlink asserting a legitimate page's title made **both**
+    disappear; refusing the planted one restores the legitimate row. Measured,
+    the guarded output equals the never-planted control exactly, so this is the
+    repair of a small availability attack — plant a title collision and the
+    legitimate page vanishes — and not a #1793 escalation. It is the third
+    distinct way "a guard emits less" fails as a test, alongside the RATIO
+    (`Medicine share` 50% -> 100%, up and correct) and the CAPPED LIST (a freed
+    slot promotes the next record, carrying its own vault prose). All three are
+    why every direction claim in this issue is byte-compared against a vault
+    where the link was never created, rather than argued from the sign of a
+    change.
+
+  - **The compiled layer is asked first.**
+    `DraftGenerator._compose_thread_section` consults the compiled index and
+    only falls back to the frontmatter loader on a miss, so guarding the
+    fallback alone left the same planted note reachable by writing
+    `type: compiled_page` instead of `type: thread` — and that header renders
+    the page **body**, not merely a `description`.
+  - **The compiled arm was the one route not blocked from cloud egress.** A
+    frontmatter fallback fires only on a compiled miss, and the same miss is
+    reported `opaque` by `compile_routing.compiled_source_ids` off the same
+    index, which both draft surfaces fail closed to `INTIMATE` on. A planted
+    *compiled page* has no miss to report: its `provenance` is
+    attacker-chosen, so it could name an `open` fragment and clear its own
+    out-of-root body for a cloud provider. Measured
+    `opaque=False, fragment_ids=('FRAG-OPEN',)` before, `opaque=True` after.
+  - **The voice skill tree reads the same two roots.**
+    `generate/state_tiers.py` names the failure condition — "an eddy the state
+    report withholds at `ceiling=open` and the voice skill tree emits is not a
+    difference of opinion, it is a leak" — and guarding `state` alone produced
+    exactly that, measured. `generate/skills.py` slugifies an eddy title into a
+    SKILL **filename** written to disk, so the divergence would have been
+    durable.
+
+  The by-id loaders collapse **last-wins** in `sorted()` on-disk order, which
+  is what made the id an aim rather than a guess: a planted note sorting after
+  a legitimate one and declaring that record's id *replaced* it, for an id a
+  legitimate seed already names — reproduced end to end into a composed prompt,
+  with no mining step. The residuals from the `10-Liminal` entry above apply
+  here unchanged and are not closed: a **symlinked corpus root** makes every
+  leaf guard inert, and a **hard link** is invisible to any `lstat`-based
+  predicate.
+
+- **`generate/skills.py::_read_all_fragments` stays UNGUARDED, and that is a
+  ruling (#1794).** It is the last unguarded reader of `01-Fragments`, and a
+  naive guard there is the #1793 inversion rather than a fix: that corpus
+  supplies the exemplar bodies *and*, through `skills._member_tiers`, the
+  evidence every thread and eddy title is admitted against. The reduction is a
+  MAXIMUM, so dropping the refused fragment **lowers** it. Measured on a vault
+  whose only `intimate` member of an eddy is the escaping note: the skill tree
+  goes from emitting no eddy at `ceiling=open` to writing a skill file named
+  after it. The consequence is a live **escalation**, and calling it a
+  divergence understates it. Measured at `ceiling=open` on a vault where an
+  out-of-root `open` fragment names an eddy no in-root fragment names: the
+  planted file is the FIRST contributor to `max_source_tier`, so it replaces
+  that reduction's fail-closed `INTIMATE` with its own declared `open`, and
+  the skill tree gains `lonely-eddy.SKILL.md` on disk on the very run where
+  `creek state` withholds every eddy title. An out-of-root file vouching for a
+  vault title is what `creek/generate/state_tiers.py`'s module docstring calls
+  a leak. Separately, an out-of-root fragment's own body stays
+  exemplar-eligible for `## Exemplar Passages`. Both are present at the base
+  commit — #1794 neither creates nor widens them — and leaving them open is
+  the accepted cost of declining the one-line guard. Closing it needs the
+  split-plus-unproven mechanism `state._read_fragment_files` carries, whose
+  availability cost is filed as #1796; it is not a one-line guard, and
+  `tests/test_thread_and_eddy_containment.py` pins the direction so a later
+  change cannot add one silently.
+
+- **`## Wavelength snapshot` was a THIRD unguarded reader of `01-Fragments`,
+  and the state report's stamp cannot see it (#1794).** `creek state` renders
+  the dominant phase name, a fragment count, a confidence figure and the
+  medicine/toxic shares from
+  `generate/wavelength.py::load_fragments_from_vault`, and `_content_tier`
+  reduces over `_TierIndex.content_tiers`, to which that summary contributes
+  **nothing**. Two consequences, both measured:
+
+  - The entry above about `_read_fragment_files` said guarding it stopped one
+    rendered document disagreeing with itself. That was **incomplete**: with
+    the census guarded and this walk not, one page rendered
+    `- Fragments observed: 2` directly above `- Fragments: 1`, the larger
+    number computed over an out-of-root `intimate` fragment.
+  - Because those figures are unaccounted, removing the last thread/eddy
+    contributor to `content_tiers` dropped the stamp `intimate` -> `open`, and
+    a report `creek_mcp.tools.state_read` refused at `ceiling=open` was
+    served, carrying `- Phase: **withdrawal** (confidence 0.75)` and
+    `- Toxic share: 75.0%` derived entirely from files outside the vault. The
+    dominant phase name is attacker-controlled through this channel.
+
+  The walk is now guarded, which restores the agreement rather than patching
+  the stamp. Patching the stamp was tried and rejected on measurement:
+  appending `INTIMATE` whenever `link_tiers_unproven` is set is
+  ceiling-independent, so it yields `broad=intimate | narrow=intimate` and
+  converts the *recoverable* outage #969 requires into a permanent one.
+
+  **Direction here is not the usual one.** Every other #1794 guard shortens a
+  listing; this one feeds RATIOS, and guarding it moved `Medicine share` from
+  `50.0%` **up** to `100.0%`. What settles it is the control rather than the
+  sign: the guarded render of a vault holding the planted link is identical,
+  on every wavelength line, to the render of the same vault with the link
+  never created. Before the guard the weekly and monthly reports also wrote
+  the planted fragment's **id, title and phase** verbatim into
+  `05-Wavelength/Phase-Maps/`.
+
+- **#1794's guard list is NOT a completeness claim, and four rounds of review
+  are the evidence.** The count of readers of `02-Threads` / `03-Eddies` /
+  `04-Praxis` was corrected four times — filed as 3, measured at 7, corrected
+  to 11, corrected again to 13 — because "guard every reader of a corpus" is an
+  unbounded unit of work that any reviewer can extend. Thirteen readers now
+  share `creek._containment.iter_contained`; the honest statement is that these
+  thirteen are guarded, **not** that the corpus is closed. The structural
+  remedy — a guard every new reader must pass by construction — is filed
+  separately. Until it lands, treat any "N readers" sentence here as a
+  timestamp rather than an invariant, and re-run the census before relying on
+  one.
+
+  Readers still unguarded, measured and recorded rather than closed:
+
+  - `creek/generate/skills.py::_read_all_fragments` — deliberate; a guard is
+    the #1793 inversion (see the entry above).
+  - `creek/generate/decisions.py::_iter_markdown` at its `08-Decisions` and
+    `05-Wavelength/Observations` call sites — the helper is corpus-agnostic and
+    serves four directories; the two inside this issue's corpora are guarded
+    (see above) and these two are not. `08-Decisions` is simply out of scope.
+    `05-Wavelength/Observations` is out of scope **and** the one consumer in
+    that module that REDUCES — `_current_wavelength` keeps the observation with
+    the greatest `date`, and dropping a record from a maximum is the shape that
+    inverts — so it needs its own measurement before anyone guards it. The
+    `contained` argument is a required keyword precisely so neither can be
+    changed by accident.
+  - `creek/generate/mining.py::_load_synchronicities` and
+    `creek/generate/state.py::_load_synchronicities` — `10-Liminal/Synchronicities`,
+    two unguarded walks over one corpus. Explicitly Lane 3 of #1794.
+  - `creek/vault/links.py::iter_link_sources` / `build_link_index` — vault-rooted
+    and shared by many consumers. An out-of-root page reached through a symlink
+    still counts as a link SOURCE, so its wikilinks suppress orphan findings
+    that would otherwise be reported. A suppression, not a disclosure.
+  - `creek/clean/hygiene.py` — `BrokenLinkScanner` / `OrphanScanner`. Ruled: a
+    guard makes them emit MORE (measured 0 -> 1 broken links), the #1793
+    inversion.
+  - `creek/generate/compost_scan.py::load_composted_source_ids` — ruled: its ids
+    are read through `c.source_id not in seen`, so they SUPPRESS. Guarding it
+    would make `creek compost scan` write MORE notes.
+
+  Plus roughly twenty `01-Fragments` walks outside this issue's scope
+  (`purge`, `ingest`, `cli`, `author/checks`, `classify_engine`,
+  `review_runner`, `voice`, `ai_style/fingerprint`, `vault/writer`, four
+  `lint/checks`), unaudited here.
+
 - **Audit log integrity.** Every purge and redaction-apply writes a
   structured entry to `<vault>/00-Creek-Meta/audit/`. The integrity
   story (hash chaining, tamper-evidence) is the subject of SEC-005;

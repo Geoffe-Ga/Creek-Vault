@@ -19,11 +19,13 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek._containment import iter_contained
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     raw_privacy_tier,
     within_ceiling,
 )
+from creek.generate.compile_routing import PRAXIS_SKIP_NOUN, THREAD_SKIP_NOUN
 from creek.models import (
     Decision,
     DecisionCandidate,
@@ -950,7 +952,9 @@ class DecisionContextGatherer:
     ) -> list[str]:
         """Find IDs of threads related by token overlap or frequency."""
         results: list[tuple[float, str]] = []
-        for md_file in self._iter_markdown(vault_path / "02-Threads"):
+        for md_file in self._iter_markdown(
+            vault_path / "02-Threads", contained=THREAD_SKIP_NOUN
+        ):
             scored = self._score_thread(md_file, title_tokens, freqs)
             if scored is not None:
                 results.append(scored)
@@ -991,7 +995,9 @@ class DecisionContextGatherer:
         decisions_dir = vault_path / "08-Decisions"
         results: list[tuple[float, str]] = []
         for subfolder in ("Active", "Archive"):
-            for md_file in self._iter_markdown(decisions_dir / subfolder):
+            for md_file in self._iter_markdown(
+                decisions_dir / subfolder, contained=None
+            ):
                 scored = self._score_decision(
                     md_file,
                     exclude_id,
@@ -1033,7 +1039,7 @@ class DecisionContextGatherer:
         """Find IDs of praxis notes whose frequencies overlap the decision."""
         praxis_dir = vault_path / "04-Praxis"
         results: list[str] = []
-        for md_file in self._iter_markdown(praxis_dir):
+        for md_file in self._iter_markdown(praxis_dir, contained=PRAXIS_SKIP_NOUN):
             post = _load_post(md_file)
             if post is None:
                 continue
@@ -1063,7 +1069,7 @@ class DecisionContextGatherer:
         """
         obs_dir = vault_path / "05-Wavelength" / "Observations"
         most_recent: tuple[str, str] | None = None
-        for md_file in self._iter_markdown(obs_dir):
+        for md_file in self._iter_markdown(obs_dir, contained=None):
             post = _load_post(md_file)
             if post is None:
                 continue
@@ -1095,7 +1101,9 @@ class DecisionContextGatherer:
         for decision_freq in decision.frequency_context:
             key = str(decision_freq)
             counts[key] = counts.get(key, 0) + 2
-        for md_file in self._iter_markdown(vault_path / "04-Praxis"):
+        for md_file in self._iter_markdown(
+            vault_path / "04-Praxis", contained=PRAXIS_SKIP_NOUN
+        ):
             post = _load_post(md_file)
             if post is None:
                 continue
@@ -1209,11 +1217,60 @@ class DecisionContextGatherer:
         return lines
 
     @staticmethod
-    def _iter_markdown(directory: Path) -> list[Path]:
-        """List markdown files in a directory, safely handling absence."""
+    def _iter_markdown(directory: Path, *, contained: str | None) -> list[Path]:
+        """List markdown files in a directory, safely handling absence.
+
+        **Containment (#1794), and *contained* is deliberately REQUIRED.** This
+        helper is corpus-agnostic and serves five call sites across four vault
+        directories, only three of which are in #1794 lane 2's scope. A default
+        would let the next call site inherit a policy nobody chose for it, and
+        the default that reads naturally — no guard — is the fail-open one. So
+        every caller states its answer and the reason is reviewable at the call
+        site rather than buried here.
+
+        Callers that PASS a noun, and why the guard is safe for each:
+
+        * ``_find_related_threads`` over ``02-Threads`` and
+          ``_find_relevant_praxis`` over ``04-Praxis`` — pure listings. Each
+          surviving note contributes at most one id, and the ids are rendered
+          one row per id by :meth:`_render_threads` / :meth:`_render_praxis`.
+          Measured before the guard at the real writer: an out-of-root thread
+          and praxis put ``- [[THREAD-PLANTED]]`` and ``- [[PRAXIS-PLANTED]]``
+          into a decision note's ``## Context`` **on disk**, which is why this
+          is guarded in the same change rather than deferred.
+        * ``_frequency_affinity``'s second pass over ``04-Praxis`` — a COUNT
+          rather than a listing, and guarded anyway. It is redundant, because
+          it only counts ids ``_find_relevant_praxis`` already admitted, and it
+          is not optional: two readers of one root answering to different
+          policies is the #1079 divergence this issue exists to close.
+
+        Callers that pass ``None``, and why:
+
+        * ``_find_related_decisions`` over ``08-Decisions`` — a corpus outside
+          this issue's scope. Not a ruling that it is safe; an unmeasured one.
+        * ``_current_wavelength`` over ``05-Wavelength/Observations`` — outside
+          scope AND the one consumer here that **reduces**: it keeps the
+          observation with the greatest ``date``. Dropping a record from a
+          maximum is the shape that inverts, so it needs its own measurement
+          before anyone guards it. Both are recorded in
+          ``docs/security/threat-model.md``.
+
+        Args:
+            directory: The folder to list.
+            contained: The operator-facing skip noun, which also selects the
+                guard; ``None`` walks unguarded and obliges the caller to have
+                stated why above.
+
+        Returns:
+            The markdown files in *directory*, sorted, minus any escaping link
+            when *contained* is given.
+        """
         if not directory.exists():
             return []
-        return sorted(directory.glob("*.md"))
+        candidates = sorted(directory.glob("*.md"))
+        if contained is None:
+            return candidates
+        return list(iter_contained(directory, candidates, what=contained))
 
 
 def _coerce_phase(raw: object) -> str:

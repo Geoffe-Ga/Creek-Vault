@@ -35,6 +35,23 @@ from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
 
+FRAGMENT_SKIP_NOUN: str = "fragment"
+"""Operator-facing noun for a containment skip under ``01-Fragments`` (#1794).
+
+THREE loaders walk that one root — :func:`iter_vault_fragments` here,
+:func:`creek.generate.state._read_fragment_files` for the state report's
+census, and :func:`creek.generate.wavelength.load_fragments_from_vault` for
+``## Wavelength snapshot``. They share this constant so the operator reads one
+word for one event whichever of them lost the note, exactly as
+:data:`creek.generate.mining.LIMINAL_SKIP_NOUN` does for ``10-Liminal``.
+
+``creek.generate.skills._read_all_fragments`` is a FOURTH reader of the same
+root and is deliberately unguarded — a guard there lowers the derived-tier
+maximum and makes the skill tree emit more (#1793's inversion, measured). It
+therefore has no skip to name and does not use this constant; see
+``tests/test_thread_and_eddy_containment.py`` for the pin.
+"""
+
 FRONTMATTER_LOAD_ERRORS: Final[tuple[type[Exception], ...]] = (
     OSError,
     TypeError,
@@ -247,7 +264,7 @@ def iter_vault_fragments(
     for md_file in iter_contained(
         fragments_root,
         sorted(fragments_root.rglob("*.md")),
-        what="fragment",
+        what=FRAGMENT_SKIP_NOUN,
     ):
         try:
             record = try_load_fragment(md_file)

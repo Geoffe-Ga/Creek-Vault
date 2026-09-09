@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import ValidationError
 
+from creek._containment import iter_contained
 from creek.care.guardrail import CARE_POLICY
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
@@ -58,7 +59,9 @@ from creek.generate.ai_style.guard import (
 )
 from creek.generate.cohesion import run_cohesion_pass
 from creek.generate.compile_routing import (
+    EDDY_SKIP_NOUN,
     NO_COMPILED_SOURCES,
+    THREAD_SKIP_NOUN,
     CompiledPageIndex,
     CompiledSources,
     compiled_source_ids,
@@ -681,11 +684,51 @@ def _load_fragments_by_id(
 
 
 def _load_threads_by_id(root: Path) -> dict[str, Thread]:
-    """Return ``{thread.id: thread}`` for every thread under *root*."""
+    """Return ``{thread.id: thread}`` for every thread under *root* (#1794).
+
+    The frontmatter half of ``## Threads``, reached only when
+    :meth:`DraftGenerator._compose_thread_section` misses the compiled index —
+    which is every thread in a vault that has not run ``creek compile``, and
+    every thread minted since the last one.
+
+    **Containment.** The walk goes through
+    :func:`creek._containment.iter_contained`. :class:`~creek.models.Thread`
+    carries no ``privacy_tier`` field at all, so unlike a fragment there is no
+    tier gate behind this walk: the guard is the only thing between a planted
+    file and ``f"### {tid}: {thread.title}"`` plus an unbounded ``description``
+    composed verbatim into an LLM prompt. A ``description`` that opens with its
+    own ``## Ask`` header is a prompt-injection primitive.
+
+    **And the collapse is last-wins, which is what makes the id an aim rather
+    than a guess.** Candidates arrive in ``sorted()`` on-disk order and the
+    final assignment for an id stands, so a planted note named to sort late
+    (``zzz-evil.md``) that declares a *legitimate* thread's id **replaces** the
+    legitimate record for an id the seed already names. Measured end to end at
+    the base commit: no mining step, no id guessing beyond reading the vault.
+
+    **Direction: this corpus is listed, never reduced over.** Every consumer
+    of the returned map — there is one, the ``### `` entry above — emits one
+    block per surviving record, so a skip can only ever make the prompt carry
+    less. That is not universal in this codebase (see
+    :func:`creek.generate.mining._load_essay_titles`, deliberately unguarded
+    because its records *suppress*), so it is measured at
+    :meth:`DraftGenerator._compose_thread_section` rather than assumed.
+
+    Args:
+        root: ``<vault>/02-Threads``.
+
+    Returns:
+        The admitted threads keyed by id. Two in-root files sharing an id
+        still collapse last-wins, exactly as they did before.
+    """
     if not root.exists():
         return {}
     collected: dict[str, Thread] = {}
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(
+        root,
+        sorted(root.rglob("*.md")),
+        what=THREAD_SKIP_NOUN,
+    ):
         post = _safe_post(md_file)
         if post is None:
             continue
@@ -702,11 +745,27 @@ def _load_threads_by_id(root: Path) -> dict[str, Thread]:
 
 
 def _load_eddies_by_id(root: Path) -> dict[str, Eddy]:
-    """Return ``{eddy.id: eddy}`` for every eddy under *root*."""
+    """Return ``{eddy.id: eddy}`` for every eddy under *root* (#1794).
+
+    The ``03-Eddies`` twin of :func:`_load_threads_by_id`, guarded for the same
+    reasons and with the same measured last-wins collapse;
+    :class:`~creek.models.Eddy` carries no ``privacy_tier`` either. See that
+    function for the direction measurement and the injection shape.
+
+    Args:
+        root: ``<vault>/03-Eddies``.
+
+    Returns:
+        The admitted eddies keyed by id.
+    """
     if not root.exists():
         return {}
     collected: dict[str, Eddy] = {}
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(
+        root,
+        sorted(root.rglob("*.md")),
+        what=EDDY_SKIP_NOUN,
+    ):
         post = _safe_post(md_file)
         if post is None:
             continue
