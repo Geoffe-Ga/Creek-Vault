@@ -18,7 +18,7 @@ come to mean one thing for the scanner and another for the ingestors.
 #1794 found the same argument one level up, in the *walks*. Three vault
 read loaders each hand-rolled ``rglob``/``glob`` and only one of them
 called the predicate, so a guard existed for ``01-Fragments`` and not for
-``10-Liminal``. :func:`iter_contained_paths` is the guarded walk those
+``10-Liminal``. :func:`iter_contained` is the guarded walk those
 three now share — a guard is only as good as the glob it wraps.
 
 **Stdlib-only by design.** :mod:`creek.ingest.base` imports this module, and
@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -270,22 +270,25 @@ def escaping_child(child: Path, resolved_root: Path) -> bool:
     return child.is_symlink() and not resolves_within(child, resolved_root)
 
 
-def iter_contained_paths(
+def iter_contained(
     root: Path,
-    pattern: str,
+    candidates: Iterable[Path],
     *,
-    noun: str,
-    walk_root: Path | None = None,
+    what: str,
 ) -> Iterator[Path]:
-    """Yield each *pattern* match under *root* that does not link out of it.
+    """Yield each of *candidates* that does not link out of *root*.
 
     The guarded walk every READ path needs, in one place — the walk-shaped
-    counterpart to :func:`escaping_child`, which is only the leaf test. Three
+    counterpart to :func:`escaping_child`, which is only the leaf test. Four
     loaders wrote the same walk out by hand and only one of them carried the
     guard:
 
     * :func:`creek.vault.reader.iter_vault_fragments` — ``01-Fragments``,
       guarded since #1373.
+    * :func:`creek.generate.state._read_fragment_files` — the SAME root, read
+      again for the state report's census, unguarded until #1794. One rendered
+      document therefore disagreed with itself: the guarded half logged a skip
+      while this half counted the planted fragment.
     * :func:`creek.generate.mining._load_liminal_fragments` — ``10-Liminal``,
       unguarded until #1794.
     * :func:`creek.generate.state._admitted_liminal_notes` — one
@@ -295,9 +298,18 @@ def iter_contained_paths(
 
     #1294 already settled this argument for :func:`resolves_within` and #1373
     for :func:`escaping_child`. The residual it leaves is the walk itself: a
-    guard is only as good as the glob it wraps, and a fourth hand-rolled
-    ``rglob`` would be unguarded again by default. Callers pass a pattern, not
-    a walk.
+    guard is only as good as the glob it wraps, and a fifth hand-rolled
+    ``rglob`` would be unguarded again by default.
+
+    **It takes CANDIDATES, not a pattern.** An rglob-only API cannot serve its
+    own callers: :func:`creek.generate.state._admitted_liminal_notes` needs a
+    flat ``glob("*.md")`` over one subfolder judged against a root a level up
+    and then re-sorted by ``st_mtime``, and
+    :func:`creek.ingest.markdown._enumerate_markdown_paths` walks with
+    ``os.walk`` and sorts per directory. A narrower signature would push the
+    predicate back inline at those sites, which is the second copy this
+    function exists to prevent. The caller owns the walk and the ordering;
+    this owns the containment question and the log line.
 
     **A path iterator, deliberately, and not a record loader.** The obvious
     next step — one shared function that also parses and validates each file —
@@ -310,51 +322,65 @@ def iter_contained_paths(
     DEBUG-logged by the validator. Yielding paths leaves each caller's own
     ordering untouched.
 
-    Security direction is this module's usual one-way: the iterator can only
-    ever cause a caller to read *less*. It skips and logs rather than raising,
-    for the reason :func:`creek.vault.reader.iter_vault_fragments` records —
-    hard-erroring in a shared read loader hands anyone with write access to
-    the vault a denial of service over every consumer of it.
+    **Direction.** Every skip can only ever cause a caller to read *less*.
+    That is the safe direction for a loader whose output feeds a prompt, and
+    it is NOT universally the safe direction in this codebase: where a corpus
+    is consumed as a SUPPRESSOR — ``mining._load_essay_titles``, whose titles
+    are read only through ``not IdeaMiner._has_matching_essay(...)`` — dropping
+    a record makes the caller emit MORE, and adding a guard there would be the
+    #1793 inversion. Read the consumer before adopting this function.
+
+    **Leaf-only, and that is sufficient for the ``rglob`` callers only because
+    ``**`` refuses to descend a symlinked directory** (pinned across the CI
+    matrix by ``test_rglob_does_not_descend_a_symlinked_directory``). The
+    residual is the flat-glob caller, which is handed the escaping directory
+    directly; that one needs :func:`named_path_escapes` on the folder itself
+    before it globs, and ``_admitted_liminal_notes`` does exactly that.
+
+    It skips and logs rather than raising, for the reason
+    :func:`creek.vault.reader.iter_vault_fragments` records — hard-erroring in
+    a shared read loader hands anyone with write access to the vault a denial
+    of service over every consumer of it.
 
     Skips are logged at WARNING, not the DEBUG a read path uses for a merely
     unreadable file: an unreadable markdown file is common and benign in a
     live Obsidian vault, while a note symlinked out of its root cannot happen
     by accident, and #1087's lesson was that a silent skip in a safety path is
-    its own hazard. The log names the entry EXACTLY AS WALKED and never its
-    resolved target — disclosing where the link points is the exfiltration
-    oracle #1087 closed.
+    its own hazard. This is the SOLE emitter of that line, so the tree carries
+    one log shape for one event. It names the entry EXACTLY AS WALKED and
+    never its resolved target — disclosing where the link points is the
+    exfiltration oracle #1087 closed.
 
     Args:
         root: The root containment is judged against, resolved exactly once
             here. Resolving per child would be both wasteful and wrong: the
-            policy is resolve-the-root and ``lstat``-the-leaf.
-        pattern: The glob pattern, relative to *walk_root* — ``"*.md"`` for one
-            directory, ``"**/*.md"`` for a whole tree.
-        noun: What the caller is reading, singular, for the skip log
+            policy is resolve-the-root and ``lstat``-the-leaf. It need not be
+            the directory the candidates were globbed from —
+            ``_admitted_liminal_notes`` globs ``10-Liminal/<sub>`` and judges
+            against ``10-Liminal``, because that is the root the miner walks
+            and two readers answering to two different roots is the #1079
+            divergence all over again.
+        candidates: The paths to test, in whatever order the caller wants them
+            back. Consumed lazily; ordering and sorting stay the caller's.
+        what: What the caller is reading, singular, for the skip log
             ("fragment", "liminal note"). The operator reads this line, so it
             names the thing they lost rather than the function that lost it.
-        walk_root: The directory the glob runs from, when it is a SUBDIRECTORY
-            of *root* rather than *root* itself. Defaults to *root*.
-            :func:`creek.generate.state._admitted_liminal_notes` needs the two
-            to differ: it globs one ``10-Liminal`` subfolder but must judge
-            containment against ``10-Liminal``, because the miner walks the
-            whole of it and two readers answering to two different roots is
-            the #1079 divergence all over again.
 
     Yields:
-        Matching paths in sorted order, exactly as walked — never resolved.
+        Every candidate that is not an escaping link, in the order given —
+        exactly as walked, never resolved.
     """
     resolved_root = root.resolve(strict=False)
-    for child in sorted((walk_root or root).glob(pattern)):
-        if escaping_child(child, resolved_root):
+    for candidate in candidates:
+        if escaping_child(candidate, resolved_root):
             logger.warning(
                 "Skipping a %s whose symlink leaves %s: %s",
-                noun,
+                what,
                 root,
-                child,
+                candidate,
             )
             continue
-        yield child
+        yield candidate
 
 
 @dataclass(frozen=True, slots=True)

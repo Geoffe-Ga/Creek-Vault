@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, TypeVar
 import frontmatter
 from pydantic import ValidationError
 
-from creek._containment import iter_contained_paths
+from creek._containment import iter_contained
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
@@ -532,7 +532,7 @@ def _load_liminal_fragments(
     against each other note by note, at every ceiling.
 
     **Containment (#1794).** The walk goes through
-    :func:`creek._containment.iter_contained_paths`, so a ``.md`` file under
+    :func:`creek._containment.iter_contained`, so a ``.md`` file under
     ``10-Liminal`` that is itself a symlink resolving OUTSIDE that root is
     skipped and logged. It was a bespoke ``sorted(root.rglob("*.md"))`` with
     no guard at all, and the consequence was not a cosmetic one: the planted
@@ -566,10 +566,10 @@ def _load_liminal_fragments(
     ceiling = privacy_override or PrivacyTierOverride.OPEN
     collected = [
         entry
-        for md_file in iter_contained_paths(
+        for md_file in iter_contained(
             liminal_root,
-            "**/*.md",
-            noun=LIMINAL_SKIP_NOUN,
+            sorted(liminal_root.rglob("*.md")),
+            what=LIMINAL_SKIP_NOUN,
         )
         if (entry := _admitted_liminal_entry(md_file, liminal_root, ceiling))
         is not None
@@ -611,7 +611,39 @@ def _load_typed(
 
 
 def _load_essay_titles(root: Path) -> list[str]:
-    """Return the ``title`` frontmatter (falling back to filename) for essays."""
+    """Return the ``title`` frontmatter (falling back to filename) for essays.
+
+    **This walk is deliberately NOT containment-guarded (#1794), and that is a
+    ruling rather than an oversight.** Its two neighbours in this module —
+    :func:`_load_liminal_fragments` and the ``01-Fragments`` reader — go
+    through :func:`creek._containment.iter_contained`, so the asymmetry is the
+    thing most likely to be "fixed" by the next reader. It must not be.
+
+    Measured. ``published_essay_titles`` has exactly one consumer,
+    :meth:`IdeaMiner._has_matching_essay`, and it is read there as
+    ``not self._has_matching_essay(...)`` in :meth:`mine_thread_terminus`'s
+    candidate filter. These records are therefore **suppressors**: with an
+    escaping essay symlink planted the thread-terminus seed list is empty;
+    remove the essay and the seed comes back. A containment guard here would
+    make the miner emit **MORE**, not less — the inversion #1793 established,
+    where the direction of a guard has to be measured at its consumer rather
+    than assumed from its shape.
+
+    Nothing leaks either. A title is compared and discarded; the planted string
+    reaches no prompt, no artifact and no log. And guarding would break a
+    legitimate workflow — essays symlinked in from a blog repository — by
+    re-suggesting essays their author has already published.
+
+    ``tests/test_generate_walk_containment.py`` pins the current behaviour, so
+    a future silent guard flips the direction and fails rather than landing
+    quietly for consistency's sake.
+
+    Args:
+        root: ``<vault>/09-Reference/Published-Essays``.
+
+    Returns:
+        One title per essay note, falling back to the filename stem.
+    """
     if not root.exists():
         return []
     titles: list[str] = []

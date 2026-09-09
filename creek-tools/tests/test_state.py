@@ -1930,7 +1930,11 @@ class TestAdmittedLiminalNotesStepsOverBadNotes:
             )
         corrupt_note(folder / "note-aa.md", shape)
 
-        admitted = _admitted_liminal_notes(folder, PrivacyTierOverride.ALL)
+        admitted = _admitted_liminal_notes(
+            folder,
+            PrivacyTierOverride.ALL,
+            liminal_root=empty_vault / "10-Liminal",
+        )
 
         assert sorted(stem for stem, _tier in admitted) == ["note-a", "note-b"]
 
@@ -1952,7 +1956,11 @@ class TestAdmittedLiminalNotesStepsOverBadNotes:
                 created=datetime(2026, 5, 1, tzinfo=UTC),
             )
 
-        admitted = _admitted_liminal_notes(folder, PrivacyTierOverride.ALL)
+        admitted = _admitted_liminal_notes(
+            folder,
+            PrivacyTierOverride.ALL,
+            liminal_root=empty_vault / "10-Liminal",
+        )
 
         assert sorted(stem for stem, _tier in admitted) == ["note-a", "note-b"]
 

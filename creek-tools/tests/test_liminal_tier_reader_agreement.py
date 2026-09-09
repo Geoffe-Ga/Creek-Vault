@@ -53,6 +53,7 @@ from creek.generate.state import (
     EMPTY_PLACEHOLDER,
     StateReportGenerator,
     _admitted_liminal_notes,
+    _read_fragment_files,
 )
 from creek.generate.state_tiers import TIER_STAMP_KEY
 from creek.models import PrivacyTier
@@ -138,7 +139,13 @@ def liminal_vault(tmp_path: Path) -> Path:
 
 def _state_reader(vault: Path, ceiling: PrivacyTierOverride) -> dict[str, PrivacyTier]:
     """Return ``{stem: tier}`` as the ``## Liminal Watch`` side reads it."""
-    return dict(_admitted_liminal_notes(vault / _LIMINAL_ROOT / "Unnamed", ceiling))
+    return dict(
+        _admitted_liminal_notes(
+            vault / _LIMINAL_ROOT / "Unnamed",
+            ceiling,
+            liminal_root=vault / _LIMINAL_ROOT,
+        ),
+    )
 
 
 def _mining_reader(vault: Path, ceiling: PrivacyTierOverride) -> dict[str, PrivacyTier]:
@@ -423,6 +430,14 @@ def _plant_liminal_escape(tmp_path: Path) -> tuple[Path, Path]:
     The fixture asserts its own preconditions, because a symlink fixture that
     silently failed to be a symlink — or whose target happened to land inside
     the walked root — would turn every test below into a no-op that passes.
+
+    **The containment root here is ``10-Liminal``, not the vault**, at both
+    readers. That is why ``tmp_path/"outside"`` is a genuine escaping target
+    even though ``liminal_vault`` elsewhere in this module deliberately makes
+    the vault root equal ``tmp_path``: a target inside the vault but outside
+    ``10-Liminal`` still escapes, under the accepted narrowing already
+    documented on :func:`creek.vault.reader.iter_vault_fragments`. Recorded so
+    nobody later "fixes" the fixture shape.
 
     Args:
         tmp_path: pytest's per-test temporary directory.
@@ -795,32 +810,84 @@ def test_the_ceiling_is_still_checked_before_the_note_is_ever_parsed(
     )
 
 
-def test_all_three_liminal_and_fragment_walks_share_one_containment_predicate() -> None:
-    """The three walks call the ONE shared iterator, not three copies of the check.
+@pytest.mark.parametrize("ceiling", _CEILINGS)
+def test_both_readers_refuse_an_out_of_vault_linked_subfolder(
+    tmp_path: Path,
+    ceiling: PrivacyTierOverride,
+) -> None:
+    """The agreement holds on the DIRECTORY axis too, not only the leaf axis.
 
-    #1294's whole finding: a predicate written out three times is three
+    A leaf guard cannot reach this shape. With ``10-Liminal/Unnamed`` a symlink
+    to an out-of-vault folder, every entry the state reader's glob yields is an
+    ordinary file — the escape is the directory they were reached through — so
+    ``escaping_child`` sees nothing wrong. The miner meanwhile returns ``[]``
+    without any guard at all, because ``rglob`` refuses to descend a symlinked
+    directory.
+
+    Measured at the parent commit: miner ``[]``, report
+    ``[('planted', OPEN)]``. Two readers, one folder, two answers — the #1079
+    divergence this module exists to forbid, in the one shape its leaf cases
+    cannot express.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The admission ceiling both readers are asked about.
+    """
+    vault = tmp_path / "vault"
+    (vault / _LIMINAL_ROOT).mkdir(parents=True)
+    outside = tmp_path / "outside-subfolder"
+    _write_control_note(outside)
+    folder = vault / _LIMINAL_ROOT / "Unnamed"
+    folder.symlink_to(outside, target_is_directory=True)
+
+    assert folder.is_symlink(), "the fixture did not create a directory symlink"
+    assert not os.path.realpath(folder).startswith(
+        str((vault / _LIMINAL_ROOT).resolve()) + os.sep,
+    ), "the linked subfolder resolves inside 10-Liminal, so it does not escape"
+
+    mined = _mining_reader(vault, ceiling)
+    reported = _state_reader(vault, ceiling)
+
+    assert mined == {}, f"the miner reached through a symlinked directory.\n\n{mined}"
+    assert reported == {}, (
+        "the report read through a subfolder that is itself a symlink out of "
+        f"the vault, while the miner returned nothing.\n\n{reported}"
+    )
+    assert set(mined) == set(reported), (
+        f"the two readers disagree about an escaping subfolder at "
+        f"ceiling={ceiling.value!r}.\n\n{mined} vs {reported}"
+    )
+
+
+def test_all_four_lane_one_walks_share_one_containment_predicate() -> None:
+    """The four guarded walks call the ONE shared iterator, not four copies.
+
+    #1294's whole finding: a predicate written out four times is four
     predicates, and they drift. Asserted on the source rather than described
-    in prose so a fourth hand-rolled ``rglob`` cannot quietly reappear.
+    in prose so a fifth hand-rolled walk cannot quietly reappear unguarded.
+
+    The walk itself deliberately stays in the CALLER — ``iter_contained`` takes
+    candidates, not a pattern, because ``_admitted_liminal_notes`` needs a flat
+    ``glob`` re-sorted by ``st_mtime`` against a root one level up. So the
+    assertion is not "no glob here"; it is "the glob's output goes through the
+    shared gate, and the predicate is not re-derived beside it".
     """
     walks = {
         "mining._load_liminal_fragments": _load_liminal_fragments,
         "state._admitted_liminal_notes": _admitted_liminal_notes,
+        "state._read_fragment_files": _read_fragment_files,
         "vault.reader.iter_vault_fragments": iter_vault_fragments,
     }
     for name, walk in walks.items():
-        # The docstrings quote the very ``rglob`` shape they replaced, so the
+        # The docstrings quote the very shapes they replaced, so the
         # assertions below run over the CODE alone.
         source = inspect.getsource(walk).replace(walk.__doc__ or "", "")
-        assert "iter_contained_paths" in source, (
-            f"{name} does not go through creek._containment.iter_contained_paths, "
+        assert "iter_contained(" in source, (
+            f"{name} does not go through creek._containment.iter_contained, "
             f"so it carries its own copy of the containment rule.\n\n{source}"
         )
-        assert "escaping_child(" not in source, (
-            f"{name} inlines the escaping_child call the shared iterator "
-            f"already makes.\n\n{source}"
-        )
-        for walk in (".rglob(", ".glob("):
-            assert walk not in source, (
-                f"{name} still walks with a bare {walk} — the guard is only "
-                f"as good as the walk it wraps.\n\n{source}"
+        for inlined in ("escaping_child(", "resolves_within(", ".is_symlink()"):
+            assert inlined not in source, (
+                f"{name} re-derives the containment predicate with {inlined} "
+                f"beside the gate that already makes that call.\n\n{source}"
             )

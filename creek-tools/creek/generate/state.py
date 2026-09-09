@@ -58,7 +58,7 @@ from typing import TYPE_CHECKING, TypeVar
 import frontmatter
 from pydantic import ValidationError
 
-from creek._containment import iter_contained_paths
+from creek._containment import iter_contained, named_path_escapes
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     max_source_tier,
@@ -380,6 +380,14 @@ def _read_fragment_files(
     admitted at ``ceiling=personal``, so reading the tier off the model alone
     fails open relative to what the file actually says.
 
+    **Containment (#1794).** The walk goes through
+    :func:`creek._containment.iter_contained`, the same guarded iterator
+    :func:`creek.vault.reader.iter_vault_fragments` uses over this very root.
+    Until #1794 this was the last unguarded reader of ``01-Fragments``, which
+    made one rendered state report disagree with itself: the guarded half
+    logged a containment skip while this half counted the planted fragment in
+    the census and could list it under drift warnings.
+
     Args:
         root: The ``01-Fragments`` directory.
 
@@ -393,7 +401,11 @@ def _read_fragment_files(
     if not root.exists():
         return []
     loaded: list[tuple[Path, Fragment, dict[str, object]]] = []
-    for md_file in sorted(root.rglob("*.md")):
+    for md_file in iter_contained(
+        root,
+        sorted(root.rglob("*.md")),
+        what="fragment",
+    ):
         post = _safe_post(md_file)
         if post is None:
             continue
@@ -491,6 +503,8 @@ def _admit_praxis(
 def _admitted_liminal_notes(
     folder: Path,
     override: PrivacyTierOverride,
+    *,
+    liminal_root: Path,
 ) -> list[tuple[str, PrivacyTier]]:
     """Return admitted ``(file stem, tier)`` pairs under one liminal subfolder.
 
@@ -513,25 +527,51 @@ def _admitted_liminal_notes(
     reason (#1079). ``tests/test_liminal_tier_reader_agreement.py`` asserts
     the two agree note by note rather than leaving it to coincidence.
 
-    **Containment (#1794), judged against ``10-Liminal`` and not against
-    *folder*.** A ``.md`` entry here that is a symlink resolving outside the
-    liminal tree is skipped and logged, via the same
-    :func:`creek._containment.iter_contained_paths` the miner walks with. The
+    **Containment (#1794) closes TWO shapes, because one guard cannot see
+    both.**
+
+    *The escaping leaf.* A ``.md`` entry that is a symlink resolving outside
+    the liminal tree is skipped and logged, via the same
+    :func:`creek._containment.iter_contained` the miner walks with. The
     ``p.is_file()`` filter below looks like it already screened such a link
     out and does not: ``is_file()`` FOLLOWS the link, so it answers about the
     target and admits a file parked anywhere on disk.
 
-    The root is ``folder.parent`` — the ``10-Liminal`` root this function's
-    own contract says *folder* sits directly under — rather than *folder*
-    itself, and that is the whole reason the two readers are guarded in one
-    change. The miner walks all of ``10-Liminal``, so an alias from ``Unnamed``
-    into ``Compost`` is contained to it; judging the same file against
-    ``Unnamed`` alone would drop it here only, and two readers disagreeing
-    about one physical file is precisely the #1079 divergence
-    ``tests/test_liminal_tier_reader_agreement.py`` exists to forbid.
+    *The escaping directory.* When *folder* is ITSELF a symlink out of the
+    vault, every entry the glob yields is an ordinary file and the leaf
+    predicate sees nothing wrong — yet the miner returns ``[]`` for the same
+    tree, because ``rglob`` refuses to descend a symlinked directory. Measured
+    at the parent commit: mining ``[]``, this reader ``[('planted', OPEN)]``.
+    So the folder is refused whole, up front, via
+    :func:`creek._containment.named_path_escapes`.
+
+    That refusal is deliberately NOT the simpler ``folder.is_symlink()``.
+    Measured with ``Unnamed -> 10-Liminal/Archive``: the miner reaches the real
+    directory by its own name and returns the note, so blanket-dropping every
+    linked subfolder would manufacture a NEW divergence in the opposite
+    direction and silently empty the Liminal Watch after a legitimate in-root
+    relocation.
+
+    *liminal_root* is REQUIRED and passed by the caller rather than derived
+    from ``folder.parent``. The root has to be the root the miner walks — the
+    whole ``10-Liminal`` tree — or an alias from ``Unnamed`` into a sibling
+    subfolder is contained to the miner and escaping to this reader, which is
+    exactly the #1079 divergence ``tests/test_liminal_tier_reader_agreement.py``
+    exists to forbid. Deriving it from the caller's nesting convention encodes
+    an invariant mypy cannot check and widens silently the moment anyone nests
+    a subfolder one level deeper.
 
     Dropping a note here can only ever make this section render *less*, which
     is the safe direction.
+
+    KNOWN RESIDUAL, recorded rather than closed: ``10-Liminal/Unnamed`` linked
+    to ``10-Liminal/Synchronicities`` survives every rule above — the target is
+    in-root, so ``named_path_escapes`` is ``False`` — yet the two readers still
+    disagree, because this one admits those notes as ``Unnamed`` while
+    :func:`creek.generate.mining._liminal_kind` returns ``None`` for
+    Synchronicities. That is a ``_liminal_kind`` question, not a containment
+    one, and belongs with the same family as the leaf-only ancestor residual
+    in :mod:`creek._containment`.
 
     Sorting is unchanged from FEAT-007 and is applied before admission so the
     displayed order does not shift with the ceiling. ``st_mtime`` is
@@ -542,19 +582,30 @@ def _admitted_liminal_notes(
     Args:
         folder: ``<vault>/10-Liminal/<subfolder>``.
         override: The admission ceiling.
+        liminal_root: ``<vault>/10-Liminal`` — the root containment is judged
+            against, which is the root the miner walks.
 
     Returns:
         Admitted notes, newest first.
     """
+    if named_path_escapes(folder):
+        # Named as walked, never resolved: #1087's no-oracle invariant applies
+        # to a folder-level refusal exactly as it does to a leaf skip.
+        logger.warning(
+            "Skipping the whole of %s: it is a symlink whose target resolves "
+            "outside its own parent, so nothing under it is a liminal note "
+            "this vault owns.",
+            folder,
+        )
+        return []
     if not folder.exists():
         return []
     files = [
         p
-        for p in iter_contained_paths(
-            folder.parent,
-            "*.md",
-            noun=LIMINAL_SKIP_NOUN,
-            walk_root=folder,
+        for p in iter_contained(
+            liminal_root,
+            folder.glob("*.md"),
+            what=LIMINAL_SKIP_NOUN,
         )
         if p.is_file()
     ]
@@ -587,7 +638,11 @@ def _load_liminal_watch(
     stems: dict[str, tuple[str, ...]] = {}
     tiers: list[PrivacyTier] = []
     for sub in _LIMINAL_SUBDIRS:
-        entries = _admitted_liminal_notes(vault_path / _LIMINAL_ROOT / sub, override)
+        entries = _admitted_liminal_notes(
+            vault_path / _LIMINAL_ROOT / sub,
+            override,
+            liminal_root=vault_path / _LIMINAL_ROOT,
+        )
         stems[sub] = tuple(stem for stem, _tier in entries)
         tiers.extend(tier for _stem, tier in entries)
     return stems, tiers

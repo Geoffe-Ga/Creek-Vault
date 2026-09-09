@@ -643,7 +643,7 @@ def test_the_escaping_leaf_predicate_has_exactly_one_definition() -> None:
     **#1794 moved the vault reader one level further in, and the assertion
     follows it rather than being relaxed.** ``iter_vault_fragments`` no longer
     calls the predicate itself: it walks through
-    :func:`creek._containment.iter_contained_paths`, the shared guarded
+    :func:`creek._containment.iter_contained`, the shared guarded
     iterator it now has in common with the two ``10-Liminal`` readers, and
     that iterator makes the one canonical call. So the reader is pinned to the
     canonical *iterator* by identity, and pinned NEGATIVELY against holding a
@@ -663,12 +663,12 @@ def test_the_escaping_leaf_predicate_has_exactly_one_definition() -> None:
         "instead of the canonical one.\n\n"
         f"{scanner.escaping_child!r}\n{_containment.escaping_child!r}"
     )
-    assert reader.iter_contained_paths is _containment.iter_contained_paths, (
+    assert reader.iter_contained is _containment.iter_contained, (
         "creek.vault.reader walks 01-Fragments with something other than the "
         "canonical guarded iterator. The vault loader, the two 10-Liminal "
         "readers, the scanner walk and the ingest gate must share one "
         "definition of 'this leaf leaves the root', or a future fix to one "
-        f"silently leaves the others behind.\n\n{reader.iter_contained_paths!r}"
+        f"silently leaves the others behind.\n\n{reader.iter_contained!r}"
     )
     assert not hasattr(reader, "escaping_child"), (
         "creek.vault.reader holds the leaf predicate directly again. Since "
