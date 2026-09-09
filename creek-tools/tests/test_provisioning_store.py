@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from creek_mcp.provisioning import store as store_module
 from creek_mcp.provisioning.models import FailureReason, JobState
 from creek_mcp.provisioning.store import (
     MAX_ACTIVATION_ALIASES_PER_CONSUMER,
@@ -595,6 +596,37 @@ def test_a_v3_database_backfills_every_delete_clock_on_upgrade(
         "job-deleting",
         "job-failed-delete",
     ]
+
+
+def test_a_future_schema_bump_does_not_replay_the_v4_backfill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each backfill is gated on the version that introduced it, not the latest.
+
+    Gating on ``_SCHEMA_VERSION`` would make every historical backfill re-run on
+    every future bump. The v4 backfill happens to be idempotent, so that would be
+    survivable today and invisible in a test that only opens a v4 database at v4 --
+    which is why this pins the behaviour at the NEXT version instead. PR4 of #1769
+    takes 5 for a receipts table; on that day a v4 database must not have its
+    delete clocks rewritten from ``updated_at`` underneath it.
+    """
+    database = tmp_path / "provisioning.sqlite3"
+    ProvisioningStore(database)
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute(
+            "INSERT INTO provisioning_jobs (job_id, canonical_activation_id,"
+            " requester_identity, consumer_identity, state, operation, attempts,"
+            " retry_count, retryable, delete_requested_at, created_at, updated_at)"
+            " VALUES ('job-settled','act-A','req','con','deleting','delete',1,0,1,"
+            " NULL,'2026-01-01T00:00:00+00:00','2026-02-02T00:00:00+00:00')"
+        )
+        connection.commit()
+
+    monkeypatch.setattr(store_module, "_SCHEMA_VERSION", 5)
+    ProvisioningStore(database)
+
+    assert _delete_clocks(database) == {"job-settled": None}
 
 
 def test_a_migration_that_crashed_after_its_alter_heals_on_the_next_open(

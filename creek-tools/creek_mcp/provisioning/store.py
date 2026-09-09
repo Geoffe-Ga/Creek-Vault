@@ -34,6 +34,10 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _SCHEMA_VERSION: Final[int] = 4
+"""Current schema version. Bumping this must NOT change any existing backfill."""
+
+_DELETE_CLOCK_VERSION: Final[int] = 4
+"""Version that introduced ``delete_requested_at``; its backfill is gated on this."""
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
 MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
@@ -202,6 +206,13 @@ class ProvisioningStore:
         a crash leaves it at the old value and the next open finishes the job.
         Every backfill is additionally written to be idempotent, so re-running
         one after a rollback costs nothing.
+
+        Each backfill is gated on the version that INTRODUCED it -- never on
+        ``_SCHEMA_VERSION``. Gating on the moving constant means every historical
+        backfill re-runs on every future bump: the day this schema takes 5, a v4
+        database would satisfy ``version < _SCHEMA_VERSION`` and replay the v4
+        backfill. That is survivable only while every one of them is idempotent,
+        which is a property no future author is obliged to preserve.
         """
         version_row = connection.execute("PRAGMA user_version").fetchone()
         version = 0 if version_row is None else int(version_row[0])
@@ -227,7 +238,7 @@ class ProvisioningStore:
             connection.execute(
                 "ALTER TABLE provisioning_jobs ADD COLUMN delete_requested_at TEXT"
             )
-        if version < _SCHEMA_VERSION:
+        if version < _DELETE_CLOCK_VERSION:
             # Backfill from updated_at rather than leaving NULL: a delete that
             # was already stuck when this column landed must not become
             # invisible to reconciliation because of the upgrade itself. Gated
