@@ -652,7 +652,7 @@ def _load_fragments_by_id(
     :func:`creek.classify.privacy_filter.resolved_source_tiers` — the survey
     :meth:`DraftGenerator._bind_routing_tier` routes on — walks
     :func:`~creek.vault.reader.iter_vault_fragments` and did. A ``.md`` file
-    under ``01-Fragments/`` that is a symlink out of the vault was therefore
+    under ``01-Fragments/`` that is a symlink escaping *that root* was therefore
     *rendered* by :func:`_render_fragment_section` — title and body, straight
     into the prompt — while being invisible to the survey that had to rank it.
     ``_rendered_source_tiers`` fails such an id closed to ``INTIMATE``, which

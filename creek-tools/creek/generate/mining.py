@@ -376,7 +376,7 @@ def _load_fragments(
     point of this function's shape. It used to be a bespoke
     ``sorted(root.rglob("*.md"))`` scan, which meant it did not inherit the
     #1373 containment guard: a ``.md`` file under ``01-Fragments/`` that is a
-    symlink resolving OUTSIDE the vault was read here, its body rendered into
+    symlink resolving OUTSIDE THAT ROOT was read here, its body rendered into
     the mined seed and — through
     :func:`creek.generate.drafts._load_fragments_by_id` — into the draft
     prompt. Meanwhile

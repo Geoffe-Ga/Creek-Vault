@@ -532,3 +532,50 @@ def test_the_draft_loader_still_loads_an_intra_root_alias(tmp_path: Path) -> Non
     assert _bodies([loaded[_INROOT_ID]]) == [_INROOT_SENTINEL], (
         f"the alias overwrote the real entry with something else.\n\n{loaded}"
     )
+
+
+def test_a_link_inside_the_vault_but_outside_the_fragments_root_is_dropped(
+    tmp_path: Path,
+) -> None:
+    """The guard is judged against the fragments ROOT, not the vault. Deliberate.
+
+    A ``01-Fragments`` entry symlinked to a note elsewhere in the same vault --
+    ``09-Reference`` here -- resolves inside the vault yet outside the root the
+    guard is given, so it is dropped. That is the ACCEPTED NARROWING
+    :func:`~creek.vault.reader.iter_vault_fragments` documents, and it is
+    precisely what makes these loaders agree with the tier survey: the survey
+    drops it too, so admitting it here would recreate the divergence #1789
+    closed, pointing the other way.
+
+    Pinned because it is the one shape a future reader is most likely to
+    "repair": adversarial review measured it live -- pre-fix both loaders
+    returned this id, post-fix neither does -- and nothing else in this module
+    would fail if someone widened the guard to the vault root.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    vault = tmp_path / "vault"
+    fragments = vault / "01-Fragments"
+    reference = vault / "09-Reference"
+    _write(fragments, _fragment(_INROOT_ID, "In root"), _INROOT_SENTINEL)
+    elsewhere = _write(reference, _fragment("ref-note", "Reference"), "REF-BODY")
+    link = fragments / "ref-note.md"
+    link.symlink_to(elsewhere)
+    assert link.is_symlink(), "the fixture is not a symlink; it proves nothing."
+    assert vault in link.resolve().parents, (
+        "the fixture must resolve INSIDE the vault -- that is the whole point; "
+        "if it escapes the vault it is just another escape test."
+    )
+
+    mined = _load_fragments(fragments)
+    drafted = _load_fragments_by_id(fragments)
+
+    assert [f.id for f, _ in mined] == [_INROOT_ID], (
+        "a link out of 01-Fragments but inside the vault was admitted by the "
+        "mining loader. The tier survey drops it, so admitting it here "
+        f"reopens the #1789 divergence.\n\nloaded={_bodies(mined)}"
+    )
+    assert list(drafted) == [_INROOT_ID], (
+        "same, for the draft loader.\n\nloaded=" + str(sorted(drafted))
+    )
