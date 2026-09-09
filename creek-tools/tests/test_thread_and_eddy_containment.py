@@ -2246,8 +2246,13 @@ def test_the_decision_reader_states_a_containment_choice_at_every_call_site(
     """
     vault = _decision_vault(tmp_path, planted=True)
 
+    # Bound through an untyped alias so the deliberately-wrong call is a
+    # runtime assertion rather than a suppressed type error: `# type: ignore`
+    # is forbidden outright by the anti-bypass record, and a suppression here
+    # would also hide a real signature regression from mypy.
+    unbound: Callable[..., object] = DecisionContextGatherer._iter_markdown
     with pytest.raises(TypeError):
-        DecisionContextGatherer._iter_markdown(vault / "02-Threads")  # type: ignore[call-arg]
+        unbound(vault / "02-Threads")
 
     guarded = DecisionContextGatherer._iter_markdown(
         vault / "02-Threads",
