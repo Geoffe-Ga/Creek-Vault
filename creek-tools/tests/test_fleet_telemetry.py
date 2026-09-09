@@ -984,3 +984,6 @@ def test_duplicate_provider_resources_are_counted_off_the_reconciler(
     assert snapshot.duplicate_provider_resources == Meter(2, MetricQuality.EXACT)
     assert snapshot.duplicate_allocation_attempts == Meter(0, MetricQuality.EXACT)
     assert snapshot.volume_gb == Meter(10, MetricQuality.EXACT)
+    # The report is carried out of the single pass rather than re-derived, so
+    # PR3's alarms get subjects without a second provider and store read.
+    assert snapshot.reconciliation == report

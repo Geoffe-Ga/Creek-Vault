@@ -250,5 +250,83 @@ them — `$6.67` at 720, `$6.75` at 730, `$6.87` at 744 — which is why 720 is 
 value supplied.
 
 Nothing in the telemetry module compares a meter to `monthly_budget`. The budget
-is configuration this slice records so that alarms, when they land, evaluate an
-operator-set threshold rather than a number baked into the control plane.
+is configuration that slice records so that alarms evaluate an operator-set
+threshold rather than a number baked into the control plane. Alarms land in
+`creek_mcp/provisioning/alerts.py`, and the rest of this section is what they do
+with it.
+
+### Alarms notify; they never remediate
+
+`FleetAlarms.raise_alerts()` runs **one** telemetry pass and compares it to the
+operator's thresholds. It is typed on `FleetTelemetry`, holds neither a
+`ProvisioningStore` nor a `ProviderDriver`, and `AlertSink` declares exactly one
+method — so a sink is never handed a repair capability and the whole pass puts
+nothing but GETs on the wire. That is the same ruling `ReconcileMode` carries:
+Decision 6 binds resource removal to revoking the consumer credential, and an
+automatic repair path would destroy billable resources while leaving a live
+credential issued.
+
+Six codes, and every `DivergenceKind` maps to one of them:
+
+| Code | What it observes |
+|---|---|
+| `duplicate_allocation` | a second billable Machine or volume under one allocation |
+| `orphan_resource` | a provider resource no live allocation accounts for |
+| `missing_resource` | a live allocation whose app the provider no longer lists |
+| `stuck_deletion` | a deletion the provider has not confirmed within the window |
+| `continuous_running` | a Machine billing for CPU past `max_continuous_running` |
+| `budget_departure` | an injected billing period costing more than `monthly_budget` |
+
+`missing_resource` exists rather than being ruled unalarmed because it is a
+customer's vault gone while the store still bills for it. Totality is asserted
+(`set(_DIVERGENCE_ALERTS) == set(DivergenceKind)`) and the lookup raises, so a
+sixth divergence kind fails loudly instead of quietly escaping the alarm surface.
+
+*An alarm that could not be evaluated never looks like one that found nothing.*
+Every alert carries a `Meter`. `UNAVAILABLE` means **this threshold could not be
+evaluated**; a threshold that *was* evaluated and found compliant raises no alert
+at all, so the two are never confusable. Three cases are structural rather than
+hypothetical: a running Machine whose provider clock is unreadable yields no
+divergence and appears only in `unmetered_running`; a live Machine in a state
+that is neither known-running nor known-stopped is in neither meter's set; and an
+enumeration that did not complete makes `FleetReconciler._missing` suppress
+itself wholesale. The first two raise a per-subject unevaluable
+`continuous_running`; the third raises one **fleet-scoped** unevaluable alert
+(`subject is None`) for each of the four inventory-derived codes.
+`stuck_deletion` and `budget_departure` are outside that partition — their
+evidence is the durable store and the injected billing boundary, and a failed
+provider read says nothing about either.
+
+*Dedupe is per-run and stateless.* One adopted orphan produces one divergence per
+resource and exactly one `orphan_resource` alert carrying the contributor count,
+taken from telemetry's own combinator so the alert and the meter cannot disagree.
+Nothing durable is written — no table, no schema version, no suppression ledger —
+because a durable ledger would break the equal-passes purity property the
+reconciler and the telemetry pass both hold: the second pass over unchanged state
+would emit nothing. **Cross-run suppression is the injected sink's contract**,
+exactly as `FakeKeyReleaseSink` owns key-release idempotency; `observed_at` is
+carried on every alert (excluded from equality) so a sink can implement a
+time-boxed policy.
+
+*The budget is injected, and it is fleet-scoped.* A billing period cannot be
+derived from an instant, so it arrives through a third read-only Protocol,
+`BillingPeriodSource`, shaped exactly like `EgressMeter`. The shipped
+`UnavailableBillingPeriodSource` answers `UNAVAILABLE` honestly — the Fly
+Machines API has no billing surface — and that produces an explicit
+`budget_departure` alert rather than silence. Its subject is `None`: Decision 4
+says "an operator-set monthly budget" and Decision 7 "the approved fleet budget",
+and a typed `None` cannot collide with a `fly-<24 hex>` surrogate by construction.
+
+Three limits, stated so nobody reads them as closed:
+
+* A departure raised here is a **single-period** departure. It does **not**
+  satisfy Decision 7's "three rolling months above the approved fleet budget"
+  trigger, which needs persisted samples and therefore a schema change this
+  slice deliberately does not take.
+* A **running orphan past the policy window is a named non-alert**. It is
+  covered by `orphan_resource`; `continuous_running` is out of scope for
+  non-live subjects because `FleetReconciler._running` is live-fenced, and
+  re-deriving the threshold in the alarm would duplicate one the reconciler
+  owns. If that is ever to be closed the fix belongs in `FleetReconciler`.
+* `missing_resource` inherits reconcile.py's **app granularity**: a volume that
+  vanishes under a still-listed app is invisible to this alarm too.

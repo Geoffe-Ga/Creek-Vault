@@ -1,5 +1,16 @@
 """Authenticated asynchronous vault-provisioning control plane (#1768)."""
 
+from creek_mcp.provisioning.alerts import (
+    Alert,
+    AlertCode,
+    AlertSink,
+    BillingPeriodReading,
+    BillingPeriodSource,
+    FakeAlertSink,
+    FleetAlarmError,
+    FleetAlarms,
+    UnavailableBillingPeriodSource,
+)
 from creek_mcp.provisioning.inventory import (
     InventorySnapshot,
     MetricQuality,
@@ -38,11 +49,19 @@ from creek_mcp.provisioning.telemetry import (
 )
 
 __all__ = [
+    "Alert",
+    "AlertCode",
+    "AlertSink",
     "AllocationMeter",
+    "BillingPeriodReading",
+    "BillingPeriodSource",
     "BillingPeriodUsage",
     "DivergenceKind",
     "EgressMeter",
     "FailureReason",
+    "FakeAlertSink",
+    "FleetAlarmError",
+    "FleetAlarms",
     "FleetDivergence",
     "FleetPriceTable",
     "FleetReconcilePolicy",
@@ -63,6 +82,7 @@ __all__ = [
     "ProvisioningAllocation",
     "ProvisioningJob",
     "ReconcileMode",
+    "UnavailableBillingPeriodSource",
     "UnavailableEgressMeter",
     "estimate_monthly_cost",
     "storage_bytes",
