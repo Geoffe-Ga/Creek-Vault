@@ -3362,7 +3362,14 @@ def test_save_written_intimate_paradox_is_excluded_below_intimate(
 
     folder = vault / "10-Liminal" / "Paradoxes"
     for override in (PrivacyTierOverride.OPEN, PrivacyTierOverride.PERSONAL):
-        stems = [stem for stem, _tier in _admitted_liminal_notes(folder, override)]
+        stems = [
+            stem
+            for stem, _tier in _admitted_liminal_notes(
+                folder,
+                override,
+                liminal_root=vault / "10-Liminal",
+            )
+        ]
         assert sealed.stem not in stems, (
             "a save-written intimate paradox note was admitted at "
             f"--include-tier {override.value}: {stems}"
@@ -3372,7 +3379,14 @@ def test_save_written_intimate_paradox_is_excluded_below_intimate(
             f"too — the reader is returning nothing, not filtering: {stems}"
         )
     for override in (PrivacyTierOverride.INTIMATE, PrivacyTierOverride.ALL):
-        stems = [stem for stem, _tier in _admitted_liminal_notes(folder, override)]
+        stems = [
+            stem
+            for stem, _tier in _admitted_liminal_notes(
+                folder,
+                override,
+                liminal_root=vault / "10-Liminal",
+            )
+        ]
         assert sealed.stem in stems, (
             "the intimate paradox note was withheld from an entitled "
             f"--include-tier {override.value} consumer: {stems}"

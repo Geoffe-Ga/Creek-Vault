@@ -237,6 +237,55 @@ from most to least likely:
   because the assumed adversary is "third-party content / careless
   operator," not "sophisticated prompt-injection specialist." The
   strict YAML response validator is the second line of defence.
+- **The `10-Liminal` walk guards are leaf-and-subfolder only (#1794).**
+  Both readers of `10-Liminal` — `generate/mining.py::_load_liminal_fragments`
+  and `generate/state.py::_admitted_liminal_notes` — now skip a `.md` entry
+  whose own symlink resolves out of that tree, and refuse a subfolder that is
+  itself a symlink out of it. This matters because a liminal note's `id` is
+  templated verbatim into a draft prompt's `## Ask` block and into
+  `State/latest.md`, and `Fragment.id` carries no pattern or length constraint,
+  so a planted multiline id is a prompt-injection primitive rather than an id
+  echo. Two routes are accepted rather than closed, both measured on real
+  vaults. First, when `10-Liminal` is **itself** a symlink to a directory
+  outside the vault, every guard is inert: `rglob` fully descends its own start
+  path even when that path is a link — it refuses only a symlinked *child* — so
+  `named_path_escapes` sees a real directory under the target and every
+  candidate judges in-root. This is the leaf-only ancestor residual above,
+  reached through the tree's own root rather than through an intermediate
+  component. Second, a **hard link** into `10-Liminal/Unnamed` supplies the same
+  planted id with `is_symlink()` false and `st_nlink` 2; no predicate over path
+  resolution can see it, and no version of the leaf-only policy ever will.
+  Detection is unchanged in both cases — nothing is skipped, so nothing is
+  logged. The bound on both is that they need write access inside the vault
+  directory itself, which is the same access an attacker would need to write
+  the planted note directly.
+- **A containment skip under `01-Fragments` makes the state report's derived
+  tiers unprovable, and it says so (#1794).** `03-Eddies` and `02-Threads`
+  notes carry no `privacy_tier`; their tier is derived as the MAXIMUM over the
+  fragments naming them. A skipped fragment therefore cannot lower a title's
+  admission — it removes evidence from a maximum, which would lower it — so on
+  any run where `generate/state.py::_read_fragment_files` refused a candidate,
+  both derived-tier maps are discarded and every eddy and thread title falls
+  back to the module's standing verdict for unvouched-for content, `INTIMATE`.
+  The refused file is deliberately NOT re-read for its tier, and the reason is
+  the EMPTY case rather than the maximum: contributing to a max cannot lower it
+  (`max_source_tier([intimate, open, open, open])` is `intimate`, measured), but
+  `max_source_tier([])` answers `INTIMATE` *by policy*, so the first contributor
+  replaces that fail-closed floor with whatever it declares. Measured on an eddy
+  no in-root fragment names, feeding the refused file's declared
+  `privacy_tier: open` back in moves the derived tier `intimate -> open` and
+  renders the title at `ceiling=open` — an out-of-root file vouching for a vault
+  title, which is what the guard exists to prevent. A narrower repair (read only
+  the refused file's wikilink *targets* and contribute `INTIMATE` for each) is
+  leak-safe and strictly better on availability, and is declined on a second
+  ground: it opens the file, which breaks `iter_contained`'s
+  never-resolve-never-read contract and hangs on a link to `/dev/zero` (measured:
+  still reading after ten seconds). Recorded as a #1794 follow-up. The
+  `## Active eddies` and `## Active threads` sections render an explicit
+  unevaluable note rather than the ordinary empty-state placeholder, and the
+  `## Vault summary` eddy and thread counts carry an unevaluated marker rather
+  than a bare `0`, because a zero asserts "evaluated against complete evidence
+  and none surfaced" exactly as silence does.
 - **Audit log integrity.** Every purge and redaction-apply writes a
   structured entry to `<vault>/00-Creek-Meta/audit/`. The integrity
   story (hash chaining, tamper-evidence) is the subject of SEC-005;

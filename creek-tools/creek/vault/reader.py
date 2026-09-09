@@ -30,7 +30,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
-from creek._containment import escaping_child
+from creek._containment import iter_contained
 from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
@@ -190,9 +190,13 @@ def iter_vault_fragments(
     skipped — callers that need to surface them to the operator
     should iterate manually with :func:`try_load_fragment`.
 
-    **Containment (#1373).** A ``.md`` file under *fragments_root* that is
-    itself a symlink resolving OUTSIDE that root is skipped and logged, via
-    the one shared predicate :func:`creek._containment.escaping_child`.
+    **Containment (#1373, #1794).** A ``.md`` file under *fragments_root* that
+    is itself a symlink resolving OUTSIDE that root is skipped and logged. The
+    walk goes through :func:`creek._containment.iter_contained`, the one
+    guarded iterator this loader now shares with the two ``10-Liminal``
+    readers, rather than through a bare ``rglob`` with the predicate inlined
+    beside it: #1794 found that the second and third copies of that shape had
+    no guard at all.
     Without it, dropping a single link into ``01-Fragments/`` puts
     attacker-chosen content — and the ``privacy_tier`` it is admitted under,
     since that field is read from the planted file's own frontmatter — into
@@ -239,21 +243,12 @@ def iter_vault_fragments(
     if not fragments_root.exists():
         return []
 
-    # Resolved exactly once, above the loop: resolving per child would be
-    # both wasteful and wrong, since the policy is resolve-the-root and
-    # ``lstat``-the-leaf.
-    resolved_root = fragments_root.resolve(strict=False)
     out: list[tuple[Path, Fragment, str, dict[str, object]]] = []
-    for md_file in sorted(fragments_root.rglob("*.md")):
-        if escaping_child(md_file, resolved_root):
-            # Named as walked. The resolved target is never logged: that is
-            # the exfiltration oracle #1087 closed.
-            logger.warning(
-                "Skipping a fragment whose symlink leaves %s: %s",
-                fragments_root,
-                md_file,
-            )
-            continue
+    for md_file in iter_contained(
+        fragments_root,
+        sorted(fragments_root.rglob("*.md")),
+        what="fragment",
+    ):
         try:
             record = try_load_fragment(md_file)
         except FRONTMATTER_LOAD_ERRORS:

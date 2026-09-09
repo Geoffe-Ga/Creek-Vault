@@ -1859,12 +1859,12 @@ class TestReadFragmentFilesSkipsSchemaInvalid:
             created=datetime(2026, 5, 1, tzinfo=UTC),
         )
         root = empty_vault / "01-Fragments"
-        before = [f.id for _p, f, _raw in _read_fragment_files(root)]
+        before = [f.id for _p, f, _raw in _read_fragment_files(root).records]
         assert before == ["frag-good"]
 
         pydantic_invalid_note(root / "Notes" / "broken.md")
 
-        after = [f.id for _p, f, _raw in _read_fragment_files(root)]
+        after = [f.id for _p, f, _raw in _read_fragment_files(root).records]
         assert after == ["frag-good"]
 
 
@@ -1930,7 +1930,11 @@ class TestAdmittedLiminalNotesStepsOverBadNotes:
             )
         corrupt_note(folder / "note-aa.md", shape)
 
-        admitted = _admitted_liminal_notes(folder, PrivacyTierOverride.ALL)
+        admitted = _admitted_liminal_notes(
+            folder,
+            PrivacyTierOverride.ALL,
+            liminal_root=empty_vault / "10-Liminal",
+        )
 
         assert sorted(stem for stem, _tier in admitted) == ["note-a", "note-b"]
 
@@ -1952,7 +1956,11 @@ class TestAdmittedLiminalNotesStepsOverBadNotes:
                 created=datetime(2026, 5, 1, tzinfo=UTC),
             )
 
-        admitted = _admitted_liminal_notes(folder, PrivacyTierOverride.ALL)
+        admitted = _admitted_liminal_notes(
+            folder,
+            PrivacyTierOverride.ALL,
+            liminal_root=empty_vault / "10-Liminal",
+        )
 
         assert sorted(stem for stem, _tier in admitted) == ["note-a", "note-b"]
 
