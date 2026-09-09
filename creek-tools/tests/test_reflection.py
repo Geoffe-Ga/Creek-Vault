@@ -8,13 +8,16 @@ escalates rather than ships when the round budget is exhausted on REVISE.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
+from creek._containment import escaping_child
 from creek.author.checks import (
     _TIER_RANK,
+    _resolve_cited_tiers,
     check_privacy_compliance,
     check_voice_fidelity,
 )
@@ -81,12 +84,38 @@ def _seed_fragment(
     """
     folder = vault / subtree / "Notes"
     folder.mkdir(parents=True, exist_ok=True)
-    tier_line = "" if tier is None else f"privacy_tier: {tier.value}\n"
     (folder / f"{frag_id}.md").write_text(
+        _fragment_text(frag_id, body, tier, title=title), encoding="utf-8"
+    )
+
+
+def _fragment_text(
+    frag_id: str,
+    body: str,
+    tier: PrivacyTier | None = PrivacyTier.OPEN,
+    *,
+    title: str = "t",
+) -> str:
+    """Render the markdown a minimal Creek fragment file holds.
+
+    Extracted from :func:`_seed_fragment` so the containment pins at the foot
+    of this module can write the identical shape to a path *outside* the vault
+    — a file the vault-relative seeder cannot address.
+
+    Args:
+        frag_id: Fragment id, written into the frontmatter.
+        body: Markdown body written below the frontmatter.
+        tier: Tier to stamp, or ``None`` to omit the ``privacy_tier`` key.
+        title: Fragment title.
+
+    Returns:
+        The complete file text, frontmatter and body.
+    """
+    tier_line = "" if tier is None else f"privacy_tier: {tier.value}\n"
+    return (
         f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
         f"{tier_line}"
-        f"source:\n  platform: journal\n  author: self\n---\n{body}\n",
-        encoding="utf-8",
+        f"source:\n  platform: journal\n  author: self\n---\n{body}\n"
     )
 
 
@@ -2054,3 +2083,302 @@ def test_an_unranked_contract_tier_cannot_outrank_a_raised_config(
         ("privacy_compliance", "HIGH")
     ]
     assert "the medium contract" in findings[0].message
+
+
+# ---------------------------------------------------------------------------
+# the #1793 containment pins
+#
+# #1793 reported that ``_scan_subtree_for_cited``'s bare ``rglob`` walk is a
+# fail-open, because it reads a cited fragment reachable only through a symlink
+# leaving the corpus root — a file ``iter_vault_fragments`` refuses since #1373
+# — and asked for the same ``escaping_child`` skip #1789 added to the draft
+# path. A premise audit refuted it and the measurement inverted it. The three
+# tests below pin the refutation, because the mistake is a natural one to make
+# twice: the walk really is unguarded, and the guard really is right one module
+# over.
+#
+# The difference is loader versus gate. ``creek.generate``'s loaders compose
+# what they read into an LLM prompt, so reading an out-of-root file IS the
+# leak and skipping is the safe direction (#1789, #1794).
+# ``check_privacy_compliance`` only ever EMITS findings, and only for ids it
+# resolved; an id it declines to resolve produces no finding at all. Skipping
+# is therefore the PERMISSIVE direction here, and the fold in
+# ``_CitedFragment.merged_with`` — most restrictive tier wins, every body kept,
+# order-independently — is what makes reading the extra record safe: an extra
+# record can only raise a tier or add a body.
+#
+# The rationale lives in ``_resolve_cited_tiers``'s docstring, from #1374. Its
+# prediction — that a skip path "would introduce the one genuinely unsafe move
+# available here, dropping a body, and with it a leak" — is what
+# ``test_the_leak_gate_folds_an_out_of_root_twin_rather_than_skipping_it``
+# turns into an executable assertion.
+# ---------------------------------------------------------------------------
+
+_TWIN_ID = "frag-x"
+"""The one cited id both the in-vault record and the out-of-root twin declare."""
+
+_ESCAPING_LINK_NAME = "journal.md"
+"""Filename of the planted link — deliberately unrelated to the id it carries.
+
+``_validate_fragment`` enforces no relation between a fragment's ``id`` and its
+filename stem, so an attacker naming the link chooses both.
+"""
+
+_OUTSIDE_OPEN_BODY = "an outsider paragraph reached only through a symlink"
+"""Body of the ``open`` out-of-root twin — over ``_MIN_PROTECTED_LEAK_WORDS``.
+
+Long enough to trip the gate if its tier were ever ranked above the ceiling, so
+the neutrality pin below cannot pass merely because the snippet was too short.
+"""
+
+
+def _plant_escaping_twin(
+    vault: Path,
+    outside_dir: Path,
+    tier: PrivacyTier,
+    body: str,
+) -> Path:
+    """Symlink an out-of-vault fragment carrying *_TWIN_ID* into ``01-Fragments``.
+
+    The target is written OUTSIDE the vault entirely, so the link escapes both
+    the walked corpus root and the vault. Its frontmatter is valid, so a gate
+    that declines it declined it on containment grounds and nothing else.
+
+    Every precondition is asserted rather than described. A symlink fixture is
+    filesystem-sensitive — a filesystem without link support, or a
+    copy-on-write ``symlink_to`` — and a fixture that silently degrades into a
+    plain in-vault file would turn all three pins below into no-ops that pass
+    for the wrong reason.
+
+    Args:
+        vault: Vault root to plant the link inside.
+        outside_dir: A directory outside *vault* to park the real file in.
+        tier: The tier the out-of-root twin declares.
+        body: The out-of-root twin's stored body.
+
+    Returns:
+        The planted link, as walked and never resolved.
+    """
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    target = outside_dir / f"{_TWIN_ID}-outside.md"
+    target.write_text(_fragment_text(_TWIN_ID, body, tier), encoding="utf-8")
+
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    link = folder / _ESCAPING_LINK_NAME
+    link.symlink_to(target)
+
+    assert link.is_symlink(), (
+        f"the fixture did not create a symlink, so the pin proves nothing.\n\n{link}"
+    )
+    walked_root = (vault / "01-Fragments").resolve(strict=False)
+    assert escaping_child(link, walked_root), (
+        "the planted link does not escape the walked corpus root, so it is "
+        "not the shape #1793 is about. This is the production predicate the "
+        f"proposed guard would use.\n\nlink={link}\nroot={walked_root}"
+    )
+    resolved = os.path.realpath(link)
+    vault_root = os.path.realpath(vault)
+    assert not resolved.startswith(vault_root + os.sep), (
+        "the planted link resolves INSIDE the vault, so it is not an escape "
+        f"and proves nothing.\n\nresolved={resolved}\nvault={vault_root}"
+    )
+    return link
+
+
+def _citing(*frag_ids: str) -> EvidenceBundle:
+    """Return an evidence bundle whose single claim cites *frag_ids*.
+
+    Args:
+        frag_ids: The fragment ids the claim is sourced from.
+
+    Returns:
+        A one-claim :class:`~creek.author.models.EvidenceBundle`.
+    """
+    return EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=list(frag_ids))]
+    )
+
+
+def test_the_leak_gate_folds_an_out_of_root_twin_rather_than_skipping_it(
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """THE PIN. Adding #1793's ``escaping_child`` skip here turns a leak into a PASS.
+
+    One cited id, two records. The in-vault one under ``09-Reference`` declares
+    ``open``; the one reachable only through a symlink out of the vault
+    declares ``intimate``. Both carry the body the draft reproduces verbatim.
+
+    Today the monotone fold keeps the more restrictive of the two, so the id
+    resolves ``intimate``, sits above the ``open`` ceiling, and the HARD
+    finding fires. Skip the escaping record — the change #1793 asked for — and
+    the id resolves ``open``, the finding disappears, and protected text ships
+    as ``PASS``. That is a privacy-tier de-escalation, which is why the
+    direction of the guard that is correct on the draft path (#1789, #1794) is
+    a regression on this one.
+
+    MEASURED against a scratch copy carrying the proposed guard: the resolver
+    returned ``PrivacyTier.OPEN`` and ``check_privacy_compliance`` returned
+    ``[]``. Both assertions below are load-bearing against that edit.
+
+    Args:
+        tmp_path: Vault root for this case.
+        tmp_path_factory: Mints a sibling directory OUTSIDE ``tmp_path`` — the
+            vault root here is ``tmp_path`` itself, so the twin must be parked
+            outside it to escape.
+    """
+    _seed_fragment(
+        tmp_path, _TWIN_ID, _LEAK_SECRET, PrivacyTier.OPEN, subtree="09-Reference"
+    )
+    _plant_escaping_twin(
+        tmp_path,
+        tmp_path_factory.mktemp("outside-1793-pin"),
+        PrivacyTier.INTIMATE,
+        _LEAK_SECRET,
+    )
+    evidence = _citing(_TWIN_ID)
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    resolved = _resolve_cited_tiers(evidence, tmp_path)
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert resolved[_TWIN_ID].tier is PrivacyTier.INTIMATE, (
+        "the out-of-root twin was dropped, so the id resolved at the "
+        "permissive in-vault tier. A skip in this walk cannot fail closed: "
+        f"the fold is the only thing raising the tier.\n\nresolved={resolved}"
+    )
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ], f"the HARD leak finding was lost.\n\nfindings={findings}"
+    assert f"'{_TWIN_ID}'" in findings[0].message
+    assert "'intimate'" in findings[0].message
+
+
+def test_an_escaping_open_twin_leaves_the_verdict_exactly_as_it_found_it(
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """#1793's "exploit" is a no-op: planting the file matches planting nothing.
+
+    The issue's core claim was that an attacker-supplied ``privacy_tier: open``
+    on a file symlinked in from outside makes the citation PASS. It does — and
+    so does the same vault with nothing planted at all, because
+    ``check_privacy_compliance`` emits a finding only for an id it resolved and
+    an unresolvable id is skipped rather than guessed. The attacker buys
+    nothing by being read.
+
+    Two vaults, identical but for the plant, are gated with the same evidence
+    and the same draft. The finding lists must be equal. They are also asserted
+    NON-empty: a genuinely over-tier in-vault fragment is cited alongside, so
+    "the two agree" cannot be satisfied by a gate that has stopped working, and
+    the draft reproduces the planted body too, so the planted record has every
+    chance to change the answer.
+
+    This also pins the other direction the invariants forbid: merely
+    encountering a planted symlink must not manufacture a new HARD finding,
+    which would hand anyone with vault write a permanent ESCALATE on the
+    Writing Desk.
+
+    Args:
+        tmp_path: Holds both vault roots.
+        tmp_path_factory: Mints the out-of-vault directory the twin lives in.
+    """
+    planted, control = tmp_path / "planted", tmp_path / "control"
+    for vault in (planted, control):
+        _seed_fragment(vault, "frag-live", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    _plant_escaping_twin(
+        planted,
+        tmp_path_factory.mktemp("outside-1793-neutral"),
+        PrivacyTier.OPEN,
+        _OUTSIDE_OPEN_BODY,
+    )
+    evidence = _citing("frag-live", _TWIN_ID)
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = f"{_draft_reproducing(_LEAK_SECRET)} And also: {_OUTSIDE_OPEN_BODY}."
+
+    verdicts = [
+        [(f.dimension, f.severity, f.message) for f in check_privacy_compliance(*args)]
+        for args in (
+            (body, evidence, planted, contract),
+            (body, evidence, control, contract),
+        )
+    ]
+
+    assert verdicts[0] == verdicts[1], (
+        "reading the out-of-vault file changed the verdict. Either a planted "
+        "`open` record now suppresses a finding — the fail-open #1793 "
+        "claimed, which would be real — or encountering the link raises one, "
+        f"which hands vault-write a permanent ESCALATE.\n\n{verdicts}"
+    )
+    assert len(verdicts[0]) == 1, (
+        "the neutrality assertion has gone vacuous: with an intimate in-vault "
+        f"fragment cited and reproduced, both vaults must flag it.\n\n{verdicts}"
+    )
+    assert "'frag-live'" in verdicts[0][0][2]
+
+
+def test_the_leak_gate_still_resolves_an_intra_root_alias(tmp_path: Path) -> None:
+    """NON-VACUITY ANCHOR (passes before and after). Not "skip every symlink".
+
+    Without this, the two pins above are also satisfied by a walk that drops
+    every symlinked file — a cruder over-correction than #1793 asked for, and
+    one that would silently shrink real vaults, since an alias beside the note
+    it aliases is an ordinary Obsidian shape. It is this gate's counterpart of
+    ``tests/test_draft_path_containment.py``'s two alias anchors.
+
+    The aliased file is deliberately named ``.markdown`` rather than ``.md``:
+    the walk globs ``*.md``, so the link is the ONLY route to that record, and
+    the assertion bites. An anchor whose target the walk also reaches directly
+    would keep passing under "drop every symlink" and prove nothing — the
+    reason #1789 needed two anchors to cover one loader. The precondition is
+    asserted below rather than trusted.
+
+    The alias stays INSIDE the corpus root, so ``escaping_child`` is ``False``
+    for it: this anchor passes at HEAD and would still pass with #1793's guard
+    applied. It pins that any hardening here is about the target escaping the
+    root, never about the link existing.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    root = tmp_path / "01-Fragments"
+    attachments = root / "Attachments"
+    attachments.mkdir(parents=True)
+    target = attachments / "aliased-note.markdown"
+    target.write_text(
+        _fragment_text("frag-alias", _LEAK_SECRET, PrivacyTier.INTIMATE),
+        encoding="utf-8",
+    )
+    notes = root / "Notes"
+    notes.mkdir(parents=True)
+    alias = notes / "frag-alias.md"
+    alias.symlink_to(target)
+
+    assert alias.is_symlink(), f"the alias fixture is not a symlink.\n\n{alias}"
+    assert not escaping_child(alias, root.resolve(strict=False)), (
+        f"the alias escapes the corpus root, so it is not an intra-root "
+        f"alias and anchors nothing.\n\n{alias}"
+    )
+    assert [p.name for p in sorted(root.rglob("*.md"))] == ["frag-alias.md"], (
+        "the walk reaches the aliased record without the link, so this "
+        f"anchor would survive dropping every symlink.\n\n{sorted(root.rglob('*'))}"
+    )
+
+    evidence = _citing("frag-alias")
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ], (
+        "an intra-root alias was dropped. Containment is about the target "
+        "leaving the root, not about the link existing; refusing every "
+        f"symlink blinds the gate to ordinary vaults.\n\nfindings={findings}"
+    )
+    assert "'intimate'" in findings[0].message
