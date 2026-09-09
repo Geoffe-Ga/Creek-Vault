@@ -283,19 +283,39 @@ customer's vault gone while the store still bills for it. Totality is asserted
 sixth divergence kind fails loudly instead of quietly escaping the alarm surface.
 
 *An alarm that could not be evaluated never looks like one that found nothing.*
-Every alert carries a `Meter`. `UNAVAILABLE` means **this threshold could not be
-evaluated**; a threshold that *was* evaluated and found compliant raises no alert
-at all, so the two are never confusable. Three cases are structural rather than
-hypothetical: a running Machine whose provider clock is unreadable yields no
-divergence and appears only in `unmetered_running`; a live Machine in a state
-that is neither known-running nor known-stopped is in neither meter's set; and an
-enumeration that did not complete makes `FleetReconciler._missing` suppress
-itself wholesale. The first two raise a per-subject unevaluable
-`continuous_running`; the third raises one **fleet-scoped** unevaluable alert
-(`subject is None`) for each of the four inventory-derived codes.
-`stuck_deletion` and `budget_departure` are outside that partition — their
-evidence is the durable store and the injected billing boundary, and a failed
-provider read says nothing about either.
+The rule, stated exactly, because a looser version of it let two defects through
+review:
+
+> An alert is raised whenever its condition holds **or could not be ruled out**.
+> Silence means one thing only: the condition was evaluated against complete
+> evidence and did not hold.
+
+Every alert carries a `Meter` saying how far its evidence goes, read as a
+statement about the *figure* rather than the verdict. `EXACT` — complete and
+readable, condition confirmed. `ESTIMATED` — the figure is a **lower bound**;
+for a count that still confirms the condition (at least *n* orphans is still
+orphans), but for the budget it does not, so a lower bound under the threshold
+alarms rather than falling silent. `UNAVAILABLE` — no readable evidence at all.
+
+Four cases are structural rather than hypothetical:
+
+* a running Machine whose provider clock is unreadable yields no divergence and
+  appears only in `unmetered_running`;
+* a live Machine in a state that is neither known-running nor known-stopped is
+  in neither meter's set;
+* an enumeration that did not complete makes `FleetReconciler._missing`
+  suppress itself wholesale;
+* a resource whose `provider_allocation_id` could not be read is skipped by
+  *every* divergence path, because none of them has a subject to name it by —
+  it is billed for and would otherwise reach no alarm at all. The count is
+  surfaced as `FleetTelemetrySnapshot.unattributed_resources` so it is visible
+  rather than inferred from silence.
+
+The first two raise a per-subject unevaluable `continuous_running`; the last two
+raise one **fleet-scoped** unevaluable alert (`subject is None`) for each of the
+four inventory-derived codes. `stuck_deletion` and `budget_departure` are
+outside that partition — their evidence is the durable store and the injected
+billing boundary, and a failed provider read says nothing about either.
 
 *Dedupe is per-run and stateless.* One adopted orphan produces one divergence per
 resource and exactly one `orphan_resource` alert carrying the contributor count,
@@ -316,6 +336,32 @@ Machines API has no billing surface — and that produces an explicit
 `budget_departure` alert rather than silence. Its subject is `None`: Decision 4
 says "an operator-set monthly budget" and Decision 7 "the approved fleet budget",
 and a typed `None` cannot collide with a `fly-<24 hex>` surrogate by construction.
+
+Only one budget outcome is silent, and it is the only one that may be: a period
+read on **complete** evidence that came in at or under the budget.
+
+| Reading | Verdict |
+|---|---|
+| no readable period | `budget_departure`, `Meter(None, UNAVAILABLE)` |
+| figure over budget | `budget_departure` carrying the reading's own quality |
+| **lower bound under budget** | `budget_departure`, `Meter(1, ESTIMATED)` |
+| exact figure at or under budget | silence |
+
+The third row matters most, and it is the realistic one. `BillingPeriodUsage`
+has five non-Optional `Decimal` fields, so an export whose egress meter lags
+**cannot express "unmeasured"** — it must zero-fill and flag the reading
+`ESTIMATED`, the only signal the type leaves it. Treating that as compliant
+reports a fleet over budget as a clean month. The quality is carried into the
+alert rather than collapsed to `UNAVAILABLE`, so an approximate export stays
+distinguishable from having no billing source at all; collapsing it would be
+this same defect mirrored.
+
+Egress itself is not separately alarmed, and the reason is not that it is
+unreadable — an operator can inject an `EgressMeter` and it reads fine. It
+reaches this surface through the cost path, as `BillingPeriodUsage.egress_gb`
+feeding `estimate_monthly_cost`. What does not exist is a separate egress
+*threshold*: `FleetPriceTable.egress_gb` is a unit price, not a budget, and
+alarming against a threshold nobody set is what Decision 4 forbids.
 
 Three limits, stated so nobody reads them as closed:
 

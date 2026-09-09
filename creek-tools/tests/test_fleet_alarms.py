@@ -55,7 +55,12 @@ from creek_mcp.provisioning.driver import (
     FakeProviderDriver,
     ProviderError,
 )
-from creek_mcp.provisioning.inventory import MetricQuality
+from creek_mcp.provisioning.inventory import (
+    InventorySnapshot,
+    MetricQuality,
+    ProviderResource,
+    ProviderResourceClass,
+)
 from creek_mcp.provisioning.models import FailureReason
 from creek_mcp.provisioning.reconcile import DivergenceKind
 from creek_mcp.provisioning.store import ProvisioningStore
@@ -63,6 +68,7 @@ from creek_mcp.provisioning.telemetry import (
     BillingPeriodUsage,
     FleetPriceTable,
     Meter,
+    estimate_monthly_cost,
 )
 from creek_mcp.provisioning.worker import ProvisioningWorker
 from tests.fly_api_support import (
@@ -72,6 +78,13 @@ from tests.fly_api_support import (
     FakeFlyAPI,
     build_driver,
 )
+from tests.provisioning_report_only_support import (
+    DYNAMIC_DISPATCH as _DYNAMIC_DISPATCH,
+)
+from tests.provisioning_report_only_support import (
+    MUTATING_OPERATIONS as _MUTATING_OPERATIONS,
+)
+from tests.provisioning_report_only_support import durable_fingerprint
 from tests.provisioning_secret_support import (
     FORBIDDEN_FIELD_NAMES,
     assert_content_free,
@@ -101,6 +114,7 @@ _PACKAGE: Final[Path] = (
 _ALERTS_SOURCE: Final[str] = (_PACKAGE / "alerts.py").read_text(encoding="utf-8")
 
 _CONSUMER: Final[str] = "adepthood-user-001"
+_SECOND_ACTIVATION: Final[str] = "activation-C"
 _REQUESTER: Final[str] = "adepthood"
 
 # Both usages are INPUTS, exactly as _REFERENCE_PRICES is: they stand in for a
@@ -122,6 +136,52 @@ _OVER_BUDGET_USAGE: Final[BillingPeriodUsage] = BillingPeriodUsage(
     snapshot_gb=Decimal(0),
 )
 """A hundred GB of volume plus a nearly-continuous month: comfortably over."""
+
+_EGRESS_UNMEASURED_USAGE: Final[BillingPeriodUsage] = BillingPeriodUsage(
+    volume_gb=Decimal(60),
+    rootfs_gb=Decimal(1),
+    running_hours=Decimal(0),
+    egress_gb=Decimal(0),
+    snapshot_gb=Decimal(0),
+)
+"""An export whose egress meter lagged, zero-filled and flagged ESTIMATED.
+
+``BillingPeriodUsage`` has five non-Optional ``Decimal`` fields, so a source
+that could not read one of them **cannot express "unmeasured"**. Zero-filling
+and degrading the reading's quality is the only honest signal the type leaves
+it — which is exactly what makes this the realistic shape of a real billing
+export, not a contrived one.
+"""
+
+_EGRESS_MEASURED_USAGE: Final[BillingPeriodUsage] = dataclasses.replace(
+    _EGRESS_UNMEASURED_USAGE, egress_gb=Decimal(200)
+)
+"""The same period once the lagging egress meter caught up: over budget."""
+
+
+class _UnattributedInventory:
+    """Serve one billable resource whose attribution could not be read.
+
+    ``ProviderResource.provider_allocation_id`` is ``str | None`` and
+    ``ProviderInventory`` is an injected Protocol whose docstring anticipates
+    "an offline invoice export rather than a live API". ``FlyProviderDriver``
+    always attributes, but nothing in the type or the seam requires that of
+    another implementation, and every divergence path skips ``None`` outright.
+    """
+
+    def list_resources(self) -> InventorySnapshot:
+        """Return one Machine the pass can see but cannot attribute."""
+        return InventorySnapshot(
+            resources=(
+                ProviderResource(
+                    resource_class=ProviderResourceClass.MACHINE,
+                    provider_id="machine-unattributed",
+                    provider_allocation_id=None,
+                    state="started",
+                ),
+            ),
+            complete=True,
+        )
 
 
 class _StubBillingPeriodSource:
@@ -607,6 +667,81 @@ def test_the_budget_boundary_is_strict_and_a_compliant_period_stays_silent(
     )
 
 
+def test_a_lower_bound_under_budget_is_unevaluable_never_compliant(
+    tmp_path: Path,
+) -> None:
+    """An approximate period under budget must not read as a measured clean month.
+
+    This is PR2's own defect class arriving through the type system. The
+    reading is ESTIMATED — a lower bound, exactly as ``_measured`` arm 3 and
+    ``_lower_bound`` already use the word — so a lower bound *under* the budget
+    rules nothing out. Discarding it as compliant makes a fleet that is really
+    over budget byte-identical to a fully-measured month inside it.
+
+    The lower bound over budget is a different case and stays a departure: an
+    actual figure at or above a lower bound that already exceeds the budget
+    exceeds it too.
+    """
+    store, api, _ = _provisioned(tmp_path)
+    driver = build_driver(api)
+    budget = _REFERENCE_PRICES.monthly_budget
+    lower_bound = estimate_monthly_cost(_EGRESS_UNMEASURED_USAGE, _REFERENCE_PRICES)
+    truth = estimate_monthly_cost(_EGRESS_MEASURED_USAGE, _REFERENCE_PRICES)
+
+    raised = _raised(
+        _alarms(
+            store,
+            driver,
+            billing=_StubBillingPeriodSource(
+                BillingPeriodReading(_EGRESS_UNMEASURED_USAGE, MetricQuality.ESTIMATED)
+            ),
+        ),
+        api,
+    )
+
+    # The fixture is the real failure, not a contrivance: the figure the source
+    # could report is under budget while the period it describes is over it.
+    assert lower_bound < budget < truth
+    assert raised == (
+        Alert(
+            AlertCode.BUDGET_DEPARTURE,
+            None,
+            Meter(1, MetricQuality.ESTIMATED),
+            _NOW,
+        ),
+    )
+    # Distinguishable from having no billing source at all, which is the
+    # mirror defect: an approximate export must not look like no export.
+    assert raised[0].contributing != Meter(None, MetricQuality.UNAVAILABLE)
+
+
+def test_an_estimated_period_over_budget_is_still_a_departure(
+    tmp_path: Path,
+) -> None:
+    """A lower bound already past the budget confirms the departure it reports."""
+    store, api, _ = _provisioned(tmp_path)
+
+    raised = _raised(
+        _alarms(
+            store,
+            build_driver(api),
+            billing=_StubBillingPeriodSource(
+                BillingPeriodReading(_OVER_BUDGET_USAGE, MetricQuality.ESTIMATED)
+            ),
+        ),
+        api,
+    )
+
+    assert raised == (
+        Alert(
+            AlertCode.BUDGET_DEPARTURE,
+            None,
+            Meter(1, MetricQuality.ESTIMATED),
+            _NOW,
+        ),
+    )
+
+
 def test_a_billing_source_that_raises_degrades_to_an_unevaluable_budget(
     tmp_path: Path,
 ) -> None:
@@ -771,17 +906,96 @@ def test_the_alarm_pass_writes_nothing_durable_and_leaves_the_schema_at_four(
     Cross-run dedupe would need durable state *and* would break the
     equal-passes purity property PR1 and PR2 both hold: a suppression ledger
     makes the second pass emit nothing.
+
+    The fingerprint is the load-bearing assertion, and the schema pin alone was
+    not. ``PRAGMA user_version`` proves no *migration* ran; an ``INSERT`` leaves
+    it untouched, names no method any allowlist enumerates and puts nothing on
+    the provider wire, so a raw write escaped the tripwire, the wire assertion
+    and the schema pin at once. Hashing the file asserts the outcome instead of
+    the syntax, so it holds whatever spelling reached the database.
     """
+    database = tmp_path / "provisioning.sqlite3"
     store, api, _ = _provisioned(tmp_path)
     _plant_orphan(api, _ORPHAN_ACTIVATION)
+    before = durable_fingerprint(database)
 
     _raised(_alarms(store, build_driver(api)), api)
 
-    with sqlite3.connect(tmp_path / "provisioning.sqlite3") as connection:
+    assert durable_fingerprint(database) == before
+    with sqlite3.connect(database) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()
     assert version[0] == 4
     for forbidden in ("CREATE TABLE", "ALTER", "PRAGMA", "user_version", "_SCHEMA"):
         assert forbidden not in _ALERTS_SOURCE
+
+
+def test_the_durable_fingerprint_would_notice_a_raw_row_write(
+    tmp_path: Path,
+) -> None:
+    """The guard above is only worth having if it can fail.
+
+    A schema-version pin cannot tell these two states apart; the fingerprint
+    can, which is the whole reason the previous test does not rest on the pin.
+    """
+    database = tmp_path / "provisioning.sqlite3"
+    store, _, _ = _provisioned(tmp_path)
+    before = durable_fingerprint(database)
+
+    store.submit(_SECOND_ACTIVATION, _CONSUMER, _REQUESTER, now=_NOW)
+
+    with sqlite3.connect(database) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()
+    assert version[0] == 4
+    assert durable_fingerprint(database) != before
+
+
+def test_a_resource_that_could_not_be_attributed_is_never_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    """A billable resource with no readable attribution reaches no alarm at all.
+
+    ``FleetReconciler._orphans``, ``._duplicates`` and ``._unmetered`` all skip
+    ``provider_allocation_id is None``, and so does
+    ``_unclassified_machines``. So the resource is enumerated, billed for, and
+    invisible to every code — absence of signal reading as absence of problem,
+    one notch inside the ``UNAVAILABLE`` boundary rather than across it.
+
+    It blinds the same four inventory-derived codes a partial enumeration
+    does, so it raises the same four fleet-scoped unevaluable alerts, and the
+    count itself is surfaced on the snapshot rather than left to inference.
+    """
+    store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
+    inventory = _UnattributedInventory()
+    alarms = _alarms(store, inventory)
+
+    snapshot = _telemetry(store, inventory).observe()
+    raised = _raised(alarms)
+
+    assert snapshot.inventory_complete is True
+    assert snapshot.unattributed_resources == Meter(1, MetricQuality.EXACT)
+    assert _codes(raised) == {
+        AlertCode.DUPLICATE_ALLOCATION,
+        AlertCode.ORPHAN_RESOURCE,
+        AlertCode.MISSING_RESOURCE,
+        AlertCode.CONTINUOUS_RUNNING,
+    }
+    assert all(alert.subject is None for alert in raised)
+    assert all(
+        alert.contributing == Meter(None, MetricQuality.UNAVAILABLE) for alert in raised
+    )
+
+
+def test_a_fully_attributed_complete_pass_raises_no_coverage_alarm(
+    tmp_path: Path,
+) -> None:
+    """The blinding trigger is load-bearing, not a constant True."""
+    store, api, _ = _provisioned(tmp_path)
+
+    snapshot = _telemetry(store, build_driver(api)).observe()
+    raised = _raised(_alarms(store, build_driver(api)), api)
+
+    assert snapshot.unattributed_resources == Meter(0, MetricQuality.EXACT)
+    assert raised == ()
 
 
 def test_the_fake_driver_proves_report_only_without_a_provider(
@@ -904,60 +1118,49 @@ Notably absent: ``ProvisioningStore``, ``ProviderDriver`` and
 structural rather than conventional — that model carries ``consumer_identity``.
 """
 
-_MUTATING_OPERATIONS: Final[frozenset[str]] = frozenset(
-    {
-        # The provider seam.
-        "provision",
-        "delete",
-        "start",
-        "stop",
-        "delete_orphan",
-        # The durable seam. A store mutation reaches provider deletion
-        # through the worker, so covering only the driver leaves a whole
-        # path an alarm pass must never take.
-        "submit",
-        "request_delete",
-        "retry",
-        "record_failure",
-        "complete_create",
-        "complete_delete",
-        "claim_next",
-        "complete_key_ceremony",
-        "expire_key_ceremonies",
-    }
-)
-
-_DYNAMIC_DISPATCH: Final[frozenset[str]] = frozenset(
-    {"getattr", "setattr", "vars", "eval", "exec", "__import__", "globals"}
-)
-
 
 def test_the_alerts_module_trips_on_the_spellings_of_a_repair_path() -> None:
-    """A tripwire over the common spellings, not a proof, and not presented as one.
+    """A tripwire over three syntactic shapes. Not a proof, and materially leaky.
 
-    What it actually enforces, and nothing beyond it: ``alerts.py``'s import
-    set equals ``_ALERTS_IMPORTS`` exactly; no attribute call, bare-name call
-    or attribute reference in that one file names a mutating operation on
-    either seam — the provider driver's ``provision``/``delete``/``start``/
-    ``stop`` or the durable store's ``submit``/``request_delete``/
-    ``claim_next`` and the rest; and no dynamic-dispatch builtin or
-    ``__dict__``/``__class__`` spelling appears in it. It says nothing at all
-    about any other module.
+    Four of these have now been written across three PRs and every one shipped
+    a docstring that outran its walk, so this one states the walk itself rather
+    than the property someone hoped it implied.
 
-    What it cannot enforce: attribute access has spellings no syntax check
-    enumerates, and this one is scoped to a single file, so a mutating helper
-    reached through a variable obtained some other way is outside it. PR1's
-    and PR2's equivalent tripwires were both reviewed as overclaiming; this
-    docstring is deliberately narrower than theirs.
+    It parses ``alerts.py`` and checks exactly three things about that one
+    file: the set of imported names equals ``_ALERTS_IMPORTS``; the ``attr`` of
+    every ``ast.Attribute`` and the ``id`` of every **called** ``ast.Name`` are
+    disjoint from the shared mutating-operation set; and the same two
+    collections are disjoint from the dynamic-dispatch set plus
+    ``__dict__``/``__class__``. That is the entire content.
 
-    The behavioural guarantee lives elsewhere and is true as stated: every
-    call in this module that reaches the provider goes through ``_raised`` or
-    ``_notified``, each of which asserts the pass put nothing but GETs on the
-    wire, and the one site that cannot — the sink whose ``deliver`` raises, so
-    nothing is returned — makes the same assertion inline after the exception.
-    There is no exempt call site. The ``FakeProviderDriver`` test additionally
-    asserts a zero teardown count, and ``AlertSink`` declares exactly one
-    method, so a sink is never handed a mutation capability.
+    Three holes are named because they are reachable, not to be exhaustive:
+
+    * **Dynamic dispatch escapes by rebinding.** Called names are collected
+      only in call position, so ``dispatch = getattr`` then ``dispatch(...)``
+      passes: ``getattr`` never appears as a called name and never as an
+      attribute.
+    * **A raw store write escapes entirely.** ``sqlite3``-style ``connect`` and
+      ``execute`` are in neither set, an ``INSERT`` moves no schema version and
+      touches no provider, so the store-seam names in the allowlist give no
+      coverage against SQL that never spells one of them.
+    * **It is one file.** Nothing here says anything about any other module.
+
+    Because of that the real guarantees are behavioural and are the assertions
+    to trust:
+
+    * *The wire.* Every call in this module that reaches a **provider fake**
+      goes through ``_raised`` or ``_notified``, which assert the pass put
+      nothing but GETs on it; the one site that cannot — the sink whose
+      ``deliver`` raises, so nothing returns — asserts it inline after the
+      exception. The single call passing no ``api`` is the
+      ``FakeProviderDriver`` test, which has no wire to observe and asserts
+      ``delete_count == 0`` instead. That is the exhaustive list.
+    * *The store.* ``test_the_alarm_pass_writes_nothing_durable...`` fingerprints
+      the whole database file across a pass, which catches a durable write
+      whatever spelling reached it, and a companion test proves that
+      fingerprint can actually fail.
+    * *The capability.* ``AlertSink`` declares exactly one method, so a sink is
+      never handed a mutation capability in the first place.
     """
     tree = ast.parse(_ALERTS_SOURCE)
     imported = {

@@ -56,6 +56,12 @@ from creek_mcp.provisioning.reconcile import (
 from creek_mcp.provisioning.store import ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
 from tests.fly_api_support import FakeFlyAPI, build_driver
+from tests.provisioning_report_only_support import (
+    DYNAMIC_DISPATCH as _DYNAMIC_DISPATCH,
+)
+from tests.provisioning_report_only_support import (
+    MUTATING_OPERATIONS as _MUTATING_OPERATIONS,
+)
 from tests.provisioning_secret_support import (
     FORBIDDEN_FIELD_NAMES,
     assert_content_free,
@@ -497,24 +503,18 @@ _RECONCILE_IMPORTS: Final[frozenset[str]] = frozenset(
 )
 """Every name reconcile.py may import. All of them are read-only or inert."""
 
-_MUTATING_OPERATIONS: Final[frozenset[str]] = frozenset(
-    {"provision", "delete", "start", "stop", "delete_orphan"}
-)
-
-_DYNAMIC_DISPATCH: Final[frozenset[str]] = frozenset(
-    {"getattr", "setattr", "vars", "eval", "exec", "__import__", "globals"}
-)
-"""Spellings that would reach a mutating method without naming it."""
-
 
 def test_the_reconciler_module_trips_on_the_spellings_of_a_repair_path() -> None:
     """A tripwire over the common spellings, not a proof, and not presented as one.
 
     What it actually enforces: no attribute call, bare-name call or attribute
-    reference in ``reconcile.py`` names a mutating provider operation; no
-    dynamic-dispatch builtin is called; and the module's import set is exactly
-    the listed read-only names, so a mutating helper cannot be reached from
-    another module without failing this test first.
+    reference in ``reconcile.py`` names a mutating operation on **either**
+    seam — the shared set in ``tests/provisioning_report_only_support.py``
+    covers the provider driver and the durable store alike, and this suite's
+    own copy used to cover only the provider half; no dynamic-dispatch builtin
+    is called; and the module's import set is exactly the listed read-only
+    names, so a mutating helper cannot be reached from another module without
+    failing this test first.
 
     What it cannot enforce: attribute access has spellings this does not
     enumerate (``__getattribute__`` reached through a variable, an operator

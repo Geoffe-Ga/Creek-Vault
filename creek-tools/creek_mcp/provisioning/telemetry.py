@@ -196,6 +196,13 @@ class FleetTelemetrySnapshot:
     stopped-capacity and running-duration meters rather than being silently
     assigned to either.
 
+    ``unattributed_resources`` counts resources whose
+    ``provider_allocation_id`` could not be read. They are named by no field
+    here, because there is no surrogate to name them by — which is exactly why
+    they are counted: every divergence path skips them, so without this figure
+    a billed resource nothing could attribute would be indistinguishable from
+    one that does not exist.
+
     **Why the whole reconciliation report is carried.** Every divergence meter
     below reduces its divergences to a *count*, which is all a cost report
     needs. An alarm needs the **subjects**, and the only other way to obtain
@@ -224,6 +231,7 @@ class FleetTelemetrySnapshot:
     unconfirmed_deletions: Meter
     unmetered_running: tuple[str, ...]
     unclassified_machines: tuple[str, ...]
+    unattributed_resources: Meter
     inventory_complete: bool
     reconciliation: FleetReconciliationReport
     observed_at: datetime = field(compare=False)
@@ -433,6 +441,29 @@ def _unclassified_machines(inventory: InventorySnapshot) -> tuple[str, ...]:
     )
 
 
+def _unattributed_resources(inventory: InventorySnapshot) -> Meter:
+    """Count billable resources this pass could see but could not attribute.
+
+    ``ProviderResource.provider_allocation_id`` is optional because
+    ``ProviderInventory`` is an injected Protocol whose docstring anticipates
+    an offline invoice export, not only ``FlyProviderDriver`` (which always
+    attributes). Every divergence path — ``_orphans``, ``_duplicates``,
+    ``_running``, ``_unmetered`` and :func:`_unclassified_machines` — skips an
+    unattributed resource outright, because none of them has a subject to name
+    it by. Counting them here is what stops that skip from reading downstream
+    as a clean fleet: the resource is billed for, and nothing else on this
+    record would say it exists.
+    """
+    return _measured(
+        [
+            1
+            for resource in inventory.resources
+            if resource.provider_allocation_id is None
+        ],
+        complete=inventory.complete,
+    )
+
+
 def _of_class(
     inventory: InventorySnapshot,
     resource_class: ProviderResourceClass,
@@ -608,6 +639,7 @@ class FleetTelemetry:
             ),
             unmetered_running=report.unmetered_running,
             unclassified_machines=_unclassified_machines(inventory),
+            unattributed_resources=_unattributed_resources(inventory),
             inventory_complete=inventory.complete,
             reconciliation=report,
             observed_at=now,

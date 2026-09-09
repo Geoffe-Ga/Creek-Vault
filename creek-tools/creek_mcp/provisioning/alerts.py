@@ -26,12 +26,28 @@ alert and the meter beside it are arithmetically incapable of disagreeing.
 
 *No silent non-alert.* This is the inverse of the defect
 :class:`~creek_mcp.provisioning.inventory.MetricQuality` exists to prevent, and
-it is the rule this module is built around: **an alarm whose threshold input
-was UNAVAILABLE emits an explicit unevaluable alert — never silence, and never
-a compliant reading.** Every alert carries a
-:class:`~creek_mcp.provisioning.telemetry.Meter`, so an alarm that could not be
-evaluated is distinguishable from one that evaluated and found nothing. Three
-places make that structural rather than aspirational:
+it is the rule this module is built around. Stated exactly, because a looser
+version of it is what let two defects through review:
+
+    **An alert is raised whenever its condition holds OR could not be ruled
+    out. Silence means one thing only: the condition was evaluated against
+    complete evidence and did not hold.**
+
+Every alert carries a :class:`~creek_mcp.provisioning.telemetry.Meter` saying
+how far its evidence goes, and the quality is read the same way it is read
+everywhere else in this package — as a statement about the *figure*, not about
+the verdict:
+
+* ``EXACT`` — complete, readable evidence. The condition is confirmed.
+* ``ESTIMATED`` — the figure is a **lower bound**. For a count that still
+  confirms the condition (at least *n* orphans is still orphans). For the
+  budget it does not: a lower bound *under* the threshold rules nothing out,
+  so that case alarms rather than falling silent, and its alert is
+  ``ESTIMATED`` rather than ``UNAVAILABLE`` so an approximate export stays
+  distinguishable from having no billing source at all.
+* ``UNAVAILABLE`` — there was no readable evidence whatever.
+
+Four places make that structural rather than aspirational:
 
 1. ``FleetReconciler._is_running_beyond`` refuses to report a Machine with no
    readable clock, so such a Machine yields *no* divergence and appears only in
@@ -43,6 +59,10 @@ places make that structural rather than aspirational:
    *wholesale*, so ``missing_resource`` has no per-subject signal at all and an
    absence of findings would be a confident zero. One fleet-scoped unevaluable
    alert is emitted for each inventory-derived code instead.
+4. A resource whose ``provider_allocation_id`` could not be read is skipped by
+   *every* divergence path, because none of them has a subject to name it by.
+   It is billed for and would otherwise reach no alarm at all, so it raises the
+   same four fleet-scoped unevaluable alerts an incomplete enumeration does.
 
 :meth:`Alert.__post_init__` closes the gap ``Meter``'s own biconditional
 leaves: ``Meter(0, EXACT)`` satisfies that biconditional and is exactly a
@@ -80,10 +100,20 @@ Four judgement calls, stated so they are known gaps rather than silent ones.
    If that is ever to be closed, the fix belongs in ``FleetReconciler``.
 3. ``missing_resource`` inherits reconcile.py's **app granularity**: a volume
    that vanishes under a still-listed app is invisible to this alarm too.
-4. ``refused_allocation_attempts`` and ``egress_bytes`` are permanently
-   unavailable meters by construction rather than by circumstance, so they are
-   deliberately not alarmed — an alarm that could never be evaluated on any
-   pass is noise, not a signal.
+4. ``refused_allocation_attempts`` and ``egress_bytes`` are not alarmed, for
+   two *different* reasons — an earlier draft gave one reason for both, and it
+   was wrong about egress and inconsistent with how the budget is treated.
+   ``refused_allocation_attempts`` is rejected before anything durable is
+   written, so no pass can count it, and there is no operator threshold to
+   compare it against: there is no condition to raise. ``egress_bytes`` is
+   perfectly readable whenever an operator injects an
+   :class:`~creek_mcp.provisioning.telemetry.EgressMeter` — it is *not*
+   permanently unavailable — and it is not unalarmed either: egress reaches
+   this surface through the cost path, as ``BillingPeriodUsage.egress_gb``
+   feeding :func:`~creek_mcp.provisioning.telemetry.estimate_monthly_cost` and
+   so ``budget_departure``. What does not exist is a *separate* egress
+   threshold; ``FleetPriceTable.egress_gb`` is a unit price, not a budget, and
+   alarming against a threshold nobody set is what Decision 4 forbids.
 """
 
 from __future__ import annotations
@@ -324,6 +354,19 @@ def _sort_key(alert: Alert) -> tuple[str, str]:
     return (alert.code.value, alert.subject or "")
 
 
+def _is_lower_bound(reading: BillingPeriodReading) -> bool:
+    """Return whether a readable period is a lower bound, not a settled figure.
+
+    ``ESTIMATED`` is this package's word for a lower bound — ``_measured``'s
+    third arm and :func:`~creek_mcp.provisioning.telemetry._lower_bound` both
+    use it that way. A lower bound cannot rule a departure out, so a reading
+    that is one alarms even when its figure sits under the budget. Written
+    against ``EXACT`` rather than for ``ESTIMATED`` so a quality added later is
+    treated as not-yet-settled rather than silently as confirmation.
+    """
+    return reading.quality is not MetricQuality.EXACT
+
+
 def _orphaned_subjects(snapshot: FleetTelemetrySnapshot) -> set[str]:
     """Return the surrogates this pass reported as orphaned."""
     return {
@@ -438,11 +481,29 @@ class FleetAlarms:
     def _budget_alerts(self, observed_at: datetime) -> Iterator[Alert]:
         """Compare an injected billing period against the operator's budget.
 
-        Three outcomes, and the first is the one that matters: a period nobody
-        could read raises an explicit unevaluable departure rather than
-        silence. An evaluated period over budget raises a departure; an
-        evaluated period at or under it raises nothing, because that is an
-        alarm that *was* evaluated and found compliant.
+        Exactly one outcome is silent, and it is the only one that may be:
+        a period read on **complete** evidence that came in at or under the
+        budget. Everything else alarms.
+
+        * No readable period at all -> ``Meter(None, UNAVAILABLE)``.
+        * A figure over the budget -> a departure carrying the reading's own
+          quality. A lower bound already past the budget confirms a departure,
+          because the true figure is at or above it.
+        * A **lower bound under** the budget -> a departure carrying
+          ``ESTIMATED``. This is the arm that used to fall off the end
+          silently. ``ESTIMATED`` means lower bound here exactly as it does in
+          ``_measured``'s third arm, so a lower bound under the threshold rules
+          nothing out — and a source that could not read one component of
+          :class:`~creek_mcp.provisioning.telemetry.BillingPeriodUsage` cannot
+          say so in the type, whose five fields are non-Optional ``Decimal``.
+          Zero-filling and degrading the quality is the only signal it has, so
+          treating that as compliant reports a fleet over budget as a clean
+          month.
+
+        The quality is carried rather than collapsed to ``UNAVAILABLE`` on
+        purpose: collapsing would make an approximate but genuinely in-budget
+        export permanently indistinguishable from having no billing source at
+        all, which is this same defect mirrored.
         """
         reading = self._read_billing_period()
         if reading.usage is None:
@@ -452,7 +513,7 @@ class FleetAlarms:
                 Meter(None, MetricQuality.UNAVAILABLE),
                 observed_at,
             )
-        elif self._departed(reading.usage):
+        elif self._departed(reading.usage) or _is_lower_bound(reading):
             yield Alert(
                 AlertCode.BUDGET_DEPARTURE,
                 None,
@@ -473,21 +534,39 @@ class FleetAlarms:
             return BillingPeriodReading(None, MetricQuality.UNAVAILABLE)
 
 
+def _blinded(snapshot: FleetTelemetrySnapshot) -> bool:
+    """Return whether anything blinded this pass\u2019s inventory-derived codes.
+
+    Two causes, and they blind the same four codes for the same reason —
+    evidence that exists and could not be read:
+
+    1. The enumeration did not complete, so a subject may never have been seen.
+    2. A resource **was** seen but could not be attributed. Every divergence
+       path skips ``provider_allocation_id is None`` because none of them has
+       a subject to name it by, so such a resource reaches no per-subject alert
+       and its absence would otherwise read as absence of a problem.
+    """
+    return not snapshot.inventory_complete or (
+        snapshot.unattributed_resources.value != 0
+    )
+
+
 def _fleet_unevaluable(snapshot: FleetTelemetrySnapshot) -> Iterator[Alert]:
-    """Raise one fleet-scoped unevaluable alert per code a partial read blinded.
+    """Raise one fleet-scoped unevaluable alert per code this pass was blinded on.
 
     Not defence in depth. ``FleetReconciler._missing`` suppresses itself
     *wholesale* on an enumeration that did not complete, so for
     ``missing_resource`` there is no per-subject signal at all and an absence
     of findings reads as a confident zero — precisely the fleet an operator
     most needs told about. The other three inventory-derived codes degrade
-    per-subject but can still be silent for a subject nobody enumerated.
+    per-subject but can still be silent for a subject nobody enumerated, or
+    for a resource nobody could attribute.
 
     ``stuck_deletion`` and ``budget_departure`` are outside this partition:
     their evidence is the durable store and the injected billing boundary, and
-    a provider read that failed says nothing about either.
+    a provider read that failed or went unattributed says nothing about either.
     """
-    if snapshot.inventory_complete:
+    if not _blinded(snapshot):
         return
     for code in sorted(_INVENTORY_DERIVED):
         yield Alert(
