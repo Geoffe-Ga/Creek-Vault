@@ -860,17 +860,47 @@ def test_both_readers_refuse_an_out_of_vault_linked_subfolder(
 
 
 def test_all_four_lane_one_walks_share_one_containment_predicate() -> None:
-    """The four guarded walks call the ONE shared iterator, not four copies.
+    """A NAMING-CONVENTION CHECK over four named functions. Read it as no more.
 
-    #1294's whole finding: a predicate written out four times is four
-    predicates, and they drift. Asserted on the source rather than described
-    in prose so a fifth hand-rolled walk cannot quietly reappear unguarded.
+    What it asserts, exactly: the literal text ``iter_contained(`` appears
+    somewhere in each of these four functions' source, and the literal texts
+    ``escaping_child(``, ``resolves_within(`` and ``.is_symlink()`` do not.
+    Nothing about where in the source, and nothing about the four globs below.
+
+    Three things therefore satisfy it without a guarded walk, all built and
+    run rather than imagined:
+
+    * A bare ``sorted(root.rglob("*.md"))`` with the COMMENT
+      ``# replaces: iter_contained( ... )`` above it. ``inspect.getsource``
+      strips the docstring (the round-2 fix) but not comments, so the comment
+      alone satisfies the substring — deleting just that line makes this test
+      fail, which is how it was proven. Owning the incompleteness here rather
+      than adding a comment stripper: the next hole is a string literal, and
+      the one after that is ``ast.unparse``, which drops comments but PRESERVES
+      docstrings and so would trade this loophole for the previous one.
+    * A dead ``list(iter_contained(root, [], what=...))`` on the line above a
+      bare glob.
+    * A genuinely new FIFTH loader anywhere in the package. The dict below is
+      hardcoded, so "a fifth hand-rolled walk cannot quietly reappear
+      unguarded" — the round-2 docstring's claim — is delivered by no
+      assertion here at all. That claim is withdrawn.
+
+    **The guarantee is behavioural, and it exists for all four.** Each walk has
+    a test that plants an escaping note and asserts the reader drops it:
+    ``mining._load_liminal_fragments`` and ``state._admitted_liminal_notes`` in
+    this file and in ``tests/test_generate_walk_containment.py``,
+    ``state._read_fragment_files`` at
+    ``test_the_state_fragment_census_skips_an_escaping_fragment``, and
+    ``vault.reader.iter_vault_fragments`` across the nine #1373 pins in
+    ``tests/test_draft_path_containment.py`` and
+    ``tests/test_ingest_symlink_containment.py``. Those kill all three mutants
+    above. This test is kept because a walk that stops NAMING the shared gate
+    is worth a fast, legible failure — not because it proves anything the
+    behavioural pins do not.
 
     The walk itself deliberately stays in the CALLER — ``iter_contained`` takes
     candidates, not a pattern, because ``_admitted_liminal_notes`` needs a flat
-    ``glob`` re-sorted by ``st_mtime`` against a root one level up. So the
-    assertion is not "no glob here"; it is "the glob's output goes through the
-    shared gate, and the predicate is not re-derived beside it".
+    ``glob`` re-sorted by ``st_mtime`` against a root one level up.
     """
     walks = {
         "mining._load_liminal_fragments": _load_liminal_fragments,
@@ -883,8 +913,10 @@ def test_all_four_lane_one_walks_share_one_containment_predicate() -> None:
         # assertions below run over the CODE alone.
         source = inspect.getsource(walk).replace(walk.__doc__ or "", "")
         assert "iter_contained(" in source, (
-            f"{name} does not go through creek._containment.iter_contained, "
-            f"so it carries its own copy of the containment rule.\n\n{source}"
+            f"{name} no longer NAMES creek._containment.iter_contained. That "
+            "is a convention break worth fixing, but the containment "
+            "guarantee is the behavioural drop test for this walk — check "
+            f"that too rather than satisfying this string.\n\n{source}"
         )
         for inlined in ("escaping_child(", "resolves_within(", ".is_symlink()"):
             assert inlined not in source, (

@@ -58,7 +58,7 @@ from typing import TYPE_CHECKING, TypeVar
 import frontmatter
 from pydantic import ValidationError
 
-from creek._containment import iter_contained, named_path_escapes
+from creek._containment import SkipTally, iter_contained, named_path_escapes
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     max_source_tier,
@@ -156,6 +156,26 @@ FEAT-006 acceptance criteria require an explicit empty-state note —
 the section header must always render, never silently disappear.
 """
 
+UNEVALUATED_NOTE: str = (
+    "_Withheld: a containment skip left this run's tier evidence incomplete, "
+    "so every title here fails closed._"
+)
+"""Body used when a section could not be EVALUATED, as opposed to came out empty.
+
+The distinction is the whole point and it is a safety property, not a nicety.
+:data:`EMPTY_PLACEHOLDER` is an assertion — "evaluated against complete
+evidence, nothing surfaced". A run whose fragment corpus lost a member to
+:func:`creek._containment.iter_contained` cannot make that assertion about
+``## Active eddies`` or ``## Active threads``, because the derived tier those
+sections gate on is a maximum over exactly the corpus that lost a member. Two
+runs over the same vault would then render byte-identical silence for two
+different reasons, one of which is "I could not tell".
+
+It names no path and no resolved target: the skip is already logged at
+WARNING by the single emitter, and #1087 keeps the artifact from becoming a
+second, durable copy of that disclosure.
+"""
+
 _TOP_N: int = 10
 """Cap on the number of items rendered in each list-style section."""
 
@@ -227,12 +247,21 @@ class _TierIndex:
             exact form the hygiene scanners return, so the drift section can
             compare without re-normalising.
         liminal: ``{subfolder: (admitted file stem, ...)}`` in render order.
+        link_tiers_unproven: ``True`` when a containment skip under
+            ``01-Fragments`` left the eddy/thread tier reduction incomplete
+            (see :func:`_load_fragments_admitted`). Both sections then fail
+            closed AND say so: a section that renders
+            :data:`EMPTY_PLACEHOLDER` when the truth is "this run could not
+            evaluate it" is a confident zero, and silence in a safety surface
+            must mean one thing only — evaluated against complete evidence and
+            found nothing.
     """
 
     override: PrivacyTierOverride = PrivacyTierOverride.ALL
     content_tiers: tuple[PrivacyTier, ...] = ()
     admitted_paths: frozenset[str] = frozenset()
     liminal: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    link_tiers_unproven: bool = False
 
 
 @dataclass
@@ -287,8 +316,13 @@ class _FragmentLoad:
         tiers: Those fragments' tiers, positionally parallel to *admitted*.
         paths: ``str(path)`` of each admitted fragment file.
         eddy_tiers: ``{eddy title: [member tier, ...]}`` over the **whole**
-            corpus, admitted or not — see :func:`derived_link_tiers`.
+            corpus, admitted or not — see :func:`derived_link_tiers`. **Empty
+            when** :attr:`link_tiers_unproven`, which is not the same fact as
+            "no eddy was named": see :func:`_load_fragments_admitted`.
         thread_tiers: The same, keyed by thread title.
+        link_tiers_unproven: ``True`` when containment refused a fragment, so
+            neither tier map is a complete maximum and both sections must fail
+            closed and say so.
     """
 
     admitted: list[Fragment]
@@ -296,6 +330,7 @@ class _FragmentLoad:
     paths: frozenset[str]
     eddy_tiers: dict[str, list[PrivacyTier]]
     thread_tiers: dict[str, list[PrivacyTier]]
+    link_tiers_unproven: bool = False
 
     def tiers_by_id(self) -> dict[str, PrivacyTier]:
         """Return ``{fragment id: tier}`` for the admitted slice.
@@ -367,9 +402,30 @@ def _load_typed_models(
     return collected
 
 
-def _read_fragment_files(
-    root: Path,
-) -> list[tuple[Path, Fragment, dict[str, object]]]:
+@dataclass(frozen=True)
+class _FragmentFiles:
+    """Every fragment file read off disk, plus whether that read was complete.
+
+    Two facts, deliberately not collapsed into one list — the same separation
+    :class:`creek._containment.TreeContainment` makes for a tree walk. The
+    records are what may be read; :attr:`link_tiers_unproven` is whether
+    anything may be *reduced* over them.
+
+    Attributes:
+        records: ``(path, fragment, raw frontmatter)`` per valid fragment, in
+            sorted on-disk order.
+        link_tiers_unproven: ``True`` when containment refused at least one
+            candidate under this root. The refused file's ``eddies`` /
+            ``threads`` wikilinks are unknown — and unknowable, see
+            :func:`_read_fragment_files` — so no derived link tier computed
+            from *records* can be trusted as a maximum.
+    """
+
+    records: list[tuple[Path, Fragment, dict[str, object]]]
+    link_tiers_unproven: bool
+
+
+def _read_fragment_files(root: Path) -> _FragmentFiles:
     """Load every ``type: fragment`` note under *root* with its raw frontmatter.
 
     Separate from :func:`_load_typed_models` because #969 needs three things
@@ -388,23 +444,45 @@ def _read_fragment_files(
     logged a containment skip while this half counted the planted fragment in
     the census and could list it under drift warnings.
 
+    **This corpus is read in BOTH directions, and the guard is only safe in
+    one of them.** :func:`_load_fragments_admitted` both LISTS these records
+    (census, drift) and REDUCES over them (``derived_link_tiers``, whose
+    result is a MAXIMUM). Dropping a record makes the listing emit less — the
+    safe direction — but LOWERS the maximum, so an eddy whose only remaining
+    member is ``open`` renders its title at ``ceiling=open`` that the
+    unguarded read correctly withheld. That is the #1793 inversion and it is
+    #969's leak (3) reopened, measured on a rendered report at both
+    ``ceiling=open`` and ``ceiling=personal``. Hence the tally: the guard
+    stays, and the reduction is marked unproven instead.
+
+    **The skipped file's tier cannot be recovered, and must not be.** The
+    obvious repair — read the escaping file anyway, just for its
+    ``privacy_tier`` and its wikilinks — is strictly worse than not reading
+    it. That frontmatter is attacker-controlled: a planted note would declare
+    ``privacy_tier: open`` and name every eddy in the vault, LOWERING the
+    derived maximum by design. There is no evidence to keep, which is why the
+    answer is "unproven" rather than "recovered".
+
     Args:
         root: The ``01-Fragments`` directory.
 
     Returns:
-        ``(path, fragment, raw frontmatter)`` per valid fragment, in sorted
-        on-disk order. Unreadable, non-fragment and schema-invalid files are
-        skipped, and so are invisible to every gate below — which fails them
-        closed, since a fragment nobody can load is a fragment nobody can vouch
-        for.
+        A :class:`_FragmentFiles`. Unreadable, non-fragment and schema-invalid
+        files are skipped, and so are invisible to every gate below — which
+        fails them closed, since a fragment nobody can load is a fragment
+        nobody can vouch for. Those three skips are NOT counted as unproven:
+        the file was read and judged, whereas a containment skip means it was
+        never opened at all.
     """
     if not root.exists():
-        return []
+        return _FragmentFiles(records=[], link_tiers_unproven=False)
+    tally = SkipTally()
     loaded: list[tuple[Path, Fragment, dict[str, object]]] = []
     for md_file in iter_contained(
         root,
         sorted(root.rglob("*.md")),
         what="fragment",
+        tally=tally,
     ):
         post = _safe_post(md_file)
         if post is None:
@@ -418,7 +496,7 @@ def _read_fragment_files(
             logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
             continue
         loaded.append((md_file, fragment, metadata))
-    return loaded
+    return _FragmentFiles(records=loaded, link_tiers_unproven=tally.skipped > 0)
 
 
 def _load_fragments_admitted(
@@ -434,6 +512,38 @@ def _load_fragments_admitted(
     resolve to ``open`` at ``ceiling=open`` and render its title, which is
     leak (3) of the three #969 reproduced.
 
+    **A containment skip narrows the corpus by the same arithmetic**, and
+    #1794 measured it doing exactly that: the escaping member vanishes, the
+    maximum falls to the surviving ``open`` member, and the title renders. The
+    two reads are therefore split here. The listing half (``admitted``,
+    ``tiers``, ``paths``) keeps the guard and emits less, which is safe. The
+    reducing half is abandoned: both tier maps are emptied, and
+    :func:`~creek.classify.privacy_filter.max_source_tier` then answers
+    ``INTIMATE`` for every title — this module's standing verdict for a title
+    nobody has vouched for, reached here because the vouching evidence is
+    incomplete rather than absent.
+
+    **Coarse on purpose.** The skip is known by path, not by content: nothing
+    records which eddies or threads the refused file named, and
+    :func:`_read_fragment_files` explains why reading it to find out is worse
+    than useless. So every title's evidence is potentially incomplete, and the
+    only sound reduction is none.
+
+    **Two costs, both measured, both priced deliberately.** First, over-refusal:
+    a vault whose every fragment is ``open`` loses its eddy and thread titles at
+    ``ceiling=open`` after one stray escaping link, even though an ``open``
+    member could not have raised any maximum. That tier is exactly the thing
+    that cannot be known — reading it back is the attacker's own input — so the
+    over-refusal is the price of not trusting it. Second, the stamp: at
+    ``ceiling=all`` those titles still render and now carry ``INTIMATE``, so
+    :func:`~creek.generate.state_tiers.max_admitted_tier` stamps the artifact
+    ``intimate`` and ``creek.state.read`` refuses it at the default
+    ``ceiling=open``. Under-stamping instead would be a read gate failing open
+    over content nobody vouched for, so the stamp is honest and the outage is
+    the recoverable kind #969 requires: re-rendering at ``--include-tier open``
+    withholds the titles and stamps ``open`` again, one command, nothing lost.
+    Direction stays one-way throughout: titles are withheld, never added.
+
     Args:
         root: The ``01-Fragments`` directory.
         override: The admission ceiling.
@@ -441,14 +551,24 @@ def _load_fragments_admitted(
     Returns:
         A :class:`_FragmentLoad`.
     """
-    loaded = _read_fragment_files(root)
-    eddy_tiers = derived_link_tiers(
-        (raw_privacy_tier(raw), wikilink_targets(fragment.eddies))
-        for _path, fragment, raw in loaded
+    files = _read_fragment_files(root)
+    loaded = files.records
+    unproven = files.link_tiers_unproven
+    eddy_tiers = (
+        {}
+        if unproven
+        else derived_link_tiers(
+            (raw_privacy_tier(raw), wikilink_targets(fragment.eddies))
+            for _path, fragment, raw in loaded
+        )
     )
-    thread_tiers = derived_link_tiers(
-        (raw_privacy_tier(raw), wikilink_targets(fragment.threads))
-        for _path, fragment, raw in loaded
+    thread_tiers = (
+        {}
+        if unproven
+        else derived_link_tiers(
+            (raw_privacy_tier(raw), wikilink_targets(fragment.threads))
+            for _path, fragment, raw in loaded
+        )
     )
     admitted = [entry for entry in loaded if within_ceiling(entry[2], override)]
     return _FragmentLoad(
@@ -457,6 +577,7 @@ def _load_fragments_admitted(
         paths=frozenset(str(path) for path, _fragment, _raw in admitted),
         eddy_tiers=eddy_tiers,
         thread_tiers=thread_tiers,
+        link_tiers_unproven=unproven,
     )
 
 
@@ -559,7 +680,13 @@ def _admitted_liminal_notes(
     exactly the #1079 divergence ``tests/test_liminal_tier_reader_agreement.py``
     exists to forbid. Deriving it from the caller's nesting convention encodes
     an invariant mypy cannot check and widens silently the moment anyone nests
-    a subfolder one level deeper.
+    a subfolder one level deeper. That is not a forward-looking worry left as
+    prose: ``_LIMINAL_SUBDIRS`` is flat today, so at the single production call
+    site ``folder.parent`` and ``liminal_root`` coincide and the mutant
+    ``iter_contained(folder.parent, ...)`` survives 301 tests. The nested case
+    that separates the two roots, and kills that mutant, is
+    ``test_a_nested_liminal_subfolder_is_judged_against_the_whole_tree`` in
+    ``tests/test_generate_walk_containment.py``.
 
     Dropping a note here can only ever make this section render *less*, which
     is the safe direction.
@@ -776,6 +903,7 @@ def _load_vault_state(
             ),
             admitted_paths=frags.paths,
             liminal=liminal,
+            link_tiers_unproven=frags.link_tiers_unproven,
         ),
     )
 
@@ -1305,10 +1433,7 @@ class StateReportGenerator:
             "fragment(s)"
             for eddy in eddies
         ]
-        return _section(
-            _HEADER_ACTIVE_EDDIES,
-            self._prepend_annotation(rows, "leaves"),
-        )
+        return self._linked_section(_HEADER_ACTIVE_EDDIES, rows)
 
     def section_active_threads(self) -> str:
         """Render section 4: most-recent threads by ``last_seen`` (capped at ten).
@@ -1334,10 +1459,7 @@ class StateReportGenerator:
             "fragment(s))"
             for thread in threads
         ]
-        return _section(
-            _HEADER_ACTIVE_THREADS,
-            self._prepend_annotation(rows, "leaves"),
-        )
+        return self._linked_section(_HEADER_ACTIVE_THREADS, rows)
 
     def section_synchronicities(self) -> str:
         """Render section 5: surprising connections (synchronicities).
@@ -1364,6 +1486,34 @@ class StateReportGenerator:
             _HEADER_SYNCHRONICITIES,
             self._prepend_annotation(body, "leaves"),
         )
+
+    def _linked_section(self, header: str, rows: list[str]) -> str:
+        """Render an eddy/thread section, declaring an unevaluable run as one.
+
+        These are the two sections gated on a *derived* tier — a maximum over
+        the ``01-Fragments`` corpus — so they are the two a containment skip
+        under that root leaves unprovable. When
+        :attr:`_TierIndex.link_tiers_unproven` is set they are already failing
+        closed (:func:`_load_fragments_admitted` empties the tier maps, so
+        every title resolves ``INTIMATE``); this makes them SAY so rather than
+        rendering the same silence a fully-evaluated empty vault renders.
+
+        The note leads the section in both cases, including at
+        ``ceiling=intimate``/``all`` where rows still render: the reader is
+        being told the gate could not be evaluated, which is true whether or
+        not the ceiling happened to admit everything anyway.
+
+        Args:
+            header: The section header.
+            rows: The section's body rows, before the level annotation.
+
+        Returns:
+            The rendered section.
+        """
+        body = self._prepend_annotation(rows, "leaves")
+        if self._state.tiers.link_tiers_unproven:
+            body = [UNEVALUATED_NOTE, *(["", *body] if body else [])]
+        return _section(header, body)
 
     @staticmethod
     def _prepend_annotation(rows: list[str], level: str) -> list[str]:

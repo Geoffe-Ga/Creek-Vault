@@ -28,6 +28,21 @@ say why in assertions rather than prose: ``mining._load_essay_titles`` (its
 records SUPPRESS, so a guard makes the miner emit MORE — the #1793 inversion),
 and the thread/eddy prose sites, which are lane 2 and are held still here by
 the routing pins.
+
+**One corpus is read in BOTH directions, and that is the subtlest case in the
+lane.** ``state._read_fragment_files`` feeds a LIST (the census, the drift
+paths) and a REDUCTION (``derived_link_tiers``, whose result is a maximum).
+Guarding it makes the first render less and the second render MORE — the same
+#1793 inversion, in the same file as the ruling that names it, measured on a
+rendered report at ``ceiling=open`` and ``ceiling=personal``. The guard stays
+and the reduction is abandoned instead; the pins for that render the whole
+report, because no loader assertion can see a title move.
+
+**The structural tripwires here are hints, not guarantees, and their docstrings
+now say so.** An AST scan can only ever name the spellings someone thought of:
+an inline re-derivation via ``os.path.islink`` passed every one of them and
+leaked. Each one is paired with a behavioural pin that asserts what a reader
+RETURNS for a planted vault, which no spelling escapes.
 """
 
 from __future__ import annotations
@@ -53,7 +68,14 @@ from creek.generate.mining import (
     _load_liminal_fragments,
     _load_mining_snapshot,
 )
-from creek.generate.state import _admitted_liminal_notes, _read_fragment_files
+from creek.generate.state import (
+    EMPTY_PLACEHOLDER,
+    UNEVALUATED_NOTE,
+    StateReportGenerator,
+    _admitted_liminal_notes,
+    _read_fragment_files,
+)
+from creek.generate.state_tiers import stamped_content_tier
 from creek.models import Phase, PrivacyTier
 from creek.vault import reader as reader_module
 
@@ -425,6 +447,126 @@ def test_a_subfolder_linked_inside_the_liminal_tree_is_still_read(
     )
 
 
+def test_a_sibling_folder_whose_name_extends_the_liminal_root_is_refused(
+    tmp_path: Path,
+) -> None:
+    """BEHAVIOURAL PIN against a re-derived containment predicate, any spelling.
+
+    The structural scans in this file and in
+    ``tests/test_liminal_tier_reader_agreement.py`` catch exactly two
+    spellings: an ``ast.Attribute`` call named ``is_symlink``, and the literal
+    strings ``escaping_child(`` / ``resolves_within(`` / ``.is_symlink()``. An
+    inline re-derivation written any other way passes both — measured, with
+
+        os.path.islink(folder) and not str(folder.resolve()).startswith(
+            str(folder.parent.resolve())
+        )
+
+    which survived every test in this lane AND leaked. This vault is the shape
+    that separates the two rules: ``10-Liminal-secrets`` is a sibling of
+    ``10-Liminal`` whose path string STARTS WITH it, so a prefix comparison
+    answers "contained" while ``relative_to`` answers "escaped". The
+    precondition below asserts that separation, so this pin cannot decay into
+    a restatement of the shipped rule.
+
+    Asserting the reader's OUTPUT rather than which call it made is the whole
+    point: no scan can enumerate the spellings of a predicate, but every
+    spelling has to produce an answer, and a wrong one is visible here.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = tmp_path / "vault"
+    liminal_root = vault / "10-Liminal"
+    liminal_root.mkdir(parents=True)
+    outside = vault / "10-Liminal-secrets"
+    _write(outside / "Planted.md", _PLANTED_NOTE)
+    folder = liminal_root / "Unnamed"
+    folder.symlink_to(outside, target_is_directory=True)
+
+    resolved = os.path.realpath(folder)
+    assert resolved.startswith(str(liminal_root.resolve())), (
+        "the sibling folder's path does not share 10-Liminal's prefix, so a "
+        "startswith-based re-derivation would refuse it anyway and this pin "
+        f"is vacuous.\n\n{resolved}"
+    )
+    assert named_path_escapes(folder), (
+        "the shipped predicate considers this folder contained, so the "
+        "fixture is not the escaping case."
+    )
+
+    admitted = _admitted_liminal_notes(
+        folder,
+        PrivacyTierOverride.ALL,
+        liminal_root=liminal_root,
+    )
+
+    assert admitted == [], (
+        "the state reader admitted a note from a folder that resolves OUTSIDE "
+        "10-Liminal, while the miner returns nothing for the same tree — the "
+        "#1079 divergence in its permissive direction. Containment has been "
+        "re-derived somewhere with a prefix comparison instead of "
+        f"creek._containment.\n\n{admitted}"
+    )
+
+
+def test_a_nested_liminal_subfolder_is_judged_against_the_whole_tree(
+    tmp_path: Path,
+) -> None:
+    """The ``liminal_root`` parameter, made load-bearing rather than argued for.
+
+    ``_admitted_liminal_notes`` takes ``liminal_root`` as a required keyword
+    instead of deriving it from ``folder.parent``, because the root has to be
+    the whole tree the miner walks. Today ``_LIMINAL_SUBDIRS`` is flat, so at
+    the single production call site the two coincide and the mutant
+    ``iter_contained(folder.parent, ...)`` is equivalent — it survives 301
+    tests, measured.
+
+    This is the case that separates them: the alias sits one level deeper than
+    a production subfolder, and its target is a SIBLING subfolder. Judged
+    against the whole tree it is contained; judged against ``folder.parent``
+    it escapes and is dropped, while the miner — which rglobs
+    ``10-Liminal`` — keeps it. That is the #1079 divergence, reached by
+    nesting rather than by symlinking.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = tmp_path / "vault"
+    liminal_root = vault / "10-Liminal"
+    target = _write(liminal_root / "Paradoxes" / "Target.md", _note("nest-1", "T"))
+    folder = liminal_root / "Unnamed" / "sub"
+    folder.mkdir(parents=True)
+    link = folder / "NestedAlias.md"
+    link.symlink_to(target)
+
+    assert link.is_symlink(), "the fixture did not create a symlink"
+    subfolder_root = str(folder.parent.resolve()) + os.sep
+    assert not os.path.realpath(link).startswith(subfolder_root), (
+        "the alias target resolves inside folder.parent, so judging against "
+        "folder.parent would admit it too and this pin cannot separate the "
+        "two roots."
+    )
+    mined = [f.id for f, _b, _k in _load_liminal_fragments(liminal_root)]
+    assert "nest-1" in mined, (
+        f"the miner does not reach the nested alias, so the two readers would "
+        f"agree on empty and this pin proves nothing.\n\n{mined}"
+    )
+
+    admitted = _admitted_liminal_notes(
+        folder,
+        PrivacyTierOverride.ALL,
+        liminal_root=liminal_root,
+    )
+
+    assert [stem for stem, _tier in admitted] == ["NestedAlias"], (
+        "a nested alias into a sibling liminal subfolder was dropped, so "
+        "containment is being judged against the subfolder rather than the "
+        "10-Liminal tree the miner walks. liminal_root is not being "
+        f"honoured.\n\n{admitted}"
+    )
+
+
 def test_a_skipped_liminal_note_loses_its_stem_and_its_tier_together(
     tmp_path: Path,
 ) -> None:
@@ -485,7 +627,8 @@ def test_the_state_fragment_census_skips_an_escaping_fragment(
     _write(vault / "01-Fragments" / "real.md", _note("frag-1", "Real"))
     (vault / "01-Fragments" / "escape.md").symlink_to(planted)
 
-    loaded = [f.id for _p, f, _raw in _read_fragment_files(vault / "01-Fragments")]
+    files = _read_fragment_files(vault / "01-Fragments")
+    loaded = [f.id for _p, f, _raw in files.records]
 
     assert "frag-1" in loaded, f"no fragment was read at all.\n\n{loaded}"
     assert _CANARY_ID not in loaded, (
@@ -520,11 +663,279 @@ def test_the_state_fragment_census_still_reads_an_intra_root_alias(
         "is vacuous against an 'is_symlink() -> skip' mutation."
     )
 
-    loaded = [f.id for _p, f, _raw in _read_fragment_files(fragments)]
+    loaded = [f.id for _p, f, _raw in _read_fragment_files(fragments).records]
 
     assert "alias-1" in loaded, (
         "a contained intra-root alias was dropped. Containment is about the "
         f"target leaving the root, not about the link existing.\n\n{loaded}"
+    )
+
+
+_EDDY_CANARY = "EddyTitleCanary"
+_THREAD_CANARY = "ThreadTitleCanary"
+
+
+def _linked_note(frag_id: str, tier: str) -> str:
+    """Return a fragment naming both canary titles at *tier*.
+
+    Args:
+        frag_id: The fragment's ``id``.
+        tier: The ``privacy_tier`` value written into the frontmatter.
+
+    Returns:
+        The complete markdown document.
+    """
+    return (
+        "---\n"
+        "type: fragment\n"
+        f"id: {frag_id}\n"
+        f"title: {frag_id}\n"
+        "source:\n"
+        "  platform: journal\n"
+        "created: 2026-01-01T00:00:00Z\n"
+        f"privacy_tier: {tier}\n"
+        "eddies:\n"
+        f"  - '[[{_EDDY_CANARY}]]'\n"
+        "threads:\n"
+        f"  - '[[{_THREAD_CANARY}]]'\n"
+        "---\n\nbody\n"
+    )
+
+
+def _mixed_membership_vault(tmp_path: Path, *, escaping: bool) -> Path:
+    """Build a vault whose eddy and thread have one ``open`` member.
+
+    When *escaping* is set, a SECOND member is added at ``intimate`` and
+    reached only through a symlink out of the vault — the realistic mixed
+    case. The boundary where the escaping link is the *only* member is not
+    this shape and does not reproduce anything:
+    ``max_source_tier([])`` fails closed to ``INTIMATE`` and every revision
+    withholds the title.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        escaping: Whether to add the escaping ``intimate`` member.
+
+    Returns:
+        The vault root.
+    """
+    vault = tmp_path / "vault"
+    _write(
+        vault / "03-Eddies" / "e.md",
+        "---\ntype: eddy\nid: eddy-1\n"
+        f"title: {_EDDY_CANARY}\n"
+        "formed: 2026-01-01\ndescription: d\n---\n\nbody\n",
+    )
+    _write(
+        vault / "02-Threads" / "t.md",
+        "---\ntype: thread\nid: thread-1\n"
+        f"title: {_THREAD_CANARY}\n"
+        "started: 2026-01-01\nlast_seen: 2026-09-09\n"
+        "fragment_count: 2\nstatus: active\n---\n\nbody\n",
+    )
+    _write(vault / "01-Fragments" / "Notes" / "open.md", _linked_note("open-1", "open"))
+    if escaping:
+        target = _write(
+            tmp_path / "outside" / "secret.md",
+            _linked_note("secret-1", "intimate"),
+        )
+        link = vault / "01-Fragments" / "Notes" / "alias.md"
+        link.symlink_to(target)
+        assert link.is_symlink(), "the fixture did not create a symlink"
+    return vault
+
+
+@pytest.mark.parametrize(
+    "ceiling",
+    [PrivacyTierOverride.OPEN, PrivacyTierOverride.PERSONAL],
+)
+def test_an_escaping_member_never_lowers_a_rendered_title_past_the_ceiling(
+    tmp_path: Path,
+    ceiling: PrivacyTierOverride,
+) -> None:
+    """BLOCKER PIN. Guarding a REDUCED-OVER corpus inverts direction (#1793).
+
+    ``_read_fragment_files`` is read twice by ``_load_fragments_admitted``: as
+    a LIST (census, drift), where dropping a record renders less, and as the
+    input to ``derived_link_tiers``, whose result is a MAXIMUM, where dropping
+    a record renders MORE. Round 2 guarded the walk and measured only the
+    first. Measured on the rendered report, the second half moved the other
+    way::
+
+        - Eddies: 0                ->  - Eddies: 1
+        ## Active eddies
+        _No surfacing this week._  ->  - EddyTitleCanary — 1 fragment(s)
+
+    at ``ceiling=open`` AND ``ceiling=personal`` — the two strictest surfaces,
+    ``open`` being the MCP default in ``creek_mcp.tools.state``. That is
+    #969's leak (3) reopened by a guard.
+
+    This renders the whole report rather than asserting on a loader, because
+    no loader assertion can see it: the census half is correct in both
+    revisions and it is the *titles* that move.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The admission ceiling to render under.
+    """
+    vault = _mixed_membership_vault(tmp_path, escaping=True)
+
+    report = StateReportGenerator(vault, override=ceiling).render()
+
+    assert _EDDY_CANARY not in report, (
+        "an eddy title rendered at ceiling="
+        f"{ceiling.value!r} whose membership includes an intimate fragment. "
+        "The containment guard dropped that member, which LOWERED the derived "
+        "maximum — the #1793 inversion, measured at the consumer."
+    )
+    assert _THREAD_CANARY not in report, (
+        f"a thread title rendered at ceiling={ceiling.value!r} for the same "
+        "reason as the eddy above."
+    )
+
+
+@pytest.mark.parametrize("escaping", [False, True])
+def test_the_open_report_renders_a_title_only_when_nothing_was_skipped(
+    tmp_path: Path,
+    escaping: bool,
+) -> None:
+    """POSITIVE CONTROL, both halves of the same fixture.
+
+    The ``escaping=False`` half proves the pipeline does render these titles
+    at ``ceiling=open``, so their absence in the ``escaping=True`` half is
+    evidence rather than an artefact of an empty report.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        escaping: Whether the fixture plants the escaping intimate member.
+    """
+    vault = _mixed_membership_vault(tmp_path, escaping=escaping)
+
+    report = StateReportGenerator(vault, override=PrivacyTierOverride.OPEN).render()
+
+    assert (_EDDY_CANARY in report) is not escaping, (
+        "with no escaping member the eddy title must render at ceiling=open "
+        "(all evidence is open); with one it must not. Rendered="
+        f"{_EDDY_CANARY in report}, escaping={escaping}."
+    )
+
+
+def test_an_unevaluable_section_says_so_rather_than_rendering_silence(
+    tmp_path: Path,
+) -> None:
+    """Silence must mean "evaluated and found nothing", never "could not tell".
+
+    Failing the derived-tier sections closed is only half the answer. A
+    section that renders :data:`EMPTY_PLACEHOLDER` when the run could not
+    evaluate it is a confident zero: two runs over the same vault produce
+    byte-identical silence for two different reasons, and the operator has no
+    way to tell a quiet week from a skipped fragment. The WARNING in the log
+    is not a substitute — the report is the durable artifact, read back by
+    every later run as session-start context.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _mixed_membership_vault(tmp_path, escaping=True)
+
+    report = StateReportGenerator(vault, override=PrivacyTierOverride.OPEN).render()
+    eddies_body = report.split("## Active eddies\n\n", 1)[1].split("\n\n##", 1)[0]
+
+    assert UNEVALUATED_NOTE in report, (
+        "the report withheld the titles without saying why, so its silence "
+        "claims complete evidence it does not have."
+    )
+    assert eddies_body.strip() != EMPTY_PLACEHOLDER, (
+        "## Active eddies rendered the ordinary empty-state placeholder for a "
+        f"run that could not evaluate it.\n\n{eddies_body}"
+    )
+
+
+def test_a_quiet_vault_still_renders_the_ordinary_empty_placeholder(
+    tmp_path: Path,
+) -> None:
+    """NON-VACUITY ANCHOR for the note above: the two states stay distinct.
+
+    A note that appeared on every report would be worthless. With nothing
+    skipped, the sections must render the FEAT-006 placeholder unchanged.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+
+    report = StateReportGenerator(vault, override=PrivacyTierOverride.OPEN).render()
+
+    assert UNEVALUATED_NOTE not in report, (
+        "a vault with no containment skip at all reported its derived-tier "
+        "sections as unevaluable, so the note carries no information."
+    )
+    assert EMPTY_PLACEHOLDER in report, (
+        "the ordinary empty-state placeholder disappeared from a quiet vault."
+    )
+
+
+def test_an_unevaluable_run_stays_recoverable_at_the_narrow_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The fail-closed sections must not make the artifact unreadable for good.
+
+    At ``ceiling=all`` the withheld-but-rendered titles carry the fail-closed
+    ``INTIMATE``, so the stamp rises to ``intimate`` and ``creek.state.read``
+    refuses the report at its default ``ceiling=open``. Under-stamping would be
+    a read gate failing open over content nobody vouched for, so the stamp is
+    right and the outage has to be the recoverable kind #969 requires: one
+    re-render at the narrow ceiling withholds the titles and stamps ``open``
+    again. This pins that recovery, which is the whole reason the coarse rule
+    is acceptable.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _mixed_membership_vault(tmp_path, escaping=True)
+
+    # Both renders write the same ISO-week file, so each is read back before
+    # the next overwrites it.
+    broad_gen = StateReportGenerator(vault, override=PrivacyTierOverride.ALL)
+    broad = broad_gen.write().read_text(encoding="utf-8")
+    narrow_gen = StateReportGenerator(vault, override=PrivacyTierOverride.OPEN)
+    narrow = narrow_gen.write().read_text(encoding="utf-8")
+
+    assert stamped_content_tier(broad) is PrivacyTier.INTIMATE, (
+        "the broad render stamped below intimate while rendering titles whose "
+        "tier evidence was incomplete, so the read gate fails open."
+    )
+    assert stamped_content_tier(narrow) is PrivacyTier.OPEN, (
+        "re-rendering at ceiling=open did not recover a readable artifact, so "
+        "one stray symlink locks the operator out of their own state report "
+        "until they widen every reader's ceiling."
+    )
+
+
+def test_the_rendered_census_still_drops_the_escaping_fragment(
+    tmp_path: Path,
+) -> None:
+    """The guard's BENEFIT half, pinned at the render rather than the loader.
+
+    The fix for the inversion above is a split, not a revert, and this is the
+    half that must survive it: at ``ceiling=all`` the unguarded read counted
+    the out-of-root fragment in the census and could list its slugified
+    filename under drift warnings.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _mixed_membership_vault(tmp_path, escaping=True)
+
+    report = StateReportGenerator(vault, override=PrivacyTierOverride.ALL).render()
+
+    assert "- Fragments: 1" in report, (
+        "the census counted a fragment symlinked in from outside the vault, "
+        f"so the containment guard has been reverted rather than split.\n\n{report}"
+    )
+    assert "alias" not in report, (
+        f"the escaping fragment's filename reached the rendered report.\n\n{report}"
     )
 
 
@@ -646,24 +1057,20 @@ def test_the_skip_is_logged_without_ever_naming_the_resolved_target(
 # ---------------------------------------------------------------------------
 
 
-def test_essay_titles_stay_unguarded_because_they_suppress(tmp_path: Path) -> None:
-    """DIRECTION PIN. ``_load_essay_titles`` must NOT acquire a guard (#1793 shape).
+def _essay_suppression_vault(tmp_path: Path) -> tuple[Path, Path, str]:
+    """Build a vault holding one active thread and an empty essays folder.
 
-    Published essay titles have exactly one consumer,
-    ``IdeaMiner._has_matching_essay``, used as ``not self._has_matching_essay(...)``
-    in the ``mine_thread_terminus`` candidate filter. The records therefore
-    SUPPRESS: dropping one makes the miner emit MORE, not less, and the planted
-    title itself reaches no artifact — it is compared and discarded.
-
-    Guarding here would also break the legitimate workflow of symlinking a blog
-    repo into ``09-Reference/Published-Essays``, by re-suggesting essays the
-    author has already published.
-
-    This asserts the CURRENT behaviour so a future silent guard flips it and
-    fails, rather than sliding in for consistency with its guarded neighbours.
+    The thread alone is load-bearing: with 99 fragments it clears
+    ``min_thread_fragments``, so ``mine_thread_terminus`` yields exactly one
+    seed unless a published essay title suppresses it. No member fragments are
+    written, because the seed count is identical with and without them — a
+    fixture that does not move the assertion is not a fixture.
 
     Args:
         tmp_path: pytest's per-test temporary directory.
+
+    Returns:
+        ``(vault, essays dir, thread title)``.
     """
     vault = tmp_path / "vault"
     thread_title = "The shape of attention"
@@ -673,16 +1080,72 @@ def test_essay_titles_stay_unguarded_because_they_suppress(tmp_path: Path) -> No
         f"title: {thread_title}\n"
         "status: active\nfragment_count: 99\n---\n\nbody\n",
     )
-    for index in range(12):
-        _write(
-            vault / "01-Fragments" / f"f{index}.md",
-            _note(f"frag-{index}", "F").replace(
-                "---\n\n",
-                "threads:\n  - thread-1\n---\n\n",
-            ),
-        )
     essays = vault / "09-Reference" / "Published-Essays"
     essays.mkdir(parents=True)
+    return vault, essays, thread_title
+
+
+def _terminus_seed_count(vault: Path) -> int:
+    """Return how many thread-terminus seeds the miner emits for *vault*.
+
+    Args:
+        vault: The vault root.
+
+    Returns:
+        The seed count — the number the essay records SUPPRESS.
+    """
+    return len(IdeaMiner(bypass_compiled=True).mine_thread_terminus(vault))
+
+
+def test_a_thread_with_no_published_essay_yields_one_terminus_seed(
+    tmp_path: Path,
+) -> None:
+    """POSITIVE CONTROL for the direction pin below.
+
+    Without it, "the seed count did not increase" is satisfiable by a miner
+    that emits nothing for an unrelated reason, and the pin would be vacuous.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault, _essays, _title = _essay_suppression_vault(tmp_path)
+
+    assert _terminus_seed_count(vault) == 1, (
+        "the fixture yields no seed even with no essay planted, so the "
+        "suppression pin below cannot observe suppression at all."
+    )
+
+
+def test_an_escaping_published_essay_still_suppresses_its_thread(
+    tmp_path: Path,
+) -> None:
+    """DIRECTION PIN, asserted at the CONSUMER (#1793 shape).
+
+    Published essay titles have exactly one consumer,
+    ``IdeaMiner._has_matching_essay``, used as ``not self._has_matching_essay(...)``
+    in the ``mine_thread_terminus`` candidate filter. The records therefore
+    SUPPRESS: dropping one makes the miner emit MORE, not less. So
+    ``mining._load_essay_titles`` must NOT acquire a containment guard, and
+    the planted title itself reaches no artifact — it is compared and
+    discarded.
+
+    **This asserts the seed count, not the loader's return value.** The round-2
+    version of this pin asserted ``thread_title in _load_essay_titles(essays)``,
+    which a future author defeats without touching that function at all: guard
+    the essays walk at its CALL SITE in ``_load_mining_snapshot`` instead, and
+    the loader still returns the title while the snapshot no longer carries it.
+    That mutant was built and measured — it flips the miner from zero seeds to
+    one, re-suggesting an already-published essay — and the loader-return
+    assertion cannot see it. A consumer assertion sees any spelling.
+
+    Guarding here would also break the legitimate workflow of symlinking a blog
+    repo into ``09-Reference/Published-Essays``, by re-suggesting essays the
+    author has already published.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault, essays, thread_title = _essay_suppression_vault(tmp_path)
     planted = _write(
         tmp_path / "outside-essays" / "published.md",
         f"---\ntitle: {thread_title}\n---\n\nbody\n",
@@ -691,13 +1154,18 @@ def test_essay_titles_stay_unguarded_because_they_suppress(tmp_path: Path) -> No
     link.symlink_to(planted)
 
     assert link.is_symlink(), "the fixture did not create a symlink"
-    titles = mining._load_essay_titles(essays)
+    assert not os.path.realpath(link).startswith(str(vault.resolve()) + os.sep), (
+        "the planted essay resolves INSIDE the vault, so no containment guard "
+        "would drop it and this pin is vacuous."
+    )
 
-    assert thread_title in titles, (
-        "the escaping essay title was dropped, so _load_essay_titles has "
+    assert _terminus_seed_count(vault) == 0, (
+        "the miner emitted a seed for a thread whose essay is already "
+        "published, so the escaping essay title stopped suppressing. Either "
+        "_load_essay_titles or its call site in _load_mining_snapshot has "
         "acquired a containment guard. That is the #1793 inversion: these "
-        "records suppress, so the guard makes the miner emit MORE. If this "
-        f"change was deliberate, it belongs in lane 3 with its ruling.\n\n{titles}"
+        "records suppress, so a guard makes the miner emit MORE. If this "
+        "change was deliberate, it belongs in lane 3 with its ruling."
     )
 
 
@@ -836,17 +1304,40 @@ def test_rglob_does_not_descend_a_symlinked_directory(tmp_path: Path) -> None:
 
 
 def test_no_module_re_derives_containment_with_a_bare_is_symlink() -> None:
-    """AC1, as a scan: the predicate is not re-derived in the guarded packages.
+    """A LINT-SHAPED HINT for ONE spelling. It is not the containment guarantee.
 
-    ``creek/generate/`` and ``creek/vault/`` must reach containment only
-    through :mod:`creek._containment`. A bare ``is_symlink()`` in either
-    package is either a second copy of the predicate or the beginning of one.
+    What it actually asserts, stated in full so nobody has to infer it: no
+    ``ast.Call`` in ``creek/generate/`` or ``creek/vault/`` whose function is
+    an ``ast.Attribute`` named ``is_symlink`` — except one whose receiver
+    unparses to the text ``latest`` inside ``state.py``, which is the
+    unlink-before-relink existence check on the ``State/latest.md`` convenience
+    link ("is there something here to remove", not "does this leave its root").
 
-    ONE documented exception, narrowed here rather than quietly:
-    ``creek/generate/state.py``'s ``latest.exists() or latest.is_symlink()`` is
-    an unlink-before-relink existence check on the ``State/latest.md``
-    convenience link. It answers "is there something here to remove", not "does
-    this leave its root", and is unrelated to containment.
+    What it does NOT assert, measured rather than assumed. The exemption is
+    keyed on the receiver's *text*, module-wide, so any local named ``latest``
+    anywhere in ``state.py`` is exempt. And an inline re-derivation spelled
+    with any other stdlib call passes untouched::
+
+        os.path.islink(folder) and not str(folder.resolve()).startswith(
+            str(folder.parent.resolve())
+        )
+
+    That mutant was built and it is not behaviour-preserving: with
+    ``10-Liminal/Unnamed`` linked to the sibling ``10-Liminal-secrets``, the
+    prefix comparison answers "contained" where ``relative_to`` answers
+    "escaped", and the state report admitted a note the miner refused. It
+    survived every test in this lane.
+
+    **The response is not a longer pattern list.** Widening the scan moves the
+    hole to the next spelling, and this repo's AST/identity tripwires have now
+    been found overclaiming on five consecutive changes. The guarantee lives in
+    behaviour instead:
+    ``test_a_sibling_folder_whose_name_extends_the_liminal_root_is_refused``
+    asserts what the reader RETURNS for exactly that vault, which kills the
+    re-derivation in any spelling — no scan can enumerate spellings, but every
+    spelling has to produce an answer. This scan is kept as a cheap first
+    alarm for the one shape it does catch, and its failure message should be
+    read as "look here", not as "containment is proven".
     """
     package_roots = (
         Path(state.__file__).parent,
@@ -873,7 +1364,9 @@ def test_no_module_re_derives_containment_with_a_bare_is_symlink() -> None:
     assert offenders == [], (
         "a module in creek/generate/ or creek/vault/ calls is_symlink() "
         "directly. Containment there must go through creek._containment — a "
-        "second copy of the predicate is the drift #1294 closed. If this is a "
-        "non-containment existence check, narrow the exception here "
-        f"deliberately rather than deleting the assertion.\n\n{offenders}"
+        "second copy of the predicate is the drift #1294 closed. This scan "
+        "catches one spelling only; if you are here because it fired, check "
+        "the behavioural pins too. If this is a non-containment existence "
+        "check, narrow the exception here deliberately rather than deleting "
+        f"the assertion.\n\n{offenders}"
     )

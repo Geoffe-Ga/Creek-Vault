@@ -634,9 +634,16 @@ def _load_essay_titles(root: Path) -> list[str]:
     legitimate workflow — essays symlinked in from a blog repository — by
     re-suggesting essays their author has already published.
 
-    ``tests/test_generate_walk_containment.py`` pins the current behaviour, so
-    a future silent guard flips the direction and fails rather than landing
-    quietly for consistency's sake.
+    **The pin is at the CONSUMER, and it has to be.**
+    ``tests/test_generate_walk_containment.py::\
+test_an_escaping_published_essay_still_suppresses_its_thread`` asserts the
+    thread-terminus SEED COUNT, not this function's return value. A
+    loader-return assertion is defeated without touching this function at all:
+    guard the walk at its call site in :func:`_load_mining_snapshot` instead,
+    and the loader still returns the title while the snapshot no longer carries
+    it. That mutant was built and measured — the miner went from zero seeds to
+    one, re-suggesting an already-published essay — and it survived the
+    loader-return pin. A seed-count assertion sees any spelling.
 
     Args:
         root: ``<vault>/09-Reference/Published-Essays``.

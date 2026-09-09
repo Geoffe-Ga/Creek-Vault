@@ -649,6 +649,18 @@ def test_the_escaping_leaf_predicate_has_exactly_one_definition() -> None:
     canonical *iterator* by identity, and pinned NEGATIVELY against holding a
     reference to the leaf predicate as well — a module that reached for both
     would be halfway back to its own copy of the walk.
+
+    **What this has never asserted, at either revision: that the reader's walk
+    USES what it imports.** It is a name-binding assertion. A module can hold
+    ``iter_contained`` under the canonical name and glob past it, and this test
+    passes — measured on the #1794 tip AND on its parent, where the equivalent
+    mutant of the older assertion passed too. So the honest reading is "this
+    was never a walk assertion", not "the #1794 rewrite loosened one". The
+    walk itself is pinned behaviourally, by the #1373 drop tests in
+    ``tests/test_draft_path_containment.py`` and
+    ``tests/test_ingest_symlink_containment.py``, which is where it belongs:
+    identity keeps the definition single, behaviour keeps the walk honest, and
+    neither can do the other's job.
     """
     from creek import _containment
     from creek.redact import scanner

@@ -99,6 +99,7 @@ from creek.generate.skills import (
 from creek.generate.state import (
     EMPTY_PLACEHOLDER,
     SECTION_ORDER,
+    UNEVALUATED_NOTE,
     StateReportGenerator,
 )
 from creek.generate.synchronicity import (
@@ -172,6 +173,7 @@ __all__ = [
     "REGISTER_VOICE_PROMPTS",
     "SECTION_ORDER",
     "TRADITION_GLOSSARIES",
+    "UNEVALUATED_NOTE",
     "VOICE_REGISTERS",
     "BorrowedTermEntry",
     "CoinedTermEntry",

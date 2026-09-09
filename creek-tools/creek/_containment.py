@@ -270,11 +270,44 @@ def escaping_child(child: Path, resolved_root: Path) -> bool:
     return child.is_symlink() and not resolves_within(child, resolved_root)
 
 
+@dataclass(slots=True)
+class SkipTally:
+    """How many candidates one :func:`iter_contained` walk refused (#1794).
+
+    A walk answers two questions, not one — the same separation
+    :class:`TreeContainment` makes for :func:`inspect_tree`: "which entries
+    may I read?" and "was my answer complete?". :func:`iter_contained` yields
+    the first; a caller that hands it a tally also gets the second.
+
+    That second answer only matters to a caller whose corpus is reduced over
+    rather than listed. ``state._load_fragments_admitted`` derives an eddy's
+    privacy tier as the MAX over the fragments naming it, so a dropped
+    fragment can only ever LOWER that maximum — the one direction in which
+    reading less makes a consumer emit MORE. Such a caller needs to know that
+    it read less, and this is how it finds out.
+
+    **It cannot be recovered by reading the skipped file.** A planted note's
+    ``privacy_tier`` is attacker-controlled and would simply declare ``open``
+    to lower the maximum, so re-reading it to "keep the tier evidence" is
+    strictly worse than not reading it. The only sound response to a non-zero
+    tally is to treat the whole reduction as unproven.
+
+    Attributes:
+        skipped: Candidates refused so far. :func:`iter_contained` is lazy, so
+            this is only the walk's complete answer once the iterator is
+            exhausted; every caller that reads it drives the walk to
+            completion first.
+    """
+
+    skipped: int = 0
+
+
 def iter_contained(
     root: Path,
     candidates: Iterable[Path],
     *,
     what: str,
+    tally: SkipTally | None = None,
 ) -> Iterator[Path]:
     """Yield each of *candidates* that does not link out of *root*.
 
@@ -331,11 +364,20 @@ def iter_contained(
     #1793 inversion. Read the consumer before adopting this function.
 
     **Leaf-only, and that is sufficient for the ``rglob`` callers only because
-    ``**`` refuses to descend a symlinked directory** (pinned across the CI
-    matrix by ``test_rglob_does_not_descend_a_symlinked_directory``). The
+    ``**`` refuses to descend a symlinked CHILD directory** (pinned across the
+    CI matrix by ``test_rglob_does_not_descend_a_symlinked_directory``). The
     residual is the flat-glob caller, which is handed the escaping directory
     directly; that one needs :func:`named_path_escapes` on the folder itself
     before it globs, and ``_admitted_liminal_notes`` does exactly that.
+
+    The word CHILD is load-bearing and the exception is the *start path*:
+    ``rglob`` descends its own root even when that root is itself a symlink, so
+    a caller whose ROOT is a link out of the vault gets every candidate judged
+    against the resolved target and nothing is skipped. That is the leaf-only
+    ancestor residual reaching the tree through its own root; it is recorded in
+    ``docs/security/threat-model.md`` rather than closed here, because closing
+    it means resolving the root's ancestry, which would flag every vault
+    reached through a symlinked home directory.
 
     It skips and logs rather than raising, for the reason
     :func:`creek.vault.reader.iter_vault_fragments` records — hard-erroring in
@@ -365,6 +407,11 @@ def iter_contained(
         what: What the caller is reading, singular, for the skip log
             ("fragment", "liminal note"). The operator reads this line, so it
             names the thing they lost rather than the function that lost it.
+        tally: Optional :class:`SkipTally` incremented once per refusal, for a
+            caller that must know its corpus is incomplete rather than merely
+            smaller. Optional because most callers LIST what they read, where
+            a skip is self-describing; it is the callers that REDUCE over the
+            corpus that need it. Read it only after exhausting the iterator.
 
     Yields:
         Every candidate that is not an escaping link, in the order given —
@@ -373,6 +420,8 @@ def iter_contained(
     resolved_root = root.resolve(strict=False)
     for candidate in candidates:
         if escaping_child(candidate, resolved_root):
+            if tally is not None:
+                tally.skipped += 1
             logger.warning(
                 "Skipping a %s whose symlink leaves %s: %s",
                 what,

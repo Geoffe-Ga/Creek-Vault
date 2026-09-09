@@ -171,9 +171,22 @@ itself wrote: the only liminal field a prompt renders is the fragment's id,
 which the pipeline generates as an opaque 12-hex string. That is a property of
 how Creek writes the file and **not** a constraint the model enforces —
 `Fragment.id` is unconstrained free text, so a hand-edited or planted note's id
-renders verbatim, newlines and all. #1794 closed the route by which a file from
-outside `10-Liminal` could supply one: a `.md` entry whose symlink resolves out
-of that tree is now skipped by both readers. The consequence to know is a
+renders verbatim, newlines and all. #1794 closed **one** route by which a file
+from outside `10-Liminal` could supply one, and only that one: a `.md` *entry*
+whose own symlink resolves out of that tree is now skipped by both readers, and
+a *subfolder* that is itself a symlink out of the tree is refused whole. Two
+routes stay open and are recorded rather than claimed closed. (1) When
+`10-Liminal` is **itself** a symlink to a directory outside the vault, every
+guard above is inert — `rglob` fully descends its own start path even when that
+path is a link (it refuses only a symlinked *child*), so the notes underneath
+judge as in-root and a planted id renders with no warning. This is the leaf-only
+ancestor residual `creek/_containment.py` already records, reached through the
+tree's own root. Note that the sentence further down this page — "`rglob` does
+not descend into symlinked *directories*" — is about a symlinked child and does
+not cover this case. (2) A **hard link** into `10-Liminal/Unnamed` supplies the
+same id: `is_symlink()` is false, there is no link to resolve, and no
+containment predicate over paths can ever see it. Both are listed in
+`docs/security/threat-model.md`. The consequence to know is a
 **posture split on the same file**: an `Unnamed` note
 with no `privacy_tier` key needs `ceiling=intimate` to appear in the Liminal
 Watch (read fail-closed off raw frontmatter) but only `ceiling=personal` for its
