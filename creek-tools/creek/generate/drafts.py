@@ -110,7 +110,7 @@ from creek.models import (
     PrivacyTier,
     Thread,
 )
-from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -645,23 +645,37 @@ def _load_fragments_by_id(
     :func:`~creek.classify.privacy_filter.filter_fragments_by_tier` so
     intimate content never leaks into the draft prompt under default
     policy and personal bodies are replaced by title-only summaries.
+
+    **The walk goes through the shared loader** (#1789). This was a bespoke
+    ``sorted(root.rglob("*.md"))`` scan and so did not inherit the #1373
+    containment guard, while
+    :func:`creek.classify.privacy_filter.resolved_source_tiers` — the survey
+    :meth:`DraftGenerator._bind_routing_tier` routes on — walks
+    :func:`~creek.vault.reader.iter_vault_fragments` and did. A ``.md`` file
+    under ``01-Fragments/`` that is a symlink escaping *that root* was therefore
+    *rendered* by :func:`_render_fragment_section` — title and body, straight
+    into the prompt — while being invisible to the survey that had to rank it.
+    ``_rendered_source_tiers`` fails such an id closed to ``INTIMATE``, which
+    keeps it off a cloud provider but does nothing about the body already
+    sitting in the composed prompt.
+
+    Sharing the loader makes the two sets agree by construction, which is the
+    only fix that survives the next consumer: a second copy of
+    :func:`creek._containment.escaping_child` here is exactly the drift #1294
+    closed. See :func:`creek.generate.mining._load_fragments` for why the
+    ``raw`` frontmatter is dropped rather than carried.
+
+    Args:
+        root: ``<vault>/01-Fragments``.
+        privacy_override: The admission ceiling, or ``None`` for the default.
+
+    Returns:
+        The admitted fragments keyed by id. Two files sharing an id collapse
+        last-wins, exactly as they did before.
     """
-    if not root.exists():
-        return {}
-    pairs: list[tuple[Fragment, str]] = []
-    for md_file in sorted(root.rglob("*.md")):
-        post = _safe_post(md_file)
-        if post is None:
-            continue
-        metadata = dict(post.metadata)
-        if metadata.get("type") != "fragment":
-            continue
-        try:
-            fragment = Fragment.model_validate(metadata)
-        except ValidationError:
-            logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
-            continue
-        pairs.append((fragment, post.content))
+    pairs = [
+        (fragment, body) for _path, fragment, body, _raw in iter_vault_fragments(root)
+    ]
     filtered = filter_fragments_by_tier(pairs, override=privacy_override)
     return {f.id: (f, body) for f, body in filtered}
 
