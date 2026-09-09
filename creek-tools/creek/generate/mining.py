@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, TypeVar
 import frontmatter
 from pydantic import ValidationError
 
+from creek._containment import iter_contained_paths
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
@@ -76,6 +77,14 @@ _EDDIES_SUBDIR: str = "03-Eddies"
 _ESSAYS_SUBDIR: str = "09-Reference/Published-Essays"
 _LIMINAL_SUBDIR: str = "10-Liminal"
 _SYNCHRONICITIES_SUBDIR: str = "10-Liminal/Synchronicities"
+
+LIMINAL_SKIP_NOUN: str = "liminal note"
+"""What a containment skip calls a dropped ``10-Liminal`` file in the log.
+
+Shared with :func:`creek.generate.state._admitted_liminal_notes` (#1794) so
+the two readers that admit the same physical corpus cannot describe the same
+skip to the operator in two different words.
+"""
 
 _ESSAY_MATCH_THRESHOLD: float = 0.5
 """Jaccard overlap above which a thread title is considered already-published."""
@@ -522,6 +531,27 @@ def _load_liminal_fragments(
     ``tests/test_liminal_tier_reader_agreement.py`` pins the two call sites
     against each other note by note, at every ceiling.
 
+    **Containment (#1794).** The walk goes through
+    :func:`creek._containment.iter_contained_paths`, so a ``.md`` file under
+    ``10-Liminal`` that is itself a symlink resolving OUTSIDE that root is
+    skipped and logged. It was a bespoke ``sorted(root.rglob("*.md"))`` with
+    no guard at all, and the consequence was not a cosmetic one: the planted
+    note's ``id`` is interpolated verbatim into
+    :meth:`IdeaMiner._seed_from_liminal`'s ``brief_description`` and thence
+    into a draft prompt's ``## Ask`` block and a ``## Suggested questions``
+    bullet in ``State/latest.md``. :class:`~creek.models.Fragment` constrains
+    ``id`` neither by pattern nor by length, so that id can be multiline and
+    can spell its own ``## Ask`` header — a prompt-injection primitive, not an
+    id echo.
+
+    The guard is applied to :func:`creek.generate.state._admitted_liminal_notes`
+    in the same change and against the same root, because guarding one of two
+    readers that admit the same physical file is exactly the divergence #1079
+    closed — and it would leave that agreement's pin green while breaking it.
+
+    Dropping a liminal record can only ever make this loader emit *less*,
+    which is the safe direction for a corpus that feeds a prompt.
+
     Args:
         liminal_root: ``<vault>/10-Liminal``.
         privacy_override: The admission ceiling. ``None`` means ``OPEN``,
@@ -536,7 +566,11 @@ def _load_liminal_fragments(
     ceiling = privacy_override or PrivacyTierOverride.OPEN
     collected = [
         entry
-        for md_file in sorted(liminal_root.rglob("*.md"))
+        for md_file in iter_contained_paths(
+            liminal_root,
+            "**/*.md",
+            noun=LIMINAL_SKIP_NOUN,
+        )
         if (entry := _admitted_liminal_entry(md_file, liminal_root, ceiling))
         is not None
     ]

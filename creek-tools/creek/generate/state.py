@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, TypeVar
 import frontmatter
 from pydantic import ValidationError
 
+from creek._containment import iter_contained_paths
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     max_source_tier,
@@ -69,6 +70,7 @@ from creek.classify.privacy_filter import (
 from creek.clean.hygiene import BrokenLinkScanner, OrphanScanner
 from creek.generate.indexes import FREQUENCY_NAMES
 from creek.generate.mining import (
+    LIMINAL_SKIP_NOUN,
     IdeaMiner,
     IdeaSeed,
     MiningSnapshot,
@@ -511,6 +513,26 @@ def _admitted_liminal_notes(
     reason (#1079). ``tests/test_liminal_tier_reader_agreement.py`` asserts
     the two agree note by note rather than leaving it to coincidence.
 
+    **Containment (#1794), judged against ``10-Liminal`` and not against
+    *folder*.** A ``.md`` entry here that is a symlink resolving outside the
+    liminal tree is skipped and logged, via the same
+    :func:`creek._containment.iter_contained_paths` the miner walks with. The
+    ``p.is_file()`` filter below looks like it already screened such a link
+    out and does not: ``is_file()`` FOLLOWS the link, so it answers about the
+    target and admits a file parked anywhere on disk.
+
+    The root is ``folder.parent`` — the ``10-Liminal`` root this function's
+    own contract says *folder* sits directly under — rather than *folder*
+    itself, and that is the whole reason the two readers are guarded in one
+    change. The miner walks all of ``10-Liminal``, so an alias from ``Unnamed``
+    into ``Compost`` is contained to it; judging the same file against
+    ``Unnamed`` alone would drop it here only, and two readers disagreeing
+    about one physical file is precisely the #1079 divergence
+    ``tests/test_liminal_tier_reader_agreement.py`` exists to forbid.
+
+    Dropping a note here can only ever make this section render *less*, which
+    is the safe direction.
+
     Sorting is unchanged from FEAT-007 and is applied before admission so the
     displayed order does not shift with the ceiling. ``st_mtime`` is
     best-effort — CI containers and fresh clones flatten it to the checkout
@@ -526,7 +548,16 @@ def _admitted_liminal_notes(
     """
     if not folder.exists():
         return []
-    files = [p for p in folder.glob("*.md") if p.is_file()]
+    files = [
+        p
+        for p in iter_contained_paths(
+            folder.parent,
+            "*.md",
+            noun=LIMINAL_SKIP_NOUN,
+            walk_root=folder,
+        )
+        if p.is_file()
+    ]
     files.sort(key=lambda p: (-p.stat().st_mtime, p.name))
     admitted: list[tuple[str, PrivacyTier]] = []
     for path in files:

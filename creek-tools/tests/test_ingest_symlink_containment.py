@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -2263,6 +2264,75 @@ def test_iter_vault_fragments_still_loads_an_intra_vault_alias(
         "an intra-vault alias was dropped. The guard is about the target "
         "escaping the root, not about the link existing; refusing every "
         f"symlink breaks ordinary vaults.\n\n{loaded}"
+    )
+
+
+def test_iter_vault_fragments_loads_an_alias_its_own_glob_cannot_reach(
+    tmp_path: Path,
+) -> None:
+    """NON-VACUITY ANCHOR with teeth (#1794). The one above has none.
+
+    ``test_iter_vault_fragments_still_loads_an_intra_vault_alias`` places the
+    alias BESIDE the ``.md`` file it aliases, so ``rglob("*.md")`` finds the
+    real file too and the loaded set is unchanged by a
+    ``if md_file.is_symlink(): continue`` mutation. #1793's lane measured that
+    and found the anchor vacuous: it cannot tell "containment guard" from
+    "drop every symlink", which is the mutation an anchor exists to catch.
+
+    Here the aliased note is parked under a name the loader's own ``**/*.md``
+    pattern cannot match, so the link is its ONLY route into the corpus — a
+    precondition asserted below rather than assumed. Kept alongside the
+    original rather than replacing it: the beside-the-file shape is the
+    ordinary Obsidian one and is still worth loading.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek.vault.reader import iter_vault_fragments
+    from tests.helpers import write_raw_fragment_file
+
+    vault = tmp_path / "vault"
+    fragments = vault / "01-Fragments"
+    fragments.mkdir(parents=True)
+    write_raw_fragment_file(
+        vault,
+        "01-Fragments",
+        "real-1",
+        "Real",
+        body=_VAULT_INROOT_MARKER,
+    )
+    target = fragments / "aliased-target.markdown"
+    target.write_text(
+        fragments.joinpath("real-1.md")
+        .read_text(encoding="utf-8")
+        .replace("real-1", "aliased-1")
+        .replace("Real", "Aliased"),
+        encoding="utf-8",
+    )
+    link = fragments / "aliased-1.md"
+    link.symlink_to(target)
+
+    assert link.is_symlink(), (
+        "the fixture did not create a symlink, so this anchor is a no-op on "
+        "this filesystem."
+    )
+    assert target not in set(fragments.rglob("*.md")), (
+        "the alias target is reachable by the loader's own glob, so this "
+        "anchor is vacuous against an 'is_symlink() -> skip' mutation: the "
+        "record would still be produced from the real file."
+    )
+    assert os.path.realpath(link).startswith(str(fragments.resolve()) + os.sep), (
+        "the alias target resolves outside 01-Fragments, so this is an escape "
+        "rather than the contained alias the anchor is about."
+    )
+
+    records = iter_vault_fragments(fragments)
+    ids = sorted(fragment.id for _path, fragment, _body, _meta in records)
+
+    assert ids == ["aliased-1", "real-1"], (
+        "a contained intra-root alias was dropped. Containment is about the "
+        "target leaving the root, never about the link existing; refusing "
+        f"every symlink silently shrinks real vaults.\n\n{ids}"
     )
 
 

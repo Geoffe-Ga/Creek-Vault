@@ -626,12 +626,12 @@ def test_redact_scan_warns_about_a_subtree_it_could_not_list_and_does_not_refuse
 
 
 def test_the_escaping_leaf_predicate_has_exactly_one_definition() -> None:
-    """RED. The expression is currently written out twice; it must not become three.
+    """The expression was written out twice; it must not become three.
 
-    ``child.is_symlink() and not resolves_within(child, resolved_root)`` is
-    spelled out at ``creek/_containment.py:255`` and again at
-    ``creek/redact/scanner.py:757``, and #1373 needs the same test a third
-    time in ``creek/vault/reader.py``. #1294 already fought this fight for
+    ``child.is_symlink() and not resolves_within(child, resolved_root)`` was
+    spelled out in ``creek/_containment.py`` and again in
+    ``creek/redact/scanner.py``, and #1373 needed the same test a third time
+    in ``creek/vault/reader.py``. #1294 already fought this fight for
     ``resolves_within`` and settled it with an identity assertion rather than
     a behavioural one, because two copies that agree today are two copies that
     disagree after the next fix lands in one of them. This is that assertion
@@ -639,6 +639,16 @@ def test_the_escaping_leaf_predicate_has_exactly_one_definition() -> None:
 
     Identity, not equality: a re-implementation that happens to behave the
     same is exactly the drift being prevented.
+
+    **#1794 moved the vault reader one level further in, and the assertion
+    follows it rather than being relaxed.** ``iter_vault_fragments`` no longer
+    calls the predicate itself: it walks through
+    :func:`creek._containment.iter_contained_paths`, the shared guarded
+    iterator it now has in common with the two ``10-Liminal`` readers, and
+    that iterator makes the one canonical call. So the reader is pinned to the
+    canonical *iterator* by identity, and pinned NEGATIVELY against holding a
+    reference to the leaf predicate as well — a module that reached for both
+    would be halfway back to its own copy of the walk.
     """
     from creek import _containment
     from creek.redact import scanner
@@ -653,9 +663,16 @@ def test_the_escaping_leaf_predicate_has_exactly_one_definition() -> None:
         "instead of the canonical one.\n\n"
         f"{scanner.escaping_child!r}\n{_containment.escaping_child!r}"
     )
-    assert reader.escaping_child is _containment.escaping_child, (
-        "creek.vault.reader defines a third copy of the escaping-leaf test. "
-        "The vault loader, the scanner walk and the ingest gate must share "
-        "one definition of 'this leaf leaves the root', or a future fix to "
-        f"one silently leaves the others behind.\n\n{reader.escaping_child!r}"
+    assert reader.iter_contained_paths is _containment.iter_contained_paths, (
+        "creek.vault.reader walks 01-Fragments with something other than the "
+        "canonical guarded iterator. The vault loader, the two 10-Liminal "
+        "readers, the scanner walk and the ingest gate must share one "
+        "definition of 'this leaf leaves the root', or a future fix to one "
+        f"silently leaves the others behind.\n\n{reader.iter_contained_paths!r}"
+    )
+    assert not hasattr(reader, "escaping_child"), (
+        "creek.vault.reader holds the leaf predicate directly again. Since "
+        "#1794 its walk is the shared iterator's, and a module that reaches "
+        "for the raw predicate alongside it is re-growing the hand-rolled "
+        "rglob the iterator replaced."
     )

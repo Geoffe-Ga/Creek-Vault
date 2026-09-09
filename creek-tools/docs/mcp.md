@@ -166,9 +166,15 @@ Watch never reads — so `render` has no admitted list to narrow it against.
 Those notes' tiers are folded into the artefact's stamp instead, which means an
 untiered one pushes the stamp to `unclassified` (ranked with `personal`, #961)
 and the report is refused at `ceiling=open` — the one ceiling at which the
-section does not render anyway. Nothing identifying escapes regardless: the only
-liminal field a prompt renders is the fragment's opaque generated id. The
-consequence to know is a **posture split on the same file**: an `Unnamed` note
+section does not render anyway. Nothing identifying escapes from a note Creek
+itself wrote: the only liminal field a prompt renders is the fragment's id,
+which the pipeline generates as an opaque 12-hex string. That is a property of
+how Creek writes the file and **not** a constraint the model enforces —
+`Fragment.id` is unconstrained free text, so a hand-edited or planted note's id
+renders verbatim, newlines and all. #1794 closed the route by which a file from
+outside `10-Liminal` could supply one: a `.md` entry whose symlink resolves out
+of that tree is now skipped by both readers. The consequence to know is a
+**posture split on the same file**: an `Unnamed` note
 with no `privacy_tier` key needs `ceiling=intimate` to appear in the Liminal
 Watch (read fail-closed off raw frontmatter) but only `ceiling=personal` for its
 id to reach a prompt (read through the validated model's `unclassified`
