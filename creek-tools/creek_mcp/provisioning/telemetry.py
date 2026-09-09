@@ -14,9 +14,10 @@ Four properties are structural rather than asserted.
 
 *Report only.* :class:`FleetTelemetry` is typed on ``ProviderInventory``, which
 cannot mutate anything, and composes the report-only reconciler. There is no
-``start``, ``stop``, ``delete`` or repair path anywhere here. PR2 measures;
-alarms are the next slice's, and nothing below compares a meter to
-:attr:`FleetPriceTable.monthly_budget`.
+``start``, ``stop``, ``delete`` or repair path anywhere here. PR2 measures and
+nothing below compares a meter to :attr:`FleetPriceTable.monthly_budget`;
+``creek_mcp.provisioning.alerts`` is where a threshold is evaluated, and it is
+report-only too — an alarm notifies, it never remediates.
 
 *A meter that could not be read is never a silent zero.* :class:`Meter` refuses
 to exist unless ``value is None`` and the quality being ``UNAVAILABLE`` agree,
@@ -194,6 +195,25 @@ class FleetTelemetrySnapshot:
     running nor known-stopped. They contribute an unreadable value to both the
     stopped-capacity and running-duration meters rather than being silently
     assigned to either.
+
+    ``unattributed_resources`` counts resources whose
+    ``provider_allocation_id`` could not be read. They are named by no field
+    here, because there is no surrogate to name them by — which is exactly why
+    they are counted: every divergence path skips them, so without this figure
+    a billed resource nothing could attribute would be indistinguishable from
+    one that does not exist.
+
+    **Why the whole reconciliation report is carried.** Every divergence meter
+    below reduces its divergences to a *count*, which is all a cost report
+    needs. An alarm needs the **subjects**, and the only other way to obtain
+    them is to run :class:`FleetReconciler` a second time over a second
+    provider read and a second store read — reintroducing exactly the
+    split-instant defect :class:`_ReplayInventory` and :class:`_ReplayStore`
+    exist to close, and letting the alarm disagree with the meter beside it
+    about what one pass saw. So the report this pass already built is carried
+    verbatim. It is content-free by construction (``reconcile.py`` names only
+    surrogates) and its own ``observed_at`` is likewise excluded from equality,
+    so two passes over unchanged state still compare equal.
     """
 
     activated_allocations: Meter
@@ -211,7 +231,9 @@ class FleetTelemetrySnapshot:
     unconfirmed_deletions: Meter
     unmetered_running: tuple[str, ...]
     unclassified_machines: tuple[str, ...]
+    unattributed_resources: Meter
     inventory_complete: bool
+    reconciliation: FleetReconciliationReport
     observed_at: datetime = field(compare=False)
 
 
@@ -289,9 +311,15 @@ def estimate_monthly_cost(
     usage: BillingPeriodUsage,
     prices: FleetPriceTable,
 ) -> Decimal:
-    """Return one allocation's estimated monthly cost from injected inputs.
+    """Return one usage record's estimated monthly cost from injected inputs.
 
-    Pure, and ``Decimal`` throughout rather than ``float``: the figures are
+    Pure: the scope of the answer is whatever scope *usage* covers, and that is
+    fixed entirely by the caller. One allocation's usage yields one
+    allocation's cost; a whole billing period's fleet usage yields the fleet's,
+    which is the scope ADR-0013 Decision 4's "operator-set monthly budget" is
+    written in and the scope ``alerts.py`` calls this at.
+
+    ``Decimal`` throughout rather than ``float``: the figures are
     money reconciled against an invoice, and binary floating point cannot
     represent a cent exactly. ``stopped_fraction`` is derived here rather than
     passed in, so a caller cannot supply a running duration and a stopped
@@ -410,6 +438,29 @@ def _unclassified_machines(inventory: InventorySnapshot) -> tuple[str, ...]:
                 and resource.state not in _STOPPED_STATES
             }
         )
+    )
+
+
+def _unattributed_resources(inventory: InventorySnapshot) -> Meter:
+    """Count billable resources this pass could see but could not attribute.
+
+    ``ProviderResource.provider_allocation_id`` is optional because
+    ``ProviderInventory`` is an injected Protocol whose docstring anticipates
+    an offline invoice export, not only ``FlyProviderDriver`` (which always
+    attributes). Every divergence path — ``_orphans``, ``_duplicates``,
+    ``_running``, ``_unmetered`` and :func:`_unclassified_machines` — skips an
+    unattributed resource outright, because none of them has a subject to name
+    it by. Counting them here is what stops that skip from reading downstream
+    as a clean fleet: the resource is billed for, and nothing else on this
+    record would say it exists.
+    """
+    return _measured(
+        [
+            1
+            for resource in inventory.resources
+            if resource.provider_allocation_id is None
+        ],
+        complete=inventory.complete,
     )
 
 
@@ -588,7 +639,9 @@ class FleetTelemetry:
             ),
             unmetered_running=report.unmetered_running,
             unclassified_machines=_unclassified_machines(inventory),
+            unattributed_resources=_unattributed_resources(inventory),
             inventory_complete=inventory.complete,
+            reconciliation=report,
             observed_at=now,
         )
 

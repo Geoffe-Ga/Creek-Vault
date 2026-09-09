@@ -68,6 +68,12 @@ from tests.fly_api_support import (
     FakeFlyAPI,
     build_driver,
 )
+from tests.provisioning_report_only_support import (
+    DYNAMIC_DISPATCH as _DYNAMIC_DISPATCH,
+)
+from tests.provisioning_report_only_support import (
+    MUTATING_OPERATIONS as _MUTATING_OPERATIONS,
+)
 from tests.provisioning_secret_support import (
     FORBIDDEN_FIELD_NAMES,
     assert_content_free,
@@ -657,33 +663,6 @@ _TELEMETRY_IMPORTS: Final[frozenset[str]] = frozenset(
 )
 """Every name telemetry.py may import. All of them are read-only or inert."""
 
-_MUTATING_OPERATIONS: Final[frozenset[str]] = frozenset(
-    {
-        # The provider seam.
-        "provision",
-        "delete",
-        "start",
-        "stop",
-        "delete_orphan",
-        # The durable seam. A store mutation reaches provider deletion
-        # through the worker, so covering only the driver leaves a whole
-        # path a telemetry pass must never take.
-        "submit",
-        "request_delete",
-        "retry",
-        "record_failure",
-        "complete_create",
-        "complete_delete",
-        "claim_next",
-        "complete_key_ceremony",
-        "expire_key_ceremonies",
-    }
-)
-
-_DYNAMIC_DISPATCH: Final[frozenset[str]] = frozenset(
-    {"getattr", "setattr", "vars", "eval", "exec", "__import__", "globals"}
-)
-
 
 def test_the_telemetry_module_trips_on_the_spellings_of_a_repair_path() -> None:
     """A tripwire over the common spellings, not a proof, and not presented as one.
@@ -825,6 +804,40 @@ def test_a_stuck_deletion_is_counted_off_the_reconciler_not_re_derived(
     assert snapshot.unconfirmed_deletions == Meter(1, MetricQuality.EXACT)
     assert snapshot.orphan_provider_resources == Meter(0, MetricQuality.EXACT)
     assert snapshot.observed_at == later
+
+
+def test_the_carried_report_survives_a_clock_that_moved(tmp_path: Path) -> None:
+    """The amendment's own purity claim, tested at two instants rather than one.
+
+    ``FleetTelemetrySnapshot`` now carries a whole
+    ``FleetReconciliationReport``, and that record has its own ``observed_at``.
+    Asserting equality with both passes drawn from one frozen clock would make
+    the claim true for the wrong reason — the nested instants would match
+    anyway — which is exactly the defect this suite already pins for the
+    reconciler at ``test_two_passes_at_different_instants_still_compare_equal``.
+    """
+    store, api, _ = _provisioned(tmp_path)
+    driver = build_driver(api)
+    _plant_orphan(api, _ORPHAN_ACTIVATION)
+    later = _NOW + timedelta(days=3)
+
+    first = _observe(_telemetry(store, driver), api)
+    second = _observe(
+        FleetTelemetry(
+            store,
+            driver,
+            _POLICY,
+            egress=UnavailableEgressMeter(),
+            clock=lambda: later,
+        ),
+        api,
+    )
+
+    assert first.reconciliation.observed_at != second.reconciliation.observed_at
+    assert second.reconciliation.observed_at == later
+    assert first.reconciliation == second.reconciliation
+    assert first == second
+    assert first.reconciliation.divergences
 
 
 class _RecordingStore(ProvisioningStore):
@@ -984,3 +997,6 @@ def test_duplicate_provider_resources_are_counted_off_the_reconciler(
     assert snapshot.duplicate_provider_resources == Meter(2, MetricQuality.EXACT)
     assert snapshot.duplicate_allocation_attempts == Meter(0, MetricQuality.EXACT)
     assert snapshot.volume_gb == Meter(10, MetricQuality.EXACT)
+    # The report is carried out of the single pass rather than re-derived, so
+    # PR3's alarms get subjects without a second provider and store read.
+    assert snapshot.reconciliation == report
