@@ -12,6 +12,8 @@ from __future__ import annotations
 from datetime import datetime  # noqa: TC003  # used at runtime as a parameter type
 from pathlib import Path  # noqa: TC003  # plain stdlib import; no lazy benefit
 
+from creek._containment import iter_contained
+from creek.generate.compost import COMPOST_SKIP_NOUN
 from creek.lint._result import CheckResult
 from creek.vault.links import read_header_meta
 
@@ -39,7 +41,11 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     compost_dir = vault_path.joinpath(*_COMPOST_DIR)
     findings: list[str] = []
     if compost_dir.is_dir():
-        for note in sorted(compost_dir.glob("*.md")):
+        for note in iter_contained(
+            compost_dir,
+            sorted(compost_dir.glob("*.md")),
+            what=COMPOST_SKIP_NOUN,
+        ):
             if note.stem.startswith("_"):
                 continue  # skip the rollup report itself
             meta = read_header_meta(note)

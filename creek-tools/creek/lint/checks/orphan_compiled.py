@@ -72,13 +72,23 @@ def _stems_in(vault_path: Path, subdirs: tuple[str, ...]) -> list[Path]:
     **Direction: this is the REPORTED set, so a skip emits less.** The result
     feeds :func:`_candidate_pages`, the pages an orphan verdict may be passed
     on; the *source* side of the check comes from
-    :func:`creek.vault.links.iter_link_sources`, a different walk this does not
-    touch. So dropping a page removes a candidate rather than removing a
-    credit, and no in-root page can be orphaned by this guard — measured
-    against the never-planted control. That distinction is the whole reason the
-    guard is safe here and NOT safe on a scanner whose corpus is the source
-    side: see ``creek.clean.hygiene``, where dropping a record makes the
-    broken-link count go UP (measured 0 -> 1) and no guard is applied.
+    :func:`creek.vault.links.iter_link_sources`, a different walk. So dropping
+    a page removes a candidate rather than removing a credit, and no in-root
+    page can be orphaned by this guard — measured against the never-planted
+    control. That distinction is the whole reason the guard is safe here and
+    NOT safe on a scanner whose corpus is the source side: see
+    :mod:`creek.clean.hygiene`, where dropping a record makes the broken-link
+    count go UP (measured 0 -> 1) and no guard is applied.
+
+    **The source side is an accepted residual, not an irrelevance, and this
+    docstring said otherwise until #1794's third round.** ``iter_link_sources``
+    and :func:`~creek.vault.links.build_link_index` are vault-rooted and
+    unguarded, so an out-of-root page reached through a symlink still counts as
+    a link SOURCE: its wikilinks credit in-root pages and SUPPRESS orphan
+    findings that would otherwise be reported. That is a suppression rather
+    than a disclosure — nothing out-of-root is rendered — and guarding a
+    vault-rooted walk that many consumers share is out of this issue's scope,
+    so it is recorded in ``docs/security/threat-model.md`` rather than closed.
     """
     paths: list[Path] = []
     for sub in subdirs:

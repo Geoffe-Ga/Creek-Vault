@@ -287,16 +287,18 @@ from most to least likely:
   than a bare `0`, because a zero asserts "evaluated against complete evidence
   and none surfaced" exactly as silence does.
 - **The `02-Threads` / `03-Eddies` / `04-Praxis` walks are guarded, and the
-  corpus has ELEVEN readers rather than the three the issue enumerates
+  corpus has at least THIRTEEN readers rather than the three the issue enumerates
   (#1794).** The count was corrected twice: the issue said three, the first
-  pass measured seven, and an exhaustive AST census of `creek/` — every
-  `rglob` / `glob` / `os.walk` / `iterdir` / `scandir` whose root resolves to
-  one of those three directories — found four more. No "N readers" claim in
-  this file should be trusted without re-running that census. `Thread` and
+  pass measured seven, an AST census of `creek/` found four more, and focused
+  review then found two the census had missed — one because its root arrives as
+  a function parameter, one because it lives in `creek_mcp/`, outside the
+  census's declared scope. **This is a list, not an invariant**; see the
+  closing entry of this section for what is still unguarded and why the real
+  remedy is structural. `Thread` and
   `Eddy` carry **no
   `privacy_tier` field**, so unlike a fragment there is no tier gate behind
   these walks — the walk is the whole gate, and `title` and `description` are
-  bare `str` with no pattern and no length bound. All eleven now share
+  bare `str` with no pattern and no length bound. All thirteen now share
   `creek._containment.iter_contained`:
   `generate/drafts.py::_load_threads_by_id` and `::_load_eddies_by_id`,
   `generate/state.py::_load_typed_models` (which also covers `04-Praxis`),
@@ -305,19 +307,41 @@ from most to least likely:
   `generate/compost_scan.py::_load_threads`,
   `generate/compost.py::CompostTracker._load_active_threads`,
   `generate/tags.py::TagGardenGenerator.scan_tags` (which crosses all five
-  `_SCAN_DIRS`), and `lint/checks/orphan_compiled.py::_stems_in`. The issue
+  `_SCAN_DIRS`), `lint/checks/orphan_compiled.py::_stems_in`,
+  `generate/compost.py::CompostTracker._load_existing_compost_notes` with its
+  `lint/checks/compost.py` twin, and `creek_mcp/compiled_pages.py::_pages_under`.
+  The issue
   enumerated four; the rest were found by measurement, and they are the reason
   the guard is worth having:
 
-  - **Three of them WRITE.** `creek compost scan` materialised an out-of-root
+  - **Five of them WRITE.** `creek compost scan` materialised an out-of-root
     thread into the vault as `10-Liminal/Compost/<date>-<title>.md`;
-    `creek fill --with-compost` listed it in `_Compost-Report.md`; and
-    `creek report tags` published an out-of-root note's tag into
-    `00-Creek-Meta/Tag-Garden.md`, which `creek lint` then surveys at
-    `PrivacyTierOverride.ALL` and `creek state` appends verbatim under
-    `## Lint summary`. So `creek state` and `creek skills` withheld a thread
-    that `creek compost`, `creek fill` and `creek tags` still wrote to disk —
-    the #1079 divergence completing into a durable artifact.
+    `creek fill --with-compost` listed both an out-of-root thread AND an
+    out-of-root compost note in `_Compost-Report.md`; `creek lint`'s compost
+    check counted the latter into
+    `00-Creek-Meta/Processing-Log/lint-<date>.md`; and `creek report tags`
+    published an out-of-root note's tag into `00-Creek-Meta/Tag-Garden.md`.
+    `creek state` appends the lint artifacts verbatim under `## Lint summary`,
+    so two of those writes then re-rendered inside the report. All are closed,
+    and the closure is asserted against a never-planted control rather than by
+    a marker scan — `_Compost-Report.md` in particular is built by TWO loaders
+    twenty lines apart, and guarding only one of them left a single rendered
+    file disagreeing with itself: `## Active Threads` refused the planted
+    thread while the note list above it published
+    `- [[zz-planted|SECRET-OUT-OF-ROOT-COMPOST]]`.
+
+  - **One of them is remote-facing and lives outside `creek/`.**
+    `creek_mcp/compiled_pages.py::_pages_under` reads `03-Eddies` and
+    `04-Praxis`, and `related_compiled` is reached by `creek.reflect` at
+    `TierCeiling.OPEN` — a member of `creek_mcp.policy.REMOTE_ADMITTED_CEILINGS`.
+    Measured: an eddy symlinked out of `03-Eddies` published its unbounded
+    `description`, including an embedded `## Ask` header, and a praxis
+    symlinked out of `04-Praxis` published its body excerpt. That module was
+    already half-guarded — its `_read_corpus` half goes through
+    `iter_vault_fragments`. It is also where this issue's own reader-agreement
+    property broke: once the `creek`-side guards landed, four readers of
+    `03-Eddies` refused the planted note while this one published it, so the
+    *disagreement* was created by the fix rather than by the bug.
 
   - **The compiled layer is asked first.**
     `DraftGenerator._compose_thread_section` consults the compiled index and
@@ -409,6 +433,48 @@ from most to least likely:
   never created. Before the guard the weekly and monthly reports also wrote
   the planted fragment's **id, title and phase** verbatim into
   `05-Wavelength/Phase-Maps/`.
+
+- **#1794's guard list is NOT a completeness claim, and four rounds of review
+  are the evidence.** The count of readers of `02-Threads` / `03-Eddies` /
+  `04-Praxis` was corrected four times — filed as 3, measured at 7, corrected
+  to 11, corrected again to 13 — because "guard every reader of a corpus" is an
+  unbounded unit of work that any reviewer can extend. Thirteen readers now
+  share `creek._containment.iter_contained`; the honest statement is that these
+  thirteen are guarded, **not** that the corpus is closed. The structural
+  remedy — a guard every new reader must pass by construction — is filed
+  separately. Until it lands, treat any "N readers" sentence here as a
+  timestamp rather than an invariant, and re-run the census before relying on
+  one.
+
+  Readers still unguarded, measured and recorded rather than closed:
+
+  - `creek/generate/skills.py::_read_all_fragments` — deliberate; a guard is
+    the #1793 inversion (see the entry above).
+  - `creek/generate/decisions.py::_iter_markdown` — a bare
+    `sorted(directory.glob("*.md"))` called on `02-Threads` and `04-Praxis`,
+    inside the census's declared scope, which the census missed because its
+    root arrives as a parameter. Its output reaches DISK: `_find_related_threads`
+    feeds `related_threads`, rendered as `- [[<id>]]` into a decision note's
+    `## Context`. Same shape as the compost write closed above; left for the
+    structural fix rather than guarded piecemeal.
+  - `creek/generate/mining.py::_load_synchronicities` and
+    `creek/generate/state.py::_load_synchronicities` — `10-Liminal/Synchronicities`,
+    two unguarded walks over one corpus. Explicitly Lane 3 of #1794.
+  - `creek/vault/links.py::iter_link_sources` / `build_link_index` — vault-rooted
+    and shared by many consumers. An out-of-root page reached through a symlink
+    still counts as a link SOURCE, so its wikilinks suppress orphan findings
+    that would otherwise be reported. A suppression, not a disclosure.
+  - `creek/clean/hygiene.py` — `BrokenLinkScanner` / `OrphanScanner`. Ruled: a
+    guard makes them emit MORE (measured 0 -> 1 broken links), the #1793
+    inversion.
+  - `creek/generate/compost_scan.py::load_composted_source_ids` — ruled: its ids
+    are read through `c.source_id not in seen`, so they SUPPRESS. Guarding it
+    would make `creek compost scan` write MORE notes.
+
+  Plus roughly twenty `01-Fragments` walks outside this issue's scope
+  (`purge`, `ingest`, `cli`, `author/checks`, `classify_engine`,
+  `review_runner`, `voice`, `ai_style/fingerprint`, `vault/writer`, four
+  `lint/checks`), unaudited here.
 
 - **Audit log integrity.** Every purge and redaction-apply writes a
   structured entry to `<vault>/00-Creek-Meta/audit/`. The integrity

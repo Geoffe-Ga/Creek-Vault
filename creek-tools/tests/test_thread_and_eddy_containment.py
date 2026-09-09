@@ -1,8 +1,10 @@
 """Containment for the thread/eddy corpus walks (#1794, lane 2).
 
 Lane 1 closed ``01-Fragments`` and ``10-Liminal``. This lane closes
-``02-Threads`` and ``03-Eddies`` — and, measured, the corpus is read by
-**seven** walks rather than the three the issue enumerates:
+``02-Threads`` and ``03-Eddies``. The issue enumerates three readers; four
+rounds of measurement found thirteen, and the list is a timestamp rather than
+an invariant — ``docs/security/threat-model.md`` carries the current one and
+the residuals. The seven this module pins directly are:
 
 * :func:`creek.generate.drafts._load_threads_by_id` /
   :func:`~creek.generate.drafts._load_eddies_by_id` — the frontmatter half of
@@ -103,8 +105,10 @@ from creek.generate.drafts import (
 from creek.generate.mining import IdeaMiner, IdeaSeed, MiningStrategy
 from creek.generate.state import StateReportGenerator
 from creek.generate.tags import TagGardenGenerator
+from creek.lint.checks import compost as lint_compost
 from creek.lint.checks import orphan_compiled
 from creek.models import Eddy, Praxis, PrivacyTier, Thread
+from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.state_read import state_read_tool
 
@@ -1102,7 +1106,13 @@ def test_every_reader_of_one_root_admits_exactly_the_same_ids(
     type_tag: str,
     cls: type[Thread] | type[Eddy],
 ) -> None:
-    """The four readers of one root cannot disagree about what it holds.
+    """These four readers of one root cannot disagree about what it holds.
+
+    **"Four" is the number this test compares, not the number that exist.**
+    Review corrected the enumeration four times (3 -> 7 -> 11 -> 13), so no
+    count here is an invariant; ``docs/security/threat-model.md`` carries the
+    current list and the residuals. What this pin holds is the property, over
+    the readers a divergence would most plausibly appear between.
 
     The #1079 property: a corpus one tool withholds and another emits is not a
     difference of opinion, it is a leak. Pinned note by note — as sets of ids —
@@ -1805,7 +1815,24 @@ def _writer_vault(tmp_path: Path, *, planted: bool) -> Path:
     )
     (vault / "03-Eddies").mkdir(parents=True, exist_ok=True)
     (vault / "04-Praxis").mkdir(parents=True, exist_ok=True)
+    _write(
+        vault / "10-Liminal" / "Compost" / "2026-01-01-real.md",
+        "---\ntype: compost\ntitle: Real composted note\n"
+        "composted_on: 2026-01-01\n---\n\nbody\n",
+    )
     if planted:
+        # 10-Liminal/Compost is planted as well as 02-Threads, because
+        # `generate_compost_report` reads BOTH folders into one rendered file
+        # and only the thread half was guarded first. Without this note the
+        # report pin below passes vacuously for the compost half — measured.
+        _write(
+            root / "outside" / "compost.md",
+            f"---\ntype: compost\ntitle: {_PLANTED_TITLE}\n"
+            "composted_on: 2026-01-01\n---\n\nbody\n",
+        )
+        (vault / "10-Liminal" / "Compost" / "zz-planted.md").symlink_to(
+            root / "outside" / "compost.md"
+        )
         active = _write(
             root / "outside" / "active.md",
             _tagged_thread(
@@ -1863,20 +1890,41 @@ def test_the_compost_scan_never_materialises_an_out_of_root_thread(
 def test_the_compost_report_never_lists_an_out_of_root_thread(
     tmp_path: Path,
 ) -> None:
-    """``_Compost-Report.md`` renders one row per active thread.
+    """``_Compost-Report.md`` is built from TWO loaders, and both must agree.
+
+    :meth:`~creek.generate.compost.CompostTracker.generate_compost_report`
+    calls ``_load_existing_compost_notes`` and ``_load_active_threads`` twenty
+    lines apart into one file. Guarding only the second shipped a report that
+    disagreed with itself: measured, ``## Active Threads`` refused the planted
+    thread and logged the skip while the note list above it published
+    ``- [[zz-planted|<planted title>]]`` on the same page. So this fixture
+    plants in ``10-Liminal/Compost`` as well as ``02-Threads``, and the
+    assertion is equality with the never-planted control rather than a marker
+    scan, which is what the first version of this pin got wrong.
 
     Args:
         tmp_path: pytest's per-test temporary directory.
     """
-    vault = _writer_vault(tmp_path, planted=True)
-
-    report = CompostTracker().generate_compost_report(vault).read_text(encoding="utf-8")
+    planted = CompostTracker().generate_compost_report(
+        _writer_vault(tmp_path, planted=True)
+    )
+    control = CompostTracker().generate_compost_report(
+        _writer_vault(tmp_path, planted=False)
+    )
+    report = planted.read_text(encoding="utf-8")
 
     assert "Legit thread" in report, (
         f"the in-root thread stopped rendering.\n\n{report}"
     )
+    assert "Real composted note" in report, (
+        f"the in-root compost note stopped rendering.\n\n{report}"
+    )
     assert _markers_in(report) == [], (
-        f"an out-of-root thread reached _Compost-Report.md.\n\n{report}"
+        f"out-of-root prose reached _Compost-Report.md.\n\n{report}"
+    )
+    assert report == control.read_text(encoding="utf-8"), (
+        "the report differs from the never-planted control, so something in "
+        f"it still knows about the refused files.\n\n{report}"
     )
 
 
@@ -1953,4 +2001,102 @@ def test_the_orphan_check_never_reports_an_out_of_root_page(
     )
     assert not any("zz-" in finding for finding in findings), (
         f"an out-of-root page was reported as an orphan candidate.\n\n{findings}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# STEP 14 — the durable lint artifact, and the remote-facing reader
+# ---------------------------------------------------------------------------
+
+
+def test_the_compost_lint_check_counts_only_in_root_notes(tmp_path: Path) -> None:
+    """The lint check's rows are written to disk and re-rendered by ``creek state``.
+
+    ``LintRunner.write`` puts this check's findings verbatim into
+    ``00-Creek-Meta/Processing-Log/lint-<date>.md``, and
+    :meth:`~creek.generate.state.StateReportGenerator.section_lint_summary`
+    appends that artifact verbatim. So an out-of-root compost note's ``title``
+    reached a durable file and then a rendered report — measured
+    ``1 recorded compost note(s)`` -> ``2``.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    planted = lint_compost.run(_writer_vault(tmp_path, planted=True))
+    control = lint_compost.run(_writer_vault(tmp_path, planted=False))
+
+    assert control.findings, (
+        "the control run found nothing, so equality below would hold over two "
+        "empty lists and prove nothing."
+    )
+    assert planted.summary == control.summary, (
+        f"the compost count differs from the control.\n\n"
+        f"{planted.summary} vs {control.summary}"
+    )
+    assert planted.findings == control.findings, (
+        f"an out-of-root compost note reached the lint artifact.\n\n{planted.findings}"
+    )
+
+
+def test_the_mcp_compiled_reader_publishes_no_out_of_root_page(
+    tmp_path: Path,
+) -> None:
+    """``creek_mcp`` reads ``03-Eddies`` and ``04-Praxis`` too, and it is remote.
+
+    :func:`creek_mcp.compiled_pages.related_compiled` is reached by
+    ``creek.reflect`` at ``TierCeiling.OPEN``, which
+    :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` admits — so a network
+    caller sees whatever it returns. Measured before the guard: an eddy
+    symlinked out of ``03-Eddies`` published its unbounded ``description``
+    (attacker prose, ``## Ask`` header and all) and a praxis symlinked out of
+    ``04-Praxis`` published its body excerpt.
+
+    It is also where this issue's own reader-agreement claim broke: once the
+    ``creek``-side guards landed, four readers of ``03-Eddies`` refused the
+    planted note while this one published it. The disagreement was created by
+    the fix, not by the bug — which is why the guard belongs in the same
+    change.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+
+    def _related(*, planted: bool) -> RelatedCompiled:
+        """Build one arm and ask the real compiled-page reader."""
+        root = tmp_path / ("p" if planted else "c")
+        vault = root / "vault"
+        _write(
+            vault / "01-Fragments" / "open.md",
+            "---\ntype: fragment\nid: FRAG-OPEN\ntitle: An open fragment\n"
+            "privacy_tier: open\nsource:\n  platform: journal\n  kind: writing\n"
+            "captured: 2026-01-01\ncreated: 2026-01-01T00:00:00Z\n"
+            'eddies:\n  - "[[Lonely eddy]]"\n---\n\nAn open body.\n',
+        )
+        (vault / "03-Eddies").mkdir(parents=True, exist_ok=True)
+        (vault / "04-Praxis").mkdir(parents=True, exist_ok=True)
+        if planted:
+            eddy = _write(
+                root / "outside" / "eddy.md",
+                _eddy_note("EDDY-P", "Lonely eddy", _PLANTED_DESCRIPTION),
+            )
+            praxis = _write(
+                root / "outside" / "praxis.md",
+                "---\ntype: praxis\nid: PRAXIS-P\n"
+                f"title: {_PLANTED_TITLE}\npraxis_type: practice\n"
+                "status: proposed\nderived_from:\n  - FRAG-OPEN\n"
+                "---\n\nPLANTED-1794-DESCRIPTION body.\n",
+            )
+            (vault / "03-Eddies" / "zzz-evil.md").symlink_to(eddy)
+            (vault / "04-Praxis" / "zzz-evil.md").symlink_to(praxis)
+        return related_compiled(["FRAG-OPEN"], vault, TierCeiling.OPEN)
+
+    planted = _related(planted=True)
+    control = _related(planted=False)
+
+    assert _markers_in(repr(planted)) == [], (
+        f"an out-of-root compiled page reached a remote-facing reply.\n\n{planted}"
+    )
+    assert planted == control, (
+        "the compiled-page reply differs from the never-planted control."
+        f"\n\n{planted}\n{control}"
     )

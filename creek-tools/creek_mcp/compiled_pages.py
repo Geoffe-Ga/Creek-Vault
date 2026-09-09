@@ -62,6 +62,8 @@ import logging
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
+from creek._containment import iter_contained
+from creek.generate.compile_routing import COMPILED_PAGE_SKIP_NOUN
 from creek.models import PraxisStatus, PraxisType
 from creek.vault.links import read_header_meta
 from creek.vault.reader import iter_vault_fragments
@@ -377,10 +379,50 @@ def _praxis_page(path: Path) -> _PraxisPage | None:
 
 
 def _pages_under(root: Path) -> list[Path]:
-    """Return the markdown files under *root*, sorted, or ``[]`` when absent."""
+    """Return the markdown files under *root*, sorted, or ``[]`` when absent.
+
+    **Containment (#1794), and this is the remote-facing one.** The walk goes
+    through :func:`creek._containment.iter_contained`. This module was already
+    half-guarded — ``_read_corpus`` reads ``01-Fragments`` through
+    :func:`~creek.vault.reader.iter_vault_fragments` — while this half read
+    ``03-Eddies`` and ``04-Praxis`` raw. Measured on the real
+    :func:`creek_mcp.tools.reflect.reflect_tool` at
+    ``TierCeiling.OPEN`` (a member of ``creek_mcp.policy.REMOTE_ADMITTED_CEILINGS``,
+    so a network caller reaches it): an eddy symlinked out of ``03-Eddies``
+    published its unbounded ``description`` — attacker prose, including a
+    ``## Ask`` header — in ``related_eddies``, and a praxis symlinked out of
+    ``04-Praxis`` published its body excerpt in ``related_praxis``. Neither key
+    appears on the same vault with the links never created.
+
+    **It is also where #1794's own reader-agreement claim broke.** After the
+    ``creek``-side guards landed, all four readers of ``03-Eddies`` refused the
+    planted note while this one published it — the disagreement
+    :mod:`creek.generate.state_tiers` calls a leak, created by the fix rather
+    than by the bug.
+
+    **Direction, measured against a never-planted control on three vaults**,
+    because two of the shapes here are not plain shortenings: a page dropped
+    from a capped list PROMOTES the next one, and a planted page claiming a
+    legitimate title makes :func:`_eddy_pages` drop BOTH as ambiguous, so
+    guarding can make a row APPEAR. In every case the guarded output equals
+    the control exactly — the appearing row is the legitimate in-root page
+    whose availability the planted title had denied.
+
+    Args:
+        root: A compiled-layer directory, judged against itself.
+
+    Returns:
+        Every contained markdown file under *root*, sorted.
+    """
     if not root.is_dir():
         return []
-    return sorted(root.rglob("*.md"))
+    return list(
+        iter_contained(
+            root,
+            sorted(root.rglob("*.md")),
+            what=COMPILED_PAGE_SKIP_NOUN,
+        )
+    )
 
 
 def _eddy_pages(vault_path: Path) -> dict[str, _EddyPage]:
