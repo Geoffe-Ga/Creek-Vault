@@ -308,10 +308,19 @@ def _scan_subtree_for_cited(
 ) -> None:
     """Fold every cited fragment found under *root* into *resolved*, in place.
 
-    The walk is sorted, mirroring :func:`~creek.vault.reader.iter_vault_fragments`,
-    so a run is reproducible across hosts. Correctness does not depend on it —
+    Exactly two things are mirrored from
+    :func:`~creek.vault.reader.iter_vault_fragments`: the sorted walk order and
+    the :data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS` tolerance below.
+    Its **containment guard is deliberately not**, and #1793 was filed on the
+    assumption that the omission was drift — so the scoping is spelled out
+    here rather than left to be inferred. The sorting makes a run reproducible
+    across hosts; correctness does not depend on it —
     :class:`_CitedFragment`'s fold is order-independent — but a host-dependent
-    walk order in a HARD gate is a debugging trap worth not setting.
+    walk order in a HARD gate is a debugging trap worth not setting. For why
+    an ``escaping_child`` skip must never be added, see
+    :func:`_resolve_cited_tiers`, which records the ruling and the measurement
+    behind it; ``creek.author.agents.fragment_tier_map`` carries this gate's
+    other deliberate divergence from the specialists' view.
 
     Unreadable files and markdown that is not a Creek fragment are skipped with
     exactly the tolerance :func:`~creek.vault.reader.try_load_fragment` callers
@@ -394,6 +403,20 @@ def _resolve_cited_tiers(
     tier or add a body, so a planted shadow cannot downgrade or mask anything;
     adding a skip path would introduce the one genuinely unsafe move available
     here — dropping a body, and with it a leak.
+
+    That is the OPPOSITE of the ruling on the draft path, and the asymmetry is
+    the whole point. #1789 routed ``creek.generate.mining`` and
+    ``creek.generate.drafts`` through the guarded shared reader, and #1794
+    tracks six more walks there, because those are **loaders**: what they read
+    is composed into an LLM prompt, so reading an out-of-root file is itself
+    the leak and skipping it is the safe direction. This is a **gate**: its
+    only output is findings, and it emits one solely for an id it managed to
+    resolve. Refusing to resolve an id therefore *removes* a finding, which
+    makes skipping the permissive direction here. #1793 proposed the guard on
+    the loaders' reasoning and was measured: with an in-vault ``open`` twin and
+    an escaping-symlink ``intimate`` twin of one cited id, this code raises the
+    HARD finding and the guarded version raises none. The pins live in
+    ``tests/test_reflection.py`` under "the #1793 containment pins".
 
     Honest cost: worst case this parses all three subtrees once per ``review``
     call, and the conductor may call ``review`` once per round up to
