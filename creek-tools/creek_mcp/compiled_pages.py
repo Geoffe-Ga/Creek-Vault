@@ -401,12 +401,27 @@ def _pages_under(root: Path) -> list[Path]:
     than by the bug.
 
     **Direction, measured against a never-planted control on three vaults**,
-    because two of the shapes here are not plain shortenings: a page dropped
-    from a capped list PROMOTES the next one, and a planted page claiming a
-    legitimate title makes :func:`_eddy_pages` drop BOTH as ambiguous, so
-    guarding can make a row APPEAR. In every case the guarded output equals
-    the control exactly — the appearing row is the legitimate in-root page
-    whose availability the planted title had denied.
+    because two of the shapes here are not plain shortenings.
+
+    The first is the capped list: a page dropped from one PROMOTES the next,
+    which carries its own vault prose rather than nothing.
+
+    The second is sharper and is the subtlest result this issue produced.
+    :func:`_eddy_pages` drops a title two pages both answer to, because an
+    ambiguous title cannot be matched to the member set that authorizes it. So
+    a planted symlink asserting a *legitimate* page's title makes **both**
+    disappear, and refusing the planted one makes the legitimate row **appear**
+    — a guard that emits MORE. That is not the #1793 inversion: the appearing
+    row is in-root, and the guarded output equals the never-planted control
+    exactly. It is the repair of a small availability attack in its own right
+    — plant a title collision and the legitimate page vanishes from every
+    consumer of this index, with no warning anywhere.
+
+    Together with the ratio case in
+    :func:`creek.generate.wavelength.load_fragments_from_vault`, these are the
+    three distinct ways "a guard emits less" fails as a test, and they are why
+    every direction claim in #1794 is byte-compared against a vault where the
+    link was never created rather than argued from the sign of a change.
 
     Args:
         root: A compiled-layer directory, judged against itself.

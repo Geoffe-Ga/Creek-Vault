@@ -287,7 +287,7 @@ from most to least likely:
   than a bare `0`, because a zero asserts "evaluated against complete evidence
   and none surfaced" exactly as silence does.
 - **The `02-Threads` / `03-Eddies` / `04-Praxis` walks are guarded, and the
-  corpus has at least THIRTEEN readers rather than the three the issue enumerates
+  corpus has at least FOURTEEN readers rather than the three the issue enumerates
   (#1794).** The count was corrected twice: the issue said three, the first
   pass measured seven, an AST census of `creek/` found four more, and focused
   review then found two the census had missed — one because its root arrives as
@@ -298,7 +298,7 @@ from most to least likely:
   `Eddy` carry **no
   `privacy_tier` field**, so unlike a fragment there is no tier gate behind
   these walks — the walk is the whole gate, and `title` and `description` are
-  bare `str` with no pattern and no length bound. All thirteen now share
+  bare `str` with no pattern and no length bound. All fourteen now share
   `creek._containment.iter_contained`:
   `generate/drafts.py::_load_threads_by_id` and `::_load_eddies_by_id`,
   `generate/state.py::_load_typed_models` (which also covers `04-Praxis`),
@@ -309,12 +309,13 @@ from most to least likely:
   `generate/tags.py::TagGardenGenerator.scan_tags` (which crosses all five
   `_SCAN_DIRS`), `lint/checks/orphan_compiled.py::_stems_in`,
   `generate/compost.py::CompostTracker._load_existing_compost_notes` with its
-  `lint/checks/compost.py` twin, and `creek_mcp/compiled_pages.py::_pages_under`.
-  The issue
+  `lint/checks/compost.py` twin, `creek_mcp/compiled_pages.py::_pages_under`,
+  and `generate/decisions.py::DecisionContextGatherer._iter_markdown` at its
+  `02-Threads` and `04-Praxis` call sites. The issue
   enumerated four; the rest were found by measurement, and they are the reason
   the guard is worth having:
 
-  - **Five of them WRITE.** `creek compost scan` materialised an out-of-root
+  - **Six of them WRITE.** `creek compost scan` materialised an out-of-root
     thread into the vault as `10-Liminal/Compost/<date>-<title>.md`;
     `creek fill --with-compost` listed both an out-of-root thread AND an
     out-of-root compost note in `_Compost-Report.md`; `creek lint`'s compost
@@ -330,6 +331,14 @@ from most to least likely:
     thread while the note list above it published
     `- [[zz-planted|SECRET-OUT-OF-ROOT-COMPOST]]`.
 
+  - **A sixth write is the decision note.**
+    `DecisionContextGatherer._find_related_threads` and `_find_relevant_praxis`
+    read `02-Threads` and `04-Praxis`, and `append_context_section` writes
+    their ids into a decision note's `## Context` as `- [[<id>]]`. Measured at
+    that writer before the guard: `- [[THREAD-PLANTED]]` and
+    `- [[PRAXIS-PLANTED]]` landed in the file on disk. Guarded, the note is
+    byte-identical to the never-planted control.
+
   - **One of them is remote-facing and lives outside `creek/`.**
     `creek_mcp/compiled_pages.py::_pages_under` reads `03-Eddies` and
     `04-Praxis`, and `related_compiled` is reached by `creek.reflect` at
@@ -342,6 +351,21 @@ from most to least likely:
     property broke: once the `creek`-side guards landed, four readers of
     `03-Eddies` refused the planted note while this one published it, so the
     *disagreement* was created by the fix rather than by the bug.
+
+    **It also carries the subtlest direction result of this issue, and the one
+    most likely to mislead the next reader.** Guarding a walk can make a row
+    *appear*. `_eddy_pages` drops a title claimed by two pages as ambiguous, so
+    a planted symlink asserting a legitimate page's title made **both**
+    disappear; refusing the planted one restores the legitimate row. Measured,
+    the guarded output equals the never-planted control exactly, so this is the
+    repair of a small availability attack — plant a title collision and the
+    legitimate page vanishes — and not a #1793 escalation. It is the third
+    distinct way "a guard emits less" fails as a test, alongside the RATIO
+    (`Medicine share` 50% -> 100%, up and correct) and the CAPPED LIST (a freed
+    slot promotes the next record, carrying its own vault prose). All three are
+    why every direction claim in this issue is byte-compared against a vault
+    where the link was never created, rather than argued from the sign of a
+    change.
 
   - **The compiled layer is asked first.**
     `DraftGenerator._compose_thread_section` consults the compiled index and
@@ -450,13 +474,16 @@ from most to least likely:
 
   - `creek/generate/skills.py::_read_all_fragments` — deliberate; a guard is
     the #1793 inversion (see the entry above).
-  - `creek/generate/decisions.py::_iter_markdown` — a bare
-    `sorted(directory.glob("*.md"))` called on `02-Threads` and `04-Praxis`,
-    inside the census's declared scope, which the census missed because its
-    root arrives as a parameter. Its output reaches DISK: `_find_related_threads`
-    feeds `related_threads`, rendered as `- [[<id>]]` into a decision note's
-    `## Context`. Same shape as the compost write closed above; left for the
-    structural fix rather than guarded piecemeal.
+  - `creek/generate/decisions.py::_iter_markdown` at its `08-Decisions` and
+    `05-Wavelength/Observations` call sites — the helper is corpus-agnostic and
+    serves four directories; the two inside this issue's corpora are guarded
+    (see above) and these two are not. `08-Decisions` is simply out of scope.
+    `05-Wavelength/Observations` is out of scope **and** the one consumer in
+    that module that REDUCES — `_current_wavelength` keeps the observation with
+    the greatest `date`, and dropping a record from a maximum is the shape that
+    inverts — so it needs its own measurement before anyone guards it. The
+    `contained` argument is a required keyword precisely so neither can be
+    changed by accident.
   - `creek/generate/mining.py::_load_synchronicities` and
     `creek/generate/state.py::_load_synchronicities` — `10-Liminal/Synchronicities`,
     two unguarded walks over one corpus. Explicitly Lane 3 of #1794.

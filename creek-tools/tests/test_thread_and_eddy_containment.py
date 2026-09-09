@@ -97,6 +97,7 @@ from creek.generate.compile_routing import (
 )
 from creek.generate.compost import CompostTracker
 from creek.generate.compost_scan import run_compost_scan
+from creek.generate.decisions import DecisionContextGatherer
 from creek.generate.drafts import (
     DraftGenerator,
     _load_eddies_by_id,
@@ -107,7 +108,7 @@ from creek.generate.state import StateReportGenerator
 from creek.generate.tags import TagGardenGenerator
 from creek.lint.checks import compost as lint_compost
 from creek.lint.checks import orphan_compiled
-from creek.models import Eddy, Praxis, PrivacyTier, Thread
+from creek.models import Decision, Eddy, Praxis, PrivacyTier, Thread
 from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.state_read import state_read_tool
@@ -2099,4 +2100,167 @@ def test_the_mcp_compiled_reader_publishes_no_out_of_root_page(
     assert planted == control, (
         "the compiled-page reply differs from the never-planted control."
         f"\n\n{planted}\n{control}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# STEP 15 — the decision note, the last in-corpus reader that writes
+# ---------------------------------------------------------------------------
+
+_DEC_THREAD = (
+    "---\ntype: thread\nid: {tid}\ntitle: {title}\nstatus: active\n"
+    "first_seen: 2026-01-01\nlast_seen: 2026-01-01\nfragment_count: 3\n"
+    "frequency_affinity:\n  - F1\ndescription: attunement and rhythm\n---\n\nbody\n"
+)
+
+_DEC_PRAXIS = (
+    "---\ntype: praxis\nid: {pid}\ntitle: {title}\npraxis_type: practice\n"
+    "status: proposed\nfrequency:\n  - F1\nderived_from: []\n---\n\nbody\n"
+)
+
+_DEC_NOTE = (
+    "---\ntype: decision\nid: DEC-1\ntitle: Attunement and rhythm\n"
+    "status: sensing\nopened: 2026-01-01\nfrequency_context:\n  - F1\n"
+    "---\n\nA decision body.\n"
+)
+
+
+def _decision_vault(tmp_path: Path, *, planted: bool) -> Path:
+    """Build a decision vault, optionally with escaping thread and praxis links.
+
+    The in-root thread shares the decision's title tokens and the in-root
+    praxis shares its frequency, so both arms surface a real row — otherwise
+    "the planted id is absent" would hold over an empty section.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        planted: Whether ``02-Threads`` and ``04-Praxis`` hold escaping links.
+
+    Returns:
+        The vault root.
+    """
+    root = tmp_path / ("planted" if planted else "control")
+    vault = root / "vault"
+    _write(
+        vault / "02-Threads" / "real.md",
+        _DEC_THREAD.format(tid="THREAD-REAL", title="Attunement and rhythm"),
+    )
+    _write(
+        vault / "04-Praxis" / "real.md",
+        _DEC_PRAXIS.format(pid="PRAXIS-REAL", title="Real praxis"),
+    )
+    _write(vault / "08-Decisions" / "Active" / "DEC-1.md", _DEC_NOTE)
+    if planted:
+        thread = _write(
+            root / "outside" / "thread.md",
+            _DEC_THREAD.format(tid="THREAD-PLANTED", title="Attunement and rhythm"),
+        )
+        praxis = _write(
+            root / "outside" / "praxis.md",
+            _DEC_PRAXIS.format(pid="PRAXIS-PLANTED", title="Planted praxis"),
+        )
+        (vault / "02-Threads" / "zz-planted.md").symlink_to(thread)
+        (vault / "04-Praxis" / "zz-planted.md").symlink_to(praxis)
+    return vault
+
+
+def test_a_decision_note_records_no_out_of_root_id(tmp_path: Path) -> None:
+    """The decision writer puts related ids on DISK, so this asserts the file.
+
+    ``_find_related_threads`` and ``_find_relevant_praxis`` read ``02-Threads``
+    and ``04-Praxis`` through ``DecisionContextGatherer._iter_markdown``, and
+    ``append_context_section`` writes their ids into a decision note's
+    ``## Context`` as ``- [[<id>]]``. Measured before the guard, at this same
+    writer: ``- [[THREAD-PLANTED]]`` and ``- [[PRAXIS-PLANTED]]`` landed in the
+    file.
+
+    Asserted as byte equality with the never-planted control rather than as a
+    marker scan — a marker scan is what let the compost pin pass over half a
+    rendered report earlier in this issue.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+
+    def _written(*, planted: bool) -> tuple[str, list[str], list[str]]:
+        """Gather, render and write one arm; return the note and its ids."""
+        vault = _decision_vault(tmp_path, planted=planted)
+        decision = Decision(
+            id="DEC-1",
+            title="Attunement and rhythm",
+            opened=date(2026, 1, 1),
+            frequency_context=["F1"],
+            wavelength_phase_at_opening="rest",
+        )
+        gatherer = DecisionContextGatherer()
+        context = gatherer.gather_context(decision, vault)
+        note = gatherer.append_context_section(
+            vault / "08-Decisions" / "Active" / "DEC-1.md",
+            gatherer.generate_context_section(context),
+        )
+        return (
+            note.read_text(encoding="utf-8"),
+            list(context.related_threads),
+            list(context.relevant_praxis),
+        )
+
+    planted_note, _planted_threads, _planted_praxis = _written(planted=True)
+    control_note, control_threads, control_praxis = _written(planted=False)
+
+    assert control_threads == ["THREAD-REAL"], (
+        "the control surfaced no in-root thread, so equality below would hold "
+        f"over two empty sections.\n\n{control_threads}"
+    )
+    assert control_praxis == ["PRAXIS-REAL"], (
+        f"the control surfaced no in-root praxis.\n\n{control_praxis}"
+    )
+    assert "THREAD-PLANTED" not in planted_note, (
+        f"an out-of-root thread id was written to a decision note.\n\n{planted_note}"
+    )
+    assert "PRAXIS-PLANTED" not in planted_note, (
+        f"an out-of-root praxis id was written to a decision note.\n\n{planted_note}"
+    )
+    assert planted_note == control_note, (
+        "the written decision note differs from the never-planted control, so "
+        f"something in it still knows about the refused files.\n\n{planted_note}"
+    )
+
+
+def test_the_decision_reader_states_a_containment_choice_at_every_call_site(
+    tmp_path: Path,
+) -> None:
+    """``_iter_markdown``'s *contained* argument is required, and stays required.
+
+    A default would let the next call site inherit a policy nobody chose for
+    it, and the default that reads naturally — no guard — is the fail-open
+    one. This is asserted behaviourally, by calling it without the argument,
+    rather than by scanning the signature.
+
+    The ``None`` callers are not a claim that those corpora are safe:
+    ``08-Decisions`` is outside this issue's scope and
+    ``05-Wavelength/Observations`` additionally REDUCES (it keeps the greatest
+    ``date``), which is the shape that inverts. Both are recorded residuals.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _decision_vault(tmp_path, planted=True)
+
+    with pytest.raises(TypeError):
+        DecisionContextGatherer._iter_markdown(vault / "02-Threads")  # type: ignore[call-arg]
+
+    guarded = DecisionContextGatherer._iter_markdown(
+        vault / "02-Threads",
+        contained="thread",
+    )
+    unguarded = DecisionContextGatherer._iter_markdown(
+        vault / "02-Threads",
+        contained=None,
+    )
+    assert [p.name for p in guarded] == ["real.md"], (
+        f"the guarded call admitted the escaping link.\n\n{guarded}"
+    )
+    assert [p.name for p in unguarded] == ["real.md", "zz-planted.md"], (
+        "the unguarded call no longer admits everything, so the two arms of "
+        f"this helper are no longer distinguishable.\n\n{unguarded}"
     )

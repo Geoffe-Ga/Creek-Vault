@@ -64,6 +64,14 @@ The ``03-Eddies`` twin of :data:`THREAD_SKIP_NOUN`; see there for why the
 generic loaders do not import it.
 """
 
+PRAXIS_SKIP_NOUN: str = "praxis"
+"""Operator-facing noun for a containment skip under ``04-Praxis`` (#1794).
+
+The third corpus this issue covers, and the one the generic loaders reach
+through their own ``type_tag``; see :data:`THREAD_SKIP_NOUN` for why the
+literal callers import a constant while the generic ones derive it.
+"""
+
 COMPILED_PAGE_SKIP_NOUN: str = "compiled page"
 """Operator-facing noun for a containment skip in the compiled layer (#1794).
 
