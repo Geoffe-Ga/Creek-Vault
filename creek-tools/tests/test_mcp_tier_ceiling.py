@@ -283,7 +283,15 @@ def test_routing_tier_answers_only_in_routing_vocabulary(
         PrivacyTier.PERSONAL,
     }
     assert PrivacyTier.UNCLASSIFIED not in expected_vocabulary
-    assert routing_tier(ceiling, content_tier) in expected_vocabulary
+    answer = routing_tier(ceiling, content_tier)
+    assert answer in expected_vocabulary
+    # Membership alone is near-vacuous for the string rows: PrivacyTier is a
+    # StrEnum, so 'open' in {PrivacyTier.OPEN, ...} is True and only the two
+    # unrecognised spellings can redden. Adversarial review measured exactly
+    # 3 of 20 added cases going red against the broken implementation. The
+    # type pin is what makes the recognised string rows carry their weight --
+    # a caller keying a model off this value gets an enum, never a bare str.
+    assert type(answer) is PrivacyTier
 
 
 @pytest.mark.parametrize(

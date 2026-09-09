@@ -31,6 +31,9 @@ of a test that steps in them:
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -275,6 +278,30 @@ class TestCompileExcerptGate:
             "[Personal-tier summary: T]"
         )
         assert len(calls) == 1
+
+        # The call count alone does NOT enforce the docstring's claim: reverting
+        # the second branch to `fragment.privacy_tier == PrivacyTier.PERSONAL`
+        # while keeping the shared binding leaves tier_of called exactly once and
+        # this whole module green. Adversarial review reproduced precisely that.
+        # So pin the absence of the raw read, which is the property being claimed.
+        # Strip the docstring before checking: it *names* the raw read in prose
+        # precisely to warn the next author off it, so a plain substring scan
+        # over getsource reports the warning as the defect.
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(engine._fragment_excerpt_for_prompt))
+        )
+        func = tree.body[0]
+        assert isinstance(func, ast.FunctionDef)
+        body = func.body[1:] if ast.get_docstring(func) else func.body
+        source = "\n".join(ast.unparse(node) for node in body)
+        assert "fragment.privacy_tier" not in source, (
+            "Both branches must read the single `tier = tier_of(fragment)` "
+            "binding. A raw `fragment.privacy_tier` read reintroduces #1742: on "
+            "an unrecognised tier the comparison is False, both branches fall "
+            "through, and the full body reaches the LLM prompt. The two branches "
+            "cannot be told apart by any input, so this is the only check that "
+            "catches a partial revert."
+        )
 
     def test_the_keyless_residual_is_caught_by_the_routing_gate(self) -> None:
         """A keyless file still yields its body here — and still compiles local-only.
