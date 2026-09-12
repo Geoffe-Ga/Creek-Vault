@@ -1,0 +1,4 @@
+{
+  "reason": "foreign, unknown, already-withdrawn, and never-present journal identifiers are absent-equivalent successes, so journal withdrawal has no privacy-refusal response shape",
+  "unreachable": true
+}

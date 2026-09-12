@@ -1,8 +1,8 @@
 """The published contract bundle for the Adepthood ``/v1`` API (#1072).
 
 :func:`build_bundle` renders the whole of ``docs/contracts/adepthood-v1/`` from
-the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, an
-8x7 matrix of worked example responses, the retry table, and a manifest that
+the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, a
+9x7 matrix of worked example responses, the retry table, and a manifest that
 hashes every one of them. :func:`write_bundle` materialises it.
 
 **Why generate it instead of hand-writing it.** A hand-written fixture bundle
@@ -30,7 +30,7 @@ its whole error-handling surface against fixtures:
 - ``refusal`` — an :class:`~creek_mcp.api.models.ErrorEnvelope` carrying
   ``privacy_refused``. **These are the intimate examples, and every one of them
   is a refusal rather than a success** — that is the point of publishing them.
-- ``care-escalation`` — ``reflections`` only; the other five cells are
+- ``care-escalation`` — ``reflections`` only; the other eight cells are
   :class:`~creek_mcp.api.models.NotApplicableExample`, because the
   acute-distress guard runs only inside ``reflect_tool``.
 - ``malformed-input`` / ``incompatible-version`` / ``unavailable-service`` —
@@ -160,18 +160,24 @@ EXAMPLE_STATES: Final[tuple[str, ...]] = (
 """The state axis of the fixture matrix, in the order a consumer meets them."""
 
 UNREACHABLE_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
-    (capability, _STATE_CARE_ESCALATION)
-    for capability in CAPABILITIES
-    if capability != Capability.REFLECTIONS.value
+    {
+        *(
+            (capability, _STATE_CARE_ESCALATION)
+            for capability in CAPABILITIES
+            if capability != Capability.REFLECTIONS.value
+        ),
+        (Capability.JOURNAL_WITHDRAW.value, _STATE_REFUSAL),
+    }
 )
 """The matrix cells that have no reachable response shape.
 
 Derived from the axes rather than listed, so it cannot fall out of step with
 the matrix it describes. The acute-distress guard runs only inside
 :func:`creek_mcp.tools.reflect.reflect_tool`, so ``capabilities``,
-``journal-upsert``, ``wheel``, ``upload``, ``drive-connector`` and
-``pipeline`` can never escalate. Those six cells are filled with a
-:class:`~creek_mcp.api.models.NotApplicableExample` that says so.
+every other capability can never escalate. Journal withdrawal additionally
+has no privacy-refusal state: foreign, absent, and already-withdrawn resources
+are deliberately indistinguishable successes. Each cell is filled with a
+:class:`~creek_mcp.api.models.NotApplicableExample` that says why.
 """
 
 _ERROR_STATE_CODES: Final[dict[str, ErrorCode]] = {
@@ -204,7 +210,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "tier_model": _TIER_MODEL_PAYLOAD,
     "capabilities": list(CAPABILITIES),
 }
-"""A ready server: vault present, all eight capabilities served."""
+"""A ready server: vault present, all nine capabilities served."""
 
 _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     **_CAPABILITIES_SUCCESS,
@@ -252,6 +258,13 @@ _JOURNAL_EMPTY: Final[dict[str, Any]] = {
     "action": JournalAction.UNCHANGED.value,
 }
 """A re-sync that changed nothing: a success, not an error."""
+
+_JOURNAL_WITHDRAW_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "action": "withdrawn",
+}
+"""A complete withdrawal, which carries no consumer or entry identity."""
 
 _EXAMPLE_VOICE_DRAFT_EXTERNAL_ID: Final[str] = "adepthood-voicedraft-4ab787c21ef0"
 """A synthetic Adepthood digest key for one AI-authored Voice Draft."""
@@ -520,14 +533,24 @@ The signal is embedded by reference, not abridged, so the resources a person in
 distress is handed here are exactly the ones the guardrail ships.
 """
 
-_UNREACHABLE_PAYLOAD: Final[dict[str, Any]] = {
+_CARE_UNREACHABLE_PAYLOAD: Final[dict[str, Any]] = {
     "unreachable": True,
     "reason": (
         "the acute-distress guard runs only inside reflect_tool, so this "
         "capability has no care-escalation response shape"
     ),
 }
-"""What fills a structurally unreachable cell, and why it is unreachable."""
+"""Why a non-reflection capability cannot emit care escalation."""
+
+_WITHDRAWAL_REFUSAL_UNREACHABLE_PAYLOAD: Final[dict[str, Any]] = {
+    "unreachable": True,
+    "reason": (
+        "foreign, unknown, already-withdrawn, and never-present journal "
+        "identifiers are absent-equivalent successes, so journal withdrawal "
+        "has no privacy-refusal response shape"
+    ),
+}
+"""Why journal withdrawal has no object-state refusal response."""
 
 _EXAMPLE_FREQUENCY_COUNT: Final[int] = 1
 """One classified fragment per frequency, so the shares are readable."""
@@ -580,7 +603,7 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 
 
 # --------------------------------------------------------------------------
-# The 8 x 7 matrix
+# The 9 x 7 matrix
 # --------------------------------------------------------------------------
 
 _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
@@ -615,6 +638,10 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.VOICE_DRAFTS.value: _Example(
         model="VoiceDraftUpsertResponse",
         payload=_VOICE_DRAFT_SUCCESS,
+    ),
+    Capability.JOURNAL_WITHDRAW.value: _Example(
+        model="JournalWithdrawResponse",
+        payload=_JOURNAL_WITHDRAW_SUCCESS,
     ),
 }
 """The ``success`` column: one canonical happy response per capability.
@@ -660,8 +687,22 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
         model="VoiceDraftUpsertResponse",
         payload=_VOICE_DRAFT_EMPTY,
     ),
+    Capability.JOURNAL_WITHDRAW.value: _Example(
+        model="JournalWithdrawResponse",
+        payload=_JOURNAL_WITHDRAW_SUCCESS,
+    ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""
+
+
+def _unreachable_example(capability: str, state: str) -> _Example:
+    """Return the reason-bearing marker for one unreachable matrix cell."""
+    payload = (
+        _WITHDRAWAL_REFUSAL_UNREACHABLE_PAYLOAD
+        if (capability, state) == (Capability.JOURNAL_WITHDRAW.value, _STATE_REFUSAL)
+        else _CARE_UNREACHABLE_PAYLOAD
+    )
+    return _Example(model="NotApplicableExample", payload=payload)
 
 
 def _care_example(capability: str) -> _Example:
@@ -672,10 +713,10 @@ def _care_example(capability: str) -> _Example:
 
     Returns:
         The real escalation envelope for ``reflections``; an explicit
-        unreachability marker for the five capabilities that cannot escalate.
+        unreachability marker for the eight capabilities that cannot escalate.
     """
     if (capability, _STATE_CARE_ESCALATION) in UNREACHABLE_CELLS:
-        return _Example(model="NotApplicableExample", payload=_UNREACHABLE_PAYLOAD)
+        return _unreachable_example(capability, _STATE_CARE_ESCALATION)
     return _Example(model="CareEscalationResponse", payload=_CARE_PAYLOAD)
 
 
@@ -714,6 +755,8 @@ def _example_for(capability: str, state: str) -> _Example:
     Returns:
         The fixture for that cell.
     """
+    if (capability, state) in UNREACHABLE_CELLS:
+        return _unreachable_example(capability, state)
     if state == _STATE_SUCCESS:
         return _SUCCESS_EXAMPLES[capability]
     if state == _STATE_EMPTY:
@@ -871,7 +914,7 @@ def build_bundle() -> dict[str, str]:
 
     Returns:
         Every generated file: ``schemas/<Model>.schema.json`` for each
-        published model, ``examples/<capability>/<state>.json`` for all 28
+        published model, ``examples/<capability>/<state>.json`` for all 63
         matrix cells, ``retry-policy.json``, and ``manifest.json``. The
         committed bundle must equal this exactly, minus the docs-owned
         ``README.md``.

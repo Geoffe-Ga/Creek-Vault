@@ -13,18 +13,21 @@ import logging
 import re
 import resource
 import signal
+import threading
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pytest
 
+from creek._fslock import vault_lock
 from creek.config import EmbeddingsConfig
 from creek.link.embeddings import (
     CachedEmbedding,
     EmbeddingLinker,
     Resonance,
     content_hash_for_text,
+    embeddings_cache_lock_path,
     embeddings_cache_path,
     fragment_embedding_text,
 )
@@ -387,6 +390,41 @@ class TestSaveLoadCache:
         save_path = tmp_path / "embeddings.parquet"
         linker.save_cache({"a": _entry("a", vector=[1.0])}, save_path)
         assert save_path.exists()
+
+    def test_canonical_cache_save_waits_for_the_shared_mutation_lock(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A linker replacement cannot overlap a purge/check cache mutation."""
+        vault = tmp_path / "vault"
+        cache_path = embeddings_cache_path(vault)
+        cache_path.parent.mkdir(parents=True)
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        started = threading.Event()
+        finished = threading.Event()
+        errors: list[BaseException] = []
+
+        def save() -> None:
+            """Attempt a canonical replacement from another live caller."""
+            try:
+                started.set()
+                linker.save_cache({"a": _entry("a", vector=[1.0])}, cache_path)
+            except BaseException as exc:  # captured and re-raised below
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        with vault_lock(embeddings_cache_lock_path(vault), timeout=1):
+            thread = threading.Thread(target=save)
+            thread.start()
+            assert started.wait(timeout=1)
+            assert not finished.wait(timeout=0.1)
+            assert not cache_path.exists()
+
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert errors == []
+        assert cache_path.exists()
 
     def test_load_missing_file_returns_empty(self, tmp_path: Path) -> None:
         """load_cache should return an empty dict for a missing file.

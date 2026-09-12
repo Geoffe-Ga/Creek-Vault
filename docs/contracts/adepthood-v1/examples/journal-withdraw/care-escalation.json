@@ -1,0 +1,4 @@
+{
+  "reason": "the acute-distress guard runs only inside reflect_tool, so this capability has no care-escalation response shape",
+  "unreachable": true
+}

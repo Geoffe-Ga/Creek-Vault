@@ -114,9 +114,9 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.15.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.16.0.json"
 )
-"""The published document at contract 0.15.0, including Voice Drafts (#1727).
+"""The published document at contract 0.16.0, including withdrawal (#1799).
 
 Regenerate it **only** with a deliberate contract change, and say in that
 change's ADR row what moved:
@@ -442,7 +442,7 @@ def test_documented_paths_equal_the_mounted_routes(vault: Path) -> None:
 def test_every_published_route_is_documented() -> None:
     """All fourteen paths appear, named explicitly so a silent drop is visible.
 
-    Fourteen paths over seventeen operations since #1727: two resource paths
+    Fourteen paths over eighteen operations since #1799: two resource paths
     serve multiple methods, which is why this is a set of paths
     while ``test_documented_routes_are_the_mounted_ones`` above compares
     ``(method, path)`` pairs.
@@ -559,7 +559,7 @@ def _spec_for(path: str, method: str) -> RouteSpec:
 
 
 def test_the_generated_document_matches_the_current_contract_golden() -> None:
-    """The complete published document is pinned byte-for-byte at 0.15.0.
+    """The complete published document is pinned byte-for-byte at 0.16.0.
 
     A **golden file**, deliberately, and it is the whole review of the
     ``RouteSpec.success_responses`` change: that change rewrote the response
@@ -570,7 +570,7 @@ def test_the_generated_document_matches_the_current_contract_golden() -> None:
     user-visible contract of that work, and a live re-derivation would pass
     against a generator that broke the same way twice.
 
-    ``tests/fixtures/openapi-0.15.0.json`` was captured from the generator with
+    ``tests/fixtures/openapi-0.16.0.json`` was captured from the generator with
     ``json.dumps(build_openapi(), indent=2, ensure_ascii=False) + "\n"`` — no
     ``sort_keys``, so response *insertion order* is pinned too and not merely
     the set of keys.

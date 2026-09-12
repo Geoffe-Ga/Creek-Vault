@@ -213,6 +213,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek._fslock import vault_lock
 from creek.classify.audience import AudienceClassifier
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
@@ -251,6 +252,7 @@ from creek.classify.weighted import classify_weighted
 from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
 from creek.time import now_la
+from creek.vault.mutations import content_mutation_lock_path
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, try_load_fragment
 from creek.vault.writer import VaultWriter
 
@@ -582,7 +584,49 @@ def run_classify(
     force: bool,
     retier: bool = False,
 ) -> ClassifySummary:
-    """Classify every fragment in *vault_path* using the chosen method.
+    """Classify a vault inside its shared load-to-write mutation boundary.
+
+    Holding one cross-process boundary across the complete pass gives journal
+    withdrawal a linearization point: either classification finishes first
+    and DELETE purges its output, or DELETE finishes first and classification
+    loads no withdrawn source.  It cannot load plaintext before DELETE and
+    write that plaintext back after DELETE reports success.
+
+    Args:
+        vault_path: Vault root.
+        config: Loaded Creek configuration.
+        method: ``"rules"`` or ``"llm"``.
+        force: Whether to overwrite preserved classifications.
+        retier: Whether to apply the opt-in escalate-only retiering pass.
+
+    Returns:
+        A :class:`ClassifySummary` reporting per-method counts.
+
+    Raises:
+        creek._fslock.VaultLockTimeoutError: When another content mutation
+            holds the shared boundary past its bounded wait.
+        LLMProviderUnavailableError: When the requested provider is
+            unavailable.
+    """
+    with vault_lock(content_mutation_lock_path(vault_path)):
+        return _run_classify_with_content_lock_held(
+            vault_path=vault_path,
+            config=config,
+            method=method,
+            force=force,
+            retier=retier,
+        )
+
+
+def _run_classify_with_content_lock_held(
+    *,
+    vault_path: Path,
+    config: CreekConfig,
+    method: str,
+    force: bool,
+    retier: bool = False,
+) -> ClassifySummary:
+    """Implement :func:`run_classify` while its content lock is held.
 
     Args:
         vault_path: Vault root.

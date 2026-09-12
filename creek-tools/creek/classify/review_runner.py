@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 import typer
 
+from creek._fslock import vault_lock
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
     CLASSIFIED_AT_KEY,
@@ -29,12 +30,21 @@ from creek.classify.constants import (
 from creek.classify.review import ReviewQueueGenerator
 from creek.models import Fragment, Frequency, FrequencyClassification
 from creek.time import LA_TZ
+from creek.vault.mutations import content_mutation_lock_path
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, try_load_fragment
 
 if TYPE_CHECKING:
     from rich.console import Console
 
 logger = logging.getLogger(__name__)
+
+
+class StaleReviewEntryError(OSError):
+    """Raised when a queued fragment changed before review persistence."""
+
+    def __init__(self) -> None:
+        """Initialize the stable operator-facing error."""
+        super().__init__("fragment changed or was removed while awaiting review")
 
 
 @dataclass(frozen=True)
@@ -200,7 +210,7 @@ class ReviewQueueRunner:
             ``OSError`` was caught.
         """
         try:
-            _persist_manual(entry, fragment)
+            _persist_manual(self.vault_path, entry, fragment)
         except OSError as exc:
             message = f"failed to persist {entry.path}: {exc}"
             summary.errors.append(message)
@@ -263,21 +273,30 @@ def _override_frequency(
     )
 
 
-def _persist_manual(entry: ReviewEntry, fragment: Fragment) -> None:
+def _persist_manual(vault_path: Path, entry: ReviewEntry, fragment: Fragment) -> None:
     """Write the operator's decision back to disk.
 
     Args:
+        vault_path: Root of the vault containing the reviewed fragment.
         entry: Original entry (used for path and body).
         fragment: Updated fragment metadata to persist.
-    """
-    metadata = entry.raw_metadata.copy()
-    metadata.update(fragment.model_dump(mode="json"))
-    metadata[CLASSIFICATION_METHOD_KEY] = MANUAL_METHOD
-    metadata[CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
 
-    post = frontmatter.Post(content=entry.body)
-    post.metadata.update(metadata)
-    entry.path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    Raises:
+        StaleReviewEntryError: If the fragment changed or disappeared after the
+            review queue loaded.
+        OSError: If the guarded write fails.
+    """
+    with vault_lock(content_mutation_lock_path(vault_path)):
+        if _read_entry(entry.path) != entry:
+            raise StaleReviewEntryError
+        metadata = entry.raw_metadata.copy()
+        metadata.update(fragment.model_dump(mode="json"))
+        metadata[CLASSIFICATION_METHOD_KEY] = MANUAL_METHOD
+        metadata[CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
+
+        post = frontmatter.Post(content=entry.body)
+        post.metadata.update(metadata)
+        entry.path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
 
 def _read_entry(md_file: Path) -> ReviewEntry | None:

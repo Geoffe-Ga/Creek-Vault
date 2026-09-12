@@ -532,10 +532,11 @@ def create_app(
             seeing the problem versus a surface being live until somebody
             notices.
     """
+    configured_verifier = verifier if verifier is not None else build_verifier()
     app = Starlette(
         routes=[_route_for(spec) for spec in ROUTES],
         middleware=_middleware(
-            verifier if verifier is not None else build_verifier(),
+            configured_verifier,
             max_body_bytes,
             timeout_seconds,
             max_concurrency,
@@ -550,6 +551,10 @@ def create_app(
     )
     app.router.redirect_slashes = REDIRECT_SLASHES
     app.state.vault_path = vault_path
+    # The withdrawal adapter uses only the cardinality of this authenticated
+    # registry when deciding whether a pre-0.16, unscoped staged entry has one
+    # unambiguous owner. The token values are never retained on app state.
+    app.state.consumer_ids = frozenset(configured_verifier.consumers)
     app.state.pipeline_worker_id = uuid4().hex
     app.state.pipeline_job_admission_lock = asyncio.Lock()
     app.state.pipeline_job_tasks = set()

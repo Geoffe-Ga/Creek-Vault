@@ -98,6 +98,7 @@ from creek_mcp.api.models import (
     JournalAction,
     JournalUpsertRequest,
     JournalUpsertResponse,
+    JournalWithdrawResponse,
     LinkRequest,
     LinkResponse,
     NotApplicableExample,
@@ -189,6 +190,10 @@ CAPABILITIES_RESPONSE_PAYLOAD: dict[str, Any] = {
         "reflections",
         "wheel",
         "upload",
+        "drive-connector",
+        "pipeline",
+        "voice-drafts",
+        "journal-withdraw",
     ],
 }
 
@@ -205,6 +210,12 @@ JOURNAL_UPSERT_RESPONSE_PAYLOAD: dict[str, Any] = {
     "fragment_id": "frag-2026-07-31-ridge-fog",
     "action": "created",
     "tier": "personal",
+}
+
+JOURNAL_WITHDRAW_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "personal",
+    "action": "withdrawn",
 }
 
 UPLOAD_REQUEST_PAYLOAD: dict[str, Any] = {
@@ -461,6 +472,7 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     ErrorEnvelope.__name__: ERROR_ENVELOPE_PAYLOAD,
     JournalUpsertRequest.__name__: JOURNAL_UPSERT_REQUEST_PAYLOAD,
     JournalUpsertResponse.__name__: JOURNAL_UPSERT_RESPONSE_PAYLOAD,
+    JournalWithdrawResponse.__name__: JOURNAL_WITHDRAW_RESPONSE_PAYLOAD,
     JobAcceptedResponse.__name__: JOB_ACCEPTED_RESPONSE_PAYLOAD,
     JobStatusResponse.__name__: JOB_STATUS_RESPONSE_PAYLOAD,
     LinkRequest.__name__: LINK_REQUEST_PAYLOAD,
@@ -564,6 +576,8 @@ EXPECTED_UNREACHABLE_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("drive-connector", "care-escalation"),
         ("pipeline", "care-escalation"),
         ("voice-drafts", "care-escalation"),
+        ("journal-withdraw", "care-escalation"),
+        ("journal-withdraw", "refusal"),
     }
 )
 
@@ -1025,7 +1039,7 @@ def test_bundle_root_name_matches_the_declared_dir_name() -> None:
 
 
 def test_capability_and_state_axes_are_pinned() -> None:
-    """The fixture matrix is 8 capabilities x 7 states = 56 cells."""
+    """The fixture matrix is 9 capabilities x 7 states = 63 cells."""
     assert CAPABILITIES == (
         "capabilities",
         "journal-upsert",
@@ -1035,6 +1049,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "drive-connector",
         "pipeline",
         "voice-drafts",
+        "journal-withdraw",
     )
     assert EXAMPLE_STATES == (
         "success",
@@ -1045,7 +1060,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 56
+    assert len(_matrix()) == 63
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
@@ -1133,8 +1148,8 @@ def test_retry_policy_json_mirrors_the_runtime_table() -> None:
     }
 
 
-def test_unreachable_cells_are_the_seven_non_reflection_care_escalations() -> None:
-    """Only ``reflections`` can escalate; the other seven cells are N/A."""
+def test_unreachable_cells_are_the_structurally_impossible_states() -> None:
+    """Only reflections escalate; withdrawal additionally cannot refuse."""
     assert UNREACHABLE_CELLS == EXPECTED_UNREACHABLE_CELLS
 
 
@@ -1155,6 +1170,17 @@ def test_unreachable_fixture_states_why(capability: str, state: str) -> None:
     example = NotApplicableExample.model_validate(payload)
     assert example.unreachable is True
     assert example.reason.strip()
+
+
+def test_journal_withdraw_refusal_fixture_explains_absence_equivalence() -> None:
+    """Withdrawal cannot refuse on object state without becoming an oracle."""
+    payload = json.loads(
+        _example_path("journal-withdraw", "refusal").read_text(encoding="utf-8")
+    )
+    example = NotApplicableExample.model_validate(payload)
+
+    assert "absent-equivalent" in example.reason
+    assert "acute-distress" not in example.reason
 
 
 def test_committed_bundle_equals_a_fresh_build() -> None:
@@ -1229,7 +1255,7 @@ def test_no_committed_fixture_carries_an_intimate_tier_value() -> None:
     The model-level tests pin three typed fields, but a fixture is a hand-built
     payload and the security invariant is about the bytes a consumer vendors:
     no ``intimate``-tier success response may be published, and every INTIMATE
-    example must be a refusal. This walks every string value of all 28
+    example must be a refusal. This walks every string value of all 63
     committed examples rather than trusting the fields that happen to be typed.
     """
     offenders = [
@@ -1291,7 +1317,7 @@ def test_contract_minor_is_derived_from_the_runtime_version() -> None:
     so the minor a client negotiates against must be a function of the version
     the server actually speaks. Pinned here because several contract rules are
     explicitly scoped to 0.2 -- ``essay_grounded`` may only be ``False``, and
-    ``NotApplicableExample`` marks three unreachable cells -- and each of those
+    ``NotApplicableExample`` marks structurally unreachable cells -- and each
     is owed a re-examination when ``CONTRACT_VERSION`` moves.
     """
     assert ".".join(CONTRACT_VERSION.split(".")[:2]) == CONTRACT_MINOR
@@ -1807,9 +1833,9 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.15 widened the compatibility window rather than shifting it.
+    """0.16 widened the compatibility window rather than shifting it.
 
-    A ``0.14`` client has no Voice Draft resource in its vendored route or
+    A ``0.15`` client has no journal withdrawal resource in its vendored route or
     model set, and every route it does know keeps its byte-identical response
     under #1727. Earlier minors are checked alongside it because the window
     only ever widens.
@@ -1820,6 +1846,7 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.15" in SUPPORTED_CONTRACT_MINORS
     assert "0.14" in SUPPORTED_CONTRACT_MINORS
     assert "0.13" in SUPPORTED_CONTRACT_MINORS
     assert "0.12" in SUPPORTED_CONTRACT_MINORS
@@ -1827,7 +1854,7 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.15"
+    assert CONTRACT_MINOR == "0.16"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

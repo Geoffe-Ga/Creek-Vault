@@ -90,6 +90,30 @@ def test_run_interactive_accept_persists_manual(tmp_path: Path) -> None:
     assert reloaded["classification_method"] == "manual"
 
 
+def test_accept_does_not_recreate_a_fragment_deleted_after_queue_load(
+    tmp_path: Path,
+) -> None:
+    """A stale review entry cannot recreate plaintext after withdrawal."""
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-review-withdrawn-1799",
+        title="Withdrawn during review",
+        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+    )
+    file = _write_fragment(vault=vault, fragment=fragment, body="withdrawn body")
+
+    runner = ReviewQueueRunner(vault_path=vault, console=Console())
+    pending = runner.list_pending()
+    file.unlink()
+
+    with patch("typer.prompt", return_value="a"):
+        summary = runner.run_interactive(pending)
+
+    assert not file.exists()
+    assert summary.accepted == 0
+    assert len(summary.errors) == 1
+
+
 def test_run_interactive_defer_leaves_file(tmp_path: Path) -> None:
     """``defer`` is a no-op for the file."""
     vault = tmp_path / "vault"

@@ -20,8 +20,17 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.15.0"
+CONTRACT_VERSION: Final[str] = "0.16.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.16.0 (#1799): ``/v1`` publishes ``journal-withdraw`` and
+``DELETE /v1/journal-entries/{external_id}``, the consumer-scoped,
+idempotent destructive inverse of journal upsert. A complete response means
+the staged source, fragment, ingest-ledger membership, references, and
+retrieval-facing derived state were removed and persistent index/provenance
+membership was removed or tombstoned; partial cleanup is retryable and never
+reported as success. The new route and closed response model widen the HTTP
+contract; ``0.15`` remains served without seeing or reaching them.
 
 0.15.0 (#1727): ``/v1`` publishes an eighth capability,
 ``voice-drafts``, over one caller-owned ``external_id`` resource. ``PUT``
