@@ -931,12 +931,16 @@ class _IndexLoad(NamedTuple):
             the sentinel instead keeps an unreadable file from reading as
             a fully-consumed empty one. Required rather than defaulted,
             so a new construction site has to decide which it means.
+        identity: The ``(device, inode)`` generation of the file descriptor
+            whose bytes were parsed, or ``None`` when no file was readable.
+            Atomic whole-file replacement changes this even at equal size.
     """
 
     entries: dict[str, str]
     torn_lines: int
     read_failed: bool
     consumed: int
+    identity: tuple[int, int] | None
 
     @property
     def damaged(self) -> bool:
@@ -966,10 +970,13 @@ class _IndexCursor(NamedTuple):
             deliberately overrides what the file said — replaying the
             file's tail onto it would reinstate the claims the scan just
             disproved.
+        identity: The ``(device, inode)`` generation the cached mapping came
+            from. Appends preserve it; atomic replacement changes it.
     """
 
     consumed: int
     incremental: bool
+    identity: tuple[int, int] | None
 
 
 class _IndexView(NamedTuple):
@@ -1706,16 +1713,11 @@ class VaultWriter:
     def compact_index(self, target_dir: Path) -> int:
         """Reclaim the dead records in *target_dir*'s id index (#1300).
 
-        **No production caller today, and that is tracked, not accepted.**
-        #1300 suggested hanging this off ``creek lint --fix``; that lands
-        in ``creek/cli.py``, which was held by another in-flight change
-        when this shipped, so the operator surface is #1631. Until that
-        closes, this method is reachable only from its tests — which is
-        precisely the shape ``scripts/lint-vulture.sh`` documents as its
-        own blind spot ("code kept alive only by its own tests"). If #1631
-        is still open when you read this, it has been dead code for
-        longer than intended: wire it up or delete it, but do not leave
-        it drifting.
+        The authenticated journal-withdrawal path is the first production
+        caller. It must erase a withdrawn fragment ID from the hidden index,
+        rather than merely deleting the indexed Markdown and leaving a durable
+        identity behind. The operator-facing maintenance surface remains
+        tracked by #1631.
 
         ``.id-index.jsonl`` is append-only, so nothing in it is ever
         reclaimed in the ordinary course of writing: a superseded mapping
@@ -1753,30 +1755,15 @@ class VaultWriter:
         point of the pass.
 
         **The rewrite is refused unless it shrinks the file.** A directory
-        holding notes the index never learned about would otherwise
-        *grow* it, and a longer file at an unchanged inode is precisely
-        what another process's incremental cursor (#1603) would splice
-        onto a stale mapping as if it were an append. Shrinking bounds
-        that: a reader that had consumed the *whole* pre-compaction file
-        finds a size below its cursor, hits the cursor's own shrink guard
-        and reloads, and compaction resolves every id exactly as the file
-        it replaced did, so the reload costs it nothing.
-
-        The guard bounds the hazard; it does **not** eliminate it, and a
-        caller must not read it as a proof of reader safety. A reader
-        whose cursor is *behind* the pre-compaction size — one that
-        cached the directory early and has not looked since — can find
-        the compacted file longer than its own cursor and resume from an
-        offset that no longer falls where it did. Nearly always that
-        offset lands inside a record, the tail fails to parse, and the
-        cursor's parse guard forces a full load anyway; the residual is
-        the alignment where it lands on a record boundary, which leaves
-        that reader holding whichever mappings compaction re-sorted ahead
-        of the offset — including one the file had since corrected.
-        Closing the residual needs a generation stamp on the cursor
-        rather than a byte offset. Nothing reaches it today, because this
-        method has no caller yet; wiring one is #1631, and that is the
-        work that has to weigh it.
+        holding notes the index never learned about would otherwise grow a
+        maintenance artifact while claiming reclamation. Reader safety does
+        not depend on that size guard: every cursor records the device/inode
+        identity of the descriptor it parsed, and every incremental refresh
+        compares that generation before reading a tail. ``os.replace`` gives
+        compaction a new inode, so even the formerly dangerous case — a stale
+        cursor aligned exactly to a record boundary in a longer replacement —
+        reloads the whole mapping instead of skipping records sorted ahead of
+        its old byte offset.
 
         Args:
             target_dir: The fragment directory whose index to compact.
@@ -1828,22 +1815,11 @@ class VaultWriter:
         if after >= before:
             return 0
         _atomic_write_text(index_path, rendered)
-        # The cached mapping and its byte cursor both described the file
-        # this call just replaced. Dropping them is a cheap SECOND line of
-        # defence, not the mechanism -- and the difference matters, because
-        # an earlier draft of this comment claimed otherwise and a reviewer
-        # reasonably read it as load-bearing. What actually stops a stale
-        # cursor from being believed is the framing in
-        # ``_read_index_tail``: every record carries a leading newline, so
-        # resuming at an offset into rewritten content lands mid-record,
-        # ``_parse_index_text`` reports damage, and the caller falls back to
-        # a full load. Measured directly -- offsets 10 and 45 into a
-        # three-record file both return None, offsets 0 and 31 (record
-        # boundaries) parse. Removing these two lines therefore leaves the
-        # suite green; they are kept because resuming correctly by accident
-        # is worse than not resuming, and because the shrink guard in
-        # ``_refresh_index_locked`` stops firing once appends grow the file
-        # back past the old offset.
+        # This writer knows immediately that its cached mapping described the
+        # replaced inode, so discard it eagerly. Separate live writers detect
+        # the same replacement through the device/inode generation stored in
+        # their cursors; framing remains corruption defence, not concurrency
+        # control.
         self._dir_indexes.pop(target_dir, None)
         self._index_cursors.pop(target_dir, None)
         return before - after
@@ -2640,15 +2616,17 @@ class VaultWriter:
 
         Returns:
             *cached*, updated, when it could be brought current; ``None``
-            when the caller must reload the index from scratch — the file
-            shrank (a whole-file rewrite), the tail would not parse, or
-            the previous load was damaged and its mapping outranks what
-            the file claims.
+            when the caller must reload the index from scratch — the file was
+            atomically replaced, shrank, the tail would not parse, or the
+            previous load was damaged and its mapping outranks what the file
+            claims.
         """
         cursor = self._index_cursors.get(target_dir)
         if cursor is None:
             return None
-        size = self._index_size(target_dir)
+        size, identity = self._index_state(target_dir)
+        if identity != cursor.identity:
+            return None
         if size == cursor.consumed:
             # Includes "absent then, absent now" (both ``_NO_INDEX_FILE``),
             # which is what keeps #1332's empty-directory memo intact.
@@ -2657,12 +2635,29 @@ class VaultWriter:
             return None
         if not cursor.incremental:
             return None
-        appended = self._read_index_tail(target_dir / INDEX_FILENAME, cursor.consumed)
+        appended = self._read_index_tail(
+            target_dir / INDEX_FILENAME,
+            cursor.consumed,
+            expected_identity=identity,
+        )
         if appended is None:
             return None
         cached.update(appended)
-        self._index_cursors[target_dir] = _IndexCursor(size, incremental=True)
+        self._index_cursors[target_dir] = _IndexCursor(
+            size,
+            incremental=True,
+            identity=identity,
+        )
         return cached
+
+    @staticmethod
+    def _index_state(target_dir: Path) -> tuple[int, tuple[int, int] | None]:
+        """Return the index byte size and its atomic-replacement generation."""
+        try:
+            stat = (target_dir / INDEX_FILENAME).stat()
+        except OSError:
+            return _NO_INDEX_FILE, None
+        return stat.st_size, (stat.st_dev, stat.st_ino)
 
     @staticmethod
     def _index_size(target_dir: Path) -> int:
@@ -2678,13 +2673,15 @@ class VaultWriter:
             equality test cover "unchanged" for both a present and an
             absent index.
         """
-        try:
-            return (target_dir / INDEX_FILENAME).stat().st_size
-        except OSError:
-            return _NO_INDEX_FILE
+        return VaultWriter._index_state(target_dir)[0]
 
     @staticmethod
-    def _read_index_tail(index_path: Path, offset: int) -> dict[str, str] | None:
+    def _read_index_tail(
+        index_path: Path,
+        offset: int,
+        *,
+        expected_identity: tuple[int, int] | None,
+    ) -> dict[str, str] | None:
         """Parse the index records written past *offset*.
 
         Args:
@@ -2693,6 +2690,7 @@ class VaultWriter:
                 record is framed with a leading newline
                 (:meth:`_append_index_entry`), so a read resuming at a
                 record boundary always starts on a self-delimiting line.
+            expected_identity: Generation the cached mapping was read from.
 
         Returns:
             The mappings the tail declares, or ``None`` when the tail
@@ -2702,6 +2700,9 @@ class VaultWriter:
         """
         try:
             with index_path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                if (stat.st_dev, stat.st_ino) != expected_identity:
+                    return None
                 handle.seek(offset)
                 raw = handle.read().decode("utf-8")
         except (OSError, UnicodeDecodeError):
@@ -2820,6 +2821,7 @@ class VaultWriter:
             load = self._read_index_records(index_path)
             index = load.entries
             consumed = load.consumed
+            identity = load.identity
             if load.damaged:
                 index = self._recover_damaged_index(index_path, target_dir, load)
                 incremental = False
@@ -2832,9 +2834,13 @@ class VaultWriter:
             # Measured *after* the optional persist, so the freshly
             # written file is already accounted for and the very next
             # lookup does not re-read what this call just produced.
-            consumed = self._index_size(target_dir)
+            consumed, identity = self._index_state(target_dir)
         self._dir_indexes[target_dir] = index
-        self._index_cursors[target_dir] = _IndexCursor(consumed, incremental)
+        self._index_cursors[target_dir] = _IndexCursor(
+            consumed,
+            incremental,
+            identity,
+        )
         return _IndexView(index, owes_write=False)
 
     @staticmethod
@@ -2917,10 +2923,20 @@ class VaultWriter:
             many bytes of the file the parse accounted for.
         """
         try:
-            raw = index_path.read_text(encoding="utf-8")
+            with index_path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                raw = handle.read().decode("utf-8")
         except (OSError, UnicodeDecodeError):
-            return _IndexLoad({}, 0, read_failed=True, consumed=_NO_INDEX_FILE)
-        return VaultWriter._parse_index_text(raw)
+            return _IndexLoad(
+                {},
+                0,
+                read_failed=True,
+                consumed=_NO_INDEX_FILE,
+                identity=None,
+            )
+        return VaultWriter._parse_index_text(raw)._replace(
+            identity=(stat.st_dev, stat.st_ino)
+        )
 
     @staticmethod
     def _parse_index_text(raw: str) -> _IndexLoad:
@@ -2967,6 +2983,7 @@ class VaultWriter:
             torn_lines,
             read_failed=False,
             consumed=len(raw.encode("utf-8")),
+            identity=None,
         )
 
     @staticmethod

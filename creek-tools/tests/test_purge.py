@@ -14,6 +14,7 @@ import logging
 import re
 import shutil
 from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -262,7 +263,7 @@ the (perfectly well-formed, byte-clean ASCII) YAML frontmatter block is
 ever parsed.
 """
 
-_UNDECODABLE_SECRET = "synthetic-undecodable-secret-910"
+_UNDECODABLE_PRIVATE_MARKER = "synthetic-undecodable-private-marker-910"
 """Synthetic marker standing in for private body content — never real data."""
 
 
@@ -276,7 +277,7 @@ def _write_fragment_with_undecodable_body(
     created: datetime | None = None,
     threads: list[str] | None = None,
     eddies: list[str] | None = None,
-    secret: str = _UNDECODABLE_SECRET,
+    secret: str = _UNDECODABLE_PRIVATE_MARKER,
 ) -> tuple[Path, bytes]:
     """Write a house-schema fragment whose *body* is not valid UTF-8 (#910).
 
@@ -1135,7 +1136,7 @@ def test_fragment_purge_nul_byte_origin_key_is_noop(tmp_path: Path) -> None:
 _JOURNAL_STAGING_DIR = "00-Creek-Meta/adepthood/journal"
 """Where ``journal_ingest_tool`` stages full entry bodies (the ledger key root)."""
 
-_JOURNAL_SECRET = "synthetic-intimate-secret-845"
+_JOURNAL_PRIVATE_MARKER = "synthetic-intimate-private-marker-845"
 """Synthetic marker standing in for intimate body content — never real data."""
 
 
@@ -1153,7 +1154,7 @@ def _write_journal_fragment_with_staged(
     fragment lands under ``01-Fragments/Journal/`` with frontmatter
     ``source.origin_key`` naming the staged full-body markdown file
     under ``00-Creek-Meta/adepthood/journal/``. The staged body carries
-    :data:`_JOURNAL_SECRET` so tests can assert the plaintext is really
+    :data:`_JOURNAL_PRIVATE_MARKER` so tests can assert the plaintext is really
     gone from the vault after a purge.
 
     Args:
@@ -1174,7 +1175,7 @@ def _write_journal_fragment_with_staged(
     if write_staged:
         staged_path.parent.mkdir(parents=True, exist_ok=True)
         staged_post = frontmatter.Post(
-            content=f"The full journal body. {_JOURNAL_SECRET}\n",
+            content=f"The full journal body. {_JOURNAL_PRIVATE_MARKER}\n",
             privacy_tier="intimate",
             source_id=title,
         )
@@ -1204,7 +1205,7 @@ def _vault_files_containing_secret(vault: Path) -> list[Path]:
     """Return every vault markdown file whose text still carries the secret.
 
     Walks the whole vault (not just ``01-Fragments``) because the RTBF
-    contract is vault-wide: after a purge, :data:`_JOURNAL_SECRET` must
+    contract is vault-wide: after a purge, :data:`_JOURNAL_PRIVATE_MARKER` must
     appear in **no** file anywhere under the vault root.
 
     Args:
@@ -1216,7 +1217,7 @@ def _vault_files_containing_secret(vault: Path) -> list[Path]:
     return [
         md_file
         for md_file in sorted(vault.rglob("*.md"))
-        if _JOURNAL_SECRET in md_file.read_text(encoding="utf-8")
+        if _JOURNAL_PRIVATE_MARKER in md_file.read_text(encoding="utf-8")
     ]
 
 
@@ -1333,7 +1334,7 @@ def test_journal_staged_pointer_outside_vault_skipped(tmp_path: Path) -> None:
     assert result_out.journal_staged_removed == 0
     assert not frag_out.exists()
     assert outside.exists()
-    assert _JOURNAL_SECRET in outside.read_text(encoding="utf-8")
+    assert _JOURNAL_PRIVATE_MARKER in outside.read_text(encoding="utf-8")
 
     # Variant 2: the pointer stays inside the vault but outside the
     # staging dir (staging-dir scope guard).
@@ -1349,7 +1350,7 @@ def test_journal_staged_pointer_outside_vault_skipped(tmp_path: Path) -> None:
     assert result_in.journal_staged_removed == 0
     assert not frag_in.exists()
     assert decoy.exists()
-    assert _JOURNAL_SECRET in decoy.read_text(encoding="utf-8")
+    assert _JOURNAL_PRIVATE_MARKER in decoy.read_text(encoding="utf-8")
 
 
 def test_journal_purge_audit_records_count(tmp_path: Path) -> None:
@@ -4265,7 +4266,9 @@ def test_source_purge_deletes_fragment_with_undecodable_body(
     assert result.fragments_affected == 1
     assert not frag.exists()
     # The RTBF core: the private body survives NOWHERE under the vault.
-    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+    assert (
+        _vault_files_containing_bytes(vault, _UNDECODABLE_PRIVATE_MARKER.encode()) == []
+    )
 
 
 def test_source_purge_audit_records_the_undecodable_deletion(
@@ -4312,7 +4315,9 @@ def test_fragment_purge_finds_fragment_with_undecodable_body(
 
     assert result.fragments_affected == 1
     assert not frag.exists()
-    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+    assert (
+        _vault_files_containing_bytes(vault, _UNDECODABLE_PRIVATE_MARKER.encode()) == []
+    )
 
 
 def test_source_path_purge_deletes_fragment_with_undecodable_body(
@@ -4332,7 +4337,9 @@ def test_source_path_purge_deletes_fragment_with_undecodable_body(
 
     assert result.fragments_affected == 1
     assert not frag.exists()
-    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+    assert (
+        _vault_files_containing_bytes(vault, _UNDECODABLE_PRIVATE_MARKER.encode()) == []
+    )
 
 
 def test_daterange_purge_deletes_fragment_with_undecodable_body(
@@ -4356,7 +4363,9 @@ def test_daterange_purge_deletes_fragment_with_undecodable_body(
 
     assert result.fragments_affected == 1
     assert not frag.exists()
-    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+    assert (
+        _vault_files_containing_bytes(vault, _UNDECODABLE_PRIVATE_MARKER.encode()) == []
+    )
 
 
 def test_source_purge_leaves_undecodable_nonmatching_fragment_intact(
@@ -4584,7 +4593,9 @@ def test_source_purge_survives_two_undecodable_matching_fragments(
     assert result.fragments_affected == 2
     assert not first.exists()
     assert not second.exists()
-    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+    assert (
+        _vault_files_containing_bytes(vault, _UNDECODABLE_PRIVATE_MARKER.encode()) == []
+    )
     outcome = PurgeAuditLog(vault).read()[-1]
     assert outcome.status == "complete"
     assert outcome.fragments_deleted == 2
@@ -5078,7 +5089,7 @@ def test_the_deleted_files_table_is_capped_and_says_how_many_it_hid(
 # Ingest-ledger erasure and the deny-by-default 00-Creek-Meta sweep (#1453)
 # ---------------------------------------------------------------------------
 
-_LEDGER_HASH = "e29568dd0772c2a8ac12fc4a677d3b6a678baa35f8b17fe0f7c76b59dacd3335"
+_LEDGER_HASH = sha256(b"synthetic ledger fixture").hexdigest()
 """A full unsalted SHA-256, the shape the ledger really stores."""
 
 
@@ -5349,6 +5360,8 @@ _KEPT_META_RELPATHS: tuple[str, ...] = (
     "audit/privacy.jsonl",
     "audit/redact.jsonl",
     "audit/mcp.jsonl",
+    "locks/content-mutations.lock",
+    "locks/embeddings.lock",
 )
 """Every ``00-Creek-Meta/`` artifact a vault purge must preserve."""
 
@@ -5390,7 +5403,8 @@ def test_vault_purge_sweeps_every_unkept_meta_artifact(tmp_path: Path) -> None:
     tells you nothing about the twenty-first artifact somebody adds next
     month, and a keep-list that quietly grows is how a leak reopens.
 
-    Everything that survives is a compliance record or the vault marker.
+    Everything that survives is a compliance record, the vault marker, or
+    an empty coordination inode that must remain stable while held.
     Nothing survives merely because it looked harmless — the ``creek
     init`` scaffold is swept too, because ``Skills/`` is the directory
     operators drop their own skill files into.

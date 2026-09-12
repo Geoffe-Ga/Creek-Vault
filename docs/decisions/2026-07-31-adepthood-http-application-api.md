@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.15.0`
+- **Contract version**: `0.16.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -39,7 +39,7 @@ remote tier ceiling in order to demo a capability early — see
 ## Versioning
 
 `/v1` in the route path is the HTTP major. Below that, exactly one
-`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.15.0`
+`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.16.0`
 — covers both the MCP surface and `/v1`, because the epic's premise is one
 behavioral implementation: a shape change in a shared `creek_mcp.tools.*`
 function changes what both adapters can honestly promise at the same moment.
@@ -220,6 +220,7 @@ every content route refuses an undeclared minor anyway.
 | `drive-connector` | `0.9` |
 | `pipeline` | `0.10` |
 | `voice-drafts` | `0.15` |
+| `journal-withdraw` | `0.16` |
 <!-- /capability-set -->
 
 **The build-out divergence is closed (#1112).** While epic #1071 was being
@@ -231,8 +232,8 @@ completed steady state, because re-publishing and re-hashing a consumer-pinned
 artifact four times inside one epic would have trained that consumer to re-pin
 without reading. **#1077 and epic #1071 are both closed**, so there is no gap
 left: `IMPLEMENTED_CAPABILITIES` is `frozenset(Capability)`, the fixture lists
-the same six, and a live response over a vault declaring the current minor
-returns the same six. `tests/test_v1_api_capabilities.py` asserts those three
+the same nine, and a live response over a vault declaring the current minor
+returns the same nine. `tests/test_v1_api_capabilities.py` asserts those three
 and the enum as **one four-way equality**, which is what replaced the old test
 that existed to record the divergence.
 
@@ -289,6 +290,50 @@ members (`open`, `personal` — `intimate` is not a constructible value; see
 caller's own malformed payload, which discloses nothing about the vault —
 not `403`, which this contract reserves for a statement about a vault
 object.
+
+## Journal withdrawal
+
+`DELETE /v1/journal-entries/{external_id}` is Journal upsert's destructive,
+idempotent inverse (#1799). The path carries the same caller-owned idempotency
+key; the request has no body and never retransmits entry prose. In addition to
+the bearer and negotiated `0.16` contract minor, this route requires an
+explicit `X-Creek-Tier-Ceiling` header. It does not inherit the middleware's
+default ceiling for a destructive action.
+
+Journal storage is scoped to the authenticated consumer before the external
+id is hashed. One consumer's matching id therefore cannot name, inspect, or
+withdraw another consumer's source. Foreign, unknown, already-withdrawn, and
+never-present resources all return the same closed success body:
+`{status: "ok", tier_ceiling, action: "withdrawn"}`. There is no
+object-state `privacy_refused` response because adding one would turn the
+route into an ownership and existence oracle. A single configured consumer
+may withdraw the pre-`0.16` unscoped layout for migration; a multi-consumer
+server never guesses who owns legacy data.
+
+Withdrawal and upsert share one cross-process mutation lock. The handler
+discovers every fragment whose source origin belongs to that Journal entry,
+dry-runs the existing `PurgeEngine` over the complete set, and only then
+applies removal. A durable recovery marker contains fragment identifiers and
+scope digests but no external id or prose, so a retry after interruption can
+finish without caller content appearing in metadata. Success is emitted only
+after staged source, fragments, ingest-ledger membership, fragment-index
+mappings, references, and retrieval-facing derived artifacts have been
+verified absent. Fragment indexes are compacted through `VaultWriter`'s locked,
+concurrent-safe maintenance primitive. A cached reader records the parsed
+index file's device/inode generation and reloads after atomic replacement, so
+even an old cursor aligned at a new record boundary cannot skip an unrelated
+live mapping. Cache save, purge, and membership verification share a separate
+cross-process mutation lock. The operational provenance log remains
+append-only: withdrawal appends a content-free terminal event for each
+fragment id, with `type: "withdrawal"` and no path, external id, or prose,
+before the final cache check. A linker holding a pre-withdraw snapshot consults
+that latest event under the cache lock and drops the tombstoned row; a later
+journal write clears the tombstone naturally. A missing index compaction or
+provenance tombstone, surviving cache row, or unreadable cache is incomplete
+work: the recovery marker remains and the handler returns `503
+temporarily_unavailable`, allowing the identical `DELETE` to finish it on
+retry. The same retryable response covers a partial, busy, or otherwise
+unverifiable purge.
 
 ## Voice Drafts
 
@@ -709,7 +754,8 @@ network MCP call. It is out of scope for #1117 and is tracked as follow-up
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
 truth for the wire shapes in this repository:
 `manifest.json`, `retry-policy.json`, one `schemas/*.schema.json` file per
-`CONTRACT_MODELS` entry (thirty-seven at contract `0.15.0`, adding the five
+`CONTRACT_MODELS` entry (thirty-eight at contract `0.16.0`, adding the closed
+Journal withdrawal response; thirty-seven at contract `0.15.0`, adding the five
 Voice Draft request/response and attribution models; thirty-two at contract `0.14.0`, adding
 `JobAcceptedResponse` and `JobStatusResponse`; thirty at contract `0.12.0`, unchanged since
 `0.11.0` because #1292 moves no `/v1` shape — twenty-seven at
@@ -718,8 +764,8 @@ Voice Draft request/response and attribution models; thirty-two at contract `0.1
 and the three `Drive*Response` models from #1527 — plus
 `ClassificationRequest`/`ClassificationResponse` and `LinkRequest`/`LinkResponse`
 from #1570 — plus `DriveAuthorizationRequest`, `DriveAuthorizationResponse` and
-`DriveAuthorizationExchangeRequest` from #1568), and fifty-six
-`examples/<capability>/<state>.json` fixtures (eight capabilities × seven
+`DriveAuthorizationExchangeRequest` from #1568), and sixty-three
+`examples/<capability>/<state>.json` fixtures (nine capabilities × seven
 states). Everything in the directory except its own `README.md` is
 **generated** by `build_bundle()`
 ([`creek_mcp/api/bundle.py`](../../creek-tools/creek_mcp/api/bundle.py)), and
@@ -743,11 +789,12 @@ as a GitHub Release asset — alongside the existing rolling `knowledge-graph`
 release — is the natural upgrade path and is **explicitly not done here**:
 no subtree, no submodule, no package.
 
-**The three `NotApplicableExample` cells.** Care escalation is structurally
-unreachable for `capabilities`, `journal-upsert`, and `wheel`: the
-acute-distress guard runs only inside `reflect_tool`. Fabricating a
-care-escalation response for those three cells would publish a response
-shape the server can never actually emit; omitting the cells would break the
+**The nine `NotApplicableExample` cells.** Care escalation is structurally
+unreachable for every capability except `reflections`: the acute-distress
+guard runs only inside `reflect_tool`. Journal withdrawal's `refusal` cell is
+also unreachable because foreign and absent resources deliberately collapse
+to the same successful withdrawal. Fabricating any of those nine responses
+would publish a shape the server can never actually emit; omitting the cells would break the
 matrix's rectangularity, and a hole in a matrix reads as "not documented
 yet" rather than "cannot happen" — exactly the distinction a cross-repo
 consumer needs to be able to draw. Each unreachable cell is filled with an
@@ -837,6 +884,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.16.0` | 2026-09-11 | #1799 publishes the **ninth capability**, `journal-withdraw`, as `DELETE /v1/journal-entries/{external_id}`. The consumer-scoped, body-free operation removes a Journal source and all of its fragments, ledger/index/provenance references, and retrieval-facing derived state. It shares the upsert mutation lock, persists only content-free recovery state, and refuses to report success until absence is verified; partial work is a retryable `503`. Foreign, unknown, already-withdrawn, and never-present identifiers are identical `200` successes, preventing an ownership oracle. One closed response model joins the bundle, `0.15` stays served without seeing or reaching the route, and the OpenAPI golden advances deliberately. |
 | `0.15.0` | 2026-09-06 | #1727 publishes the **eighth capability**, `voice-drafts`, as `PUT`, `GET`, and `DELETE /v1/voice-drafts/{external_id}`. The caller owns the idempotency key; Creek hashes it into a deterministic filename and stable fragment id, so the same id creates once and then updates or returns unchanged without duplicating the document. The stored fragment is structurally outside owner voice: it lives under `11-Other-Authors/ai-as-user`, carries `source.author=ai`, `source.author_slug=ai-as-user`, and `voice_weight=0.0`, and the wire attribution model admits no other values. Reads and mutations enforce the canonical tier ceiling; the existing-tier admission check happens while the storage lock is held, so an open caller cannot race or overwrite a personal draft. Missing, corrupt, deleted, and above-ceiling slots collapse to the same refusal. `DELETE` supports Adepthood's required retraction when a source entry later becomes intimate, without intimate text crossing the network. The route set adds three operations and five closed models; no error code or status is added. `CAPABILITY_SINCE_MINOR` both withholds and refuses the resource for `0.14` clients, whose known routes remain byte-identical, so `SUPPORTED_CONTRACT_MINORS` widens to retain `0.14`. The generated bundle adds five schemas and seven content-free `voice-drafts` examples, and the OpenAPI golden advances deliberately. |
 | `0.14.0` | 2026-09-05 | #1605 closes the long-running pipeline gap with a durable job surface. `POST /v1/classifications` now admits `method=llm`, and `POST /v1/links` admits `method=embeddings`; both persist a consumer-bound record before returning `202` with an opaque UUID. `GET /v1/jobs/{job_id}` returns only `{status, job_id, state, result}` where state is one of `queued`, `running`, `succeeded`, or `failed`, and `result` is either null or the existing counts-only classification/link model. No fragment id, path, title, prose, or tool error is published. Another authenticated consumer and an unknown id collapse to the same `unavailable` response. An active record belonging to an earlier server instance becomes `failed` after restart rather than remaining live forever. Admission permits one active detached pipeline job per authenticated consumer; another long-method request receives static `unavailable` until the worker finishes, bounding the otherwise-cheap `202` fan-out. The event loop alone mutates the admission sets, and status workers receive immutable snapshots. Existing `rules`, `temporal`, `eddies`, and `threads` calls retain their byte-identical synchronous `200` bodies. The worker deliberately reuses `classify_tool` / `link_tool`; in particular, LLM jobs still traverse `ModelRouter._enforce_local_for_intimate`, and the HTTP test observes an intimate fragment reach only the local provider under a cloud classification config. This adds one route, two enum members, `202`, and two wire models, so the shared minor advances and `SUPPORTED_CONTRACT_MINORS` widens to retain `0.13`. The generated fixture bundle gains the two schemas and republishes its version-bearing capability examples and manifest; `openapi.json` remains generated on demand for the standing contract-event reason. |
 | *(no contract change)* | 2026-08-21 | **Documentation corrections (#1111/#1112/#1150).** No route, shape, status, error code or version moved. Three things were written down. **#1150:** row (c) of the capabilities state table said `vault.available` was `—`; the probe runs unconditionally and `_render` emits `VaultState(available=…)` at every status, so an `incompatible` body always carries a real boolean — the table now says so in both this document and `docs/api.md`, and a test asserts the two cells are identical. Whether the probe *should* run at that status is left open — as open question 6 of the [sibling ADR](./2026-06-30-adepthood-creek-mcp-contract.md#open-questions-resolve-before-accepted), not on #1150, whose requested correction this row delivers, and not on #1148, which owned the reordering and is closed. **#1112:** the recorded fixture-vs-server divergence is closed — #1077 and epic #1071 shipped, so the committed fixture, `IMPLEMENTED_CAPABILITIES`, the `Capability` enum and a live response are now asserted as one four-way equality, and the capability list is machine-checked against the enum from both documents. **#1111:** the OpenAPI document stays generated-on-demand and out of `build_bundle()`, because committing it would rewrite the consumer-pinned `manifest.json` — a contract event, not a docs change. The revisit trigger now lives in [The OpenAPI document is deliberately not in the bundle](#the-openapi-document-is-deliberately-not-in-the-bundle-1111-2026-08-21) rather than in an issue nobody reads at bump time. |

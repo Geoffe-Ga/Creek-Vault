@@ -118,16 +118,22 @@ leak surface, to guard against a write this gate now refuses.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import frontmatter
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.classify.privacy_filter import max_source_tier, source_tiers
 from creek.ingest.journal_staging import JOURNAL_STAGING_RELDIR
 from creek.ingest.markdown import MarkdownIngestor
 from creek.ingest.pipeline import derive_source_key, ledger_for_source, run_ingest
 from creek.models import PrivacyTier
+from creek.vault.mutations import (
+    CONTENT_MUTATION_LOCK_RELPATH,
+    content_mutation_lock_path,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.read_gate import refuse_above_ceiling
 from creek_mcp.staged_names import safe_stem
@@ -156,29 +162,58 @@ _JOURNAL_INBOX = JOURNAL_STAGING_RELDIR
 # Where JOURNAL-platform fragments are routed by the writer — recorded as the
 # audit ``created_path`` (mirrors ingest_tool's dir-level created_path).
 _FRAGMENT_ROUTING_DIR = Path("01-Fragments/Journal")
+JOURNAL_MUTATION_LOCK_RELPATH = CONTENT_MUTATION_LOCK_RELPATH
+"""Backward-compatible name for the shared vault-content lock path."""
 # The staged-name derivation now lives in creek_mcp.staged_names so this tool
 # and ``creek.upload`` cannot compute two different stems for one external id
 # (#1023). Aliased so the rest of the module reads unchanged.
 _safe_stem = safe_stem
 
 
-def _staged_path(vault_path: Path, external_id: str) -> Path:
-    """Return the stable staged markdown path *external_id* maps to.
+def _scope_component(consumer: str) -> str:
+    """Return a fixed, non-identifying directory component for *consumer*."""
+    return sha256(consumer.encode("utf-8")).hexdigest()
 
-    Pure — it computes, and never creates. Split out of :func:`_stage_entry`
-    (#970) because the overwrite gate has to derive the ledger source key
-    *before* deciding whether the caller may write anything at all, and a
-    "compute the path" helper that also writes the file would make that
-    ordering impossible to express.
+
+def journal_staged_path(
+    vault_path: Path,
+    external_id: str,
+    *,
+    consumer_scope: str | None = None,
+) -> Path:
+    """Return the stable staged path for one optionally scoped identity.
+
+    Contract 0.16 scopes network journal identities by the authenticated
+    consumer so equal external-id text from two consumers cannot collide. The
+    consumer name itself is hashed rather than copied into a vault path. A
+    ``None`` scope preserves the pre-0.16 and local-MCP location.
     """
-    return vault_path / _JOURNAL_INBOX / f"{_safe_stem(external_id)}.md"
+    inbox = vault_path / _JOURNAL_INBOX
+    if consumer_scope is not None:
+        inbox /= _scope_component(consumer_scope)
+    return inbox / f"{_safe_stem(external_id)}.md"
+
+
+def journal_mutation_lock_path(vault_path: Path) -> Path:
+    """Return the lock shared by journal and downstream content writers."""
+    return content_mutation_lock_path(vault_path)
 
 
 def _stage_entry(
-    vault_path: Path, external_id: str, content: str, timestamp: str, tier: PrivacyTier
+    vault_path: Path,
+    external_id: str,
+    content: str,
+    timestamp: str,
+    tier: PrivacyTier,
+    *,
+    consumer_scope: str | None = None,
 ) -> Path:
     """Write the entry to its stable staged markdown path and return it."""
-    staged = _staged_path(vault_path, external_id)
+    staged = journal_staged_path(
+        vault_path,
+        external_id,
+        consumer_scope=consumer_scope,
+    )
     staged.parent.mkdir(parents=True, exist_ok=True)
     post = frontmatter.Post(
         content,
@@ -230,7 +265,11 @@ def _existing_tier(vault_path: Path, fragment_id: str) -> PrivacyTier:
 
 
 def _refuse_unadmitted_overwrite(
-    vault_path: Path, external_id: str, ceiling: TierCeiling
+    vault_path: Path,
+    external_id: str,
+    ceiling: TierCeiling,
+    *,
+    consumer_scope: str | None = None,
 ) -> dict[str, Any] | None:
     """Refuse an update that would destroy content *ceiling* cannot read (#970).
 
@@ -254,7 +293,11 @@ def _refuse_unadmitted_overwrite(
         working at every ceiling. Otherwise the canonical four-key refusal,
         which names neither the resolved fragment nor its tier.
     """
-    staged = _staged_path(vault_path, external_id)
+    staged = journal_staged_path(
+        vault_path,
+        external_id,
+        consumer_scope=consumer_scope,
+    )
     existing_id = _resolve_fragment_id(vault_path, staged)
     existing = None if existing_id is None else _existing_tier(vault_path, existing_id)
     return refuse_above_ceiling(
@@ -330,63 +373,45 @@ def _action_of(result: IngestRunResult) -> str:
     return "unchanged"
 
 
-def journal_ingest_tool(
+def _selected_storage_scope(
+    vault_path: Path,
+    external_id: str,
+    storage_scope: str | None,
+    *,
+    allow_legacy: bool,
+) -> str | None:
+    """Choose a scoped path or an unambiguous pre-0.16 legacy path.
+
+    Called only while :func:`journal_mutation_lock_path` is held, so a
+    concurrent withdrawal cannot remove the legacy source between this check
+    and the ingest runner opening it.
+    """
+    if storage_scope is None or not allow_legacy:
+        return storage_scope
+    if journal_staged_path(vault_path, external_id).exists():
+        return None
+    return storage_scope
+
+
+def _ingest_validated_entry(
     *,
     vault_path: Path,
     content: str,
     external_id: str,
-    timestamp: str | None = None,
-    tier: str | None = None,
-    privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
-    consumer: str = "unknown",
-    run: _Runner | None = None,
+    timestamp: str | None,
+    tier: str | None,
+    entry_tier: PrivacyTier,
+    privacy_tier_ceiling: TierCeiling,
+    consumer: str,
+    run: _Runner | None,
+    consumer_scope: str | None,
 ) -> dict[str, Any]:
-    """Ingest one Adepthood journal entry as a vault fragment (idempotently).
-
-    Args:
-        vault_path: Vault root.
-        content: The journal entry body.
-        external_id: The Adepthood-side stable id — the idempotency key. The same
-            id updates in place; a new id creates a new fragment.
-        timestamp: ISO-8601 entry time; defaults to now (UTC) when absent.
-        tier: The entry's privacy tier (``open``/``personal``/``intimate``).
-            **Required**: it has no default, and omitting it is refused rather
-            than filled in as ``open`` (#1494). Only the caller knows what the
-            entry was derived from, so a default here filed intimate-derived
-            journal content in the clear.
-        privacy_tier_ceiling: The caller's admission ceiling — an entry whose
-            tier exceeds it is refused, not downgraded, and so is an update
-            that would overwrite a fragment the ceiling could not read.
-        consumer: Free-form consumer id for the audit log.
-        run: Ingest-runner seam; production passes ``None`` and gets
-            :func:`creek.ingest.pipeline.run_ingest`.
-
-    Returns:
-        ``{status, tool, tier_ceiling, external_id, fragment_id, action, tier,
-        warnings}`` on success (``action`` ∈
-        ``created``/``updated``/``unchanged``; ``warnings`` is the run's
-        content-free advisory channel, an empty list when the run was quiet),
-        or a structured refusal — the canonical four-key one carrying
-        :data:`~creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`, naming
-        neither the protected fragment nor its tier, when the overwrite gate
-        fires (#970).
-    """
-    entry_tier = _validated_entry_tier(
-        content=content,
-        external_id=external_id,
-        tier=tier,
-        ceiling=privacy_tier_ceiling,
-    )
-    # A non-tier answer is the refusal a malformed call earned; from here down
-    # ``entry_tier`` is narrowed to the parsed tier.
-    if not isinstance(entry_tier, PrivacyTier):
-        return entry_tier
-
-    audit_args = {"external_id": external_id[:64], "tier": tier}
-    # Gate 1 — the INCOMING tier. Deliberately kept on write_tier_allowed
-    # rather than folded into the read primitive below, so ``grep
-    # write_tier_allowed`` still enumerates every write-side create gate on
-    # the surface (compile's argument).
+    """Run both admission gates and the ingest while the mutation lock is held."""
+    audit_args = {
+        "has_external_id": True,
+        "body_len": len(content),
+        "tier": tier,
+    }
     if not write_tier_allowed(entry_tier, privacy_tier_ceiling):
         MCPAuditLog(vault_path).append(
             tool=TOOL_NAME,
@@ -400,20 +425,13 @@ def journal_ingest_tool(
             reason=f"entry tier {entry_tier.value} exceeds the ceiling",
         )
 
-    # Gate 2 — the tier of what an update would DESTROY (#970). It sits above
-    # the staging write below it, so a refusal leaves the staged entry intact
-    # as well as the fragment; _stage_entry used to run before all of this.
-    # The refusal audit carries the caller's own arguments and nothing else:
-    # no created_tier, no affected_fragment_ids, no created_path. The resolved
-    # fragment id and the protected tier must not enter the trail, which is
-    # served onward through other surfaces — read_gate's rule 1 is "never the
-    # probed target id and never the outcome", and that binds these bytes
-    # exactly as it binds the response.
-    if (
-        refusal := _refuse_unadmitted_overwrite(
-            vault_path, external_id, privacy_tier_ceiling
-        )
-    ) is not None:
+    refusal = _refuse_unadmitted_overwrite(
+        vault_path,
+        external_id,
+        privacy_tier_ceiling,
+        consumer_scope=consumer_scope,
+    )
+    if refusal is not None:
         MCPAuditLog(vault_path).append(
             tool=TOOL_NAME,
             args=audit_args,
@@ -428,6 +446,7 @@ def journal_ingest_tool(
         content,
         timestamp or datetime.now(UTC).isoformat(),
         entry_tier,
+        consumer_scope=consumer_scope,
     )
     runner = run if run is not None else run_ingest
     try:
@@ -439,11 +458,11 @@ def journal_ingest_tool(
         )
     except FileNotFoundError:
         return refusal_response(
-            tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason="vault unavailable"
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason="vault unavailable",
         )
     if result.errors:
-        # Content was staged and tier-allowed but the write failed — audit the
-        # attempt (with its tier) so the failure leaves a trace, like ingest_tool.
         MCPAuditLog(vault_path).append(
             tool=TOOL_NAME,
             args=audit_args,
@@ -475,10 +494,91 @@ def journal_ingest_tool(
         "fragment_id": fragment_id,
         "action": _action_of(result),
         "tier": entry_tier.value,
-        # ``ceiling_safe_warnings``, never ``warnings``: it is the only ingest
-        # advisory channel that may cross this boundary, because the operator
-        # channel interpolates real vault fragment ids this caller's ceiling
-        # may not admit. See the ``warn`` doctrine in creek/ingest/pipeline.py
-        # for why that call is made at the producer (#1372).
         "warnings": list(result.ceiling_safe_warnings),
     }
+
+
+def journal_ingest_tool(
+    *,
+    vault_path: Path,
+    content: str,
+    external_id: str,
+    timestamp: str | None = None,
+    tier: str | None = None,
+    privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    consumer: str = "unknown",
+    run: _Runner | None = None,
+    storage_scope: str | None = None,
+    allow_legacy: bool = False,
+) -> dict[str, Any]:
+    """Ingest one Adepthood journal entry as a vault fragment (idempotently).
+
+    Args:
+        vault_path: Vault root.
+        content: The journal entry body.
+        external_id: The Adepthood-side stable id — the idempotency key. The same
+            id updates in place; a new id creates a new fragment.
+        timestamp: ISO-8601 entry time; defaults to now (UTC) when absent.
+        tier: The entry's privacy tier (``open``/``personal``/``intimate``).
+            **Required**: it has no default, and omitting it is refused rather
+            than filled in as ``open`` (#1494). Only the caller knows what the
+            entry was derived from, so a default here filed intimate-derived
+            journal content in the clear.
+        privacy_tier_ceiling: The caller's admission ceiling — an entry whose
+            tier exceeds it is refused, not downgraded, and so is an update
+            that would overwrite a fragment the ceiling could not read.
+        consumer: Free-form consumer id for the audit log.
+        run: Ingest-runner seam; production passes ``None`` and gets
+            :func:`creek.ingest.pipeline.run_ingest`.
+        storage_scope: Authenticated consumer identity used only to namespace
+            network staging. ``None`` preserves the local MCP path.
+        allow_legacy: Reuse a pre-0.16 unscoped path when the HTTP adapter has
+            proved the configured consumer is its only possible owner.
+
+    Returns:
+        ``{status, tool, tier_ceiling, external_id, fragment_id, action, tier,
+        warnings}`` on success (``action`` ∈
+        ``created``/``updated``/``unchanged``; ``warnings`` is the run's
+        content-free advisory channel, an empty list when the run was quiet),
+        or a structured refusal — the canonical four-key one carrying
+        :data:`~creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`, naming
+        neither the protected fragment nor its tier, when the overwrite gate
+        fires (#970).
+    """
+    entry_tier = _validated_entry_tier(
+        content=content,
+        external_id=external_id,
+        tier=tier,
+        ceiling=privacy_tier_ceiling,
+    )
+    # A non-tier answer is the refusal a malformed call earned; from here down
+    # ``entry_tier`` is narrowed to the parsed tier.
+    if not isinstance(entry_tier, PrivacyTier):
+        return entry_tier
+
+    try:
+        with vault_lock(journal_mutation_lock_path(vault_path)):
+            selected_scope = _selected_storage_scope(
+                vault_path,
+                external_id,
+                storage_scope,
+                allow_legacy=allow_legacy,
+            )
+            return _ingest_validated_entry(
+                vault_path=vault_path,
+                content=content,
+                external_id=external_id,
+                timestamp=timestamp,
+                tier=tier,
+                entry_tier=entry_tier,
+                privacy_tier_ceiling=privacy_tier_ceiling,
+                consumer=consumer,
+                run=run,
+                consumer_scope=selected_scope,
+            )
+    except VaultLockTimeoutError:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason="journal mutation busy",
+        )

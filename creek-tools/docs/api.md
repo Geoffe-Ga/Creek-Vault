@@ -22,6 +22,7 @@ does and does not yet do.
 | `GET /v1/capabilities` | **Implemented.** Real handshake — versions, vault readiness, tier model, capability list. |
 | `GET /v1/health` | **Implemented.** Readiness only. Not part of the published contract. |
 | `PUT /v1/journal-entries/{external_id}` | **Implemented.** Idempotent journal write over the shared `creek.journal` tool — same tier gates, same audit records, same fragment identity as MCP (#1075). |
+| `DELETE /v1/journal-entries/{external_id}` | **Implemented.** Consumer-scoped, idempotent journal withdrawal. It accepts no body and returns only `{status, tier_ceiling, action}`. A complete `200` means the staged source, fragment, ledger rows, persistent fragment-index mapping, references, voice artifacts, and embedding-cache membership are gone and each removed fragment's latest operational-provenance event is a content-free `withdrawal` tombstone. A shortfall is retryable `503`, never a false success. Equal external-id text from two authenticated consumers names two independent entries, and a foreign id is indistinguishable from an absent one. Single-consumer deployments can erase pre-`0.16` unscoped entries without migrating plaintext. Published at contract `0.16.0` (#1799). |
 | `POST /v1/reflections` | **Implemented.** Anchored margin notes over the shared `creek.reflect` tool. `ok` / `empty` / `escalate` / every refusal are distinguishable from a closed `status` or `code` enum — **no client needs to parse prose to branch**. `notes[].quote` is the only verbatim-guaranteed field: each is validated as a whitespace-normalised span of the submitted or referenced entry, and a span that is not is dropped rather than returned. `essay` is free model prose and is **never** grounding-checked, which is what `essay_grounded: false` (always present, always `false`) tells you — a client must not present it as the writer's own words. A care-flagged entry returns `status: "escalate"` at HTTP **200** with the full `care_signal`, and the model is never called; an escalation is not an error, because a person in acute distress must not land in a client's error path. An `entry_ref` that is above your ceiling and one that does not resolve are **deliberately indistinguishable** — both are `403 privacy_refused` with the same message, because a caller who could tell them apart could enumerate the corpus (#1077). **Grounding is a local embedding pass, and on a cold cache it costs.** Retrieval ranks the ceiling-admitted corpus against your entry, and a fragment whose vector is not in the embeddings parquet is embedded live by a *local* sentence-transformer — so the first call against a vault that has never run `creek link --method embeddings` does real work before answering. Two things bound it, neither of which existed before #1034: the retrieval specialist (its loaded model and the parquet it read) is built **once per process** rather than once per call, and the live embeds one call may perform are **capped**, with the fragments over the cap dropped from ranking rather than embedded. A dropped fragment contributes nothing — no title, no id, no body — so a cold vault answers with *less* grounding, never with content you are not admitted to. Filling the cache with `creek link --method embeddings` is still the way to ground a large vault fully. |
 | `POST /v1/uploads` | **Implemented.** Idempotent **document** upload over the shared `creek.upload` tool — JSON + base64, never multipart. Body is `{filename, content_base64, external_id, timestamp?, tier}`; the extension of `filename` picks the ingestor and there is deliberately **no `source_type` override** (naming a directory-only ingestor for one file is a silent no-op; whole-archive upload is #1525). `external_id` is the idempotency key: re-sending it updates in place and never mints a second fragment. The response publishes **no `tier`**, on purpose — classification is escalate-only, so a `.md` declaring `intimate` in its own frontmatter lands at `intimate` however modest a tier you declared, and a field claiming the resulting tier could only be false or an oracle. A format Creek must not flatten into one blob (`.json`, `.zip`, `.doc`, …) is `415 unsupported_source` carrying the remedy, never a `500` and never a fragment (#1526). Published at contract `0.8.0` (#1524). |
 | `PUT /v1/voice-drafts/{external_id}` | **Implemented.** Idempotently store one AI-authored Voice Draft under a caller-owned key. The deterministic fragment lives under `11-Other-Authors/ai-as-user` with `author=ai`, `author_slug=ai-as-user`, and `voice_weight=0.0`; those values are fixed literals in the response schema, not caller claims. Both incoming and existing tiers are admitted under the canonical ceiling while the mutation lock is held. Published at contract `0.15.0` (#1727). |
@@ -69,13 +70,14 @@ list of names:
 | `drive-connector` | `0.9` |
 | `pipeline` | `0.10` |
 | `voice-drafts` | `0.15` |
+| `journal-withdraw` | `0.16` |
 <!-- /capability-set -->
 
 **The advertised list is caller-dependent, and the count above is the ceiling,
 not the answer.** What a given caller is shown is the intersection of that set
 with what its *declared* contract minor published, off `CAPABILITY_SINCE_MINOR`
 in `creek_mcp/api/models.py`: a caller declaring `0.2` is shown the first four,
-one declaring `0.15` — or declaring no minor at all — is shown all eight. The
+one declaring `0.16` — or declaring no minor at all — is shown all nine. The
 route that serves a withheld capability refuses the same caller off the same
 table, so what is hidden here is unreachable there.
 
@@ -84,7 +86,7 @@ single constant, `IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so
 they cannot disagree. The table above is machine-checked against the enum by
 `tests/test_v1_api_capabilities.py`, along with the committed
 `docs/contracts/adepthood-v1/examples/capabilities/success.json` fixture and a
-live response — one four-way equality, so an eighth capability cannot be added
+live response — one four-way equality, so a ninth capability cannot be added
 without this page moving with it.
 
 > **On the issue's `not_implemented` spelling.** Issue #1074 was written before
@@ -323,7 +325,7 @@ could put on any wire position that names it.
 `/v1` is the HTTP major. Below it, one `contract_version` covers both this
 surface and MCP.
 
-The fifteen capability routes — `PUT /v1/journal-entries/{external_id}`,
+The sixteen capability routes — `PUT` and `DELETE /v1/journal-entries/{external_id}`,
 `POST /v1/reflections`, `GET /v1/wheel`, `POST /v1/uploads`, the five
 `/v1/connectors/drive` verbs, `POST /v1/classifications`, `POST /v1/links`, and
 `GET /v1/jobs/{job_id}`, plus the three verbs on
@@ -334,7 +336,7 @@ header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.15`, `0.14`, `0.13`, `0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and
+`0.16`, `0.15`, `0.14`, `0.13`, `0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and
 `0.2`. The
 `0.3.0`, `0.4.0` and `0.6.0` moves all
 came from the MCP surface and changed no `/v1` shape — `0.3.0` added
@@ -436,6 +438,38 @@ intimate. Every stored fragment is fixed to AI authorship in
 `11-Other-Authors/ai-as-user` with zero voice weight. A `0.14` consumer knows
 none of the three routes or five models, so the capability gate withholds and
 refuses them while every older route remains byte-identical.
+
+`0.16.0` (#1799) adds `journal-withdraw` and `DELETE
+/v1/journal-entries/{external_id}`. Network journal writes are now namespaced
+by the authenticated consumer, while a single-consumer deployment can still
+address its pre-0.16 unscoped entries. Withdrawal takes no body, never echoes
+the id, and treats absent, already-withdrawn, and foreign-owned ids alike. It
+uses the purge engine under the same cross-process mutation lock as upsert;
+`200` is emitted only after staged plaintext, fragments, references, ledger
+rows, persistent fragment-index mappings, and embedding membership verify
+absent. That mutation boundary is vault-content-wide: classification, linking,
+compilation, and guarded manual-review writes share it across their complete
+load-to-write windows. Therefore an already-started writer either commits
+before withdrawal (and its output is purged before `200`) or starts after
+withdrawal (and cannot load the removed source); it cannot commit a stale
+fragment or derived page after the successful withdrawal linearization point.
+Long pipeline work may make withdrawal return retryable `503` when the bounded
+lock wait expires, but it cannot produce a false `200`. Cache save, scrub, and
+membership verification also share their own cross-process lock; a stale linker
+snapshot consults the latest provenance event before replacement, so it cannot
+restore a row after withdrawal. Stale index mappings
+are removed with the writer's locked, atomic compaction primitive, and index
+cursors bind to the parsed file's device/inode generation so a live reader
+reloads after replacement rather than resuming at a stale byte offset.
+Withdrawal appends a content-free `withdrawal` event to the hash-chained
+operational provenance log for each removed fragment before the final absence
+check; the latest event defines membership and therefore tombstones the
+historical write without rewriting the chain. A partial purge, failed index
+compaction, failed tombstone append, or unverifiable cache leaves a
+digest-keyed, content-free recovery record and returns retryable `503`. A
+`0.15` client knows neither the route nor its closed response model, so the
+since-minor gate withholds and refuses it while its known routes remain
+byte-identical.
 
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.

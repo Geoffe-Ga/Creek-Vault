@@ -61,7 +61,7 @@ def _audit(vault: Path) -> list[dict[str, object]]:
 # The #970 overwrite-gate fixtures. Two sentinels, deliberately disjoint from
 # every tier word, so an assertion about "intimate" and an assertion about the
 # protected plaintext can never accidentally satisfy each other.
-_SECRET = "synthetic-tender-secret-970"
+_PROTECTED_BODY = "synthetic-tender-body-970"
 _BENIGN = "benign-open-replacement-970"
 
 
@@ -80,7 +80,7 @@ def _leaking_files(vault: Path, needle: str) -> list[Path]:
 
 
 def _seed_intimate(vault: Path, external_id: str) -> dict[str, object]:
-    """Create one INTIMATE entry carrying ``_SECRET`` under the broadest ceiling.
+    """Create one INTIMATE entry carrying ``_PROTECTED_BODY`` at the broadest ceiling.
 
     Args:
         vault: Vault root.
@@ -92,7 +92,7 @@ def _seed_intimate(vault: Path, external_id: str) -> dict[str, object]:
     """
     result = journal_ingest_tool(
         vault_path=vault,
-        content=f"a tender confession {_SECRET}",
+        content=f"a tender confession {_PROTECTED_BODY}",
         external_id=external_id,
         timestamp=_TS,
         tier="intimate",
@@ -422,13 +422,13 @@ def test_resend_after_purge_restages_cleanly(tmp_path: Path) -> None:
     the idempotency key.
     """
     vault = _vault(tmp_path)
-    secret = "synthetic-intimate-secret-845"
+    protected_body = "synthetic-intimate-body-845"
 
     def _send() -> dict[str, object]:
         """Ingest the same intimate entry (stable external id + content)."""
         return journal_ingest_tool(
             vault_path=vault,
-            content=f"a tender entry {secret}",
+            content=f"a tender entry {protected_body}",
             external_id="adep-845",
             timestamp=_TS,
             tier="intimate",
@@ -440,7 +440,7 @@ def test_resend_after_purge_restages_cleanly(tmp_path: Path) -> None:
     staged_dir = vault / "00-Creek-Meta" / "adepthood" / "journal"
     staged = sorted(staged_dir.glob("*.md"))
     assert len(staged) == 1
-    assert secret in staged[0].read_text(encoding="utf-8")
+    assert protected_body in staged[0].read_text(encoding="utf-8")
 
     PurgeEngine(vault).purge_fragment(str(first["fragment_id"]))
 
@@ -532,7 +532,7 @@ def test_refused_update_leaves_the_fragment_bytes_untouched(tmp_path: Path) -> N
     # response-shaped assertion below cannot see.
     assert fragment.read_bytes() == before
     post = _load(fragment)
-    assert _SECRET in post.content
+    assert _PROTECTED_BODY in post.content
     assert post.metadata["privacy_tier"] == "intimate"
     assert _leaking_files(vault, _BENIGN) == []
     assert result["status"] == "refused"
@@ -561,7 +561,7 @@ def test_refused_update_leaves_the_staged_entry_untouched(tmp_path: Path) -> Non
     # correct refusal over an already-destroyed staged entry.
     assert staged.read_bytes() == before
     staged_post = _load(staged)
-    assert _SECRET in staged_post.content
+    assert _PROTECTED_BODY in staged_post.content
     assert staged_post.metadata["privacy_tier"] == "intimate"
     assert result["status"] == "refused"
 
@@ -570,7 +570,7 @@ def test_refused_update_is_audited_without_naming_the_fragment(tmp_path: Path) -
     """The refused overwrite IS audited, and the entry names no protected thing.
 
     An attempted ceiling violation is an operator-relevant signal, so it gets
-    a trail — the tool, the ceiling and the caller's *own* arguments. What it
+    a trail — the tool, the ceiling, and content-free argument facts. What it
     must not get is anything resolved from the fragment it was refused:
     ``created_tier`` and ``affected_fragment_ids`` stay absent-or-empty, and
     neither the protected fragment's id nor its tier appears anywhere in the
@@ -579,15 +579,21 @@ def test_refused_update_is_audited_without_naming_the_fragment(tmp_path: Path) -
     outcome — applies to these bytes exactly as it does to the response.
     """
     vault = _vault(tmp_path)
-    seeded = _seed_intimate(vault, "e4")
+    external_id = "protected-external-identity-must-never-enter-audit"
+    seeded = _seed_intimate(vault, external_id)
 
-    assert _overwrite_at_open(vault, "e4")["status"] == "refused"
+    assert _overwrite_at_open(vault, external_id)["status"] == "refused"
 
     last = _audit(vault)[-1]
     assert last["tool"] == TOOL_NAME
     assert last["tier_ceiling"] == "open"
     assert last["consumer"] == "adepthood"
-    assert last["args_summary"] == {"external_id": "e4", "tier": "open"}
+    assert last["args_summary"] == {
+        "has_external_id": True,
+        "body_len": len(f"{_BENIGN} nothing to see here"),
+        "tier": "open",
+    }
+    assert external_id not in json.dumps(last)
     assert not last.get("created_tier")
     assert not last.get("affected_fragment_ids")
     serialised = json.dumps(last)
@@ -679,7 +685,7 @@ def test_intimate_entry_stays_updatable_at_an_admitted_ceiling(
 
     edited = journal_ingest_tool(
         vault_path=vault,
-        content=f"a revised tender confession {_SECRET}",
+        content=f"a revised tender confession {_PROTECTED_BODY}",
         external_id="e7",
         timestamp=_TS,
         tier="intimate",

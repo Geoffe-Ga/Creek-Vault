@@ -11,11 +11,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from creek._fslock import VaultLockTimeoutError
 from creek.classify.classify_engine import (
     LLMProviderUnavailableError,
     run_classify,
 )
 from creek.config import load_vault_config
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
@@ -96,14 +98,19 @@ def classify_tool(
             retier=retier,
         )
     except LLMProviderUnavailableError as exc:
-        # The engine refuses to iterate when the configured LLM
-        # provider is unreachable. Translate to a structured refusal
-        # so MCP clients see a stable shape instead of an unhandled
-        # ``RuntimeError`` traceback.
+        # The engine refuses to iterate when the configured LLM provider is
+        # unreachable. Translate the no-work-started condition to a stable
+        # shape instead of an unhandled ``RuntimeError`` traceback.
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason=str(exc),
+        )
+    except VaultLockTimeoutError:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=CONTENT_MUTATION_BUSY_REASON,
         )
     # Classify rewrites existing frontmatter in place; it does not
     # produce a new file, so ``created_path`` is omitted from the audit

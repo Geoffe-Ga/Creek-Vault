@@ -66,8 +66,10 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, cast
 
+from creek._fslock import VaultLockTimeoutError
 from creek.classify.privacy_filter import ancestry_tiers
 from creek.compile.engine import TARGET_KINDS, compile_to_vault
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import (
     TierCeiling,
@@ -444,6 +446,12 @@ def compile_tool(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason=str(exc),
+        )
+    except VaultLockTimeoutError:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=CONTENT_MUTATION_BUSY_REASON,
         )
 
     relative = str(written.relative_to(vault_path))

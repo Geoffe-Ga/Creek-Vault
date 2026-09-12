@@ -45,6 +45,7 @@ from creek_mcp.api.models import (
     JobStatusResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
+    JournalWithdrawResponse,
     LinkRequest,
     LinkResponse,
     ReflectionRequest,
@@ -103,6 +104,9 @@ OP_CAPABILITIES: Final[str] = "getCapabilities"
 
 OP_JOURNAL_UPSERT: Final[str] = "upsertJournalEntry"
 """``operation_id`` of ``PUT /v1/journal-entries/{external_id}``."""
+
+OP_JOURNAL_WITHDRAW: Final[str] = "withdrawJournalEntry"
+"""``operation_id`` of ``DELETE /v1/journal-entries/{external_id}``."""
 
 OP_REFLECTIONS: Final[str] = "createReflection"
 """``operation_id`` of ``POST /v1/reflections``."""
@@ -412,6 +416,16 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         response_model=JournalUpsertResponse,
         requires_contract_version=True,
         summary="Create or update one journal entry, idempotently.",
+    ),
+    RouteSpec(
+        path="/v1/journal-entries/{external_id}",
+        method="DELETE",
+        operation_id=OP_JOURNAL_WITHDRAW,
+        capability=Capability.JOURNAL_WITHDRAW,
+        request_model=None,
+        response_model=JournalWithdrawResponse,
+        requires_contract_version=True,
+        summary="Withdraw one consumer-owned journal entry, idempotently.",
     ),
     RouteSpec(
         path="/v1/reflections",

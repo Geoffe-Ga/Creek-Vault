@@ -138,7 +138,7 @@ def test_current_clients_negotiate_the_voice_drafts_capability(tmp_path: Path) -
 
     assert Capability.VOICE_DRAFTS.value in current["capabilities"]
     assert Capability.VOICE_DRAFTS.value not in old["capabilities"]
-    assert CAPABILITY_SINCE_MINOR[Capability.VOICE_DRAFTS] == CONTRACT_MINOR
+    assert CAPABILITY_SINCE_MINOR[Capability.VOICE_DRAFTS] == "0.15"
 
 
 def test_upsert_files_an_ai_attributed_voice_neutral_fragment(tmp_path: Path) -> None:
