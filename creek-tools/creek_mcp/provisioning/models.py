@@ -79,3 +79,66 @@ class ClaimedJob:
     job: ProvisioningJob
     lease_token: str
     provider_allocation_id: str | None = None
+
+
+@unique
+class ResourceClass(StrEnum):
+    """Billable or access-granting provider resource classes (ADR-0013 D6)."""
+
+    CREDENTIAL = "credential"
+    MACHINE = "machine"
+    VOLUME = "volume"
+    APP = "app"
+
+
+@unique
+class ReceiptOutcome(StrEnum):
+    """Lifecycle of one content-free deletion receipt."""
+
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionOutcome:
+    """What a provider confirmed it removed; carries no secret or address."""
+
+    provider: str
+    resource_classes: tuple[ResourceClass, ...]
+
+    def __post_init__(self) -> None:
+        """Refuse a receipt that names no provider or no resource class."""
+        if not self.provider.strip():
+            raise ValueError("deletion outcome provider must not be blank")
+        if not self.resource_classes:
+            raise ValueError("deletion outcome must name at least one resource class")
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionReceipt:
+    """Durable, content-free record of one requested deletion (ADR-0013 D6)."""
+
+    job_id: str
+    requester_identity: str
+    consumer_identity: str
+    provider: str | None
+    provider_allocation_id: str | None
+    resource_classes: tuple[ResourceClass, ...]
+    requested_at: datetime
+    confirmed_at: datetime | None
+    outcome: ReceiptOutcome
+    last_failure_reason: FailureReason | None
+    attempts: int
+    backfilled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FleetJob:
+    """One job joined with its allocation and receipt for operator listings."""
+
+    job: ProvisioningJob
+    provider_allocation_id: str | None
+    allocation_deleted_at: datetime | None
+    delete_requested_at: datetime | None
+    receipt_outcome: ReceiptOutcome | None

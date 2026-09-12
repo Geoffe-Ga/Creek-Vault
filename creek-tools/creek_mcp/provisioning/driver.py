@@ -5,10 +5,20 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
+
+from creek_mcp.provisioning.models import DeletionOutcome, ResourceClass
 
 if TYPE_CHECKING:
     from creek_mcp.provisioning.models import FailureReason, ProvisioningJob
+
+_FAKE_PROVIDER: Final[str] = "fake"
+_FAKE_RESOURCE_CLASSES: Final[tuple[ResourceClass, ...]] = (
+    ResourceClass.CREDENTIAL,
+    ResourceClass.MACHINE,
+    ResourceClass.VOLUME,
+    ResourceClass.APP,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +61,8 @@ class ProviderDriver(Protocol):
         self,
         job: ProvisioningJob,
         provider_allocation_id: str | None,
-    ) -> None:
-        """Idempotently remove every provider resource associated with *job*."""
+    ) -> DeletionOutcome:
+        """Remove every provider resource of *job*; return only what was confirmed."""
 
 
 class OneTimeCredentialHandoff(Protocol):
@@ -120,14 +130,14 @@ class FakeProviderDriver:
         self,
         job: ProvisioningJob,
         provider_allocation_id: str | None,
-    ) -> None:
+    ) -> DeletionOutcome:
         """Record one idempotent fake teardown without inspecting credentials."""
         del provider_allocation_id
         with self._lock:
-            if job.job_id in self._deleted:
-                return
-            self._deleted.add(job.job_id)
-            self._delete_count += 1
+            if job.job_id not in self._deleted:
+                self._deleted.add(job.job_id)
+                self._delete_count += 1
+        return DeletionOutcome(_FAKE_PROVIDER, _FAKE_RESOURCE_CLASSES)
 
 
 class FakeOneTimeHandoff:

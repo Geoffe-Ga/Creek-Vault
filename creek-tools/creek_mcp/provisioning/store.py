@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, cast
 from uuid import uuid4
 
+from creek_mcp.provisioning import fleet_schema
 from creek_mcp.provisioning.ceremony import (
     KEY_CEREMONY_TTL,
     CeremonyConflictError,
@@ -19,6 +20,7 @@ from creek_mcp.provisioning.ceremony import (
     KeyCeremonyChallenge,
     WrappedKeyArtifact,
 )
+from creek_mcp.provisioning.fleet_schema import timestamp as _timestamp
 from creek_mcp.provisioning.models import (
     ClaimedJob,
     FailureReason,
@@ -30,9 +32,16 @@ from creek_mcp.provisioning.models import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from decimal import Decimal
     from pathlib import Path
 
-_SCHEMA_VERSION: Final[int] = 3
+    from creek_mcp.provisioning.models import (
+        DeletionOutcome,
+        DeletionReceipt,
+        FleetJob,
+    )
+
+_SCHEMA_VERSION: Final[int] = 4
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
 MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
@@ -144,13 +153,6 @@ def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
 
 
-def _timestamp(value: datetime) -> str:
-    """Return a stable UTC database representation for *value*."""
-    if value.tzinfo is None:
-        raise ValueError("provisioning timestamps must be timezone-aware")
-    return value.astimezone(UTC).isoformat(timespec="microseconds")
-
-
 def _validate_identifier(value: str, *, field: str) -> str:
     """Return one bounded non-blank public identifier."""
     normalized = value.strip()
@@ -171,6 +173,8 @@ class ProvisioningStore:
             self._migrate_schema(connection)
             self._install_requester_guards(connection)
             connection.executescript(_OWNERSHIP_INDEXES)
+            connection.executescript(fleet_schema.FLEET_SCHEMA)
+            fleet_schema.backfill_pending_receipts(connection)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @staticmethod
@@ -270,63 +274,87 @@ class ProvisioningStore:
             field="requester_identity",
         )
         instant = now or _utc_now()
-        with self._connect(write=True) as connection:
-            existing = connection.execute(
-                "SELECT requester_identity, consumer_identity, job_id "
-                "FROM provisioning_activation_ids "
-                "WHERE activation_id = ?",
-                (activation,),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    existing["requester_identity"] != requester
-                    or existing["consumer_identity"] != consumer
-                ):
-                    raise ActivationConflictError("activation cannot be accepted")
-                return self._job_by_id(connection, str(existing["job_id"]))
-
-            live = connection.execute(
-                "SELECT * FROM provisioning_jobs "
-                "WHERE requester_identity = ? AND consumer_identity = ? "
-                "AND state != 'deleted'",
-                (requester, consumer),
-            ).fetchone()
-            if live is None:
-                job_id = str(uuid4())
-                stamp = _timestamp(instant)
-                connection.execute(
-                    "INSERT INTO provisioning_jobs "
-                    "(job_id, canonical_activation_id, requester_identity, "
-                    "consumer_identity, state, operation, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        job_id,
-                        activation,
-                        requester,
-                        consumer,
-                        JobState.PENDING.value,
-                        JobOperation.CREATE.value,
-                        stamp,
-                        stamp,
-                    ),
+        try:
+            with self._connect(write=True) as connection:
+                return self._submit(
+                    connection, activation, consumer, requester, instant
                 )
-            else:
-                job_id = str(live["job_id"])
-            alias_count = connection.execute(
-                "SELECT COUNT(*) FROM provisioning_activation_ids "
-                "WHERE requester_identity = ? AND consumer_identity = ?",
-                (requester, consumer),
-            ).fetchone()
-            assert alias_count is not None
-            if int(alias_count[0]) >= MAX_ACTIVATION_ALIASES_PER_CONSUMER:
+        except ActivationConflictError:
+            # The refused transaction rolled back; count it in a second short write.
+            with self._connect(write=True) as connection:
+                fleet_schema.bump_counter(
+                    connection, fleet_schema.DUPLICATE_ALLOCATION_ATTEMPTS
+                )
+            raise
+
+    def _submit(
+        self,
+        connection: sqlite3.Connection,
+        activation: str,
+        consumer: str,
+        requester: str,
+        instant: datetime,
+    ) -> ProvisioningJob:
+        """Resolve one activation to its live job inside the caller's write fence."""
+        existing = connection.execute(
+            "SELECT requester_identity, consumer_identity, job_id "
+            "FROM provisioning_activation_ids "
+            "WHERE activation_id = ?",
+            (activation,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["requester_identity"] != requester
+                or existing["consumer_identity"] != consumer
+            ):
                 raise ActivationConflictError("activation cannot be accepted")
+            return self._job_by_id(connection, str(existing["job_id"]))
+
+        live = connection.execute(
+            "SELECT * FROM provisioning_jobs "
+            "WHERE requester_identity = ? AND consumer_identity = ? "
+            "AND state != 'deleted'",
+            (requester, consumer),
+        ).fetchone()
+        if live is None:
+            job_id = str(uuid4())
+            stamp = _timestamp(instant)
             connection.execute(
-                "INSERT INTO provisioning_activation_ids "
-                "(activation_id, requester_identity, consumer_identity, job_id) "
-                "VALUES (?, ?, ?, ?)",
-                (activation, requester, consumer, job_id),
+                "INSERT INTO provisioning_jobs "
+                "(job_id, canonical_activation_id, requester_identity, "
+                "consumer_identity, state, operation, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    activation,
+                    requester,
+                    consumer,
+                    JobState.PENDING.value,
+                    JobOperation.CREATE.value,
+                    stamp,
+                    stamp,
+                ),
             )
-            return self._job_by_id(connection, job_id)
+        else:
+            job_id = str(live["job_id"])
+            fleet_schema.bump_counter(
+                connection, fleet_schema.DUPLICATE_ALLOCATION_ATTEMPTS
+            )
+        alias_count = connection.execute(
+            "SELECT COUNT(*) FROM provisioning_activation_ids "
+            "WHERE requester_identity = ? AND consumer_identity = ?",
+            (requester, consumer),
+        ).fetchone()
+        assert alias_count is not None
+        if int(alias_count[0]) >= MAX_ACTIVATION_ALIASES_PER_CONSUMER:
+            raise ActivationConflictError("activation cannot be accepted")
+        connection.execute(
+            "INSERT INTO provisioning_activation_ids "
+            "(activation_id, requester_identity, consumer_identity, job_id) "
+            "VALUES (?, ?, ?, ?)",
+            (activation, requester, consumer, job_id),
+        )
+        return self._job_by_id(connection, job_id)
 
     def get(self, job_id: str, requester_identity: str) -> ProvisioningJob | None:
         """Return *job_id* only when its requester owns it."""
@@ -436,14 +464,16 @@ class ProvisioningStore:
         self,
         job_id: str,
         lease_token: str,
+        outcome: DeletionOutcome,
         *,
         now: datetime | None = None,
     ) -> ProvisioningJob:
-        """Settle a delete claim only after the provider confirms removal."""
+        """Settle a delete claim and confirm its receipt only on provider proof."""
         return self._settle_claim(
             job_id,
             lease_token,
             state=JobState.DELETED,
+            deletion_outcome=outcome,
             now=now,
         )
 
@@ -510,6 +540,7 @@ class ProvisioningStore:
                     job_id,
                 ),
             )
+            fleet_schema.open_deletion_receipt(connection, row, instant)
             return self._job_by_id(connection, job_id)
 
     def get_key_ceremony(
@@ -600,6 +631,7 @@ class ProvisioningStore:
                         job_id,
                     ),
                 )
+                fleet_schema.open_deletion_receipt(connection, job_row, instant)
                 expired = True
             else:
                 self._validate_ceremony_binding(job_row, ceremony, submission)
@@ -632,6 +664,7 @@ class ProvisioningStore:
         """Idempotently queue teardown for every incomplete expired ceremony."""
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
+            fleet_schema.open_expired_ceremony_receipts(connection, instant)
             cursor = connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                 "retry_count = 0, retryable = 0, failure_reason = NULL, "
@@ -714,6 +747,79 @@ class ProvisioningStore:
         assert row is not None
         return int(row[0])
 
+    def list_fleet_jobs(self) -> tuple[FleetJob, ...]:
+        """Return every job with its allocation and receipt (operator seam only)."""
+        with self._connect() as connection:
+            return fleet_schema.list_fleet_jobs(connection, self._from_row)
+
+    def list_deletion_receipts(self) -> tuple[DeletionReceipt, ...]:
+        """Return every content-free deletion receipt (operator seam only)."""
+        with self._connect() as connection:
+            return fleet_schema.list_deletion_receipts(connection)
+
+    def duplicate_allocation_attempts(self) -> int:
+        """Return how many duplicate activation attempts were durably absorbed."""
+        with self._connect() as connection:
+            return fleet_schema.counter_value(
+                connection, fleet_schema.DUPLICATE_ALLOCATION_ATTEMPTS
+            )
+
+    def record_machine_state(
+        self,
+        provider_allocation_id: str,
+        *,
+        running: bool,
+        now: datetime,
+    ) -> tuple[int, int]:
+        """Sample one Machine; return continuous and month-to-date running seconds."""
+        with self._connect(write=True) as connection:
+            return fleet_schema.record_machine_state(
+                connection,
+                provider_allocation_id,
+                running=running,
+                now=now,
+            )
+
+    def running_seconds_by_allocation(self, month: str) -> dict[str, int]:
+        """Return sampled running seconds per allocation for one ``YYYY-MM``."""
+        with self._connect() as connection:
+            return fleet_schema.running_seconds_by_allocation(connection, month)
+
+    def record_budget_month(
+        self,
+        month: str,
+        estimated: Decimal,
+        budget: Decimal,
+        currency: str,
+        *,
+        now: datetime,
+    ) -> None:
+        """Durably record one month's estimate against the operator budget."""
+        with self._connect(write=True) as connection:
+            fleet_schema.record_budget_month(
+                connection, month, estimated, budget, currency, now
+            )
+
+    def months_over_budget(self, limit: int) -> tuple[bool, ...]:
+        """Return over-budget flags for the most recent *limit* recorded months."""
+        with self._connect() as connection:
+            return fleet_schema.months_over_budget(connection, limit)
+
+    def requeue_failed_delete(
+        self,
+        job_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> ProvisioningJob:
+        """Requeue one retryable failed delete for the fleet reconciler (idempotent)."""
+        with self._connect(write=True) as connection:
+            row = fleet_schema.requeue_failed_delete(
+                connection, job_id, now or _utc_now()
+            )
+            if row is None:
+                raise InvalidJobTransitionError("job is not a requeueable delete")
+            return self._from_row(row)
+
     @staticmethod
     def _release_expired_claims(connection: sqlite3.Connection, stamp: str) -> None:
         """Make expired create/delete leases claimable after a worker crash."""
@@ -737,6 +843,7 @@ class ProvisioningStore:
         provider_allocation_id: str | None = None,
         before_settle: Callable[[], None] | None = None,
         create_key_ceremony: bool = False,
+        deletion_outcome: DeletionOutcome | None = None,
         now: datetime | None = None,
     ) -> ProvisioningJob:
         """Apply one terminal claim transition when *lease_token* still owns it."""
@@ -788,6 +895,15 @@ class ProvisioningStore:
                     "WHERE job_id = ? AND deleted_at IS NULL",
                     (stamp, job_id),
                 )
+            fleet_schema.finalize_deletion_receipt(
+                connection,
+                row,
+                instant,
+                state=state,
+                retryable=retryable,
+                failure_reason=failure_reason,
+                outcome=deletion_outcome,
+            )
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, retryable = ?, "
                 "failure_reason = ?, lease_token = NULL, lease_expires_at = NULL, "

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Final, Never, Protocol, cast
 import httpx
 
 from creek_mcp.provisioning.driver import ProviderAllocation, ProviderError
-from creek_mcp.provisioning.models import FailureReason
+from creek_mcp.provisioning.models import DeletionOutcome, FailureReason, ResourceClass
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -44,6 +44,13 @@ _VAULT_MOUNT: Final[str] = "/vault"
 _FLY_ABSENT_STATUS: Final[int] = 404
 """Fly's upstream resource-absence response; never exposed on Creek's wire."""
 _IMMUTABLE_IMAGE_RE: Final[re.Pattern[str]] = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
+_FLY_PROVIDER: Final[str] = "fly"
+_FLY_DELETED_CLASSES: Final[tuple[ResourceClass, ...]] = (
+    ResourceClass.CREDENTIAL,
+    ResourceClass.MACHINE,
+    ResourceClass.VOLUME,
+    ResourceClass.APP,
+)
 
 
 @unique
@@ -278,8 +285,12 @@ class FlyProviderDriver:
         self,
         job: ProvisioningJob,
         provider_allocation_id: str | None,
-    ) -> None:
-        """Revoke access and reconcile the activation to zero Fly resources."""
+    ) -> DeletionOutcome:
+        """Revoke access and reconcile the activation to zero Fly resources.
+
+        The outcome is returned only after absence is verified, so a caller can
+        treat it as provider confirmation for the deletion receipt.
+        """
         reference = self._reference(job.activation_id)
         if (
             provider_allocation_id is not None
@@ -287,8 +298,9 @@ class FlyProviderDriver:
         ):
             self._rejected("provider allocation identity does not match activation")
         self._secrets.revoke(job.activation_id)
+        outcome = DeletionOutcome(_FLY_PROVIDER, _FLY_DELETED_CLASSES)
         if not self._app_exists(reference):
-            return
+            return outcome
         for machine in self._matching_machines(reference):
             self._delete_machine(reference, machine)
         for volume in self._matching_volumes(reference):
@@ -302,6 +314,7 @@ class FlyProviderDriver:
         )
         if self._app_exists(reference):
             self._unavailable("Fly app deletion has not converged")
+        return outcome
 
     def _ensure_app(self, reference: _AllocationRef) -> Mapping[str, Any]:
         response = self._request(

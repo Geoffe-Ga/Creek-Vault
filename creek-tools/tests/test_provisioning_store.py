@@ -2,16 +2,32 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
-from creek_mcp.provisioning.models import FailureReason, JobState
+from creek_mcp.provisioning.ceremony import (
+    KEY_CEREMONY_TTL,
+    CeremonyExpiredError,
+    CeremonySubmission,
+)
+from creek_mcp.provisioning.models import (
+    DeletionOutcome,
+    FailureReason,
+    JobOperation,
+    JobState,
+    ReceiptOutcome,
+    ResourceClass,
+)
 from creek_mcp.provisioning.store import (
+    _OWNERSHIP_INDEXES,
+    _SCHEMA,
     MAX_ACTIVATION_ALIASES_PER_CONSUMER,
     ActivationConflictError,
     InvalidJobTransitionError,
@@ -19,10 +35,31 @@ from creek_mcp.provisioning.store import (
     ProvisioningStore,
 )
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 _NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
+_OUTCOME = DeletionOutcome(
+    "fake",
+    (
+        ResourceClass.CREDENTIAL,
+        ResourceClass.MACHINE,
+        ResourceClass.VOLUME,
+        ResourceClass.APP,
+    ),
+)
+_HTTPAPI = Path(__file__).resolve().parents[1] / "creek_mcp" / "httpapi"
+_CEREMONY_VECTORS = (
+    Path(__file__).resolve().parents[1]
+    / "docs"
+    / "contracts"
+    / "provisioning-v1"
+    / "key-ceremony-test-vectors.json"
+)
+_FLEET_TABLES = (
+    "provisioning_deletion_receipts",
+    "provisioning_counters",
+    "provisioning_machine_running",
+    "provisioning_machine_running_months",
+    "provisioning_budget_months",
+)
 
 
 @pytest.fixture
@@ -57,6 +94,7 @@ def test_one_consumer_cannot_gain_two_live_allocations_under_concurrency(
     assert len(job_ids) == 1
     assert store.count_jobs() == 1
     assert store.count_activation_ids() == 24
+    assert store.duplicate_allocation_attempts() == 23
 
 
 def test_one_requester_can_own_distinct_consumer_allocations(
@@ -241,7 +279,7 @@ def test_v2_database_migrates_authenticated_ownership_without_data_loss(
     assert job is not None
     assert job.requester_identity == "adepthood"
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
         assert connection.execute(
             "SELECT requester_identity FROM provisioning_activation_ids"
         ).fetchone() == ("adepthood",)
@@ -277,7 +315,9 @@ def test_allocation_is_a_distinct_durable_model_with_one_active_per_consumer(
     store.request_delete(first_job.job_id, "adepthood", now=_NOW)
     delete_claim = store.claim_next(now=_NOW)
     assert delete_claim is not None
-    store.complete_delete(first_job.job_id, delete_claim.lease_token, now=_NOW)
+    store.complete_delete(
+        first_job.job_id, delete_claim.lease_token, _OUTCOME, now=_NOW
+    )
     assert store.count_allocations(active_only=True) == 0
 
     second_job = store.submit("activation-allocation-2", "adepthood", now=_NOW)
@@ -470,3 +510,368 @@ def test_delete_is_idempotent_and_remains_durable_until_a_worker_claims_it(
     assert first.state is JobState.DELETING
     assert claim is not None
     assert claim.job.state is JobState.DELETING
+
+
+def _ready_job(store: ProvisioningStore, activation_id: str, allocation: str) -> str:
+    """Drive one activation (its own consumer subject) through create."""
+    job = store.submit(
+        activation_id,
+        activation_id,
+        requester_identity="adepthood",
+        now=_NOW,
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.complete_create(
+        job.job_id,
+        claim.lease_token,
+        allocation,
+        handoff=lambda: None,
+        now=_NOW,
+    )
+    return job.job_id
+
+
+def _fail_delete(store: ProvisioningStore, job_id: str, *, retryable: bool) -> None:
+    """Claim the queued delete for *job_id* and settle it as a failure."""
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    assert claim.job.job_id == job_id
+    store.record_failure(
+        job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_UNAVAILABLE,
+        retryable=retryable,
+        now=_NOW,
+    )
+
+
+def _v3_database(path: Path) -> None:
+    """Write a v3 file holding a deleting, a failed-delete, and a ready job."""
+    stamp = _NOW.isoformat(timespec="microseconds")
+    later = (_NOW + timedelta(hours=1)).isoformat(timespec="microseconds")
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(_SCHEMA)
+        connection.executescript(_OWNERSHIP_INDEXES)
+        rows = (
+            ("job-deleting", "act-deleting", "user-1", "deleting", "delete", later),
+            ("job-failed", "act-failed", "user-2", "failed", "delete", later),
+            ("job-ready", "act-ready", "user-3", "ready", "create", stamp),
+        )
+        for job_id, activation, consumer, state, operation, updated in rows:
+            connection.execute(
+                "INSERT INTO provisioning_jobs (job_id, canonical_activation_id, "
+                "requester_identity, consumer_identity, state, operation, "
+                "retryable, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    activation,
+                    "adepthood",
+                    consumer,
+                    state,
+                    operation,
+                    int(state == "failed"),
+                    stamp,
+                    updated,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO provisioning_activation_ids VALUES (?, ?, ?, ?)",
+                (activation, "adepthood", consumer, job_id),
+            )
+            connection.execute(
+                "INSERT INTO provisioning_allocations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"alloc-{job_id}",
+                    job_id,
+                    "adepthood",
+                    consumer,
+                    f"p-{job_id}",
+                    stamp,
+                    None,
+                ),
+            )
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+
+
+def test_v3_database_migrates_to_v4_keeping_rows_indexes_and_backfilling_receipts(
+    tmp_path: Path,
+) -> None:
+    """Fleet tables arrive idempotently and pre-upgrade deletions get receipts."""
+    database = tmp_path / "provisioning-v3.sqlite3"
+    _v3_database(database)
+
+    ProvisioningStore(database)
+    first_pass = ProvisioningStore(database).list_deletion_receipts()
+    ProvisioningStore(database)
+
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert set(_FLEET_TABLES) <= tables
+        assert connection.execute(
+            "SELECT COUNT(*) FROM provisioning_jobs"
+        ).fetchone() == (3,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM provisioning_allocations"
+        ).fetchone() == (3,)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO provisioning_jobs (job_id, canonical_activation_id, "
+                "requester_identity, consumer_identity, state, operation, "
+                "created_at, updated_at) VALUES ('dup', 'a', 'adepthood', 'user-3', "
+                "'pending', 'create', '2026', '2026')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO provisioning_allocations VALUES "
+                "('dup', 'job-ready', 'adepthood', 'user-3', 'p-dup', '2026', NULL)"
+            )
+    receipts = ProvisioningStore(database).list_deletion_receipts()
+    assert receipts == first_pass
+    assert {receipt.job_id for receipt in receipts} == {"job-deleting", "job-failed"}
+    for receipt in receipts:
+        assert receipt.outcome is ReceiptOutcome.PENDING
+        assert receipt.backfilled is True
+        assert receipt.requested_at == _NOW + timedelta(hours=1)
+        assert receipt.provider is None
+        assert receipt.resource_classes == ()
+
+
+def test_duplicate_attempts_count_aliases_and_conflicts_but_not_replays(
+    store: ProvisioningStore,
+) -> None:
+    """Idempotent polls cost nothing; every duplicate attempt is a durable count."""
+    assert store.duplicate_allocation_attempts() == 0
+    first = store.submit("activation-dup-000", "adepthood", now=_NOW)
+    for number in (1, 2, 3):
+        assert store.submit(f"activation-dup-{number:03d}", "adepthood", now=_NOW) == (
+            first
+        )
+    assert store.duplicate_allocation_attempts() == 3
+
+    assert store.submit("activation-dup-000", "adepthood", now=_NOW) == first
+    assert store.duplicate_allocation_attempts() == 3
+
+    with pytest.raises(ActivationConflictError):
+        store.submit("activation-dup-000", "other-consumer", now=_NOW)
+    assert store.duplicate_allocation_attempts() == 4
+    assert store.count_jobs() == 1
+
+
+def test_request_delete_and_both_ceremony_expiry_paths_open_exactly_one_pending_receipt(
+    store: ProvisioningStore,
+) -> None:
+    """Every path into ``deleting`` opens one receipt; replays never add a second."""
+    requested = _ready_job(store, "activation-receipt-request", "alloc-request")
+    expired_by_sweep = _ready_job(store, "activation-receipt-sweep", "alloc-sweep")
+    expired_by_put = _ready_job(store, "activation-receipt-put", "alloc-put")
+    submission = CeremonySubmission.model_validate(
+        json.loads(_CEREMONY_VECTORS.read_text(encoding="utf-8"))["submission"]
+    )
+    late = _NOW + KEY_CEREMONY_TTL
+
+    store.request_delete(requested, "adepthood", now=_NOW)
+    store.request_delete(requested, "adepthood", now=_NOW + timedelta(minutes=5))
+    _fail_delete(store, requested, retryable=False)
+    with pytest.raises(CeremonyExpiredError):
+        store.complete_key_ceremony(
+            expired_by_put,
+            "adepthood",
+            submission,
+            attested_confidential=False,
+            before_settle=None,
+            now=late,
+        )
+    assert store.expire_key_ceremonies(now=late) == 1
+    assert store.expire_key_ceremonies(now=late) == 0
+
+    receipts = {receipt.job_id: receipt for receipt in store.list_deletion_receipts()}
+    assert set(receipts) == {requested, expired_by_sweep, expired_by_put}
+    assert receipts[requested].requested_at == _NOW
+    assert receipts[expired_by_sweep].requested_at == late
+    assert receipts[expired_by_put].requested_at == late
+    for job_id in (expired_by_sweep, expired_by_put):
+        assert receipts[job_id].outcome is ReceiptOutcome.PENDING
+        assert receipts[job_id].backfilled is False
+        assert receipts[job_id].requester_identity == "adepthood"
+        assert receipts[job_id].consumer_identity.startswith("activation-receipt-")
+        assert receipts[job_id].attempts == 0
+        assert receipts[job_id].confirmed_at is None
+    assert receipts[requested].outcome is ReceiptOutcome.FAILED
+    assert receipts[requested].last_failure_reason is (
+        FailureReason.PROVIDER_UNAVAILABLE
+    )
+
+    reset = store.request_delete(requested, "adepthood", now=_NOW + timedelta(days=1))
+    assert reset.state is JobState.DELETING
+    receipt = {r.job_id: r for r in store.list_deletion_receipts()}[requested]
+    assert receipt.outcome is ReceiptOutcome.PENDING
+    assert receipt.requested_at == _NOW
+    assert receipt.attempts == 1
+    assert len(store.list_deletion_receipts()) == 3
+
+
+def test_complete_delete_confirms_the_receipt_only_inside_the_lease_fence(
+    store: ProvisioningStore,
+) -> None:
+    """A lost lease cannot confirm; a held lease confirms atomically with deleted."""
+    job_id = _ready_job(store, "activation-receipt-fence", "alloc-fence")
+    store.request_delete(job_id, "adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW, lease_for=timedelta(seconds=1))
+    assert claim is not None
+    store.request_delete(job_id, "adepthood", now=_NOW)  # idempotent, keeps lease
+
+    with pytest.raises(LostJobLeaseError):
+        store.complete_delete(job_id, "stale-token", _OUTCOME, now=_NOW)
+    pending = store.list_deletion_receipts()[0]
+    assert pending.outcome is ReceiptOutcome.PENDING
+    assert pending.confirmed_at is None
+
+    settled = store.complete_delete(
+        job_id,
+        claim.lease_token,
+        _OUTCOME,
+        now=_NOW + timedelta(seconds=30),
+    )
+    confirmed = store.list_deletion_receipts()[0]
+    assert settled.state is JobState.DELETED
+    assert confirmed.outcome is ReceiptOutcome.CONFIRMED
+    assert confirmed.confirmed_at == _NOW + timedelta(seconds=30)
+    assert confirmed.provider == "fake"
+    assert confirmed.provider_allocation_id == "alloc-fence"
+    assert confirmed.resource_classes == _OUTCOME.resource_classes
+    assert confirmed.requested_at == _NOW
+    with pytest.raises(LostJobLeaseError):
+        store.complete_delete(job_id, claim.lease_token, _OUTCOME, now=_NOW)
+
+
+def test_requeue_failed_delete_moves_only_a_retryable_failed_delete_back_to_deleting(
+    store: ProvisioningStore,
+) -> None:
+    """The operator repair primitive is narrow, idempotent, and content-free."""
+    retryable = _ready_job(store, "activation-requeue-ok", "alloc-requeue-ok")
+    terminal = _ready_job(store, "activation-requeue-no", "alloc-requeue-no")
+    ready = _ready_job(store, "activation-requeue-ready", "alloc-requeue-ready")
+    store.request_delete(retryable, "adepthood", now=_NOW)
+    _fail_delete(store, retryable, retryable=True)
+    store.request_delete(terminal, "adepthood", now=_NOW)
+    _fail_delete(store, terminal, retryable=False)
+
+    requeued = store.requeue_failed_delete(retryable, now=_NOW + timedelta(hours=1))
+    replay = store.requeue_failed_delete(retryable, now=_NOW + timedelta(hours=2))
+
+    assert requeued.state is JobState.DELETING
+    assert requeued.operation is JobOperation.DELETE
+    assert requeued.retryable is False
+    assert requeued.failure_reason is None
+    assert requeued.updated_at == _NOW + timedelta(hours=1)
+    assert replay == requeued
+    for job_id in (terminal, ready, "job-that-does-not-exist"):
+        with pytest.raises(InvalidJobTransitionError):
+            store.requeue_failed_delete(job_id, now=_NOW)
+    receipt = {r.job_id: r for r in store.list_deletion_receipts()}[retryable]
+    assert receipt.outcome is ReceiptOutcome.PENDING
+    assert receipt.attempts == 1
+    assert receipt.last_failure_reason is FailureReason.PROVIDER_UNAVAILABLE
+
+
+def test_record_machine_state_accrues_between_running_samples_and_splits_months(
+    store: ProvisioningStore,
+    tmp_path: Path,
+) -> None:
+    """Running seconds are sampled into bounded per-allocation month buckets."""
+    start = datetime(2026, 9, 30, 23, tzinfo=UTC)
+    crossed = datetime(2026, 10, 1, 1, tzinfo=UTC)
+
+    first = store.record_machine_state("fly-sample", running=True, now=start)
+    replay = store.record_machine_state("fly-sample", running=True, now=start)
+    accrued = store.record_machine_state("fly-sample", running=True, now=crossed)
+    stopped = store.record_machine_state(
+        "fly-sample", running=False, now=crossed + timedelta(minutes=10)
+    )
+    restarted = store.record_machine_state(
+        "fly-sample", running=True, now=crossed + timedelta(minutes=20)
+    )
+    other = store.record_machine_state("fly-other", running=False, now=crossed)
+
+    assert first == (0, 0)
+    assert replay == (0, 0)
+    assert accrued == (7200, 3600)
+    assert stopped == (0, 3600)
+    assert restarted == (0, 3600)
+    assert other == (0, 0)
+    assert store.running_seconds_by_allocation("2026-09") == {"fly-sample": 3600}
+    assert store.running_seconds_by_allocation("2026-10") == {"fly-sample": 3600}
+    assert store.running_seconds_by_allocation("2026-11") == {}
+    with closing(sqlite3.connect(tmp_path / "provisioning.sqlite3")) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM provisioning_machine_running"
+        ).fetchone() == (2,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM provisioning_machine_running_months"
+        ).fetchone() == (2,)
+
+
+def test_list_fleet_jobs_is_fleet_wide_and_requester_scoped_reads_are_unchanged(
+    store: ProvisioningStore,
+) -> None:
+    """Operators see every job; the public API keeps its ownership boundary."""
+    ready = _ready_job(store, "activation-fleet-ready", "alloc-fleet-ready")
+    deleting = _ready_job(store, "activation-fleet-deleting", "alloc-fleet-deleting")
+    store.request_delete(deleting, "adepthood", now=_NOW + timedelta(minutes=1))
+    pending = store.submit(
+        "activation-fleet-pending",
+        "user-9",
+        requester_identity="service-b",
+        now=_NOW,
+    ).job_id
+
+    fleet = {entry.job.job_id: entry for entry in store.list_fleet_jobs()}
+
+    assert set(fleet) == {ready, deleting, pending}
+    assert fleet[ready].provider_allocation_id == "alloc-fleet-ready"
+    assert fleet[ready].allocation_deleted_at is None
+    assert fleet[ready].delete_requested_at is None
+    assert fleet[ready].receipt_outcome is None
+    assert fleet[deleting].job.state is JobState.DELETING
+    assert fleet[deleting].delete_requested_at == _NOW + timedelta(minutes=1)
+    assert fleet[deleting].receipt_outcome is ReceiptOutcome.PENDING
+    assert fleet[pending].provider_allocation_id is None
+    assert fleet[pending].job.requester_identity == "service-b"
+    assert store.get(pending, "adepthood") is None
+    assert store.get_allocation(ready, "service-b") is None
+    assert store.get(ready, "adepthood") == fleet[ready].job
+    httpapi_source = (_HTTPAPI / "provisioning.py").read_text(encoding="utf-8")
+    for seam in (
+        "list_fleet_jobs",
+        "list_deletion_receipts",
+        "duplicate_allocation_attempts",
+        "record_machine_state",
+        "running_seconds_by_allocation",
+        "requeue_failed_delete",
+        "record_budget_month",
+        "months_over_budget",
+    ):
+        assert seam not in httpapi_source
+
+
+def test_budget_months_record_and_report_most_recent_first(
+    store: ProvisioningStore,
+) -> None:
+    """Durable month history lets the D7 rolling-months trigger be evaluated."""
+    budget = Decimal("500.00")
+    store.record_budget_month("2026-07", Decimal("512.10"), budget, "USD", now=_NOW)
+    store.record_budget_month("2026-08", Decimal("499.99"), budget, "USD", now=_NOW)
+    store.record_budget_month("2026-09", Decimal("100.00"), budget, "USD", now=_NOW)
+    store.record_budget_month("2026-09", Decimal("500.00"), budget, "USD", now=_NOW)
+
+    assert store.months_over_budget(2) == (True, False)
+    assert store.months_over_budget(5) == (True, False, True)
+    assert store.months_over_budget(0) == ()

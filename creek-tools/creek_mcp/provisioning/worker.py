@@ -46,13 +46,14 @@ class ProvisioningWorker:
             return False
         try:
             if claimed.job.operation is JobOperation.DELETE:
-                self._driver.delete(
+                outcome = self._driver.delete(
                     claimed.job,
                     claimed.provider_allocation_id,
                 )
                 self._store.complete_delete(
                     claimed.job.job_id,
                     claimed.lease_token,
+                    outcome,
                     now=now,
                 )
             else:
