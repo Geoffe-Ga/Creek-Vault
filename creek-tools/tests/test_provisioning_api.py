@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -316,3 +317,43 @@ def test_status_retry_and_delete_are_each_safe_under_concurrency(
             )
         )
     assert set(delete_results) == {(202, JobState.DELETING.value)}
+
+
+def test_every_mutating_route_stamps_the_injected_clock(
+    store: ProvisioningStore,
+) -> None:
+    """POST /activations, POST /retry and DELETE all take `now` from the clock."""
+    instants = iter(
+        datetime(2031, 1, 1, tzinfo=UTC) + timedelta(days=offset) for offset in range(3)
+    )
+    current = next(instants)
+
+    def clock() -> datetime:
+        return current
+
+    verifier = ConsumerTokenVerifier({"adepthood": (_TOKEN,)})
+    client = TestClient(build_provisioning_app(store, verifier, clock=clock))
+
+    created = _submit(client, "activation-clock").json()
+    claimed = store.claim_next(now=current)
+    assert claimed is not None
+    store.record_failure(
+        claimed.job.job_id,
+        claimed.lease_token,
+        FailureReason.PROVIDER_UNAVAILABLE,
+        retryable=True,
+        now=current,
+    )
+    current = next(instants)
+    retried = client.post(
+        f"/control/v1/jobs/{created['job_id']}/retry", headers=_headers()
+    )
+    current = next(instants)
+    deleted = client.delete(created["status_url"], headers=_headers())
+
+    assert created["created_at"] == "2031-01-01T00:00:00+00:00"
+    assert created["updated_at"] == "2031-01-01T00:00:00+00:00"
+    assert retried.status_code == 202
+    assert retried.json()["updated_at"] == "2031-01-02T00:00:00+00:00"
+    assert deleted.status_code == 202
+    assert deleted.json()["updated_at"] == "2031-01-03T00:00:00+00:00"

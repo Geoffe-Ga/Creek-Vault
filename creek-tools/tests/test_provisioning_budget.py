@@ -116,6 +116,10 @@ def test_fleet_policy_requires_every_operator_value_and_validates(
         {"review_activated_vaults": 0},
         {"review_months_over_budget": 0},
         {"snapshot_gb_month_rate": "0"},
+        {"monthly_budget": "NaN"},
+        {"monthly_budget": "Infinity"},
+        {"running_hour_rate": Decimal("-Infinity")},
+        {"egress_gb_rate": "sNaN"},
     ):
         with pytest.raises((ValueError, TypeError), match=next(iter(bad))):
             _policy(**bad)
@@ -157,9 +161,20 @@ def test_fleet_policy_requires_every_operator_value_and_validates(
 
 def test_no_reference_price_literal_lives_in_provisioning_code(tmp_path: Path) -> None:
     """ADR-0013 D4 figures are injected assumptions, never business logic."""
+    scanned = sorted(_PROVISIONING.rglob("*.py"))
+    assert {path.name for path in scanned} >= {
+        "budget.py",
+        "reconcile.py",
+        "fleet_cli.py",
+        "fleet_schema.py",
+        "fly.py",
+        "store.py",
+        "driver.py",
+        "worker.py",
+    }
     offenders = {
         path.name: literals
-        for path in sorted(_PROVISIONING.glob("*.py"))
+        for path in scanned
         if (literals := _reference_price_literals(path))
     }
     assert offenders == {}
@@ -394,3 +409,41 @@ def test_review_checkpoint_triggers_at_each_operator_threshold_and_manual_flag()
         "confidential_compute_change",
         "months_over_budget",
     }
+
+
+def test_unknown_rootfs_sizes_are_listed_as_unpriced_not_zeroed() -> None:
+    """A Machine the provider did not size is reported, never counted as free."""
+    policy = _policy()
+    now = datetime(2026, 9, 1, 6, tzinfo=UTC)
+
+    sized = estimate_monthly_cost(_telemetry(), policy, now=now)
+    partly_unknown = estimate_monthly_cost(
+        _telemetry(machines_without_rootfs_size=2), policy, now=now
+    )
+
+    assert sized.unpriced == ("egress", "snapshot")
+    assert partly_unknown.unpriced == ("egress", "snapshot", "stopped_rootfs")
+    assert partly_unknown.components["stopped_rootfs"] == Decimal("0.10")
+    assert partly_unknown.estimated_month == sized.estimated_month
+
+
+def test_a_closed_month_estimate_uses_its_sampled_seconds_without_projection() -> None:
+    """Recording a closed month must not extrapolate its complete sample."""
+    policy = _policy()
+    now = datetime(2026, 9, 1, 2, tzinfo=UTC)
+    sampled = _telemetry(running_machine_seconds_fleet=36000)
+
+    closed = estimate_monthly_cost(sampled, policy, now=now, month="2026-08")
+    live = estimate_monthly_cost(sampled, policy, now=now)
+    injected = estimate_monthly_cost(
+        _telemetry(running_machine_seconds_fleet=36000, running_seconds_injected=7200),
+        policy,
+        now=now,
+        month="2026-08",
+    )
+
+    assert closed.running_basis is RunningBasis.CLOSED_MONTH
+    assert closed.components["running"] == Decimal("0.10")
+    assert live.running_basis is RunningBasis.MONTH_TO_DATE
+    assert injected.running_basis is RunningBasis.INJECTED
+    assert injected.components["running"] == Decimal("0.02")

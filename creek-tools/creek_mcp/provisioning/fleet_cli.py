@@ -14,8 +14,10 @@ emergency-stop failure), 2 usage error.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
+import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,9 +26,9 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
-from creek_mcp.provisioning.budget import load_policy_file
+from creek_mcp.provisioning.budget import estimate_monthly_cost, load_policy_file
 from creek_mcp.provisioning.driver import ProviderError
-from creek_mcp.provisioning.fleet_schema import month_key
+from creek_mcp.provisioning.fleet_schema import month_range
 from creek_mcp.provisioning.fly import (
     FlyCredential,
     FlyCredentialScope,
@@ -42,7 +44,7 @@ if TYPE_CHECKING:
 
     from creek_mcp.provisioning.budget import PolicyFile
     from creek_mcp.provisioning.inventory import FleetInventorySource, FleetStopper
-    from creek_mcp.provisioning.models import FleetJob
+    from creek_mcp.provisioning.models import FleetJob, FleetTelemetry
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_API_BASE_URL: Final[str] = "https://api.machines.dev"
@@ -51,8 +53,11 @@ _EXIT_UNAVAILABLE: Final[int] = 1
 _EXIT_ALERTS: Final[int] = 3
 _REPORT_COMMANDS: Final[frozenset[str]] = frozenset({"report", "reconcile"})
 _INVENTORY_ERROR: Final[str] = (
-    "--inventory-file must be a JSON list of app names or objects with a name"
+    "--inventory-file must be a JSON list of app names ([a-z0-9-]) "
+    "or objects with such a name"
 )
+_APP_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[a-z0-9-]+")
+_MONTH_RE: Final[re.Pattern[str]] = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,21 +86,31 @@ def build_parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name, help=description)
         _add_common_arguments(command)
         if name in _REPORT_COMMANDS:
-            command.add_argument("--record-month", action="store_true")
-            command.add_argument("--confidential-compute-changed", action="store_true")
+            _add_report_arguments(command)
     return parser
 
 
 def _add_common_arguments(command: argparse.ArgumentParser) -> None:
-    """Add the store, policy, provider, and inventory arguments."""
+    """Add the store and provider arguments every command needs."""
     command.add_argument("--database", type=Path, required=True)
-    command.add_argument("--policy-file", type=Path, required=True)
     command.add_argument("--fly-token-file", type=Path)
     command.add_argument("--fly-organization")
     command.add_argument("--fly-image")
     command.add_argument("--fly-api-base-url", default=_DEFAULT_API_BASE_URL)
     command.add_argument("--fly-token-expires-at")
+
+
+def _add_report_arguments(command: argparse.ArgumentParser) -> None:
+    """Add the policy, inventory and recording arguments of report/reconcile."""
+    command.add_argument("--policy-file", type=Path, required=True)
     command.add_argument("--inventory-file", type=Path)
+    command.add_argument("--record-month", metavar="YYYY-MM")
+    command.add_argument("--confidential-compute-changed", action="store_true")
+
+
+def _utc_now() -> datetime:
+    """Return the wall clock the CLI observes with unless a test injects one."""
+    return datetime.now(tz=UTC)
 
 
 def compose_fly(
@@ -168,10 +183,27 @@ def _load_inventory_names(
     names: list[str] = []
     for item in document:
         name = item.get("name", item.get("Name")) if isinstance(item, dict) else item
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or _APP_NAME_RE.fullmatch(name) is None:
             parser.error(_INVENTORY_ERROR)
         names.append(name)
     return tuple(names)
+
+
+def _record_month_target(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    now: datetime,
+) -> str | None:
+    """Validate ``--record-month``: a ``YYYY-MM`` month that has already ended."""
+    month: str | None = args.record_month
+    if month is None:
+        return None
+    if _MONTH_RE.fullmatch(month) is None:
+        parser.error("--record-month must be a calendar month written as YYYY-MM")
+    _, month_end = month_range(month)
+    if month_end > now:
+        parser.error("--record-month must name a month that has already ended")
+    return month
 
 
 def main(
@@ -180,17 +212,22 @@ def main(
     compose: Callable[
         [argparse.Namespace, argparse.ArgumentParser], FleetDriverBundle
     ] = compose_fly,
+    clock: Callable[[], datetime] = _utc_now,
 ) -> int:
     """Run one fleet command and return its exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    store = ProvisioningStore(args.database)
+    if args.command == "emergency-stop":
+        return _run_emergency_stop(store, compose(args, parser).stopper)
+    now = clock()
     policy_file = _load_policy(args.policy_file, parser)
     app_names = _load_inventory_names(args.inventory_file, parser)
-    store = ProvisioningStore(args.database)
+    month = _record_month_target(args, parser, now)
     bundle = compose(args, parser)
-    if args.command == "emergency-stop":
-        return _run_emergency_stop(store, bundle.stopper)
-    return _run_report(args, store, bundle, policy_file, app_names)
+    return _run_report(
+        args, store, bundle, policy_file, app_names, now=now, month=month
+    )
 
 
 def _run_report(
@@ -199,9 +236,11 @@ def _run_report(
     bundle: FleetDriverBundle,
     policy_file: PolicyFile,
     app_names: tuple[str, ...],
+    *,
+    now: datetime,
+    month: str | None,
 ) -> int:
     """Run one pass, print the JSON report, and log each alert content-free."""
-    now = datetime.now(tz=UTC)
     reconciler = FleetReconciler(
         store,
         bundle.inventory,
@@ -219,20 +258,42 @@ def _run_report(
     except ReconcileUnavailableError:
         print(json.dumps({"error": "provider_unavailable"}), file=sys.stderr)
         return _EXIT_UNAVAILABLE
-    if args.record_month:
-        store.record_budget_month(
-            month_key(now),
-            report.estimate.estimated_month,
-            policy_file.policy.monthly_budget,
-            policy_file.policy.currency,
-            now=now,
-        )
+    if month is not None:
+        _record_closed_month(store, report.telemetry, policy_file, month, now)
     for alert in report.alerts:
         _LOGGER.warning(
             "fleet alert kind=%s subject=%s", alert.kind.value, alert.subject
         )
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     return _EXIT_ALERTS if report.alerts else _EXIT_CLEAN
+
+
+def _record_closed_month(
+    store: ProvisioningStore,
+    telemetry: FleetTelemetry,
+    policy_file: PolicyFile,
+    month: str,
+    now: datetime,
+) -> None:
+    """Record *month* from its own stored running buckets plus injected usage.
+
+    Storage components come from the current inventory; compute comes from the
+    month's sampled seconds unless ``[usage]`` injected the invoice figure.
+    """
+    running = store.running_seconds_by_allocation(month)
+    closed = dataclasses.replace(
+        telemetry,
+        running_machine_seconds_by_allocation=running,
+        running_machine_seconds_fleet=sum(running.values()),
+    )
+    estimate = estimate_monthly_cost(closed, policy_file.policy, now=now, month=month)
+    store.record_budget_month(
+        month,
+        estimate.estimated_month,
+        policy_file.policy.monthly_budget,
+        policy_file.policy.currency,
+        now=now,
+    )
 
 
 def _has_live_allocation(entry: FleetJob) -> bool:

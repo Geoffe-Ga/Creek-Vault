@@ -34,6 +34,7 @@ from creek_mcp.provisioning.models import (
     ResourceClass,
     ResourceState,
 )
+from creek_mcp.provisioning.store import InvalidJobTransitionError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -99,7 +100,8 @@ _INJECTED_FIELDS: Final[dict[str, str]] = {
 
 
 class ReconcileUnavailableError(RuntimeError):
-    """The provider inventory could not be read; the pass wrote and repaired nothing."""
+    """The provider inventory could not be read: no observation was recorded and
+    no repair ran (the idempotent key-ceremony expiry sweep has already run)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,8 +349,7 @@ class FleetReconciler:
             )
             disposition = Disposition.REPORTED
             if repair and entry.job.state is JobState.FAILED and entry.job.retryable:
-                self._store.requeue_failed_delete(entry.job.job_id, now=now)
-                disposition = Disposition.REPAIRED
+                disposition = self._requeue(entry.job.job_id, now)
             divergences.append(
                 Divergence(
                     kind,
@@ -361,6 +362,15 @@ class FleetReconciler:
             )
         return divergences
 
+    def _requeue(self, job_id: str, now: datetime) -> Disposition:
+        """Requeue one failed delete; a concurrent transition leaves it reported."""
+        try:
+            self._store.requeue_failed_delete(job_id, now=now)
+        except InvalidJobTransitionError:
+            _LOGGER.info("fleet repair skipped kind=stuck_deletion subject=%s", job_id)
+            return Disposition.REPORTED
+        return Disposition.REPAIRED
+
     def _observe_machines(
         self,
         resources: Sequence[ProviderResource],
@@ -369,26 +379,38 @@ class FleetReconciler:
         *,
         repair: bool,
     ) -> list[Divergence]:
-        """Sample every Machine; stop an overrunning live one only under repair."""
+        """Sample each allocation once; stop an overrunning live one only under repair.
+
+        An allocation counts as running when any of its Machines is running, so
+        a stopped duplicate can never mask its running twin.
+        """
         limit = self._policy.max_continuous_running.total_seconds()
-        divergences: list[Divergence] = []
+        running_by_allocation: dict[str, bool] = {}
         for resource in filter(_is_machine, resources):
+            key = resource.provider_allocation_id
+            running_by_allocation[key] = running_by_allocation.get(key, False) or (
+                resource.state is ResourceState.RUNNING
+            )
+        divergences: list[Divergence] = []
+        for provider_allocation_id, running in sorted(running_by_allocation.items()):
             continuous, _ = self._store.record_machine_state(
-                resource.provider_allocation_id,
-                running=resource.state is ResourceState.RUNNING,
+                provider_allocation_id,
+                running=running,
                 now=now,
             )
             if continuous < limit:
                 continue
-            entry = desired.get(resource.provider_allocation_id)
+            entry = desired.get(provider_allocation_id)
             disposition = Disposition.REPORTED
             if repair and entry is not None and _is_live(entry):
-                disposition = self._stop(entry.job.activation_id, resource)
+                disposition = self._stop(
+                    entry.job.activation_id, provider_allocation_id
+                )
             divergences.append(
                 Divergence(
                     DivergenceKind.CONTINUOUS_RUNNING,
                     disposition,
-                    resource.provider_allocation_id,
+                    provider_allocation_id,
                     ResourceClass.MACHINE,
                     None if entry is None else entry.job.job_id,
                     continuous,
@@ -396,14 +418,14 @@ class FleetReconciler:
             )
         return divergences
 
-    def _stop(self, activation_id: str, resource: ProviderResource) -> Disposition:
+    def _stop(self, activation_id: str, provider_allocation_id: str) -> Disposition:
         """Stop one Machine; a provider refusal leaves the divergence reported."""
         try:
             self._stopper.stop(activation_id)
         except ProviderError as exc:
             _LOGGER.info(
                 "fleet repair refused kind=continuous_running subject=%s reason=%s",
-                resource.provider_allocation_id,
+                provider_allocation_id,
                 exc.reason.value,
             )
             return Disposition.REPORTED

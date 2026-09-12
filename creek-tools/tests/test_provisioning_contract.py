@@ -307,6 +307,10 @@ def test_runbook_documents_fleet_reconciliation_invoice_and_review_checkpoint() 
         "interrupts background work",
         "reference assumptions from adr-0013 decision 4, not defaults",
         "equal fires",
+        "only when the allocation is live",
+        "report --record-month yyyy-mm",
+        "refuses a month that has not ended",
+        "calendar-consecutive recorded months",
     ):
         assert phrase in text
     for field in (

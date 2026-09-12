@@ -113,6 +113,11 @@ _RECORD_ATTEMPT: Final[str] = (
     "UPDATE provisioning_deletion_receipts SET attempts = attempts + 1, "
     "last_failure_reason = ?, outcome = ? WHERE job_id = ?"
 )
+_LAZY_BACKFILL_RECEIPT: Final[str] = (
+    "INSERT OR IGNORE INTO provisioning_deletion_receipts "
+    "(job_id, requester_identity, consumer_identity, requested_at, outcome, "
+    "backfilled) VALUES (?, ?, ?, ?, 'pending', 1)"
+)
 _FLEET_JOBS: Final[str] = (
     "SELECT provisioning_jobs.*, "
     "provisioning_allocations.provider_allocation_id AS fleet_provider_allocation_id, "
@@ -212,21 +217,32 @@ def finalize_deletion_receipt(
     failure_reason: FailureReason | None,
     outcome: DeletionOutcome | None,
 ) -> None:
-    """Confirm or record an attempt on the receipt of a settling delete claim."""
+    """Confirm or record an attempt on the receipt of a settling delete claim.
+
+    A ``deleting`` row that somehow has no receipt is given a backfilled one
+    first (requested_at := the row's updated_at) so a deletion can always
+    settle; the post-condition then requires exactly one receipt row.
+    """
     if state is JobState.DELETED and outcome is not None:
         classes = ",".join(resource.value for resource in outcome.resource_classes)
-        cursor = connection.execute(
-            _CONFIRM_RECEIPT,
-            (timestamp(now), outcome.provider, classes, job["job_id"]),
-        )
+        statement = _CONFIRM_RECEIPT
+        parameters: tuple[object, ...] = (timestamp(now), outcome.provider, classes)
     elif state is JobState.FAILED and job["operation"] == JobOperation.DELETE.value:
         result = ReceiptOutcome.PENDING if retryable else ReceiptOutcome.FAILED
         reason = None if failure_reason is None else failure_reason.value
-        cursor = connection.execute(
-            _RECORD_ATTEMPT, (reason, result.value, job["job_id"])
-        )
+        statement, parameters = _RECORD_ATTEMPT, (reason, result.value)
     else:
         return
+    connection.execute(
+        _LAZY_BACKFILL_RECEIPT,
+        (
+            job["job_id"],
+            job["requester_identity"],
+            job["consumer_identity"],
+            job["updated_at"],
+        ),
+    )
+    cursor = connection.execute(statement, (*parameters, job["job_id"]))
     if cursor.rowcount != 1:
         raise MissingDeletionReceiptError("deletion receipt is missing")
 
@@ -314,12 +330,13 @@ def record_machine_state(
     running: bool,
     now: datetime,
 ) -> tuple[int, int]:
-    """Sample one Machine and return ``(continuous_seconds, month_to_date_seconds)``.
+    """Sample one allocation and return ``(continuous_seconds, month_to_date_seconds)``.
 
     Seconds accrue only between two consecutive *running* observations, split
     across UTC month buckets; a stop resets the continuous run; a replay at the
-    same instant accrues nothing.  Storage is one row per allocation plus one
-    per allocation-month, never a raw observation log.
+    same instant accrues nothing; a sample older than the stored observation is
+    ignored (nothing is written) so out-of-order passes cannot double count.
+    Storage is one row per allocation plus one per allocation-month.
     """
     row = connection.execute(
         "SELECT running_since, observed_at FROM provisioning_machine_running "
@@ -327,31 +344,49 @@ def record_machine_state(
         (provider_allocation_id,),
     ).fetchone()
     since = None if row is None else _optional_datetime(row["running_since"])
+    observed = None if row is None else datetime.fromisoformat(str(row["observed_at"]))
+    if observed is not None and now < observed:
+        return _continuous(since, observed), _bucket(
+            connection, provider_allocation_id, observed
+        )
     continuous = 0
-    if running and since is not None:
-        _accrue(connection, provider_allocation_id, row["observed_at"], now)
-        continuous = max(0, int((now - since).total_seconds()))
+    if running and since is not None and observed is not None:
+        _accrue(connection, provider_allocation_id, observed, now)
+        continuous = _continuous(since, now)
     running_since = timestamp(since or now) if running else None
     connection.execute(
         _UPSERT_RUNNING,
         (provider_allocation_id, running_since, timestamp(now)),
     )
+    return continuous, _bucket(connection, provider_allocation_id, now)
+
+
+def _continuous(since: datetime | None, until: datetime) -> int:
+    """Return whole seconds of the current continuous run ending at *until*."""
+    return 0 if since is None else max(0, int((until - since).total_seconds()))
+
+
+def _bucket(
+    connection: sqlite3.Connection,
+    provider_allocation_id: str,
+    instant: datetime,
+) -> int:
+    """Return the allocation's accrued seconds for the month holding *instant*."""
     bucket = connection.execute(
         "SELECT running_seconds FROM provisioning_machine_running_months "
         "WHERE provider_allocation_id = ? AND month = ?",
-        (provider_allocation_id, month_key(now)),
+        (provider_allocation_id, month_key(instant)),
     ).fetchone()
-    return continuous, 0 if bucket is None else int(bucket[0])
+    return 0 if bucket is None else int(bucket[0])
 
 
 def _accrue(
     connection: sqlite3.Connection,
     provider_allocation_id: str,
-    observed_at: object,
+    last: datetime,
     now: datetime,
 ) -> None:
     """Add the seconds between the previous running observation and *now*."""
-    last = datetime.fromisoformat(str(observed_at))
     for month, seconds in split_by_month(last, now):
         connection.execute(_ACCRUE_MONTH, (provider_allocation_id, month, seconds))
 
@@ -404,13 +439,14 @@ def requeue_failed_delete(
 ) -> sqlite3.Row | None:
     """Requeue a retryable failed delete; return the row, or None when not allowed.
 
-    A replay against the job already requeued (``deleting`` with a retry
-    recorded) is idempotent and returns the row unchanged.
+    A delete-operation row already ``deleting`` or ``deleted`` - whether from
+    an earlier requeue, a consumer's re-issued DELETE, or the worker settling
+    it - is an idempotent no-op and returns the row unchanged.
     """
     row = _job_row(connection, job_id)
     if row is None or row["operation"] != JobOperation.DELETE.value:
         return None
-    if row["state"] == JobState.DELETING.value and int(row["retry_count"]) > 0:
+    if row["state"] in {JobState.DELETING.value, JobState.DELETED.value}:
         return row
     if row["state"] != JobState.FAILED.value or not bool(row["retryable"]):
         return None
@@ -432,11 +468,38 @@ def _job_row(connection: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
 
 
 def months_over_budget(connection: sqlite3.Connection, limit: int) -> tuple[bool, ...]:
-    """Return the over-budget flag of the most recent *limit* recorded months."""
+    """Return over-budget flags for the latest recorded months, most recent first.
+
+    The window ends at the latest recorded month and stops at the first gap in
+    calendar-consecutive months, so a missing month can never be skipped over
+    when the ADR-0013 D7 rolling-months trigger is evaluated.
+    """
     if limit <= 0:
         return ()
     rows = connection.execute(
-        "SELECT over FROM provisioning_budget_months ORDER BY month DESC LIMIT ?",
+        "SELECT month, over FROM provisioning_budget_months "
+        "ORDER BY month DESC LIMIT ?",
         (limit,),
     ).fetchall()
-    return tuple(bool(row[0]) for row in rows)
+    flags: list[bool] = []
+    expected: str | None = None
+    for row in rows:
+        month = str(row[0])
+        if expected is not None and month != expected:
+            break
+        flags.append(bool(row[1]))
+        expected = previous_month(month)
+    return tuple(flags)
+
+
+def month_range(month: str) -> tuple[datetime, datetime]:
+    """Return the UTC start of ``YYYY-MM`` *month* and the start of the next month."""
+    year, month_number = (int(part) for part in month.split("-"))
+    start = datetime(year, month_number, 1, tzinfo=UTC)
+    return start, (start + _MONTH_ROLLOVER).replace(day=1)
+
+
+def previous_month(month: str) -> str:
+    """Return the ``YYYY-MM`` key of the month before *month*."""
+    start, _ = month_range(month)
+    return month_key(start - timedelta(days=1))

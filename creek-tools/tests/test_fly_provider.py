@@ -507,9 +507,10 @@ def test_list_resources_covers_injected_app_names_and_skips_missing_apps() -> No
     )
     api.apps["not-ours"] = {"id": "app-foreign", "name": "not-ours"}
 
+    missing_app = "creek-vault-" + "f" * 24
     resources = driver.list_resources(
         [],
-        app_names=[orphan_app, "not-ours", "creek-vault-missing"],
+        app_names=[orphan_app, "not-ours", missing_app, "creek-vault-missing"],
     )
     nothing = driver.list_resources(["activation-never-provisioned"])
 
@@ -524,9 +525,10 @@ def test_list_resources_covers_injected_app_names_and_skips_missing_apps() -> No
     )
     assert nothing == ()
     assert not any("not-ours" in path for _, path in api.requests)
-    assert [path for _, path in api.requests if "creek-vault-missing" in path] == [
-        "/v1/apps/creek-vault-missing"
+    assert [path for _, path in api.requests if missing_app in path] == [
+        f"/v1/apps/{missing_app}"
     ]
+    assert not any("creek-vault-missing" in path for _, path in api.requests)
     assert ("GET", "/v1/apps") not in api.requests
 
 
@@ -595,3 +597,57 @@ def test_malformed_inventory_bodies_fail_closed_without_leaking(
     rendered = caplog.text + str(raised.value) + repr(raised.value) + repr(driver)
     assert body_canary not in rendered
     assert PROVIDER_TOKEN not in rendered
+
+
+def test_injected_app_names_outside_the_strict_pattern_never_reach_the_provider() -> (
+    None
+):
+    """Only ``<prefix>-<24 hex>`` names are inventoried; nothing escapes the prefix."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    valid = "creek-vault-" + "a" * 24
+    api.apps[valid] = {"id": "app-valid", "name": valid}
+
+    resources = driver.list_resources(
+        [],
+        app_names=[
+            "creek-vault-x/../other-app",
+            "creek-vault-" + "A" * 24,
+            "creek-vault-" + "a" * 23,
+            "creek-vault-" + "a" * 25,
+            "creek-vault-../../v1/apps",
+            valid,
+        ],
+    )
+
+    assert [r.provider_ref for r in resources] == ["app-valid"]
+    assert [path for _, path in api.requests] == [
+        f"/v1/apps/{valid}",
+        f"/v1/apps/{valid}/machines",
+        f"/v1/apps/{valid}/volumes",
+    ]
+    assert all(path.startswith("/v1/apps/creek-vault-") for _, path in api.requests)
+    assert not any(".." in path or "other-app" in path for _, path in api.requests)
+
+
+def test_fly_provision_and_delete_leave_no_secret_in_the_durable_database(
+    tmp_path: Path,
+) -> None:
+    """The SQLite file and the receipt carry no provider, consumer or TLS secret."""
+    api = FakeFlyAPI()
+    database = tmp_path / "provisioning.sqlite3"
+    store = ProvisioningStore(database)
+    worker = ProvisioningWorker(store, fly_driver(api), FakeOneTimeHandoff())
+    job = store.submit("activation-fly-bytes", "adepthood", now=_NOW)
+    assert worker.run_once(now=_NOW) is True
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    assert worker.run_once(now=_NOW) is True
+
+    persisted = database.read_bytes()
+    receipt = store.list_deletion_receipts()[0]
+
+    assert receipt.outcome.value == "confirmed"
+    assert receipt.provider == "fly"
+    for canary in (PROVIDER_TOKEN, CONSUMER_TOKEN, TLS_KEY):
+        assert canary.encode() not in persisted
+        assert canary not in repr(receipt)

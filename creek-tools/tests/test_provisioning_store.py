@@ -875,3 +875,104 @@ def test_budget_months_record_and_report_most_recent_first(
     assert store.months_over_budget(2) == (True, False)
     assert store.months_over_budget(5) == (True, False, True)
     assert store.months_over_budget(0) == ()
+
+
+def test_requeue_is_a_no_op_for_a_delete_already_deleting_or_deleted(
+    store: ProvisioningStore,
+) -> None:
+    """A consumer re-issued DELETE between snapshot and repair cannot raise."""
+    finished = _ready_job(store, "activation-requeue-finished", "alloc-finished")
+    store.request_delete(finished, "adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    assert claim.job.job_id == finished
+    store.complete_delete(finished, claim.lease_token, _OUTCOME, now=_NOW)
+    reissued = _ready_job(store, "activation-requeue-reissued", "alloc-reissued")
+    store.request_delete(reissued, "adepthood", now=_NOW)
+    _fail_delete(store, reissued, retryable=True)
+    store.request_delete(reissued, "adepthood", now=_NOW + timedelta(seconds=30))
+
+    deleting = store.requeue_failed_delete(reissued, now=_NOW + timedelta(minutes=1))
+    deleted = store.requeue_failed_delete(finished, now=_NOW + timedelta(minutes=1))
+
+    assert deleting.state is JobState.DELETING
+    assert deleting.updated_at == _NOW + timedelta(seconds=30)
+    assert deleted.state is JobState.DELETED
+    assert deleted.updated_at == _NOW
+
+
+def test_record_machine_state_ignores_a_sample_older_than_the_last_observation(
+    store: ProvisioningStore,
+) -> None:
+    """Out-of-order samples neither rewind observed_at nor double count."""
+    start = datetime(2026, 9, 3, 10, tzinfo=UTC)
+    store.record_machine_state("fly-order", running=True, now=start)
+    store.record_machine_state(
+        "fly-order", running=True, now=start + timedelta(hours=1)
+    )
+
+    stale = store.record_machine_state(
+        "fly-order", running=True, now=start + timedelta(minutes=30)
+    )
+    later = store.record_machine_state(
+        "fly-order", running=True, now=start + timedelta(hours=2)
+    )
+
+    assert stale == (3600, 3600)
+    assert later == (7200, 7200)
+    assert store.running_seconds_by_allocation("2026-09") == {"fly-order": 7200}
+
+
+def test_a_receipt_less_deleting_row_still_settles_with_a_backfilled_receipt(
+    store: ProvisioningStore,
+    tmp_path: Path,
+) -> None:
+    """A missing receipt is opened lazily at settlement, never a wedged job."""
+
+    def drop_receipt(job_id: str) -> None:
+        with closing(sqlite3.connect(tmp_path / "provisioning.sqlite3")) as connection:
+            connection.execute(
+                "DELETE FROM provisioning_deletion_receipts WHERE job_id = ?",
+                (job_id,),
+            )
+            connection.commit()
+        assert job_id not in {r.job_id for r in store.list_deletion_receipts()}
+
+    confirmed = _ready_job(store, "activation-lazy-confirm", "alloc-lazy-confirm")
+    store.request_delete(confirmed, "adepthood", now=_NOW)
+    drop_receipt(confirmed)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    settled = store.complete_delete(
+        confirmed, claim.lease_token, _OUTCOME, now=_NOW + timedelta(minutes=1)
+    )
+    attempted = _ready_job(store, "activation-lazy-attempt", "alloc-lazy-attempt")
+    store.request_delete(attempted, "adepthood", now=_NOW + timedelta(seconds=1))
+    drop_receipt(attempted)
+    _fail_delete(store, attempted, retryable=True)
+
+    receipts = {r.job_id: r for r in store.list_deletion_receipts()}
+    assert settled.state is JobState.DELETED
+    assert receipts[confirmed].outcome is ReceiptOutcome.CONFIRMED
+    assert receipts[confirmed].backfilled is True
+    assert receipts[confirmed].requested_at == _NOW
+    assert receipts[confirmed].provider == "fake"
+    assert receipts[confirmed].provider_allocation_id == "alloc-lazy-confirm"
+    assert receipts[attempted].outcome is ReceiptOutcome.PENDING
+    assert receipts[attempted].backfilled is True
+    assert receipts[attempted].attempts == 1
+
+
+def test_months_over_budget_requires_calendar_consecutive_months_to_the_latest(
+    store: ProvisioningStore,
+) -> None:
+    """A gap in the recorded history ends the D7 window; year boundaries do not."""
+    budget = Decimal("100.00")
+    over = Decimal("150.00")
+    for month in ("2025-12", "2026-01", "2026-03", "2026-04"):
+        store.record_budget_month(month, over, budget, "USD", now=_NOW)
+
+    assert store.months_over_budget(4) == (True, True)
+    store.record_budget_month("2026-02", over, budget, "USD", now=_NOW)
+    assert store.months_over_budget(4) == (True, True, True, True)
+    assert store.months_over_budget(5) == (True, True, True, True, True)

@@ -6,6 +6,8 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -49,9 +51,18 @@ from creek_mcp.provisioning.reconcile import (
     FleetReport,
     ReconcileUnavailableError,
 )
-from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.store import (
+    InvalidJobTransitionError,
+    ProvisioningStore,
+)
 from creek_mcp.provisioning.worker import ProvisioningWorker
-from tests.fly_support import FakeFlyAPI, fly_driver
+from tests.fly_support import (
+    CONSUMER_TOKEN,
+    PROVIDER_TOKEN,
+    TLS_KEY,
+    FakeFlyAPI,
+    fly_driver,
+)
 
 _NOW = datetime(2026, 9, 10, 9, tzinfo=UTC)
 _CANARY = "fleet-token-canary-must-not-appear"
@@ -84,6 +95,23 @@ def store(tmp_path: Path) -> ProvisioningStore:
 def _policy(**overrides: Any) -> FleetPolicy:
     """Return the injected (non-ADR) reference policy."""
     return FleetPolicy.from_mapping({**_POLICY, **overrides})
+
+
+class LoudProviderError(ProviderError):
+    """A provider error whose rendering would leak if anything printed it."""
+
+    def __str__(self) -> str:
+        """Render the canary so any str()/f-string use is detectable."""
+        return _CANARY
+
+
+def _machine_rows(tmp_path: Path) -> int:
+    """Return how many per-allocation running-sample rows exist."""
+    with closing(sqlite3.connect(tmp_path / "provisioning.sqlite3")) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM provisioning_machine_running"
+        ).fetchone()
+    return int(row[0])
 
 
 def _reconciler(
@@ -232,6 +260,22 @@ def test_orphan_resource_is_reported_idempotently_and_never_destroyed(
             "vol-x",
         )
     )
+    driver.seed_resource(
+        ProviderResource(
+            "fake-orphan-000",
+            ResourceClass.MACHINE,
+            ResourceState.STOPPED,
+            None,
+            None,
+            "machine-nosize",
+        )
+    )
+    store.submit(
+        "activation-fleet-001-alias",
+        "activation-fleet-001",
+        requester_identity="adepthood",
+        now=_NOW,
+    )
     reconciler = _reconciler(store, driver)
 
     with caplog.at_level(logging.INFO):
@@ -240,6 +284,14 @@ def test_orphan_resource_is_reported_idempotently_and_never_destroyed(
 
     assert isinstance(one, FleetReport)
     assert one.divergences == (
+        Divergence(
+            DivergenceKind.ORPHAN_RESOURCE,
+            Disposition.REPORTED,
+            "fake-orphan-000",
+            ResourceClass.MACHINE,
+            None,
+            None,
+        ),
         Divergence(
             DivergenceKind.ORPHAN_RESOURCE,
             Disposition.REPORTED,
@@ -259,11 +311,15 @@ def test_orphan_resource_is_reported_idempotently_and_never_destroyed(
     assert one.telemetry.provisioned_volumes == 2
     assert one.telemetry.volume_bytes == 10 * _GIB
     assert one.telemetry.stopped_rootfs_gb == 1
-    assert one.telemetry.orphan_resources == 1
+    assert one.telemetry.machines_without_rootfs_size == 1
+    assert one.telemetry.duplicate_allocation_attempts == 1
+    assert one.telemetry.orphan_resources == 2
+    assert one.estimate.unpriced == ("egress", "snapshot", "stopped_rootfs")
     assert one.telemetry.unconfirmed_deletions == 0
     assert one.telemetry.snapshot_bytes is None
     assert one.telemetry.allocations_by_state == {"awaiting_key_ceremony": 1}
     assert one.alerts == (
+        Alert(AlertKind.ORPHAN_RESOURCE, "fake-orphan-000", None, None, None),
         Alert(AlertKind.ORPHAN_RESOURCE, "fake-orphan-000", None, None, None),
     )
     assert one.review_triggers == ()
@@ -523,19 +579,16 @@ def test_continuous_running_is_stopped_once_only_by_repair_and_seconds_accrue(
 
 def test_a_failing_stop_leaves_the_divergence_reported(
     store: ProvisioningStore,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A provider refusal during repair is content-free and never escalates."""
 
     class RefusingStop(FakeProviderDriver):
-        """Refuse every stop with a private detail that must not surface."""
+        """Refuse every stop with an error that renders a canary if printed."""
 
         def stop(self, activation_id: str) -> None:
             del activation_id
-            raise ProviderError(
-                FailureReason.PROVIDER_UNAVAILABLE,
-                retryable=True,
-                private_detail=_CANARY,
-            )
+            raise LoudProviderError(FailureReason.PROVIDER_UNAVAILABLE, retryable=True)
 
     driver = RefusingStop()
     _activate(store, driver, "activation-stubborn")
@@ -545,15 +598,19 @@ def test_a_failing_stop_leaves_the_divergence_reported(
     reconciler = _reconciler(store, driver)
     reconciler.run_once(now=_NOW, repair=True)
 
-    report = reconciler.run_once(now=_NOW + timedelta(hours=1), repair=True)
+    with caplog.at_level(logging.DEBUG):
+        report = reconciler.run_once(now=_NOW + timedelta(hours=1), repair=True)
 
     assert report.divergences[0].kind is DivergenceKind.CONTINUOUS_RUNNING
     assert report.divergences[0].disposition is Disposition.REPORTED
-    assert _CANARY not in repr(report)
+    assert "fleet repair refused kind=continuous_running subject=" in caplog.text
+    assert _CANARY not in repr(report) + caplog.text
 
 
 def test_provider_outage_during_inventory_aborts_without_repairs_or_observations(
     store: ProvisioningStore,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An unreadable inventory is an abort, never a clean report or a repair."""
 
@@ -567,11 +624,7 @@ def test_provider_outage_during_inventory_aborts_without_repairs_or_observations
             app_names: Any = (),
         ) -> tuple[ProviderResource, ...]:
             del activation_ids, app_names
-            raise ProviderError(
-                FailureReason.PROVIDER_UNAVAILABLE,
-                retryable=True,
-                private_detail=_CANARY,
-            )
+            raise LoudProviderError(FailureReason.PROVIDER_UNAVAILABLE, retryable=True)
 
     driver = Outage()
     _activate(store, driver, "activation-outage")
@@ -579,13 +632,16 @@ def test_provider_outage_during_inventory_aborts_without_repairs_or_observations
         driver.expected_allocation_id("activation-outage"), ResourceState.RUNNING
     )
 
-    with pytest.raises(ReconcileUnavailableError) as raised:
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(ReconcileUnavailableError) as raised,
+    ):
         _reconciler(store, driver).run_once(now=_NOW, repair=True)
 
-    assert _CANARY not in str(raised.value) + repr(raised.value)
+    assert _CANARY not in str(raised.value) + repr(raised.value) + caplog.text
     assert driver.stop_count == 0
     assert store.running_seconds_by_allocation("2026-09") == {}
-    assert store.record_machine_state("probe", running=True, now=_NOW) == (0, 0)
+    assert _machine_rows(tmp_path) == 0
 
 
 def test_telemetry_marks_snapshot_and_egress_unknown_unless_injected(
@@ -672,6 +728,7 @@ def test_review_triggers_surface_from_durable_budget_months_and_the_manual_flag(
 
 def test_known_set_is_bounded_by_live_and_pending_deletions(
     store: ProvisioningStore,
+    tmp_path: Path,
 ) -> None:
     """Confirmed-deleted jobs are never re-inspected on the provider."""
     api = FakeFlyAPI()
@@ -713,3 +770,120 @@ def test_known_set_is_bounded_by_live_and_pending_deletions(
         for receipt in store.list_deletion_receipts()
     )
     assert store.get(live.job_id, "a") is not None
+    persisted = (tmp_path / "provisioning.sqlite3").read_bytes()
+    for canary in (PROVIDER_TOKEN, CONSUMER_TOKEN, TLS_KEY):
+        assert canary.encode() not in persisted
+        assert canary not in repr(store.list_deletion_receipts())
+
+
+def test_a_delete_reissued_during_the_pass_cannot_abort_the_repair(
+    store: ProvisioningStore,
+) -> None:
+    """The consumer's 30 s DELETE poll landing mid-pass is benign, not a crash."""
+    driver = FakeProviderDriver()
+    job_id = _activate(store, driver, "activation-reissued")
+    store.request_delete(job_id, "adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_UNAVAILABLE,
+        retryable=True,
+        now=_NOW,
+    )
+
+    class ReissuingInventory(FakeProviderDriver):
+        """Re-issue the consumer DELETE between the store snapshot and the repair."""
+
+        def list_resources(
+            self,
+            activation_ids: Any,
+            *,
+            app_names: Any = (),
+        ) -> tuple[ProviderResource, ...]:
+            store.request_delete(job_id, "adepthood", now=_NOW + timedelta(seconds=5))
+            return driver.list_resources(activation_ids, app_names=app_names)
+
+    report = FleetReconciler(store, ReissuingInventory(), driver, _policy()).run_once(
+        now=_NOW + timedelta(seconds=10), repair=True
+    )
+    job = store.get(job_id, "adepthood")
+
+    assert job is not None
+    assert job.state is JobState.DELETING
+    assert [d.kind for d in report.divergences] == [DivergenceKind.UNCONFIRMED_DELETION]
+
+
+def test_a_store_that_still_refuses_the_requeue_leaves_the_divergence_reported(
+    store: ProvisioningStore,
+    tmp_path: Path,
+) -> None:
+    """Belt and braces: an InvalidJobTransitionError never escapes run_once."""
+
+    class RefusingStore(ProvisioningStore):
+        """Refuse every requeue as a concurrent transition would."""
+
+        def requeue_failed_delete(
+            self,
+            job_id: str,
+            *,
+            now: datetime | None = None,
+        ) -> ProvisioningJob:
+            del job_id, now
+            raise InvalidJobTransitionError("job is not a requeueable delete")
+
+    driver = FakeProviderDriver()
+    job_id = _activate(store, driver, "activation-refused")
+    store.request_delete(job_id, "adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_UNAVAILABLE,
+        retryable=True,
+        now=_NOW,
+    )
+    refusing = RefusingStore(tmp_path / "provisioning.sqlite3")
+
+    report = FleetReconciler(refusing, driver, driver, _policy()).run_once(
+        now=_NOW + timedelta(seconds=10), repair=True
+    )
+
+    assert report.divergences[0].kind is DivergenceKind.UNCONFIRMED_DELETION
+    assert report.divergences[0].disposition is Disposition.REPORTED
+    job = store.get(job_id, "adepthood")
+    assert job is not None
+    assert job.state is JobState.FAILED
+
+
+def test_a_stopped_duplicate_machine_does_not_mask_its_running_twin(
+    store: ProvisioningStore,
+    tmp_path: Path,
+) -> None:
+    """Observation is per allocation: running = any Machine running."""
+    driver = FakeProviderDriver()
+    job_id = _activate(store, driver, "activation-twins")
+    pid = driver.expected_allocation_id("activation-twins")
+    driver.set_machine_state(pid, ResourceState.RUNNING)
+    driver.seed_resource(
+        ProviderResource(
+            pid, ResourceClass.MACHINE, ResourceState.STOPPED, 1, None, "m-twin"
+        )
+    )
+    reconciler = _reconciler(store, driver)
+
+    reconciler.run_once(now=_NOW, repair=False)
+    report = reconciler.run_once(now=_NOW + timedelta(hours=1), repair=False)
+
+    kinds = [(d.kind, d.resource_class) for d in report.divergences]
+    assert (DivergenceKind.CONTINUOUS_RUNNING, ResourceClass.MACHINE) in kinds
+    assert (DivergenceKind.DUPLICATE_RESOURCE, ResourceClass.MACHINE) in kinds
+    hot = next(
+        d for d in report.divergences if d.kind is DivergenceKind.CONTINUOUS_RUNNING
+    )
+    assert hot.age_seconds == 3600
+    assert hot.job_id == job_id
+    assert report.telemetry.running_machine_seconds_by_allocation == {pid: 3600}
+    assert _machine_rows(tmp_path) == 1

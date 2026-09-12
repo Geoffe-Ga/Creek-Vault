@@ -188,9 +188,12 @@ def _decimal(value: object, key: str) -> Decimal:
     if isinstance(value, bool) or not isinstance(value, int | str | Decimal):
         raise ValueError(f"{key} must be a decimal string, integer, or TOML number")
     try:
-        return Decimal(value)
+        amount = Decimal(value)
     except InvalidOperation as exc:
         raise ValueError(f"{key} is not a decimal amount") from exc
+    if not amount.is_finite():
+        raise ValueError(f"{key} must be a finite decimal amount")
+    return amount
 
 
 def _money(mapping: Mapping[str, object], key: str) -> Decimal:
@@ -234,6 +237,7 @@ class RunningBasis(StrEnum):
     INJECTED = "injected"
     PROJECTED = "projected"
     MONTH_TO_DATE = "month_to_date"
+    CLOSED_MONTH = "closed_month"
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,12 +270,16 @@ def _month_bounds(now: datetime) -> tuple[datetime, datetime]:
 
 
 def _running_seconds(
-    telemetry: FleetTelemetry, now: datetime
+    telemetry: FleetTelemetry,
+    now: datetime,
+    month: str | None,
 ) -> tuple[Decimal, RunningBasis]:
-    """Pick injected, projected, or month-to-date running seconds, in that order."""
+    """Pick injected, closed-month, projected, or month-to-date running seconds."""
     if telemetry.running_seconds_injected is not None:
         return Decimal(telemetry.running_seconds_injected), RunningBasis.INJECTED
     sampled = Decimal(telemetry.running_machine_seconds_fleet)
+    if month is not None:
+        return sampled, RunningBasis.CLOSED_MONTH
     start, end = _month_bounds(now)
     elapsed = now - start
     if elapsed < _PROJECTION_MIN_ELAPSED:
@@ -285,17 +293,26 @@ def estimate_monthly_cost(
     policy: FleetPolicy,
     *,
     now: datetime,
+    month: str | None = None,
 ) -> CostEstimate:
-    """Estimate the calendar month from telemetry and the injected policy only."""
+    """Estimate one calendar month from telemetry and the injected policy only.
+
+    With *month* set (``YYYY-MM``, a closed month) the sampled running seconds
+    in *telemetry* are taken as that month's complete figure and never
+    projected.  Machines whose root filesystem size the provider did not
+    report make ``stopped_rootfs`` an unpriced input as well as a component.
+    """
     components: dict[str, Decimal] = {
         "volume": _gb(telemetry.volume_bytes) * policy.volume_gb_month_rate,
         "stopped_rootfs": (
             Decimal(telemetry.stopped_rootfs_gb) * policy.stopped_rootfs_gb_month_rate
         ),
     }
-    seconds, basis = _running_seconds(telemetry, now)
+    seconds, basis = _running_seconds(telemetry, now, month)
     components["running"] = seconds / _SECONDS_PER_HOUR * policy.running_hour_rate
     unpriced: list[str] = []
+    if telemetry.machines_without_rootfs_size:
+        unpriced.append("stopped_rootfs")
     priced_inputs = (
         ("egress", telemetry.egress_bytes, policy.egress_gb_rate),
         ("snapshot", telemetry.snapshot_bytes, policy.snapshot_gb_month_rate),
@@ -310,7 +327,7 @@ def estimate_monthly_cost(
         currency=policy.currency,
         estimated_month=_cents(total),
         components={name: _cents(value) for name, value in components.items()},
-        unpriced=tuple(unpriced),
+        unpriced=tuple(sorted(unpriced)),
         running_basis=basis,
     )
 

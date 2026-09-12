@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+import sqlite3
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -153,6 +155,22 @@ def test_report_prints_json_exits_three_on_alerts_and_never_repairs(
             "vol-x",
         )
     )
+    driver.seed_resource(
+        ProviderResource(
+            "fake-orphan-000",
+            ResourceClass.MACHINE,
+            ResourceState.STOPPED,
+            None,
+            None,
+            "machine-nosize",
+        )
+    )
+    store.submit(
+        "activation-cli-live-alias",
+        "activation-cli-live",
+        requester_identity="a",
+        now=_NOW,
+    )
     common = ["--database", str(database), "--policy-file", _policy_file(tmp_path)]
 
     with caplog.at_level(logging.INFO):
@@ -160,8 +178,15 @@ def test_report_prints_json_exits_three_on_alerts_and_never_repairs(
     report_out = capsys.readouterr()
     still_failed = store.get(doomed, "a")
     reconcile_code = main(
-        ["reconcile", *common, "--record-month", "--confidential-compute-changed"],
+        [
+            "reconcile",
+            *common,
+            "--record-month",
+            "2026-08",
+            "--confidential-compute-changed",
+        ],
         compose=_compose(driver),
+        clock=lambda: datetime(2026, 9, 1, 2, tzinfo=UTC),
     )
     reconcile_out = capsys.readouterr()
     requeued = store.get(doomed, "a")
@@ -173,9 +198,13 @@ def test_report_prints_json_exits_three_on_alerts_and_never_repairs(
     # also older than the injected stuck threshold by the time it runs.
     assert [alert["kind"] for alert in document["alerts"]] == [
         "orphan_resource",
+        "orphan_resource",
         "stuck_deletion",
     ]
     assert document["telemetry"]["snapshot_bytes"] is None
+    assert document["telemetry"]["machines_without_rootfs_size"] == 1
+    assert document["telemetry"]["duplicate_allocation_attempts"] == 1
+    assert document["estimate"]["unpriced"] == ["egress", "snapshot", "stopped_rootfs"]
     assert document["inventory_mode"] == "derived"
     assert still_failed is not None
     assert still_failed.state is JobState.FAILED
@@ -262,8 +291,14 @@ def test_emergency_stop_stops_live_machines_never_deletes_and_continues_past_fai
     driver = fly_driver(api)
     database = tmp_path / "jobs.sqlite3"
     store = ProvisioningStore(database)
+    earlier = _NOW - timedelta(seconds=1)
+    doomed = store.submit(
+        "activation-stop-2", "activation-stop-2", requester_identity="a", now=earlier
+    )
+    assert ProvisioningWorker(store, driver, FakeOneTimeHandoff()).run_once(now=earlier)
     job_ids = [
-        _activate(store, driver, f"activation-stop-{number}") for number in range(3)
+        doomed.job_id,
+        *(_activate(store, driver, f"activation-stop-{number}") for number in range(2)),
     ]
     for activation in ("activation-stop-0", "activation-stop-1"):
         driver.start(activation)
@@ -279,13 +314,7 @@ def test_emergency_stop_stops_live_machines_never_deletes_and_continues_past_fai
     api.requests.clear()
 
     code = main(
-        [
-            "emergency-stop",
-            "--database",
-            str(database),
-            "--policy-file",
-            _policy_file(tmp_path),
-        ],
+        ["emergency-stop", "--database", str(database)],
         compose=_compose(driver),
     )
     captured = capsys.readouterr()
@@ -294,12 +323,14 @@ def test_emergency_stop_stops_live_machines_never_deletes_and_continues_past_fai
     document = json.loads(captured.out)
     assert document["stopped"] == 2
     assert document["failed"] == 1
-    assert sorted(outcome["outcome"] for outcome in document["outcomes"]) == [
+    assert [outcome["outcome"] for outcome in document["outcomes"]] == [
         "failed:provider_unavailable",
         "ok",
         "ok",
     ]
-    assert {outcome["job_id"] for outcome in document["outcomes"]} == set(job_ids)
+    ordered = [outcome["job_id"] for outcome in document["outcomes"]]
+    assert ordered[0] == job_ids[0]
+    assert set(ordered[1:]) == set(job_ids[1:])
     assert all(
         machine["state"] == "stopped"
         for machines in api.machines.values()
@@ -422,6 +453,43 @@ def test_cli_takes_the_fly_token_only_from_an_owner_only_file_and_rejects_bad_in
     )
     assert code == 2
     assert "--inventory-file" in err
+    inventory.write_text(json.dumps(["creek-vault-x/../other-app"]), encoding="utf-8")
+    code, err = run(
+        [
+            "report",
+            "--database",
+            database,
+            "--policy-file",
+            policy,
+            "--inventory-file",
+            str(inventory),
+        ],
+        compose=_compose(FakeProviderDriver()),
+    )
+    assert code == 2
+    assert "--inventory-file" in err
+    assert "other-app" not in err
+
+    for literal in ("nan", "inf", "-inf"):
+        not_finite = _policy_file(
+            tmp_path,
+            _POLICY_TOML.replace(
+                "monthly_budget = 100.00", f"monthly_budget = {literal}"
+            ),
+            f"{literal.strip('-')}.toml",
+        )
+        code, err = run(
+            ["report", "--database", database, "--policy-file", not_finite],
+            compose=_compose(FakeProviderDriver()),
+        )
+        assert code == 2
+        assert "monthly_budget" in err
+
+    code, err = run(
+        ["report", "--database", database], compose=_compose(FakeProviderDriver())
+    )
+    assert code == 2
+    assert "--policy-file" in err
 
 
 def test_inventory_file_names_reach_the_driver_and_mark_the_report_mode(
@@ -501,3 +569,77 @@ def test_fly_composition_uses_a_refusing_secret_manager_and_fails_closed_on_prov
     assert raised.value.retryable is False
     assert not any(method == "POST" for method, _ in api.requests)
     assert bundle.inventory.list_resources([]) == ()
+
+
+def test_record_month_names_a_closed_month_and_refuses_an_open_one(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The closed month is recorded from its own buckets and injected usage."""
+    database = tmp_path / "jobs.sqlite3"
+    store = ProvisioningStore(database)
+    driver = FakeProviderDriver()
+    _activate(store, driver, "activation-month")
+    pid = driver.expected_allocation_id("activation-month")
+    august = datetime(2026, 8, 20, tzinfo=UTC)
+    store.record_machine_state(pid, running=True, now=august)
+    store.record_machine_state(pid, running=True, now=august + timedelta(hours=10))
+    store.record_machine_state(pid, running=False, now=august + timedelta(hours=11))
+    clock = datetime(2026, 9, 1, 2, tzinfo=UTC)
+    common = ["--database", str(database), "--policy-file", _policy_file(tmp_path)]
+
+    code = main(
+        ["report", *common, "--record-month", "2026-08"],
+        compose=_compose(driver),
+        clock=lambda: clock,
+    )
+    document = json.loads(capsys.readouterr().out)
+    with closing(sqlite3.connect(database)) as connection:
+        rows = connection.execute(
+            "SELECT month, estimated, over FROM provisioning_budget_months"
+        ).fetchall()
+
+    assert code == 0
+    assert rows == [("2026-08", "1.20", 0)]
+    assert document["estimate"]["running_basis"] == "month_to_date"
+    assert document["observed_at"] == clock.isoformat()
+    for month in ("2026-09", "2026-13", "202608", "2026-9"):
+        with pytest.raises(SystemExit) as caught:
+            main(
+                ["report", *common, "--record-month", month],
+                compose=_compose(driver),
+                clock=lambda: clock,
+            )
+        assert caught.value.code == 2
+        assert "--record-month" in capsys.readouterr().err
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM provisioning_budget_months"
+        ).fetchone() == (1,)
+
+
+def test_emergency_stop_needs_neither_a_policy_nor_an_inventory_file(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An operator in a hurry is never blocked by an unrelated file."""
+    database = tmp_path / "jobs.sqlite3"
+    store = ProvisioningStore(database)
+    driver = FakeProviderDriver()
+    _activate(store, driver, "activation-hurry")
+    pid = driver.expected_allocation_id("activation-hurry")
+    driver.set_machine_state(pid, ResourceState.RUNNING)
+
+    code = main(
+        ["emergency-stop", "--database", str(database)], compose=_compose(driver)
+    )
+    document = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert document["stopped"] == 1
+    assert document["failed"] == 0
+    assert [o["provider_allocation_id"] for o in document["outcomes"]] == [pid]
+    assert driver.stop_count == 1
+    with pytest.raises(SystemExit) as caught:
+        main(["emergency-stop", "--database", str(database), "--policy-file", "x"])
+    assert caught.value.code == 2

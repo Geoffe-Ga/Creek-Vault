@@ -357,14 +357,18 @@ class FlyProviderDriver:
     ) -> tuple[ProviderResource, ...]:
         """Inventory the bounded known set with per-app GET calls only.
 
-        Apps are derived from *activation_ids* and taken from *app_names* under
-        the configured prefix; there is no org-wide listing.  Every resource is
+        Apps are derived from *activation_ids* and taken from *app_names* only
+        when they match the derived shape ``<app_prefix>-<24 hex>`` exactly;
+        there is no org-wide listing.  Every resource is
         grouped by the allocation id derived from the app it lives in, never by
         the metadata it claims.
         """
         prefix = f"{self._policy.app_prefix}-"
+        derived = re.compile(
+            rf"{re.escape(prefix)}[0-9a-f]{{{_ALLOCATION_DIGEST_LENGTH}}}"
+        )
         names = {self._reference(activation).app_name for activation in activation_ids}
-        names.update(name for name in app_names if name.startswith(prefix))
+        names.update(name for name in app_names if derived.fullmatch(name))
         resources: list[ProviderResource] = []
         for name in sorted(names):
             app = self._app_by_name(name)

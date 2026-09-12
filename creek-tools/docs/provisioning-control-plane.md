@@ -197,7 +197,7 @@ months_over_budget = 3
 | `duplicate_resource` | a live allocation owns more than one Machine or live volume | inspect the app; the worker's create path refuses duplicates, so this is a provider-side leftover |
 | `orphan_resource` | a resource exists under an app the store does not want (no job, or the job is confirmed deleted) | confirm on the provider console, then delete it there; the tool never deletes |
 | `stuck_deletion` | a deletion has been unconfirmed for at least `stuck_deletion_seconds` | `reconcile` requeues a retryable failure; a non-retryable one needs the provider console |
-| `continuous_running` | a Machine has been observed running for at least `max_continuous_running_seconds` | `reconcile` stops it (this interrupts background work); `report` only reports |
+| `continuous_running` | a Machine has been observed running for at least `max_continuous_running_seconds` | `reconcile` stops it only when the allocation is live (this interrupts background work); an orphan or deleting Machine is reported only - stop it on the provider console; `report` only reports |
 | `monthly_budget_departure` | the month estimate is greater than or equal to `monthly_budget` (equal fires) | reconcile the invoice below and revisit the budget or the fleet |
 
 `missing_resource` and `unconfirmed_deletion` appear under `divergences` but
@@ -219,6 +219,7 @@ from the invoice into `[usage]`), or `unavailable` (`null`, never `0`).
 | `running_seconds_injected` | Machine compute hours | injected; reported beside the sampled figure, never instead of it |
 | `snapshot_bytes` | volume snapshot storage | injected or unavailable |
 | `egress_bytes` | outbound data transfer | injected or unavailable |
+| `machines_without_rootfs_size` | Machines whose root filesystem size the provider did not report; when non-zero, `stopped_rootfs` is also listed under `unpriced` | provider |
 | `activated_allocations`, `allocations_by_state` | number of billable allocations | store |
 | `duplicate_allocation_attempts` | (none; duplicate attempts the store absorbed) | store |
 | `orphan_resources`, `unconfirmed_deletions`, `oldest_unconfirmed_deletion_seconds` | resources that may still be billed | provider / store |
@@ -227,14 +228,19 @@ The estimate uses injected running seconds when present; otherwise it uses the
 sampled month-to-date figure, projected to the calendar month only once at
 least one day of the month has elapsed (`running_basis` says which). Storage
 components are full-month rates. Unpriced or unknown inputs are listed under
-`unpriced` rather than silently counted as zero.
+`unpriced` rather than silently counted as zero; a Machine whose root
+filesystem size the provider omitted adds `stopped_rootfs` to that list.
 
-Monthly walkthrough: on the first of the month run `report --record-month`
-(this writes the month's estimate to `provisioning_budget_months`); when the
-invoice arrives, copy its snapshot, egress, and running figures into
-`[usage]`, rerun `report`, and compare `estimate.estimated_month` and its
-`components` with the invoice lines. The tool's `--record-month` history is
-what makes the three-rolling-months review trigger evaluable.
+Monthly walkthrough: when the invoice for a closed month arrives, copy its
+snapshot, egress, and running figures into `[usage]`, then run
+`report --record-month YYYY-MM` naming that closed month. The tool refuses a
+month that has not ended, computes the month's compute from its own stored
+running buckets (or the injected `[usage]` running seconds) without any
+projection, and writes the result to `provisioning_budget_months`; compare
+`estimate.estimated_month` and its `components` with the invoice lines.
+Record every month: the three-rolling-months review trigger reads only
+calendar-consecutive recorded months ending at the latest one, so a gap ends
+the window rather than being skipped.
 
 ### Deletion receipts
 
