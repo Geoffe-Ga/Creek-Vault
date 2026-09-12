@@ -99,6 +99,13 @@ META_PURGE_KEEP: Final[tuple[MetaKeep, ...]] = (
         "would destroy the chain the operation is about to write into.",
     ),
     MetaKeep(
+        PurePosixPath("locks/embeddings.lock"),
+        "Empty cross-process coordination file for embedding cache save, scrub, "
+        "and erasure verification. Deleting a held advisory-lock path lets a "
+        "second process create and lock a different inode, silently splitting "
+        "the critical section. It contains no vault-derived content.",
+    ),
+    MetaKeep(
         PurePosixPath("Processing-Log/purge-log.json"),
         "The pre-Batch-C spelling of `audit/purge.jsonl`, kept on the same "
         "compliance grounds. `PurgeAuditLog` migrates it into the new log at "
@@ -110,8 +117,9 @@ META_PURGE_KEEP: Final[tuple[MetaKeep, ...]] = (
 )
 """Everything that survives ``creek purge vault`` under ``00-Creek-Meta/``.
 
-Deliberately short, and it holds **only** compliance records plus the
-vault marker. Notably absent, and therefore destroyed:
+Deliberately short, and it holds **only** compliance records, the vault marker,
+and one empty lock whose pathname must remain stable while a process may hold
+it. Notably absent, and therefore destroyed:
 ``State/ingest/*.jsonl`` (the leak this list exists to close),
 ``Processing-Log/provenance.jsonl`` (documented as "not compliance-grade,
 allowed to be lossy", which forecloses the compliance defence),

@@ -10,14 +10,17 @@ runs (INC-006).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import BaseModel
 
 from creek._fsio import atomic_replace_path
+from creek._fslock import vault_lock
 
 # FragmentLevel is a Literal alias that Pydantic resolves at class-creation
 # time when building ``Resonance``'s field schema; moving it under
@@ -53,6 +56,16 @@ EMBEDDINGS_CACHE_FILENAME: Final[str] = "embeddings.parquet"
 
 EMBEDDINGS_CACHE_DIR: Final[str] = "00-Creek-Meta"
 """Vault subdirectory that holds the embeddings cache."""
+
+EMBEDDINGS_CACHE_LOCK_FILENAME: Final[str] = "embeddings.lock"
+"""Cross-process lock serialising canonical cache replacement and scrubbing."""
+
+_PROVENANCE_RELPARTS: Final[tuple[str, str, str]] = (
+    EMBEDDINGS_CACHE_DIR,
+    "Processing-Log",
+    "provenance.jsonl",
+)
+"""Operational membership log consulted before a canonical cache save."""
 
 _RESONANCE_BLOCK_ROWS: Final[int] = 512
 """Row-block size for chunked resonance similarity (#596).
@@ -162,6 +175,88 @@ def embeddings_cache_path(vault_path: Path) -> Path:
     return vault_path / EMBEDDINGS_CACHE_DIR / EMBEDDINGS_CACHE_FILENAME
 
 
+def embeddings_cache_lock_path(vault_path: Path) -> Path:
+    """Return the cross-process mutation lock for one vault's cache."""
+    return vault_path / EMBEDDINGS_CACHE_DIR / "locks" / EMBEDDINGS_CACHE_LOCK_FILENAME
+
+
+def _cache_vault(cache_path: Path) -> Path | None:
+    """Return the vault root when *cache_path* is the canonical cache path."""
+    if (
+        cache_path.name == EMBEDDINGS_CACHE_FILENAME
+        and cache_path.parent.name == EMBEDDINGS_CACHE_DIR
+    ):
+        return cache_path.parent.parent
+    return None
+
+
+def _cache_lock(cache_path: Path) -> AbstractContextManager[None]:
+    """Return a cross-process lock for canonical caches, a no-op otherwise."""
+    vault = _cache_vault(cache_path)
+    if vault is None:
+        return nullcontext()
+    return vault_lock(embeddings_cache_lock_path(vault))
+
+
+def _withdrawn_fragment_ids(vault_path: Path) -> set[str]:
+    """Return IDs whose latest operational provenance event is withdrawal.
+
+    The append-only provenance chain is the durable membership authority used
+    by the journal withdrawal path.  Consulting its latest event immediately
+    before replacing the canonical cache prevents a linker that loaded an old
+    snapshot from restoring a row after that fragment was withdrawn.  A later
+    write event clears the tombstone naturally, so re-ingesting the same stable
+    identity remains cacheable.
+
+    Raises:
+        OSError: If a present provenance log cannot be read.
+        ValueError: If a present line is not valid JSON.
+    """
+    path = vault_path.joinpath(*_PROVENANCE_RELPARTS)
+    if not path.exists():
+        return set()
+    withdrawn: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            continue
+        fragment_id = record.get("id")
+        event_type = record.get("type")
+        if not isinstance(fragment_id, str) or not isinstance(event_type, str):
+            continue
+        if event_type == "withdrawal":
+            withdrawn.add(fragment_id)
+        else:
+            withdrawn.discard(fragment_id)
+    return withdrawn
+
+
+def cache_contains_fragment_ids(cache_path: Path, fragment_ids: Iterable[str]) -> bool:
+    """Return whether the cache still contains any requested fragment ID.
+
+    Canonical reads share the mutation lock with cache saves and purge
+    rewrites.  A malformed or unreadable parquet is intentionally allowed to
+    raise: an erasure caller cannot prove absence from bytes it could not read.
+    """
+    ids_set = set(fragment_ids)
+    if not ids_set:
+        return False
+    with _cache_lock(cache_path):
+        if not cache_path.exists():
+            return False
+        import pyarrow.parquet as pq  # lazy: pyarrow lives in [embeddings]
+
+        return any(
+            fragment_id in ids_set
+            for fragment_id in pq.read_table(
+                cache_path,
+                columns=["fragment_id"],
+            )["fragment_id"].to_pylist()
+        )
+
+
 def purge_fragment_ids_from_cache(
     cache_path: Path,
     fragment_ids: Iterable[str],
@@ -197,7 +292,25 @@ def purge_fragment_ids_from_cache(
         or no rows match.
     """
     ids_set = set(fragment_ids)
-    if not ids_set or not cache_path.exists():
+    if not ids_set:
+        return 0
+
+    with _cache_lock(cache_path):
+        return _purge_fragment_ids_from_cache_locked(
+            cache_path,
+            ids_set,
+            dry_run=dry_run,
+        )
+
+
+def _purge_fragment_ids_from_cache_locked(
+    cache_path: Path,
+    fragment_ids: set[str],
+    *,
+    dry_run: bool,
+) -> int:
+    """Implement cache row removal while the canonical mutation lock is held."""
+    if not cache_path.exists():
         return 0
 
     import pyarrow as pa  # lazy: pyarrow lives in the [embeddings] extra
@@ -205,7 +318,7 @@ def purge_fragment_ids_from_cache(
 
     table = pq.read_table(cache_path)
     ids_in_cache = table["fragment_id"].to_pylist()
-    keep_mask = [fid not in ids_set for fid in ids_in_cache]
+    keep_mask = [fid not in fragment_ids for fid in ids_in_cache]
     removed = len(ids_in_cache) - sum(keep_mask)
     if removed == 0:
         return 0
@@ -263,6 +376,12 @@ def delete_embeddings_cache(cache_path: Path, *, dry_run: bool = False) -> int:
         (or that would be deleted in a dry run). Zero when the file
         does not exist, and zero when it could not be parsed.
     """
+    with _cache_lock(cache_path):
+        return _delete_embeddings_cache_locked(cache_path, dry_run=dry_run)
+
+
+def _delete_embeddings_cache_locked(cache_path: Path, *, dry_run: bool) -> int:
+    """Implement whole-cache deletion while its canonical lock is held."""
     if not cache_path.exists():
         return 0
 
@@ -839,6 +958,27 @@ class EmbeddingLinker:
         import pyarrow as pa  # lazy: pyarrow lives in the [embeddings] extra
         import pyarrow.parquet as pq
 
+        vault = _cache_vault(path)
+        with _cache_lock(path):
+            selected = entries
+            if vault is not None:
+                withdrawn = _withdrawn_fragment_ids(vault)
+                selected = {
+                    fragment_id: entry
+                    for fragment_id, entry in entries.items()
+                    if fragment_id not in withdrawn
+                }
+            self._save_cache_locked(selected, path, pa=pa, pq=pq)
+
+    @staticmethod
+    def _save_cache_locked(
+        entries: Mapping[str, CachedEmbedding],
+        path: Path,
+        *,
+        pa: Any,
+        pq: Any,
+    ) -> None:
+        """Replace one cache from a caller holding its canonical lock."""
         rows = list(entries.values())
         table = pa.table(
             {

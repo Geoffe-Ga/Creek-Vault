@@ -293,6 +293,7 @@ OP_HEALTH: Final[str] = "getHealth"
 MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("GET", CAPABILITIES_PATH),
     ("PUT", JOURNAL_PATH),
+    ("DELETE", JOURNAL_PATH),
     ("POST", REFLECTIONS_PATH),
     ("GET", WHEEL_PATH),
     ("POST", UPLOAD_PATH),
@@ -311,6 +312,7 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
 MOUNTED_IDS: Final[tuple[str, ...]] = (
     "capabilities",
     "journal-upsert",
+    "journal-withdraw",
     "reflections",
     "wheel",
     "upload",
@@ -328,6 +330,7 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
 
 VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("PUT", JOURNAL_PATH),
+    ("DELETE", JOURNAL_PATH),
     ("POST", REFLECTIONS_PATH),
     ("GET", WHEEL_PATH),
     ("POST", UPLOAD_PATH),
@@ -344,6 +347,7 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
 
 VERSIONED_IDS: Final[tuple[str, ...]] = (
     "journal-upsert",
+    "journal-withdraw",
     "reflections",
     "wheel",
     "upload",

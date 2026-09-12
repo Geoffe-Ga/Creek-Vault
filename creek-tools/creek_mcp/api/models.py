@@ -82,6 +82,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.15",
     "0.14",
     "0.13",
     "0.12",
@@ -255,7 +256,7 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The eight capabilities ``/v1`` publishes.
+    """The nine capabilities ``/v1`` publishes.
 
     The list was identical for every minor in
     :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
@@ -307,6 +308,8 @@ class Capability(StrEnum):
             disclose nothing.
         VOICE_DRAFTS: AI-attributed draft upsert, recall, and retraction by a
             caller-owned external id. Since contract 0.15 (#1727).
+        JOURNAL_WITHDRAW: Consumer-scoped, idempotent journal erasure. Since
+            contract 0.16 (#1799).
     """
 
     CAPABILITIES = "capabilities"
@@ -317,6 +320,7 @@ class Capability(StrEnum):
     DRIVE_CONNECTOR = "drive-connector"
     PIPELINE = "pipeline"
     VOICE_DRAFTS = "voice-drafts"
+    JOURNAL_WITHDRAW = "journal-withdraw"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -358,6 +362,13 @@ current minor would silently move the capability forward on the next bump and
 hide it from clients that correctly vendored contract 0.15.
 """
 
+_JOURNAL_WITHDRAW_MINOR: Final[str] = "0.16"
+"""The minor ``journal-withdraw`` was published at (#1799).
+
+Literal so a later contract bump cannot hide the capability from clients that
+correctly vendored 0.16.
+"""
+
 RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
 """First contract minor whose ``ReflectionResponse`` carries the #873 fields.
 
@@ -383,6 +394,7 @@ CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.DRIVE_CONNECTOR: _DRIVE_CONNECTOR_MINOR,
     Capability.PIPELINE: _PIPELINE_MINOR,
     Capability.VOICE_DRAFTS: _VOICE_DRAFTS_MINOR,
+    Capability.JOURNAL_WITHDRAW: _JOURNAL_WITHDRAW_MINOR,
 }
 """The contract minor each capability was first published at.
 
@@ -1048,6 +1060,19 @@ class JournalUpsertResponse(_WireModel):
             "Content-free operator advisories this write produced; absent when none."
         ),
     )
+
+
+class JournalWithdrawResponse(_WireModel):
+    """Confirmation that one consumer-scoped journal identity was withdrawn.
+
+    The shape deliberately omits both consumer and external identity. A caller
+    withdrawing an absent id, an already-withdrawn id, or text that belongs to
+    another configured consumer receives the same three bounded facts.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    action: Literal["withdrawn"] = Field(description="Always withdrawn.")
 
 
 class VoiceDraftAttribution(_WireModel):
@@ -2204,6 +2229,7 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "ErrorEnvelope": ErrorEnvelope,
     "JournalUpsertRequest": JournalUpsertRequest,
     "JournalUpsertResponse": JournalUpsertResponse,
+    "JournalWithdrawResponse": JournalWithdrawResponse,
     "JobAcceptedResponse": JobAcceptedResponse,
     "JobStatusResponse": JobStatusResponse,
     "LinkRequest": LinkRequest,

@@ -2250,15 +2250,15 @@ class TestIndexDamageRecovery:
         victim_path = _seed_victim(seed)
         target_dir = victim_path.parent
 
-        real_read_text = RuntimePath.read_text
+        real_open = RuntimePath.open
 
-        def _deny_index(path: Path, *args: Any, **kwargs: Any) -> str:
+        def _deny_index(path: Path, *args: Any, **kwargs: Any) -> Any:
             """Refuse to read the index file; pass everything else through."""
             if path.name == INDEX_FILENAME:
                 raise OSError(errno.EACCES, os.strerror(errno.EACCES))
-            return real_read_text(path, *args, **kwargs)
+            return real_open(path, *args, **kwargs)
 
-        monkeypatch.setattr(RuntimePath, "read_text", _deny_index)
+        monkeypatch.setattr(RuntimePath, "open", _deny_index)
 
         fresh = VaultWriter(vault_path=vault_path)
         with caplog.at_level(logging.WARNING, logger="creek.vault.writer"):
@@ -3952,23 +3952,11 @@ class TestIndexCompaction:
     ) -> None:
         """A writer that compacted still sees another writer's later appends.
 
-        This pins the BEHAVIOUR, and deliberately does not claim to kill
-        the ``.pop()`` mutant the review flagged — it does not, and
-        chasing that was how the real mechanism turned up. Removing the
-        cache-invalidation lines leaves this green because
-        :meth:`_read_index_tail` frames every record with a leading
-        newline: a resume into rewritten content lands mid-record,
-        ``_parse_index_text`` reports damage, and the caller falls back to
-        a full load. That framing is the protection; the ``.pop()`` calls
-        are redundancy.
-
-        The scenario is still worth pinning, because it is the one the
-        shrink guard does **not** cover. Once appends grow the file back
-        past the pre-compaction size, the stale offset looks valid again,
-        so nothing but the framing stands between this lookup and a
-        silently skipped record — and a skipped record here means the id
-        resolves to nothing and the next write mints a counter-suffixed
-        sibling for a fragment that already exists.
+        The compactor invalidates its own cache eagerly, while the cursor's
+        file identity protects every separate live writer. Once appends grow
+        the replacement beyond the pre-compaction size, byte length alone can
+        no longer distinguish a rewrite from an append; the generation still
+        can, so the reader reloads before following later append tails.
 
         The second writer is load-bearing: this writer's own
         ``write_fragment`` puts the mapping straight into its in-memory
@@ -4002,8 +3990,8 @@ class TestIndexCompaction:
             _fragment("frag-after0001"),
             body="written after the compaction by another writer",
         )
-        # Grow the file back past the old cursor so the shrink guard -- the
-        # only thing that would otherwise force a re-read -- stops firing.
+        # Grow the file back past the old cursor so byte length alone no longer
+        # identifies the replacement. File identity must still force reload.
         filler = 0
         while index_path.stat().st_size <= size_before:
             filler += 1
@@ -4012,21 +4000,50 @@ class TestIndexCompaction:
 
         assert writer._find_existing("frag-after0001", target_dir) is not None
 
+    def test_a_stale_writer_detects_an_aligned_compaction_replacement(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A replaced index is a new generation even at an aligned old cursor.
+
+        The two records deliberately have equal encoded lengths.  The stale
+        reader's cursor therefore lands exactly between them after compaction,
+        where framing cannot diagnose the rewrite: without a file-generation
+        check it reads only ``zzzz`` and misses the newly sorted ``aaaa`` row.
+        """
+        target_dir = vault_path / "01-Fragments" / "Journal"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        late = target_dir / "b.md"
+        early = target_dir / "a.md"
+        late.write_text(
+            "---\nid: zzzz\ntype: fragment\n---\n\nlate\n", encoding="utf-8"
+        )
+        VaultWriter._persist_full_index(target_dir, {"zzzz": late.name})
+
+        stale = VaultWriter(vault_path=vault_path)
+        assert stale._find_existing("zzzz", target_dir) == late
+        cursor = (target_dir / INDEX_FILENAME).stat().st_size
+
+        early.write_text(
+            "---\nid: aaaa\ntype: fragment\n---\n\nearly\n",
+            encoding="utf-8",
+        )
+        VaultWriter._append_index_entry(target_dir, "aaaa", early.name)
+        assert VaultWriter(vault_path=vault_path).compact_index(target_dir) > 0
+        assert (target_dir / INDEX_FILENAME).stat().st_size > cursor
+
+        assert stale._find_existing("aaaa", target_dir) == early
+
     def test_compaction_refuses_a_rewrite_that_would_grow_the_file(
         self,
         vault_path: Path,
     ) -> None:
-        """A longer file at the same path is the one shape a reader misreads.
+        """Compaction reclaims bytes; it does not grow an incomplete index.
 
-        ``_refresh_index_locked`` treats a file longer than its cursor as
-        *appended to* and splices the extra bytes onto the cached mapping.
-        A whole-file rewrite that grew the file would hand it unrelated
-        content at that offset. The shrink guard is what keeps a reader
-        that had consumed the whole file inside the shapes #1603's cursor
-        recovers from — so a directory holding notes the index never
-        learned about is left alone rather than rewritten. It bounds the
-        hazard rather than removing it; ``compact_index``'s docstring
-        names the residual a reader with an older cursor still has.
+        File-generation identity now makes longer atomic replacements safe for
+        readers, but a pass that writes more bytes is not compaction. A
+        directory holding notes the index never learned about is therefore
+        left alone rather than turning maintenance into an implicit rebuild.
         """
         seed = VaultWriter(vault_path=vault_path)
         victim_path = _seed_victim(seed)
