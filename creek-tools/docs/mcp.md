@@ -1027,6 +1027,13 @@ that update artefacts **in place** (`creek.classify`, `creek.link`) do
 not produce new files, so they omit `created_path` and `created_tier`
 from their audit entry.
 
+Journal upsert/withdrawal, classification, linking, compilation, and the
+write step of manual review share one cross-process vault-content mutation
+boundary. This closes stale load-to-write races: a pipeline pass cannot load a
+journal fragment, let withdrawal report success, and then recreate the removed
+fragment or a derived page. A pass that cannot take the boundary within the
+bounded lock wait returns the ordinary structured refusal and is safe to retry.
+
 For tools that accept a `body` argument (`creek.save`), the audit entry
 records `body_len` rather than `body` — on both the success and the
 refusal path — so a fragment body never lands in `mcp.jsonl` verbatim,

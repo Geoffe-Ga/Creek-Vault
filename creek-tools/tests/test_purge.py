@@ -5360,6 +5360,7 @@ _KEPT_META_RELPATHS: tuple[str, ...] = (
     "audit/privacy.jsonl",
     "audit/redact.jsonl",
     "audit/mcp.jsonl",
+    "locks/content-mutations.lock",
     "locks/embeddings.lock",
 )
 """Every ``00-Creek-Meta/`` artifact a vault purge must preserve."""

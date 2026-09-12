@@ -130,6 +130,10 @@ from creek.ingest.journal_staging import JOURNAL_STAGING_RELDIR
 from creek.ingest.markdown import MarkdownIngestor
 from creek.ingest.pipeline import derive_source_key, ledger_for_source, run_ingest
 from creek.models import PrivacyTier
+from creek.vault.mutations import (
+    CONTENT_MUTATION_LOCK_RELPATH,
+    content_mutation_lock_path,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.read_gate import refuse_above_ceiling
 from creek_mcp.staged_names import safe_stem
@@ -158,8 +162,8 @@ _JOURNAL_INBOX = JOURNAL_STAGING_RELDIR
 # Where JOURNAL-platform fragments are routed by the writer — recorded as the
 # audit ``created_path`` (mirrors ingest_tool's dir-level created_path).
 _FRAGMENT_ROUTING_DIR = Path("01-Fragments/Journal")
-JOURNAL_MUTATION_LOCK_RELPATH = Path("00-Creek-Meta/locks/journal-mutations.lock")
-"""Cross-process lock shared by journal upsert and withdrawal."""
+JOURNAL_MUTATION_LOCK_RELPATH = CONTENT_MUTATION_LOCK_RELPATH
+"""Backward-compatible name for the shared vault-content lock path."""
 # The staged-name derivation now lives in creek_mcp.staged_names so this tool
 # and ``creek.upload`` cannot compute two different stems for one external id
 # (#1023). Aliased so the rest of the module reads unchanged.
@@ -191,8 +195,8 @@ def journal_staged_path(
 
 
 def journal_mutation_lock_path(vault_path: Path) -> Path:
-    """Return the advisory lock shared by journal create/update/withdraw."""
-    return vault_path / JOURNAL_MUTATION_LOCK_RELPATH
+    """Return the lock shared by journal and downstream content writers."""
+    return content_mutation_lock_path(vault_path)
 
 
 def _stage_entry(

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import frontmatter
 
+from creek._fslock import vault_lock
 from creek.link.eddies import EddyDetector
 from creek.link.embeddings import (
     CachedEmbedding,
@@ -32,6 +33,7 @@ from creek.link.embeddings import (
 )
 from creek.link.temporal import TemporalLinker
 from creek.link.threads import ThreadDetector
+from creek.vault.mutations import content_mutation_lock_path
 from creek.vault.reader import iter_vault_fragments
 from creek.vault.writer import VaultWriter
 
@@ -177,7 +179,39 @@ def run_link(
     method: str,
     rebuild: bool,
 ) -> LinkSummary:
-    """Run a single linker stage against the vault.
+    """Link a vault inside its shared load-to-write mutation boundary.
+
+    Args:
+        vault_path: Vault root.
+        config: Loaded Creek configuration.
+        method: ``"embeddings"``, ``"temporal"``, ``"eddies"``, or
+            ``"threads"``.
+        rebuild: Whether to invalidate the embeddings cache first.
+
+    Returns:
+        A :class:`LinkSummary` capturing per-method counts.
+
+    Raises:
+        creek._fslock.VaultLockTimeoutError: When another content mutation
+            holds the shared boundary past its bounded wait.
+    """
+    with vault_lock(content_mutation_lock_path(vault_path)):
+        return _run_link_with_content_lock_held(
+            vault_path=vault_path,
+            config=config,
+            method=method,
+            rebuild=rebuild,
+        )
+
+
+def _run_link_with_content_lock_held(
+    *,
+    vault_path: Path,
+    config: CreekConfig,
+    method: str,
+    rebuild: bool,
+) -> LinkSummary:
+    """Implement :func:`run_link` while its content lock is held.
 
     Args:
         vault_path: Vault root.

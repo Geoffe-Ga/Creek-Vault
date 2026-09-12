@@ -447,9 +447,17 @@ the id, and treats absent, already-withdrawn, and foreign-owned ids alike. It
 uses the purge engine under the same cross-process mutation lock as upsert;
 `200` is emitted only after staged plaintext, fragments, references, ledger
 rows, persistent fragment-index mappings, and embedding membership verify
-absent. Cache save, scrub, and membership verification share one cross-process
-lock; a stale linker snapshot also consults the latest provenance event before
-replacement, so it cannot restore a row after withdrawal. Stale index mappings
+absent. That mutation boundary is vault-content-wide: classification, linking,
+compilation, and guarded manual-review writes share it across their complete
+load-to-write windows. Therefore an already-started writer either commits
+before withdrawal (and its output is purged before `200`) or starts after
+withdrawal (and cannot load the removed source); it cannot commit a stale
+fragment or derived page after the successful withdrawal linearization point.
+Long pipeline work may make withdrawal return retryable `503` when the bounded
+lock wait expires, but it cannot produce a false `200`. Cache save, scrub, and
+membership verification also share their own cross-process lock; a stale linker
+snapshot consults the latest provenance event before replacement, so it cannot
+restore a row after withdrawal. Stale index mappings
 are removed with the writer's locked, atomic compaction primitive, and index
 cursors bind to the parsed file's device/inode generation so a live reader
 reloads after replacement rather than resuming at a stale byte offset.

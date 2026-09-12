@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 
 from creek._fsio import atomic_write_text
+from creek._fslock import vault_lock
 from creek._schema import coerce_optional_list
 from creek.audit import AuditLog
 from creek.care.guardrail import CARE_POLICY
@@ -47,6 +48,7 @@ from creek.hierarchy import (
     structural_path_context,
 )
 from creek.models import CompiledPage, CompileTargetKind, Fragment, PrivacyTier
+from creek.vault.mutations import content_mutation_lock_path
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -394,7 +396,51 @@ def compile_to_vault(
     llm_factory: CompileLLMFactory,
     level_policy: LevelPolicy = "leaves",
 ) -> Path:
-    """Compile *fragment_ids* into a compiled-layer page on disk.
+    """Compile sources inside the shared load-to-write mutation boundary.
+
+    Args:
+        fragment_ids: IDs of source fragments to roll up.
+        vault_path: Vault root.
+        target_kind: Kind of compiled-layer page to write.
+        target_id: Stable ID of the synthesis target.
+        target_title: Human-readable title for the page.
+        llm_factory: Tier-keyed builder for the compile LLM client.
+        level_policy: Hierarchy policy applied to the source fragments.
+
+    Returns:
+        The path of the written compiled-layer page.
+
+    Raises:
+        creek._fslock.VaultLockTimeoutError: When another content mutation
+            holds the shared boundary past its bounded wait.
+        ValueError: If a requested fragment cannot be resolved or the target
+            escapes its compiled-layer directory.
+        creek.classify.llm.router.IntimateRoutingError: If intimate content
+            has no local generation route.
+    """
+    with vault_lock(content_mutation_lock_path(vault_path)):
+        return _compile_to_vault_with_content_lock_held(
+            fragment_ids=fragment_ids,
+            vault_path=vault_path,
+            target_kind=target_kind,
+            target_id=target_id,
+            target_title=target_title,
+            llm_factory=llm_factory,
+            level_policy=level_policy,
+        )
+
+
+def _compile_to_vault_with_content_lock_held(
+    *,
+    fragment_ids: list[str],
+    vault_path: Path,
+    target_kind: CompileTargetKind,
+    target_id: str,
+    target_title: str,
+    llm_factory: CompileLLMFactory,
+    level_policy: LevelPolicy = "leaves",
+) -> Path:
+    """Implement :func:`compile_to_vault` while its content lock is held.
 
     Loads the named fragments from ``<vault>/01-Fragments``, builds the
     LLM client for their combined privacy tier, runs

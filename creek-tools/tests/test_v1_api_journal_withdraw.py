@@ -21,9 +21,11 @@ from typing import TYPE_CHECKING, Final
 
 import frontmatter
 
+import creek.classify.classify_engine as classify_module
 import creek.link.embeddings as embeddings_module
 from creek._fslock import vault_lock
-from creek.config import EmbeddingsConfig
+from creek.classify.classify_engine import run_classify
+from creek.config import CreekConfig, EmbeddingsConfig
 from creek.link.embeddings import (
     CachedEmbedding,
     EmbeddingLinker,
@@ -52,6 +54,7 @@ from tests.v1_api_support import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from contextlib import AbstractContextManager
     from pathlib import Path
 
@@ -618,6 +621,74 @@ def test_a_concurrent_stale_cache_save_cannot_resurrect_a_withdrawn_row(
     assert not saver.is_alive()
     assert errors == []
     assert fragment_id not in EmbeddingLinker(EmbeddingsConfig()).load_cache(cache_path)
+
+
+def test_withdrawal_waits_for_an_inflight_classifier_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A classifier that loaded plaintext cannot recreate it after HTTP 200."""
+    vault = _vault(tmp_path)
+    classifier_loaded = threading.Event()
+    resume_classifier = threading.Event()
+    withdrawal_finished = threading.Event()
+    classifier_errors: list[BaseException] = []
+    withdrawal_errors: list[BaseException] = []
+    withdrawal_responses: list[httpx.Response] = []
+    original_classify_one: Callable[..., object] = classify_module._classify_one
+
+    def paused_classify_one(*args: object, **kwargs: object) -> object:
+        """Pause after the production loader has captured the fragment body."""
+        classifier_loaded.set()
+        if not resume_classifier.wait(timeout=5):
+            raise AssertionError("withdrawal test did not release classifier")
+        return original_classify_one(*args, **kwargs)
+
+    monkeypatch.setattr(classify_module, "_classify_one", paused_classify_one)
+    with client(vault_path=vault) as test_client:
+        assert _put(test_client).status_code == _OK
+
+        def classify() -> None:
+            """Run the production rules pipeline and retain thread failures."""
+            try:
+                run_classify(
+                    vault_path=vault,
+                    config=CreekConfig(),
+                    method="rules",
+                    force=True,
+                )
+            except BaseException as exc:  # captured and re-raised below
+                classifier_errors.append(exc)
+
+        def withdraw() -> None:
+            """Issue the real authenticated withdrawal concurrently."""
+            try:
+                withdrawal_responses.append(_delete(test_client))
+            except BaseException as exc:  # captured and re-raised below
+                withdrawal_errors.append(exc)
+            finally:
+                withdrawal_finished.set()
+
+        classifier = threading.Thread(target=classify)
+        classifier.start()
+        assert classifier_loaded.wait(timeout=5)
+        deleter = threading.Thread(target=withdraw)
+        deleter.start()
+        completed_before_classifier = withdrawal_finished.wait(timeout=0.2)
+        resume_classifier.set()
+        classifier.join(timeout=5)
+        deleter.join(timeout=5)
+
+    assert not classifier.is_alive()
+    assert not deleter.is_alive()
+    assert classifier_errors == []
+    assert withdrawal_errors == []
+    assert not completed_before_classifier
+    assert withdrawal_responses[0].status_code == _OK
+    assert not any((vault / "01-Fragments").rglob("*.md"))
+    assert _CONTENT not in "\n".join(
+        path.read_text(encoding="utf-8") for path in _markdown_files(vault)
+    )
 
 
 def test_a_later_reingest_clears_the_cache_withdrawal_tombstone(

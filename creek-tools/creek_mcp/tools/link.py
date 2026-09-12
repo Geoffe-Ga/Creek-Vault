@@ -16,9 +16,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from creek._fslock import VaultLockTimeoutError
 from creek.config import load_vault_config
 from creek.link.link_engine import run_link
 from creek.surface_modes import LINK_METHODS
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
@@ -56,12 +58,19 @@ def link_tool(
         )
     # The vault being linked owns its own embeddings/linking knobs (#1409).
     config = load_vault_config(vault_path)
-    summary = run_link(
-        vault_path=vault_path,
-        config=config,
-        method=method,
-        rebuild=rebuild,
-    )
+    try:
+        summary = run_link(
+            vault_path=vault_path,
+            config=config,
+            method=method,
+            rebuild=rebuild,
+        )
+    except VaultLockTimeoutError:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=CONTENT_MUTATION_BUSY_REASON,
+        )
     # Linking updates existing artefacts in place; no new file is
     # produced, so ``created_path`` is omitted per the audit-schema
     # convention documented in docs/mcp.md.
