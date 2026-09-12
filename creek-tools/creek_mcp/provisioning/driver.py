@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from dataclasses import dataclass, field
+from itertools import chain
 from threading import Lock
 from typing import TYPE_CHECKING, Final, Protocol
 
-from creek_mcp.provisioning.models import DeletionOutcome, ResourceClass
+from creek_mcp.provisioning.inventory import ProviderResource
+from creek_mcp.provisioning.models import (
+    DeletionOutcome,
+    FailureReason,
+    ResourceClass,
+    ResourceState,
+)
 
 if TYPE_CHECKING:
-    from creek_mcp.provisioning.models import FailureReason, ProvisioningJob
+    from collections.abc import Sequence
+
+    from creek_mcp.provisioning.models import ProvisioningJob
 
 _FAKE_PROVIDER: Final[str] = "fake"
+_FAKE_ROOTFS_GB: Final[int] = 1
+_FAKE_VOLUME_GB: Final[int] = 5
+_FAKE_DIGEST_LENGTH: Final[int] = 24
 _FAKE_RESOURCE_CLASSES: Final[tuple[ResourceClass, ...]] = (
     ResourceClass.CREDENTIAL,
     ResourceClass.MACHINE,
@@ -88,6 +101,10 @@ class FakeProviderDriver:
         self._failures: list[ProviderError] = []
         self._deleted: set[str] = set()
         self._delete_count = 0
+        self._resources: dict[str, list[ProviderResource]] = {}
+        self._activation_allocations: dict[str, str] = {}
+        self._inventory_calls = 0
+        self._stopped: list[str] = []
         self.last_failure: ProviderError | None = None
 
     @property
@@ -101,6 +118,24 @@ class FakeProviderDriver:
         """Return the number of distinct provider teardowns performed."""
         with self._lock:
             return self._delete_count
+
+    @property
+    def inventory_call_count(self) -> int:
+        """Return how many times the fleet inventory was listed."""
+        with self._lock:
+            return self._inventory_calls
+
+    @property
+    def stop_count(self) -> int:
+        """Return how many stop calls the fake honoured."""
+        with self._lock:
+            return len(self._stopped)
+
+    @property
+    def stopped_activation_ids(self) -> tuple[str, ...]:
+        """Return the activation ids stopped, in call order."""
+        with self._lock:
+            return tuple(self._stopped)
 
     def fail_next(self, failure: ProviderError) -> None:
         """Queue one deterministic provider failure for the next create call."""
@@ -118,12 +153,17 @@ class FakeProviderDriver:
             if existing is not None:
                 return existing
             digest = hashlib.sha256(job.job_id.encode("utf-8")).hexdigest()
+            allocation_id = f"fake-{digest[:_FAKE_DIGEST_LENGTH]}"
             allocation = ProviderAllocation(
-                allocation_id=f"fake-{digest[:24]}",
+                allocation_id=allocation_id,
                 vault_url=f"https://fake-{digest[:16]}.internal.invalid/v1",
                 consumer_credential=(f"fake-consumer-{job.consumer_identity}-{digest}"),
             )
             self._allocations[job.job_id] = allocation
+            self._activation_allocations[job.activation_id] = allocation_id
+            self._resources[allocation_id] = _fake_resources(
+                allocation_id, job.activation_id
+            )
             return allocation
 
     def delete(
@@ -137,7 +177,83 @@ class FakeProviderDriver:
             if job.job_id not in self._deleted:
                 self._deleted.add(job.job_id)
                 self._delete_count += 1
+            existing = self._allocations.get(job.job_id)
+            if existing is not None:
+                self._resources.pop(existing.allocation_id, None)
         return DeletionOutcome(_FAKE_PROVIDER, _FAKE_RESOURCE_CLASSES)
+
+    def list_resources(
+        self,
+        activation_ids: Sequence[str],
+        *,
+        app_names: Sequence[str] = (),
+    ) -> tuple[ProviderResource, ...]:
+        """Return every created or seeded resource; the fake ignores its scope."""
+        del activation_ids, app_names
+        with self._lock:
+            self._inventory_calls += 1
+            return tuple(
+                sorted(
+                    chain.from_iterable(self._resources.values()),
+                    key=lambda r: (
+                        r.provider_allocation_id,
+                        r.resource_class.value,
+                        r.provider_ref,
+                    ),
+                )
+            )
+
+    def expected_allocation_id(self, activation_id: str) -> str:
+        """Return the allocation id *activation_id* has or would receive."""
+        with self._lock:
+            known = self._activation_allocations.get(activation_id)
+        if known is not None:
+            return known
+        digest = hashlib.sha256(activation_id.encode("utf-8")).hexdigest()
+        return f"fake-{digest[:_FAKE_DIGEST_LENGTH]}"
+
+    def stop(self, activation_id: str) -> None:
+        """Stop the allocation's Machine; unknown allocations are unavailable."""
+        allocation_id = self.expected_allocation_id(activation_id)
+        with self._lock:
+            if not self._set_machine_state(allocation_id, ResourceState.STOPPED):
+                raise ProviderError(FailureReason.PROVIDER_UNAVAILABLE, retryable=True)
+            self._stopped.append(activation_id)
+
+    def seed_resource(self, resource: ProviderResource) -> None:
+        """Add one provider-side resource the control plane did not create."""
+        with self._lock:
+            self._resources.setdefault(resource.provider_allocation_id, []).append(
+                resource
+            )
+
+    def set_machine_state(
+        self,
+        provider_allocation_id: str,
+        state: ResourceState,
+    ) -> None:
+        """Flip every Machine under one allocation to *state* (test seam)."""
+        with self._lock:
+            self._set_machine_state(provider_allocation_id, state)
+
+    def has_resource(self, provider_allocation_id: str) -> bool:
+        """Return whether any resource survives under *provider_allocation_id*."""
+        with self._lock:
+            return bool(self._resources.get(provider_allocation_id))
+
+    def _set_machine_state(
+        self,
+        provider_allocation_id: str,
+        state: ResourceState,
+    ) -> bool:
+        """Replace Machine states under the lock; return whether any existed."""
+        resources = self._resources.get(provider_allocation_id, [])
+        machines = [r for r in resources if r.resource_class is ResourceClass.MACHINE]
+        for machine in machines:
+            resources[resources.index(machine)] = dataclasses.replace(
+                machine, state=state
+            )
+        return bool(machines)
 
 
 class FakeOneTimeHandoff:
@@ -173,3 +289,33 @@ class FakeOneTimeHandoff:
                 return
             if existing != fingerprint:
                 raise HandoffError("credential handoff conflicts with prior delivery")
+
+
+def _fake_resources(allocation_id: str, activation_id: str) -> list[ProviderResource]:
+    """Return the app, stopped Machine, and volume one fake provision creates."""
+    return [
+        ProviderResource(
+            allocation_id,
+            ResourceClass.APP,
+            ResourceState.OTHER,
+            None,
+            None,
+            f"{allocation_id}-app",
+        ),
+        ProviderResource(
+            allocation_id,
+            ResourceClass.MACHINE,
+            ResourceState.STOPPED,
+            _FAKE_ROOTFS_GB,
+            activation_id,
+            f"{allocation_id}-machine",
+        ),
+        ProviderResource(
+            allocation_id,
+            ResourceClass.VOLUME,
+            ResourceState.OTHER,
+            _FAKE_VOLUME_GB,
+            None,
+            f"{allocation_id}-volume",
+        ),
+    ]

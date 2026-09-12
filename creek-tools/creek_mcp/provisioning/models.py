@@ -93,6 +93,16 @@ class ResourceClass(StrEnum):
 
 
 @unique
+class ResourceState(StrEnum):
+    """Coarse provider resource state as observed by fleet inventory."""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
+    OTHER = "other"
+    DESTROYED = "destroyed"
+
+
+@unique
 class ReceiptOutcome(StrEnum):
     """Lifecycle of one content-free deletion receipt."""
 

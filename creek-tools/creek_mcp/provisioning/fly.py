@@ -21,7 +21,13 @@ from typing import TYPE_CHECKING, Any, Final, Never, Protocol, cast
 import httpx
 
 from creek_mcp.provisioning.driver import ProviderAllocation, ProviderError
-from creek_mcp.provisioning.models import DeletionOutcome, FailureReason, ResourceClass
+from creek_mcp.provisioning.inventory import ProviderResource
+from creek_mcp.provisioning.models import (
+    DeletionOutcome,
+    FailureReason,
+    ResourceClass,
+    ResourceState,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -51,6 +57,14 @@ _FLY_DELETED_CLASSES: Final[tuple[ResourceClass, ...]] = (
     ResourceClass.VOLUME,
     ResourceClass.APP,
 )
+_MACHINE_STATES: Final[dict[str, ResourceState]] = {
+    "started": ResourceState.RUNNING,
+    "starting": ResourceState.RUNNING,
+    "stopped": ResourceState.STOPPED,
+    "stopping": ResourceState.STOPPED,
+    "suspended": ResourceState.STOPPED,
+    "destroyed": ResourceState.DESTROYED,
+}
 
 
 @unique
@@ -141,6 +155,25 @@ class FlySecretManager(Protocol):
 
     def revoke(self, activation_id: str) -> None:
         """Idempotently make the activation's consumer credential unusable."""
+
+
+class RefusingSecretManager:
+    """A secret manager for fleet processes, which never provision or revoke.
+
+    It lets the fleet CLI construct ``FlyProviderDriver`` for inventory and
+    stop calls while making any accidental ``provision``/``delete`` fail
+    closed with a non-retryable provider rejection.
+    """
+
+    def issue(self, activation_id: str, consumer_identity: str) -> Never:
+        """Refuse to mint runtime secrets outside the provisioning worker."""
+        del activation_id, consumer_identity
+        raise ProviderError(FailureReason.PROVIDER_REJECTED, retryable=False)
+
+    def revoke(self, activation_id: str) -> Never:
+        """Refuse to revoke credentials outside the provisioning worker."""
+        del activation_id
+        raise ProviderError(FailureReason.PROVIDER_REJECTED, retryable=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +348,95 @@ class FlyProviderDriver:
         if self._app_exists(reference):
             self._unavailable("Fly app deletion has not converged")
         return outcome
+
+    def list_resources(
+        self,
+        activation_ids: Sequence[str],
+        *,
+        app_names: Sequence[str] = (),
+    ) -> tuple[ProviderResource, ...]:
+        """Inventory the bounded known set with per-app GET calls only.
+
+        Apps are derived from *activation_ids* and taken from *app_names* under
+        the configured prefix; there is no org-wide listing.  Every resource is
+        grouped by the allocation id derived from the app it lives in, never by
+        the metadata it claims.
+        """
+        prefix = f"{self._policy.app_prefix}-"
+        names = {self._reference(activation).app_name for activation in activation_ids}
+        names.update(name for name in app_names if name.startswith(prefix))
+        resources: list[ProviderResource] = []
+        for name in sorted(names):
+            app = self._app_by_name(name)
+            if app is None:
+                continue
+            allocation_id = f"fly-{name.removeprefix(prefix)}"
+            resources.append(
+                ProviderResource(
+                    allocation_id,
+                    ResourceClass.APP,
+                    ResourceState.OTHER,
+                    None,
+                    None,
+                    self._identifier(app, "Fly app"),
+                )
+            )
+            machines = self._request(
+                "GET", f"/v1/apps/{name}/machines", expected=(200,)
+            )
+            volumes = self._request("GET", f"/v1/apps/{name}/volumes", expected=(200,))
+            resources.extend(
+                self._machine_resource(allocation_id, machine)
+                for machine in self._objects(machines, "Fly Machine list")
+            )
+            resources.extend(
+                self._volume_resource(allocation_id, volume)
+                for volume in self._objects(volumes, "Fly volume list")
+            )
+        return tuple(sorted(resources, key=_resource_key))
+
+    def expected_allocation_id(self, activation_id: str) -> str:
+        """Return the allocation id a provisioned *activation_id* carries."""
+        return self._reference(activation_id).allocation_id
+
+    def _machine_resource(
+        self,
+        allocation_id: str,
+        machine: Mapping[str, Any],
+    ) -> ProviderResource:
+        """Map one Machine to inventory; metadata is informational only."""
+        config = machine.get("config")
+        config = config if isinstance(config, dict) else {}
+        metadata = config.get("metadata")
+        activation = (
+            metadata.get("creek_activation_id") if isinstance(metadata, dict) else None
+        )
+        rootfs = config.get("rootfs")
+        size = rootfs.get("size_gb") if isinstance(rootfs, dict) else None
+        return ProviderResource(
+            allocation_id,
+            ResourceClass.MACHINE,
+            _MACHINE_STATES.get(str(machine.get("state")), ResourceState.OTHER),
+            _size_gb(size),
+            activation if isinstance(activation, str) else None,
+            self._identifier(machine, "Fly Machine"),
+        )
+
+    def _volume_resource(
+        self,
+        allocation_id: str,
+        volume: Mapping[str, Any],
+    ) -> ProviderResource:
+        """Map one volume to inventory."""
+        destroyed = volume.get("state") == "destroyed"
+        return ProviderResource(
+            allocation_id,
+            ResourceClass.VOLUME,
+            ResourceState.DESTROYED if destroyed else ResourceState.OTHER,
+            _size_gb(volume.get("size_gb")),
+            None,
+            self._identifier(volume, "Fly volume"),
+        )
 
     def _ensure_app(self, reference: _AllocationRef) -> Mapping[str, Any]:
         response = self._request(
@@ -571,12 +693,17 @@ class FlyProviderDriver:
         ]
 
     def _app_exists(self, reference: _AllocationRef) -> bool:
+        return self._app_by_name(reference.app_name) is not None
+
+    def _app_by_name(self, app_name: str) -> Mapping[str, Any] | None:
         response = self._request(
             "GET",
-            f"/v1/apps/{reference.app_name}",
+            f"/v1/apps/{app_name}",
             expected=(200, _FLY_ABSENT_STATUS),
         )
-        return response.status_code == 200
+        if response.status_code == _FLY_ABSENT_STATUS:
+            return None
+        return self._object(response, "Fly app")
 
     def _request(
         self,
@@ -679,3 +806,17 @@ class FlyProviderDriver:
             retryable=False,
             private_detail=private_detail,
         )
+
+
+def _size_gb(value: object) -> int | None:
+    """Return a provider size in GB, or None when absent or not an integer."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _resource_key(resource: ProviderResource) -> tuple[str, str, str]:
+    """Order inventory deterministically by allocation, class, and reference."""
+    return (
+        resource.provider_allocation_id,
+        resource.resource_class.value,
+        resource.provider_ref,
+    )
