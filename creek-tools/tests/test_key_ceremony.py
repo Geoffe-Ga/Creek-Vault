@@ -59,12 +59,14 @@ _VECTOR = (
 )
 
 
-def _awaiting_store(tmp_path: Path) -> tuple[ProvisioningStore, str]:
+def _awaiting_store(
+    tmp_path: Path, *, now: datetime = _NOW
+) -> tuple[ProvisioningStore, str]:
     """Return one real store whose provider create reached the ceremony boundary."""
     store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
-    job = store.submit("activation-ceremony", "adepthood", now=_NOW)
+    job = store.submit("activation-ceremony", "adepthood", now=now)
     worker = ProvisioningWorker(store, FakeProviderDriver(), FakeOneTimeHandoff())
-    assert worker.run_once(now=_NOW) is True
+    assert worker.run_once(now=now) is True
     awaiting = store.get(job.job_id, "adepthood")
     assert awaiting is not None
     assert awaiting.state is JobState.AWAITING_KEY_CEREMONY
@@ -149,12 +151,14 @@ def _release_envelope(recipient: X25519PublicKey) -> KeyReleaseEnvelope:
     )
 
 
-def _api_client(store: ProvisioningStore) -> TestClient:
+def _api_client(store: ProvisioningStore, *, now: datetime | None = _NOW) -> TestClient:
     """Return the authenticated public ceremony API over *store*."""
     verifier = ConsumerTokenVerifier(
         {"adepthood": (_TOKEN,), "other-consumer": (_OTHER_TOKEN,)}
     )
-    return TestClient(build_provisioning_app(store, verifier))
+    if now is None:
+        return TestClient(build_provisioning_app(store, verifier))
+    return TestClient(build_provisioning_app(store, verifier, clock=lambda: now))
 
 
 def _headers(token: str = _TOKEN) -> dict[str, str]:
@@ -556,6 +560,26 @@ def test_http_challenge_and_completion_publish_only_safe_resumable_state(
     assert "recovery" not in challenge_response.text.lower()
     assert "recovery" not in completed.text.lower()
     assert client.get(path, headers=_headers()).json()["code"] == "invalid_transition"
+
+
+def test_http_default_clock_completes_a_fresh_challenge(tmp_path: Path) -> None:
+    """Production's default UTC clock is wired when no test clock is supplied."""
+    wall_now = datetime.now(tz=UTC).replace(microsecond=0)
+    store, job_id = _awaiting_store(tmp_path, now=wall_now)
+    client = _api_client(store, now=None)
+    path = f"/control/v1/jobs/{job_id}/key-ceremony"
+    challenge = KeyCeremonyChallenge.model_validate(
+        client.get(path, headers=_headers()).json()
+    )
+
+    completed = client.put(
+        path,
+        headers=_headers(),
+        json=_for_challenge(_vector_submission(), challenge).model_dump(mode="json"),
+    )
+
+    assert completed.status_code == 200
+    assert completed.json()["state"] == JobState.READY.value
 
 
 def test_http_rejects_secret_fields_and_cross_consumer_access(tmp_path: Path) -> None:

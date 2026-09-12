@@ -32,6 +32,8 @@ from creek_mcp.provisioning.store import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from starlette.requests import Request
 
     from creek_mcp.provisioning.ceremony import AttestationVerifier, KeyReleaseSink
@@ -40,6 +42,11 @@ if TYPE_CHECKING:
 
 _VERSION_HEADER: Final[str] = "Creek-Provisioning-Version"
 _NO_STORE: Final[str] = "no-store"
+
+
+def _utc_now() -> datetime:
+    """Return the current aware UTC time for production ceremony expiry checks."""
+    return datetime.now(tz=UTC)
 
 
 def _response(payload: dict[str, object], *, status_code: int) -> JSONResponse:
@@ -92,10 +99,12 @@ class ProvisioningAPI:
         self,
         store: ProvisioningStore,
         ceremony: KeyCeremonyService,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
-        """Bind handlers to the injected durable store."""
+        """Bind handlers to the durable store and expiry-check clock."""
         self._store = store
         self._ceremony = ceremony
+        self._clock = clock
 
     async def activate(self, request: Request) -> Response:
         """Submit an activation and immediately return its durable handle."""
@@ -204,7 +213,7 @@ class ProvisioningAPI:
                 job_id,
                 consumer,
                 payload,
-                datetime.now(tz=UTC),
+                self._clock(),
             )
         except CeremonyExpiredError:
             return _error(
@@ -276,8 +285,9 @@ def build_provisioning_app(
     *,
     attestation_verifier: AttestationVerifier | None = None,
     key_release_sink: KeyReleaseSink | None = None,
+    clock: Callable[[], datetime] = _utc_now,
 ) -> Starlette:
-    """Build the authenticated control plane without injecting a provider driver."""
+    """Build the authenticated control plane with an injectable UTC clock."""
     api = ProvisioningAPI(
         store,
         KeyCeremonyService(
@@ -285,6 +295,7 @@ def build_provisioning_app(
             verifier=attestation_verifier,
             release_sink=key_release_sink,
         ),
+        clock,
     )
     routes = [
         Route("/control/v1/activations", api.activate, methods=["POST"]),
