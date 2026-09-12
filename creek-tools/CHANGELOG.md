@@ -11,6 +11,20 @@ to locate the originating commit for any reference below.
 
 ### Added
 
+- **`creek-provisioning-fleet` — fleet reconciliation, cost telemetry, and
+  budget alarms (#1769).** Implements ADR-0013 Decisions 4, 6, and 7 as an
+  operator surface without changing the `/control/v1` job contract. A
+  reconciler compares the store's live and pending-deletion allocations with
+  a bounded provider inventory and reports orphan, missing, duplicate,
+  unconfirmed/stuck-deletion, and continuous-running divergences; its only
+  repairs are stopping an overrunning Machine and requeueing a retryable
+  failed delete. Deletions now leave a content-free receipt (schema v4,
+  backfilled for in-flight rows) confirmed inside the lease fence. Every
+  rate, budget, duration, and review threshold is injected from a TOML
+  policy file; the estimate lists unpriced inputs instead of zeroing them
+  and the budget alarm fires at `>=`. `emergency-stop` stops every live
+  Machine and destroys nothing.
+
 - **`creek.classify.entry` — read one fragment's persisted classification
   (#874).** A new read-only MCP tool. It takes an `entry_ref` and a
   `privacy_tier_ceiling` and returns exactly eight keys — `status`, `tool`,

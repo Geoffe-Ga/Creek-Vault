@@ -115,6 +115,167 @@ opaque key envelope to the injected idempotent release sink. Attestation expiry,
 signature failure, measurement mismatch, challenge mismatch, or recipient
 mismatch fails before release.
 
+## Fleet reconciliation, telemetry, and budget alarms (#1769)
+
+ADR-0013 Decisions 4, 6, and 7 are operated from a third process,
+`creek-provisioning-fleet`. It shares the SQLite file with the API and worker,
+holds a Fly driver whose secret manager refuses to issue or revoke, and can
+therefore inventory and stop Machines but never provision or delete. Nothing
+here changes the `/control/v1` job contract: stuck, orphan, and budget
+conditions are operator-side classifications, not job states.
+
+```console
+creek-provisioning-fleet report \
+  --database ./provisioning-state/jobs.sqlite3 \
+  --policy-file ./provisioning-state/fleet-policy.toml \
+  --fly-token-file ./run-secrets/fly_token \
+  --fly-organization creek-vaults \
+  --fly-image registry.example/creek@sha256:<digest> \
+  --fly-token-expires-at 2026-12-31T00:00:00+00:00 \
+  --inventory-file ./provisioning-state/apps.json
+```
+
+`report` observes and exits `0` when clean, `3` when any alert is present, and
+`1` when the provider inventory could not be read (it never prints a "clean"
+report in that case). `reconcile` takes the same arguments and additionally
+performs the only two repairs the tool knows: stopping a live allocation's
+Machine that has run continuously past `max_continuous_running_seconds`, and
+requeueing a retryable failed delete. Stopping an overrunning Machine
+interrupts background work, so run `reconcile` on a schedule you accept for
+that, and `report` everywhere else. Both commands print one JSON document with
+the keys `observed_at`, `telemetry`, `divergences`, `alerts`, `estimate`,
+`review_triggers`, and `inventory_mode`, and log each alert as
+`fleet alert kind=<kind> subject=<id>` with nothing else on the line.
+
+The driver inspects only apps it can derive from live and pending-deletion
+allocations plus the injected inventory file; no org-wide listing endpoint is
+used. Confirmed-deleted jobs are never re-inspected, so provider traffic is
+bounded by the live fleet, not by history. To catch apps the store has
+forgotten, pass the output of `fly apps list --json` as `--inventory-file`
+(a JSON list of names or of objects with `name`/`Name`); names outside the
+configured app prefix are ignored by the driver. An org-wide discovery call
+can be added once its endpoint is verified against a fake route.
+
+### Policy file
+
+Every rate, budget, duration, and review threshold is operator configuration
+read from `--policy-file`. The file is parsed with `parse_float=Decimal`, so
+`0.15` is exactly `0.15`. The values below are reference assumptions from
+ADR-0013 Decision 4, not defaults: the tool has no defaults and refuses to
+start without every key. They are injected assumptions for billing tests and
+operations, never as business logic.
+
+```toml
+[budget]            # reference assumptions from ADR-0013 Decision 4, not defaults
+currency = "USD"
+monthly_budget = 500.00
+volume_gb_month_rate = 0.15
+stopped_rootfs_gb_month_rate = 0.15
+running_hour_rate = 0.0082
+# snapshot_gb_month_rate = 0.02   omit -> the component is reported as unpriced
+# egress_gb_rate = 0.02
+
+[policy]
+max_continuous_running_seconds = 14400
+stuck_deletion_seconds = 3600
+
+[review]            # ADR-0013 Decision 7 thresholds, supplied by the operator
+activated_vaults = 500
+provisioned_volumes = 1000
+months_over_budget = 3
+
+[usage]             # optional, copied from the provider invoice each month
+# snapshot_bytes = 0
+# egress_bytes = 0
+# running_seconds = 0
+```
+
+### Alerts
+
+| kind | meaning | response |
+|------|---------|----------|
+| `duplicate_resource` | a live allocation owns more than one Machine or live volume | inspect the app; the worker's create path refuses duplicates, so this is a provider-side leftover |
+| `orphan_resource` | a resource exists under an app the store does not want (no job, or the job is confirmed deleted) | confirm on the provider console, then delete it there; the tool never deletes |
+| `stuck_deletion` | a deletion has been unconfirmed for at least `stuck_deletion_seconds` | `reconcile` requeues a retryable failure; a non-retryable one needs the provider console |
+| `continuous_running` | a Machine has been observed running for at least `max_continuous_running_seconds` | `reconcile` stops it (this interrupts background work); `report` only reports |
+| `monthly_budget_departure` | the month estimate is greater than or equal to `monthly_budget` (equal fires) | reconcile the invoice below and revisit the budget or the fleet |
+
+`missing_resource` and `unconfirmed_deletion` appear under `divergences` but
+raise no alert: the first is expected during a partial create and the second
+is the normal window between a delete request and provider confirmation.
+
+### Invoice reconciliation
+
+Each telemetry field maps to one invoice line. `sources` in the report says
+where every value came from: `store` (sampled or counted by the control
+plane), `provider` (read from the provider API this pass), `injected` (copied
+from the invoice into `[usage]`), or `unavailable` (`null`, never `0`).
+
+| telemetry field | invoice line | source |
+|-----------------|--------------|--------|
+| `provisioned_volumes`, `volume_bytes` | persistent volume GB-months | provider |
+| `stopped_rootfs_gb` | stopped root filesystem GB-months | provider |
+| `running_machine_seconds_fleet` (and per allocation) | Machine compute hours | store (sampled between consecutive running observations) |
+| `running_seconds_injected` | Machine compute hours | injected; reported beside the sampled figure, never instead of it |
+| `snapshot_bytes` | volume snapshot storage | injected or unavailable |
+| `egress_bytes` | outbound data transfer | injected or unavailable |
+| `activated_allocations`, `allocations_by_state` | number of billable allocations | store |
+| `duplicate_allocation_attempts` | (none; duplicate attempts the store absorbed) | store |
+| `orphan_resources`, `unconfirmed_deletions`, `oldest_unconfirmed_deletion_seconds` | resources that may still be billed | provider / store |
+
+The estimate uses injected running seconds when present; otherwise it uses the
+sampled month-to-date figure, projected to the calendar month only once at
+least one day of the month has elapsed (`running_basis` says which). Storage
+components are full-month rates. Unpriced or unknown inputs are listed under
+`unpriced` rather than silently counted as zero.
+
+Monthly walkthrough: on the first of the month run `report --record-month`
+(this writes the month's estimate to `provisioning_budget_months`); when the
+invoice arrives, copy its snapshot, egress, and running figures into
+`[usage]`, rerun `report`, and compare `estimate.estimated_month` and its
+`components` with the invoice lines. The tool's `--record-month` history is
+what makes the three-rolling-months review trigger evaluable.
+
+### Deletion receipts
+
+Every path that moves a job into `deleting` (a consumer delete, an expired key
+ceremony) opens a content-free receipt in `provisioning_deletion_receipts`.
+The receipt is confirmed - with provider, provider allocation id, and the
+resource classes removed (credential, machine, volume, app) - inside the same
+write fence that marks the job `deleted`; a retryable failed delete bumps its
+`attempts`, and only a non-retryable failure marks it `failed`. The receipt
+carries the requester and consumer subjects the store already holds and never
+a vault URL, credential, provider token, or ceremony material. Databases
+upgraded from schema v3 receive a receipt flagged `backfilled` for any
+deletion already in flight.
+
+### Emergency fleet stop
+
+```console
+creek-provisioning-fleet emergency-stop --database ... --policy-file ... \
+  --fly-token-file ... --fly-organization ... --fly-image ... --fly-token-expires-at ...
+```
+
+The emergency fleet stop calls `FlyProviderDriver.stop` for every allocation
+the store still owns, which stops the Machine without detaching its volume. It
+destroys no volume, Machine, or app, issues no `DELETE`, continues past a
+per-allocation provider failure, prints a per-allocation outcome list, and
+exits `1` if any stop failed. Stopping interrupts background work in progress;
+the durable worker resumes it on the next claim.
+
+### Review checkpoint (ADR-0013 Decision 7)
+
+Decision 7 requires reviewing the one-app/one-Machine driver at 500 activated
+vaults, 1,000 provisioned volumes, a material change in confidential-compute
+availability, or three rolling months above the approved fleet budget,
+whichever comes first. The report surfaces these as `review_triggers`:
+`activated_vaults` and `provisioned_volumes` compare telemetry with the
+`[review]` thresholds, `months_over_budget` reads the durable
+`--record-month` history, and `confidential_compute_change` is raised by
+passing `--confidential-compute-changed` when the operator judges that a
+material change has happened. The thresholds are policy values; the ADR
+numbers above are the example, not defaults.
+
 ## State and retry rules
 
 - `pending` is claimable create work.
@@ -124,8 +285,9 @@ mismatch fails before release.
   attested confidential processing was actually verified;
 - stable failures become `failed` and are retryable only when explicitly
   recorded as safe;
-- delete changes any live state to `deleting`, and only provider confirmation
-  produces the durable `deleted` receipt.
+- delete changes any live state to `deleting` and opens a pending deletion
+  receipt; only provider confirmation moves the job to `deleted` and confirms
+  the receipt.
 
 Activation ids remain durable aliases. Repeating one returns the same job;
 distinct concurrent ids for the same requester/consumer-subject pair resolve to
