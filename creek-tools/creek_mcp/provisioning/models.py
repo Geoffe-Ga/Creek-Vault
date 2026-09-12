@@ -7,6 +7,7 @@ from enum import StrEnum, unique
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from datetime import datetime
 
 
@@ -142,3 +143,57 @@ class FleetJob:
     allocation_deleted_at: datetime | None
     delete_requested_at: datetime | None
     receipt_outcome: ReceiptOutcome | None
+
+
+@unique
+class DivergenceKind(StrEnum):
+    """Operator-side classifications of store/provider disagreement."""
+
+    ORPHAN_RESOURCE = "orphan_resource"
+    MISSING_RESOURCE = "missing_resource"
+    DUPLICATE_RESOURCE = "duplicate_resource"
+    UNCONFIRMED_DELETION = "unconfirmed_deletion"
+    STUCK_DELETION = "stuck_deletion"
+    CONTINUOUS_RUNNING = "continuous_running"
+
+
+@unique
+class Disposition(StrEnum):
+    """Whether the reconciler only reported a divergence or also repaired it."""
+
+    REPORTED = "reported"
+    REPAIRED = "repaired"
+
+
+@dataclass(frozen=True, slots=True)
+class Divergence:
+    """One content-free divergence; identifiers only, never addresses or secrets."""
+
+    kind: DivergenceKind
+    disposition: Disposition
+    provider_allocation_id: str | None
+    resource_class: ResourceClass | None
+    job_id: str | None
+    age_seconds: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class FleetTelemetry:
+    """Content-free fleet measurements plus the provenance of every field."""
+
+    activated_allocations: int
+    allocations_by_state: Mapping[str, int]
+    provisioned_volumes: int
+    volume_bytes: int
+    stopped_rootfs_gb: int
+    machines_without_rootfs_size: int
+    running_machine_seconds_by_allocation: Mapping[str, int]
+    running_machine_seconds_fleet: int
+    running_seconds_injected: int | None
+    snapshot_bytes: int | None
+    egress_bytes: int | None
+    duplicate_allocation_attempts: int
+    orphan_resources: int
+    unconfirmed_deletions: int
+    oldest_unconfirmed_deletion_seconds: int | None
+    sources: Mapping[str, str]
