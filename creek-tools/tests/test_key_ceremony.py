@@ -26,6 +26,7 @@ from creek.confidential.keyvault import (
 )
 from creek_mcp.httpapi.provisioning import build_provisioning_app
 from creek_mcp.provisioning.ceremony import (
+    KEY_CEREMONY_TTL,
     KEY_CEREMONY_VERSION,
     AttestationStatement,
     CeremonyConflictError,
@@ -560,6 +561,33 @@ def test_http_challenge_and_completion_publish_only_safe_resumable_state(
     assert "recovery" not in challenge_response.text.lower()
     assert "recovery" not in completed.text.lower()
     assert client.get(path, headers=_headers()).json()["code"] == "invalid_transition"
+
+
+def test_http_refuses_a_challenge_older_than_its_ttl_at_the_injected_instant(
+    tmp_path: Path,
+) -> None:
+    """The HTTP boundary settles ceremonies on an injected clock, not wall time."""
+    store, job_id = _awaiting_store(tmp_path)
+    path = f"/control/v1/jobs/{job_id}/key-ceremony"
+    challenge = KeyCeremonyChallenge.model_validate(
+        _api_client(store).get(path, headers=_headers()).json()
+    )
+    submission = _for_challenge(_vector_submission(), challenge)
+    expired_client = _api_client(store, now=_NOW + KEY_CEREMONY_TTL)
+
+    refused = expired_client.put(
+        path,
+        headers=_headers(),
+        json=submission.model_dump(mode="json"),
+    )
+
+    assert challenge.expires_at == _NOW + KEY_CEREMONY_TTL
+    assert refused.status_code == 409
+    assert refused.json()["code"] == "ceremony_expired"
+    queued = store.get(job_id, "adepthood")
+    assert queued is not None
+    assert queued.state is JobState.DELETING
+    assert queued.updated_at == _NOW + KEY_CEREMONY_TTL
 
 
 def test_http_default_clock_completes_a_fresh_challenge(tmp_path: Path) -> None:

@@ -45,7 +45,7 @@ _NO_STORE: Final[str] = "no-store"
 
 
 def _utc_now() -> datetime:
-    """Return the current aware UTC time for production ceremony expiry checks."""
+    """Return the wall clock the control plane uses unless a test injects one."""
     return datetime.now(tz=UTC)
 
 
@@ -99,9 +99,10 @@ class ProvisioningAPI:
         self,
         store: ProvisioningStore,
         ceremony: KeyCeremonyService,
+        *,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
-        """Bind handlers to the durable store and expiry-check clock."""
+        """Bind handlers to the injected durable store and request clock."""
         self._store = store
         self._ceremony = ceremony
         self._clock = clock
@@ -115,7 +116,7 @@ class ProvisioningAPI:
         assert requester is not None
         try:
             job = await write_off_loop(
-                self._store.submit,
+                self._submit,
                 payload.activation_id,
                 payload.consumer_identity,
                 requester,
@@ -142,7 +143,7 @@ class ProvisioningAPI:
         consumer = context_of(request.scope).consumer
         assert consumer is not None
         try:
-            job = await write_off_loop(self._store.retry, job_id, consumer)
+            job = await write_off_loop(self._retry, job_id, consumer)
         except InvalidJobTransitionError as error:
             if await read_off_loop(self._store.get, job_id, consumer) is None:
                 return _error(request, "job_unavailable", "job unavailable", 403)
@@ -161,11 +162,7 @@ class ProvisioningAPI:
         consumer = context_of(request.scope).consumer
         assert consumer is not None
         try:
-            job = await write_off_loop(
-                self._store.request_delete,
-                job_id,
-                consumer,
-            )
+            job = await write_off_loop(self._request_delete, job_id, consumer)
         except InvalidJobTransitionError:
             return _error(request, "job_unavailable", "job unavailable", 403)
         return _response(_job_payload(job), status_code=202)
@@ -240,6 +237,28 @@ class ProvisioningAPI:
             )
         return _response(_job_payload(job), status_code=200)
 
+    def _submit(
+        self,
+        activation_id: str,
+        consumer_identity: str,
+        requester: str,
+    ) -> ProvisioningJob:
+        """Submit at the injected instant; off-loop calls take positionals only."""
+        return self._store.submit(
+            activation_id,
+            consumer_identity,
+            requester,
+            now=self._clock(),
+        )
+
+    def _retry(self, job_id: str, requester: str) -> ProvisioningJob:
+        """Requeue at the injected instant; off-loop calls take positionals only."""
+        return self._store.retry(job_id, requester, now=self._clock())
+
+    def _request_delete(self, job_id: str, requester: str) -> ProvisioningJob:
+        """Enqueue teardown at the injected instant, never the wall clock."""
+        return self._store.request_delete(job_id, requester, now=self._clock())
+
     async def _owned_job(self, request: Request) -> ProvisioningJob | None:
         """Load the path job under the authenticated requester boundary."""
         consumer = context_of(request.scope).consumer
@@ -287,7 +306,11 @@ def build_provisioning_app(
     key_release_sink: KeyReleaseSink | None = None,
     clock: Callable[[], datetime] = _utc_now,
 ) -> Starlette:
-    """Build the authenticated control plane with an injectable UTC clock."""
+    """Build the authenticated control plane without injecting a provider driver.
+
+    *clock* is the only source of "now" for every store transition the HTTP
+    boundary performs, so ceremony expiry is testable at an injected instant.
+    """
     api = ProvisioningAPI(
         store,
         KeyCeremonyService(
@@ -295,7 +318,7 @@ def build_provisioning_app(
             verifier=attestation_verifier,
             release_sink=key_release_sink,
         ),
-        clock,
+        clock=clock,
     )
     routes = [
         Route("/control/v1/activations", api.activate, methods=["POST"]),

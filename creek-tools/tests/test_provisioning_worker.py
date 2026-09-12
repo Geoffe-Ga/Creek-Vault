@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +17,14 @@ from creek_mcp.provisioning.driver import (
     FakeProviderDriver,
     ProviderError,
 )
-from creek_mcp.provisioning.models import FailureReason, JobState
+from creek_mcp.provisioning.models import (
+    DeletionOutcome,
+    DeletionReceipt,
+    FailureReason,
+    JobState,
+    ReceiptOutcome,
+    ResourceClass,
+)
 from creek_mcp.provisioning.store import ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
 
@@ -140,13 +148,19 @@ def test_provider_result_secrets_never_reach_the_durable_database(
     )
 
     worker.run_once(now=_NOW)
+    local_store.request_delete(job.job_id, "adepthood", now=_NOW)
+    worker.run_once(now=_NOW)
 
     digest = hashlib.sha256(job.job_id.encode("utf-8")).hexdigest()
     credential = f"fake-consumer-adepthood-{digest}".encode()
     vault_url = f"https://fake-{digest[:16]}.internal.invalid/v1".encode()
     persisted = database.read_bytes()
+    receipt = local_store.list_deletion_receipts()[0]
+    assert receipt.outcome is ReceiptOutcome.CONFIRMED
     assert credential not in persisted
     assert vault_url not in persisted
+    assert credential.decode() not in repr(receipt)
+    assert vault_url.decode() not in repr(receipt)
 
 
 def test_conflicting_one_time_handoff_fails_closed_without_retry(
@@ -313,3 +327,85 @@ def test_delete_calls_the_driver_once_and_finishes_idempotently(
     assert deleted.state is JobState.DELETED
     assert driver.delete_count == 1
     assert store.request_delete(job.job_id, "adepthood", now=_NOW) == deleted
+    receipts = store.list_deletion_receipts()
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt.outcome is ReceiptOutcome.CONFIRMED
+    assert receipt.provider == "fake"
+    assert receipt.resource_classes == (
+        ResourceClass.CREDENTIAL,
+        ResourceClass.MACHINE,
+        ResourceClass.VOLUME,
+        ResourceClass.APP,
+    )
+    assert receipt.requested_at == _NOW
+    assert receipt.confirmed_at == _NOW
+    assert receipt.attempts == 0
+    assert receipt.backfilled is False
+    assert {field.name for field in dataclasses.fields(DeletionReceipt)} == {
+        "job_id",
+        "requester_identity",
+        "consumer_identity",
+        "provider",
+        "provider_allocation_id",
+        "resource_classes",
+        "requested_at",
+        "confirmed_at",
+        "outcome",
+        "last_failure_reason",
+        "attempts",
+        "backfilled",
+    }
+    assert set(ReceiptOutcome) == {"pending", "confirmed", "failed"}
+
+
+def test_failed_delete_bumps_receipt_attempts_and_terminal_failure_marks_it_failed(
+    store: ProvisioningStore,
+) -> None:
+    """A retryable teardown failure keeps the receipt open; a terminal one closes it."""
+
+    class FailingDeleteDriver(FakeProviderDriver):
+        """Fail teardown with a queued policy before deleting anything."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.policies = [True, True, False]
+
+        def delete(
+            self,
+            job: ProvisioningJob,
+            provider_allocation_id: str | None,
+        ) -> DeletionOutcome:
+            if self.policies:
+                raise ProviderError(
+                    FailureReason.PROVIDER_UNAVAILABLE,
+                    retryable=self.policies.pop(0),
+                )
+            return super().delete(job, provider_allocation_id)
+
+    job = store.submit("activation-delete-failures", "adepthood", now=_NOW)
+    driver = FailingDeleteDriver()
+    worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
+    worker.run_once(now=_NOW)
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+
+    worker.run_once(now=_NOW)
+    after_first = store.list_deletion_receipts()[0]
+    store.retry(job.job_id, "adepthood", now=_NOW)
+    worker.run_once(now=_NOW)
+    after_second = store.list_deletion_receipts()[0]
+    store.retry(job.job_id, "adepthood", now=_NOW)
+    worker.run_once(now=_NOW)
+    terminal = store.list_deletion_receipts()[0]
+
+    assert (after_first.outcome, after_first.attempts) == (ReceiptOutcome.PENDING, 1)
+    assert after_first.last_failure_reason is FailureReason.PROVIDER_UNAVAILABLE
+    assert (after_second.outcome, after_second.attempts) == (ReceiptOutcome.PENDING, 2)
+    assert (terminal.outcome, terminal.attempts) == (ReceiptOutcome.FAILED, 3)
+    assert terminal.confirmed_at is None
+    assert terminal.provider is None
+    failed = store.get(job.job_id, "adepthood")
+    assert failed is not None
+    assert failed.state is JobState.FAILED
+    assert failed.retryable is False
+    assert driver.delete_count == 0

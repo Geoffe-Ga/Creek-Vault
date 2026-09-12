@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import httpx
 import pytest
 
 from creek_mcp.provisioning.driver import FakeOneTimeHandoff, ProviderError
@@ -18,250 +15,41 @@ from creek_mcp.provisioning.fly import (
     FlyCredentialScope,
     FlyProviderDriver,
     FlyProviderPolicy,
-    FlyRuntimeSecrets,
 )
-from creek_mcp.provisioning.models import JobOperation, JobState, ProvisioningJob
+from creek_mcp.provisioning.inventory import ProviderResource
+from creek_mcp.provisioning.models import (
+    DeletionOutcome,
+    FailureReason,
+    ResourceClass,
+    ResourceState,
+)
 from creek_mcp.provisioning.store import ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
+from tests.fly_support import (
+    CONSUMER_TOKEN,
+    PROVIDER_TOKEN,
+    TLS_KEY,
+    FakeFlyAPI,
+    FakeSecretManager,
+    fly_driver,
+    fly_job,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 _NOW = datetime(2026, 9, 7, 4, tzinfo=UTC)
-_PROVIDER_TOKEN = "fly-provider-secret-canary"
-_CONSUMER_TOKEN = "creek-consumer-secret-canary"
-_TLS_KEY = "tls-private-key-secret-canary"
 _RUNBOOK = (
     Path(__file__).resolve().parents[1] / "docs" / "provisioning-control-plane.md"
 )
 
 
-@dataclass
-class _FakeSecretManager:
-    """Return stable per-activation runtime secrets and record revocation."""
-
-    revoked: set[str]
-
-    def issue(self, activation_id: str, consumer_identity: str) -> FlyRuntimeSecrets:
-        """Return the same secret bundle on every retry."""
-        del activation_id
-        return FlyRuntimeSecrets(
-            consumer_credential=_CONSUMER_TOKEN,
-            consumer_registry=f"{consumer_identity}={_CONSUMER_TOKEN}\n".encode(),
-            tls_certificate=b"test-certificate",
-            tls_private_key=_TLS_KEY.encode(),
-        )
-
-    def revoke(self, activation_id: str) -> None:
-        """Record an idempotent revocation."""
-        self.revoked.add(activation_id)
-
-
-class _FakeFlyAPI:
-    """Stateful HTTP fake for the documented Fly Machines endpoints."""
-
-    def __init__(self) -> None:
-        self.apps: dict[str, dict[str, Any]] = {}
-        self.volumes: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
-        self.machines: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
-        self.requests: list[tuple[str, str]] = []
-        self.failures: dict[tuple[str, str], int] = {}
-        self.failure_body = "provider unavailable"
-
-    def fail_once(self, method: str, path_suffix: str) -> None:
-        """Return one 503 for a matching method and path suffix."""
-        self.failures[(method, path_suffix)] = 1
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        """Serve one authenticated request without a real network."""
-        assert request.headers["Authorization"] == f"Bearer {_PROVIDER_TOKEN}"
-        method = request.method
-        path = request.url.path
-        self.requests.append((method, path))
-        for key, remaining in self.failures.items():
-            if remaining and method == key[0] and path.endswith(key[1]):
-                self.failures[key] = remaining - 1
-                return httpx.Response(503, text=self.failure_body, request=request)
-        segments = path.strip("/").split("/")
-        if segments == ["v1", "apps"] and method == "POST":
-            return self._create_app(request)
-        if len(segments) >= 3 and segments[:2] == ["v1", "apps"]:
-            return self._app_request(request, segments[2:])
-        return httpx.Response(404, request=request)
-
-    def _create_app(self, request: httpx.Request) -> httpx.Response:
-        body = self._json(request)
-        app_name = str(body["app_name"])
-        if app_name in self.apps:
-            return httpx.Response(422, request=request)
-        self.apps[app_name] = {
-            "id": f"app-{len(self.apps) + 1}",
-            "name": app_name,
-            "organization": {"slug": body["org_slug"]},
-            "network": body["network"],
-        }
-        return httpx.Response(201, json=self.apps[app_name], request=request)
-
-    def _app_request(
-        self,
-        request: httpx.Request,
-        segments: list[str],
-    ) -> httpx.Response:
-        app_name = segments[0]
-        if len(segments) == 1:
-            return self._app_resource(request, app_name)
-        if app_name not in self.apps:
-            return httpx.Response(404, request=request)
-        if segments[1] == "volumes":
-            return self._volume_request(request, app_name, segments[2:])
-        if segments[1] == "machines":
-            return self._machine_request(request, app_name, segments[2:])
-        return httpx.Response(404, request=request)
-
-    def _app_resource(self, request: httpx.Request, app_name: str) -> httpx.Response:
-        if request.method == "GET":
-            app = self.apps.get(app_name)
-            return httpx.Response(
-                404 if app is None else 200,
-                json=None if app is None else app,
-                request=request,
-            )
-        if request.method == "DELETE":
-            if app_name not in self.apps:
-                return httpx.Response(404, request=request)
-            if self.volumes[app_name] or self.machines[app_name]:
-                return httpx.Response(409, request=request)
-            del self.apps[app_name]
-            return httpx.Response(202, request=request)
-        return httpx.Response(405, request=request)
-
-    def _volume_request(
-        self,
-        request: httpx.Request,
-        app_name: str,
-        segments: list[str],
-    ) -> httpx.Response:
-        if not segments and request.method == "GET":
-            return httpx.Response(200, json=self.volumes[app_name], request=request)
-        if not segments and request.method == "POST":
-            body = self._json(request)
-            volume = {
-                "id": f"vol-{len(self.volumes[app_name]) + 1}",
-                "name": body["name"],
-                "region": body["region"],
-                "size_gb": body["size_gb"],
-                "encrypted": body["encrypted"],
-                "state": "created",
-            }
-            self.volumes[app_name].append(volume)
-            return httpx.Response(200, json=volume, request=request)
-        if len(segments) == 1 and request.method == "DELETE":
-            volume_id = segments[0]
-            before = len(self.volumes[app_name])
-            self.volumes[app_name] = [
-                volume for volume in self.volumes[app_name] if volume["id"] != volume_id
-            ]
-            status = 200 if len(self.volumes[app_name]) < before else 404
-            return httpx.Response(status, request=request)
-        return httpx.Response(404, request=request)
-
-    def _machine_request(
-        self,
-        request: httpx.Request,
-        app_name: str,
-        segments: list[str],
-    ) -> httpx.Response:
-        if not segments and request.method == "GET":
-            return httpx.Response(200, json=self.machines[app_name], request=request)
-        if not segments and request.method == "POST":
-            body = self._json(request)
-            machine = {
-                "id": f"machine-{len(self.machines[app_name]) + 1}",
-                "name": body["name"],
-                "region": body["region"],
-                "state": "stopped" if body["skip_launch"] else "started",
-                "config": body["config"],
-            }
-            self.machines[app_name].append(machine)
-            return httpx.Response(200, json=machine, request=request)
-        if not segments:
-            return httpx.Response(404, request=request)
-        matched_machine: dict[str, Any] | None = None
-        for candidate in self.machines[app_name]:
-            if candidate["id"] == segments[0]:
-                matched_machine = candidate
-                break
-        if matched_machine is None:
-            return httpx.Response(404, request=request)
-        if len(segments) == 2 and request.method == "POST":
-            if segments[1] == "start":
-                matched_machine["state"] = "started"
-            elif segments[1] == "stop":
-                matched_machine["state"] = "stopped"
-            else:
-                return httpx.Response(404, request=request)
-            return httpx.Response(200, json=matched_machine, request=request)
-        if len(segments) == 1 and request.method == "DELETE":
-            self.machines[app_name].remove(matched_machine)
-            return httpx.Response(200, request=request)
-        return httpx.Response(404, request=request)
-
-    @staticmethod
-    def _json(request: httpx.Request) -> dict[str, Any]:
-        """Decode a fake request body."""
-        import json
-
-        value = json.loads(request.content)
-        assert isinstance(value, dict)
-        return value
-
-
-def _job(activation_id: str = "activation-fly-001") -> ProvisioningJob:
-    return ProvisioningJob(
-        job_id="job-fly-001",
-        activation_id=activation_id,
-        requester_identity="adepthood",
-        consumer_identity="adepthood-user-001",
-        state=JobState.PROVISIONING,
-        operation=JobOperation.CREATE,
-        attempts=1,
-        retryable=False,
-        failure_reason=None,
-        created_at=_NOW,
-        updated_at=_NOW,
-    )
-
-
-def _driver(
-    api: _FakeFlyAPI,
-    secrets: _FakeSecretManager | None = None,
-) -> FlyProviderDriver:
-    credential = FlyCredential(
-        token=_PROVIDER_TOKEN,
-        organization="creek-vaults",
-        scope=FlyCredentialScope.ORG_DEPLOY,
-        expires_at=_NOW + timedelta(days=7),
-    )
-    policy = FlyProviderPolicy(
-        organization="creek-vaults",
-        image="registry.example/creek@sha256:" + "a" * 64,
-        api_base_url="https://fly.test",
-    )
-    client = httpx.Client(
-        base_url=policy.api_base_url,
-        transport=httpx.MockTransport(api.handle),
-    )
-    return FlyProviderDriver(
-        policy, credential, secrets or _FakeSecretManager(set()), client
-    )
-
-
-def _only_app(api: _FakeFlyAPI) -> str:
+def _only_app(api: FakeFlyAPI) -> str:
     assert len(api.apps) == 1
     return next(iter(api.apps))
 
 
-def _only_machine(api: _FakeFlyAPI) -> dict[str, Any]:
+def _only_machine(api: FakeFlyAPI) -> dict[str, Any]:
     machines = api.machines[_only_app(api)]
     assert len(machines) == 1
     return machines[0]
@@ -269,10 +57,10 @@ def _only_machine(api: _FakeFlyAPI) -> dict[str, Any]:
 
 def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None:
     """Reference defaults remain config while the request stays private."""
-    api = _FakeFlyAPI()
-    driver = _driver(api)
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
 
-    allocation = driver.provision(_job())
+    allocation = driver.provision(fly_job())
 
     app_name = _only_app(api)
     volume = api.volumes[app_name][0]
@@ -331,18 +119,18 @@ def test_provider_and_runtime_secrets_are_repr_safe_and_never_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Provider bodies and every credential stay out of exceptions and logs."""
-    api = _FakeFlyAPI()
-    api.failure_body = f"echo {_PROVIDER_TOKEN} {_CONSUMER_TOKEN} {_TLS_KEY}"
+    api = FakeFlyAPI()
+    api.failure_body = f"echo {PROVIDER_TOKEN} {CONSUMER_TOKEN} {TLS_KEY}"
     api.fail_once("POST", "/machines")
-    driver = _driver(api)
+    driver = fly_driver(api)
 
     with caplog.at_level(logging.DEBUG), pytest.raises(ProviderError) as raised:
-        driver.provision(_job())
+        driver.provision(fly_job())
 
     rendered = caplog.text + repr(driver) + str(raised.value)
-    assert _PROVIDER_TOKEN not in rendered
-    assert _CONSUMER_TOKEN not in rendered
-    assert _TLS_KEY not in rendered
+    assert PROVIDER_TOKEN not in rendered
+    assert CONSUMER_TOKEN not in rendered
+    assert TLS_KEY not in rendered
 
 
 def test_credential_file_requires_an_org_deploy_scope_and_hides_token(
@@ -350,7 +138,7 @@ def test_credential_file_requires_an_org_deploy_scope_and_hides_token(
 ) -> None:
     """A personal token cannot accidentally become the fleet credential."""
     token_file = tmp_path / "fly-token"
-    token_file.write_text(f"{_PROVIDER_TOKEN}\n", encoding="utf-8")
+    token_file.write_text(f"{PROVIDER_TOKEN}\n", encoding="utf-8")
     token_file.chmod(0o600)
 
     credential = FlyCredential.from_file(
@@ -360,10 +148,10 @@ def test_credential_file_requires_an_org_deploy_scope_and_hides_token(
         expires_at=_NOW + timedelta(days=1),
     )
 
-    assert _PROVIDER_TOKEN not in repr(credential)
+    assert PROVIDER_TOKEN not in repr(credential)
     with pytest.raises(ValueError, match="org-scoped deploy"):
         FlyCredential(
-            token=_PROVIDER_TOKEN,
+            token=PROVIDER_TOKEN,
             organization="creek-vaults",
             scope=FlyCredentialScope.PERSONAL,
             expires_at=_NOW + timedelta(days=1),
@@ -373,7 +161,7 @@ def test_credential_file_requires_an_org_deploy_scope_and_hides_token(
 def test_credential_file_rejects_unsafe_permissions(tmp_path: Path) -> None:
     """Provider credentials are never loaded from a group-readable file."""
     token_file = tmp_path / "fly-token"
-    token_file.write_text(_PROVIDER_TOKEN, encoding="utf-8")
+    token_file.write_text(PROVIDER_TOKEN, encoding="utf-8")
     token_file.chmod(0o640)
 
     with pytest.raises(ValueError, match="owner-only and regular"):
@@ -419,21 +207,21 @@ def test_driver_rejects_cross_organization_credentials() -> None:
         image="registry.example/creek@sha256:" + "a" * 64,
     )
     credential = FlyCredential(
-        token=_PROVIDER_TOKEN,
+        token=PROVIDER_TOKEN,
         organization="another-organization",
         scope=FlyCredentialScope.ORG_DEPLOY,
         expires_at=_NOW + timedelta(days=1),
     )
     with pytest.raises(ValueError, match="organization does not match"):
-        FlyProviderDriver(policy, credential, _FakeSecretManager(set()))
+        FlyProviderDriver(policy, credential, FakeSecretManager(set()))
 
 
 def test_provision_start_stop_and_delete_are_idempotent() -> None:
     """Every lifecycle call is safe to replay after an unknown outcome."""
-    api = _FakeFlyAPI()
-    secrets = _FakeSecretManager(set())
-    driver = _driver(api, secrets)
-    job = _job()
+    api = FakeFlyAPI()
+    secrets = FakeSecretManager(set())
+    driver = fly_driver(api, secrets)
+    job = fly_job()
 
     first = driver.provision(job)
     second = driver.provision(job)
@@ -453,9 +241,9 @@ def test_provision_start_stop_and_delete_are_idempotent() -> None:
 
 def test_stopped_machine_restarts_with_the_same_encrypted_volume() -> None:
     """Scale-to-zero preserves the durable volume across demand starts."""
-    api = _FakeFlyAPI()
-    driver = _driver(api)
-    job = _job()
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
     driver.provision(job)
     original_volume = _only_machine(api)["config"]["mounts"][0]["volume"]
 
@@ -474,9 +262,9 @@ def test_stopped_machine_restarts_with_the_same_encrypted_volume() -> None:
 
 def test_background_work_owns_commit_close_and_shutdown_order() -> None:
     """Returning from initiation cannot stop work; the durable worker does."""
-    api = _FakeFlyAPI()
-    driver = _driver(api)
-    job = _job()
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
     driver.provision(job)
 
     driver.start(job.activation_id)
@@ -499,9 +287,9 @@ def test_background_work_owns_commit_close_and_shutdown_order() -> None:
 
 def test_background_failure_still_closes_and_stops_the_vault() -> None:
     """Failed durable work cannot strand an unlocked, billable Machine."""
-    api = _FakeFlyAPI()
-    driver = _driver(api)
-    job = _job()
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
     driver.provision(job)
     events: list[str] = []
 
@@ -523,10 +311,10 @@ def test_background_failure_still_closes_and_stops_the_vault() -> None:
 
 def test_delete_rejects_a_cross_activation_allocation_before_revocation() -> None:
     """A stale queue record cannot delete or revoke another allocation."""
-    api = _FakeFlyAPI()
-    secrets = _FakeSecretManager(set())
-    driver = _driver(api, secrets)
-    job = _job()
+    api = FakeFlyAPI()
+    secrets = FakeSecretManager(set())
+    driver = fly_driver(api, secrets)
+    job = fly_job()
     allocation = driver.provision(job)
 
     with pytest.raises(ProviderError) as raised:
@@ -540,9 +328,9 @@ def test_delete_rejects_a_cross_activation_allocation_before_revocation() -> Non
 
 def test_reconciliation_rejects_colliding_app_or_machine_identity() -> None:
     """Deterministic names cannot make foreign Fly resources adoptable."""
-    api = _FakeFlyAPI()
-    driver = _driver(api)
-    job = _job()
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
     driver.provision(job)
     app_name = _only_app(api)
     api.apps[app_name]["organization"] = {"slug": "foreign-organization"}
@@ -560,10 +348,10 @@ def test_reconciliation_rejects_colliding_app_or_machine_identity() -> None:
 
 def test_worker_supplies_activation_context_to_the_provider(tmp_path: Path) -> None:
     """Crash reconciliation is keyed by activation, not an opaque queue id."""
-    api = _FakeFlyAPI()
+    api = FakeFlyAPI()
     store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
     job = store.submit("activation-from-worker", "adepthood", now=_NOW)
-    worker = ProvisioningWorker(store, _driver(api), FakeOneTimeHandoff())
+    worker = ProvisioningWorker(store, fly_driver(api), FakeOneTimeHandoff())
 
     assert worker.run_once(now=_NOW) is True
 
@@ -575,10 +363,10 @@ def test_worker_supplies_activation_context_to_the_provider(tmp_path: Path) -> N
 @pytest.mark.integration
 def test_fake_fly_api_reconciles_partial_creation() -> None:
     """A retry adopts one app and volume left by a failed Machine create."""
-    api = _FakeFlyAPI()
+    api = FakeFlyAPI()
     api.fail_once("POST", "/machines")
-    driver = _driver(api)
-    job = _job("activation-partial-create")
+    driver = fly_driver(api)
+    job = fly_job("activation-partial-create")
 
     with pytest.raises(ProviderError) as raised:
         driver.provision(job)
@@ -597,10 +385,10 @@ def test_fake_fly_api_reconciles_partial_creation() -> None:
 @pytest.mark.integration
 def test_fake_fly_api_reconciles_partial_deletion() -> None:
     """A failed teardown remains retryable until every billable resource is gone."""
-    api = _FakeFlyAPI()
-    secrets = _FakeSecretManager(set())
-    driver = _driver(api, secrets)
-    job = _job("activation-partial-delete")
+    api = FakeFlyAPI()
+    secrets = FakeSecretManager(set())
+    driver = fly_driver(api, secrets)
+    job = fly_job("activation-partial-delete")
     allocation = driver.provision(job)
     api.fail_once("DELETE", "/volumes/vol-1")
 
@@ -617,3 +405,249 @@ def test_fake_fly_api_reconciles_partial_deletion() -> None:
     assert not any(api.volumes.values())
     assert not any(api.machines.values())
     assert secrets.revoked == {job.activation_id}
+
+
+def test_delete_returns_a_provider_confirmed_outcome() -> None:
+    """The outcome names provider and classes only after absence is verified."""
+    api = FakeFlyAPI()
+    secrets = FakeSecretManager(set())
+    driver = fly_driver(api, secrets)
+    job = fly_job()
+    allocation = driver.provision(job)
+
+    outcome = driver.delete(job, allocation.allocation_id)
+    replay = driver.delete(job, allocation.allocation_id)
+
+    assert outcome == DeletionOutcome(
+        "fly",
+        (
+            ResourceClass.CREDENTIAL,
+            ResourceClass.MACHINE,
+            ResourceClass.VOLUME,
+            ResourceClass.APP,
+        ),
+    )
+    assert replay == outcome
+    assert api.apps == {}
+    for canary in (PROVIDER_TOKEN, CONSUMER_TOKEN, TLS_KEY):
+        assert canary not in repr(outcome)
+
+
+def test_list_resources_reads_only_per_app_get_calls_and_maps_states_and_sizes() -> (
+    None
+):
+    """Inventory is three GETs per app, grouped by the app-derived allocation id."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    allocation = driver.provision(fly_job())
+    app_name = _only_app(api)
+    api.requests.clear()
+
+    resources = driver.list_resources(["activation-fly-001"])
+
+    pid = allocation.allocation_id
+    assert resources == (
+        ProviderResource(
+            pid, ResourceClass.APP, ResourceState.OTHER, None, None, "app-1"
+        ),
+        ProviderResource(
+            pid,
+            ResourceClass.MACHINE,
+            ResourceState.STOPPED,
+            1,
+            "activation-fly-001",
+            "machine-1",
+        ),
+        ProviderResource(
+            pid, ResourceClass.VOLUME, ResourceState.OTHER, 5, None, "vol-1"
+        ),
+    )
+    assert all(method == "GET" for method, _ in api.requests)
+    assert {path for _, path in api.requests} == {
+        f"/v1/apps/{app_name}",
+        f"/v1/apps/{app_name}/machines",
+        f"/v1/apps/{app_name}/volumes",
+    }
+    assert len(api.requests) == 3
+    assert driver.expected_allocation_id("activation-fly-001") == pid
+
+    machine = api.machines[app_name][0]
+    for fly_state, expected in (
+        ("started", ResourceState.RUNNING),
+        ("starting", ResourceState.RUNNING),
+        ("stopping", ResourceState.STOPPED),
+        ("suspended", ResourceState.STOPPED),
+        ("replacing", ResourceState.OTHER),
+        ("destroyed", ResourceState.DESTROYED),
+    ):
+        machine["state"] = fly_state
+        listed = driver.list_resources(["activation-fly-001"])
+        assert [
+            r.state for r in listed if r.resource_class is ResourceClass.MACHINE
+        ] == [expected]
+    del machine["config"]["rootfs"]
+    api.volumes[app_name][0]["state"] = "destroyed"
+    listed = driver.list_resources(["activation-fly-001"])
+    assert [r.size_gb for r in listed if r.resource_class is ResourceClass.MACHINE] == [
+        None
+    ]
+    assert [r.state for r in listed if r.resource_class is ResourceClass.VOLUME] == [
+        ResourceState.DESTROYED
+    ]
+
+
+def test_list_resources_covers_injected_app_names_and_skips_missing_apps() -> None:
+    """Discovery is bounded to derived and injected names under the app prefix."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    orphan_app = "creek-vault-" + "0" * 24
+    api.apps[orphan_app] = {"id": "app-orphan", "name": orphan_app}
+    api.volumes[orphan_app].append(
+        {"id": "vol-orphan", "name": "left-behind", "size_gb": 3, "state": "created"}
+    )
+    api.apps["not-ours"] = {"id": "app-foreign", "name": "not-ours"}
+
+    missing_app = "creek-vault-" + "f" * 24
+    resources = driver.list_resources(
+        [],
+        app_names=[orphan_app, "not-ours", missing_app, "creek-vault-missing"],
+    )
+    nothing = driver.list_resources(["activation-never-provisioned"])
+
+    pid = "fly-" + "0" * 24
+    assert resources == (
+        ProviderResource(
+            pid, ResourceClass.APP, ResourceState.OTHER, None, None, "app-orphan"
+        ),
+        ProviderResource(
+            pid, ResourceClass.VOLUME, ResourceState.OTHER, 3, None, "vol-orphan"
+        ),
+    )
+    assert nothing == ()
+    assert not any("not-ours" in path for _, path in api.requests)
+    assert [path for _, path in api.requests if missing_app in path] == [
+        f"/v1/apps/{missing_app}"
+    ]
+    assert not any("creek-vault-missing" in path for _, path in api.requests)
+    assert ("GET", "/v1/apps") not in api.requests
+
+
+def test_machine_metadata_claiming_another_allocation_stays_under_its_own_app() -> None:
+    """Metadata is informational: a rogue Machine cannot be adopted by its claim."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    first = driver.provision(fly_job("activation-fly-001"))
+    second = driver.provision(fly_job("activation-fly-002"))
+    app_of_first = next(
+        name for name, app in api.apps.items() if app["network"] == first.allocation_id
+    )
+    api.machines[app_of_first].append(
+        {
+            "id": "machine-rogue",
+            "name": "rogue",
+            "region": "iad",
+            "state": "stopped",
+            "config": {
+                "rootfs": {"size_gb": 1},
+                "metadata": {
+                    "creek_allocation_id": second.allocation_id,
+                    "creek_activation_id": "activation-fly-002",
+                },
+            },
+        }
+    )
+
+    resources = driver.list_resources(["activation-fly-001", "activation-fly-002"])
+
+    rogue = [r for r in resources if r.provider_ref == "machine-rogue"]
+    assert rogue == [
+        ProviderResource(
+            first.allocation_id,
+            ResourceClass.MACHINE,
+            ResourceState.STOPPED,
+            1,
+            "activation-fly-002",
+            "machine-rogue",
+        )
+    ]
+    second_machines = [
+        r
+        for r in resources
+        if r.provider_allocation_id == second.allocation_id
+        and r.resource_class is ResourceClass.MACHINE
+    ]
+    assert len(second_machines) == 1
+
+
+def test_malformed_inventory_bodies_fail_closed_without_leaking(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-list inventory body is a retryable provider fault with no echo."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    driver.provision(fly_job())
+    body_canary = "inventory-body-canary-" + PROVIDER_TOKEN
+    api.malformed_once("GET", "/machines", f'{{"echo": "{body_canary}"}}')
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(ProviderError) as raised:
+        driver.list_resources(["activation-fly-001"])
+
+    assert raised.value.reason is FailureReason.PROVIDER_UNAVAILABLE
+    assert raised.value.retryable is True
+    rendered = caplog.text + str(raised.value) + repr(raised.value) + repr(driver)
+    assert body_canary not in rendered
+    assert PROVIDER_TOKEN not in rendered
+
+
+def test_injected_app_names_outside_the_strict_pattern_never_reach_the_provider() -> (
+    None
+):
+    """Only ``<prefix>-<24 hex>`` names are inventoried; nothing escapes the prefix."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    valid = "creek-vault-" + "a" * 24
+    api.apps[valid] = {"id": "app-valid", "name": valid}
+
+    resources = driver.list_resources(
+        [],
+        app_names=[
+            "creek-vault-x/../other-app",
+            "creek-vault-" + "A" * 24,
+            "creek-vault-" + "a" * 23,
+            "creek-vault-" + "a" * 25,
+            "creek-vault-../../v1/apps",
+            valid,
+        ],
+    )
+
+    assert [r.provider_ref for r in resources] == ["app-valid"]
+    assert [path for _, path in api.requests] == [
+        f"/v1/apps/{valid}",
+        f"/v1/apps/{valid}/machines",
+        f"/v1/apps/{valid}/volumes",
+    ]
+    assert all(path.startswith("/v1/apps/creek-vault-") for _, path in api.requests)
+    assert not any(".." in path or "other-app" in path for _, path in api.requests)
+
+
+def test_fly_provision_and_delete_leave_no_secret_in_the_durable_database(
+    tmp_path: Path,
+) -> None:
+    """The SQLite file and the receipt carry no provider, consumer or TLS secret."""
+    api = FakeFlyAPI()
+    database = tmp_path / "provisioning.sqlite3"
+    store = ProvisioningStore(database)
+    worker = ProvisioningWorker(store, fly_driver(api), FakeOneTimeHandoff())
+    job = store.submit("activation-fly-bytes", "adepthood", now=_NOW)
+    assert worker.run_once(now=_NOW) is True
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    assert worker.run_once(now=_NOW) is True
+
+    persisted = database.read_bytes()
+    receipt = store.list_deletion_receipts()[0]
+
+    assert receipt.outcome.value == "confirmed"
+    assert receipt.provider == "fly"
+    for canary in (PROVIDER_TOKEN, CONSUMER_TOKEN, TLS_KEY):
+        assert canary.encode() not in persisted
+        assert canary not in repr(receipt)
