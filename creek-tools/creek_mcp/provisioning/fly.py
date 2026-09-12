@@ -696,6 +696,7 @@ class FlyProviderDriver:
         return self._app_by_name(reference.app_name) is not None
 
     def _app_by_name(self, app_name: str) -> Mapping[str, Any] | None:
+        """Return the Fly app object for *app_name*, or None when it is absent."""
         response = self._request(
             "GET",
             f"/v1/apps/{app_name}",

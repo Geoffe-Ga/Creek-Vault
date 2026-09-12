@@ -146,9 +146,10 @@ def compose_fly(
 def _load_policy(path: Path, parser: argparse.ArgumentParser) -> PolicyFile:
     """Load the operator policy or exit 2 naming the offending key only."""
     try:
-        return load_policy_file(path)
+        policy_file = load_policy_file(path)
     except ValueError as exc:
         parser.error(f"--policy-file is invalid: {exc}")
+    return policy_file
 
 
 def _load_inventory_names(
