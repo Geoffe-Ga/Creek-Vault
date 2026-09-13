@@ -60,7 +60,9 @@ route honest despite that deadline. ``run_classify`` short-circuits on the
 ``classification_method`` stamp it already wrote (the OPS-001 resume contract),
 and a linker stage rewrites the same artefacts, so an abandoned call followed by
 a retry converges rather than duplicating. ``complete`` on the classification
-response is the client's signal for which of the two it is looking at.
+response is the client's signal for which of the two it is looking at. It is
+false for both file-processing errors and LLM calls that exhausted their
+retries, because either condition leaves work for the resumable pass to retry.
 """
 
 from __future__ import annotations
@@ -304,10 +306,12 @@ def _classification_model(
     as a completed pass — the exact failure this route exists to prevent. The
     ``KeyError`` is caught one level up and rendered as the server fault it is.
 
-    ``complete`` collapses the engine's ``errors`` list to a boolean rather
-    than forwarding it. Each entry names the file it failed on, so the list is
-    a path disclosure wearing a diagnostic hat; the reasons stay in the server
-    log, where the operator who can act on them already is.
+    ``complete`` collapses both incomplete outcomes to one actionable boolean:
+    the engine's ``errors`` list and its ``llm_call_failed`` count. Error entries
+    name the file they failed on, so the list is a path disclosure wearing a
+    diagnostic hat; provider exhaustion likewise needs only the retry signal,
+    not provider detail. The reasons stay in the server log, where the operator
+    who can act on them already is.
 
     Args:
         result: The tool's success dict.
@@ -329,7 +333,7 @@ def _classification_model(
         retiered=int(result["retiered"]),
         praxis_marked=int(result["praxis_marked"]),
         tags_extracted=int(result["tags_extracted"]),
-        complete=not result["errors"],
+        complete=not result["errors"] and int(result["llm_call_failed"]) == 0,
     )
 
 
