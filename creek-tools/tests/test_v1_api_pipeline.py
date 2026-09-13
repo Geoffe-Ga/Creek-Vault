@@ -637,8 +637,23 @@ def _llm_success(**_kwargs: object) -> dict[str, object]:
         "retiered": 0,
         "praxis_marked": 1,
         "tags_extracted": 2,
+        "llm_call_failed": 0,
         "errors": [],
     }
+
+
+def _llm_result_with_failures(
+    llm_call_failed: int, *, total: int, **_kwargs: object
+) -> dict[str, object]:
+    """Return one otherwise-clean classification result with provider failures."""
+    result = _llm_success()
+    result.update(
+        total=total,
+        classified=total,
+        preserved_manual=0,
+        llm_call_failed=llm_call_failed,
+    )
+    return result
 
 
 def _blocked_llm_success(
@@ -709,6 +724,66 @@ def test_an_accepted_job_is_pollable_to_its_counts_only_result(
             "complete": True,
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("llm_call_failed", "total"),
+    [(1, 3), (3, 3)],
+    ids=["mixed-provider-results", "all-provider-calls-failed"],
+)
+def test_provider_retry_exhaustion_makes_the_durable_job_incomplete(
+    api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    llm_call_failed: int,
+    total: int,
+) -> None:
+    """Mixed and all-failed provider outcomes stay resumable on the public wire."""
+    monkeypatch.setattr(
+        pipeline_module,
+        "classify_tool",
+        partial(_llm_result_with_failures, llm_call_failed, total=total),
+    )
+
+    accepted = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    terminal = _await_terminal(api, accepted.json()["job_id"])
+
+    assert terminal["state"] == "succeeded"
+    result = terminal["result"]
+    assert isinstance(result, dict)
+    assert result["complete"] is False
+    assert result["classified"] == total
+    assert set(result) == {
+        "status",
+        "tier_ceiling",
+        "method",
+        "total",
+        "classified",
+        "preserved_manual",
+        "preserved_llm",
+        "privacy_tiers_assigned",
+        "retiered",
+        "praxis_marked",
+        "tags_extracted",
+        "complete",
+    }
+
+
+def test_synchronous_classification_uses_the_same_provider_failure_rule(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The synchronous response cannot disagree with the durable job projection."""
+    monkeypatch.setattr(
+        pipeline_module,
+        "classify_tool",
+        partial(_llm_result_with_failures, 1, total=2),
+    )
+
+    response = api.post(
+        CLASSIFICATIONS_PATH, json={"method": "rules"}, headers=headers()
+    )
+
+    assert response.status_code == HTTP_OK
+    assert response.json()["complete"] is False
 
 
 def test_a_consumer_cannot_fan_out_inflight_pipeline_jobs(
@@ -1006,6 +1081,26 @@ def test_a_success_this_contract_cannot_express_is_a_server_fault(
     )
 
     response = api.post(LINKS_PATH, json={"method": "temporal"}, headers=headers())
+
+    assert response.status_code == HTTP_SERVER_FAULT
+    assert response.json()["code"] == ErrorCode.INTERNAL_ERROR.value
+
+
+def test_a_classification_result_missing_the_failure_count_is_a_server_fault(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed if the tool omits the counter needed to certify completion."""
+    result = _llm_success()
+    del result["llm_call_failed"]
+    monkeypatch.setattr(
+        pipeline_module,
+        "classify_tool",
+        lambda **_kwargs: result,
+    )
+
+    response = api.post(
+        CLASSIFICATIONS_PATH, json={"method": "rules"}, headers=headers()
+    )
 
     assert response.status_code == HTTP_SERVER_FAULT
     assert response.json()["code"] == ErrorCode.INTERNAL_ERROR.value
