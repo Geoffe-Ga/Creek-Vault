@@ -12,7 +12,7 @@ from creek_mcp.provisioning.driver import (
     ProviderDriver,
     ProviderError,
 )
-from creek_mcp.provisioning.models import FailureReason, JobOperation
+from creek_mcp.provisioning.models import CustodyMode, FailureReason, JobOperation
 from creek_mcp.provisioning.store import LostJobLeaseError
 
 if TYPE_CHECKING:
@@ -72,6 +72,7 @@ class ProvisioningWorker:
                     claimed.lease_token,
                     allocation.allocation_id,
                     handoff=handoff,
+                    custody_mode=CustodyMode.PROVIDER_MANAGED,
                     now=now,
                 )
         except ProviderError as failure:

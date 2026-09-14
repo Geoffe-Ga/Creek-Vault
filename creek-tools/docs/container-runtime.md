@@ -5,12 +5,15 @@ process for exactly one consumer identity and one durable vault. The image is
 disposable. Every writable Creek artifact—configuration, staged input, audit
 state, and vault content—lives below the explicitly mounted `/vault` tree.
 
-This runtime is the storage and API primitive selected by ADR-0013. It does not
-implement the user-held volume-key ceremony or recovery key flow tracked by
-#1771. Until that ceremony lands, the mounted provider volume must supply
-encryption at rest. Do not describe the current image as operator-blind or
-no-escrow encryption: the container enforces placement and isolation, while
-the later key ceremony supplies that stronger property.
+This runtime is the storage and API primitive selected by ADR-0013. Under the
+ordinary-Fly MVP in
+[ADR-0014](architecture/ADR/0014-provider-managed-custody-for-ordinary-fly.md),
+the mounted provider volume supplies encryption at rest. There is no user-held
+passphrase or recovery key: Fly and a sufficiently privileged Creek operator
+can read mounted bytes, and Fly supplies the unlock capability across
+scale-to-zero restarts. Do not describe this image as operator-blind,
+end-to-end encrypted, no-escrow, or user-recoverable. INTIMATE content remains
+local until a future runtime proves the complete attested custody design.
 
 ## Build and identify the image
 
@@ -135,8 +138,8 @@ restart, not a first boot. Verify `--check ready` before routing traffic.
 
 Deletion is a lifecycle operation owned by the control plane: stop traffic,
 destroy the container, destroy the user's volume and snapshots, and revoke the
-consumer credential. Once #1771 supplies no-escrow keys, losing both the
-passphrase and recovery key is intentionally unrecoverable.
+consumer credential. Provider backup and restore is the only ordinary-Fly MVP
+recovery mechanism; there is no user recovery ceremony or reset promise.
 
 ## Executable contract
 

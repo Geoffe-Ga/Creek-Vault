@@ -84,9 +84,11 @@ mounted secrets, and layered health/readiness.
 The separate demand-provisioning service is documented in the
 [`provisioning control-plane`](docs/provisioning-control-plane.md) runbook. Its
 versioned [OpenAPI contract](docs/contracts/provisioning-v1/openapi.json)
-defines the [user-held key ceremony](docs/contracts/provisioning-v1/key-ceremony.md)
+defines a provider-managed ordinary-Fly custody mode and direct activation
 while keeping provider work and one-time credential handoff outside the
-browser-facing job API.
+browser-facing job API. The
+[retired key-ceremony contract](docs/contracts/provisioning-v1/key-ceremony.md)
+is retained only as a historical interoperability record.
 
 ---
 

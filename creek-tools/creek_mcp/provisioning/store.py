@@ -23,6 +23,7 @@ from creek_mcp.provisioning.ceremony import (
 from creek_mcp.provisioning.fleet_schema import timestamp as _timestamp
 from creek_mcp.provisioning.models import (
     ClaimedJob,
+    CustodyMode,
     FailureReason,
     JobOperation,
     JobState,
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
         FleetJob,
     )
 
-_SCHEMA_VERSION: Final[int] = 4
+_SCHEMA_VERSION: Final[int] = 5
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
 MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS provisioning_jobs (
     lease_token TEXT,
     lease_expires_at TEXT,
     attested_confidential INTEGER,
+    custody_mode TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK (state IN (
@@ -84,7 +86,10 @@ CREATE TABLE IF NOT EXISTS provisioning_jobs (
     )),
     CHECK (operation IN ('create', 'delete')),
     CHECK (retryable IN (0, 1)),
-    CHECK (attested_confidential IS NULL OR attested_confidential IN (0, 1))
+    CHECK (attested_confidential IS NULL OR attested_confidential IN (0, 1)),
+    CHECK (custody_mode IS NULL OR custody_mode IN (
+        'provider_managed', 'wrapped_artifact_only'
+    ))
 );
 
 CREATE TABLE IF NOT EXISTS provisioning_allocations (
@@ -198,6 +203,27 @@ class ProvisioningStore:
                 "CHECK (attested_confidential IS NULL "
                 "OR attested_confidential IN (0, 1))"
             )
+        if "custody_mode" not in table_columns["provisioning_jobs"]:
+            connection.execute(
+                "ALTER TABLE provisioning_jobs ADD COLUMN custody_mode TEXT "
+                "CHECK (custody_mode IS NULL OR custody_mode IN "
+                "('provider_managed', 'wrapped_artifact_only'))"
+            )
+        connection.execute(
+            "UPDATE provisioning_jobs SET custody_mode = CASE "
+            "WHEN job_id IN (SELECT job_id FROM provisioning_key_ceremonies) "
+            "THEN 'wrapped_artifact_only' "
+            "WHEN state = 'ready' AND custody_mode IS NULL "
+            "THEN 'provider_managed' ELSE custody_mode END, "
+            "attested_confidential = CASE WHEN job_id IN "
+            "(SELECT job_id FROM provisioning_key_ceremonies) "
+            "OR custody_mode IN ('provider_managed', 'wrapped_artifact_only') "
+            "OR (state = 'ready' AND custody_mode IS NULL) THEN 0 "
+            "ELSE attested_confidential END "
+            "WHERE job_id IN (SELECT job_id FROM provisioning_key_ceremonies) "
+            "OR custody_mode IN ('provider_managed', 'wrapped_artifact_only') "
+            "OR (state = 'ready' AND custody_mode IS NULL)"
+        )
         for table, migration in _REQUESTER_MIGRATIONS.items():
             if "requester_identity" not in table_columns[table]:
                 add_requester_column, backfill_requester = migration
@@ -443,20 +469,26 @@ class ProvisioningStore:
         provider_allocation_id: str,
         *,
         handoff: Callable[[], None],
+        custody_mode: CustodyMode,
         now: datetime | None = None,
     ) -> ProvisioningJob:
-        """Handoff and settle a create claim inside one lease-valid write fence."""
+        """Handoff and settle create under one explicit, durable custody mode."""
         allocation = _validate_identifier(
             provider_allocation_id,
             field="provider_allocation_id",
         )
+        provider_managed = custody_mode is CustodyMode.PROVIDER_MANAGED
         return self._settle_claim(
             job_id,
             lease_token,
-            state=JobState.AWAITING_KEY_CEREMONY,
+            state=(
+                JobState.READY if provider_managed else JobState.AWAITING_KEY_CEREMONY
+            ),
             provider_allocation_id=allocation,
             before_settle=handoff,
-            create_key_ceremony=True,
+            create_key_ceremony=not provider_managed,
+            custody_mode=custody_mode,
+            attested_confidential=False if provider_managed else None,
             now=now,
         )
 
@@ -843,6 +875,8 @@ class ProvisioningStore:
         provider_allocation_id: str | None = None,
         before_settle: Callable[[], None] | None = None,
         create_key_ceremony: bool = False,
+        custody_mode: CustodyMode | None = None,
+        attested_confidential: bool | None = None,
         deletion_outcome: DeletionOutcome | None = None,
         now: datetime | None = None,
     ) -> ProvisioningJob:
@@ -907,11 +941,19 @@ class ProvisioningStore:
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, retryable = ?, "
                 "failure_reason = ?, lease_token = NULL, lease_expires_at = NULL, "
+                "custody_mode = COALESCE(?, custody_mode), "
+                "attested_confidential = COALESCE(?, attested_confidential), "
                 "updated_at = ? WHERE job_id = ?",
                 (
                     state.value,
                     int(retryable),
                     None if failure_reason is None else failure_reason.value,
+                    None if custody_mode is None else custody_mode.value,
+                    (
+                        None
+                        if attested_confidential is None
+                        else int(attested_confidential)
+                    ),
                     stamp,
                     job_id,
                 ),
@@ -953,6 +995,7 @@ class ProvisioningStore:
         """Convert one SQLite row into its immutable domain representation."""
         reason = row["failure_reason"]
         attested = row["attested_confidential"]
+        custody = row["custody_mode"]
         return ProvisioningJob(
             job_id=str(row["job_id"]),
             activation_id=str(row["canonical_activation_id"]),
@@ -966,6 +1009,7 @@ class ProvisioningStore:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
             attested_confidential=None if attested is None else bool(attested),
+            custody_mode=None if custody is None else CustodyMode(str(custody)),
         )
 
     @staticmethod

@@ -4,6 +4,14 @@ ADR-0013 separates a small authenticated control plane from every single-vault
 runtime. The API commits idempotency and queue state to SQLite and returns a job
 handle immediately; provider work never runs in the API process.
 
+Provisioning contract 2.0 implements the honest ordinary-Fly custody boundary
+ratified in
+[ADR-0014](architecture/ADR/0014-provider-managed-custody-for-ordinary-fly.md).
+Fly supplies storage encryption and restart-time unlock; Fly and a sufficiently
+privileged Creek operator can read mounted bytes. The service requests no
+passphrase or recovery key, makes no no-escrow claim, and does not admit
+INTIMATE content. An ordinary Fly Machine does not advertise INTIMATE.
+
 ## Serve the API
 
 Create a durable database location and a mounted consumer registry. Bearer
@@ -98,22 +106,22 @@ sequence is drain, commit, close, and stop. Both success and failure close the
 vault and explicitly stop the Machine; HTTP-request lifetime is never the
 shutdown signal.
 
-Successful create work stops at `awaiting_key_ceremony` and atomically creates
-a 24-hour challenge. The versioned
-[`key ceremony protocol`](contracts/provisioning-v1/key-ceremony.md) (issue
-#1771) accepts only an activation-bound ciphertext artifact. Passphrase,
-recovery value/code, and unwrapped volume key never reach this service. An
-identical completion retry is idempotent; a conflicting replay is refused.
-Expired incomplete ceremonies move to `deleting`, and every worker pass sweeps
-them before claiming work, so an abandoned activation reconciles provider
-resources to zero.
+Successful ordinary-Fly create work performs the authenticated one-time
+credential handoff and moves directly to `ready` inside the same lease-valid
+write fence. The job records `custody_mode=provider_managed` and
+`attested_confidential=false`; it creates no ceremony row or wrapped artifact.
+The provider transparently unlocks the attached encrypted volume after a
+scale-to-zero restart. Provider backup/restore is the only MVP recovery
+mechanism.
 
-The completed job advertises `attested_confidential`. An ordinary Fly Machine
-does not advertise INTIMATE: it completes as `false`. `true` requires a fresh,
-correctly measured, trust-root-signed recipient statement and delivery of an
-opaque key envelope to the injected idempotent release sink. Attestation expiry,
-signature failure, measurement mismatch, challenge mismatch, or recipient
-mismatch fails before release.
+The retired version-1
+[`key ceremony protocol`](contracts/provisioning-v1/key-ceremony.md) and its
+language-neutral vector remain only for migrated-row and interoperability
+tests. `custody_mode=wrapped_artifact_only` identifies those historical rows
+without claiming that the artifact ever controlled runtime storage. It is not
+a production activation mode. A future attested implementation must prove key
+use at first initialization and every restart before it may expose a ceremony
+or set `attested_confidential=true`.
 
 ## Fleet reconciliation, telemetry, and budget alarms (#1769)
 
@@ -244,8 +252,9 @@ the window rather than being skipped.
 
 ### Deletion receipts
 
-Every path that moves a job into `deleting` (a consumer delete, an expired key
-ceremony) opens a content-free receipt in `provisioning_deletion_receipts`.
+Every path that moves a job into `deleting` (a consumer delete or a migrated
+expired ceremony) opens a content-free receipt in
+`provisioning_deletion_receipts`.
 The receipt is confirmed - with provider, provider allocation id, and the
 resource classes removed (credential, machine, volume, app) - inside the same
 write fence that marks the job `deleted`; a retryable failed delete bumps its
@@ -286,9 +295,12 @@ numbers above are the example, not defaults.
 
 - `pending` is claimable create work.
 - a create lease moves it to `provisioning`;
-- a successful fake/real driver result moves it to `awaiting_key_ceremony`;
-- a valid ciphertext-only ceremony marks the job `ready` and reports whether
-  attested confidential processing was actually verified;
+- a successful ordinary-Fly provider result plus authenticated handoff moves it
+  directly to `ready`, records `custody_mode=provider_managed`, and reports
+  `attested_confidential=false`;
+- `awaiting_key_ceremony` and `custody_mode=wrapped_artifact_only` remain
+  readable only for historical rows and are not reachable through the public
+  contract;
 - stable failures become `failed` and are retryable only when explicitly
   recorded as safe;
 - delete changes any live state to `deleting` and opens a pending deletion

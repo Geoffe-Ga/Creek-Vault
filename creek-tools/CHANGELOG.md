@@ -11,6 +11,18 @@ to locate the originating commit for any reference below.
 
 ### Added
 
+- **Honest provider-managed custody for ordinary Fly vaults (#1808).**
+  Provisioning contract 2.0 removes the public key-ceremony endpoints and moves
+  a successfully allocated and handed-off ordinary Fly job directly to
+  `ready`. Jobs record `custody_mode=provider_managed` and
+  `attested_confidential=false`; no passphrase, recovery key, ceremony row, or
+  wrapped artifact is created. ADR-0014 makes the actual boundary durable: Fly
+  and a sufficiently privileged Creek operator can read mounted bytes, Fly
+  supplies unattended restart unlock, provider backup/restore is the only MVP
+  recovery mechanism, and INTIMATE remains local. Historical ceremony rows are
+  migrated as `wrapped_artifact_only` and their cryptographic vector remains an
+  archived compatibility record, not a custody claim.
+
 - **`creek-provisioning-fleet` — fleet reconciliation, cost telemetry, and
   budget alarms (#1769).** Implements ADR-0013 Decisions 4, 6, and 7 as an
   operator surface without changing the `/control/v1` job contract. A

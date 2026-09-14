@@ -6,7 +6,11 @@
 - **Implemented by**: #758 (volume key), #759 (network transport), #760 (enclave provider), #761 (BYOK)
 - **Lifecycle amendment**: [ADR-0013](0013-demand-provisioned-vault-lifecycle.md)
   ratifies activation after signup, a Creek-owned asynchronous control plane,
-  and scale-to-zero per-user compute. The privacy boundary below is unchanged.
+  and scale-to-zero per-user compute.
+- **Ordinary Fly custody amendment**:
+  [ADR-0014](0014-provider-managed-custody-for-ordinary-fly.md) records the
+  honest provider-managed MVP boundary. Ordinary Fly does not yet deliver the
+  user-held/no-escrow target below and cannot serve INTIMATE content.
 
 ## Context
 
@@ -31,11 +35,13 @@ Adopt the ratified hosting/custody/routing model (#755):
    spun up on access) plus a **durable, encrypted, user-owned volume** (the
    vault). Compute is disposable; the encrypted volume is the durable asset.
 
-2. **User-held keys, no operator escrow.** The volume is encrypted under a random
+2. **Target: user-held keys, no operator escrow.** The volume is encrypted under a random
    volume master key wrapped twice: a user **passphrase** (KEK via Argon2id,
    memory-hard) and a one-time **recovery key** (KEK via HKDF). The operator
    stores ciphertext only; losing both factors is unrecoverable, by design. This
    is issue-#758 "option E" — see **[ADR-0005](0005-confidential-volume-key-no-escrow.md)**.
+   Ordinary Fly instead uses the explicitly provider-managed boundary in
+   ADR-0014 until a deployed runtime proves this target end to end.
 
 3. **Confidential compute (TEE) with remote attestation; GPU-CC in scope.** The
    volume key is released into an enclave only after remote attestation verifies
@@ -65,8 +71,10 @@ Adopt the ratified hosting/custody/routing model (#755):
 
 ## Alternatives considered (briefly)
 
-- **Operator-escrowed / resettable keys** — rejected: makes the operator a single
-  point of compromise, contradicting "the operator cannot read it" (see ADR-0005).
+- **Operator-escrowed / resettable keys** — rejected for the target architecture:
+  it makes the operator a single point of compromise and contradicts "the
+  operator cannot read it" (see ADR-0005). ADR-0014 accepts provider-managed
+  ordinary Fly only as a bounded MVP with honest copy and no INTIMATE content.
 - **Co-locate the Adepthood backend with the vault** — the per-user VM is the
   chosen shape of this; a bare relay/bridge or syncing a scoped non-intimate
   subset were considered and rejected (INTIMATE must never be remotely reachable
@@ -80,10 +88,12 @@ Adopt the ratified hosting/custody/routing model (#755):
 
 ## Consequences
 
-- The operator genuinely cannot read a user's vault (no escrow; INTIMATE never
-  egresses to a readable cloud or over the network), which is the whole point.
-- Two independent recovery factors reduce accidental total loss, but double-loss
-  is permanent and must be surfaced in setup UX.
+- A runtime that proves the full target prevents the operator from reading a
+  user's vault. Ordinary Fly does not: Fly and a sufficiently privileged Creek
+  operator can read mounted bytes, and INTIMATE therefore stays local.
+- For a future runtime that proves the target, two independent recovery factors
+  reduce accidental total loss, but double-loss is permanent and must be
+  surfaced in setup UX. Those factors do not exist in ordinary Fly.
 - More moving parts (VM lifecycle, attestation, per-consumer tokens, BYOK key
   supply); each is isolated behind a tested seam and its own issue/ADR.
 - Must stay in lock-step with `geoffe-ga/adepthood#927` and the handshake epic

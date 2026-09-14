@@ -35,6 +35,7 @@ from creek_mcp.provisioning.inventory import (
     ProviderResource,
 )
 from creek_mcp.provisioning.models import (
+    CustodyMode,
     Disposition,
     Divergence,
     DivergenceKind,
@@ -129,12 +130,26 @@ def _activate(
     activation_id: str,
     *,
     now: datetime = _NOW,
+    custody_mode: CustodyMode = CustodyMode.PROVIDER_MANAGED,
 ) -> str:
-    """Submit and provision one activation to the key-ceremony boundary."""
+    """Submit and provision one activation under the requested custody mode."""
     job = store.submit(
         activation_id, activation_id, requester_identity="adepthood", now=now
     )
-    assert ProvisioningWorker(store, driver, FakeOneTimeHandoff()).run_once(now=now)
+    if custody_mode is CustodyMode.PROVIDER_MANAGED:
+        assert ProvisioningWorker(store, driver, FakeOneTimeHandoff()).run_once(now=now)
+    else:
+        claim = store.claim_next(now=now)
+        assert claim is not None
+        allocation = driver.provision(claim.job)
+        store.complete_create(
+            job.job_id,
+            claim.lease_token,
+            allocation.allocation_id,
+            handoff=lambda: None,
+            custody_mode=CustodyMode.WRAPPED_ARTIFACT_ONLY,
+            now=now,
+        )
     return job.job_id
 
 
@@ -317,7 +332,7 @@ def test_orphan_resource_is_reported_idempotently_and_never_destroyed(
     assert one.estimate.unpriced == ("egress", "snapshot", "stopped_rootfs")
     assert one.telemetry.unconfirmed_deletions == 0
     assert one.telemetry.snapshot_bytes is None
-    assert one.telemetry.allocations_by_state == {"awaiting_key_ceremony": 1}
+    assert one.telemetry.allocations_by_state == {"ready": 1}
     assert one.alerts == (
         Alert(AlertKind.ORPHAN_RESOURCE, "fake-orphan-000", None, None, None),
         Alert(AlertKind.ORPHAN_RESOURCE, "fake-orphan-000", None, None, None),
@@ -430,6 +445,7 @@ def test_duplicate_and_missing_resources_are_reported_per_class_without_repair(
         claim.lease_token,
         "fake-vanished-000",
         handoff=lambda: None,
+        custody_mode=CustodyMode.PROVIDER_MANAGED,
         now=_NOW,
     )
 
@@ -483,7 +499,12 @@ def test_expired_ceremony_is_unconfirmed_then_stuck_and_repair_requeues_failure(
 ) -> None:
     """Expired ceremonies are an explicit input; only repair requeues a failure."""
     driver = FakeProviderDriver()
-    job_id = _activate(store, driver, "activation-expiring")
+    job_id = _activate(
+        store,
+        driver,
+        "activation-expiring",
+        custody_mode=CustodyMode.WRAPPED_ARTIFACT_ONLY,
+    )
     expiry = _NOW + KEY_CEREMONY_TTL
     reconciler = _reconciler(store, driver)
 

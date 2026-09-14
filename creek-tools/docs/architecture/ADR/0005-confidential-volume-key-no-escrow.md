@@ -3,6 +3,10 @@
 - **Status**: Accepted
 - **Date**: 2026-07-01
 - **Driving issues**: #758 (per-user encrypted volume + recovery key), #757 / #755 (confidential-hosting / remote-transport decisions)
+- **Ordinary Fly amendment**:
+  [ADR-0014](0014-provider-managed-custody-for-ordinary-fly.md) records that
+  today's Fly runtime does not implement this custody design. The design below
+  remains a future target and must not be claimed for provider-managed vaults.
 
 ## Context
 

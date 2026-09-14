@@ -56,6 +56,7 @@ _JOB_WIRE_FIELDS = {
     "created_at",
     "updated_at",
     "attested_confidential",
+    "custody_mode",
     "status_url",
 }
 
@@ -69,7 +70,6 @@ def test_openapi_contract_is_versioned_and_matches_the_served_paths() -> None:
     assert set(contract["paths"]) == {
         "/control/v1/activations",
         "/control/v1/jobs/{job_id}",
-        "/control/v1/jobs/{job_id}/key-ceremony",
         "/control/v1/jobs/{job_id}/retry",
     }
     assert contract["security"] == [{"consumerBearer": []}]
@@ -104,24 +104,22 @@ def test_public_schema_contains_no_credential_or_provider_result_field() -> None
 
 
 def test_key_ceremony_contract_is_versioned_strict_and_language_neutral() -> None:
-    """The checked-in protocol and vector pin every cross-language primitive."""
+    """The archived protocol vector remains testable but is absent from v2."""
     contract = json.loads(OPENAPI.read_text(encoding="utf-8"))
-    submission = contract["components"]["schemas"]["CeremonySubmission"]
     vector = json.loads(CEREMONY_VECTORS.read_text(encoding="utf-8"))
     prose = " ".join(CEREMONY.read_text(encoding="utf-8").split())
 
-    assert submission["additionalProperties"] is False
-    assert submission["properties"]["protocol_version"]["const"] == KEY_CEREMONY_VERSION
     assert (
         CeremonySubmission.model_validate(vector["submission"]).protocol_version
         == KEY_CEREMONY_VERSION
     )
+    assert "CeremonySubmission" not in contract["components"]["schemas"]
     for phrase in (
         "Argon2id",
         "HKDF-SHA256",
         "AES-256-GCM",
-        "unrecoverable data loss",
-        "shown or downloaded by the client exactly once",
+        "did **not** make an ordinary Fly vault unrecoverable",
+        "Current clients must not perform this flow",
         "attestation fails",
         "reconciles provider resources to zero",
     ):
@@ -157,13 +155,13 @@ def test_authentication_contract_is_backend_only_and_file_mounted() -> None:
         assert phrase in text
 
 
-def test_runbook_states_the_fake_driver_and_key_ceremony_boundaries() -> None:
-    """Operators cannot mistake this issue for Fly or no-escrow delivery."""
+def test_runbook_states_fake_driver_and_provider_managed_custody_boundaries() -> None:
+    """Operators cannot mistake the ordinary Fly MVP for no-escrow delivery."""
     text = RUNBOOK.read_text(encoding="utf-8")
 
     assert "FakeProviderDriver" in text
     assert "#1770" in text
-    assert "#1771" in text
+    assert "provider-managed" in text
     assert "provider work never runs in the API process" in text
 
 
@@ -232,14 +230,12 @@ def test_job_wire_and_enums_are_unchanged_by_fleet_work(tmp_path: Path) -> None:
         "handoff_failed",
         "internal_error",
     }
-    assert CONTRACT_VERSION == "1.1.0"
+    assert CONTRACT_VERSION == "2.0.0"
     assert served == {
         ("/control/v1/activations", "POST"),
         ("/control/v1/jobs/{job_id}", "GET"),
         ("/control/v1/jobs/{job_id}", "DELETE"),
         ("/control/v1/jobs/{job_id}/retry", "POST"),
-        ("/control/v1/jobs/{job_id}/key-ceremony", "GET"),
-        ("/control/v1/jobs/{job_id}/key-ceremony", "PUT"),
     }
 
 

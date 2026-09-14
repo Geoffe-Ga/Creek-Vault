@@ -6,8 +6,11 @@
   `Geoffe-Ga/adepthood#2575`
 - **Amends**: [ADR-0007](0007-confidential-per-user-hosting.md) Decision 1 by
   defining when an allocation exists and how its disposable compute runs. The
-  per-user isolation, encrypted-volume, no-escrow, and attestation decisions
-  remain unchanged.
+  per-user isolation and encrypted-volume decisions remain unchanged.
+- **Custody amendment**:
+  [ADR-0014](0014-provider-managed-custody-for-ordinary-fly.md) replaces the
+  ordinary-Fly ceremony below with an explicit provider-managed direct-ready
+  transition. Historical ceremony states remain readable for migration only.
 - **Consumer counterpart**: Adepthood ADR 0007, "Confidential vaults are
   provisioned on demand, not at signup"
 
@@ -54,10 +57,11 @@ rules.
 
 The job API is asynchronous and idempotent. Repeating one activation id returns
 the same allocation or terminal result. Concurrent activation requests for one
-consumer identity cannot create multiple billable volumes. States include at
-least `pending`, `provisioning`, `awaiting_key_ceremony`, `ready`, `failed`,
-`deleting`, and `deleted`; failure carries a stable machine-readable reason and
-no secret material.
+consumer identity cannot create multiple billable volumes. The ordinary-Fly
+path uses `pending`, `provisioning`, `ready`, `failed`, `deleting`, and
+`deleted`. The legacy `awaiting_key_ceremony` value remains readable for
+migrated rows only; failure carries a stable machine-readable reason and no
+secret material.
 
 Job logs and consumer-visible responses never contain provider tokens,
 passphrases, recovery keys, volume master keys, unredacted per-consumer bearer
@@ -67,14 +71,14 @@ tokens, journal text, or other vault content.
 
 Account creation is not a Creek provisioning event. The consumer calls the
 control plane only after an authenticated person explicitly activates the
-private-vault capability and begins the key ceremony. An account that never
+private-vault capability. An account that never
 activates creates no provider application, Machine, root filesystem, or volume.
 
-The passphrase-derived wrapping key and one-time recovery key from ADR-0005 are
-created during activation, not signup. The control plane may reserve an
-idempotency record while the ceremony is incomplete, but it must not leave a
-usable plaintext vault or an indefinitely billable volume behind. Abandoned
-ceremonies expire and reconcile to zero provider resources.
+Ordinary Fly requests no passphrase or recovery key because neither one
+controls its volume. After allocation and authenticated credential handoff, the
+job becomes `ready` with `custody_mode=provider_managed` and
+`attested_confidential=false`. Provider failures remain durably reconcilable so
+an abandoned activation cannot silently leave an indefinitely billable volume.
 
 Provisioning failure is retryable and does not imply that an Adepthood account
 or journal write failed. That degrade-never-throw behavior is a consumer
@@ -177,5 +181,5 @@ this decision; it is a different architecture requiring a new ADR.
 - Cold-start and provisioning states become part of the product contract.
 - The control plane becomes security-critical and needs narrow credentials,
   auditability, reconciliation, quotas, and adversarial tests.
-- ADR-0007's privacy posture remains intact and is no longer conflated with an
-  always-on VM or signup-time allocation.
+- ADR-0007's target privacy posture remains explicit, while ADR-0014 prevents
+  the ordinary Fly MVP from claiming it prematurely.

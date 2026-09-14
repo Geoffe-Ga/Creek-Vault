@@ -1,26 +1,37 @@
-# Key ceremony protocol 1.0.0
+# Archived key ceremony protocol 1.0.0
 
-This protocol completes an explicitly requested private-vault activation without
-giving the Creek operator a recovery path. It is language-neutral; the checked-in
+> **Historical interoperability record only.** Provisioning contract 2.0 does
+> not expose these routes or perform this ceremony. The artifact described here
+> never controlled ordinary Fly volume encryption or restart, so it did not
+> prevent Fly or a sufficiently privileged Creek operator from reading mounted
+> bytes. It must not be presented as no-escrow or user-recoverable storage. See
+> [ADR-0014](../../architecture/ADR/0014-provider-managed-custody-for-ordinary-fly.md).
+
+This retired protocol specified a client-side wrapped artifact without
+delivering the intended runtime custody boundary. It remains language-neutral
+only so migrated records and the checked-in
 [`key-ceremony-test-vectors.json`](key-ceremony-test-vectors.json) is the
 interoperability authority for client and server implementations.
 
-## Security boundary
+## Archived wire boundary
 
-The client generates the passphrase, 256-bit volume master key (VMK), 256-bit
-recovery value, Argon2id salt, client nonce, and both AES-GCM nonces locally.
-Only the ciphertext-only wrapped artifact is submitted. The passphrase,
-printable recovery code, raw recovery value, and unwrapped VMK MUST NOT enter an
-HTTP request, log, analytic event, crash report, or operator-controlled durable
-store.
+The retired client design generated the passphrase, 256-bit volume master key
+(VMK), 256-bit recovery value, Argon2id salt, client nonce, and both AES-GCM
+nonces locally. The historical contract admitted only the ciphertext-wrapped
+artifact; its passphrase, printable recovery code, raw recovery value, and
+unwrapped VMK were forbidden from HTTP requests, logs, analytic events, crash
+reports, and operator-controlled durable stores.
 
-The recovery code is shown or downloaded by the client exactly once before it
-sets `recovery_saved: true`. Creek has no request field or retrieval route for
-it. Losing both the passphrase and recovery code is permanent, unrecoverable
-data loss; clients MUST state that before confirmation. Cancelling before
-completion submits no artifact and leaves the challenge to expire.
+The retired wire shape required the client to show or download the recovery
+code exactly once before setting `recovery_saved: true`; Creek had no request
+field or retrieval route for it. That warning concerned only whether this
+archived ciphertext artifact could be unwrapped. Losing both factors did **not**
+make an ordinary Fly vault unrecoverable because neither factor controlled its
+volume or restart path. Current clients must not perform this flow or present a
+double-loss warning. Cancelling the historical flow before completion submitted
+no artifact and left the challenge to expire.
 
-## Sequence and expiry
+## Archived sequence and expiry
 
 1. The consumer explicitly submits an activation and polls until the job is
    `awaiting_key_ceremony`.

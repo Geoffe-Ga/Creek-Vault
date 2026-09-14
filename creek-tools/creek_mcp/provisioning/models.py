@@ -33,6 +33,14 @@ class JobOperation(StrEnum):
 
 
 @unique
+class CustodyMode(StrEnum):
+    """Truthful relationship between a durable volume and client key material."""
+
+    PROVIDER_MANAGED = "provider_managed"
+    WRAPPED_ARTIFACT_ONLY = "wrapped_artifact_only"
+
+
+@unique
 class FailureReason(StrEnum):
     """Stable, content-free failure reasons safe for API responses and logs."""
 
@@ -58,6 +66,7 @@ class ProvisioningJob:
     created_at: datetime
     updated_at: datetime
     attested_confidential: bool | None = None
+    custody_mode: CustodyMode | None = None
 
 
 @dataclass(frozen=True, slots=True)
