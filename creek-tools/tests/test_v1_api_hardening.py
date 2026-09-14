@@ -2626,12 +2626,24 @@ _HTTPAPI_DIR: Final[Path] = Path(httpapi_package.__file__).parent
 """The package whose every threadpool dispatch has to state its deadline class."""
 
 _READ_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
-    {"capabilities", "drive", "provisioning", "reflect", "voice_drafts", "wheel"}
+    {
+        "capabilities",
+        "drive",
+        "provisioning",
+        "reflect",
+        "routing",
+        "voice_drafts",
+        "wheel",
+    }
 )
 """Modules serving at least one route that mutates no vault state.
 
 ``drive`` is in both sets on purpose: ``GET /v1/connectors/drive`` reports
 status, while the sync and disconnect routes beside it write.
+
+``routing`` reads the durable allocation off-loop. Its provider wake-up is
+single-flighted in a shielded task, so a cancelled caller cannot abandon or
+duplicate that external state transition.
 """
 
 _WRITE_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(

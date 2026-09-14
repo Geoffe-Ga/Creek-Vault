@@ -29,6 +29,7 @@ from creek_mcp.provisioning.models import (
     JobState,
     ProvisioningAllocation,
     ProvisioningJob,
+    RoutableAllocation,
 )
 
 if TYPE_CHECKING:
@@ -768,6 +769,50 @@ class ProvisioningStore:
                 (job_id, requester_identity),
             ).fetchone()
         return None if row is None else self._allocation_from_row(row)
+
+    def get_routable_allocation(
+        self,
+        requester_identity: str,
+        consumer_identity: str,
+    ) -> RoutableAllocation | None:
+        """Resolve one ready allocation only through its authenticated ownership.
+
+        Both identities come from the credential verifier.  No provider name,
+        address, job id, activation id, or allocation id is accepted from the
+        request, so this query is the only public-to-provider routing decision.
+        """
+        requester = _validate_identifier(
+            requester_identity,
+            field="requester_identity",
+        )
+        consumer = _validate_identifier(
+            consumer_identity,
+            field="consumer_identity",
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT jobs.job_id, jobs.canonical_activation_id, "
+                "jobs.requester_identity, jobs.consumer_identity, "
+                "allocations.provider_allocation_id "
+                "FROM provisioning_jobs AS jobs "
+                "JOIN provisioning_allocations AS allocations USING (job_id) "
+                "WHERE jobs.requester_identity = ? "
+                "AND jobs.consumer_identity = ? AND jobs.state = 'ready' "
+                "AND jobs.custody_mode = 'provider_managed' "
+                "AND allocations.requester_identity = jobs.requester_identity "
+                "AND allocations.consumer_identity = jobs.consumer_identity "
+                "AND allocations.deleted_at IS NULL",
+                (requester, consumer),
+            ).fetchone()
+        if row is None:
+            return None
+        return RoutableAllocation(
+            job_id=str(row["job_id"]),
+            activation_id=str(row["canonical_activation_id"]),
+            requester_identity=str(row["requester_identity"]),
+            consumer_identity=str(row["consumer_identity"]),
+            provider_allocation_id=str(row["provider_allocation_id"]),
+        )
 
     def count_allocations(self, *, active_only: bool = False) -> int:
         """Return all or only active durable allocations (test/telemetry seam)."""

@@ -31,6 +31,7 @@ TLS_KEY = "tls-private-key-secret-canary"
 ORGANIZATION = "creek-vaults"
 IMAGE = "registry.example/creek@sha256:" + "a" * 64
 API_BASE_URL = "https://fly.test"
+ROUTING_PUBLIC_URL = "https://vault-router.example.com"
 
 
 @dataclass
@@ -65,6 +66,10 @@ class FakeFlyAPI:
         self.failures: dict[tuple[str, str], int] = {}
         self.failure_body = "provider unavailable"
         self.malformed: dict[tuple[str, str], str] = {}
+        self.replace_machine_on_wait = False
+        self.replacement_drops_mount = False
+        self.volume_loses_encryption_on_wait = False
+        self.start_stays_stopped = False
 
     def fail_once(self, method: str, path_suffix: str) -> None:
         """Return one 503 for a matching method and path suffix."""
@@ -201,12 +206,29 @@ class FakeFlyAPI:
             return httpx.Response(404, request=request)
         if len(segments) == 2 and request.method == "POST":
             if segments[1] == "start":
-                matched_machine["state"] = "started"
+                if not self.start_stays_stopped:
+                    matched_machine["state"] = "started"
             elif segments[1] == "stop":
                 matched_machine["state"] = "stopped"
             else:
                 return httpx.Response(404, request=request)
             return httpx.Response(200, json=matched_machine, request=request)
+        if len(segments) == 2 and segments[1] == "wait" and request.method == "GET":
+            if self.volume_loses_encryption_on_wait:
+                self.volumes[app_name][0]["encrypted"] = False
+                self.volume_loses_encryption_on_wait = False
+            if self.replace_machine_on_wait:
+                replacement = dict(matched_machine)
+                if self.replacement_drops_mount:
+                    replacement["config"] = dict(matched_machine["config"])
+                    replacement["config"]["mounts"] = []
+                replacement["id"] = "machine-replacement"
+                replacement["state"] = "started"
+                self.machines[app_name] = [replacement]
+                self.replace_machine_on_wait = False
+                return httpx.Response(200, request=request)
+            status = 200 if matched_machine["state"] == "started" else 408
+            return httpx.Response(status, request=request)
         if len(segments) == 1 and request.method == "DELETE":
             self.machines[app_name].remove(matched_machine)
             return httpx.Response(200, request=request)
@@ -258,6 +280,7 @@ def fly_driver(
     policy = FlyProviderPolicy(
         organization=ORGANIZATION,
         image=IMAGE,
+        routing_public_url=ROUTING_PUBLIC_URL,
         api_base_url=API_BASE_URL,
     )
     return FlyProviderDriver(

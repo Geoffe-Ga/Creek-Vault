@@ -124,9 +124,11 @@ from creek_mcp.httpapi.middleware.limits import (
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
+    from typing import Any
 
     from starlette.requests import Request
     from starlette.responses import Response
+    from starlette.types import ExceptionHandler
 
     from creek_mcp.api.routes import RouteSpec
     from creek_mcp.httpapi.context import RequestContext
@@ -178,11 +180,16 @@ purpose* — see the module docstring for why a method miss must be
 indistinguishable from a path miss — so there is no table to derive it from,
 and inventing a code to derive it from would put it back in the set.
 
-Its sibling key is written ``ERROR_STATUS[ErrorCode.NOT_FOUND]`` rather than a
-bare ``404`` for the mirror-image reason: that status *does* have a table, and
-the key dispatch matches on must not be able to drift from the code
-:func:`_routing_miss` renders.
+Its sibling :data:`ROUTING_MISS_STATUS` is derived from
+``ERROR_STATUS[ErrorCode.NOT_FOUND]`` rather than a bare ``404`` for the
+mirror-image reason: that status *does* have a table, and the key dispatch
+matches on must not be able to drift from the code :func:`_routing_miss`
+renders. The shared routing proxy imports that status, so both adapters still
+route through this module's one refusal constructor.
 """
+
+ROUTING_MISS_STATUS: Final[int] = ERROR_STATUS[ErrorCode.NOT_FOUND]
+"""Published status used to register the one routing-miss constructor."""
 
 
 def _speaks_a_served_minor(request: Request) -> bool:
@@ -437,6 +444,16 @@ async def _outermost_fault(request: Request, _exc: Exception) -> Response:
     return error_response(ErrorCode.INTERNAL_ERROR, context)
 
 
+def routing_exception_handlers() -> dict[Any, ExceptionHandler]:
+    """Return the shared closed-contract handlers for either `/v1` adapter."""
+    return {
+        ROUTING_MISS_STATUS: _routing_miss,
+        METHOD_NOT_ALLOWED: _routing_miss,
+        HTTPException: _not_a_routing_miss,
+        Exception: _outermost_fault,
+    }
+
+
 def _middleware(
     verifier: ConsumerTokenVerifier,
     max_body_bytes: int,
@@ -542,12 +559,7 @@ def create_app(
             max_concurrency,
             max_per_consumer,
         ),
-        exception_handlers={
-            ERROR_STATUS[ErrorCode.NOT_FOUND]: _routing_miss,
-            METHOD_NOT_ALLOWED: _routing_miss,
-            HTTPException: _not_a_routing_miss,
-            Exception: _outermost_fault,
-        },
+        exception_handlers=routing_exception_handlers(),
     )
     app.router.redirect_slashes = REDIRECT_SLASHES
     app.state.vault_path = vault_path

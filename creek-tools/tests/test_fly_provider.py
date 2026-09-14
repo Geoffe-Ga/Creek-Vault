@@ -22,15 +22,21 @@ from creek_mcp.provisioning.models import (
     FailureReason,
     ResourceClass,
     ResourceState,
+    RoutableAllocation,
 )
 from creek_mcp.provisioning.store import ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
 from tests.fly_support import (
+    API_BASE_URL,
     CONSUMER_TOKEN,
+    IMAGE,
+    ORGANIZATION,
     PROVIDER_TOKEN,
+    ROUTING_PUBLIC_URL,
     TLS_KEY,
     FakeFlyAPI,
     FakeSecretManager,
+    fly_client,
     fly_driver,
     fly_job,
 )
@@ -53,6 +59,12 @@ def _only_machine(api: FakeFlyAPI) -> dict[str, Any]:
     machines = api.machines[_only_app(api)]
     assert len(machines) == 1
     return machines[0]
+
+
+def _only_volume(api: FakeFlyAPI) -> dict[str, Any]:
+    volumes = api.volumes[_only_app(api)]
+    assert len(volumes) == 1
+    return volumes[0]
 
 
 def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None:
@@ -96,7 +108,212 @@ def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None
         }
     ]
     assert all("ips" not in path for _, path in api.requests)
-    assert allocation.vault_url.endswith(".internal:8823/v1")
+    assert allocation.vault_url == f"{ROUTING_PUBLIC_URL}/v1"
+    assert ".internal" not in allocation.vault_url
+
+
+def test_routing_start_wait_and_machine_rediscovery_are_store_bound() -> None:
+    """The driver wakes its canonical allocation and targets its current Machine."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    first = driver.prepare_route(routed)
+    second = driver.prepare_route(routed)
+
+    app_name = _only_app(api)
+    machine_id = _only_machine(api)["id"]
+    assert first == second
+    assert first.base_url == f"https://{machine_id}.vm.{app_name}.internal:8823"
+    starts = [request for request in api.requests if request[1].endswith("/start")]
+    waits = [request for request in api.requests if request[1].endswith("/wait")]
+    assert len(starts) == 1
+    assert len(waits) == 2
+
+
+def test_routing_rejects_a_stale_provider_allocation_before_start() -> None:
+    """A corrupted ownership row cannot redirect a canonical activation."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    driver.provision(job)
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        "fly-stale-provider-id",
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_route(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert not any(path.endswith("/start") for _, path in api.requests)
+
+
+def test_routing_rejects_drifted_machine_policy_before_start() -> None:
+    """A canonical name cannot bypass exact route-time Machine ownership checks."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    _only_machine(api)["config"]["metadata"] = {
+        "creek_allocation_id": "fly-other-allocation",
+        "creek_activation_id": "activation-other",
+    }
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_route(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert not any(path.endswith("/start") for _, path in api.requests)
+
+
+def test_routing_rejects_drifted_volume_policy_before_start() -> None:
+    """Route-time custody rejects an allocation whose volume is no longer encrypted."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    _only_volume(api)["encrypted"] = False
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_route(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert not any(path.endswith("/start") for _, path in api.requests)
+
+
+def test_routing_rediscovers_a_replacement_machine_after_readiness_wait() -> None:
+    """The final private target follows a provider replacement, not stale state."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    api.replace_machine_on_wait = True
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    target = driver.prepare_route(routed)
+
+    assert target.base_url.startswith("https://machine-replacement.vm.")
+
+
+def test_routing_rejects_replacement_without_the_encrypted_mount() -> None:
+    """Post-wait rediscovery revalidates replacement custody before private dial."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    api.replace_machine_on_wait = True
+    api.replacement_drops_mount = True
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_route(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+
+
+def test_routing_revalidates_volume_custody_after_readiness_wait() -> None:
+    """A volume policy race after start is refused before returning a target."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    api.volume_loses_encryption_on_wait = True
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_route(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+
+
+def test_routing_readiness_timeout_is_retryable_and_target_free() -> None:
+    """A Machine that never starts becomes one bounded secret-free failure."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    api.start_stays_stopped = True
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_route(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_UNAVAILABLE
+    assert raised.value.retryable is True
+    assert "machine-1" not in str(raised.value)
+
+
+def test_routing_start_failure_is_retryable_and_target_free() -> None:
+    """A provider start failure exposes neither the Machine nor its topology."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    api.fail_once("POST", "/start")
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_route(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_UNAVAILABLE
+    assert raised.value.retryable is True
+    assert "machine-1" not in str(raised.value)
 
 
 def test_fly_runbook_pins_scope_reconciliation_and_background_ownership() -> None:
@@ -198,6 +415,58 @@ def test_policy_rejects_plaintext_provider_transport() -> None:
             image="registry.example/creek@sha256:" + "a" * 64,
             api_base_url="http://fly.example.test",
         )
+
+
+@pytest.mark.parametrize(
+    "routing_url",
+    [
+        "http://router.example.com",
+        "https://machine.vm.app.internal",
+        "https://machine.vm.app.internal.",
+        "https://127.0.0.1",
+        "https://[fdaa::1]",
+        "https://user@router.example.com",
+        "https://router.example.com/private-proxy",
+        "https://router.example.com?target=internal",
+        "https://router.example.com#private-target",
+    ],
+)
+def test_policy_refuses_non_public_handoff_routes(routing_url: str) -> None:
+    """A worker cannot hand Adepthood a private or credential-bearing endpoint."""
+    with pytest.raises(ValueError, match="public HTTPS"):
+        FlyProviderPolicy(
+            organization="creek-vaults",
+            image="registry.example/creek@sha256:" + "a" * 64,
+            routing_public_url=routing_url,
+        )
+
+
+def test_provision_refuses_to_handoff_without_a_public_route() -> None:
+    """An omitted route fails closed instead of falling back to private DNS."""
+    api = FakeFlyAPI()
+    policy = FlyProviderPolicy(
+        organization=ORGANIZATION,
+        image=IMAGE,
+        api_base_url=API_BASE_URL,
+    )
+    credential = FlyCredential(
+        token=PROVIDER_TOKEN,
+        organization=ORGANIZATION,
+        scope=FlyCredentialScope.ORG_DEPLOY,
+        expires_at=_NOW + timedelta(days=1),
+    )
+    driver = FlyProviderDriver(
+        policy,
+        credential,
+        FakeSecretManager(set()),
+        fly_client(api),
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.provision(fly_job())
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert api.apps == {}
 
 
 def test_driver_rejects_cross_organization_credentials() -> None:

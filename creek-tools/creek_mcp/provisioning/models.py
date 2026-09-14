@@ -83,6 +83,17 @@ class ProvisioningAllocation:
 
 
 @dataclass(frozen=True, slots=True)
+class RoutableAllocation:
+    """The secret-free ownership record needed to route one live allocation."""
+
+    job_id: str
+    activation_id: str
+    requester_identity: str
+    consumer_identity: str
+    provider_allocation_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimedJob:
     """A leased job plus the private token required to settle its claim."""
 

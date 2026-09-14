@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import os
 import re
 import stat
@@ -27,7 +28,9 @@ from creek_mcp.provisioning.models import (
     FailureReason,
     ResourceClass,
     ResourceState,
+    RoutableAllocation,
 )
+from creek_mcp.provisioning.routing import PrivateVaultTarget
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -46,6 +49,7 @@ _DEFAULT_MEMORY_MB: Final[int] = 1024
 _DEFAULT_ROOTFS_GB: Final[int] = 1
 _DEFAULT_VOLUME_GB: Final[int] = 5
 _DEFAULT_VAULT_PORT: Final[int] = 8823
+_DEFAULT_READINESS_TIMEOUT_SECONDS: Final[int] = 20
 _VAULT_MOUNT: Final[str] = "/vault"
 _FLY_ABSENT_STATUS: Final[int] = 404
 """Fly's upstream resource-absence response; never exposed on Creek's wire."""
@@ -182,6 +186,7 @@ class FlyProviderPolicy:
 
     organization: str
     image: str
+    routing_public_url: str | None = None
     api_base_url: str = _DEFAULT_API_BASE_URL
     region: str = _DEFAULT_REGION
     app_prefix: str = "creek-vault"
@@ -191,6 +196,7 @@ class FlyProviderPolicy:
     rootfs_size_gb: int = _DEFAULT_ROOTFS_GB
     volume_size_gb: int = _DEFAULT_VOLUME_GB
     vault_port: int = _DEFAULT_VAULT_PORT
+    readiness_timeout_seconds: int = _DEFAULT_READINESS_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         """Validate configuration before any provider request is possible."""
@@ -218,9 +224,12 @@ class FlyProviderPolicy:
             self.rootfs_size_gb,
             self.volume_size_gb,
             self.vault_port,
+            self.readiness_timeout_seconds,
         )
         if any(value <= 0 for value in positive):
             raise ValueError("Fly provider numeric policy values must be positive")
+        if self.routing_public_url is not None:
+            _validate_public_route_url(self.routing_public_url)
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +266,7 @@ class FlyProviderDriver:
 
     def provision(self, job: ProvisioningJob) -> ProviderAllocation:
         """Reconcile exactly one stopped allocation for *job*'s activation."""
+        vault_url = self._public_vault_url()
         reference = self._reference(job.activation_id)
         runtime_secrets = self._secrets.issue(
             job.activation_id,
@@ -264,19 +274,45 @@ class FlyProviderDriver:
         )
         self._ensure_app(reference)
         volume = self._ensure_volume(reference)
-        machine = self._ensure_machine(
+        self._ensure_machine(
             reference,
             volume_id=self._identifier(volume, "volume"),
             runtime_secrets=runtime_secrets,
         )
-        machine_id = self._identifier(machine, "Machine")
         return ProviderAllocation(
             allocation_id=reference.allocation_id,
-            vault_url=(
-                f"https://{machine_id}.vm.{reference.app_name}.internal:"
-                f"{self._policy.vault_port}/v1"
-            ),
+            vault_url=vault_url,
             consumer_credential=runtime_secrets.consumer_credential,
+        )
+
+    def prepare_route(self, allocation: RoutableAllocation) -> PrivateVaultTarget:
+        """Start and wait for one store-owned allocation, then derive its target."""
+        reference = self._reference(allocation.activation_id)
+        if allocation.provider_allocation_id != reference.allocation_id:
+            self._rejected("provider allocation identity does not match activation")
+        machine = self._require_machine(reference)
+        volume = self._require_volume(reference)
+        self._verify_machine(
+            machine,
+            reference,
+            self._identifier(volume, "volume"),
+        )
+        if str(machine.get("state")) not in {"started", "starting"}:
+            self._change_machine_state(reference, machine, "start")
+        self._wait_until_started(reference, machine)
+        ready = self._require_machine(reference)
+        ready_volume = self._require_volume(reference)
+        self._verify_machine(
+            ready,
+            reference,
+            self._identifier(ready_volume, "volume"),
+        )
+        if str(ready.get("state")) != "started":
+            self._unavailable("Fly Machine readiness did not converge")
+        machine_id = self._identifier(ready, "Machine")
+        return PrivateVaultTarget(
+            f"https://{machine_id}.vm.{reference.app_name}.internal:"
+            f"{self._policy.vault_port}"
         )
 
     def start(self, activation_id: str) -> None:
@@ -495,6 +531,17 @@ class FlyProviderDriver:
                 else [self._object(response, "Fly volume")]
             )
         volume = self._only(matches, "Fly volume")
+        self._verify_volume(volume)
+        return volume
+
+    def _require_volume(self, reference: _AllocationRef) -> Mapping[str, Any]:
+        """Return the one existing volume only when its custody policy is intact."""
+        volume = self._only(self._matching_volumes(reference), "Fly volume")
+        self._verify_volume(volume)
+        return volume
+
+    def _verify_volume(self, volume: Mapping[str, Any]) -> None:
+        """Reject a volume that drifted from the encrypted allocation policy."""
         if (
             volume.get("region") != self._policy.region
             or volume.get("size_gb") != self._policy.volume_size_gb
@@ -502,7 +549,6 @@ class FlyProviderDriver:
             or volume.get("state") == "destroyed"
         ):
             self._rejected("Fly volume does not match encrypted allocation policy")
-        return volume
 
     def _ensure_machine(
         self,
@@ -627,6 +673,30 @@ class FlyProviderDriver:
             f"/v1/apps/{reference.app_name}/machines/{machine_id}/{operation}",
             expected=(200, 201, 204),
         )
+
+    def _wait_until_started(
+        self,
+        reference: _AllocationRef,
+        machine: Mapping[str, Any],
+    ) -> None:
+        """Use Fly's bounded wait endpoint for one concrete Machine generation."""
+        machine_id = self._identifier(machine, "Machine")
+        timeout = self._policy.readiness_timeout_seconds
+        response = self._request(
+            "GET",
+            f"/v1/apps/{reference.app_name}/machines/{machine_id}/wait"
+            f"?state=started&timeout={timeout}",
+            expected=(200, 408),
+        )
+        if response.status_code == 408:
+            self._unavailable("Fly Machine readiness timed out")
+
+    def _public_vault_url(self) -> str:
+        """Return the shared public route, or refuse unsafe worker wiring."""
+        public = self._policy.routing_public_url
+        if public is None:
+            self._rejected("public routing URL is not configured")
+        return f"{public.rstrip('/')}/v1"
 
     def _delete_machine(
         self,
@@ -825,3 +895,36 @@ def _resource_key(resource: ProviderResource) -> tuple[str, str, str]:
         resource.resource_class.value,
         resource.provider_ref,
     )
+
+
+def _validate_public_route_url(value: str) -> None:
+    """Refuse a handoff endpoint that is not an uncredentialed public HTTPS URL."""
+    try:
+        route = httpx.URL(value)
+    except httpx.InvalidURL as exc:
+        raise ValueError("Fly routing public URL must be public HTTPS") from exc
+    host = route.host
+    canonical_host = None if host is None else host.rstrip(".")
+    private_name = (
+        not canonical_host
+        or canonical_host == "localhost"
+        or canonical_host.endswith((".internal", ".local", ".localhost"))
+    )
+    private_ip = False
+    if canonical_host is not None:
+        try:
+            address = ipaddress.ip_address(canonical_host)
+        except ValueError:
+            pass
+        else:
+            private_ip = not address.is_global
+    if (
+        route.scheme != "https"
+        or private_name
+        or private_ip
+        or route.userinfo
+        or route.query
+        or route.fragment
+        or route.path not in {"", "/"}
+    ):
+        raise ValueError("Fly routing public URL must be public HTTPS")
