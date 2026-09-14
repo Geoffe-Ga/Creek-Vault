@@ -43,7 +43,7 @@ def store(tmp_path: Path) -> ProvisioningStore:
     return ProvisioningStore(tmp_path / "provisioning.sqlite3")
 
 
-def test_worker_provisions_once_and_stops_at_the_key_ceremony_boundary(
+def test_worker_provisions_once_and_handoffs_provider_managed_ready(
     store: ProvisioningStore,
 ) -> None:
     """The fake provider result is handed off internally, never put on the job."""
@@ -56,7 +56,8 @@ def test_worker_provisions_once_and_stops_at_the_key_ceremony_boundary(
     result = store.get(job.job_id, "adepthood")
 
     assert result is not None
-    assert result.state is JobState.AWAITING_KEY_CEREMONY
+    assert result.state is JobState.READY
+    assert result.attested_confidential is False
     assert driver.allocation_count == 1
     assert handoff.delivery_count == 1
     assert "credential" not in repr(result).lower()
@@ -99,7 +100,7 @@ def test_post_handoff_process_crash_retries_without_delivering_twice(
     result = store.get(job.job_id, "adepthood")
 
     assert result is not None
-    assert result.state is JobState.AWAITING_KEY_CEREMONY
+    assert result.state is JobState.READY
     assert driver.allocation_count == 1
     assert handoff.delivery_count == 1
 
@@ -202,7 +203,7 @@ def test_retry_reuses_the_same_provider_allocation(
 
     result = store.get(job.job_id, "adepthood")
     assert result is not None
-    assert result.state is JobState.AWAITING_KEY_CEREMONY
+    assert result.state is JobState.READY
     assert driver.allocation_count == 1
 
 

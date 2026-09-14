@@ -18,6 +18,7 @@ from creek_mcp.provisioning.ceremony import (
     CeremonySubmission,
 )
 from creek_mcp.provisioning.models import (
+    CustodyMode,
     DeletionOutcome,
     FailureReason,
     JobOperation,
@@ -279,7 +280,7 @@ def test_v2_database_migrates_authenticated_ownership_without_data_loss(
     assert job is not None
     assert job.requester_identity == "adepthood"
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert connection.execute(
             "SELECT requester_identity FROM provisioning_activation_ids"
         ).fetchone() == ("adepthood",)
@@ -304,6 +305,7 @@ def test_allocation_is_a_distinct_durable_model_with_one_active_per_consumer(
         first_claim.lease_token,
         "provider-allocation-1",
         handoff=lambda: None,
+        custody_mode=CustodyMode.PROVIDER_MANAGED,
         now=_NOW,
     )
 
@@ -328,6 +330,7 @@ def test_allocation_is_a_distinct_durable_model_with_one_active_per_consumer(
         second_claim.lease_token,
         "provider-allocation-2",
         handoff=lambda: None,
+        custody_mode=CustodyMode.PROVIDER_MANAGED,
         now=_NOW,
     )
 
@@ -359,10 +362,11 @@ def test_create_handoff_runs_inside_the_lease_settlement_write_fence(
         claimed.lease_token,
         "provider-fenced-handoff",
         handoff=assert_write_fenced,
+        custody_mode=CustodyMode.PROVIDER_MANAGED,
         now=_NOW,
     )
 
-    assert completed.state is JobState.AWAITING_KEY_CEREMONY
+    assert completed.state is JobState.READY
 
 
 def test_an_expired_create_lease_cannot_handoff_or_complete(
@@ -384,6 +388,7 @@ def test_an_expired_create_lease_cannot_handoff_or_complete(
             claimed.lease_token,
             "provider-expired-handoff",
             handoff=handoff,
+            custody_mode=CustodyMode.PROVIDER_MANAGED,
             now=_NOW + timedelta(seconds=2),
         )
     assert handed_off is False
@@ -527,6 +532,7 @@ def _ready_job(store: ProvisioningStore, activation_id: str, allocation: str) ->
         claim.lease_token,
         allocation,
         handoff=lambda: None,
+        custody_mode=CustodyMode.WRAPPED_ARTIFACT_ONLY,
         now=_NOW,
     )
     return job.job_id
@@ -595,7 +601,7 @@ def _v3_database(path: Path) -> None:
         connection.commit()
 
 
-def test_v3_database_migrates_to_v4_keeping_rows_indexes_and_backfilling_receipts(
+def test_v3_database_migrates_to_v5_keeping_rows_indexes_and_backfilling_receipts(
     tmp_path: Path,
 ) -> None:
     """Fleet tables arrive idempotently and pre-upgrade deletions get receipts."""
@@ -607,7 +613,7 @@ def test_v3_database_migrates_to_v4_keeping_rows_indexes_and_backfilling_receipt
     ProvisioningStore(database)
 
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         tables = {
             str(row[0])
             for row in connection.execute(

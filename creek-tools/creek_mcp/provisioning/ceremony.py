@@ -1,4 +1,4 @@
-"""Versioned user-held key ceremony with replay and attestation gates (#1771)."""
+"""Archived v1 key-ceremony primitive; not a public runtime custody path."""
 
 from __future__ import annotations
 
@@ -302,7 +302,7 @@ class FakeKeyReleaseSink:
 
 
 class KeyCeremonyService:
-    """Apply attestation policy before atomically completing a durable ceremony."""
+    """Interpret migrated v1 ceremony rows for compatibility and teardown."""
 
     def __init__(
         self,
@@ -323,7 +323,7 @@ class KeyCeremonyService:
         submission: CeremonySubmission,
         now: datetime,
     ) -> ProvisioningJob:
-        """Complete an ordinary or verified-attested key ceremony idempotently."""
+        """Complete one migrated v1 ceremony record idempotently."""
         challenge = self._store.get_key_ceremony(job_id, requester_identity)
         before_settle, attested = self._release_gate(
             job_id,

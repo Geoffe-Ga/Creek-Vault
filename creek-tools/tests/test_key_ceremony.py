@@ -14,7 +14,6 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PublicKey,
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from starlette.testclient import TestClient
 
 from creek.confidential.keyvault import (
     KeyVault,
@@ -24,9 +23,7 @@ from creek.confidential.keyvault import (
     unlock_with_passphrase,
     unlock_with_recovery,
 )
-from creek_mcp.httpapi.provisioning import build_provisioning_app
 from creek_mcp.provisioning.ceremony import (
-    KEY_CEREMONY_TTL,
     KEY_CEREMONY_VERSION,
     AttestationStatement,
     CeremonyConflictError,
@@ -40,17 +37,14 @@ from creek_mcp.provisioning.ceremony import (
     attestation_signed_payload,
 )
 from creek_mcp.provisioning.driver import FakeOneTimeHandoff, FakeProviderDriver
-from creek_mcp.provisioning.models import JobState
+from creek_mcp.provisioning.models import CustodyMode, JobState
 from creek_mcp.provisioning.store import ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
-from creek_mcp.remote_auth import ConsumerTokenVerifier
 
 _NOW = datetime(2026, 9, 7, 8, tzinfo=UTC)
 _PASSPHRASE = "correct horse test battery staple"
 _RECOVERY = "AEAQC-AIBAE-AQCAI-BAEAQ-CAIBA-EAQCA-IBAEA-QCAIB-AEAQC-AIBAE-AQ"
 _VMK = bytes(32)
-_TOKEN = "ceremony-api-test-token-" + "a" * 32
-_OTHER_TOKEN = "ceremony-api-other-token-" + "b" * 32
 _VECTOR = (
     Path(__file__).resolve().parents[1]
     / "docs"
@@ -66,8 +60,18 @@ def _awaiting_store(
     """Return one real store whose provider create reached the ceremony boundary."""
     store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
     job = store.submit("activation-ceremony", "adepthood", now=now)
-    worker = ProvisioningWorker(store, FakeProviderDriver(), FakeOneTimeHandoff())
-    assert worker.run_once(now=now) is True
+    claim = store.claim_next(now=now)
+    assert claim is not None
+    driver = FakeProviderDriver()
+    allocation = driver.provision(claim.job)
+    store.complete_create(
+        job.job_id,
+        claim.lease_token,
+        allocation.allocation_id,
+        handoff=lambda: None,
+        custody_mode=CustodyMode.WRAPPED_ARTIFACT_ONLY,
+        now=now,
+    )
     awaiting = store.get(job.job_id, "adepthood")
     assert awaiting is not None
     assert awaiting.state is JobState.AWAITING_KEY_CEREMONY
@@ -150,21 +154,6 @@ def _release_envelope(recipient: X25519PublicKey) -> KeyReleaseEnvelope:
         nonce=_b64(bytes(12)),
         ciphertext=_b64(bytes(48)),
     )
-
-
-def _api_client(store: ProvisioningStore, *, now: datetime | None = _NOW) -> TestClient:
-    """Return the authenticated public ceremony API over *store*."""
-    verifier = ConsumerTokenVerifier(
-        {"adepthood": (_TOKEN,), "other-consumer": (_OTHER_TOKEN,)}
-    )
-    if now is None:
-        return TestClient(build_provisioning_app(store, verifier))
-    return TestClient(build_provisioning_app(store, verifier, clock=lambda: now))
-
-
-def _headers(token: str = _TOKEN) -> dict[str, str]:
-    """Return one accepted synthetic bearer header."""
-    return {"Authorization": f"Bearer {token}"}
 
 
 def test_language_neutral_vector_unwraps_identically_by_both_user_factors() -> None:
@@ -304,10 +293,10 @@ def test_attested_wire_submission_requires_explicit_algorithm_markers(
         CeremonySubmission.model_validate(attested)
 
 
-def test_ordinary_machine_completes_without_advertising_attested_confidentiality(
+def test_archived_artifact_path_records_that_it_does_not_control_runtime_custody(
     tmp_path: Path,
 ) -> None:
-    """No quote means no key release and an honest non-attested capability result."""
+    """The archived primitive stays explicit and never becomes an escrow promise."""
     store, job_id = _awaiting_store(tmp_path)
     challenge = store.get_key_ceremony(job_id, "adepthood")
     submission = _for_challenge(_vector_submission(), challenge)
@@ -319,6 +308,7 @@ def test_ordinary_machine_completes_without_advertising_attested_confidentiality
     assert completed == repeated
     assert completed.state is JobState.READY
     assert completed.attested_confidential is False
+    assert completed.custody_mode is CustodyMode.WRAPPED_ARTIFACT_ONLY
     assert store.get_wrapped_key_artifact(job_id, "adepthood") is not None
     assert challenge.expires_at == _NOW + timedelta(hours=24)
 
@@ -534,97 +524,3 @@ def test_database_never_contains_plaintext_user_key_material(tmp_path: Path) -> 
     assert _RECOVERY.encode() not in database
     assert _VMK.hex().encode() not in database
     assert KEY_CEREMONY_VERSION.encode() in database
-
-
-def test_http_challenge_and_completion_publish_only_safe_resumable_state(
-    tmp_path: Path,
-) -> None:
-    """The API exposes a challenge and honest capability, never recovery data."""
-    store, job_id = _awaiting_store(tmp_path)
-    client = _api_client(store)
-    path = f"/control/v1/jobs/{job_id}/key-ceremony"
-
-    challenge_response = client.get(path, headers=_headers())
-    challenge = KeyCeremonyChallenge.model_validate(challenge_response.json())
-    submission = _for_challenge(_vector_submission(), challenge)
-    completed = client.put(
-        path,
-        headers=_headers(),
-        json=submission.model_dump(mode="json"),
-    )
-
-    assert challenge_response.status_code == 200
-    assert completed.status_code == 200
-    assert completed.json()["state"] == JobState.READY.value
-    assert completed.json()["attested_confidential"] is False
-    assert completed.headers["Cache-Control"] == "no-store"
-    assert "recovery" not in challenge_response.text.lower()
-    assert "recovery" not in completed.text.lower()
-    assert client.get(path, headers=_headers()).json()["code"] == "invalid_transition"
-
-
-def test_http_refuses_a_challenge_older_than_its_ttl_at_the_injected_instant(
-    tmp_path: Path,
-) -> None:
-    """The HTTP boundary settles ceremonies on an injected clock, not wall time."""
-    store, job_id = _awaiting_store(tmp_path)
-    path = f"/control/v1/jobs/{job_id}/key-ceremony"
-    challenge = KeyCeremonyChallenge.model_validate(
-        _api_client(store).get(path, headers=_headers()).json()
-    )
-    submission = _for_challenge(_vector_submission(), challenge)
-    expired_client = _api_client(store, now=_NOW + KEY_CEREMONY_TTL)
-
-    refused = expired_client.put(
-        path,
-        headers=_headers(),
-        json=submission.model_dump(mode="json"),
-    )
-
-    assert challenge.expires_at == _NOW + KEY_CEREMONY_TTL
-    assert refused.status_code == 409
-    assert refused.json()["code"] == "ceremony_expired"
-    queued = store.get(job_id, "adepthood")
-    assert queued is not None
-    assert queued.state is JobState.DELETING
-    assert queued.updated_at == _NOW + KEY_CEREMONY_TTL
-
-
-def test_http_default_clock_completes_a_fresh_challenge(tmp_path: Path) -> None:
-    """Production's default UTC clock is wired when no test clock is supplied."""
-    wall_now = datetime.now(tz=UTC).replace(microsecond=0)
-    store, job_id = _awaiting_store(tmp_path, now=wall_now)
-    client = _api_client(store, now=None)
-    path = f"/control/v1/jobs/{job_id}/key-ceremony"
-    challenge = KeyCeremonyChallenge.model_validate(
-        client.get(path, headers=_headers()).json()
-    )
-
-    completed = client.put(
-        path,
-        headers=_headers(),
-        json=_for_challenge(_vector_submission(), challenge).model_dump(mode="json"),
-    )
-
-    assert completed.status_code == 200
-    assert completed.json()["state"] == JobState.READY.value
-
-
-def test_http_rejects_secret_fields_and_cross_consumer_access(tmp_path: Path) -> None:
-    """The wire boundary forbids secrets and hides another consumer's ceremony."""
-    store, job_id = _awaiting_store(tmp_path)
-    client = _api_client(store)
-    path = f"/control/v1/jobs/{job_id}/key-ceremony"
-    challenge = KeyCeremonyChallenge.model_validate(
-        client.get(path, headers=_headers()).json()
-    )
-    raw = _for_challenge(_vector_submission(), challenge).model_dump(mode="json")
-    raw["recovery_code"] = _RECOVERY
-
-    invalid = client.put(path, headers=_headers(), json=raw)
-    foreign = client.get(path, headers=_headers(_OTHER_TOKEN))
-
-    assert invalid.status_code == 400
-    assert invalid.json()["code"] == "invalid_request"
-    assert foreign.status_code == 403
-    assert foreign.json()["code"] == "job_unavailable"
