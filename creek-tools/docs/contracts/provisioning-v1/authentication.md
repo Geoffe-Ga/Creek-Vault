@@ -34,6 +34,12 @@ by durable job id. Identical crash replays are acknowledged without a second
 delivery; conflicting replays fail closed. That payload is never returned to
 browser clients and has no public HTTP route.
 
+Contract 2.1 adds no job field. It adds the bounded
+`503 activation_unavailable` result for a new id refused by the deployment's
+disable switch or SQLite-atomic live-allocation cap. The status is retryable as
+a service condition. An exact already-admitted activation id remains a `202`
+idempotent replay even while admission is closed.
+
 Failure responses and logs carry only the stable reason enum. Provider detail,
 provider tokens, passphrases, recovery material, unwrapped keys, vault content,
 and handoff payloads are excluded.

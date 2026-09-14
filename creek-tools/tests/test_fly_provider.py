@@ -97,6 +97,11 @@ def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None
         {"volume": "vol-1", "path": "/vault", "encrypted": True}
     ]
     assert config["restart"] == {"policy": "no"}
+    assert {item["guest_path"] for item in config["files"]} == {
+        "/run/secrets/creek_consumer_tokens",
+        "/run/secrets/tls.crt",
+        "/run/secrets/tls.key",
+    }
     assert config["services"] == [
         {
             "protocol": "tcp",
@@ -110,6 +115,213 @@ def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None
     assert all("ips" not in path for _, path in api.requests)
     assert allocation.vault_url == f"{ROUTING_PUBLIC_URL}/v1"
     assert ".internal" not in allocation.vault_url
+
+
+def test_cross_network_route_uses_fly_replay_not_private_dns() -> None:
+    """An isolated vault is addressed only by a checked Fly replay target."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+    job = fly_job()
+    allocation = driver.provision(job)
+    routable = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    target = driver.prepare_replay(routable)
+
+    app_name = _only_app(api)
+    machine = _only_machine(api)
+    assert target.app_name == app_name
+    assert target.machine_id == machine["id"]
+    assert ".internal" not in repr(target)
+    config = machine["config"]
+    assert config["user"] == "root"
+    assert config["init"] == {
+        "exec": [
+            "python",
+            "-m",
+            "creek_mcp.provisioning.fly_vault_bootstrap",
+        ]
+    }
+    assert {item["guest_path"] for item in config["files"]} == {
+        "/run/secrets/creek_consumer_tokens",
+        "/run/secrets/creek_replay_state",
+    }
+    assert config["services"][0]["ports"] == [
+        {"port": 443, "handlers": ["tls", "http"]}
+    ]
+
+
+@pytest.mark.parametrize("network", [None, "default", "other-allocation"])
+def test_replay_refuses_missing_or_drifted_allocation_network(
+    network: str | None,
+) -> None:
+    """Cross-network replay never weakens per-vault network isolation."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+    job = fly_job()
+    allocation = driver.provision(job)
+    api.apps[_only_app(api)]["network"] = network
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_replay(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert not any(path.endswith("/start") for _, path in api.requests)
+
+
+def test_replay_rechecks_allocation_network_after_machine_readiness() -> None:
+    """A network swap during cold start cannot emit stale replay coordinates."""
+
+    class NetworkSwapAPI(FakeFlyAPI):
+        def handle(self, request):
+            response = super().handle(request)
+            if request.url.path.endswith("/wait"):
+                self.apps[_only_app(self)]["network"] = "other-allocation"
+            return response
+
+    api = NetworkSwapAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+    job = fly_job()
+    allocation = driver.provision(job)
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_replay(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+
+
+@pytest.mark.parametrize(
+    ("_label", "mutate"),
+    [
+        ("name", lambda machine: machine.update(name="wrong-machine")),
+        ("region", lambda machine: machine.update(region="ord")),
+        (
+            "image",
+            lambda machine: machine["config"].update(
+                image="registry.example/other@sha256:" + "b" * 64
+            ),
+        ),
+        (
+            "rootfs",
+            lambda machine: machine["config"].update(
+                rootfs={"size_gb": 2, "persist": "never"}
+            ),
+        ),
+        (
+            "guest",
+            lambda machine: machine["config"].update(
+                guest={"cpu_kind": "shared", "cpus": 2, "memory_mb": 1024}
+            ),
+        ),
+        ("mount", lambda machine: machine["config"].update(mounts=[])),
+        (
+            "restart",
+            lambda machine: machine["config"].update(restart={"policy": "always"}),
+        ),
+        ("environment", lambda machine: machine["config"].update(env={})),
+        ("init", lambda machine: machine["config"].update(init={})),
+        ("service", lambda machine: machine["config"].update(services=[])),
+        (
+            "replay-secret",
+            lambda machine: machine["config"].update(
+                files=machine["config"]["files"][:1]
+            ),
+        ),
+        (
+            "unexpected-secret",
+            lambda machine: machine["config"]["files"].append(
+                {"guest_path": "/run/secrets/tls.key", "raw_value": "YQ=="}
+            ),
+        ),
+    ],
+)
+def test_replay_refuses_every_machine_policy_drift_before_emitting_target(
+    _label: str,
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    """Replay is issued only for the exact reviewed immutable Machine shape."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+    job = fly_job()
+    allocation = driver.provision(job)
+    mutate(_only_machine(api))
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_replay(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert not any(path.endswith("/start") for _, path in api.requests)
+
+
+@pytest.mark.parametrize("secret_index", [0, 1])
+def test_replay_refuses_same_path_stale_secret_material_before_start(
+    secret_index: int,
+) -> None:
+    """A retry cannot adopt stale credentials hidden behind expected paths."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+    job = fly_job()
+    allocation = driver.provision(job)
+    _only_machine(api)["config"]["files"][secret_index]["raw_value"] = "c3RhbGU="
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_replay(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert not any(path.endswith("/start") for _, path in api.requests)
+
+
+def test_provision_retry_refuses_same_path_wrong_secret_material() -> None:
+    """A retry never adopts a Machine whose mounted values predate the bundle."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+    job = fly_job()
+    driver.provision(job)
+    _only_machine(api)["config"]["files"][0]["raw_value"] = "c3RhbGU="
+    request_count = len(api.requests)
+
+    with pytest.raises(ProviderError) as raised:
+        driver.provision(job)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert len(_only_machine(api)["config"]["files"]) == 2
+    assert not any(
+        method == "POST" and path.endswith("/machines")
+        for method, path in api.requests[request_count:]
+    )
 
 
 def test_routing_start_wait_and_machine_rediscovery_are_store_bound() -> None:
@@ -818,6 +1030,67 @@ def test_list_resources_covers_injected_app_names_and_skips_missing_apps() -> No
     ]
     assert not any("creek-vault-missing" in path for _, path in api.requests)
     assert ("GET", "/v1/apps") not in api.requests
+
+
+def test_list_resources_discovers_prefixed_apps_from_the_provider_organization() -> (
+    None
+):
+    """Production inventory finds forgotten apps without a hand-maintained file."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, discover_organization_apps=True)
+    orphan_app = "creek-vault-" + "0" * 24
+    api.apps[orphan_app] = {
+        "id": "app-orphan",
+        "name": orphan_app,
+        "organization": {"slug": "creek-vaults"},
+    }
+    api.apps["not-ours"] = {
+        "id": "app-foreign",
+        "name": "not-ours",
+        "organization": {"slug": "creek-vaults"},
+    }
+    api.volumes[orphan_app].append(
+        {"id": "vol-orphan", "name": "left-behind", "size_gb": 3}
+    )
+
+    resources = driver.list_resources([])
+
+    assert [resource.provider_ref for resource in resources] == [
+        "app-orphan",
+        "vol-orphan",
+    ]
+    assert api.requests[0] == ("GET", "/v1/apps")
+    assert not any("not-ours" in path for _, path in api.requests)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '["inventory-body-canary"]',
+        '{"apps": {}, "echo": "inventory-body-canary"}',
+        '{"apps": [null], "echo": "inventory-body-canary"}',
+        '{"apps": [{"echo": "inventory-body-canary"}]}',
+        '{"apps": [{"name": 7, "echo": "inventory-body-canary"}]}',
+        '{"total_apps": 2, "apps": [{"name": "inventory-body-canary"}]}',
+    ],
+)
+def test_organization_inventory_shape_fails_closed_without_echo(
+    caplog: pytest.LogCaptureFixture,
+    body: str,
+) -> None:
+    """Malformed org discovery is unavailable and never becomes empty inventory."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, discover_organization_apps=True)
+    api.malformed_once("GET", "/v1/apps", body)
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(ProviderError) as raised:
+        driver.list_resources([])
+
+    assert raised.value.reason is FailureReason.PROVIDER_UNAVAILABLE
+    assert raised.value.retryable is True
+    rendered = caplog.text + str(raised.value) + repr(raised.value) + repr(driver)
+    assert "inventory-body-canary" not in rendered
+    assert PROVIDER_TOKEN not in rendered
 
 
 def test_machine_metadata_claiming_another_allocation_stays_under_its_own_app() -> None:

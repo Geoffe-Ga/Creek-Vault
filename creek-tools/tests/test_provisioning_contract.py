@@ -43,9 +43,11 @@ CEREMONY_VECTORS = (
 )
 CLI = PROJECT_ROOT / "creek_mcp" / "provisioning" / "cli.py"
 FLEET_CLI = PROJECT_ROOT / "creek_mcp" / "provisioning" / "fleet_cli.py"
+ROUTING_CLI = PROJECT_ROOT / "creek_mcp" / "provisioning" / "routing_cli.py"
 PYPROJECT = PROJECT_ROOT / "pyproject.toml"
 DOCS_INDEX = PROJECT_ROOT / "docs" / "README.md"
 CHANGELOG = PROJECT_ROOT / "CHANGELOG.md"
+PILOT_RUNBOOK = PROJECT_ROOT / "docs" / "managed-vault-fly-pilot.md"
 _JOB_WIRE_FIELDS = {
     "job_id",
     "activation_id",
@@ -73,6 +75,14 @@ def test_openapi_contract_is_versioned_and_matches_the_served_paths() -> None:
         "/control/v1/jobs/{job_id}/retry",
     }
     assert contract["security"] == [{"consumerBearer": []}]
+    assert set(contract["paths"]["/control/v1/activations"]["post"]["responses"]) == {
+        "202",
+        "400",
+        "401",
+        "403",
+        "409",
+        "503",
+    }
 
 
 def test_public_schema_contains_no_credential_or_provider_result_field() -> None:
@@ -230,7 +240,7 @@ def test_job_wire_and_enums_are_unchanged_by_fleet_work(tmp_path: Path) -> None:
         "handoff_failed",
         "internal_error",
     }
-    assert CONTRACT_VERSION == "2.0.0"
+    assert CONTRACT_VERSION == "2.1.0"
     assert served == {
         ("/control/v1/activations", "POST"),
         ("/control/v1/jobs/{job_id}", "GET"),
@@ -267,6 +277,79 @@ def test_fleet_cli_is_installed_and_accepts_only_secret_file_paths() -> None:
         assert f'"{subcommand}"' in script
 
 
+def test_router_cli_is_installed_and_accepts_only_secret_file_paths() -> None:
+    """The public router composes production boundaries behind TLS."""
+    project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    script = ROUTING_CLI.read_text(encoding="utf-8")
+
+    assert (
+        project["project"]["scripts"]["creek-provisioning-router"]
+        == "creek_mcp.provisioning.routing_cli:main"
+    )
+    for argument in (
+        "--database",
+        "--fly-token-file",
+        "--fly-organization",
+        "--fly-image",
+        "--fly-token-expires-at",
+        "--secret-state-directory",
+        "--secret-master-key-file",
+        "--private-tls-ca-certificate-file",
+        "--tls-cert",
+        "--tls-key",
+    ):
+        assert argument in script
+    assert re.search(r'"--fly-token"', script) is None
+    assert "EncryptedFileRoutingCredentialVerifier" in script
+    assert "RefusingSecretManager" in script
+    assert "require_transport_confidentiality" in script
+
+
+def test_pilot_runbook_covers_every_cost_and_recovery_acceptance_boundary() -> None:
+    """A real run is gated, bounded, restorable, and captured without user data."""
+    runbook = PILOT_RUNBOOK.read_text(encoding="utf-8")
+    text = " ".join(runbook.lower().split())
+    index = DOCS_INDEX.read_text(encoding="utf-8")
+
+    for phrase in (
+        "explicit cost authorization",
+        "dedicated fly organization",
+        "org-scoped deploy token",
+        "never a personal token",
+        "seven days",
+        "immutable digest",
+        "maximum-live-allocations 5",
+        "disable-new-activations",
+        "no provider request",
+        "usd 25",
+        "tls",
+        "owner-only mounted files",
+        "atomic snapshot",
+        "scheduled report",
+        "scheduled reconcile",
+        "accepted interruption window",
+        "duplicate_resource",
+        "orphan_resource",
+        "stuck_deletion",
+        "continuous_running",
+        "unknown and unpriced",
+        "monthly_budget_departure",
+        "alert delivery",
+        "emergency-stop",
+        "destroys no volume",
+        "sqlite restore",
+        "volume snapshot restore",
+        "invoice reconciliation",
+        "production user identifiers",
+        "vault urls",
+        "corpus content",
+        "exact-main ci",
+        "independent lgtm",
+    ):
+        assert phrase in text
+    assert "managed-vault-fly-pilot.md" in index
+
+
 def test_runbook_documents_fleet_reconciliation_invoice_and_review_checkpoint() -> None:
     """Operators receive the alerts, invoice, emergency-stop and D7 procedures."""
     runbook = RUNBOOK.read_text(encoding="utf-8")
@@ -295,7 +378,7 @@ def test_runbook_documents_fleet_reconciliation_invoice_and_review_checkpoint() 
         "injected assumptions",
         "never as business logic",
         "--inventory-file",
-        "no org-wide listing",
+        "org-scoped",
         "500 activated vaults",
         "1,000 provisioned volumes",
         "confidential-compute availability",

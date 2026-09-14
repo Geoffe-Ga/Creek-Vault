@@ -88,10 +88,18 @@ creek-provisioning-api = "creek_mcp.provisioning.cli:main"
 # Production-only durable worker (#1805). All credential-bearing inputs are
 # owner-only mounted files; no fake adapter is reachable from this entry point.
 creek-provisioning-worker = "creek_mcp.provisioning.worker_cli:main"
+# Public managed-vault router. It authenticates the per-allocation credential,
+# wakes one exact owned Fly Machine, and proxies only the published /v1 surface.
+creek-provisioning-router = "creek_mcp.provisioning.routing_cli:main"
 # Operator fleet tooling (#1769): reconciliation report, bounded repair, and
 # emergency stop. A separate process whose Fly driver can inventory and stop
 # but never provision or delete; it holds no consumer token.
 creek-provisioning-fleet = "creek_mcp.provisioning.fleet_cli:main"
+creek-provisioning-pilot-evidence = "creek_mcp.provisioning.pilot_evidence_cli:main"
+# Dedicated one-Machine Fly pilot composition. The Fly Proxy terminates public
+# TLS; this process owns the attested edge, worker, router, and fleet schedule.
+creek-managed-vault-pilot = "creek_mcp.provisioning.pilot_cli:main"
+creek-fly-pilot-deploy = "creek_mcp.provisioning.fly_pilot_deploy:main"
 
 [project.optional-dependencies]
 # Transport hold, same swap the openai ceiling below holds. anthropic

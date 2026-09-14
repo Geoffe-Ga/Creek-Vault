@@ -8,6 +8,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from creek_mcp.provisioning import cli
+from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -103,3 +104,88 @@ def test_cli_refuses_an_unreadable_or_empty_consumer_registry(
                 ]
             )
         assert caught.value.code == 2
+
+
+def test_cli_enforces_the_five_allocation_pilot_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production startup injects a five-live-job cap instead of observation only."""
+    token_file = tmp_path / "consumer_tokens"
+    token_file.write_text(f"adepthood={_TOKEN}\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(app: object, **kwargs: object) -> None:
+        captured["app"] = app
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(cli.uvicorn, "run", fake_run)
+    cli.main(
+        [
+            "--database",
+            str(tmp_path / "jobs.sqlite3"),
+            "--consumer-tokens-file",
+            str(token_file),
+        ]
+    )
+
+    with TestClient(cast("ASGIApp", captured["app"])) as client:
+        responses = [
+            client.post(
+                "/control/v1/activations",
+                headers={"Authorization": f"Bearer {_TOKEN}"},
+                json={
+                    "activation_id": f"activation-{number}",
+                    "consumer_identity": f"user-{number}",
+                },
+            )
+            for number in range(6)
+        ]
+
+    assert [response.status_code for response in responses] == [
+        202,
+        202,
+        202,
+        202,
+        202,
+        503,
+    ]
+    assert responses[-1].json()["code"] == "activation_unavailable"
+
+
+def test_cli_disable_switch_refuses_before_creating_queue_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The emergency admission switch leaves the durable store unchanged."""
+    token_file = tmp_path / "consumer_tokens"
+    token_file.write_text(f"adepthood={_TOKEN}\n", encoding="utf-8")
+    database = tmp_path / "jobs.sqlite3"
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli.uvicorn,
+        "run",
+        lambda app, **kwargs: captured.update(app=app, kwargs=kwargs),
+    )
+    cli.main(
+        [
+            "--database",
+            str(database),
+            "--consumer-tokens-file",
+            str(token_file),
+            "--disable-new-activations",
+        ]
+    )
+
+    with TestClient(cast("ASGIApp", captured["app"])) as client:
+        response = client.post(
+            "/control/v1/activations",
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+            json={
+                "activation_id": "activation-disabled",
+                "consumer_identity": "user-disabled",
+            },
+        )
+
+    assert response.status_code == 503
+    assert ProvisioningStore(database).count_jobs() == 0

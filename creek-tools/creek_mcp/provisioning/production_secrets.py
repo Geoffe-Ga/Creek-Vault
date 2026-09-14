@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from creek_mcp.provisioning.fly import FlyRuntimeSecrets
+from creek_mcp.provisioning.replay_contract import REPLAY_STATE_BYTES, is_replay_state
 from creek_mcp.provisioning.routing import RoutingPrincipal
 
 if TYPE_CHECKING:
@@ -73,6 +74,7 @@ class _BundleDocument:
     requester_identity: str = field(repr=False)
     consumer_identity: str = field(repr=False)
     consumer_credential: str = field(repr=False)
+    replay_state: str = field(repr=False)
     consumer_registry: bytes = field(repr=False)
     tls_certificate: bytes = field(repr=False)
     tls_private_key: bytes = field(repr=False)
@@ -84,6 +86,7 @@ class _BundleDocument:
             "requester_identity": self.requester_identity,
             "consumer_identity": self.consumer_identity,
             "consumer_credential": self.consumer_credential,
+            "replay_state": self.replay_state,
             "consumer_registry": _b64(self.consumer_registry),
             "tls_certificate": _b64(self.tls_certificate),
             "tls_private_key": _b64(self.tls_private_key),
@@ -101,6 +104,13 @@ class _BundleDocument:
             requester = document["requester_identity"]
             consumer = document["consumer_identity"]
             credential = document["consumer_credential"]
+            replay_state = document.get("replay_state")
+            if (
+                replay_state is None
+                and isinstance(activation, str)
+                and isinstance(credential, str)
+            ):
+                replay_state = _legacy_replay_state(activation, credential)
             if (
                 not isinstance(activation, str)
                 or not activation.strip()
@@ -110,6 +120,7 @@ class _BundleDocument:
                 or _SAFE_IDENTITY_RE.fullmatch(consumer) is None
                 or not isinstance(credential, str)
                 or not credential
+                or not is_replay_state(replay_state)
             ):
                 raise ValueError
             return cls(
@@ -117,6 +128,7 @@ class _BundleDocument:
                 requester,
                 consumer,
                 credential,
+                replay_state,
                 _unb64(document["consumer_registry"]),
                 _unb64(document["tls_certificate"]),
                 _unb64(document["tls_private_key"]),
@@ -128,6 +140,7 @@ class _BundleDocument:
         """Return the provider-facing repr-safe secret bundle."""
         return FlyRuntimeSecrets(
             self.consumer_credential,
+            self.replay_state,
             self.consumer_registry,
             self.tls_certificate,
             self.tls_private_key,
@@ -307,6 +320,11 @@ class EncryptedFileFlySecretManager:
         consumer_identity: str,
     ) -> _BundleDocument:
         credential = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+        replay_state = (
+            base64.urlsafe_b64encode(os.urandom(REPLAY_STATE_BYTES))
+            .rstrip(b"=")
+            .decode()
+        )
         private_key = ec.generate_private_key(ec.SECP256R1())
         certificate = self._certificate(activation_id, digest, private_key)
         private_pem = private_key.private_bytes(
@@ -319,6 +337,7 @@ class EncryptedFileFlySecretManager:
             requester_identity,
             consumer_identity,
             credential,
+            replay_state,
             f"{consumer_identity}={credential}\n".encode(),
             certificate.public_bytes(serialization.Encoding.PEM),
             private_pem,
@@ -414,6 +433,7 @@ class EncryptedFileRoutingCredentialVerifier:
                 principal = RoutingPrincipal(
                     document.requester_identity,
                     document.consumer_identity,
+                    document.replay_state,
                 )
                 conflicting = conflicting or (
                     matched is not None and matched != principal
@@ -503,6 +523,16 @@ def _activation_digest(value: str) -> str:
 
 def _aad(activation_digest: str) -> bytes:
     return f"creek-runtime-v2\0{activation_digest}".encode()
+
+
+def _legacy_replay_state(activation_id: str, credential: str) -> str:
+    """Derive stable opaque replay state for a pre-replay encrypted bundle."""
+    digest = hmac.digest(
+        credential.encode(),
+        b"creek-fly-replay-v1\0" + activation_id.encode(),
+        "sha384",
+    )
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
 def _b64(value: bytes) -> str:

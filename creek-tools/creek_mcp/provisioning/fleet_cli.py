@@ -3,9 +3,9 @@
 ``creek-provisioning-fleet`` is a separate process from the API and worker.
 It holds a Fly driver whose secret manager refuses to issue or revoke, so it
 can inventory and stop Machines but can never provision or delete.  Every
-rate, budget, duration and review threshold comes from ``--policy-file``;
-org-wide discovery is an injected ``--inventory-file`` because the driver
-uses no org listing endpoint.
+rate, budget, duration and review threshold comes from ``--policy-file``.
+Production Fly inventory discovers the configured organization directly;
+``--inventory-file`` remains an additive audit input.
 
 Exit codes: 0 clean, 3 alerts present, 1 provider unavailable (or any
 emergency-stop failure), 2 usage error.
@@ -19,8 +19,8 @@ import json
 import logging
 import re
 import sys
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -58,6 +58,7 @@ _INVENTORY_ERROR: Final[str] = (
 )
 _APP_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[a-z0-9-]+")
 _MONTH_RE: Final[re.Pattern[str]] = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=7)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +67,11 @@ class FleetDriverBundle:
 
     inventory: FleetInventorySource
     stopper: FleetStopper
+    _close: Callable[[], None] = field(default=lambda: None, repr=False)
+
+    def close(self) -> None:
+        """Release the provider transport owned by this fleet pass."""
+        self._close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,6 +123,7 @@ def compose_fly(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
     *,
+    clock: Callable[[], datetime] | None = None,
     transport: httpx.BaseTransport | None = None,
 ) -> FleetDriverBundle:
     """Build the Fly driver from mounted, non-secret arguments plus a token file."""
@@ -135,6 +142,11 @@ def compose_fly(
         parser.error("--fly-token-expires-at must be an ISO-8601 timestamp")
     if expires_at.tzinfo is None:
         parser.error("--fly-token-expires-at must carry a timezone")
+    observed_at = (clock or _utc_now)()
+    if expires_at <= observed_at:
+        parser.error("--fly-token-expires-at must be in the future")
+    if expires_at > observed_at + _MAX_FLY_TOKEN_LIFETIME:
+        parser.error("--fly-token-expires-at must be no more than seven days away")
     try:
         credential = FlyCredential.from_file(
             args.fly_token_file,
@@ -146,16 +158,20 @@ def compose_fly(
             organization=args.fly_organization,
             image=args.fly_image,
             api_base_url=args.fly_api_base_url,
+            discover_organization_apps=True,
         )
     except ValueError as exc:
         parser.error(f"--fly-token-file or Fly policy is invalid: {exc}")
-    client = (
-        None
-        if transport is None
-        else httpx.Client(base_url=policy.api_base_url, transport=transport)
+    client = httpx.Client(
+        base_url=policy.api_base_url,
+        transport=transport,
     )
     driver = FlyProviderDriver(policy, credential, RefusingSecretManager(), client)
-    return FleetDriverBundle(inventory=driver, stopper=driver)
+    return FleetDriverBundle(
+        inventory=driver,
+        stopper=driver,
+        _close=client.close,
+    )
 
 
 def _load_policy(path: Path, parser: argparse.ArgumentParser) -> PolicyFile:
@@ -213,21 +229,38 @@ def main(
         [argparse.Namespace, argparse.ArgumentParser], FleetDriverBundle
     ] = compose_fly,
     clock: Callable[[], datetime] = _utc_now,
+    emit_output: bool = True,
+    alert_sink: Callable[[tuple[str, ...]], None] | None = None,
 ) -> int:
-    """Run one fleet command and return its exit code."""
+    """Run one fleet command; the supervised pilot suppresses private output."""
     parser = build_parser()
     args = parser.parse_args(argv)
     store = ProvisioningStore(args.database)
     if args.command == "emergency-stop":
-        return _run_emergency_stop(store, compose(args, parser).stopper)
+        bundle = compose(args, parser)
+        try:
+            return _run_emergency_stop(store, bundle.stopper)
+        finally:
+            bundle.close()
     now = clock()
     policy_file = _load_policy(args.policy_file, parser)
     app_names = _load_inventory_names(args.inventory_file, parser)
     month = _record_month_target(args, parser, now)
     bundle = compose(args, parser)
-    return _run_report(
-        args, store, bundle, policy_file, app_names, now=now, month=month
-    )
+    try:
+        return _run_report(
+            args,
+            store,
+            bundle,
+            policy_file,
+            app_names,
+            now=now,
+            month=month,
+            emit_output=emit_output,
+            alert_sink=alert_sink,
+        )
+    finally:
+        bundle.close()
 
 
 def _run_report(
@@ -239,8 +272,10 @@ def _run_report(
     *,
     now: datetime,
     month: str | None,
+    emit_output: bool,
+    alert_sink: Callable[[tuple[str, ...]], None] | None,
 ) -> int:
-    """Run one pass, print the JSON report, and log each alert content-free."""
+    """Run one pass, optionally emitting the private operator report."""
     reconciler = FleetReconciler(
         store,
         bundle.inventory,
@@ -256,15 +291,22 @@ def _run_report(
             confidential_compute_changed=args.confidential_compute_changed,
         )
     except ReconcileUnavailableError:
-        print(json.dumps({"error": "provider_unavailable"}), file=sys.stderr)
+        if emit_output:
+            print(json.dumps({"error": "provider_unavailable"}), file=sys.stderr)
         return _EXIT_UNAVAILABLE
     if month is not None:
         _record_closed_month(store, report.telemetry, policy_file, month, now)
     for alert in report.alerts:
-        _LOGGER.warning(
-            "fleet alert kind=%s subject=%s", alert.kind.value, alert.subject
-        )
-    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        if emit_output:
+            _LOGGER.warning(
+                "fleet alert kind=%s subject=%s", alert.kind.value, alert.subject
+            )
+        else:
+            _LOGGER.warning("fleet alert kind=%s", alert.kind.value)
+    if report.alerts and alert_sink is not None:
+        alert_sink(tuple(alert.kind.value for alert in report.alerts))
+    if emit_output:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     return _EXIT_ALERTS if report.alerts else _EXIT_CLEAN
 
 

@@ -24,6 +24,7 @@ chmod 0400 ./run-secrets/consumer_tokens
 creek-provisioning-api \
   --database ./provisioning-state/jobs.sqlite3 \
   --consumer-tokens-file ./run-secrets/consumer_tokens \
+  --maximum-live-allocations 5 \
   --host 127.0.0.1 --port 8830
 ```
 
@@ -31,6 +32,15 @@ A routable bind requires `--tls-cert` and `--tls-key`. Back up the SQLite file
 with its filesystem's atomic snapshot mechanism; it contains job and provider
 allocation identifiers, but no plaintext provider token, consumer credential,
 recovery material, key material, or corpus content.
+
+The production CLI defaults to a five-live-allocation admission cap. The count
+includes every non-deleted durable job, so pending or deleting work reserves
+capacity before a provider call. The count and new job/alias insert share one
+SQLite write transaction; concurrent API processes cannot cross the cap. Start
+the API with `--disable-new-activations` to refuse every new activation id with
+`503 activation_unavailable`. An exact existing id remains replayable, and
+status, routing, retry, export, and deletion do not depend on create admission.
+The refusal writes nothing and the provider-free API makes no Fly request.
 
 The checked-in contract is
 [`contracts/provisioning-v1/openapi.json`](contracts/provisioning-v1/openapi.json).
@@ -139,6 +149,31 @@ bundle. It compares every active credential in constant time, returns the same
 anonymous miss for unknown, revoked, corrupt, or conflicting ownership, and
 persists and logs none of the presented value. A restarted verifier reads the
 same durable state immediately; it never issues or revokes credentials.
+
+`creek-provisioning-router` is the production composition around that verifier.
+The process also mounts the short-lived org deploy token used by its separate
+Fly routing provider and the CA certificate used to authenticate private vault
+Machines; the verifier itself still receives neither. A non-loopback bind
+requires `--tls-cert` and `--tls-key`. The private `httpx` client trusts only the
+mounted CA. Before each cold start the routing provider requires enough token
+lifetime for every bounded Fly boundary plus the proxied request, so a process
+that reaches its rotation window sheds traffic rather than attempting a route
+with a token that can expire mid-flight.
+
+```console
+creek-provisioning-router \
+  --database /var/lib/creek/jobs.sqlite3 \
+  --fly-token-file /run/creek-secrets/fly-token \
+  --fly-organization creek-vaults \
+  --fly-image registry.example/creek@sha256:<digest> \
+  --fly-token-expires-at 2026-09-14T12:00:00+00:00 \
+  --secret-state-directory /var/lib/creek/runtime-secrets \
+  --secret-master-key-file /run/creek-secrets/runtime-master-key \
+  --private-tls-ca-certificate-file /run/creek-secrets/runtime-ca.crt \
+  --host 0.0.0.0 --port 8840 \
+  --tls-cert /run/creek-secrets/router.crt \
+  --tls-key /run/creek-secrets/router.key
+```
 
 The Adepthood callback is an authenticated HTTPS POST to
 `/internal/vault-provisioning/completions`. A `204` includes an identical
@@ -254,15 +289,17 @@ Machine, hostname, IP, volume, or provider resource. Only a
 `custody_mode=provider_managed`, `ready`, undeleted allocation owned by that
 exact pair can route.
 
-For an admitted request, the Fly driver derives the canonical app from the
-stored activation, verifies the stored provider allocation id, and revalidates
-the Machine's pinned policy and encrypted-volume custody before starting it
-idempotently. It uses Fly's bounded `wait?state=started` operation, then
-re-discovers the Machine and volume and revalidates both (so replacement or
-policy drift cannot produce a stale or unowned target). It returns a validated
-HTTPS `.internal` origin, and the router re-reads ownership before dialing.
-Deletion or replacement races therefore
-either reach the current owned Machine or fail as a content-free refusal.
+For the managed Fly pilot, an admitted request derives the canonical app from
+the stored activation, verifies the stored provider allocation id, and
+revalidates the Machine's complete immutable policy plus encrypted-volume
+custody before starting it idempotently. It uses Fly's bounded
+`wait?state=started` operation, then re-discovers and revalidates the Machine
+and volume (so replacement or policy drift cannot produce a stale or unowned
+target). The public router re-reads ownership, then returns Fly Proxy's
+empty-body `307` with a delimiter-safe app/Machine target and the exact
+per-allocation replay state. It never dials or emits a `.internal` address.
+Deletion or replacement races therefore either replay to the current owned
+Machine or fail as a content-free refusal.
 Concurrent requests for the same durable allocation generation share one
 in-flight preparation. A caller cancellation does not release a second start
 beside the provider operation already running; cancellation still propagates
@@ -270,16 +307,23 @@ to that caller, and the single flight is forgotten when the bounded preparation
 ends. A deleted and recreated owner-consumer pair has a new generation key and
 can never inherit the prior Machine target.
 
-The router mounts only the published `/v1` method/path table. It preserves the
-consumer bearer, contract-version and tier-ceiling headers for the private
-runtime to enforce, applies the same request body caps and public timeout,
-streams request and response bodies, and strips only hop-by-hop transport and
-caller-supplied forwarding headers. A private response outside the contract's
-closed status set becomes `temporarily_unavailable`, so a provider redirect can
-never publish an internal `Location`. Routing access logs contain the requester
+The pilot router mounts only the published `/v1` method/path table. It preserves
+the consumer bearer, contract-version and tier-ceiling headers for the vault
+runtime to enforce, applies the public timeout, and caps replay bodies at Fly's
+documented 1 MiB limit. The vault's Fly-only runtime requires a single
+closed-shape `Fly-Replay-Src` state plus the preserved bearer before handling
+the request. The generic private-TLS forwarding router remains available for
+non-Fly deployments but is not the cross-network pilot path. Routing access
+logs contain the requester
 service identity, route template, status, duration, and correlation id; they
 never contain the per-user consumer identity, credential, internal address,
 provider identifier, request/response body, or content-derived metric.
+
+Ordinary provider-managed deployments still install and require a private TLS
+leaf certificate and key. The Fly replay runtime deliberately installs neither:
+Fly Proxy supplies the TLS boundary, and the target accepts plaintext only
+after exact Fly app/region/private-network attestation, a closed-shape replay
+state, and the original consumer bearer all succeed.
 
 The retired version-1
 [`key ceremony protocol`](contracts/provisioning-v1/key-ceremony.md) and its
@@ -322,14 +366,14 @@ the keys `observed_at`, `telemetry`, `divergences`, `alerts`, `estimate`,
 `review_triggers`, and `inventory_mode`, and log each alert as
 `fleet alert kind=<kind> subject=<id>` with nothing else on the line.
 
-The driver inspects only apps it can derive from live and pending-deletion
-allocations plus the injected inventory file; no org-wide listing endpoint is
-used. Confirmed-deleted jobs are never re-inspected, so provider traffic is
-bounded by the live fleet, not by history. To catch apps the store has
-forgotten, pass the output of `fly apps list --json` as `--inventory-file`
-(a JSON list of names or of objects with `name`/`Name`); names outside the
-configured app prefix are ignored by the driver. An org-wide discovery call
-can be added once its endpoint is verified against a fake route.
+The production fleet driver first calls Fly's documented org-scoped
+`GET /v1/apps?org_slug=...`, validates the closed response shape, and keeps only
+names matching the exact managed-vault prefix and activation-digest shape.
+It then inspects apps derived from live/pending-deletion allocations plus those
+discovered names, so a store-forgotten orphan remains visible. Confirmed-deleted
+jobs are not enough to hide an app that still exists in the provider inventory.
+`--inventory-file` remains an additive cross-check for the output of
+`fly apps list --json`; names outside the strict prefix are never requested.
 
 ### Policy file
 
