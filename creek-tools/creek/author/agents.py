@@ -49,6 +49,7 @@ from creek.models import (
 from creek.vault.reader import CORPUS_SUBDIRS, iter_vault_fragments
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from enum import StrEnum
     from pathlib import Path
 
@@ -99,22 +100,48 @@ def _load_config(vault: Path) -> CreekConfig:
     return load_vault_config(vault)
 
 
+def _load_raw_corpus(
+    vault: Path,
+    *,
+    records: Sequence[tuple[Fragment, str]] | None = None,
+) -> list[tuple[Fragment, str]]:
+    """Return unfiltered ``(fragment, body)`` records across the corpus."""
+    if records is not None:
+        return list(records)
+    return [
+        (fragment, body)
+        for sub in CORPUS_SUBDIRS
+        for _path, fragment, body, _meta in iter_vault_fragments(vault / sub)
+    ]
+
+
 def _load_corpus(
     vault: Path,
     override: PrivacyTierOverride | None = None,
+    *,
+    records: Sequence[tuple[Fragment, str]] | None = None,
 ) -> list[tuple[Fragment, str]]:
-    """Return ``(fragment, body)`` records across the corpus subtrees.
+    """Return admitted ``(fragment, body)`` records across the corpus subtrees.
 
     Fragments whose ``privacy_tier`` exceeds *override* are excluded (#660), so
     above-ceiling content never enters ranking, the link graph, or the evidence.
     ``override`` of ``None`` defaults to ``OPEN`` (the most restrictive).
+    *records* lets an owner supply a request-scoped, already-parsed corpus;
+    admission is still applied here rather than baked into that snapshot.
     """
-    records: list[tuple[Fragment, str]] = []
-    for sub in CORPUS_SUBDIRS:
-        for _path, fragment, body, _meta in iter_vault_fragments(vault / sub):
-            if tier_within_override(fragment.privacy_tier, override):
-                records.append((fragment, body))
-    return records
+    return _admit_corpus(_load_raw_corpus(vault, records=records), override)
+
+
+def _admit_corpus(
+    records: list[tuple[Fragment, str]],
+    override: PrivacyTierOverride | None,
+) -> list[tuple[Fragment, str]]:
+    """Return the request-local admission projection of raw *records*."""
+    return [
+        (fragment, body)
+        for fragment, body in records
+        if tier_within_override(fragment.privacy_tier, override)
+    ]
 
 
 def fragment_tier_map(
@@ -206,12 +233,131 @@ def _cached_vector(
     return cached.vector
 
 
+def _live_cached_vector(
+    fragment: Fragment,
+    cache: dict[str, tuple[str, list[float]]],
+) -> list[float] | None:
+    """Return a fresh session-only vector, evicting a stale one.
+
+    The key and freshness rule deliberately match the persisted parquet cache,
+    but the value is kept small: only the content hash and vector needed by a
+    later request.  A stale row is removed so a changed fragment can spend the
+    freed bounded slot again.
+    """
+    cached = cache.get(fragment.id)
+    if cached is None:
+        return None
+    content_hash, vector = cached
+    fresh_hash = content_hash_for_text(fragment_embedding_text(fragment))
+    if content_hash != fresh_hash:
+        del cache[fragment.id]
+        return None
+    return vector
+
+
+def _fragment_vector(
+    fragment: Fragment,
+    linker: EmbeddingLinker,
+    persisted_cache: dict[str, CachedEmbedding],
+    live_cache: dict[str, tuple[str, list[float]]] | None,
+    *,
+    may_embed: bool,
+) -> tuple[list[float] | None, bool]:
+    """Resolve one fragment vector and report whether it was embedded live."""
+    vector = _cached_vector(fragment, persisted_cache)
+    if vector is None and live_cache is not None:
+        vector = _live_cached_vector(fragment, live_cache)
+    if vector is not None or not may_embed or live_cache is not None:
+        return vector, False
+
+    embedding_text = fragment_embedding_text(fragment)
+    vector = linker.generate_embedding(embedding_text)
+    return vector, True
+
+
+def _live_cache_targets(
+    corpus: list[tuple[Fragment, str]],
+    persisted_cache: dict[str, CachedEmbedding],
+    max_entries: int,
+) -> list[Fragment]:
+    """Return the tier-blind, deterministic prefix the live cache may hold."""
+    if max_entries <= 0:
+        return []
+    targets: list[Fragment] = []
+    seen: set[str] = set()
+    for fragment, _body in sorted(corpus, key=lambda record: record[0].id):
+        if fragment.id in seen or _cached_vector(fragment, persisted_cache) is not None:
+            continue
+        seen.add(fragment.id)
+        targets.append(fragment)
+        if len(targets) == max_entries:
+            break
+    return targets
+
+
+def _refresh_live_cache(
+    corpus: list[tuple[Fragment, str]],
+    linker: EmbeddingLinker,
+    persisted_cache: dict[str, CachedEmbedding],
+    live_cache: dict[str, tuple[str, list[float]]],
+    *,
+    max_entries: int,
+    max_live_embeds: int | None,
+) -> set[str]:
+    """Reconcile the bounded shared cache from the unfiltered corpus.
+
+    Membership is the first *max_entries* persisted-cache misses in fragment-id
+    order, before any caller override is applied.  Removing non-target rows
+    first prevents a previous ceiling from reserving capacity.  Freshness is
+    checked before the embed budget, so a stale target frees and refills its own
+    deterministic slot in the same call rather than letting a later id take it.
+
+    Returns:
+        Fragment ids embedded during this refresh.
+    """
+    targets = _live_cache_targets(corpus, persisted_cache, max_entries)
+    target_ids = {fragment.id for fragment in targets}
+    for fragment_id in tuple(live_cache):
+        if fragment_id not in target_ids:
+            del live_cache[fragment_id]
+
+    remaining = max_live_embeds
+    embedded: set[str] = set()
+    for fragment in targets:
+        if _live_cached_vector(fragment, live_cache) is not None:
+            continue
+        if remaining is not None and remaining <= 0:
+            continue
+        embedding_text = fragment_embedding_text(fragment)
+        live_cache[fragment.id] = (
+            content_hash_for_text(embedding_text),
+            linker.generate_embedding(embedding_text),
+        )
+        embedded.add(fragment.id)
+        if remaining is not None:
+            remaining -= 1
+    return embedded
+
+
+def _embedded_for_ranking(
+    fragment: Fragment,
+    embedded_live: bool,
+    refreshed_ids: set[str] | None,
+) -> bool:
+    """Return whether this request newly embedded *fragment* by either path."""
+    if embedded_live:
+        return True
+    return refreshed_ids is not None and fragment.id in refreshed_ids
+
+
 def _rank_fragments(
     query: str,
     corpus: list[tuple[Fragment, str]],
     linker: EmbeddingLinker,
     cache: dict[str, CachedEmbedding],
     max_live_embeds: int | None = None,
+    live_cache: dict[str, tuple[str, list[float]]] | None = None,
+    live_embedded_ids: set[str] | None = None,
 ) -> list[Fragment]:
     """Rank *corpus* fragments by semantic similarity to *query* (descending).
 
@@ -231,6 +377,10 @@ def _rank_fragments(
     yields no title, no id and no body, and the budget is applied only to a
     corpus that ``_load_corpus`` has already filtered by the caller's override,
     so it can never admit a fragment the ceiling excluded.
+
+    When *live_cache* is supplied, this function only reads it. Its owner has
+    already populated a tier-blind, content-hash-validated prefix from the raw
+    corpus; ranking still receives only this request's admitted projection.
 
     **What the cap costs, stated plainly.** Because the budget is spent walking
     ids in order, a bounded pass on a cold cache ranks an **id-ordered prefix of
@@ -258,6 +408,9 @@ def _rank_fragments(
         cache: Persisted, model-filtered embedding cache keyed by fragment id.
         max_live_embeds: Maximum cache misses this call may embed live, or
             ``None`` for unbounded (the default, and today's behaviour).
+        live_cache: Optional owner-scoped, already-refreshed vector cache.
+        live_embedded_ids: Ids the owner embedded while refreshing this call,
+            used only for the content-free budget diagnostic.
 
     Returns:
         Fragments ordered by cosine similarity descending, id tie-break.
@@ -268,16 +421,22 @@ def _rank_fragments(
     skipped = 0
     scored: list[tuple[float, str, Fragment]] = []
     for fragment, _body in sorted(corpus, key=lambda record: record[0].id):
-        vec = _cached_vector(fragment, cache)
-        if vec is None:
-            if remaining is not None and remaining <= 0:
-                skipped += 1
-                continue
-            if remaining is not None:
-                remaining -= 1
+        has_budget = remaining is None or remaining > 0
+        vector, embedded_live = _fragment_vector(
+            fragment,
+            linker,
+            cache,
+            live_cache,
+            may_embed=has_budget,
+        )
+        if vector is None:
+            skipped += 1
+            continue
+        if _embedded_for_ranking(fragment, embedded_live, live_embedded_ids):
             embedded += 1
-            vec = linker.generate_embedding(fragment_embedding_text(fragment))
-        scored.append((_cosine(query_vec, vec), fragment.id, fragment))
+        if embedded_live and remaining is not None:
+            remaining -= 1
+        scored.append((_cosine(query_vec, vector), fragment.id, fragment))
     if skipped:
         # Once per call, never per fragment: this is the only runtime signal that
         # the ranking universe was a prefix of the corpus rather than the corpus.
@@ -323,12 +482,13 @@ class RetrievalSpecialist:
     parquet is read unfiltered and is already tier-blind, and the map is only
     ever *read* for ids the current call independently admitted, so sharing it
     changes **when** it is read, never **what** it contains. Everything
-    override-derived — the corpus record list, the ranked order, the top-k
-    slice, the returned bundle and the live-embed counter — is a local of
-    :meth:`gather` and must stay one, because ``_load_config`` and
-    ``_load_corpus`` re-decide admission on every call from *that* call's
-    override. An override-derived instance attribute would be a privacy leak,
-    not an optimisation, and
+    override-derived — the admitted record list, ranked order, top-k slice,
+    returned bundle and live-embed counter — is a local of :meth:`gather` and
+    must stay one. The session-owned live map is the third shared structure,
+    but its bounded membership is reconciled from the unfiltered raw corpus
+    before admission, so it too carries no caller's selection. An
+    override-derived instance attribute would be a privacy leak, not an
+    optimisation, and
     ``test_a_warmed_specialist_mutates_nothing_across_calls_at_any_ceiling``
     fails on the instance key set the moment one is added.
 
@@ -451,6 +611,9 @@ class RetrievalSpecialist:
         vault: Path,
         *,
         override: PrivacyTierOverride | None = None,
+        corpus: Sequence[tuple[Fragment, str]] | None = None,
+        live_cache: dict[str, tuple[str, list[float]]] | None = None,
+        max_live_cache_entries: int | None = None,
     ) -> EvidenceBundle:
         """Return the top-``retrieval_top_k`` fragments most relevant to *query*.
 
@@ -460,22 +623,55 @@ class RetrievalSpecialist:
         re-embedding fragments whose text is unchanged. Fragments above
         *override* are excluded from the corpus (#660).
 
-        ``_load_config`` and ``_load_corpus`` run on **every** call, before
-        either memo is consulted, so admission is re-decided per call from
-        *this* caller's override — a memo can never carry admitted content
-        across calls. When the instance was built with ``max_live_embeds``,
-        that ceiling bounds how many cache misses this call embeds live; the
-        counter is a local of :func:`_rank_fragments`, never instance state.
+        The raw corpus is loaded on every call. When a bounded *live_cache* is
+        supplied, it is refreshed from one deterministic, unfiltered corpus
+        prefix before the caller's override is applied. Admission, ranking,
+        top-k selection, and the returned bundle remain request locals, so one
+        caller's ceiling cannot select shared cache membership or admit content
+        for another. ``max_live_embeds`` bounds the refresh's live work.
+
+        Args:
+            query: Text whose nearest fragments are requested.
+            vault: Vault owning the corpus and persisted embedding cache.
+            override: Per-call privacy admission cutoff.
+            corpus: Optional already-parsed, unfiltered fragment records.
+            live_cache: Optional owner-scoped runtime vector cache.
+            max_live_cache_entries: Hard row bound for *live_cache*.
+
+        Returns:
+            The configured top-k evidence bundle, possibly empty.
         """
-        config = _load_config(vault)
-        corpus = _load_corpus(vault, override)
-        if not corpus:
+        raw_corpus = _load_raw_corpus(vault, records=corpus)
+        if not raw_corpus:
             return EvidenceBundle()
+        admitted = _admit_corpus(raw_corpus, override)
+        bounded_live_cache = live_cache if max_live_cache_entries is not None else None
+        if bounded_live_cache is None and not admitted:
+            return EvidenceBundle()
+        config = _load_config(vault)
         linker = self._get_linker(config)
         cache = self._get_cache(linker, vault)
         try:
+            live_embedded_ids: set[str] | None = None
+            if bounded_live_cache is not None and max_live_cache_entries is not None:
+                live_embedded_ids = _refresh_live_cache(
+                    raw_corpus,
+                    linker,
+                    cache,
+                    bounded_live_cache,
+                    max_entries=max_live_cache_entries,
+                    max_live_embeds=self._max_live_embeds,
+                )
+            if not admitted:
+                return EvidenceBundle()
             ranked = _rank_fragments(
-                query, corpus, linker, cache, self._max_live_embeds
+                query,
+                admitted,
+                linker,
+                cache,
+                self._max_live_embeds,
+                bounded_live_cache,
+                live_embedded_ids,
             )
         except EmbeddingModelUnavailableError:
             return EvidenceBundle()

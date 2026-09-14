@@ -16,8 +16,9 @@ of the same three-step validation chain (``frontmatter.load`` → check
 ``type == "fragment"`` → :meth:`Fragment.model_validate`). A schema
 change to :class:`Fragment` or a rename of the ``type`` sentinel
 would have required keeping three implementations in lock-step. The
-helpers here remove that drift risk by exposing one validated load
-path; callers project the result into whatever shape they need.
+helpers here remove that drift risk by exposing one validation path. Callers
+either load a document here or pass an already-parsed request snapshot, then
+project the result into whatever shape they need.
 """
 
 from __future__ import annotations
@@ -128,6 +129,29 @@ pinned by ``tests/test_vault_reader.py`` rather than by an import.
 """
 
 
+def try_validate_fragment(metadata: dict[str, object], source: Path) -> Fragment | None:
+    """Build a fragment from parsed metadata, or return ``None`` if invalid.
+
+    This is the single schema-validation boundary for parsed vault documents.
+    Callers that already own a parsed request snapshot use it directly;
+    :func:`try_load_fragment` uses the same path after reading from disk.
+
+    Args:
+        metadata: Parsed front-matter mapping.
+        source: Source path, used only in the content-free debug diagnostic.
+
+    Returns:
+        The validated fragment, or ``None`` for a non-fragment/schema mismatch.
+    """
+    if metadata.get("type") != "fragment":
+        return None
+    try:
+        return Fragment.model_validate(metadata)
+    except ValidationError:
+        logger.debug("Skipping invalid fragment frontmatter: %s", source)
+        return None
+
+
 def try_load_fragment(
     md_file: Path,
 ) -> tuple[Fragment, str, dict[str, object]] | None:
@@ -169,12 +193,8 @@ def try_load_fragment(
     """
     post = frontmatter.load(str(md_file))
     metadata = post.metadata.copy()
-    if metadata.get("type") != "fragment":
-        return None
-    try:
-        fragment = Fragment.model_validate(metadata)
-    except ValidationError:
-        logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
+    fragment = try_validate_fragment(metadata, md_file)
+    if fragment is None:
         return None
     return fragment, post.content, metadata
 

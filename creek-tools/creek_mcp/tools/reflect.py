@@ -72,7 +72,9 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol
 
+from creek._containment import escaping_child
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
+from creek.vault.reader import CORPUS_SUBDIRS, try_validate_fragment
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
 from creek_mcp.tier_ceiling import (
@@ -89,8 +91,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.author.agents import RetrievalSpecialist
+    from creek.author.models import EvidenceBundle
     from creek.classify.privacy_filter import PrivacyTierOverride
-    from creek.models import PrivacyTier
+    from creek.models import Fragment, PrivacyTier
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +126,89 @@ producer (``creek link``) remains the way to ground a large vault fully.
 """
 
 
+class _CorpusDocument(NamedTuple):
+    """One readable Markdown document from a reflection corpus subtree."""
+
+    metadata: dict[str, Any]
+    body: str
+
+
+class _CorpusFragment(NamedTuple):
+    """One model-valid fragment plus the subtree it was loaded from."""
+
+    subdir: str
+    fragment: Fragment
+    body: str
+    metadata: dict[str, Any]
+
+
+class _ReflectionCorpus(NamedTuple):
+    """One request's tier-neutral, single-parse view of the corpus.
+
+    ``entries`` includes readable non-Fragment documents because ``entry_ref``
+    has always resolved from raw front matter. ``fragments`` is the narrower,
+    model-valid projection used by retrieval and compiled-page provenance.
+    Nothing is filtered by a caller's ceiling here; each consumer applies its
+    own admission rule to this same raw snapshot.
+    """
+
+    entries: tuple[_CorpusDocument, ...]
+    fragments: tuple[_CorpusFragment, ...]
+
+    def retrieval_records(self) -> list[tuple[Fragment, str]]:
+        """Return every model-valid corpus record, without tier filtering."""
+        return [(record.fragment, record.body) for record in self.fragments]
+
+    def compiled_records(self) -> list[tuple[Fragment, dict[str, Any]]]:
+        """Return the unfiltered ``01-Fragments`` provenance projection."""
+        return [
+            (record.fragment, record.metadata)
+            for record in self.fragments
+            if record.subdir == CORPUS_SUBDIRS[0]
+        ]
+
+
+def _load_reflection_corpus(vault_path: Path) -> _ReflectionCorpus:
+    """Parse each corpus Markdown file at most once for one reflection.
+
+    The snapshot is deliberately request-scoped: caching it on the server
+    would make edits invisible and, if filtered first, could carry one caller's
+    tier override into another.  The full raw view is safe to share only among
+    consumers in this request; admission remains independently re-decided.
+    """
+    import frontmatter
+
+    entries: list[_CorpusDocument] = []
+    fragments: list[_CorpusFragment] = []
+    for subdir in CORPUS_SUBDIRS:
+        root = vault_path / subdir
+        if not root.exists():
+            continue
+        resolved_root = root.resolve(strict=False)
+        for path in sorted(root.rglob("*.md")):
+            if escaping_child(path, resolved_root):
+                logger.warning(
+                    "Skipping a fragment whose symlink leaves %s: %s", root, path
+                )
+                continue
+            try:
+                post = frontmatter.load(path)
+            except Exception as exc:
+                logger.debug(
+                    "Skipping unreadable fragment %s (%s)", path, type(exc).__name__
+                )
+                continue
+            metadata = post.metadata.copy()
+            document = _CorpusDocument(metadata, post.content)
+            if subdir == CORPUS_SUBDIRS[0]:
+                entries.append(document)
+            fragment = try_validate_fragment(metadata, path)
+            if fragment is None:
+                continue
+            fragments.append(_CorpusFragment(subdir, fragment, post.content, metadata))
+    return _ReflectionCorpus(tuple(entries), tuple(fragments))
+
+
 class GroundingSession:
     """One owner's reused :class:`RetrievalSpecialist`, held for a server or app.
 
@@ -135,7 +221,7 @@ class GroundingSession:
     one *inline in the call expression* and dropped it, so every
     ``creek.reflect`` paid a sentence-transformer load from disk plus a full
     parquet read before any corpus work. This class supplies the missing
-    lifetime and nothing else.
+    lifetime and owns the bounded, in-memory vectors produced during it.
 
     **Owner-scoped, never a module global.** One instance per ``build_server``
     and one per ``create_app``, passed down explicitly. A process global or an
@@ -150,27 +236,28 @@ class GroundingSession:
     per distinct path, for the life of the process — unbounded per-request
     growth introduced by a change whose purpose is bounding cost.
 
-    **All mutation happens once, under the lock, before the instance is
-    shared.** ``/v1`` serves reads in worker threads with several concurrency
-    slots, so two first requests really can race. Building *and warming* inside
-    the lock is what makes "one construction, one parquet read, one model load"
-    true rather than merely likely; an unsynchronised ``gather`` would let both
-    racers find the memo slots empty and do the work twice, which atomic
-    rebinding prevents corruption of but not duplication of.
+    **All shared mutation happens under one lock.** ``/v1`` serves reads in
+    worker threads with several concurrency slots, so two first requests really
+    can race. Building, warming, gathering, and filling the live-vector cache
+    under the lock makes each cold fragment embed a single spend rather than a
+    duplicated miss in both workers.
 
-    **Nothing override-derived is stored, here or on the specialist.** The
-    session keys on the vault only. ``gather`` re-runs ``_load_config`` and
-    ``_load_corpus`` on every call, so tier admission is re-decided per call
-    from that caller's own override; what is shared is the tier-blind model
-    handle and id→vector map, which are only ever *read* for ids the current
-    call independently admitted.
+    **No override-derived decision is reused.** The session keys on the vault
+    only. Tier admission is re-decided per call from that caller's own override;
+    what is shared is the tier-blind model handle, parquet map, and at most
+    :data:`_MAX_LIVE_EMBEDS` content-hash-keyed live vectors. The live map is
+    reconciled from a deterministic prefix of the unfiltered corpus before the
+    override is applied, so neither call order nor a prior ceiling selects its
+    membership. Ranking consults vectors only for ids the current call then
+    admits; stale vectors are replaced, and all are dropped on a vault switch.
     """
 
     def __init__(self) -> None:
         """Create an empty session; the first :meth:`specialist` call fills it."""
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._specialist: RetrievalSpecialist | None = None
         self._vault: Path | None = None
+        self._live_vectors: dict[str, tuple[str, list[float]]] = {}
 
     def specialist(self, vault: Path) -> RetrievalSpecialist:
         """Return this session's warmed specialist for *vault*, building once.
@@ -210,7 +297,45 @@ class GroundingSession:
             built.warm(vault)
             self._specialist = built
             self._vault = vault
+            self._live_vectors.clear()
             return built
+
+    def gather(
+        self,
+        query: str,
+        vault: Path,
+        override: PrivacyTierOverride,
+        *,
+        corpus: Sequence[tuple[Fragment, str]] | None = None,
+    ) -> EvidenceBundle:
+        """Gather with one bounded live-vector cache under the session lock.
+
+        Serialising the whole gather is intentional. ``/v1`` may run two reads
+        concurrently; without this lock both cold calls can miss the same
+        in-memory row and duplicate every live embed before either stores it.
+        The cache holds at most :data:`_MAX_LIVE_EMBEDS` tier-blind vectors,
+        reconciled from the unfiltered *corpus* before this call independently
+        applies its own tier override for ranking. It clears on a vault switch.
+
+        Args:
+            query: Entry text whose neighbours are requested.
+            vault: Vault root owning the corpus and cache.
+            override: This call's privacy admission override.
+            corpus: Optional request snapshot, already parsed but unfiltered.
+
+        Returns:
+            The specialist's provenance-carrying evidence bundle.
+        """
+        with self._lock:
+            specialist = self.specialist(vault)
+            return specialist.gather(
+                query,
+                vault,
+                override=override,
+                corpus=corpus,
+                live_cache=self._live_vectors,
+                max_live_cache_entries=_MAX_LIVE_EMBEDS,
+            )
 
 
 class _Grounding(NamedTuple):
@@ -413,7 +538,10 @@ def _fragment_tier(metadata: dict[str, Any]) -> PrivacyTier:
 
 
 def _resolve_entry(
-    content: str | None, entry_ref: str | None, vault_path: Path
+    content: str | None,
+    entry_ref: str | None,
+    vault_path: Path,
+    corpus: _ReflectionCorpus | None = None,
 ) -> tuple[str, PrivacyTier | None]:
     """Return the entry text plus its *classified* tier (``None`` for raw content).
 
@@ -460,34 +588,10 @@ def _resolve_entry(
     if content and content.strip():
         return content, None
     if entry_ref:
-        import frontmatter
-
-        for path in (vault_path / "01-Fragments").rglob("*.md"):
-            try:
-                post = frontmatter.load(path)
-            except Exception as exc:
-                # Broader than the house ``(OSError, ValueError, yaml.YAMLError)``
-                # tuple on purpose. ``frontmatter.load`` splats the parsed
-                # metadata as ``Post(content, handler, **metadata)``, so front
-                # matter with a non-string key — a bare YAML date such as
-                # ``2024-05-01: note``, a realistic hand-edited-vault case —
-                # raises ``TypeError``, which is none of those three (see
-                # ``test_nonstring_frontmatter_key_is_skipped_not_crashed``). The
-                # corpus is user-managed and arbitrarily messy, so the failure
-                # surface is open-ended *beyond* decode/IO/YAML, and per the
-                # never-raises contract none of it may cross the MCP boundary.
-                #
-                # Log the exception's *type name only* — never ``str(exc)``,
-                # ``exc_info``, or ``logger.exception``. ``yaml.MarkedYAMLError``
-                # stringifies with the offending source snippet, so the message
-                # text would write tier-unknown vault content into the log.
-                logger.debug(
-                    "Skipping unreadable fragment %s (%s)", path, type(exc).__name__
-                )
-                continue
-            if str(post.metadata.get("id", "")) == entry_ref:
-                body: str = post.content
-                return body, _fragment_tier(post.metadata)
+        snapshot = corpus if corpus is not None else _load_reflection_corpus(vault_path)
+        for document in snapshot.entries:
+            if str(document.metadata.get("id", "")) == entry_ref:
+                return document.body, _fragment_tier(document.metadata)
     return "", None
 
 
@@ -498,6 +602,7 @@ def _admit_entry(
     vault_path: Path,
     ceiling: TierCeiling,
     care_guard: Callable[[str], str | None] | None,
+    corpus: _ReflectionCorpus | None = None,
 ) -> tuple[str, PrivacyTier | None] | dict[str, Any]:
     """Resolve the entry and run the three admission gates, in source order.
 
@@ -525,7 +630,7 @@ def _admit_entry(
         call and must be returned to the caller verbatim with nothing added
         to it, or the ``(entry, entry_tier)`` pair of an admitted entry.
     """
-    entry, entry_tier = _resolve_entry(content, entry_ref, vault_path)
+    entry, entry_tier = _resolve_entry(content, entry_ref, vault_path, corpus)
     if not entry.strip():
         reason = "entry_ref not found" if entry_ref else "no entry content supplied"
         return refusal_response(tool=TOOL_NAME, ceiling=ceiling, reason=reason)
@@ -617,6 +722,7 @@ def _gather_grounding(
     ceiling: TierCeiling,
     retrieve: Callable[[str, Path, PrivacyTierOverride], list[str]] | None,
     session: GroundingSession | None = None,
+    corpus: _ReflectionCorpus | None = None,
 ) -> _Grounding:
     """Run one grounding pass and compose the compiled-layer seed list.
 
@@ -648,7 +754,7 @@ def _gather_grounding(
         grounding, retrieved_ids = _Grounding(retrieve(entry, vault_path, override), [])
     else:
         grounding, retrieved_ids = _default_retrieve(
-            entry, vault_path, override, session=session
+            entry, vault_path, override, session=session, corpus=corpus
         )
     # Seeds *select* candidate compiled pages; they never authorize one. An
     # ``entry_ref`` seed is admitted by the #846 gate above, and a retrieval
@@ -707,6 +813,29 @@ def _reflection_response(
     if related.eddies:
         result["related_eddies"] = related.eddies
     return result
+
+
+def _corpus_for_entry(
+    content: str | None,
+    entry_ref: str | None,
+    vault_path: Path,
+) -> _ReflectionCorpus | None:
+    """Load the snapshot only when resolving an entry reference requires it."""
+    has_inline_content = bool(content and content.strip())
+    if entry_ref is None or has_inline_content:
+        return None
+    return _load_reflection_corpus(vault_path)
+
+
+def _corpus_for_grounding(
+    corpus: _ReflectionCorpus | None,
+    retrieve: Callable[[str, Path, PrivacyTierOverride], list[str]] | None,
+    vault_path: Path,
+) -> _ReflectionCorpus | None:
+    """Ensure the production grounder has this request's corpus snapshot."""
+    if retrieve is not None or corpus is not None:
+        return corpus
+    return _load_reflection_corpus(vault_path)
 
 
 def reflect_tool(
@@ -810,17 +939,20 @@ def reflect_tool(
         consumer=consumer,
     )
 
+    corpus = _corpus_for_entry(content, entry_ref, vault_path)
     admitted = _admit_entry(
         content=content,
         entry_ref=entry_ref,
         vault_path=vault_path,
         ceiling=privacy_tier_ceiling,
         care_guard=care_guard,
+        corpus=corpus,
     )
     if isinstance(admitted, dict):
         return admitted
     entry, entry_tier = admitted
 
+    corpus = _corpus_for_grounding(corpus, retrieve, vault_path)
     tier = _routing_tier(privacy_tier_ceiling, entry_tier)
     grounding = _gather_grounding(
         entry=entry,
@@ -830,6 +962,7 @@ def reflect_tool(
         ceiling=privacy_tier_ceiling,
         retrieve=retrieve,
         session=session,
+        corpus=corpus,
     )
 
     try:
@@ -848,7 +981,11 @@ def reflect_tool(
     raw_notes, essay = _parse_notes(response_text)
     notes = _clean_notes(raw_notes, entry, max_notes=max_notes)
     related = _related(
-        grounding.source_ids, vault_path, privacy_tier_ceiling, related_lookup
+        grounding.source_ids,
+        vault_path,
+        privacy_tier_ceiling,
+        related_lookup,
+        corpus,
     )
     return _reflection_response(
         notes=notes,
@@ -864,6 +1001,7 @@ def _related(
     vault_path: Path,
     ceiling: TierCeiling,
     lookup: Callable[[Sequence[str], Path, TierCeiling], RelatedCompiled] | None,
+    corpus: _ReflectionCorpus | None = None,
 ) -> RelatedCompiled:
     """Look up the compiled layer, degrading to nothing on any failure.
 
@@ -890,9 +1028,11 @@ def _related(
     Returns:
         The bounded, admitted compiled structures, or empty on both axes.
     """
-    resolver = lookup if lookup is not None else related_compiled
     try:
-        return resolver(seeds, vault_path, ceiling)
+        if lookup is not None:
+            return lookup(seeds, vault_path, ceiling)
+        records = corpus.compiled_records() if corpus is not None else None
+        return related_compiled(seeds, vault_path, ceiling, corpus_records=records)
     except Exception as exc:
         logger.debug("Related compiled layer degraded to none (%s)", type(exc).__name__)
         return RelatedCompiled([], [])
@@ -903,6 +1043,7 @@ def _default_retrieve(
     vault_path: Path,
     override: PrivacyTierOverride,
     session: GroundingSession | None = None,
+    corpus: _ReflectionCorpus | None = None,
 ) -> _Grounding:
     """Production grounding: the *titles* of the corpus fragments nearest *query*.
 
@@ -962,28 +1103,34 @@ def _default_retrieve(
     :data:`_MAX_LIVE_EMBEDS`, so a cold vault no longer embeds its whole
     admitted corpus in one request.
 
-    **What a session does not amortise: the live embeds themselves.** The shared
-    map holds what the parquet held; vectors computed live are *not* written
-    back into it, so against a cold parquet every call still embeds its cache
-    misses, bounded by the cap. Measured at 40 fragments over 3 calls: sharing
-    takes constructions, parquet reads and model loads from 3 to 1 each and
-    leaves the embed count at 123 either way. Writing them back was rejected
-    deliberately — an in-memory write-back would mutate a specialist that
-    several worker threads hold at once, and a parquet write-back would put a
-    vault write on a route published as mutating no vault state, racing
-    ``creek link``. Filling the cache with ``creek link --method embeddings``
-    remains the way to make grounding cheap on a large vault.
+    **Cold once, warm thereafter.** Vectors computed live are retained in a
+    session-only map capped at the same :data:`_MAX_LIVE_EMBEDS` bound. The
+    second request therefore embeds its query but reuses every unchanged
+    fragment vector from the first. Membership is the deterministic id-ordered
+    prefix of unfiltered parquet misses, never the first caller's admitted view,
+    and cannot advance past the fixed cap. The session lock serialises cold
+    gathers, so simultaneous first requests cannot duplicate that work. Rows
+    are keyed by fragment id plus the same content hash as the parquet cache,
+    replaced in the same call when a fragment changes, and cleared when the
+    session switches vaults. This is an
+    in-memory optimisation only: ``POST /v1/reflections`` still writes no vault
+    state and cannot race ``creek link``. Filling the parquet with
+    ``creek link --method embeddings`` remains the way to ground a large vault
+    fully rather than against the bounded prefix.
 
     With no *session* — every ``retrieve=``-injecting test, both read-gate
     probes, and any caller that does not pass one — this is unchanged: a fresh
     ``RetrievalSpecialist`` per call, an unbounded cold-cache pass, model load
     included.
 
-    **Not bounded by any of this:** the corpus is still walked three times per
-    reflection (``_resolve_entry``'s rglob, ``_load_corpus``, and
-    ``compiled_pages._read_corpus``). That is the *walk* half of #1034 and it is
-    deliberately not this change. As before, the ``except Exception`` below does
-    not bound any of it, because slowness is not an exception.
+    **One parse per request, not three.** Production builds one request-scoped,
+    unfiltered :class:`_ReflectionCorpus`. Entry resolution, tier-filtered
+    retrieval, and compiled-page provenance project from that same snapshot, so
+    each corpus Markdown file crosses ``frontmatter.load`` at most once. The
+    snapshot is intentionally not cached between requests: doing so would hide
+    live Obsidian edits. It contains no override-derived view, so the retrieval
+    cutoff and compiled-page fail-closed check are still evaluated independently
+    for the current caller.
 
     A known asymmetry: a fragment with **no** ``privacy_tier`` key at all is
     admitted here from ``ceiling=personal`` (the ``Fragment`` model default is
@@ -1011,19 +1158,23 @@ def _default_retrieve(
             that passes none). The session supplies a *lifetime* only: it is
             keyed on the vault and holds nothing override-derived, so *override*
             below is still applied per call, by this call, inside ``gather``.
+        corpus: The request-scoped, unfiltered corpus snapshot. Production
+            supplies one so entry resolution, retrieval, and compiled-page
+            provenance parse each Markdown file at most once.
 
     Returns:
         Fragment titles, most relevant first, paired with the ids they came
         from — both empty when retrieval fails.
     """
     try:
+        records = corpus.retrieval_records() if corpus is not None else None
         if session is not None:
-            specialist = session.specialist(vault_path)
+            bundle = session.gather(query, vault_path, override, corpus=records)
         else:
             from creek.author.agents import RetrievalSpecialist
 
             specialist = RetrievalSpecialist()
-        bundle = specialist.gather(query, vault_path, override=override)
+            bundle = specialist.gather(query, vault_path, override=override)
         return _Grounding(
             lines=[claim.claim for claim in bundle.claims],
             source_ids=[
