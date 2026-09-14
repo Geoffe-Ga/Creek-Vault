@@ -61,7 +61,12 @@ class ProviderError(RuntimeError):
 
 
 class HandoffError(RuntimeError):
-    """The internal credential sink refused a conflicting one-time delivery."""
+    """A sanitized callback failure carrying only its durable retry policy."""
+
+    def __init__(self, *, retryable: bool) -> None:
+        """Discard transport detail and expose one content-free classification."""
+        super().__init__("credential handoff failed")
+        self.retryable = retryable
 
 
 class ProviderDriver(Protocol):
@@ -288,7 +293,7 @@ class FakeOneTimeHandoff:
                 self._fingerprints[job_id] = fingerprint
                 return
             if existing != fingerprint:
-                raise HandoffError("credential handoff conflicts with prior delivery")
+                raise HandoffError(retryable=False)
 
 
 def _fake_resources(allocation_id: str, activation_id: str) -> list[ProviderResource]:

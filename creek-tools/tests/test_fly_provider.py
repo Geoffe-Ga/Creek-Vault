@@ -350,6 +350,25 @@ def test_provider_and_runtime_secrets_are_repr_safe_and_never_logged(
     assert TLS_KEY not in rendered
 
 
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [(401, True), (403, False)],
+)
+def test_only_provider_authentication_expiry_is_recoverable(
+    status: int,
+    retryable: bool,
+) -> None:
+    """A replaced token can repair 401; an authorization refusal stays terminal."""
+    api = FakeFlyAPI()
+    api.fail_once("POST", "/machines", status=status)
+
+    with pytest.raises(ProviderError) as raised:
+        fly_driver(api).provision(fly_job("activation-provider-auth"))
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert raised.value.retryable is retryable
+
+
 def test_credential_file_requires_an_org_deploy_scope_and_hides_token(
     tmp_path: Path,
 ) -> None:
