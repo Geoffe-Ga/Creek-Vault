@@ -23,6 +23,21 @@ to locate the originating commit for any reference below.
   migrated as `wrapped_artifact_only` and their cryptographic vector remains an
   archived compatibility record, not a custody claim.
 
+- **`creek-provisioning-worker` production composition (#1805).** Adds a
+  bounded, gracefully draining worker process backed by the durable
+  `ProvisioningStore`, the real Fly Machines driver, AES-GCM encrypted
+  restart-safe runtime-secret issuance with per-Machine CA-signed TLS, and an
+  authenticated one-time HTTPS callback to Adepthood. The same encrypted state
+  supplies #1807's read-only, restart-safe routing credential verifier with
+  exact requester/consumer ownership and durable revocation. Provider,
+  readiness, and callback timeouts and the lease duration are explicit; every
+  new claim is fenced by the remaining short-lived Fly token lifetime, and an
+  in-flight `401` remains retryable across token replacement and restart so
+  partial create or delete resources reconcile without being stranded. Every
+  operator-provided credential enters through an owner-only mounted file, while
+  all credentials are excluded from logs, exceptions, process arguments,
+  environment values, durable rows, and Machine configuration metadata.
+
 - **`creek-provisioning-fleet` — fleet reconciliation, cost telemetry, and
   budget alarms (#1769).** Implements ADR-0013 Decisions 4, 6, and 7 as an
   operator surface without changing the `/control/v1` job contract. A

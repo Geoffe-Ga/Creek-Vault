@@ -85,6 +85,9 @@ creek-tools-api = "creek_mcp.httpapi.cli:main"
 # Durable authenticated provisioning API. Provider workers are composed with
 # an injected driver by the deployment; the API process never holds one.
 creek-provisioning-api = "creek_mcp.provisioning.cli:main"
+# Production-only durable worker (#1805). All credential-bearing inputs are
+# owner-only mounted files; no fake adapter is reachable from this entry point.
+creek-provisioning-worker = "creek_mcp.provisioning.worker_cli:main"
 # Operator fleet tooling (#1769): reconciliation report, bounded repair, and
 # emergency stop. A separate process whose Fly driver can inventory and stop
 # but never provision or delete; it holds no consumer token.

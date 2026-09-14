@@ -154,7 +154,13 @@ class FlyRuntimeSecrets:
 class FlySecretManager(Protocol):
     """Idempotent secret-manager boundary used by the provider lifecycle."""
 
-    def issue(self, activation_id: str, consumer_identity: str) -> FlyRuntimeSecrets:
+    def issue(
+        self,
+        activation_id: str,
+        consumer_identity: str,
+        *,
+        requester_identity: str,
+    ) -> FlyRuntimeSecrets:
         """Return the same bundle for repeated calls for one activation."""
 
     def revoke(self, activation_id: str) -> None:
@@ -169,9 +175,15 @@ class RefusingSecretManager:
     closed with a non-retryable provider rejection.
     """
 
-    def issue(self, activation_id: str, consumer_identity: str) -> Never:
+    def issue(
+        self,
+        activation_id: str,
+        consumer_identity: str,
+        *,
+        requester_identity: str = "",
+    ) -> Never:
         """Refuse to mint runtime secrets outside the provisioning worker."""
-        del activation_id, consumer_identity
+        del activation_id, consumer_identity, requester_identity
         raise ProviderError(FailureReason.PROVIDER_REJECTED, retryable=False)
 
     def revoke(self, activation_id: str) -> Never:
@@ -271,6 +283,7 @@ class FlyProviderDriver:
         runtime_secrets = self._secrets.issue(
             job.activation_id,
             job.consumer_identity,
+            requester_identity=job.requester_identity,
         )
         self._ensure_app(reference)
         volume = self._ensure_volume(reference)
@@ -802,12 +815,15 @@ class FlyProviderDriver:
                 private_detail=type(exc).__name__,
             ) from None
         if response.status_code not in expected:
-            retryable = response.status_code == 429 or response.status_code >= 500
-            reason = (
-                FailureReason.PROVIDER_UNAVAILABLE
-                if retryable
-                else FailureReason.PROVIDER_REJECTED
+            authentication_expired = response.status_code == 401
+            retryable = (
+                authentication_expired
+                or response.status_code == 429
+                or (response.status_code >= 500)
             )
+            reason = FailureReason.PROVIDER_REJECTED
+            if retryable and not authentication_expired:
+                reason = FailureReason.PROVIDER_UNAVAILABLE
             raise ProviderError(reason, retryable=retryable) from None
         return response
 

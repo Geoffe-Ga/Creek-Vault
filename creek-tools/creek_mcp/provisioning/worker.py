@@ -83,12 +83,12 @@ class ProvisioningWorker:
                 retryable=failure.retryable,
                 now=now,
             )
-        except HandoffError:
+        except HandoffError as failure:
             self._record_failure(
                 claimed.job.job_id,
                 claimed.lease_token,
                 FailureReason.HANDOFF_FAILED,
-                retryable=False,
+                retryable=failure.retryable,
                 now=now,
             )
         except LostJobLeaseError:

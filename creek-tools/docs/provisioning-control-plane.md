@@ -63,6 +63,126 @@ The worker takes two injected boundaries:
 They are not deployment drivers. `FlyProviderDriver` is the first deployment
 adapter and implements ADR-0013 Decision 3.
 
+## Run the production worker (#1805)
+
+`creek-provisioning-worker` is the only production composition that creates or
+deletes Fly allocations. It binds `ProvisioningStore`, `FlyProviderDriver`,
+`EncryptedFileFlySecretManager`, and `HttpOneTimeCredentialHandoff`; neither
+test fake is reachable from the entry point. The required public routing URL is
+the same stable origin handed to every allocation; readiness uses its separate
+bounded Fly wait. The loop claims one leased job at a time. `SIGTERM` or
+`SIGINT` interrupts an idle poll immediately, while an in-flight provider,
+callback, or store boundary is allowed to reach its bounded timeout and settle
+its lease before the process exits. An unclean process exit leaves the claim
+durable and the next worker resumes it when the lease expires.
+
+Create an owner-only secret-state directory and mount five owner-only regular
+files. The master key is exactly 32 raw bytes. The CA certificate and private
+key sign a distinct wildcard certificate for each Machine's private hostname;
+the same CA certificate belongs in the routing service's trust store. The Fly
+token must be a short-lived organization deploy token. The callback bearer is
+rotated separately from Adepthood's control-plane bearer.
+
+```console
+install -d -m 0700 /var/lib/creek/runtime-secrets /run/creek-secrets
+chmod 0400 /run/creek-secrets/fly-token \
+  /run/creek-secrets/runtime-master-key \
+  /run/creek-secrets/runtime-ca.crt \
+  /run/creek-secrets/runtime-ca.key \
+  /run/creek-secrets/adepthood-handoff-token
+
+creek-provisioning-worker \
+  --database /var/lib/creek/jobs.sqlite3 \
+  --fly-token-file /run/creek-secrets/fly-token \
+  --fly-organization creek-vaults \
+  --fly-image registry.example/creek@sha256:<digest> \
+  --fly-token-expires-at 2026-09-14T12:00:00+00:00 \
+  --routing-public-url https://vault-router.example.com \
+  --routing-readiness-timeout-seconds 20 \
+  --secret-state-directory /var/lib/creek/runtime-secrets \
+  --secret-master-key-file /run/creek-secrets/runtime-master-key \
+  --tls-ca-certificate-file /run/creek-secrets/runtime-ca.crt \
+  --tls-ca-private-key-file /run/creek-secrets/runtime-ca.key \
+  --handoff-url https://adepthood.internal/internal/vault-provisioning/completions \
+  --handoff-token-file /run/creek-secrets/adepthood-handoff-token
+```
+
+The non-secret options are `--database`, `--fly-organization`, `--fly-image`,
+`--fly-token-expires-at`, `--routing-public-url`,
+`--routing-readiness-timeout-seconds`, `--fly-api-base-url`, `--fly-region`,
+`--fly-app-prefix`, `--fly-cpu-kind`, `--fly-cpus`, `--fly-memory-mb`,
+`--fly-rootfs-size-gb`, `--fly-volume-size-gb`, `--vault-port`,
+`--secret-state-directory`, `--handoff-url`, `--poll-interval-seconds`,
+`--lease-seconds`, `--provider-timeout-seconds`,
+`--callback-timeout-seconds`, and the diagnostic one-shot `--max-jobs`. The
+mounted-secret path options are `--fly-token-file`,
+`--secret-master-key-file`, `--tls-ca-certificate-file`,
+`--tls-ca-private-key-file`, and `--handoff-token-file`; their values are file
+paths, never credentials. Every mounted file and the state directory is refused
+if group- or world-accessible, and symlinked mounted files are refused.
+
+Issuance writes an AES-256-GCM bundle durably before any plaintext leaves the
+secret boundary. Its filename and associated data contain only an activation
+digest; the authenticated ciphertext binds the activation plus its exact
+requester/consumer ownership. A retry or process restart therefore returns
+byte-identical consumer registry and TLS material. Revocation writes a
+content-free tombstone before deleting the ciphertext and is safe to repeat.
+The Machine receives the single-consumer registry, leaf certificate, and
+private key only through Fly's `files` contract; no secret enters its
+environment or metadata.
+
+The routing deployment injects `EncryptedFileRoutingCredentialVerifier` into
+#1807's `build_routing_app`. The verifier mounts only the encrypted state
+directory and master-key file—never the Fly token or TLS CA private key—and
+returns the requester/consumer pair authenticated inside exactly one active
+bundle. It compares every active credential in constant time, returns the same
+anonymous miss for unknown, revoked, corrupt, or conflicting ownership, and
+persists and logs none of the presented value. A restarted verifier reads the
+same durable state immediately; it never issues or revokes credentials.
+
+The Adepthood callback is an authenticated HTTPS POST to
+`/internal/vault-provisioning/completions`. A `204` includes an identical
+replay; `409` and other non-timeout 4xx responses are terminal conflicts, while
+transport failures, `408`, `425`, `429`, and 5xx responses are retryable. No
+response body is logged or copied into an exception.
+
+Treat the `provisioning worker ready` log after configuration validation and
+process liveness as the health signal. `provisioning worker stopped
+processed=<count>` confirms a graceful drain. Absence of a fresh ready signal
+after restart, an exited process, or retryable jobs accumulating past one lease
+duration is unhealthy. The worker admits a claim only while the mounted Fly
+token has enough remaining lifetime for ten serialized provider timeout
+boundaries, the callback timeout, and one lease duration. That deterministic
+window covers the longest normal one-app/one-volume/one-Machine create or
+delete reconciliation plus settlement headroom. The check runs before every
+claim, not only at process startup. On entering the window the worker logs a
+content-free rotation warning, leaves pending work unclaimed with its attempt
+count unchanged, drains no new work, closes its transports, and exits.
+
+A Fly `401` after an earlier request boundary is a retryable authentication
+failure. The current claim settles as failed without hiding or deleting an app,
+volume, or Machine whose prior outcome succeeded. Recovery is: stop the worker;
+preserve the SQLite file, encrypted runtime-secret directory, and master key
+together; correct the provider or callback dependency; mount a fresh unexpired
+Fly token; update `--fly-token-expires-at`; have the owning Adepthood control
+plane requeue each failed job whose `retryable` flag is true; then restart. The
+reconcile-first create/delete path adopts or removes partial resources before
+settling, so neither billable resources nor teardown are stranded. Never delete
+encrypted bundle state to fix a retry: doing so can mint a conflicting
+credential for an already-created Machine.
+
+Rotate the Fly token by stopping the worker, replacing the owner-only file with
+a new short-lived org deploy token, updating `--fly-token-expires-at`, and
+restarting. A token already inside the claim-admission window is refused at
+startup; a token that enters it while the worker is idle causes the process to
+exit before another claim. Rotate the handoff bearer by installing the same new
+file in Adepthood and Creek during a drain, then restart the worker. Rotate the
+runtime master key or CA only by draining all work and re-encrypting/reissuing
+every live bundle under an explicit migration procedure; replacing either file
+alone makes durable retries fail closed. Back up the encrypted state directory
+and SQLite database atomically; the mounted keys stay in the secret manager,
+never in that backup.
+
 ## Fly Machines driver (#1770)
 
 Compose `FlyProviderDriver` only in the separate worker process. The API

@@ -11,7 +11,7 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -23,6 +23,9 @@ from creek_mcp.provisioning.fly import (
     FlyRuntimeSecrets,
 )
 from creek_mcp.provisioning.models import JobOperation, JobState, ProvisioningJob
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 NOW = datetime(2026, 9, 7, 4, tzinfo=UTC)
 PROVIDER_TOKEN = "fly-provider-secret-canary"
@@ -40,9 +43,15 @@ class FakeSecretManager:
 
     revoked: set[str]
 
-    def issue(self, activation_id: str, consumer_identity: str) -> FlyRuntimeSecrets:
+    def issue(
+        self,
+        activation_id: str,
+        consumer_identity: str,
+        *,
+        requester_identity: str,
+    ) -> FlyRuntimeSecrets:
         """Return the same secret bundle on every retry."""
-        del activation_id
+        del activation_id, requester_identity
         return FlyRuntimeSecrets(
             consumer_credential=CONSUMER_TOKEN,
             consumer_registry=f"{consumer_identity}={CONSUMER_TOKEN}\n".encode(),
@@ -59,11 +68,12 @@ class FakeFlyAPI:
     """Stateful HTTP fake for the documented Fly Machines endpoints."""
 
     def __init__(self) -> None:
+        self.provider_token = PROVIDER_TOKEN
         self.apps: dict[str, dict[str, Any]] = {}
         self.volumes: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
         self.machines: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
         self.requests: list[tuple[str, str]] = []
-        self.failures: dict[tuple[str, str], int] = {}
+        self.failures: dict[tuple[str, str], list[int]] = {}
         self.failure_body = "provider unavailable"
         self.malformed: dict[tuple[str, str], str] = {}
         self.replace_machine_on_wait = False
@@ -71,9 +81,9 @@ class FakeFlyAPI:
         self.volume_loses_encryption_on_wait = False
         self.start_stays_stopped = False
 
-    def fail_once(self, method: str, path_suffix: str) -> None:
-        """Return one 503 for a matching method and path suffix."""
-        self.failures[(method, path_suffix)] = 1
+    def fail_once(self, method: str, path_suffix: str, *, status: int = 503) -> None:
+        """Return *status* once for a matching method and path suffix."""
+        self.failures[(method, path_suffix)] = [status]
 
     def malformed_once(self, method: str, path_suffix: str, body: str) -> None:
         """Return one 200 with a malformed *body* for a matching request."""
@@ -81,14 +91,15 @@ class FakeFlyAPI:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         """Serve one authenticated request without a real network."""
-        assert request.headers["Authorization"] == f"Bearer {PROVIDER_TOKEN}"
+        assert request.headers["Authorization"] == f"Bearer {self.provider_token}"
         method = request.method
         path = request.url.path
         self.requests.append((method, path))
-        for key, remaining in self.failures.items():
-            if remaining and method == key[0] and path.endswith(key[1]):
-                self.failures[key] = remaining - 1
-                return httpx.Response(503, text=self.failure_body, request=request)
+        for key, statuses in self.failures.items():
+            if statuses and method == key[0] and path.endswith(key[1]):
+                return httpx.Response(
+                    statuses.pop(0), text=self.failure_body, request=request
+                )
         for key, body in list(self.malformed.items()):
             if method == key[0] and path.endswith(key[1]):
                 del self.malformed[key]
@@ -286,3 +297,24 @@ def fly_driver(
     return FlyProviderDriver(
         policy, credential, secrets or FakeSecretManager(set()), fly_client(api)
     )
+
+
+def fly_driver_from_file(
+    api: FakeFlyAPI,
+    token_file: Path,
+    secrets: FakeSecretManager,
+) -> FlyProviderDriver:
+    """Return a driver that reloads its credential from an owner-only mount."""
+    credential = FlyCredential.from_file(
+        token_file,
+        organization=ORGANIZATION,
+        scope=FlyCredentialScope.ORG_DEPLOY,
+        expires_at=NOW + timedelta(days=7),
+    )
+    policy = FlyProviderPolicy(
+        organization=ORGANIZATION,
+        image=IMAGE,
+        routing_public_url=ROUTING_PUBLIC_URL,
+        api_base_url=API_BASE_URL,
+    )
+    return FlyProviderDriver(policy, credential, secrets, fly_client(api))
