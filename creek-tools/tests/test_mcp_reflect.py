@@ -40,7 +40,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -3019,8 +3021,10 @@ def test_the_grounding_session_holds_one_specialist_and_evicts_on_vault_change(
 
     first = session.specialist(vault_a)
     assert session.specialist(vault_a) is first, "same vault rebuilt the specialist"
+    vars(session)["_live_vectors"]["from-vault-a"] = ("hash", [1.0])
     second = session.specialist(vault_b)
     assert second is not first, "a new vault reused the old specialist"
+    assert not vars(session)["_live_vectors"], "vault A vectors survived the switch"
     third = session.specialist(vault_a)
 
     assert third is not first, "vault A's specialist survived a switch to vault B"
@@ -3298,13 +3302,13 @@ def _seed_bench_parquet(vault: Path) -> None:
 
 
 @pytest.mark.slow
-def test_benchmark_grounding_setup_is_paid_once_per_process_not_per_call(
+def test_benchmark_grounding_cold_and_warm_work_is_bounded_per_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mock_sentence_transformer: Any,
     record_property: Any,
 ) -> None:
-    """Measure the #1034 saving as counts across four cells (#1034).
+    """Measure the complete #1034 saving as counts across four cells (#1034).
 
     **Counts are the measurement; the wall time recorded beside them is
     structure only and must not be quoted as latency.** ``conftest``
@@ -3315,8 +3319,10 @@ def test_benchmark_grounding_setup_is_paid_once_per_process_not_per_call(
     says which number came from where.
 
     Four cells: {per-call, shared} x {cold parquet, warm parquet}, three
-    reflections each. The shared cells are what the fix buys; the per-call cells
-    are what production did before it.
+    reflections each. The shared cold cell measures the live-vector reuse added
+    by the closing change: fragments are embedded on call one and only the query
+    is embedded on calls two and three. The per-call cells are the legacy
+    control and the warm-parquet cells prove the optimization does not add work.
     """
     vault = _vault(tmp_path)
     ids = _seed_bench_vault(vault, _BENCH_FRAGMENTS)
@@ -3366,6 +3372,10 @@ def test_benchmark_grounding_setup_is_paid_once_per_process_not_per_call(
             if cache_state == "cold" and mode == "per_call":
                 # The unbounded pre-fix shape: every admitted fragment, every call.
                 assert len(embeds) == calls * (len(ids) + 1), f"{label}: {len(embeds)}"
+            elif cache_state == "cold":
+                assert len(embeds) == len(ids) + calls, f"{label}: {len(embeds)}"
+            else:
+                assert len(embeds) == calls, f"{label}: {len(embeds)}"
             monkeypatch.undo()
 
 
@@ -3443,3 +3453,284 @@ def test_the_production_cap_bounds_a_cold_gather_and_says_so(
         assert marks.title not in message, "the warning names a fragment title"
         assert marks.frag_id not in message, "the warning names a fragment id"
         assert marks.body not in message, "the warning names a fragment body"
+
+
+def test_one_reflection_parses_each_corpus_fragment_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entry, retrieval, and compiled lookup share one request snapshot (#1034).
+
+    The old path parsed every ``01-Fragments`` file up to three times: once to
+    resolve ``entry_ref``, once to rank retrieval candidates, and once to
+    authorize compiled pages.  Counting the actual parser boundary makes the
+    saving observable without depending on filesystem traversal timing.
+    """
+    vault = _vault(tmp_path)
+    for index in range(4):
+        _write_corpus_fragment(
+            vault,
+            frag_id=f"frag-one-walk-{index}",
+            title=f"One walk {index}",
+            body=_ENTRY if index == 3 else f"body {index}",
+            privacy_tier="open",
+        )
+    loaded = _spy_on_frontmatter_load(monkeypatch)
+
+    result = reflect_tool(
+        vault_path=vault,
+        llm_factory=_session_factory(),
+        entry_ref="frag-one-walk-3",
+        session=GroundingSession(),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok", result
+    corpus_paths = [
+        str(vault / "01-Fragments" / "Notes" / f"frag-one-walk-{index}.md")
+        for index in range(4)
+    ]
+    counts = {path: loaded.count(path) for path in corpus_paths}
+    assert counts == dict.fromkeys(corpus_paths, 1)
+
+
+def test_a_shared_session_reuses_cold_live_vectors_on_the_warm_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cold session embeds its bounded prefix once, not once per request.
+
+    Query vectors remain request-specific and are embedded on both calls.  The
+    fragment vectors are tier-blind cache material, capped at the same bound as
+    the cold pass, and the second call must reuse them all.
+    """
+    monkeypatch.setattr("creek_mcp.tools.reflect._MAX_LIVE_EMBEDS", 2)
+    vault = _vault(tmp_path)
+    _seed_bench_vault(vault, 4)
+    session = GroundingSession()
+    embedded: list[str] = []
+    real_embed = EmbeddingLinker.generate_embedding
+
+    def _recording_embed(self: Any, text: str) -> Any:
+        """Record the text while delegating to the configured local model."""
+        embedded.append(text)
+        return real_embed(self, text)
+
+    monkeypatch.setattr(EmbeddingLinker, "generate_embedding", _recording_embed)
+    override = to_privacy_override(TierCeiling.OPEN)
+
+    cold = _default_retrieve(_ENTRY, vault, override, session=session)
+    cold_embeds = len(embedded)
+    warm = _default_retrieve(_ENTRY, vault, override, session=session)
+
+    assert cold.lines == warm.lines
+    assert cold_embeds == 3, "one query plus the two-fragment cold bound"
+    assert len(embedded) - cold_embeds == 1, "warm call should embed only its query"
+    assert len(vars(session)["_live_vectors"]) == 2, "session cache exceeded its cap"
+
+
+def test_a_changed_fragment_invalidates_its_session_live_vector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warm-session optimization never serves a vector for stale text."""
+    monkeypatch.setattr("creek_mcp.tools.reflect._MAX_LIVE_EMBEDS", 2)
+    vault = _vault(tmp_path)
+    _seed_bench_vault(vault, 1)
+    session = GroundingSession()
+    embedded: list[str] = []
+    real_embed = EmbeddingLinker.generate_embedding
+
+    def _recording_embed(self: Any, text: str) -> Any:
+        """Record the text while delegating to the configured local model."""
+        embedded.append(text)
+        return real_embed(self, text)
+
+    monkeypatch.setattr(EmbeddingLinker, "generate_embedding", _recording_embed)
+    override = to_privacy_override(TierCeiling.OPEN)
+    _default_retrieve(_ENTRY, vault, override, session=session)
+    before = len(embedded)
+    path = vault / "01-Fragments" / "Notes" / "frag-bench-0000.md"
+    post = frontmatter.load(path)
+    post["title"] = "A title changed after the cold call"
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    _default_retrieve(_ENTRY, vault, override, session=session)
+
+    assert len(embedded) - before == 2, "changed fragment plus the new query"
+
+
+@pytest.mark.parametrize(
+    ("first_ceiling", "second_ceiling"),
+    [
+        (TierCeiling.OPEN, TierCeiling.PERSONAL),
+        (TierCeiling.PERSONAL, TierCeiling.OPEN),
+    ],
+)
+def test_a_saturated_session_cache_is_tier_blind_in_both_call_orders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_ceiling: TierCeiling,
+    second_ceiling: TierCeiling,
+) -> None:
+    """A caller's ceiling cannot select the shared cache's bounded membership.
+
+    The two newly admitted records sort before 256 open records.  An OPEN-first
+    implementation that fills from the admitted view therefore saturates with
+    only open ids and makes the later PERSONAL result differ from a fresh
+    PERSONAL session.  The reverse order catches the mirror defect: personal
+    rows left in a full cache must not make a later OPEN session differ from a
+    fresh OPEN one.  A tier-blind cache has one deterministic raw-corpus prefix
+    in both orders, while ranking still filters that prefix per request.
+    """
+    assert _MAX_LIVE_EMBEDS == 256, "this regression must fill the published cap"
+    vault = _vault(tmp_path)
+    sensitive = {
+        "frag-cache-0000-personal": "personal",
+        "frag-cache-0001-unclassified": "unclassified",
+    }
+    for frag_id, tier in sensitive.items():
+        _write_corpus_fragment(
+            vault,
+            frag_id=frag_id,
+            title=f"HIGH-SCORE-{frag_id}",
+            body=f"BODY-{frag_id}",
+            privacy_tier=tier,
+        )
+    open_ids = [f"frag-cache-{index:04d}-open" for index in range(2, 258)]
+    for frag_id in open_ids:
+        _write_corpus_fragment(
+            vault,
+            frag_id=frag_id,
+            title=f"LOW-SCORE-{frag_id}",
+            body=f"BODY-{frag_id}",
+            privacy_tier="open",
+        )
+
+    query = "CACHE-ORDER-QUERY"
+
+    def _controlled_embed(self: Any, text: str) -> list[float]:
+        """Make newly admitted records rank ahead of every open record."""
+        del self
+        if text == query or "HIGH-SCORE" in text:
+            return [1.0, 0.0]
+        return [0.0, 1.0]
+
+    monkeypatch.setattr(EmbeddingLinker, "generate_embedding", _controlled_embed)
+    shared = GroundingSession()
+    first_result = _default_retrieve(
+        query, vault, to_privacy_override(first_ceiling), session=shared
+    )
+    assert len(vars(shared)["_live_vectors"]) == _MAX_LIVE_EMBEDS
+
+    shared_result = _default_retrieve(
+        query, vault, to_privacy_override(second_ceiling), session=shared
+    )
+    fresh = GroundingSession()
+    fresh_result = _default_retrieve(
+        query, vault, to_privacy_override(second_ceiling), session=fresh
+    )
+
+    expected_cache_ids = set(sensitive) | set(open_ids[: _MAX_LIVE_EMBEDS - 2])
+    assert set(vars(shared)["_live_vectors"]) == expected_cache_ids
+    assert set(vars(fresh)["_live_vectors"]) == expected_cache_ids
+    assert shared_result == fresh_result
+    for ceiling, result in (
+        (first_ceiling, first_result),
+        (second_ceiling, shared_result),
+    ):
+        if ceiling is TierCeiling.OPEN:
+            assert not set(sensitive) & set(result.source_ids)
+        else:
+            assert set(sensitive) <= set(result.source_ids)
+
+
+def test_a_full_cache_reembeds_a_changed_fragment_before_a_later_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hash invalidation frees and refills the same deterministic slot at once."""
+    monkeypatch.setattr("creek_mcp.tools.reflect._MAX_LIVE_EMBEDS", 2)
+    vault = _vault(tmp_path)
+    ids = ["frag-cache-00-changed", "frag-cache-01-kept", "frag-cache-02-later"]
+    for frag_id in ids:
+        _write_corpus_fragment(
+            vault,
+            frag_id=frag_id,
+            title=f"OLD-{frag_id}",
+            body=f"BODY-{frag_id}",
+            privacy_tier="open",
+        )
+    embedded: list[str] = []
+
+    def _controlled_embed(self: Any, text: str) -> list[float]:
+        """Record work and make the changed title the best match."""
+        del self
+        embedded.append(text)
+        if text == "CHANGED-QUERY" or "NEW-TITLE" in text:
+            return [1.0, 0.0]
+        return [0.0, 1.0]
+
+    monkeypatch.setattr(EmbeddingLinker, "generate_embedding", _controlled_embed)
+    session = GroundingSession()
+    override = to_privacy_override(TierCeiling.OPEN)
+    _default_retrieve("CHANGED-QUERY", vault, override, session=session)
+    assert set(vars(session)["_live_vectors"]) == set(ids[:2])
+
+    path = vault / "01-Fragments" / "Notes" / f"{ids[0]}.md"
+    post = frontmatter.load(path)
+    post["title"] = "NEW-TITLE-HIGHEST-SCORE"
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    before = len(embedded)
+
+    result = _default_retrieve("CHANGED-QUERY", vault, override, session=session)
+
+    assert len(embedded) - before == 2, "changed fragment plus this call's query"
+    assert ids[0] in result.source_ids, "the changed fragment was lost for this call"
+    assert set(vars(session)["_live_vectors"]) == set(ids[:2]), (
+        "a later id stole the changed fragment's freshly invalidated slot"
+    )
+
+
+def test_concurrent_cold_calls_do_not_duplicate_fragment_embeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session lock makes a simultaneous cold miss a single spend (#1034)."""
+    monkeypatch.setattr("creek_mcp.tools.reflect._MAX_LIVE_EMBEDS", 2)
+    vault = _vault(tmp_path)
+    _seed_bench_vault(vault, 4)
+    session = GroundingSession()
+    override = to_privacy_override(TierCeiling.OPEN)
+    first_fragment_started = threading.Event()
+    second_call_started = threading.Event()
+    release_first = threading.Event()
+    fragment_embeds: list[str] = []
+    real_embed = EmbeddingLinker.generate_embedding
+
+    def _blocking_embed(self: Any, text: str) -> Any:
+        """Hold the first fragment miss until the other call is attempting entry."""
+        if text.startswith("TITLE-frag-bench"):
+            fragment_embeds.append(text)
+            if len(fragment_embeds) == 1:
+                first_fragment_started.set()
+                assert release_first.wait(timeout=5)
+        return real_embed(self, text)
+
+    def _second_call() -> Any:
+        """Signal task entry before attempting the session-locked gather."""
+        second_call_started.set()
+        return _default_retrieve(_ENTRY, vault, override, session=session)
+
+    monkeypatch.setattr(EmbeddingLinker, "generate_embedding", _blocking_embed)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(_default_retrieve, _ENTRY, vault, override, session)
+        assert first_fragment_started.wait(timeout=5)
+        second = pool.submit(_second_call)
+        assert second_call_started.wait(timeout=5)
+        release_first.set()
+        first_result = first.result(timeout=5)
+        second_result = second.result(timeout=5)
+
+    assert first_result.lines == second_result.lines
+    assert len(fragment_embeds) == 2, "the two calls duplicated cold fragment work"

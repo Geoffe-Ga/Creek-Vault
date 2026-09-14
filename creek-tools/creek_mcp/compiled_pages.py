@@ -71,7 +71,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
     from pathlib import Path
 
-    from creek.models import PrivacyTier
+    from creek.models import Fragment, PrivacyTier
     from creek_mcp.tier_ceiling import TierCeiling
 
 logger = logging.getLogger(__name__)
@@ -179,8 +179,11 @@ def _unique(ids: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
-def _read_corpus(vault_path: Path) -> _Corpus:
-    """Walk ``01-Fragments`` once and index tiers plus eddy membership.
+def _read_corpus(
+    vault_path: Path,
+    records: Sequence[tuple[Fragment, dict[str, Any]]] | None = None,
+) -> _Corpus:
+    """Index tiers plus eddy membership from a walk or request snapshot.
 
     The walk is deliberately **unfiltered**: it must see the above-ceiling
     fragments too, because an eddy compiled from one of them is exactly the
@@ -193,15 +196,26 @@ def _read_corpus(vault_path: Path) -> _Corpus:
 
     Args:
         vault_path: Vault root.
+        records: Optional unfiltered, already-parsed fragment records. The
+            caller must not tier-filter them: above-ceiling contributors are
+            exactly what this index needs to see to withhold a compiled page.
 
     Returns:
         The tier index and the eddy membership map.
     """
     tier_by_id: dict[str, PrivacyTier] = {}
     members: dict[str, list[str]] = {}
-    for _path, fragment, _body, raw in iter_vault_fragments(
-        vault_path / _FRAGMENTS_SUBDIR
-    ):
+    source = (
+        (
+            (fragment, raw)
+            for _path, fragment, _body, raw in iter_vault_fragments(
+                vault_path / _FRAGMENTS_SUBDIR
+            )
+        )
+        if records is None
+        else records
+    )
+    for fragment, raw in source:
         tier = frontmatter_tier(raw)
         prior = tier_by_id.get(fragment.id)
         tier_by_id[fragment.id] = (
@@ -498,7 +512,11 @@ def _select_praxis(
 
 
 def related_compiled(
-    seed_ids: Sequence[str], vault_path: Path, ceiling: TierCeiling
+    seed_ids: Sequence[str],
+    vault_path: Path,
+    ceiling: TierCeiling,
+    *,
+    corpus_records: Sequence[tuple[Fragment, dict[str, Any]]] | None = None,
 ) -> RelatedCompiled:
     """Return the compiled structures nearest *seed_ids*, admitted by *ceiling*.
 
@@ -512,6 +530,8 @@ def related_compiled(
             this with more than ``personal``, because
             :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` caps the request
             before dispatch.
+        corpus_records: Optional request-scoped, unfiltered ``01-Fragments``
+            projection. Supplying it avoids parsing those files a second time.
 
     Returns:
         The bounded, admitted view. Empty on both axes when there are no seeds
@@ -520,7 +540,7 @@ def related_compiled(
     seeds = {seed for seed in seed_ids if seed}
     if not seeds:
         return RelatedCompiled([], [])
-    corpus = _read_corpus(vault_path)
+    corpus = _read_corpus(vault_path, corpus_records)
     return RelatedCompiled(
         praxis=_select_praxis(seeds, corpus, vault_path, ceiling),
         eddies=_select_eddies(seeds, corpus, vault_path, ceiling),
