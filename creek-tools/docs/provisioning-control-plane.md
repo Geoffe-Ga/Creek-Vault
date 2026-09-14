@@ -114,6 +114,53 @@ The provider transparently unlocks the attached encrypted volume after a
 scale-to-zero restart. Provider backup/restore is the only MVP recovery
 mechanism.
 
+## Public managed-vault routing (#1807)
+
+The credential handoff never exposes the Machine address. Configure
+`FlyProviderPolicy.routing_public_url` with the HTTPS origin of the shared
+routing service; every allocation then hands Adepthood the same
+`<routing-public-url>/v1` endpoint. The policy refuses plaintext, private-IP,
+`.internal`, credential-bearing, query-bearing, and fragment-bearing values,
+and provisioning fails before creating provider resources when this setting is
+absent.
+
+`build_routing_app` composes the public data-plane process from four injected
+boundaries: `ProvisioningStore`, `RoutingCredentialVerifier`, `RoutingProvider`,
+and an `httpx.AsyncClient` whose network can resolve Fly private DNS. A routing
+credential authenticates to a `RoutingPrincipal(requester_identity,
+consumer_identity)`; those two verified identities are the only inputs to the
+store lookup. The request cannot name a job, activation, allocation, app,
+Machine, hostname, IP, volume, or provider resource. Only a
+`custody_mode=provider_managed`, `ready`, undeleted allocation owned by that
+exact pair can route.
+
+For an admitted request, the Fly driver derives the canonical app from the
+stored activation, verifies the stored provider allocation id, and revalidates
+the Machine's pinned policy and encrypted-volume custody before starting it
+idempotently. It uses Fly's bounded `wait?state=started` operation, then
+re-discovers the Machine and volume and revalidates both (so replacement or
+policy drift cannot produce a stale or unowned target). It returns a validated
+HTTPS `.internal` origin, and the router re-reads ownership before dialing.
+Deletion or replacement races therefore
+either reach the current owned Machine or fail as a content-free refusal.
+Concurrent requests for the same durable allocation generation share one
+in-flight preparation. A caller cancellation does not release a second start
+beside the provider operation already running; cancellation still propagates
+to that caller, and the single flight is forgotten when the bounded preparation
+ends. A deleted and recreated owner-consumer pair has a new generation key and
+can never inherit the prior Machine target.
+
+The router mounts only the published `/v1` method/path table. It preserves the
+consumer bearer, contract-version and tier-ceiling headers for the private
+runtime to enforce, applies the same request body caps and public timeout,
+streams request and response bodies, and strips only hop-by-hop transport and
+caller-supplied forwarding headers. A private response outside the contract's
+closed status set becomes `temporarily_unavailable`, so a provider redirect can
+never publish an internal `Location`. Routing access logs contain the requester
+service identity, route template, status, duration, and correlation id; they
+never contain the per-user consumer identity, credential, internal address,
+provider identifier, request/response body, or content-derived metric.
+
 The retired version-1
 [`key ceremony protocol`](contracts/provisioning-v1/key-ceremony.md) and its
 language-neutral vector remain only for migrated-row and interoperability
