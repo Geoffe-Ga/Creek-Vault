@@ -102,6 +102,18 @@ TOOL_NAME = "creek.reflect"
 _DEFAULT_MAX_NOTES = 6
 _ALLOWED_KINDS = {"reframe", "fear", "longing", "value", "pattern", "tension", "gift"}
 
+_MAX_REQUESTED_NOTES: Final[int] = 10
+_REFLECTION_BASE_OUTPUT_TOKENS: Final[int] = 64
+_REFLECTION_TOKENS_PER_NOTE: Final[int] = 32
+_REFLECTION_MAX_OUTPUT_TOKENS: Final[int] = 128
+"""Trusted output-budget inputs for one reflection model turn (#1820).
+
+The HTTP contract admits one through ten notes. Direct MCP callers still pass
+an ordinary integer, so the count is clamped before it can influence cost. The
+hard cap is the load-bearing production-deadline bound; the smaller values let
+one-note callers buy less generation rather than always paying the maximum.
+"""
+
 _MAX_LIVE_EMBEDS: Final[int] = 256
 """Cache misses one interactive grounding pass may embed from scratch (#1034).
 
@@ -370,8 +382,20 @@ class _LLM(Protocol):
 class _LLMFactory(Protocol):
     """Builds a tier-routed LLM callable; INTIMATE is forced local by the router."""
 
-    def __call__(self, tier: PrivacyTier) -> _LLM:
-        """Return an LLM callable routed for *tier* (may raise to refuse)."""
+    def __call__(self, tier: PrivacyTier, *, max_tokens: int) -> _LLM:
+        """Return a routed LLM callable with a hard output ceiling."""
+
+
+def _bounded_note_count(max_notes: int) -> int:
+    """Clamp any direct-call note count to the public contract's safe range."""
+    return min(max(max_notes, 1), _MAX_REQUESTED_NOTES)
+
+
+def _reflection_output_token_budget(max_notes: int) -> int:
+    """Return the trusted, hard-capped output budget for one reflection turn."""
+    requested = _bounded_note_count(max_notes)
+    scaled = _REFLECTION_BASE_OUTPUT_TOKENS + _REFLECTION_TOKENS_PER_NOTE * requested
+    return min(scaled, _REFLECTION_MAX_OUTPUT_TOKENS)
 
 
 def _routing_tier(ceiling: TierCeiling, entry_tier: PrivacyTier | None) -> PrivacyTier:
@@ -499,14 +523,25 @@ def _clean_notes(
     return cleaned
 
 
-def _build_prompt(entry: str, grounding: list[str]) -> str:
-    """Compose the margin-note prompt from the entry and grounding snippets."""
+def _build_prompt(
+    entry: str,
+    grounding: list[str],
+    *,
+    max_notes: int = _DEFAULT_MAX_NOTES,
+) -> str:
+    """Compose a concise, output-bounded margin-note prompt."""
     sources = "\n\n".join(f"- {snippet}" for snippet in grounding) or "(none)"
     kinds = ", ".join(sorted(_ALLOWED_KINDS))
+    note_limit = _bounded_note_count(max_notes)
     schema = (
         'Return JSON: {"notes": [{"quote": <verbatim span copied from the ENTRY>, '
-        '"kind": <one of: ' + kinds + '>, "note": <a few warm sentences>}]}. '
-        "Every quote MUST be copied verbatim from the ENTRY."
+        '"kind": <one of: '
+        + kinds
+        + '>, "note": <one warm sentence of at most 16 words>}]}. '
+        f"Return at most {note_limit} notes. Every quote MUST be copied verbatim "
+        "from the ENTRY. Keep each note to one warm sentence of at most 16 words. "
+        "Prefer one strong note; add another only when essential. Return JSON only: "
+        "no analysis, preamble, Markdown fence, or essay."
     )
     return (
         CARE_POLICY
@@ -966,8 +1001,9 @@ def reflect_tool(
     )
 
     try:
-        llm = llm_factory(tier)
-        response_text = llm(_build_prompt(entry, grounding.lines))
+        max_tokens = _reflection_output_token_budget(max_notes)
+        llm = llm_factory(tier, max_tokens=max_tokens)
+        response_text = llm(_build_prompt(entry, grounding.lines, max_notes=max_notes))
     except RuntimeError as exc:
         # Covers a missing/unavailable provider AND ``IntimateRoutingError``
         # (a RuntimeError subclass) — the router raises the latter rather than

@@ -105,18 +105,21 @@ class _FactorySpy:
         """
         self._response = response
         self.tiers: list[PrivacyTier] = []
+        self.max_tokens: list[int] = []
         self.prompts: list[str] = []
 
-    def __call__(self, tier: PrivacyTier) -> Callable[[str], str]:
-        """Return the completion callable for *tier*, recording the tier.
+    def __call__(self, tier: PrivacyTier, *, max_tokens: int) -> Callable[[str], str]:
+        """Return the completion callable, recording routing and budget.
 
         Args:
             tier: The routing tier the tool derived.
+            max_tokens: The hard output ceiling the tool derived.
 
         Returns:
             The stub completion callable.
         """
         self.tiers.append(tier)
+        self.max_tokens.append(max_tokens)
 
         def _complete(prompt: str) -> str:
             self.prompts.append(prompt)
@@ -568,16 +571,19 @@ def test_an_unavailable_provider_is_temporarily_unavailable_and_names_no_message
     Args:
         vault: A seeded vault.
     """
-    secret = "zz-provider-internals-1077-zz"
+    internal_detail = "zz-provider-internals-1077-zz"
 
     class _Raising(_FactorySpy):
         """A factory that refuses to build a model callable."""
 
-        def __call__(self, tier: PrivacyTier) -> Callable[[str], str]:
+        def __call__(
+            self, tier: PrivacyTier, *, max_tokens: int
+        ) -> Callable[[str], str]:
             """Refuse, naming an internal detail that must not travel.
 
             Args:
                 tier: The routing tier, recorded before refusing.
+                max_tokens: The requested output ceiling, recorded before refusing.
 
             Returns:
                 Never returns.
@@ -586,13 +592,14 @@ def test_an_unavailable_provider_is_temporarily_unavailable_and_names_no_message
                 RuntimeError: Always.
             """
             self.tiers.append(tier)
-            raise RuntimeError(secret)
+            self.max_tokens.append(max_tokens)
+            raise RuntimeError(internal_detail)
 
     response = _post(vault, ceiling="open", factory=_Raising())
 
     assert response.status_code == _UNAVAILABLE
     assert envelope(response)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
-    assert secret not in response.text
+    assert internal_detail not in response.text
     assert "RuntimeError" not in response.text
 
 

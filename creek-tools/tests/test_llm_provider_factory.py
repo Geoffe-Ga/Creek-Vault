@@ -331,10 +331,10 @@ class TestOllamaProvider:
         assert result.usage is None
 
     @patch("creek.classify.llm.httpx.Client")
-    def test_complete_ignores_max_tokens_and_system(
+    def test_complete_threads_max_tokens_to_num_predict(
         self, mock_client_cls: MagicMock
     ) -> None:
-        """Ollama has no max_tokens/system knobs; extra kwargs are accepted."""
+        """The provider's output ceiling reaches Ollama's ``num_predict``."""
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.return_value = {"response": "ok"}
         ctx = MagicMock()
@@ -344,6 +344,28 @@ class TestOllamaProvider:
 
         result = OllamaProvider(LLMConfig()).complete("p", max_tokens=99, system="sys")
         assert result.text == "ok"
+        payload = ctx.post.call_args.kwargs["json"]
+        assert payload["options"] == {"num_predict": 99}
+        assert payload["think"] is False
+
+    @patch("creek.classify.llm.httpx.Client")
+    def test_complete_surfaces_num_predict_cutoff(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """Ollama's ``length`` reason becomes the provider-neutral cutoff."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "response": '{"notes": [',
+            "done_reason": "length",
+        }
+        ctx = MagicMock()
+        ctx.post.return_value = mock_resp
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = OllamaProvider(LLMConfig()).complete("p", max_tokens=32)
+
+        assert result.stop_reason == "max_tokens"
 
 
 class TestUnsetModelDecoupling:

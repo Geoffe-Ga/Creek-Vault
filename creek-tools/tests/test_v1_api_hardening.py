@@ -1146,7 +1146,7 @@ def _config_read_probe(monkeypatch: pytest.MonkeyPatch, vault: Path) -> _SeamPro
     return probe
 
 
-def _silent_llm_factory() -> Callable[[Any], Callable[[str], str]]:
+def _silent_llm_factory() -> Callable[..., Callable[[str], str]]:
     """Return a tier-keyed LLM factory whose model finds nothing.
 
     ``POST /v1/reflections`` cannot be driven without one, and the reflection's
@@ -1157,15 +1157,18 @@ def _silent_llm_factory() -> Callable[[Any], Callable[[str], str]]:
         A factory returning a completion callable that answers with no notes.
     """
 
-    def _for_tier(_tier: Any) -> Callable[[str], str]:
+    def _for_tier(_tier: Any, *, max_tokens: int) -> Callable[[str], str]:
         """Return the completion callable for any routing tier.
 
         Args:
             _tier: The tier the tool derived, which this stub ignores.
+            max_tokens: The output ceiling, which this stub does not need.
 
         Returns:
             The stub completion callable.
         """
+
+        assert max_tokens > 0
 
         def _complete(_prompt: str) -> str:
             """Answer with a well-formed turn carrying no notes.

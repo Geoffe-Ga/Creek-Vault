@@ -618,36 +618,53 @@ def _extract_anthropic_usage(response: object) -> dict[str, int] | None:
     return counts or None
 
 
-def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
-    """Send a prompt to a local Ollama instance and return the response text.
+def call_ollama(
+    config: LLMConfig,
+    prompt: str,
+    *,
+    timeout: float,
+    max_tokens: int | None = None,
+) -> Completion:
+    """Send a prompt to a local Ollama instance and return its completion.
 
     Args:
         config: LLM provider configuration carrying the Ollama URL and
             model name.
         prompt: The fully-formatted classification prompt.
         timeout: HTTP request timeout in seconds.
+        max_tokens: Optional output-token ceiling, mapped to Ollama's
+            ``options.num_predict``.
 
     Returns:
-        The raw response text from the LLM.
+        The normalized response text and stop reason.
 
     Raises:
         httpx.HTTPStatusError: On HTTP error responses.
         httpx.HTTPError: On connection or transport errors.
     """
+    payload: dict[str, object] = {
+        "model": _resolve_configured_model(config.model, DEFAULT_MODELS["ollama"]),
+        "prompt": prompt,
+        "stream": False,
+    }
+    if max_tokens is not None:
+        payload["options"] = {"num_predict": max_tokens}
+        # A provider-neutral hard output budget cannot be honoured if a
+        # reasoning model spends the entire allowance on a hidden chain of
+        # thought. Ollama's bounded-call contract therefore disables thinking;
+        # unbounded classification calls retain their historical model default.
+        payload["think"] = False
     with httpx.Client(timeout=timeout) as client:
         response = client.post(
             f"{config.ollama_url}/api/generate",
-            json={
-                "model": _resolve_configured_model(
-                    config.model, DEFAULT_MODELS["ollama"]
-                ),
-                "prompt": prompt,
-                "stream": False,
-            },
+            json=payload,
         )
         response.raise_for_status()
         data = response.json()
-        return str(data.get("response", ""))
+        text = str(data.get("response", "")) if isinstance(data, dict) else ""
+        done_reason = data.get("done_reason") if isinstance(data, dict) else None
+        stop_reason = "max_tokens" if done_reason == "length" else "end_turn"
+        return Completion(text=text, stop_reason=stop_reason)
 
 
 _UNREADABLE_OLLAMA_INVENTORY = object()
@@ -799,14 +816,16 @@ class OllamaProvider:
     ) -> Completion:
         """Send *prompt* to Ollama and return a normalized :class:`Completion`.
 
-        Ollama's generate API exposes neither a ``max_tokens`` ceiling nor a
-        cached ``system`` prefix nor token usage, so those kwargs are accepted
-        for protocol compatibility but ignored, and the result carries the
-        default ``"end_turn"`` stop reason with ``usage=None``.
+        Ollama's generate API exposes its output ceiling as
+        ``options.num_predict``; this adapter maps the provider-neutral
+        ``max_tokens`` value to that field, disables hidden reasoning for that
+        bounded call, and normalizes a ``length`` finish to
+        ``stop_reason="max_tokens"``. Ollama has no cached ``system`` prefix on
+        this path, so that argument remains ignored. Token usage is absent.
 
         Args:
             prompt: The fully-formatted prompt.
-            max_tokens: Ignored (Ollama has no output ceiling knob here).
+            max_tokens: Optional output-token ceiling.
             system: Ignored (Ollama has no cached system block).
 
         Returns:
@@ -816,12 +835,12 @@ class OllamaProvider:
             httpx.HTTPStatusError: On HTTP error responses.
             httpx.HTTPError: On connection or transport errors.
         """
-        text = call_ollama(
+        return call_ollama(
             self.config,
             prompt,
             timeout=self.REQUEST_TIMEOUT,
+            max_tokens=max_tokens,
         )
-        return Completion(text=text)
 
 
 #: Endpoint paths on the attested GPU-CC enclave (#760).

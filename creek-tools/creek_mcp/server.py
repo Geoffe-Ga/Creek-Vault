@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from starlette.types import ASGIApp
 
     from creek.author.client import AuthorLLMClient
+    from creek.classify.llm.base import LLMProvider
     from creek.compile.engine import CompileLLM
     from creek.models import PrivacyTier
     from creek_mcp.tools.author import AuthorLLMFactory
@@ -349,7 +350,7 @@ def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
 
     router = load_vault_config(vault).model_router
 
-    def _factory(tier: PrivacyTier) -> _LLM:
+    def _factory(tier: PrivacyTier, *, max_tokens: int) -> _LLM:
         cfg = router.resolve("generation", tier)
         provider = build_provider(cfg)
         if not provider.available:
@@ -358,9 +359,42 @@ def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
                 "Check Ollama or ANTHROPIC_API_KEY configuration."
             )
             raise RuntimeError(msg)
-        return lambda prompt: provider.complete(prompt).text
+        return partial(
+            _complete_reflection,
+            provider,
+            max_tokens=max_tokens,
+        )
 
     return _factory
+
+
+def _complete_reflection(
+    provider: LLMProvider,
+    prompt: str,
+    *,
+    max_tokens: int,
+) -> str:
+    """Return one complete reflection turn, refusing truncated model output.
+
+    Args:
+        provider: The tier-routed provider selected for this request.
+        prompt: The fully formatted reflection prompt.
+        max_tokens: Trusted output ceiling derived by the reflection tool.
+
+    Returns:
+        The provider's complete response text.
+
+    Raises:
+        RuntimeError: When the provider reports that the output ceiling cut the
+            response off. The reflection boundary turns this into its existing
+            structured unavailable response; it never parses partial JSON or
+            retries the same bounded call.
+    """
+    completion = provider.complete(prompt, max_tokens=max_tokens)
+    if completion.stop_reason == "max_tokens":
+        msg = "reflection output reached its token ceiling"
+        raise RuntimeError(msg)
+    return completion.text
 
 
 def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient | None:

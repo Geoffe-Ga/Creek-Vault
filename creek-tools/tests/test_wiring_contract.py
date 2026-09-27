@@ -850,7 +850,9 @@ class Bench:
             vault_path=vault,
             draft_llm_factory=lambda _tier: lambda _prompt: _LLM_CANARY,
             compile_llm_factory=lambda _tier: lambda _prompt: _LLM_CANARY,
-            reflect_llm_factory=lambda: lambda _tier: lambda _prompt: _REFLECT_CANARY,
+            reflect_llm_factory=lambda: (
+                lambda _tier, *, max_tokens: lambda _prompt: _REFLECT_CANARY
+            ),
             author_llm_factory=_author_llm_double,
         )
         args = {
