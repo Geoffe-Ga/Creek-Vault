@@ -80,6 +80,14 @@ idna is transitive-only, but on three *runtime* edges rather than a
 dev-only one — anyio, httpx, and yarl behind discord.py → aiohttp — so
 the floor lives in ``[tool.uv].constraint-dependencies``.
 
+``anyio`` (issue #1818): anyio 4.14.1 and earlier carry
+CVE-2026-63374 (GHSA-82r6-8w77-94w6, TLS certificate spoofing) and
+CVE-2026-64847 (GHSA-5p39-cfhj-2xmp, process-pool stderr deadlock),
+both fixed in 4.14.2. anyio is transitive-only but reaches every
+runtime provider through anthropic, google-genai, httpx, mcp, openai,
+sse-starlette, and starlette. Its floor therefore lives in
+``[tool.uv].constraint-dependencies``.
+
 **The floor here is 3.15 and creek-tools declares 3.19, and that is
 correct.** 3.15 is where the advisory is fixed; creek-tools' higher
 number is not a stricter reading of the same advisory but a different
@@ -277,6 +285,14 @@ _AIOHTTP_PATCHED_VERSION = Version("3.14.1")
 #: 44.0.0, so this supersedes the 48.0.1 floor that answered the older
 #: GHSA-537c-gmf6-5ccf: 48.0.1 sits inside the vulnerable band.
 _CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
+
+#: First anyio release containing the fixes for CVE-2026-63374
+#: (TLS certificate spoofing) and CVE-2026-64847 (process-pool
+#: stderr deadlock).
+_ANYIO_PATCHED_VERSION = Version("4.14.2")
+
+#: The last anyio release covered by both advisories.
+_ANYIO_LAST_VULNERABLE = Version("4.14.1")
 
 #: First idna release containing the fix for CVE-2026-45409
 #: (GHSA-65pc-fj4g-8rjx / PYSEC-2026-215).
@@ -672,6 +688,47 @@ def _locked_pydantic_settings_version() -> Version:
         if package["name"] == "pydantic-settings":
             return Version(str(package["version"]))
     pytest.fail("pydantic-settings has no [[package]] entry in uv.lock")
+
+
+def _anyio_constraint_specifier() -> SpecifierSet:
+    """Return the ``anyio`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``anyio`` constraint entry.
+        Fails the calling test if the ``[tool.uv]`` table or the
+        ``anyio`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "anyio":
+            return requirement.specifier
+    pytest.fail(
+        "anyio has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_anyio_version() -> Version:
+    """Return the resolved ``anyio`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``anyio`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``anyio`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "anyio":
+            return Version(str(package["version"]))
+    pytest.fail("anyio has no [[package]] entry in uv.lock")
 
 
 def _idna_constraint_specifier() -> SpecifierSet:
@@ -1480,6 +1537,45 @@ def test_locked_pydantic_settings_at_or_above_patched_release() -> None:
         f"uv.lock pins pydantic-settings {locked}, below the patched "
         f"{_PYDANTIC_SETTINGS_PATCHED_VERSION} (GHSA-4xgf-cpjx-pc3j); the "
         "exported lock is audited, so relock after adding the constraint"
+    )
+
+
+def test_anyio_floor_rejects_last_vulnerable_release() -> None:
+    """The constraint excludes 4.14.1, the last vulnerable release.
+
+    AnyIO 4.14.1 carries CVE-2026-63374 and CVE-2026-64847. Both
+    advisories are fixed together in 4.14.2, so a lower floor still
+    admits vulnerable releases.
+    """
+    specifier = _anyio_constraint_specifier()
+    assert str(_ANYIO_LAST_VULNERABLE) not in specifier, (
+        f"anyio constraint {specifier!r} admits {_ANYIO_LAST_VULNERABLE}, "
+        "the last release carrying CVE-2026-63374 and CVE-2026-64847; "
+        f"the floor must be >={_ANYIO_PATCHED_VERSION}"
+    )
+
+
+def test_anyio_floor_accepts_patched_release() -> None:
+    """The constraint accepts 4.14.2, the first fully patched release."""
+    specifier = _anyio_constraint_specifier()
+    assert str(_ANYIO_PATCHED_VERSION) in specifier, (
+        f"anyio constraint {specifier!r} rejects {_ANYIO_PATCHED_VERSION}; "
+        "the patched release itself must satisfy the constraint"
+    )
+
+
+def test_locked_anyio_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves anyio to >= 4.14.2.
+
+    AnyIO reaches CrawDad through runtime MCP and HTTP dependency
+    paths, so a stale lock ships both vulnerabilities even if the
+    manifest floor is correct.
+    """
+    locked = _locked_anyio_version()
+    assert locked >= _ANYIO_PATCHED_VERSION, (
+        f"uv.lock pins anyio {locked}, below the patched "
+        f"{_ANYIO_PATCHED_VERSION} (CVE-2026-63374 and CVE-2026-64847); "
+        "the exported lock is audited, so relock after adding the constraint"
     )
 
 
