@@ -621,7 +621,7 @@ def test_server_reflect_factory_routes_with_the_served_vaults_config(
             model="creek-test-generation-model",
         ),
     )
-    server_mod._build_reflect_llm_factory(tuned)(PrivacyTier.OPEN)
+    server_mod._build_reflect_llm_factory(tuned)(PrivacyTier.OPEN, max_tokens=160)
 
     assert seen == ["creek-test-generation-model"], (
         f"_build_reflect_llm_factory resolved {seen} for a vault routing "

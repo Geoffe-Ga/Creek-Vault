@@ -148,7 +148,7 @@ def test_call_tool_reflect_returns_verbatim_notes(vault: Path) -> None:
         transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
-        reflect_llm_factory=lambda: lambda tier: lambda prompt: payload,
+        reflect_llm_factory=lambda: lambda tier, *, max_tokens: lambda prompt: payload,
     )
     result = asyncio.run(
         server.call_tool(
@@ -173,7 +173,9 @@ def test_call_tool_reflect_escalates_on_acute_distress(vault: Path) -> None:
         transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
-        reflect_llm_factory=lambda: lambda tier: lambda prompt: '{"notes": []}',
+        reflect_llm_factory=lambda: (
+            lambda tier, *, max_tokens: lambda prompt: '{"notes": []}'
+        ),
     )
     result = asyncio.run(
         server.call_tool(
@@ -842,19 +844,51 @@ def test_build_reflect_llm_factory_routes_then_degrades(
 
     class _Completion:
         text = "reflected"
+        stop_reason = "end_turn"
 
     class _Provider:
         available = True
+        calls = 0
+        max_tokens: int | None = None
 
-        def complete(self, prompt: str) -> _Completion:
+        def complete(
+            self, prompt: str, *, max_tokens: int | None = None
+        ) -> _Completion:
+            self.calls += 1
+            self.max_tokens = max_tokens
             return _Completion()
 
+    provider = _Provider()
     monkeypatch.setattr(
         "creek.classify.llm.providers.build_provider",
-        lambda cfg: _Provider(),
+        lambda cfg: provider,
     )
     factory = server_mod._build_reflect_llm_factory(tmp_path)
-    assert factory(PrivacyTier.OPEN)("p") == "reflected"
+    assert factory(PrivacyTier.OPEN, max_tokens=160)("p") == "reflected"
+    assert provider.max_tokens == 160
+
+    class _TruncatedCompletion:
+        text = '{"notes": ['
+        stop_reason = "max_tokens"
+
+    class _TruncatingProvider(_Provider):
+        def complete(
+            self, prompt: str, *, max_tokens: int | None = None
+        ) -> _TruncatedCompletion:
+            self.calls += 1
+            self.max_tokens = max_tokens
+            return _TruncatedCompletion()
+
+    truncating = _TruncatingProvider()
+    monkeypatch.setattr(
+        "creek.classify.llm.providers.build_provider",
+        lambda cfg: truncating,
+    )
+    with pytest.raises(RuntimeError):
+        server_mod._build_reflect_llm_factory(tmp_path)(
+            PrivacyTier.OPEN, max_tokens=32
+        )("p")
+    assert truncating.calls == 1
 
     class _Unavailable:
         available = False
@@ -864,7 +898,9 @@ def test_build_reflect_llm_factory_routes_then_degrades(
         lambda cfg: _Unavailable(),
     )
     with pytest.raises(RuntimeError):
-        server_mod._build_reflect_llm_factory(tmp_path)(PrivacyTier.OPEN)
+        server_mod._build_reflect_llm_factory(tmp_path)(
+            PrivacyTier.OPEN, max_tokens=160
+        )
 
 
 # --------------------------------------------------------------------------- #

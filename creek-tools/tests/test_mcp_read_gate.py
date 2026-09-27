@@ -1991,7 +1991,7 @@ argument.
 """
 
 
-def _forbidden_llm_factory(tier: PrivacyTier) -> Any:
+def _forbidden_llm_factory(tier: PrivacyTier, *, max_tokens: int | None = None) -> Any:
     """Fail loudly instead of returning an LLM — the gate must never reach here.
 
     Both probed tools that take it — ``creek.reflect`` and ``creek.compile`` —
@@ -2020,6 +2020,7 @@ def _forbidden_llm_factory(tier: PrivacyTier) -> Any:
             ``RuntimeError``) swallows it, so it surfaces as a test failure
             rather than as a structured refusal.
     """
+    del max_tokens
     msg = (
         "the ceiling gate let an above-ceiling read through to the model: an "
         f"LLM client was built for tier {tier!r} on a request the tool was "
@@ -4507,8 +4508,11 @@ class _RecordingLLMFactory:
         self.prompts: list[str] = []
         self._response = response
 
-    def __call__(self, tier: PrivacyTier) -> Callable[[str], str]:
+    def __call__(
+        self, tier: PrivacyTier, *, max_tokens: int | None = None
+    ) -> Callable[[str], str]:
         """Record *tier* and return the recording completion callable."""
+        del max_tokens
         self.tiers.append(tier)
         return self._complete
 

@@ -97,11 +97,13 @@ class _RecordingFactory:
         """Store the canned LLM response and init the recorded tier + prompt."""
         self.response = response
         self.asked_tier: PrivacyTier | None = None
+        self.asked_max_tokens: int | None = None
         self.prompt: str | None = None
 
-    def __call__(self, tier: PrivacyTier):
-        """Record *tier* and return an LLM callable that records its prompt."""
+    def __call__(self, tier: PrivacyTier, *, max_tokens: int | None = None):
+        """Record routing and output ceilings; return a prompt recorder."""
         self.asked_tier = tier
+        self.asked_max_tokens = max_tokens
 
         def _llm(prompt: str) -> str:
             self.prompt = prompt
@@ -218,10 +220,35 @@ def test_all_ceiling_fails_closed_to_intimate_routing(tmp_path: Path) -> None:
     assert factory.asked_tier is PrivacyTier.INTIMATE
 
 
+@pytest.mark.parametrize(
+    ("max_notes", "expected_tokens"),
+    [(1, 96), (3, 128), (10, 128), (10_000, 128)],
+)
+def test_reflection_passes_a_note_bounded_output_budget(
+    tmp_path: Path,
+    max_notes: int,
+    expected_tokens: int,
+) -> None:
+    """The provider ceiling grows with trusted note capacity, then hard-caps."""
+    factory = _RecordingFactory(_notes_payload())
+
+    reflect_tool(
+        vault_path=_vault(tmp_path),
+        content=_ENTRY,
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        max_notes=max_notes,
+    )
+
+    assert factory.asked_max_tokens == expected_tokens
+
+
 def test_intimate_routing_error_becomes_a_refusal_not_a_crash(tmp_path: Path) -> None:
     """If the router refuses to route INTIMATE locally, reflect refuses cleanly."""
 
-    def _raising_factory(tier: PrivacyTier):
+    def _raising_factory(tier: PrivacyTier, *, max_tokens: int):
+        del max_tokens
         raise IntimateRoutingError("default is cloud")
 
     result = reflect_tool(
@@ -2441,9 +2468,9 @@ class _CountingLookup:
         return RelatedCompiled([], [])
 
 
-def _char_unavailable_factory(tier: PrivacyTier):
+def _char_unavailable_factory(tier: PrivacyTier, *, max_tokens: int):
     """Refuse the way a missing/unavailable provider does."""
-    del tier
+    del tier, max_tokens
     raise RuntimeError("no provider configured")
 
 
