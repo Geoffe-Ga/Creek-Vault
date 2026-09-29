@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from functools import update_wrapper
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TypeAlias
 
 import httpx
 from starlette.applications import Starlette
@@ -44,7 +44,9 @@ if TYPE_CHECKING:
     from creek_mcp.api.routes import RouteSpec
     from creek_mcp.provisioning.models import RoutableAllocation
     from creek_mcp.provisioning.routing import (
+        FlyReplayTarget,
         PrivateVaultTarget,
+        ReplayRoutingProvider,
         RoutingCredentialVerifier,
         RoutingPrincipal,
         RoutingProvider,
@@ -52,6 +54,7 @@ if TYPE_CHECKING:
     from creek_mcp.provisioning.store import ProvisioningStore
 
 _ROUTING_PRINCIPAL: Final[str] = "creek_mcp.httpapi.routing.principal"
+RoutingApplication: TypeAlias = Starlette
 _HOP_BY_HOP: Final[frozenset[bytes]] = frozenset(
     {
         b"connection",
@@ -215,6 +218,81 @@ class AllocationRouter:
         return principal
 
 
+class AllocationReplayRouter:
+    """Resolve one owner to a Fly Proxy replay without exposing private DNS."""
+
+    def __init__(
+        self,
+        store: ProvisioningStore,
+        provider: ReplayRoutingProvider,
+    ) -> None:
+        """Bind the durable ownership source and checked replay provider."""
+        self._store = store
+        self._provider = provider
+        self._preparations: dict[tuple[str, str], asyncio.Task[FlyReplayTarget]] = {}
+
+    async def proxy(self, request: Request) -> Response:
+        """Return one proxy-consumed replay after the second deletion fence."""
+        principal = AllocationRouter._principal(request)
+        if principal.replay_state is None:
+            return error_response(ErrorCode.PRIVACY_REFUSED, context_of(request.scope))
+        allocation = await self._resolve(principal)
+        if allocation is None:
+            return error_response(ErrorCode.PRIVACY_REFUSED, context_of(request.scope))
+        target = await self._prepare(allocation)
+        if target is None:
+            return error_response(
+                ErrorCode.TEMPORARILY_UNAVAILABLE,
+                context_of(request.scope),
+            )
+        if await self._resolve(principal) != allocation:
+            return error_response(ErrorCode.PRIVACY_REFUSED, context_of(request.scope))
+        replay = (
+            f"app={target.app_name};instance={target.machine_id};"
+            f"state={principal.replay_state}"
+        )
+        return Response(status_code=307, headers={"Fly-Replay": replay})
+
+    async def _resolve(
+        self,
+        principal: RoutingPrincipal,
+    ) -> RoutableAllocation | None:
+        return await read_off_loop(
+            self._store.get_routable_allocation,
+            principal.requester_identity,
+            principal.consumer_identity,
+        )
+
+    async def _prepare(
+        self,
+        allocation: RoutableAllocation,
+    ) -> FlyReplayTarget | None:
+        key = (allocation.job_id, allocation.provider_allocation_id)
+        preparation = self._preparations.get(key)
+        if preparation is None:
+            preparation = asyncio.create_task(
+                read_off_loop(self._provider.prepare_replay, allocation)
+            )
+            self._preparations[key] = preparation
+            preparation.add_done_callback(
+                lambda completed: self._forget_preparation(key, completed)
+            )
+        try:
+            return await asyncio.shield(preparation)
+        except ProviderError:
+            return None
+
+    def _forget_preparation(
+        self,
+        key: tuple[str, str],
+        completed: asyncio.Task[FlyReplayTarget],
+    ) -> None:
+        if self._preparations.get(key) is completed:
+            del self._preparations[key]
+        if not completed.cancelled():
+            completed.exception()
+
+
 async def _secret_free_stream(response: httpx.Response) -> AsyncIterator[bytes]:
     """Relay raw body chunks and keep private-URL failures out of error logs."""
     try:
@@ -264,7 +342,7 @@ def _connection_options(headers: list[tuple[bytes, bytes]]) -> frozenset[bytes]:
 
 def _endpoint_for(
     spec: RouteSpec,
-    router: AllocationRouter,
+    router: AllocationRouter | AllocationReplayRouter,
 ) -> Callable[[Request], Awaitable[Response]]:
     """Build one proxy endpoint that records the published route template."""
 
@@ -276,7 +354,10 @@ def _endpoint_for(
     return endpoint
 
 
-def _route_for(spec: RouteSpec, router: AllocationRouter) -> Route:
+def _route_for(
+    spec: RouteSpec,
+    router: AllocationRouter | AllocationReplayRouter,
+) -> Route:
     """Mount exactly the published method, excluding Starlette's implicit HEAD."""
     route = Route(
         spec.path,
@@ -317,6 +398,43 @@ def build_routing_app(
                 BodySizeLimitMiddleware,
                 max_body_bytes=max_body_bytes,
                 route_caps=ROUTE_BODY_CAPS,
+            ),
+            Middleware(CeilingAdmissionMiddleware),
+        ],
+        exception_handlers=routing_exception_handlers(),
+    )
+    app.router.redirect_slashes = REDIRECT_SLASHES
+    return app
+
+
+def build_fly_replay_routing_app(
+    store: ProvisioningStore,
+    verifier: RoutingCredentialVerifier,
+    provider: ReplayRoutingProvider,
+    *,
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+) -> Starlette:
+    """Build the router used only behind the attested Fly edge listener."""
+    router = AllocationReplayRouter(store, provider)
+    routes = [_route_for(spec, router) for spec in ROUTES]
+    replay_caps = {**ROUTE_BODY_CAPS, "/v1/uploads": DEFAULT_MAX_BODY_BYTES}
+    app = Starlette(
+        routes=routes,
+        middleware=[
+            Middleware(AccessLogMiddleware),
+            Middleware(ErrorBoundaryMiddleware),
+            Middleware(
+                ConcurrencyLimitMiddleware,
+                max_concurrency=max_concurrency,
+            ),
+            Middleware(RequestTimeoutMiddleware, timeout_seconds=timeout_seconds),
+            Middleware(RoutingAuthMiddleware, verifier=verifier),
+            Middleware(
+                BodySizeLimitMiddleware,
+                max_body_bytes=max_body_bytes,
+                route_caps=replay_caps,
             ),
             Middleware(CeilingAdmissionMiddleware),
         ],

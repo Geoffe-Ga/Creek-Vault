@@ -116,6 +116,7 @@ def compose(
     *,
     clock: Callable[[], datetime] | None = None,
     transport: httpx.BaseTransport | None = None,
+    fly_replay_enabled: bool = False,
 ) -> WorkerBundle:
     """Build the real store, Fly, encrypted-secret, and callback adapters."""
     observe = clock or _utc_now
@@ -157,6 +158,7 @@ def compose(
                 volume_size_gb=args.fly_volume_size_gb,
                 vault_port=args.vault_port,
                 readiness_timeout_seconds=args.routing_readiness_timeout_seconds,
+                fly_replay_enabled=fly_replay_enabled,
             )
             secrets = EncryptedFileFlySecretManager(
                 args.secret_state_directory,

@@ -14,14 +14,23 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from creek_mcp.httpapi.routing import AllocationRouter, build_routing_app
+from creek_mcp.httpapi.middleware.limits import DEFAULT_MAX_BODY_BYTES
+from creek_mcp.httpapi.routing import (
+    AllocationRouter,
+    build_fly_replay_routing_app,
+    build_routing_app,
+)
 from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.models import (
     CustodyMode,
     FailureReason,
     RoutableAllocation,
 )
-from creek_mcp.provisioning.routing import PrivateVaultTarget, RoutingPrincipal
+from creek_mcp.provisioning.routing import (
+    FlyReplayTarget,
+    PrivateVaultTarget,
+    RoutingPrincipal,
+)
 from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
@@ -214,6 +223,107 @@ def test_authenticated_route_forwards_only_store_owned_v1_contract(
     assert observed[0].headers["X-Creek-Tier-Ceiling"] == "personal"
 
 
+def test_authenticated_replay_targets_exact_isolated_app_without_reading_body(
+    tmp_path: Path,
+) -> None:
+    """The Fly edge receives only checked replay coordinates and opaque state."""
+
+    class ReplayProvider:
+        def __init__(self) -> None:
+            self.calls: list[RoutableAllocation] = []
+
+        def prepare_replay(self, allocation: RoutableAllocation) -> FlyReplayTarget:
+            self.calls.append(allocation)
+            return FlyReplayTarget("creek-vault-a1b2", "0" * 14)
+
+    store = ProvisioningStore(tmp_path / "routing.sqlite3")
+    _ready_allocation(store)
+    provider = ReplayProvider()
+    verifier = FakeRoutingVerifier(RoutingPrincipal("adepthood", "user-001", "s" * 64))
+    client = TestClient(build_fly_replay_routing_app(store, verifier, provider))
+
+    response = client.post(
+        "/v1/classifications",
+        headers=_HEADERS,
+        content=b'{"body":"must-be-replayed-not-consumed"}',
+    )
+
+    assert response.status_code == 307
+    assert response.content == b""
+    assert response.headers["Fly-Replay"] == (
+        f"app=creek-vault-a1b2;instance={'0' * 14};state={'s' * 64}"
+    )
+    assert len(provider.calls) == 1
+
+
+def test_deletion_between_replay_prepare_and_emit_refuses_without_state(
+    tmp_path: Path,
+) -> None:
+    """A late deletion closes the second store fence before replay state leaves."""
+    database = tmp_path / "routing.sqlite3"
+    store = ProvisioningStore(database)
+    _ready_allocation(store)
+
+    class DeletingProvider:
+        def prepare_replay(self, allocation: RoutableAllocation) -> FlyReplayTarget:
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "UPDATE provisioning_allocations SET deleted_at = ? "
+                    "WHERE job_id = ?",
+                    ("2026-09-27T00:00:00+00:00", allocation.job_id),
+                )
+            return FlyReplayTarget("creek-vault-a1b2", "0" * 14)
+
+    verifier = FakeRoutingVerifier(RoutingPrincipal("adepthood", "user-001", "x" * 64))
+    client = TestClient(
+        build_fly_replay_routing_app(store, verifier, DeletingProvider())
+    )
+
+    response = client.get("/v1/capabilities", headers=_HEADERS)
+
+    assert response.status_code == 403
+    assert "Fly-Replay" not in response.headers
+    assert "x" * 64 not in response.text
+
+
+def test_fly_replay_refuses_above_one_mebibyte_before_emitting_target(
+    tmp_path: Path,
+) -> None:
+    """Fly's replay ceiling is inclusive and cannot leak a target on refusal."""
+
+    class ReplayProvider:
+        calls = 0
+
+        def prepare_replay(self, allocation: RoutableAllocation) -> FlyReplayTarget:
+            del allocation
+            self.calls += 1
+            return FlyReplayTarget("creek-vault-a1b2", "0" * 14)
+
+    store = ProvisioningStore(tmp_path / "routing.sqlite3")
+    _ready_allocation(store)
+    provider = ReplayProvider()
+    verifier = FakeRoutingVerifier(RoutingPrincipal("adepthood", "user-001", "s" * 64))
+    replay_client = TestClient(build_fly_replay_routing_app(store, verifier, provider))
+
+    accepted = replay_client.post(
+        "/v1/uploads",
+        headers=_HEADERS,
+        content=b"x" * DEFAULT_MAX_BODY_BYTES,
+    )
+    refused = replay_client.post(
+        "/v1/uploads",
+        headers=_HEADERS,
+        content=b"x" * (DEFAULT_MAX_BODY_BYTES + 1),
+    )
+
+    assert accepted.status_code == 307
+    assert "Fly-Replay" in accepted.headers
+    assert refused.status_code == 422
+    assert "Fly-Replay" not in refused.headers
+    assert "creek-vault" not in refused.text
+    assert provider.calls == 1
+
+
 @pytest.mark.asyncio
 async def test_concurrent_and_cancelled_callers_share_one_provider_start(
     tmp_path: Path,
@@ -298,8 +408,8 @@ def test_proxy_streams_bodies_closes_upstream_and_strips_connection_options(
             200,
             headers={
                 "Content-Type": "application/json",
-                "Connection": "X-Upstream-Secret",
-                "X-Upstream-Secret": "private-response-hop",
+                "Connection": "X-Upstream-Hop",
+                "X-Upstream-Hop": "private-response-hop",
             },
             stream=stream,
             request=request,
@@ -310,8 +420,8 @@ def test_proxy_streams_bodies_closes_upstream_and_strips_connection_options(
         "/v1/voice-drafts/body-stream-canary",
         headers={
             **_HEADERS,
-            "Connection": "X-Route-Secret",
-            "X-Route-Secret": "private-request-hop",
+            "Connection": "X-Route-Hop",
+            "X-Route-Hop": "private-request-hop",
             "Content-Type": "application/json",
         },
         content=b'{"content":"request-body-canary","tier":"open"}',
@@ -320,8 +430,8 @@ def test_proxy_streams_bodies_closes_upstream_and_strips_connection_options(
     assert response.status_code == 200
     assert response.json() == {"streamed": "response-canary"}
     assert observed[0].content == b'{"content":"request-body-canary","tier":"open"}'
-    assert "X-Route-Secret" not in observed[0].headers
-    assert "X-Upstream-Secret" not in response.headers
+    assert "X-Route-Hop" not in observed[0].headers
+    assert "X-Upstream-Hop" not in response.headers
     assert stream.closed is True
 
 

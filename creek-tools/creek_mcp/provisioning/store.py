@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, cast
 from uuid import uuid4
@@ -146,12 +147,35 @@ class ActivationConflictError(ProvisioningStoreError):
     """An activation id already belongs to another requester or subject."""
 
 
+class ActivationAdmissionError(ProvisioningStoreError):
+    """A new activation was refused by the bounded fleet policy."""
+
+
 class InvalidJobTransitionError(ProvisioningStoreError):
     """A requested lifecycle transition is not valid for the current state."""
 
 
 class LostJobLeaseError(ProvisioningStoreError):
     """A worker attempted to settle a claim it no longer owns."""
+
+
+@dataclass(frozen=True, slots=True)
+class ActivationAdmissionPolicy:
+    """Immutable create-admission limits evaluated inside the SQLite fence."""
+
+    new_activations_enabled: bool = True
+    maximum_live_allocations: int = 5
+
+    def __post_init__(self) -> None:
+        """Refuse ambiguous or non-positive limits before serving requests."""
+        if not isinstance(self.new_activations_enabled, bool):
+            raise ValueError("new_activations_enabled must be boolean")
+        if (
+            not isinstance(self.maximum_live_allocations, int)
+            or isinstance(self.maximum_live_allocations, bool)
+            or self.maximum_live_allocations <= 0
+        ):
+            raise ValueError("maximum_live_allocations must be positive")
 
 
 def _utc_now() -> datetime:
@@ -291,6 +315,7 @@ class ProvisioningStore:
         consumer_identity: str,
         requester_identity: str | None = None,
         *,
+        admission: ActivationAdmissionPolicy | None = None,
         now: datetime | None = None,
     ) -> ProvisioningJob:
         """Return one live subject job owned by the authenticated requester."""
@@ -304,7 +329,12 @@ class ProvisioningStore:
         try:
             with self._connect(write=True) as connection:
                 return self._submit(
-                    connection, activation, consumer, requester, instant
+                    connection,
+                    activation,
+                    consumer,
+                    requester,
+                    admission,
+                    instant,
                 )
         except ActivationConflictError:
             # The refused transaction rolled back; count it in a second short write.
@@ -320,6 +350,7 @@ class ProvisioningStore:
         activation: str,
         consumer: str,
         requester: str,
+        admission: ActivationAdmissionPolicy | None,
         instant: datetime,
     ) -> ProvisioningJob:
         """Resolve one activation to its live job inside the caller's write fence."""
@@ -336,6 +367,9 @@ class ProvisioningStore:
             ):
                 raise ActivationConflictError("activation cannot be accepted")
             return self._job_by_id(connection, str(existing["job_id"]))
+
+        if admission is not None:
+            self._require_activation_capacity(connection, admission)
 
         live = connection.execute(
             "SELECT * FROM provisioning_jobs "
@@ -382,6 +416,21 @@ class ProvisioningStore:
             (activation, requester, consumer, job_id),
         )
         return self._job_by_id(connection, job_id)
+
+    @staticmethod
+    def _require_activation_capacity(
+        connection: sqlite3.Connection,
+        admission: ActivationAdmissionPolicy,
+    ) -> None:
+        """Refuse new ids before any alias or job mutation can cross the cap."""
+        if not admission.new_activations_enabled:
+            raise ActivationAdmissionError("new activation unavailable")
+        row = connection.execute(
+            "SELECT COUNT(*) FROM provisioning_jobs WHERE state != 'deleted'"
+        ).fetchone()
+        assert row is not None
+        if int(row[0]) >= admission.maximum_live_allocations:
+            raise ActivationAdmissionError("new activation unavailable")
 
     def get(self, job_id: str, requester_identity: str) -> ProvisioningJob | None:
         """Return *job_id* only when its requester owns it."""

@@ -1,0 +1,83 @@
+app = "{{APP}}"
+primary_region = "{{REGION}}"
+kill_signal = "SIGTERM"
+kill_timeout = 300
+
+[deploy]
+  strategy = "rolling"
+  max_unavailable = 1
+
+[env]
+  CREEK_PILOT_FLY_ORGANIZATION = "{{ORGANIZATION}}"
+  CREEK_PILOT_EXPECTED_APP = "{{APP}}"
+  CREEK_PILOT_FLY_REGION = "{{REGION}}"
+  CREEK_PILOT_VAULT_IMAGE = "{{VAULT_IMAGE}}"
+  CREEK_PILOT_CONTROL_IMAGE = "{{CONTROL_IMAGE}}"
+  CREEK_PILOT_FLY_TOKEN_EXPIRES_AT = "{{TOKEN_EXPIRES_AT}}"
+  CREEK_PILOT_HANDOFF_URL = "{{HANDOFF_URL}}"
+  CREEK_PILOT_ALERT_URL = "{{ALERT_URL}}"
+  CREEK_PILOT_RECONCILE_INTERVAL_SECONDS = "3600"
+  CREEK_PILOT_RECONCILE_WINDOW_SECONDS = "120"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 25
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "10s"
+    method = "GET"
+    path = "/__fly/health"
+    timeout = "2s"
+
+[[mounts]]
+  source = "{{VOLUME}}"
+  destination = "/data"
+  initial_size = "1GB"
+  snapshot_retention = 7
+  scheduled_snapshots = true
+
+[[restart]]
+  policy = "on-failure"
+  retries = 3
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
+
+[[files]]
+  guest_path = "/run/secrets/creek_control_tokens"
+  {{FILE_REFERENCE_KEY}} = "CREEK_CONTROL_TOKENS_B64"
+
+[[files]]
+  guest_path = "/run/secrets/creek_fly_token"
+  {{FILE_REFERENCE_KEY}} = "CREEK_FLY_TOKEN_B64"
+
+[[files]]
+  guest_path = "/run/secrets/creek_secret_master_key"
+  {{FILE_REFERENCE_KEY}} = "CREEK_SECRET_MASTER_KEY_B64"
+
+[[files]]
+  guest_path = "/run/secrets/creek_tls_ca_certificate"
+  {{FILE_REFERENCE_KEY}} = "CREEK_TLS_CA_CERTIFICATE_B64"
+
+[[files]]
+  guest_path = "/run/secrets/creek_tls_ca_private_key"
+  {{FILE_REFERENCE_KEY}} = "CREEK_TLS_CA_PRIVATE_KEY_B64"
+
+[[files]]
+  guest_path = "/run/secrets/creek_handoff_token"
+  {{FILE_REFERENCE_KEY}} = "CREEK_HANDOFF_TOKEN_B64"
+
+[[files]]
+  guest_path = "/run/secrets/creek_fleet_policy"
+  {{FILE_REFERENCE_KEY}} = "CREEK_FLEET_POLICY_B64"

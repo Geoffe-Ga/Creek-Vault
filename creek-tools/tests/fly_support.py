@@ -54,6 +54,7 @@ class FakeSecretManager:
         del activation_id, requester_identity
         return FlyRuntimeSecrets(
             consumer_credential=CONSUMER_TOKEN,
+            replay_state="r" * 64,
             consumer_registry=f"{consumer_identity}={CONSUMER_TOKEN}\n".encode(),
             tls_certificate=b"test-certificate",
             tls_private_key=TLS_KEY.encode(),
@@ -105,6 +106,14 @@ class FakeFlyAPI:
                 del self.malformed[key]
                 return httpx.Response(200, text=body, request=request)
         segments = path.strip("/").split("/")
+        if segments == ["v1", "apps"] and method == "GET":
+            if request.url.params.get("org_slug") != ORGANIZATION:
+                return httpx.Response(404, request=request)
+            return httpx.Response(
+                200,
+                json={"total_apps": len(self.apps), "apps": list(self.apps.values())},
+                request=request,
+            )
         if segments == ["v1", "apps"] and method == "POST":
             return self._create_app(request)
         if len(segments) >= 3 and segments[:2] == ["v1", "apps"]:
@@ -280,6 +289,9 @@ def fly_client(api: FakeFlyAPI) -> httpx.Client:
 def fly_driver(
     api: FakeFlyAPI,
     secrets: FakeSecretManager | None = None,
+    *,
+    discover_organization_apps: bool = False,
+    fly_replay_enabled: bool = False,
 ) -> FlyProviderDriver:
     """Return a driver over *api* with the synthetic org-scoped credential."""
     credential = FlyCredential(
@@ -293,6 +305,8 @@ def fly_driver(
         image=IMAGE,
         routing_public_url=ROUTING_PUBLIC_URL,
         api_base_url=API_BASE_URL,
+        discover_organization_apps=discover_organization_apps,
+        fly_replay_enabled=fly_replay_enabled,
     )
     return FlyProviderDriver(
         policy, credential, secrets or FakeSecretManager(set()), fly_client(api)

@@ -19,6 +19,8 @@ from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
 from creek_mcp.httpapi.middleware.boundary import ErrorBoundaryMiddleware
 from creek_mcp.provisioning.api import CONTRACT_VERSION, ActivationRequest
 from creek_mcp.provisioning.store import (
+    ActivationAdmissionError,
+    ActivationAdmissionPolicy,
     ActivationConflictError,
     InvalidJobTransitionError,
     ProvisioningStore,
@@ -92,10 +94,12 @@ class ProvisioningAPI:
         self,
         store: ProvisioningStore,
         *,
+        admission: ActivationAdmissionPolicy,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         """Bind handlers to the injected durable store and request clock."""
         self._store = store
+        self._admission = admission
         self._clock = clock
 
     async def activate(self, request: Request) -> Response:
@@ -111,6 +115,13 @@ class ProvisioningAPI:
                 payload.activation_id,
                 payload.consumer_identity,
                 requester,
+            )
+        except ActivationAdmissionError:
+            return _error(
+                request,
+                "activation_unavailable",
+                "new activation unavailable",
+                503,
             )
         except ActivationConflictError:
             return _error(
@@ -169,6 +180,7 @@ class ProvisioningAPI:
             activation_id,
             consumer_identity,
             requester,
+            admission=self._admission,
             now=self._clock(),
         )
 
@@ -209,6 +221,7 @@ def build_provisioning_app(
     store: ProvisioningStore,
     verifier: ConsumerTokenVerifier,
     *,
+    admission: ActivationAdmissionPolicy | None = None,
     clock: Callable[[], datetime] = _utc_now,
 ) -> Starlette:
     """Build the authenticated control plane without injecting a provider driver.
@@ -218,6 +231,7 @@ def build_provisioning_app(
     """
     api = ProvisioningAPI(
         store,
+        admission=admission or ActivationAdmissionPolicy(),
         clock=clock,
     )
     routes = [

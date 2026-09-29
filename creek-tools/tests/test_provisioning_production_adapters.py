@@ -113,6 +113,8 @@ def test_runtime_secret_issue_is_restart_safe_encrypted_and_revocable(
     assert first.consumer_registry == (
         f"{_CONSUMER}={first.consumer_credential}\n".encode()
     )
+    assert len(first.replay_state) >= 43
+    assert first.replay_state != first.consumer_credential
     certificate = x509.load_pem_x509_certificate(first.tls_certificate)
     names = certificate.extensions.get_extension_for_class(
         x509.SubjectAlternativeName
@@ -122,12 +124,70 @@ def test_runtime_secret_issue_is_restart_safe_encrypted_and_revocable(
         path.read_bytes() for path in (tmp_path / "runtime-secrets").iterdir()
     )
     assert first.consumer_credential.encode() not in persisted
+    assert first.replay_state.encode() not in persisted
     assert first.tls_private_key not in persisted
 
     first_manager.revoke(_ACTIVATION)
     first_manager.revoke(_ACTIVATION)
     with pytest.raises(ValueError, match="revoked"):
         first_manager.issue(_ACTIVATION, _CONSUMER, requester_identity=_REQUESTER)
+
+
+@pytest.mark.asyncio
+async def test_pre_replay_encrypted_bundle_remains_restart_and_router_compatible(
+    tmp_path: Path,
+) -> None:
+    """Adding replay state cannot strand an existing ordinary TLS allocation."""
+    manager = _secret_manager(tmp_path)
+    credential = "legacy-consumer-credential-canary"
+    document = {
+        "activation_id": _ACTIVATION,
+        "requester_identity": _REQUESTER,
+        "consumer_identity": _CONSUMER,
+        "consumer_credential": credential,
+        "consumer_registry": production_secrets._b64(
+            f"{_CONSUMER}={credential}\n".encode()
+        ),
+        "tls_certificate": production_secrets._b64(b"legacy-certificate"),
+        "tls_private_key": production_secrets._b64(b"legacy-private-key"),
+    }
+    digest = production_secrets._activation_digest(_ACTIVATION)
+    nonce = b"n" * 12
+    encrypted = nonce + AESGCM(b"m" * 32).encrypt(
+        nonce,
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode(),
+        production_secrets._aad(digest),
+    )
+    bundle_path = tmp_path / "runtime-secrets" / f"{digest}.bundle"
+    bundle_path.write_bytes(encrypted)
+    bundle_path.chmod(0o600)
+
+    first = manager.issue(
+        _ACTIVATION,
+        _CONSUMER,
+        requester_identity=_REQUESTER,
+    )
+    restarted = EncryptedFileFlySecretManager(
+        tmp_path / "runtime-secrets",
+        master_key_file=tmp_path / "master-key",
+        ca_certificate_file=tmp_path / "ca.crt",
+        ca_private_key_file=tmp_path / "ca.key",
+        app_prefix="creek-vault",
+        clock=lambda: _NOW,
+    ).issue(_ACTIVATION, _CONSUMER, requester_identity=_REQUESTER)
+    verifier = EncryptedFileRoutingCredentialVerifier(
+        tmp_path / "runtime-secrets",
+        master_key_file=tmp_path / "master-key",
+    )
+
+    assert first == restarted
+    assert first.consumer_credential == credential
+    assert len(first.replay_state) == 64
+    assert await verifier.verify_credential(credential) == RoutingPrincipal(
+        _REQUESTER,
+        _CONSUMER,
+        first.replay_state,
+    )
 
 
 def test_runtime_secret_manager_refuses_unsafe_files_and_identity(
@@ -212,7 +272,7 @@ async def test_routing_verifier_binds_exact_encrypted_owner_after_restart(
         principal = await verifier.verify_credential(issued.consumer_credential)
         unknown = await verifier.verify_credential("unknown-routing-credential")
 
-    assert principal == RoutingPrincipal(_REQUESTER, _CONSUMER)
+    assert principal == RoutingPrincipal(_REQUESTER, _CONSUMER, issued.replay_state)
     assert unknown is None
     assert len(comparisons) == 2
     persisted = b"".join(
@@ -221,6 +281,7 @@ async def test_routing_verifier_binds_exact_encrypted_owner_after_restart(
     rendered = repr(verifier) + caplog.text
     for secret in (
         issued.consumer_credential,
+        issued.replay_state,
         _REQUESTER,
         _CONSUMER,
         _ACTIVATION,

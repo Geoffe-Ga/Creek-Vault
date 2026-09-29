@@ -9,7 +9,26 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Fix the managed-vault Fly pilot deployment boundary: one supervised control
+  Machine now owns the API, durable worker, replay router, and scheduled fleet
+  report over one volume; isolated vault networks route through authenticated
+  Fly replay with exact Machine drift checks and a 1 MiB replay ceiling. Add a
+  strict offline `fly.toml` renderer and authorization-gated `--ha=false`
+  deployment verifier without changing the ordinary TLS vault runtime.
+
 ### Added
+
+- **Bounded managed-vault Fly pilot controls (#1806).** Provisioning contract
+  2.1 adds SQLite-atomic live-allocation admission, a five-allocation production
+  default, and a disable-new-activations switch whose refusal writes nothing
+  and reaches no provider. `creek-provisioning-router` now composes the real
+  encrypted credential verifier, Fly cold-start driver, pinned private CA,
+  public TLS boundary, and a short-lived-token route fence. Fleet reports use
+  Fly's org-scoped app inventory to find forgotten prefixed resources without a
+  hand-maintained file. The pilot runbook gates every billable mutation on
+  explicit authorization and covers digest pinning, scheduled alerts/reconcile,
+  atomic state backup, SQLite and stopped-volume restore, emergency stop,
+  invoice reconciliation, token revocation, and secret-free evidence.
 
 - **Honest provider-managed custody for ordinary Fly vaults (#1808).**
   Provisioning contract 2.0 removes the public key-ceremony endpoints and moves

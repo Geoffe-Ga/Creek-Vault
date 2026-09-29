@@ -114,7 +114,7 @@ def _fly_args(tmp_path: Path, token_mode: int = 0o600) -> list[str]:
         "--fly-api-base-url",
         "https://fly.test",
         "--fly-token-expires-at",
-        "2026-12-31T00:00:00+00:00",
+        "2026-09-15T07:00:00+00:00",
     ]
 
 
@@ -281,6 +281,66 @@ def test_report_exits_one_when_the_provider_inventory_is_unavailable(
     assert "provider_unavailable" in captured.err
     assert _CANARY not in captured.err
 
+    supervised = main(
+        [
+            "report",
+            "--database",
+            str(database),
+            "--policy-file",
+            _policy_file(tmp_path, name="supervised.toml"),
+        ],
+        compose=_compose(Outage()),
+        emit_output=False,
+    )
+    suppressed = capsys.readouterr()
+    assert supervised == 1
+    assert suppressed.out == suppressed.err == ""
+
+
+def test_supervised_report_emits_no_private_inventory_or_alert_subject(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The in-Machine schedule never writes private provider IDs to logs."""
+    database = tmp_path / "jobs.sqlite3"
+    ProvisioningStore(database)
+    driver = FakeProviderDriver()
+    private_subject = "private-provider-allocation-canary"
+    driver.seed_resource(
+        ProviderResource(
+            private_subject,
+            ResourceClass.MACHINE,
+            ResourceState.STOPPED,
+            1,
+            None,
+            "private-machine-canary",
+        )
+    )
+    delivered: list[tuple[str, ...]] = []
+
+    with caplog.at_level(logging.WARNING):
+        code = main(
+            [
+                "report",
+                "--database",
+                str(database),
+                "--policy-file",
+                _policy_file(tmp_path),
+            ],
+            compose=_compose(driver),
+            emit_output=False,
+            alert_sink=delivered.append,
+        )
+
+    captured = capsys.readouterr()
+    assert code == 3
+    assert captured.out == captured.err == ""
+    assert "fleet alert kind=orphan_resource" in caplog.text
+    assert private_subject not in caplog.text
+    assert "private-machine-canary" not in caplog.text
+    assert delivered == [("orphan_resource",)]
+
 
 def test_emergency_stop_stops_live_machines_never_deletes_and_continues_past_failures(
     tmp_path: Path,
@@ -349,8 +409,10 @@ def test_cli_takes_the_fly_token_only_from_an_owner_only_file_and_rejects_bad_in
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Usage errors exit 2, name the offending key, and echo no file content."""
+    monkeypatch.setattr(fleet_cli, "_utc_now", lambda: _NOW)
     database = str(tmp_path / "jobs.sqlite3")
     policy = _policy_file(tmp_path)
 
@@ -558,7 +620,10 @@ def test_fly_composition_uses_a_refusing_secret_manager_and_fails_closed_on_prov
     )
 
     bundle = fleet_cli.compose_fly(
-        args, parser, transport=httpx.MockTransport(api.handle)
+        args,
+        parser,
+        clock=lambda: _NOW,
+        transport=httpx.MockTransport(api.handle),
     )
 
     assert isinstance(bundle.inventory, FlyProviderDriver)
@@ -569,6 +634,38 @@ def test_fly_composition_uses_a_refusing_secret_manager_and_fails_closed_on_prov
     assert raised.value.retryable is False
     assert not any(method == "POST" for method, _ in api.requests)
     assert bundle.inventory.list_resources([]) == ()
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [
+        "2026-09-11T07:00:00+00:00",
+        "2026-09-18T07:00:01+00:00",
+    ],
+)
+def test_fly_composition_refuses_expired_or_long_lived_org_tokens(
+    tmp_path: Path,
+    expires_at: str,
+) -> None:
+    """Every provider process enforces the pilot's seven-day token ceiling."""
+    parser = build_parser()
+    arguments = _fly_args(tmp_path)
+    arguments[-1] = expires_at
+    args = parser.parse_args(
+        [
+            "report",
+            "--database",
+            str(tmp_path / "j.sqlite3"),
+            "--policy-file",
+            "p",
+            *arguments,
+        ]
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        fleet_cli.compose_fly(args, parser, clock=lambda: _NOW)
+
+    assert raised.value.code == 2
 
 
 def test_record_month_names_a_closed_month_and_refuses_an_open_one(

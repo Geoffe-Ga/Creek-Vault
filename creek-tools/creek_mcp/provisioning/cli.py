@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 
 from creek_mcp.httpapi.provisioning import build_provisioning_app
-from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.store import ActivationAdmissionPolicy, ProvisioningStore
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
@@ -33,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8830)
     parser.add_argument("--tls-cert", type=Path)
     parser.add_argument("--tls-key", type=Path)
+    parser.add_argument("--maximum-live-allocations", type=_positive_int, default=5)
+    parser.add_argument("--disable-new-activations", action="store_true")
     return parser
 
 
@@ -56,16 +58,34 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     require_transport_confidentiality(parser, args)
-    verifier = _load_verifier(args.consumer_tokens_file, parser)
-    store = ProvisioningStore(args.database)
+    app = compose(args, parser)
     uvicorn.run(
-        build_provisioning_app(store, verifier),
+        app,
         host=args.host,
         port=args.port,
         ssl_certfile=None if args.tls_cert is None else str(args.tls_cert),
         ssl_keyfile=None if args.tls_key is None else str(args.tls_key),
         access_log=False,
     )
+
+
+def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Any:
+    """Build the provider-free control app for direct or Fly-edge serving."""
+    verifier = _load_verifier(args.consumer_tokens_file, parser)
+    store = ProvisioningStore(args.database)
+    admission = ActivationAdmissionPolicy(
+        new_activations_enabled=not args.disable_new_activations,
+        maximum_live_allocations=args.maximum_live_allocations,
+    )
+    return build_provisioning_app(store, verifier, admission=admission)
+
+
+def _positive_int(value: str) -> int:
+    """Parse one positive integer without accepting boolean-like spellings."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 if __name__ == "__main__":

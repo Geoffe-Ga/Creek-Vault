@@ -110,6 +110,7 @@ from creek_mcp.httpapi.middleware.boundary import (
     log_unhandled_fault,
 )
 from creek_mcp.httpapi.middleware.ceiling import CeilingAdmissionMiddleware
+from creek_mcp.httpapi.middleware.fly_replay import FlyReplayStateMiddleware
 from creek_mcp.httpapi.middleware.limits import (
     DEFAULT_MAX_BODY_BYTES,
     DEFAULT_MAX_CONCURRENCY,
@@ -460,8 +461,9 @@ def _middleware(
     timeout_seconds: float,
     max_concurrency: int,
     max_per_consumer: int,
+    fly_replay_state: str | None,
 ) -> list[Middleware]:
-    """Return the eight-layer stack, outermost first.
+    """Return the ordinary eight layers plus an optional Fly replay guard.
 
     The order is load-bearing and pinned by a test; see
     :mod:`creek_mcp.httpapi.middleware` for what each adjacent pair buys.
@@ -476,28 +478,39 @@ def _middleware(
         max_per_consumer: In-flight request limit for any one configured
             consumer. A second ceiling below authentication, never a
             replacement for the process-wide one above it (#1110).
+        fly_replay_state: Exact mounted Fly replay state, or ``None`` to keep
+            the ordinary TLS runtime's eight-layer stack unchanged.
 
     Returns:
         The middleware stack.
     """
-    return [
+    layers = [
         Middleware(AccessLogMiddleware),
         Middleware(ErrorBoundaryMiddleware),
         Middleware(ConcurrencyLimitMiddleware, max_concurrency=max_concurrency),
         Middleware(RequestTimeoutMiddleware, timeout_seconds=timeout_seconds),
-        Middleware(BearerAuthMiddleware, verifier=verifier),
-        Middleware(
-            ConsumerConcurrencyLimitMiddleware,
-            consumers=verifier.consumers,
-            max_per_consumer=max_per_consumer,
-        ),
-        Middleware(
-            BodySizeLimitMiddleware,
-            max_body_bytes=max_body_bytes,
-            route_caps=ROUTE_BODY_CAPS,
-        ),
-        Middleware(CeilingAdmissionMiddleware),
     ]
+    if fly_replay_state is not None:
+        layers.append(
+            Middleware(FlyReplayStateMiddleware, expected_state=fly_replay_state)
+        )
+    layers.extend(
+        [
+            Middleware(BearerAuthMiddleware, verifier=verifier),
+            Middleware(
+                ConsumerConcurrencyLimitMiddleware,
+                consumers=verifier.consumers,
+                max_per_consumer=max_per_consumer,
+            ),
+            Middleware(
+                BodySizeLimitMiddleware,
+                max_body_bytes=max_body_bytes,
+                route_caps=ROUTE_BODY_CAPS,
+            ),
+            Middleware(CeilingAdmissionMiddleware),
+        ]
+    )
+    return layers
 
 
 def create_app(
@@ -509,6 +522,7 @@ def create_app(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     max_per_consumer: int = DEFAULT_MAX_PER_CONSUMER,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
+    fly_replay_state: str | None = None,
 ) -> Starlette:
     """Build the ``/v1`` application.
 
@@ -558,6 +572,7 @@ def create_app(
             timeout_seconds,
             max_concurrency,
             max_per_consumer,
+            fly_replay_state,
         ),
         exception_handlers=routing_exception_handlers(),
     )

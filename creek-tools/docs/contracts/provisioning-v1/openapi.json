@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Provisioning Control Plane",
-    "version": "2.0.0",
+    "version": "2.1.0",
     "description": "Authenticated asynchronous job API for one isolated provider-managed vault allocation per consumer subject. Ordinary Fly storage is not no-escrow or user-recoverable."
   },
   "security": [
@@ -46,6 +46,10 @@
           },
           "409": {
             "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error",
+            "description": "New activation refused by the live-allocation cap or admission stop switch"
           }
         }
       }

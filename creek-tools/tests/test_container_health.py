@@ -10,6 +10,7 @@ import httpx
 from creek.config import VAULT_CONFIG_RELPATH
 from creek_mcp.container_health import ProbeStatus, ProbeTarget, probe
 from creek_mcp.container_runtime import ContainerSettings
+from creek_mcp.fly_vault_runtime import REPLAY_STATE_FILE_ENV
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -209,6 +210,45 @@ def test_v1_probe_reads_bearer_from_secret_mount_not_arguments(
     assert observed["url"] == "https://127.0.0.1:8823/v1/health"
     assert observed["headers"] == {"Authorization": f"Bearer {_TOKEN}"}
     assert _TOKEN not in str(observed["url"])
+
+
+def test_fly_replay_probe_uses_loopback_plaintext_with_both_auth_factors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Fly-only health probe proves replay state and bearer on loopback."""
+    from creek_mcp import container_health as health
+
+    settings = _settings(tmp_path)
+    replay = tmp_path / "replay-state"
+    state = "s" * 64
+    replay.write_text(state, encoding="ascii")
+    replay.chmod(0o600)
+    observed: dict[str, object] = {}
+
+    def fake_get(
+        url: str,
+        *,
+        headers: dict[str, str],
+        timeout: float,
+        verify: object,
+    ) -> httpx.Response:
+        observed.update(url=url, headers=headers, timeout=timeout, verify=verify)
+        return httpx.Response(200, json={"status": "ok"})
+
+    monkeypatch.setenv(REPLAY_STATE_FILE_ENV, str(replay))
+    monkeypatch.setattr(health.httpx, "get", fake_get)
+
+    assert health._v1_is_ready(settings) is True
+    assert observed == {
+        "url": "http://127.0.0.1:8823/v1/health",
+        "headers": {
+            "Authorization": f"Bearer {_TOKEN}",
+            "Fly-Replay-Src": f"state={state}",
+        },
+        "timeout": 2.0,
+        "verify": False,
+    }
 
 
 def test_v1_probe_treats_transport_failure_as_unready(

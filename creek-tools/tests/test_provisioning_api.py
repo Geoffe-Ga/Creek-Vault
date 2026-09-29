@@ -12,7 +12,10 @@ from starlette.testclient import TestClient
 from creek_mcp.httpapi.provisioning import build_provisioning_app
 from creek_mcp.provisioning.api import CONTRACT_VERSION
 from creek_mcp.provisioning.models import FailureReason, JobState
-from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.store import (
+    ActivationAdmissionPolicy,
+    ProvisioningStore,
+)
 from creek_mcp.remote_auth import ConsumerTokenVerifier
 
 if TYPE_CHECKING:
@@ -244,6 +247,117 @@ def test_concurrent_http_activations_share_one_job(
     assert len(job_ids) == 1
     assert store.count_jobs() == 1
     assert store.count_activation_ids() == 16
+
+
+def test_disabled_admission_replays_only_the_exact_existing_activation(
+    store: ProvisioningStore,
+) -> None:
+    """The stop switch preserves existing jobs but creates no new alias or job."""
+    verifier = ConsumerTokenVerifier({"adepthood": (_TOKEN,)})
+    enabled = TestClient(
+        build_provisioning_app(
+            store,
+            verifier,
+            admission=ActivationAdmissionPolicy(
+                new_activations_enabled=True,
+                maximum_live_allocations=5,
+            ),
+        )
+    )
+    created = _submit(enabled, "activation-before-stop", consumer_identity="user-one")
+    disabled = TestClient(
+        build_provisioning_app(
+            store,
+            verifier,
+            admission=ActivationAdmissionPolicy(
+                new_activations_enabled=False,
+                maximum_live_allocations=5,
+            ),
+        )
+    )
+
+    replay = _submit(
+        disabled,
+        "activation-before-stop",
+        consumer_identity="user-one",
+    )
+    refused_alias = _submit(
+        disabled,
+        "activation-new-alias",
+        consumer_identity="user-one",
+    )
+    refused_subject = _submit(
+        disabled,
+        "activation-new-subject",
+        consumer_identity="user-two",
+    )
+    status = disabled.get(created.json()["status_url"], headers=_headers())
+    deletion = disabled.delete(created.json()["status_url"], headers=_headers())
+
+    assert replay.status_code == 202
+    assert replay.json() == created.json()
+    assert refused_alias.status_code == 503
+    assert refused_subject.status_code == 503
+    assert refused_alias.json()["code"] == "activation_unavailable"
+    assert refused_subject.json()["code"] == "activation_unavailable"
+    assert status.status_code == 200
+    assert deletion.status_code == 202
+    assert deletion.json()["state"] == JobState.DELETING.value
+    assert store.count_jobs() == 1
+    assert store.count_activation_ids() == 1
+
+
+def test_live_allocation_cap_is_atomic_across_concurrent_api_instances(
+    store: ProvisioningStore,
+) -> None:
+    """Two API processes cannot both cross the configured allocation ceiling."""
+    verifier = ConsumerTokenVerifier({"adepthood": (_TOKEN,)})
+    admission = ActivationAdmissionPolicy(
+        new_activations_enabled=True,
+        maximum_live_allocations=1,
+    )
+    apps = (
+        build_provisioning_app(store, verifier, admission=admission),
+        build_provisioning_app(store, verifier, admission=admission),
+    )
+
+    def submit(number: int) -> tuple[int, str]:
+        with TestClient(apps[number]) as client:
+            response = _submit(
+                client,
+                f"activation-cap-{number}",
+                consumer_identity=f"user-cap-{number}",
+            )
+        return response.status_code, str(response.json().get("code", "accepted"))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(submit, range(2)))
+
+    assert sorted(results) == [(202, "accepted"), (503, "activation_unavailable")]
+    assert store.count_jobs() == 1
+    assert store.count_activation_ids() == 1
+
+
+@pytest.mark.parametrize(
+    ("enabled", "maximum"),
+    [
+        (1, 5),
+        (True, True),
+        (True, 0),
+        (True, -1),
+        (True, 1.5),
+    ],
+)
+def test_activation_admission_policy_rejects_ambiguous_limits(
+    enabled: object,
+    maximum: object,
+) -> None:
+    """Only a strict boolean switch and positive integer cap are accepted."""
+    with pytest.raises(ValueError):
+        ActivationAdmissionPolicy(
+            new_activations_enabled=cast("bool", enabled),
+            maximum_live_allocations=cast("int", maximum),
+        )
 
 
 def test_invalid_payload_and_invalid_retry_return_stable_errors(

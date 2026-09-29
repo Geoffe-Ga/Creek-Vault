@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import ssl
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Final
 
 import httpx
@@ -17,6 +19,7 @@ from creek_mcp.container_runtime import (
     is_mounted_volume,
     load_consumer_secret,
 )
+from creek_mcp.fly_vault_runtime import REPLAY_STATE_FILE_ENV, _load_replay_state
 
 _PROBE_TIMEOUT: Final[float] = 2.0
 
@@ -87,12 +90,27 @@ def _v1_is_ready(settings: ContainerSettings) -> bool:
     """Call authenticated ``/v1/health`` using only mounted credentials."""
     try:
         secret = load_consumer_secret(settings.consumer_tokens_file)
-        context = ssl.create_default_context(cafile=str(settings.tls_cert_file))
+        replay_path = os.environ.get(REPLAY_STATE_FILE_ENV)
+        if replay_path is None:
+            scheme = "https"
+            verify: ssl.SSLContext | bool = ssl.create_default_context(
+                cafile=str(settings.tls_cert_file)
+            )
+            replay_headers: dict[str, str] = {}
+        else:
+            scheme = "http"
+            verify = False
+            replay_headers = {
+                "Fly-Replay-Src": f"state={_load_replay_state(Path(replay_path))}"
+            }
         response = httpx.get(
-            f"https://{settings.probe_host}:{settings.port}/v1/health",
-            headers={"Authorization": f"Bearer {secret.tokens[0]}"},
+            f"{scheme}://{settings.probe_host}:{settings.port}/v1/health",
+            headers={
+                "Authorization": f"Bearer {secret.tokens[0]}",
+                **replay_headers,
+            },
             timeout=_PROBE_TIMEOUT,
-            verify=context,
+            verify=verify,
         )
         return response.status_code == 200 and response.json() == {"status": "ok"}
     except (ContainerConfigurationError, OSError, ValueError, httpx.HTTPError):

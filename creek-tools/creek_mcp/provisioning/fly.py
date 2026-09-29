@@ -18,6 +18,7 @@ import stat
 from dataclasses import dataclass, field
 from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Any, Final, Never, Protocol, cast
+from urllib.parse import urlencode
 
 import httpx
 
@@ -30,7 +31,8 @@ from creek_mcp.provisioning.models import (
     ResourceState,
     RoutableAllocation,
 )
-from creek_mcp.provisioning.routing import PrivateVaultTarget
+from creek_mcp.provisioning.replay_contract import is_replay_state
+from creek_mcp.provisioning.routing import FlyReplayTarget, PrivateVaultTarget
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -135,6 +137,7 @@ class FlyRuntimeSecrets:
     """Secret-manager output installed as files in one Machine."""
 
     consumer_credential: str = field(repr=False)
+    replay_state: str = field(repr=False)
     consumer_registry: bytes = field(repr=False)
     tls_certificate: bytes = field(repr=False)
     tls_private_key: bytes = field(repr=False)
@@ -143,12 +146,15 @@ class FlyRuntimeSecrets:
         """Refuse incomplete bundles before creating a billable resource."""
         values = (
             self.consumer_credential.encode(),
+            self.replay_state.encode(),
             self.consumer_registry,
             self.tls_certificate,
             self.tls_private_key,
         )
         if any(not value for value in values):
             raise ValueError("Fly runtime secret bundle must be complete")
+        if not is_replay_state(self.replay_state):
+            raise ValueError("Fly replay state is invalid")
 
 
 class FlySecretManager(Protocol):
@@ -209,6 +215,8 @@ class FlyProviderPolicy:
     volume_size_gb: int = _DEFAULT_VOLUME_GB
     vault_port: int = _DEFAULT_VAULT_PORT
     readiness_timeout_seconds: int = _DEFAULT_READINESS_TIMEOUT_SECONDS
+    discover_organization_apps: bool = False
+    fly_replay_enabled: bool = False
 
     def __post_init__(self) -> None:
         """Validate configuration before any provider request is possible."""
@@ -240,6 +248,10 @@ class FlyProviderPolicy:
         )
         if any(value <= 0 for value in positive):
             raise ValueError("Fly provider numeric policy values must be positive")
+        if not isinstance(self.discover_organization_apps, bool):
+            raise ValueError("Fly organization discovery flag must be boolean")
+        if not isinstance(self.fly_replay_enabled, bool):
+            raise ValueError("Fly replay flag must be boolean")
         if self.routing_public_url is not None:
             _validate_public_route_url(self.routing_public_url)
 
@@ -300,33 +312,62 @@ class FlyProviderDriver:
 
     def prepare_route(self, allocation: RoutableAllocation) -> PrivateVaultTarget:
         """Start and wait for one store-owned allocation, then derive its target."""
+        if self._policy.fly_replay_enabled:
+            self._rejected("private routing is disabled for Fly replay allocations")
+        reference, ready = self._prepare_machine(allocation)
+        machine_id = self._identifier(ready, "Machine")
+        return PrivateVaultTarget(
+            f"https://{machine_id}.vm.{reference.app_name}.internal:"
+            f"{self._policy.vault_port}"
+        )
+
+    def prepare_replay(self, allocation: RoutableAllocation) -> FlyReplayTarget:
+        """Start one isolated vault and return only its Fly replay coordinates."""
+        if not self._policy.fly_replay_enabled:
+            self._rejected("Fly replay is disabled for private TLS allocations")
+        reference, ready = self._prepare_machine(allocation)
+        return FlyReplayTarget(
+            app_name=reference.app_name,
+            machine_id=self._identifier(ready, "Machine"),
+        )
+
+    def _prepare_machine(
+        self,
+        allocation: RoutableAllocation,
+    ) -> tuple[_AllocationRef, Mapping[str, Any]]:
+        """Converge and revalidate the exact store-owned Machine generation."""
         reference = self._reference(allocation.activation_id)
         if allocation.provider_allocation_id != reference.allocation_id:
             self._rejected("provider allocation identity does not match activation")
+        self._require_app(reference)
         machine = self._require_machine(reference)
         volume = self._require_volume(reference)
+        runtime_secrets = self._secrets.issue(
+            allocation.activation_id,
+            allocation.consumer_identity,
+            requester_identity=allocation.requester_identity,
+        )
         self._verify_machine(
             machine,
             reference,
             self._identifier(volume, "volume"),
+            runtime_secrets,
         )
         if str(machine.get("state")) not in {"started", "starting"}:
             self._change_machine_state(reference, machine, "start")
         self._wait_until_started(reference, machine)
+        self._require_app(reference)
         ready = self._require_machine(reference)
         ready_volume = self._require_volume(reference)
         self._verify_machine(
             ready,
             reference,
             self._identifier(ready_volume, "volume"),
+            runtime_secrets,
         )
         if str(ready.get("state")) != "started":
             self._unavailable("Fly Machine readiness did not converge")
-        machine_id = self._identifier(ready, "Machine")
-        return PrivateVaultTarget(
-            f"https://{machine_id}.vm.{reference.app_name}.internal:"
-            f"{self._policy.vault_port}"
-        )
+        return reference, ready
 
     def start(self, activation_id: str) -> None:
         """Idempotently start one allocation after caller authentication."""
@@ -407,16 +448,23 @@ class FlyProviderDriver:
         """Inventory the bounded known set with per-app GET calls only.
 
         Apps are derived from *activation_ids* and taken from *app_names* only
-        when they match the derived shape ``<app_prefix>-<24 hex>`` exactly;
-        there is no org-wide listing.  Every resource is
-        grouped by the allocation id derived from the app it lives in, never by
-        the metadata it claims.
+        when they match the derived shape ``<app_prefix>-<24 hex>`` exactly.
+        Production policy also discovers names from the configured organization
+        and applies that same closed pattern before issuing any per-app request.
+        Every resource is grouped by the allocation id derived from the app it
+        lives in, never by the metadata it claims.
         """
         prefix = f"{self._policy.app_prefix}-"
         derived = re.compile(
             rf"{re.escape(prefix)}[0-9a-f]{{{_ALLOCATION_DIGEST_LENGTH}}}"
         )
         names = {self._reference(activation).app_name for activation in activation_ids}
+        if self._policy.discover_organization_apps:
+            names.update(
+                name
+                for name in self._organization_app_names()
+                if derived.fullmatch(name)
+            )
         names.update(name for name in app_names if derived.fullmatch(name))
         resources: list[ProviderResource] = []
         for name in sorted(names):
@@ -447,6 +495,29 @@ class FlyProviderDriver:
                 for volume in self._objects(volumes, "Fly volume list")
             )
         return tuple(sorted(resources, key=_resource_key))
+
+    def _organization_app_names(self) -> tuple[str, ...]:
+        """Discover app names from the credential's one organization."""
+        query = urlencode({"org_slug": self._policy.organization})
+        response = self._request("GET", f"/v1/apps?{query}", expected=(200,))
+        document = self._object(response, "Fly organization app inventory")
+        apps = document.get("apps")
+        total = document.get("total_apps")
+        if (
+            not isinstance(apps, list)
+            or any(not isinstance(app, dict) for app in apps)
+            or not isinstance(total, int)
+            or isinstance(total, bool)
+            or total != len(apps)
+        ):
+            self._unavailable("Fly organization app inventory was invalid")
+        names: list[str] = []
+        for app in cast("list[Mapping[str, Any]]", apps):
+            name = app.get("name")
+            if not isinstance(name, str):
+                self._unavailable("Fly organization app inventory was invalid")
+            names.append(name)
+        return tuple(names)
 
     def expected_allocation_id(self, activation_id: str) -> str:
         """Return the allocation id a provisioned *activation_id* carries."""
@@ -514,14 +585,30 @@ class FlyProviderDriver:
                 expected=(200,),
             )
         app = self._object(response, "Fly app")
+        self._verify_app(app, reference)
+        return app
+
+    def _require_app(self, reference: _AllocationRef) -> Mapping[str, Any]:
+        """Return one existing app only when its org and custom network match."""
+        app = self._app_by_name(reference.app_name)
+        if app is None:
+            self._unavailable("Fly allocation app is missing")
+        self._verify_app(app, reference)
+        return app
+
+    def _verify_app(
+        self,
+        app: Mapping[str, Any],
+        reference: _AllocationRef,
+    ) -> None:
+        """Require the dedicated organization and allocation-scoped network."""
         organization = app.get("organization")
         if not isinstance(organization, dict) or organization.get("slug") != (
             self._policy.organization
         ):
             self._rejected("Fly app organization does not match policy")
-        if app.get("network") not in {None, reference.allocation_id}:
+        if app.get("network") != reference.allocation_id:
             self._rejected("Fly app private network does not match allocation")
-        return app
 
     def _ensure_volume(self, reference: _AllocationRef) -> Mapping[str, Any]:
         matches = self._matching_volumes(reference)
@@ -588,7 +675,7 @@ class FlyProviderDriver:
                 else [self._object(response, "Fly Machine")]
             )
         machine = self._only(matches, "Fly Machine")
-        self._verify_machine(machine, reference, volume_id)
+        self._verify_machine(machine, reference, volume_id, runtime_secrets)
         return machine
 
     def _machine_request(
@@ -598,11 +685,8 @@ class FlyProviderDriver:
         volume_id: str,
         runtime_secrets: FlyRuntimeSecrets,
     ) -> dict[str, Any]:
-        encoded_files = (
-            ("/run/secrets/creek_consumer_tokens", runtime_secrets.consumer_registry),
-            ("/run/secrets/tls.crt", runtime_secrets.tls_certificate),
-            ("/run/secrets/tls.key", runtime_secrets.tls_private_key),
-        )
+        encoded_files = self._runtime_secret_files(runtime_secrets)
+        runtime = self._runtime_config(reference)
         return {
             "name": reference.machine_name,
             "region": self._policy.region,
@@ -633,17 +717,69 @@ class FlyProviderDriver:
                     for path, value in encoded_files
                 ],
                 "restart": {"policy": "no"},
-                "services": [
-                    {
-                        "protocol": "tcp",
-                        "internal_port": self._policy.vault_port,
-                        "ports": [],
-                        "autostart": True,
-                        "autostop": "stop",
-                        "min_machines_running": 0,
-                    }
-                ],
+                "services": [self._runtime_service()],
+                **runtime,
             },
+        }
+
+    def _runtime_secret_files(
+        self,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> tuple[tuple[str, bytes], ...]:
+        """Return only the secret files required by the selected runtime."""
+        consumer = (
+            "/run/secrets/creek_consumer_tokens",
+            runtime_secrets.consumer_registry,
+        )
+        if self._policy.fly_replay_enabled:
+            return (
+                consumer,
+                (
+                    "/run/secrets/creek_replay_state",
+                    runtime_secrets.replay_state.encode(),
+                ),
+            )
+        return (
+            consumer,
+            ("/run/secrets/tls.crt", runtime_secrets.tls_certificate),
+            ("/run/secrets/tls.key", runtime_secrets.tls_private_key),
+        )
+
+    def _runtime_config(self, reference: _AllocationRef) -> dict[str, object]:
+        """Return Fly-only bootstrap fields without changing ordinary TLS."""
+        if not self._policy.fly_replay_enabled:
+            return {}
+        return {
+            "user": "root",
+            "env": {
+                "CREEK_CONTAINER_FLY_REPLAY_STATE_FILE": (
+                    "/run/secrets/creek_replay_state"
+                ),
+                "CREEK_CONTAINER_EXPECTED_FLY_APP": reference.app_name,
+                "CREEK_CONTAINER_EXPECTED_FLY_REGION": self._policy.region,
+            },
+            "init": {
+                "exec": [
+                    "python",
+                    "-m",
+                    "creek_mcp.provisioning.fly_vault_bootstrap",
+                ]
+            },
+        }
+
+    def _runtime_service(self) -> dict[str, object]:
+        """Return the exact service for ordinary private TLS or Fly replay."""
+        return {
+            "protocol": "tcp",
+            "internal_port": self._policy.vault_port,
+            "ports": (
+                [{"port": 443, "handlers": ["tls", "http"]}]
+                if self._policy.fly_replay_enabled
+                else []
+            ),
+            "autostart": True,
+            "autostop": "stop",
+            "min_machines_running": 0,
         }
 
     def _verify_machine(
@@ -651,21 +787,45 @@ class FlyProviderDriver:
         machine: Mapping[str, Any],
         reference: _AllocationRef,
         volume_id: str,
+        runtime_secrets: FlyRuntimeSecrets,
     ) -> None:
         config = machine.get("config")
         if not isinstance(config, dict):
             self._rejected("Fly Machine has no inspectable config")
         metadata = config.get("metadata")
         mount = {"volume": volume_id, "path": _VAULT_MOUNT, "encrypted": True}
+        files = config.get("files")
+        expected_files = [
+            {
+                "guest_path": path,
+                "raw_value": base64.b64encode(value).decode("ascii"),
+            }
+            for path, value in self._runtime_secret_files(runtime_secrets)
+        ]
+        runtime = self._runtime_config(reference)
         if (
-            machine.get("region") != self._policy.region
+            machine.get("name") != reference.machine_name
+            or machine.get("region") != self._policy.region
             or config.get("image") != self._policy.image
             or metadata
             != {
                 "creek_allocation_id": reference.allocation_id,
                 "creek_activation_id": reference.activation_id,
             }
-            or mount not in cast("list[object]", config.get("mounts", []))
+            or config.get("rootfs")
+            != {"size_gb": self._policy.rootfs_size_gb, "persist": "never"}
+            or config.get("guest")
+            != {
+                "cpu_kind": self._policy.cpu_kind,
+                "cpus": self._policy.cpus,
+                "memory_mb": self._policy.memory_mb,
+            }
+            or config.get("mounts") != [mount]
+            or config.get("restart") != {"policy": "no"}
+            or any(config.get(key) != value for key, value in runtime.items())
+            or any(key in config for key in {"env", "init", "user"} - runtime.keys())
+            or config.get("services") != [self._runtime_service()]
+            or files != expected_files
         ):
             self._rejected("Fly Machine does not match allocation policy")
 

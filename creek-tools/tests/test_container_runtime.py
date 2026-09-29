@@ -242,4 +242,7 @@ def test_runtime_keeps_credentials_out_of_environment_and_process_args(
     assert observed["token_env"] is None
     assert _TOKEN not in repr(observed["app"])
     assert _TOKEN not in repr(observed["args"])
+    server_args = vars(observed["args"])
+    assert server_args["tls_cert"] == settings.tls_cert_file
+    assert server_args["tls_key"] == settings.tls_key_file
     assert os.environ[CONFIG_PATH_ENV_VAR] == str(settings.config_path)

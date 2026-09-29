@@ -710,3 +710,8 @@ def remote_auth_settings() -> AuthSettings:
         resource_server_url=AnyHttpUrl(_RESOURCE_URL),
         required_scopes=[REMOTE_SCOPE],
     )
+
+
+def secrets_match(supplied: bytes, expected: bytes) -> bool:
+    """Compare two already-encoded secret values in constant time."""
+    return hmac.compare_digest(supplied, expected)

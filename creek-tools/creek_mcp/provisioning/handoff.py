@@ -44,7 +44,7 @@ class HttpOneTimeCredentialHandoff:
         ):
             raise ValueError("handoff URL must be the HTTPS internal completion route")
         self._completion_url = str(url)
-        self._bearer = _read_bearer(bearer_file)
+        self._bearer = read_bearer_file(bearer_file)
         self._client = client or httpx.Client(timeout=httpx.Timeout(10))
 
     def deliver(
@@ -76,7 +76,7 @@ class HttpOneTimeCredentialHandoff:
         raise HandoffError(retryable=retryable)
 
 
-def _read_bearer(path: Path) -> str:
+def read_bearer_file(path: Path) -> str:
     """Load a mounted callback bearer without preserving decoding detail."""
     try:
         bearer = read_owner_only_file(path).decode("utf-8").strip()
