@@ -54,9 +54,10 @@ dependencies = [
     # Bleichenbacher oracle through distinguishable errors and timing.
     # Introduced in 44.0.0, fixed in 50.0.0 (#1167).
     "cryptography>=50.0.0",
-    # Security: pin urllib3 above CVE-2026-44431 / CVE-2026-44432
-    # (transitive via requests/conan). Both are fixed in 2.7.0.
-    "urllib3>=2.7.0",
+    # Security: pin urllib3 above CVE-2026-97687, CVE-2026-97688, and
+    # CVE-2026-97689 (transitive via requests/conan). All three are fixed
+    # in 2.8.0 (#1823), superseding the earlier 2.7.0 floor.
+    "urllib3>=2.8.0",
     # Security: pin idna above CVE-2026-45409 (transitive via httpx /
     # requests). Fixed in 3.15 — that is the security floor, and it does
     # not move. The declared floor is higher only because a floor also
@@ -294,7 +295,15 @@ constraint-dependencies = [
     # (CVE-2026-69247), the PKCS#7 EnvelopedData Bleichenbacher oracle.
     # Fixed in 50.0.0 (#1167).
     "cryptography>=50.0.0",
-    "pyjwt>=2.13.0",
+    # Security: oauthlib is transitive via the gdrive extra →
+    # google-auth-oauthlib → requests-oauthlib. CVE-2026-49265 is fixed
+    # in 4.0.0 (#1823).
+    "oauthlib>=4.0.0",
+    # Security: pyjwt is transitive via mcp → pyjwt[crypto]. Eleven
+    # 2026-09-30 findings are fixed in 2.14.0, but CVE-2026-101918
+    # remains until 2.15.0, so 2.15.0 is the first fully patched release
+    # (#1823).
+    "pyjwt>=2.15.0",
     # Security: pin python-multipart above the FOUR advisories carried by
     # 0.0.29 — PYSEC-2026-3036 (CVE-2026-53539), PYSEC-2026-3037
     # (CVE-2026-53538), PYSEC-2026-3041 (CVE-2026-53537) and
@@ -358,6 +367,11 @@ constraint-dependencies = [
     # crawdad/pyproject.toml so both projects resolve the same native
     # extension on the shared MCP path.
     "rpds-py>=2026.6.3",
+    # Security: virtualenv is build/dev tooling pulled by pre-commit.
+    # PYSEC-2026-4011 through PYSEC-2026-4014 land across 21.7.11,
+    # 21.7.12, and 21.7.13; 21.7.13 is the first release fixing all four
+    # (#1823).
+    "virtualenv>=21.7.13",
 ]
 
 [tool.setuptools.packages.find]
