@@ -129,13 +129,21 @@ record bound to the exact app, organization slug and private provider
 organization ID, region, the exact USD 25.00 pilot spend cap, and
 `cross_network_replays_enabled=true`. Pass the approved mode-0400 or mode-0600
 org-token file with `--token-file`; the helper requires the effective operator
-to own the regular file, rejects symlinks and multiline, control-bearing, or
-oversized values, strips ambient Fly token/config variables, and creates a
-disposable mode-0700 `HOME` with a sole mode-0600 flyctl config. The token is
-never placed in argv or an environment value, and the home is removed on every
-exit. Runtime credentials remain owner-only mounted files. Before mutation the
-helper verifies the exact organization slug/ID and the target app's membership
-with read-only flyctl calls. It also inventories Machines and volumes: only an
+to own the regular file, admits Fly's exact `FlyV1 ` prefix separator and
+provider token alphabet, rejects symlinks and every other whitespace,
+multiline, control-bearing, delimiter-bearing, or oversized value, strips all
+ambient credentials and Fly configuration from the child process, and creates a
+disposable mode-0700 `HOME` with a sole mode-0600 flyctl config. The helper
+writes the complete validated token as flyctl's unquoted `access_token` scalar;
+flyctl's official parser removes the authorization scheme itself. A fresh
+`last_login` value marks only the start of that disposable command session so
+current flyctl does not misclassify the file-backed scoped token as an expired
+interactive login; the token's provider-enforced caveats and expiry remain
+authoritative. The owner-only source file remains unchanged. The token is never
+placed in argv or an environment value, and the home is removed on every exit.
+Runtime credentials remain owner-only mounted files. Before
+mutation the helper verifies the exact organization slug/ID and the target
+app's membership with read-only flyctl calls. It also inventories Machines and volumes: only an
 empty pair or one already exact, admissible Machine/volume pair may proceed.
 Duplicate, partial, drifted, or uninspectable state is refused before mutation.
 It then runs

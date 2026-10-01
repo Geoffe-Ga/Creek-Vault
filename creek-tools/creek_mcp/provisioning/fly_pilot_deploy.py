@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -41,15 +42,10 @@ _HASH_PREFIX: Final[str] = "sha256:"
 _MAX_AUTHORIZATION_WINDOW: Final[timedelta] = timedelta(days=7)
 _PILOT_SPEND_CAP_USD_CENTS: Final[int] = 2500
 _MAX_TOKEN_FILE_BYTES: Final[int] = 4096
-_FLY_AMBIENT_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "FLY_ACCESS_TOKEN",
-        "FLY_API_TOKEN",
-        "FLY_CONFIG_DIR",
-        "FLY_TOKEN",
-        "FLYCTL_ACCESS_TOKEN",
-        "XDG_CONFIG_HOME",
-    }
+_FLY_TOKEN_PREFIX: Final[str] = "FlyV1 "
+_FLY_TOKEN_PAYLOAD_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_+/,=-]+")
+_FLY_CHILD_ENV_KEYS: Final[frozenset[str]] = frozenset(
+    {"LANG", "LC_ALL", "NO_COLOR", "PATH", "TERM"}
 )
 
 
@@ -323,7 +319,14 @@ def _isolated_fly_environment(token_file: Path) -> Iterator[dict[str, str]]:
         config = fly_directory / "config.yml"
         descriptor = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            value = f"access_token: {json.dumps(token)}\n".encode()
+            # flyctl treats credentials loaded from its config as an interactive
+            # session unless a recent timestamp accompanies them.  This timestamp
+            # records the start of this isolated, one-command session; the scoped
+            # token's own caveats remain the authority and expiry boundary.
+            session_started_at = datetime.now(UTC).isoformat()
+            value = (
+                f"access_token: {token}\nlast_login: {session_started_at}\n"
+            ).encode()
             os.write(descriptor, value)
             os.fsync(descriptor)
         finally:
@@ -331,8 +334,9 @@ def _isolated_fly_environment(token_file: Path) -> Iterator[dict[str, str]]:
         environment = {
             key: value
             for key, value in os.environ.items()
-            if key not in _FLY_AMBIENT_KEYS and key != "HOME"
+            if key in _FLY_CHILD_ENV_KEYS
         }
+        environment.setdefault("PATH", os.defpath)
         environment["HOME"] = str(home)
         yield environment
 
@@ -364,9 +368,10 @@ def _read_token_file(path: Path) -> str:
         raise ValueError("Fly pilot token file is invalid") from exc
     if token.endswith("\n"):
         token = token[:-1]
-    if not token or any(
-        character.isspace() or not 0x21 <= ord(character) <= 0x7E for character in token
-    ):
+    if not token.startswith(_FLY_TOKEN_PREFIX):
+        raise ValueError("Fly pilot token file is invalid")
+    payload = token[len(_FLY_TOKEN_PREFIX) :]
+    if _FLY_TOKEN_PAYLOAD_RE.fullmatch(payload) is None:
         raise ValueError("Fly pilot token file is invalid")
     return token
 
