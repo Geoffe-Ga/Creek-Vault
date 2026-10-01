@@ -47,6 +47,21 @@ _FLY_TOKEN_PAYLOAD_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_+/,=-]+"
 _FLY_CHILD_ENV_KEYS: Final[frozenset[str]] = frozenset(
     {"LANG", "LC_ALL", "NO_COLOR", "PATH", "TERM"}
 )
+_EXPECTED_HEALTH_CHECKS: Final[list[dict[str, object]]] = [
+    {
+        "grace_period": "30s",
+        "interval": "10s",
+        "method": "GET",
+        "path": "/__fly/health",
+        "timeout": "2s",
+        "type": "http",
+    }
+]
+_EXPECTED_CONCURRENCY: Final[dict[str, object]] = {
+    "hard_limit": 25,
+    "soft_limit": 20,
+    "type": "requests",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,19 +207,7 @@ def deploy(
                 execute,
                 ["fly", "volumes", "list", "--app", coordinates.app, "--json"],
             )
-            machine_id, volume = _cardinality(machines, volumes)
-            machine = _run_fly_json(
-                execute,
-                [
-                    "fly",
-                    "machine",
-                    "status",
-                    machine_id,
-                    "--app",
-                    coordinates.app,
-                    "--json",
-                ],
-            )
+            machine_id, machine, volume = _cardinality(machines, volumes)
             _verify_post_state(machine, volume, machine_id, coordinates)
 
 
@@ -226,19 +229,7 @@ def _verify_preflight_state(
     if machines == []:
         _verify_precreated_volume(volumes, coordinates)
         return
-    machine_id, volume = _cardinality(machines, volumes)
-    machine = _run_fly_json(
-        run,
-        [
-            "fly",
-            "machine",
-            "status",
-            machine_id,
-            "--app",
-            coordinates.app,
-            "--json",
-        ],
-    )
+    machine_id, machine, volume = _cardinality(machines, volumes)
     _verify_machine_state(
         machine,
         volume,
@@ -383,7 +374,10 @@ def _read_token_file(path: Path) -> str:
     return token
 
 
-def _cardinality(machines: object, volumes: object) -> tuple[str, dict[str, object]]:
+def _cardinality(
+    machines: object,
+    volumes: object,
+) -> tuple[str, dict[str, object], dict[str, object]]:
     if not isinstance(machines, list) or len(machines) != 1:
         raise RuntimeError("Fly pilot post-state Machine count is not one")
     if not isinstance(volumes, list) or len(volumes) != 1:
@@ -396,7 +390,7 @@ def _cardinality(machines: object, volumes: object) -> tuple[str, dict[str, obje
         or not isinstance(volume, dict)
     ):
         raise RuntimeError("Fly pilot post-state inventory is invalid")
-    return machine["id"], volume
+    return machine["id"], machine, volume
 
 
 def _verify_post_state(
@@ -447,8 +441,9 @@ def _verify_machine_state(
         or guest != {"cpu_kind": "shared", "cpus": 1, "memory_mb": 1024}
         or restart != {"policy": "on-failure", "max_retries": 3}
         or not isinstance(volume_id, str)
-        or not _mount_is_exact(mounts, volume_id)
+        or not _mount_is_exact(mounts, volume_id, coordinates.volume)
         or not _service_is_exact(services)
+        or volume.get("name", volume.get("Name")) != coordinates.volume
         or volume.get("region") != coordinates.region
         or volume.get("encrypted") is not True
         or volume.get("attached_machine_id") != machine_id
@@ -456,13 +451,25 @@ def _verify_machine_state(
         raise RuntimeError(f"Fly pilot {phase} drifted from reviewed policy")
 
 
-def _mount_is_exact(mounts: object, volume_id: object) -> bool:
-    """Accept Fly's documented mount shape; volume inventory proves encryption."""
+def _mount_is_exact(
+    mounts: object,
+    volume_id: object,
+    volume_name: str,
+) -> bool:
+    """Accept only Fly's current enriched list mount shape exactly."""
     if not isinstance(volume_id, str) or not isinstance(mounts, list):
         return False
-    return mounts in (
-        [{"volume": volume_id, "path": "/data"}],
-        [{"volume": volume_id, "path": "/data", "encrypted": True}],
+    if len(mounts) != 1 or not isinstance(mounts[0], dict):
+        return False
+    mount = mounts[0]
+    if set(mount) != {"volume", "path", "encrypted", "name", "size_gb"}:
+        return False
+    return (
+        mount.get("volume") == volume_id
+        and mount.get("path") == "/data"
+        and mount.get("encrypted") is True
+        and mount.get("name") == volume_name
+        and mount.get("size_gb") == 1
     )
 
 
@@ -472,15 +479,43 @@ def _service_is_exact(services: object) -> bool:
     service = services[0]
     if not isinstance(service, dict):
         return False
+    if set(service) != {
+        "protocol",
+        "internal_port",
+        "ports",
+        "autostart",
+        "autostop",
+        "checks",
+        "concurrency",
+        "force_instance_key",
+        "min_machines_running",
+    }:
+        return False
     ports = service.get("ports")
+    if not isinstance(ports, list) or len(ports) != 2:
+        return False
+    first, second = ports
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    if set(first) != {"port", "handlers", "force_https"} or set(second) != {
+        "port",
+        "handlers",
+    }:
+        return False
     return (
         service.get("protocol") == "tcp"
         and service.get("internal_port") == 8080
-        and ports
-        == [
-            {"port": 80, "handlers": ["http"]},
-            {"port": 443, "handlers": ["tls", "http"]},
-        ]
+        and first.get("port") == 80
+        and first.get("handlers") == ["http"]
+        and first.get("force_https") is True
+        and second.get("port") == 443
+        and second.get("handlers") in (["tls", "http"], ["http", "tls"])
+        and service.get("autostart") is True
+        and service.get("autostop") is False
+        and service.get("checks") == _EXPECTED_HEALTH_CHECKS
+        and service.get("concurrency") == _EXPECTED_CONCURRENCY
+        and service.get("force_instance_key") is None
+        and service.get("min_machines_running") == 1
     )
 
 
