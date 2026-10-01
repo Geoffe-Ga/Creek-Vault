@@ -82,6 +82,203 @@ def _apps_document() -> bytes:
     ).encode()
 
 
+def _machine_document(
+    *,
+    mount_encrypted: bool | None = True,
+    provider_list_shape: bool = True,
+) -> dict[str, Any]:
+    mount: dict[str, Any] = {
+        "volume": "private-volume",
+        "path": "/data",
+    }
+    if mount_encrypted is not None:
+        mount["encrypted"] = mount_encrypted
+    if provider_list_shape:
+        mount.update({"name": _coordinates().volume, "size_gb": 1})
+    service: dict[str, Any] = {
+        "protocol": "tcp",
+        "internal_port": 8080,
+        "ports": [
+            {"port": 80, "handlers": ["http"]},
+            {"port": 443, "handlers": ["tls", "http"]},
+        ],
+    }
+    if provider_list_shape:
+        service.update(
+            {
+                "autostart": True,
+                "autostop": False,
+                "checks": [
+                    {
+                        "grace_period": "30s",
+                        "interval": "10s",
+                        "method": "GET",
+                        "path": "/__fly/health",
+                        "timeout": "2s",
+                        "type": "http",
+                    }
+                ],
+                "concurrency": {
+                    "hard_limit": 25,
+                    "soft_limit": 20,
+                    "type": "requests",
+                },
+                "force_instance_key": None,
+                "min_machines_running": 1,
+            }
+        )
+        service["ports"][0]["force_https"] = True
+        service["ports"][1]["handlers"] = ["http", "tls"]
+    return {
+        "id": "private-machine",
+        "region": "iad",
+        "state": "started",
+        "image_ref": {"digest": "sha256:" + "b" * 64},
+        "config": {
+            "image": _coordinates().control_image,
+            "guest": {"cpu_kind": "shared", "cpus": 1, "memory_mb": 1024},
+            "restart": {"policy": "on-failure", "max_retries": 3},
+            "mounts": [mount],
+            "services": [service],
+        },
+    }
+
+
+def test_deploy_verifies_post_state_from_supported_json_inventory(
+    tmp_path: Path,
+) -> None:
+    """The live Fly CLI exposes JSON on list, not on machine status."""
+    authorization, digest = _authorization(tmp_path)
+    token_file = _token_file(tmp_path)
+    machine_lists = 0
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], _environ: dict[str, str]) -> CommandResult:
+        nonlocal machine_lists
+        commands.append(command)
+        if command[1:3] == ["orgs", "show"]:
+            return CommandResult(_org_document())
+        if command[1:3] == ["apps", "list"]:
+            return CommandResult(_apps_document())
+        if command[1:3] == ["machine", "list"]:
+            machine_lists += 1
+            machines = (
+                []
+                if machine_lists == 1
+                else [_machine_document(provider_list_shape=True)]
+            )
+            return CommandResult(json.dumps(machines).encode())
+        if command[1:3] == ["volumes", "list"]:
+            volumes = []
+            if machine_lists > 1:
+                volumes = [
+                    {
+                        "id": "private-volume",
+                        "name": _coordinates().volume,
+                        "region": "iad",
+                        "encrypted": True,
+                        "attached_machine_id": "private-machine",
+                    }
+                ]
+            return CommandResult(json.dumps(volumes).encode())
+        if command[1:3] == ["machine", "status"]:
+            raise AssertionError("fly machine status does not support --json")
+        return CommandResult(b"")
+
+    deploy(
+        _TEMPLATE,
+        _coordinates(),
+        token_file,
+        authorization,
+        digest,
+        run=fake_run,
+        now=_NOW,
+    )
+
+    assert not any(command[1:3] == ["machine", "status"] for command in commands)
+
+
+def test_enriched_provider_inventory_remains_fail_closed() -> None:
+    """Fly's extra list fields are accepted only at their reviewed values."""
+    machine = _machine_document(provider_list_shape=True)
+    config = machine["config"]
+    mount = config["mounts"][0]
+    service = config["services"][0]
+
+    assert fly_pilot_deploy._mount_is_exact(
+        config["mounts"], "private-volume", _coordinates().volume
+    )
+    assert fly_pilot_deploy._service_is_exact(config["services"])
+
+    mount["size_gb"] = 2
+    service["autostop"] = True
+
+    assert not fly_pilot_deploy._mount_is_exact(
+        config["mounts"], "private-volume", _coordinates().volume
+    )
+    assert not fly_pilot_deploy._service_is_exact(config["services"])
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "autostart",
+        "autostop",
+        "checks",
+        "concurrency",
+        "force_instance_key",
+        "min_machines_running",
+    ],
+)
+def test_enriched_provider_rejects_every_missing_service_attestation(
+    field: str,
+) -> None:
+    """A missing current-list policy field is not replaced by a safe default."""
+    machine = _machine_document()
+    service = machine["config"]["services"][0]
+    del service[field]
+
+    assert not fly_pilot_deploy._service_is_exact(machine["config"]["services"])
+
+
+@pytest.mark.parametrize("field", ["volume", "path", "encrypted", "name", "size_gb"])
+def test_enriched_provider_rejects_every_missing_mount_attestation(
+    field: str,
+) -> None:
+    """Current-list mount enrichment must be present rather than inferred."""
+    machine = _machine_document()
+    mount = machine["config"]["mounts"][0]
+    del mount[field]
+
+    assert not fly_pilot_deploy._mount_is_exact(
+        machine["config"]["mounts"],
+        "private-volume",
+        _coordinates().volume,
+    )
+
+
+def test_enriched_provider_rejects_missing_force_https_attestation() -> None:
+    """Port 80 must explicitly attest the reviewed HTTPS redirect policy."""
+    machine = _machine_document()
+    del machine["config"]["services"][0]["ports"][0]["force_https"]
+
+    assert not fly_pilot_deploy._service_is_exact(machine["config"]["services"])
+
+
+def test_enriched_provider_rejects_unknown_or_duplicate_service_fields() -> None:
+    """Provider enrichment cannot hide policy drift behind accepted keys."""
+    machine = _machine_document(provider_list_shape=True)
+    service = machine["config"]["services"][0]
+    service["unreviewed_policy"] = True
+
+    assert not fly_pilot_deploy._service_is_exact(machine["config"]["services"])
+
+    service.pop("unreviewed_policy")
+    service["ports"][1]["handlers"] = ["http", "http"]
+
+    assert not fly_pilot_deploy._service_is_exact(machine["config"]["services"])
+
+
 def test_rendered_config_has_one_machine_volume_and_secret_contract() -> None:
     """The reviewed template is structurally deployable without secret values."""
     rendered = render_fly_toml(_TEMPLATE, _coordinates())
@@ -209,42 +406,13 @@ def test_deploy_requires_hash_bound_live_approval_and_verifies_exact_cardinality
         if command[1:3] == ["apps", "list"]:
             return CommandResult(_apps_document())
         if command[1:3] == ["machine", "list"]:
-            return CommandResult(b'[{"id":"private-machine"}]')
+            return CommandResult(json.dumps([_machine_document()]).encode())
         if command[1:3] == ["volumes", "list"]:
             return CommandResult(
-                b'[{"id":"private-volume","region":"iad","encrypted":true,'
+                b'[{"id":"private-volume","name":"creek_control_state",'
+                b'"region":"iad","encrypted":true,'
                 b'"attached_machine_id":"private-machine"}]'
             )
-        if command[1:3] == ["machine", "status"]:
-            document = {
-                "id": "private-machine",
-                "region": "iad",
-                "state": "started",
-                "image_ref": {"digest": "sha256:" + "b" * 64},
-                "config": {
-                    "image": _coordinates().control_image,
-                    "guest": {"cpu_kind": "shared", "cpus": 1, "memory_mb": 1024},
-                    "restart": {"policy": "on-failure", "max_retries": 3},
-                    "mounts": [
-                        {
-                            "volume": "private-volume",
-                            "path": "/data",
-                            "encrypted": True,
-                        }
-                    ],
-                    "services": [
-                        {
-                            "protocol": "tcp",
-                            "internal_port": 8080,
-                            "ports": [
-                                {"port": 80, "handlers": ["http"]},
-                                {"port": 443, "handlers": ["tls", "http"]},
-                            ],
-                        }
-                    ],
-                },
-            }
-            return CommandResult(json.dumps(document).encode())
         return CommandResult(b"")
 
     deploy(
@@ -257,8 +425,8 @@ def test_deploy_requires_hash_bound_live_approval_and_verifies_exact_cardinality
         now=_NOW,
     )
 
-    assert len(commands) == 9
-    deploy_command = commands[5]
+    assert len(commands) == 7
+    deploy_command = commands[4]
     assert deploy_command[:3] == ["fly", "deploy", "--ha=false"]
     assert "--image" in deploy_command
     assert _coordinates().control_image in deploy_command
@@ -352,10 +520,10 @@ def test_deploy_requires_the_exact_reviewed_twenty_five_dollar_cap(
     assert commands == []
 
 
-def test_deploy_accepts_provider_mount_shape_without_redundant_encryption_flag(
+def test_deploy_refuses_provider_mount_shape_without_encryption_attestation(
     tmp_path: Path,
 ) -> None:
-    """Volume inventory proves encryption when Machine status omits that field."""
+    """Current list JSON must carry its own mount encryption attestation."""
     authorization, digest = _authorization(tmp_path)
     token_file = _token_file(tmp_path)
     commands: list[list[str]] = []
@@ -367,60 +535,29 @@ def test_deploy_accepts_provider_mount_shape_without_redundant_encryption_flag(
         if command[1:3] == ["apps", "list"]:
             return CommandResult(_apps_document())
         if command[1:3] == ["machine", "list"]:
-            return CommandResult(b'[{"id":"private-machine"}]')
+            return CommandResult(
+                json.dumps([_machine_document(mount_encrypted=None)]).encode()
+            )
         if command[1:3] == ["volumes", "list"]:
             return CommandResult(
-                b'[{"id":"private-volume","region":"iad","encrypted":true,'
+                b'[{"id":"private-volume","name":"creek_control_state",'
+                b'"region":"iad","encrypted":true,'
                 b'"attached_machine_id":"private-machine"}]'
-            )
-        if command[1:3] == ["machine", "status"]:
-            return CommandResult(
-                json.dumps(
-                    {
-                        "id": "private-machine",
-                        "region": "iad",
-                        "state": "started",
-                        "image_ref": {"digest": "sha256:" + "b" * 64},
-                        "config": {
-                            "image": _coordinates().control_image,
-                            "guest": {
-                                "cpu_kind": "shared",
-                                "cpus": 1,
-                                "memory_mb": 1024,
-                            },
-                            "restart": {
-                                "policy": "on-failure",
-                                "max_retries": 3,
-                            },
-                            "mounts": [{"volume": "private-volume", "path": "/data"}],
-                            "services": [
-                                {
-                                    "protocol": "tcp",
-                                    "internal_port": 8080,
-                                    "ports": [
-                                        {"port": 80, "handlers": ["http"]},
-                                        {
-                                            "port": 443,
-                                            "handlers": ["tls", "http"],
-                                        },
-                                    ],
-                                }
-                            ],
-                        },
-                    }
-                ).encode()
             )
         return CommandResult(b"")
 
-    deploy(
-        _TEMPLATE,
-        _coordinates(),
-        token_file,
-        authorization,
-        digest,
-        run=fake_run,
-        now=_NOW,
-    )
+    with pytest.raises(RuntimeError, match="preflight drifted"):
+        deploy(
+            _TEMPLATE,
+            _coordinates(),
+            token_file,
+            authorization,
+            digest,
+            run=fake_run,
+            now=_NOW,
+        )
+
+    assert not any(command[1:2] == ["deploy"] for command in commands)
 
 
 def test_deploy_refuses_wrong_preflight_cardinality_before_mutation(
@@ -471,15 +608,15 @@ def test_deploy_refuses_drifted_preflight_machine_before_mutation(
         if command[1:3] == ["apps", "list"]:
             return CommandResult(_apps_document())
         if command[1:3] == ["machine", "list"]:
-            return CommandResult(b'[{"id":"private-machine"}]')
+            document = _machine_document()
+            document["region"] = "wrong"
+            document["state"] = "stopped"
+            return CommandResult(json.dumps([document]).encode())
         if command[1:3] == ["volumes", "list"]:
             return CommandResult(
-                b'[{"id":"private-volume","region":"iad","encrypted":true,'
+                b'[{"id":"private-volume","name":"creek_control_state",'
+                b'"region":"iad","encrypted":true,'
                 b'"attached_machine_id":"private-machine"}]'
-            )
-        if command[1:3] == ["machine", "status"]:
-            return CommandResult(
-                b'{"id":"private-machine","region":"wrong","state":"stopped"}'
             )
         return CommandResult(b"")
 
@@ -517,7 +654,7 @@ def test_deploy_admits_one_exact_precreated_unattached_volume(
             machine_lists += 1
             if machine_lists == 1:
                 return CommandResult(b"[]")
-            return CommandResult(b'[{"id":"private-machine"}]')
+            return CommandResult(json.dumps([_machine_document()]).encode())
         if command[1:3] == ["volumes", "list"]:
             attached = machine_lists > 1
             return CommandResult(
@@ -533,49 +670,6 @@ def test_deploy_admits_one_exact_precreated_unattached_volume(
                             ),
                         }
                     ]
-                ).encode()
-            )
-        if command[1:3] == ["machine", "status"]:
-            return CommandResult(
-                json.dumps(
-                    {
-                        "id": "private-machine",
-                        "region": "iad",
-                        "state": "started",
-                        "image_ref": {"digest": "sha256:" + "b" * 64},
-                        "config": {
-                            "image": _coordinates().control_image,
-                            "guest": {
-                                "cpu_kind": "shared",
-                                "cpus": 1,
-                                "memory_mb": 1024,
-                            },
-                            "restart": {
-                                "policy": "on-failure",
-                                "max_retries": 3,
-                            },
-                            "mounts": [
-                                {
-                                    "volume": "private-volume",
-                                    "path": "/data",
-                                    "encrypted": True,
-                                }
-                            ],
-                            "services": [
-                                {
-                                    "protocol": "tcp",
-                                    "internal_port": 8080,
-                                    "ports": [
-                                        {"port": 80, "handlers": ["http"]},
-                                        {
-                                            "port": 443,
-                                            "handlers": ["tls", "http"],
-                                        },
-                                    ],
-                                }
-                            ],
-                        },
-                    }
                 ).encode()
             )
         return CommandResult(b"")
