@@ -874,11 +874,41 @@ def test_authorization_refuses_unreadable_path_without_disclosing_it(
 
 
 @pytest.mark.parametrize(
+    "organization",
+    [
+        "creek-vaults",
+        {"Slug": "creek-vaults", "Name": "Creek Vaults"},
+        {"slug": "creek-vaults", "name": "Creek Vaults"},
+    ],
+)
+def test_app_membership_attestation_accepts_fly_org_shapes(
+    organization: object,
+) -> None:
+    """Current nested Fly org objects and the legacy scalar both attest."""
+    fly_pilot_deploy._verify_app_membership(
+        [{"Name": "creek-control-pilot", "Organization": organization}],
+        _coordinates(),
+    )
+
+
+@pytest.mark.parametrize(
     "document",
     [
         None,
         [],
         [{"name": "creek-control-pilot", "organization": "other-org"}],
+        [
+            {
+                "Name": "creek-control-pilot",
+                "Organization": {"Slug": "other-org"},
+            }
+        ],
+        [
+            {
+                "Name": "creek-control-pilot",
+                "Organization": {"Name": "Creek Vaults"},
+            }
+        ],
         [
             {"name": "creek-control-pilot", "organization": "creek-vaults"},
             {"Name": "creek-control-pilot", "Organization": "creek-vaults"},

@@ -300,11 +300,18 @@ def _verify_app_membership(
         for item in document
         if isinstance(item, dict)
         and item.get("Name", item.get("name")) == coordinates.app
-        and item.get("Organization", item.get("organization"))
+        and _app_organization_slug(item.get("Organization", item.get("organization")))
         == coordinates.organization
     ]
     if len(matches) != 1:
         raise RuntimeError("Fly pilot app membership attestation failed")
+
+
+def _app_organization_slug(value: object) -> object:
+    """Return Fly's org slug from its legacy scalar or current object shape."""
+    if isinstance(value, dict):
+        return value.get("Slug", value.get("slug"))
+    return value
 
 
 @contextmanager
