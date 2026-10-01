@@ -25,7 +25,7 @@ pyasn1-modules and is never imported directly, so its floor lives in
 ``[tool.uv].constraint-dependencies`` rather than
 ``[project].dependencies`` — a uv constraint tightens resolution when
 the package is already in the graph without declaring a dependency we
-never import (precedent: the pyjwt>=2.13.0 constraint, DEP-003).
+never import (precedent: the pyjwt>=2.15.0 constraint, DEP-003).
 
 ``setuptools`` (issue #861): setuptools 81.0.0 carries PYSEC-2026-3447
 (CVE-2026-59890, GHSA-h35f-9h28-mq5c — path traversal in the
@@ -98,6 +98,16 @@ this package and creek-tools did not, and nothing failed, because
 until #1328 no test compared the two manifests. The parity guard at
 the end of this module does that now, in both directions, and reports
 every gap in one message.
+
+``oauthlib``, ``pyjwt``, ``urllib3``, and ``virtualenv`` (issue #1823):
+the 2026-09-30 canonical audit found twenty fixable vulnerabilities in
+these four locked packages. oauthlib 3.3.1 carries CVE-2026-49265;
+urllib3 2.7.0 carries CVE-2026-97687 through CVE-2026-97689; virtualenv
+21.7.4 carries PYSEC-2026-4011 through PYSEC-2026-4014. PyJWT 2.14.0
+fixes eleven findings against 2.13.0 but still carries CVE-2026-101918,
+so 2.15.0 is the first fully patched release. The parameterized guards
+below hold both each declaration and the installed lock at the complete
+fix boundary rather than at a partial fix.
 
 ``rpds-py`` (issue #1185): not a CVE. rpds-py abandoned SemVer for
 CalVer at 2026.5.1 — the release line runs 0.29.0, 0.30.0, then
@@ -347,6 +357,23 @@ _CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
 #: three-advisory framing carried by the older crawdad comment omits
 #: PYSEC-2026-3041.
 _PYTHON_MULTIPART_PATCHED_VERSION = Version("0.0.31")
+
+
+@dataclass(frozen=True)
+class _AuditFloor:
+    """One dependency boundary reported by the 2026-09-30 audit."""
+
+    distribution: str
+    last_vulnerable: Version
+    patched: Version
+
+
+_SEPTEMBER_AUDIT_FLOORS = (
+    _AuditFloor("oauthlib", Version("3.3.1"), Version("4.0.0")),
+    _AuditFloor("pyjwt", Version("2.14.0"), Version("2.15.0")),
+    _AuditFloor("urllib3", Version("2.7.0"), Version("2.8.0")),
+    _AuditFloor("virtualenv", Version("21.7.4"), Version("21.7.13")),
+)
 
 #: The anyio floor. No CVE here — the floor simply records the version
 #: the lock resolves, the same rule the neighbouring uvicorn
@@ -611,6 +638,61 @@ def _locked_distribution_version(distribution: str) -> Version:
         if package["name"] == distribution:
             return Version(str(package["version"]))
     pytest.fail(f"{distribution} has no [[package]] entry in uv.lock")
+
+
+def _security_floor_specifier(distribution: str) -> SpecifierSet:
+    """Return a dependency's direct or transitive security floor."""
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    entries: list[str] = list(pyproject["project"]["dependencies"])
+    entries.extend(
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in entries:
+        requirement = Requirement(entry)
+        if canonicalize_name(requirement.name) == canonicalize_name(distribution):
+            return requirement.specifier
+    pytest.fail(f"{distribution} has no declared dependency security floor")
+
+
+@pytest.mark.parametrize(
+    "floor", _SEPTEMBER_AUDIT_FLOORS, ids=lambda floor: floor.distribution
+)
+def test_september_audit_floor_excludes_vulnerable_release(
+    floor: _AuditFloor,
+) -> None:
+    """Each declaration excludes the release pip-audit reported."""
+    specifier = _security_floor_specifier(floor.distribution)
+    assert str(floor.last_vulnerable) not in specifier, (
+        f"{floor.distribution} specifier {specifier!r} admits vulnerable "
+        f"{floor.last_vulnerable}; the floor must be >={floor.patched}"
+    )
+
+
+@pytest.mark.parametrize(
+    "floor", _SEPTEMBER_AUDIT_FLOORS, ids=lambda floor: floor.distribution
+)
+def test_september_audit_floor_accepts_first_fully_patched_release(
+    floor: _AuditFloor,
+) -> None:
+    """Each declaration admits the first release clearing every finding."""
+    specifier = _security_floor_specifier(floor.distribution)
+    assert str(floor.patched) in specifier, (
+        f"{floor.distribution} specifier {specifier!r} rejects first fully "
+        f"patched release {floor.patched}"
+    )
+
+
+@pytest.mark.parametrize(
+    "floor", _SEPTEMBER_AUDIT_FLOORS, ids=lambda floor: floor.distribution
+)
+def test_september_audit_lock_is_fully_patched(floor: _AuditFloor) -> None:
+    """The lock installed and audited by CI resolves every patched floor."""
+    locked = _locked_distribution_version(floor.distribution)
+    assert locked >= floor.patched, (
+        f"uv.lock pins {floor.distribution} {locked}, below the fully patched "
+        f"{floor.patched}; relock after raising the security floor"
+    )
 
 
 def _python_multipart_constraint_specifier() -> SpecifierSet:
@@ -2150,7 +2232,7 @@ _QUOTED = re.compile(r'"([^"]+)"')
 
 #: The table this repo reserves for DEP-003 floors on transitive-only
 #: packages. Membership alone marks an entry as a security floor, which
-#: is what covers creek-tools' comment-less ``pyjwt>=2.13.0``.
+#: is what covers entries even when their comment names only an issue.
 _CONSTRAINT_ARRAY = "tool.uv.constraint-dependencies"
 
 #: Arrays a floor may be declared in, by exact name and by prefix. The

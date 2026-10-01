@@ -26,7 +26,7 @@ and is never imported directly, so its floor lives in
 ``[tool.uv].constraint-dependencies`` rather than
 ``[project].dependencies`` — a uv constraint tightens resolution when
 the package is already in the graph without declaring a dependency we
-never import (precedent: creek-tools' pyjwt>=2.13.0 constraint,
+never import (precedent: creek-tools' pyjwt>=2.15.0 constraint,
 DEP-003).
 
 ``aiohttp`` (issue #978): aiohttp 3.13.5 carries eleven published
@@ -97,25 +97,15 @@ strings would either assert a compatibility claim crawdad has never
 tested or contradict #1000, so the difference is deliberate and
 documented rather than drift to be tidied away.
 
-``pyjwt`` (issue #1328): pyjwt 2.12.1 carries five advisories —
-CVE-2026-48522 through CVE-2026-48526 (PYSEC-2026-175 through -179) —
-all fixed in 2.13.0. Transitive-only via mcp → pyjwt[crypto], the same
+``pyjwt`` (issue #1823): pyjwt 2.14.0 still carries CVE-2026-101918,
+after 2.14.0 fixes the other eleven 2026-09-30 audit findings. The last
+finding is fixed in 2.15.0. Transitive-only via mcp → pyjwt[crypto],
+the same
 edge that pulls cryptography, and the library that would verify a
 bearer token on the MCP surface this bot consumes.
 
-Its two OSV records disagree about the boundary: PYSEC-2026-176
-records ``fixed: 2.12.1`` while its GHSA alias GHSA-jq35-7prp-9v3f
-records ``2.13.0``. Both were queried live while closing #1328. The
-floor takes the higher number. When two sources disagree about where a
-fix lands, a security bound resolves the disagreement upward — the
-cost of being one release too strict is a relock, and the cost of
-being one release too loose is the advisory.
-
-``urllib3`` (issue #1328): urllib3 2.6.3 carries CVE-2026-44431
-(PYSEC-2026-141 / GHSA-qccp-gfcp-xxvc) and CVE-2026-44432
-(PYSEC-2026-142 / GHSA-mf9v-mfxr-j63j), both fixed in 2.7.0. 2.6.3
-cleared only the earlier CVE-2026-21441, so it sits inside the
-vulnerable band rather than above it.
+``urllib3`` (issue #1823): urllib3 2.7.0 carries CVE-2026-97687,
+CVE-2026-97688, and CVE-2026-97689, all fixed in 2.8.0.
 
 **Read the whole consumer list before calling an edge dev-only.** This
 package was one sentence away from being *exempted* from the
@@ -304,31 +294,20 @@ _IDNA_PATCHED_VERSION = Version("3.15")
 #: rejects it is non-vacuous.
 _IDNA_LAST_VULNERABLE = Version("3.14")
 
-#: First pyjwt release containing the fixes for all five advisories
-#: carried by 2.12.1 — CVE-2026-48522 (PYSEC-2026-175 /
-#: GHSA-993g-76c3-p5m4), CVE-2026-48523 (PYSEC-2026-176 /
-#: GHSA-jq35-7prp-9v3f), CVE-2026-48524 (PYSEC-2026-177 /
-#: GHSA-fhv5-28vv-h8m8), CVE-2026-48525 (PYSEC-2026-178 /
-#: GHSA-w7vc-732c-9m39) and CVE-2026-48526 (PYSEC-2026-179 /
-#: GHSA-xgmm-8j9v-c9wx).
-_PYJWT_PATCHED_VERSION = Version("2.13.0")
+#: First pyjwt release containing the fix for CVE-2026-101918, the one
+#: 2026-09-30 audit finding that remains after the other eleven are
+#: fixed in 2.14.0.
+_PYJWT_PATCHED_VERSION = Version("2.15.0")
 
-#: The last pyjwt release the advisories still cover. OSV's two records
-#: for CVE-2026-48523 disagree about this one: PYSEC-2026-176 says
-#: ``fixed: 2.12.1`` while its GHSA alias says ``2.13.0`` (both queried
-#: live for #1328). The floor takes the higher, safer number — a
-#: security bound resolves a source disagreement upward.
-_PYJWT_LAST_VULNERABLE = Version("2.12.1")
+#: The last pyjwt release carrying CVE-2026-101918.
+_PYJWT_LAST_VULNERABLE = Version("2.14.0")
 
-#: First urllib3 release containing the fixes for BOTH CVE-2026-44431
-#: (PYSEC-2026-141 / GHSA-qccp-gfcp-xxvc) and CVE-2026-44432
-#: (PYSEC-2026-142 / GHSA-mf9v-mfxr-j63j). 2.6.3 cleared only the
-#: earlier CVE-2026-21441 (PYSEC-2026-1996), so it sits inside this
-#: band rather than above it.
-_URLLIB3_PATCHED_VERSION = Version("2.7.0")
+#: First urllib3 release containing the fixes for CVE-2026-97687,
+#: CVE-2026-97688, and CVE-2026-97689.
+_URLLIB3_PATCHED_VERSION = Version("2.8.0")
 
-#: The last urllib3 release both advisories still cover.
-_URLLIB3_LAST_VULNERABLE = Version("2.6.3")
+#: The last urllib3 release all three advisories cover.
+_URLLIB3_LAST_VULNERABLE = Version("2.7.0")
 
 #: First pydantic-settings release containing the fix for
 #: GHSA-4xgf-cpjx-pc3j.
@@ -1629,24 +1608,22 @@ def test_locked_idna_at_or_above_patched_release() -> None:
 
 
 def test_urllib3_floor_rejects_vulnerable_releases() -> None:
-    """The constraint excludes 2.6.3, which still carries both advisories.
+    """The constraint excludes 2.7.0, which carries all three advisories.
 
-    urllib3 2.6.3 cleared the earlier CVE-2026-21441 but still carries
-    CVE-2026-44431 and CVE-2026-44432, both fixed in 2.7.0. Stopping at
-    ``>=2.6.3`` would look like a security floor and admit two live
-    advisories, so the probe pins the boundary rather than the general
-    direction.
+    CVE-2026-97687, CVE-2026-97688, and CVE-2026-97689 are all fixed in
+    2.8.0, so stopping at the previously safe 2.7.0 floor admits the new
+    vulnerable release.
     """
     specifier = _urllib3_constraint_specifier()
     assert str(_URLLIB3_LAST_VULNERABLE) not in specifier, (
         f"urllib3 constraint {specifier!r} admits {_URLLIB3_LAST_VULNERABLE}, "
-        "which still carries CVE-2026-44431 and CVE-2026-44432; the floor "
+        "which carries CVE-2026-97687 through CVE-2026-97689; the floor "
         f"must be >={_URLLIB3_PATCHED_VERSION}"
     )
 
 
 def test_urllib3_floor_accepts_patched_release() -> None:
-    """The constraint accepts 2.7.0, the first fully patched release."""
+    """The constraint accepts 2.8.0, the first fully patched release."""
     specifier = _urllib3_constraint_specifier()
     assert str(_URLLIB3_PATCHED_VERSION) in specifier, (
         f"urllib3 constraint {specifier!r} rejects {_URLLIB3_PATCHED_VERSION}; "
@@ -1655,7 +1632,7 @@ def test_urllib3_floor_accepts_patched_release() -> None:
 
 
 def test_locked_urllib3_at_or_above_patched_release() -> None:
-    """``uv.lock`` resolves urllib3 to >= 2.7.0.
+    """``uv.lock`` resolves urllib3 to >= 2.8.0.
 
     urllib3 is transitive here, but it is NOT the dev-only edge it
     first looks like. crawdad declares ``google-genai`` in
@@ -1668,29 +1645,27 @@ def test_locked_urllib3_at_or_above_patched_release() -> None:
     locked = _locked_urllib3_version()
     assert locked >= _URLLIB3_PATCHED_VERSION, (
         f"uv.lock pins urllib3 {locked}, below the patched "
-        f"{_URLLIB3_PATCHED_VERSION} (CVE-2026-44431 / CVE-2026-44432); the "
-        "exported lock is audited, so relock after adding the constraint"
+        f"{_URLLIB3_PATCHED_VERSION} (CVE-2026-97687 through CVE-2026-97689); "
+        "the exported lock is audited, so relock after adding the constraint"
     )
 
 
 def test_pyjwt_floor_rejects_vulnerable_releases() -> None:
-    """The constraint excludes 2.12.1, which still carries all five advisories.
+    """The constraint excludes 2.14.0, which still carries one advisory.
 
-    pyjwt 2.12.1 carries CVE-2026-48522 through CVE-2026-48526, every
-    one of them fixed at 2.13.0. OSV's PYSEC-2026-176 record claims
-    ``fixed: 2.12.1`` while its own GHSA alias says 2.13.0; the floor
-    takes the higher number, so the disagreement cannot leave a hole.
+    PyJWT 2.14.0 fixes eleven findings reported against 2.13.0 but still
+    carries CVE-2026-101918, which is fixed in 2.15.0.
     """
     specifier = _pyjwt_constraint_specifier()
     assert str(_PYJWT_LAST_VULNERABLE) not in specifier, (
         f"pyjwt constraint {specifier!r} admits {_PYJWT_LAST_VULNERABLE}, "
-        "which still carries CVE-2026-48522 through CVE-2026-48526; the "
+        "which still carries CVE-2026-101918; the "
         f"floor must be >={_PYJWT_PATCHED_VERSION}"
     )
 
 
 def test_pyjwt_floor_accepts_patched_release() -> None:
-    """The constraint accepts 2.13.0, the first fully patched release."""
+    """The constraint accepts 2.15.0, the first fully patched release."""
     specifier = _pyjwt_constraint_specifier()
     assert str(_PYJWT_PATCHED_VERSION) in specifier, (
         f"pyjwt constraint {specifier!r} rejects {_PYJWT_PATCHED_VERSION}; "
@@ -1699,7 +1674,7 @@ def test_pyjwt_floor_accepts_patched_release() -> None:
 
 
 def test_locked_pyjwt_at_or_above_patched_release() -> None:
-    """``uv.lock`` resolves pyjwt to >= 2.13.0.
+    """``uv.lock`` resolves pyjwt to >= 2.15.0.
 
     pyjwt arrives through ``mcp -> pyjwt[crypto]``, the same edge that
     pulls cryptography, and it is the library that would verify a
@@ -1710,7 +1685,7 @@ def test_locked_pyjwt_at_or_above_patched_release() -> None:
     locked = _locked_pyjwt_version()
     assert locked >= _PYJWT_PATCHED_VERSION, (
         f"uv.lock pins pyjwt {locked}, below the patched "
-        f"{_PYJWT_PATCHED_VERSION} (CVE-2026-48522 through CVE-2026-48526); "
+        f"{_PYJWT_PATCHED_VERSION} (CVE-2026-101918); "
         "the exported lock is audited, so relock after adding the constraint"
     )
 
