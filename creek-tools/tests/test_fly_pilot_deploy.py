@@ -25,7 +25,7 @@ _TEMPLATE = (
     Path(__file__).resolve().parents[2] / "deploy" / "fly-pilot" / "fly.toml.template"
 )
 _NOW = datetime(2026, 9, 27, 12, tzinfo=UTC)
-_TOKEN = "synthetic-org-token-canary"
+_TOKEN = "FlyV1 fm2_synthetic+org/token,canary="
 _ORG_ID = "synthetic-org-id"
 
 
@@ -173,15 +173,19 @@ def test_deploy_requires_hash_bound_live_approval_and_verifies_exact_cardinality
         "XDG_CONFIG_HOME",
     ):
         monkeypatch.setenv(name, f"ambient-{name.lower()}-canary")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-unrelated-secret-canary")
 
     def fake_run(command: list[str], environ: dict[str, str]) -> CommandResult:
         commands.append(command)
         home = Path(environ["HOME"])
         isolated_homes.append(home)
         assert home != ambient
-        assert (home / ".fly" / "config.yml").read_text(encoding="utf-8") == (
-            f'access_token: "{_TOKEN}"\n'
+        config_lines = (
+            (home / ".fly" / "config.yml").read_text(encoding="utf-8").splitlines()
         )
+        assert config_lines[0] == f"access_token: {_TOKEN}"
+        assert config_lines[1].startswith("last_login: ")
+        assert datetime.fromisoformat(config_lines[1].removeprefix("last_login: "))
         assert (home.stat().st_mode & 0o777) == 0o700
         assert ((home / ".fly").stat().st_mode & 0o777) == 0o700
         assert ((home / ".fly" / "config.yml").stat().st_mode & 0o777) == 0o600
@@ -198,6 +202,8 @@ def test_deploy_requires_hash_bound_live_approval_and_verifies_exact_cardinality
         )
         assert _TOKEN not in repr(command)
         assert _TOKEN not in repr(environ)
+        assert "ANTHROPIC_API_KEY" not in environ
+        assert "ambient-unrelated-secret-canary" not in repr(environ)
         if command[1:3] == ["orgs", "show"]:
             return CommandResult(_org_document())
         if command[1:3] == ["apps", "list"]:
@@ -716,12 +722,51 @@ def test_token_reader_requires_the_effective_owner(
         fly_pilot_deploy._read_token_file(token_file)
 
 
+@pytest.mark.parametrize("terminal_newline", ["", "\n"])
+def test_token_reader_accepts_current_fly_org_token_shape(
+    tmp_path: Path,
+    terminal_newline: str,
+) -> None:
+    """Fly's required ``FlyV1 `` separator is data, not a multiline token."""
+    token_file = _token_file(tmp_path, _TOKEN + terminal_newline)
+
+    assert fly_pilot_deploy._read_token_file(token_file) == _TOKEN
+
+
 @pytest.mark.parametrize("value", ["token\x00suffix", "token\x1fsuffix"])
 def test_token_reader_rejects_ascii_control_characters(
     tmp_path: Path,
     value: str,
 ) -> None:
     """A one-line token still cannot smuggle controls into disposable YAML."""
+    token_file = _token_file(tmp_path, value)
+
+    with pytest.raises(ValueError, match="token file"):
+        fly_pilot_deploy._read_token_file(token_file)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "synthetic-org-token-canary",
+        "FlyV2 payload",
+        "FlyV1 ",
+        "FlyV1  payload",
+        "FlyV1\tpayload",
+        "FlyV1 payload suffix",
+        "FlyV1 payload ",
+        "FlyV1 payload:unsafe",
+        "FlyV1 payload#unsafe",
+        'FlyV1 payload"unsafe',
+        "FlyV1 payload\nsuffix",
+        "FlyV1 payload\n\n",
+    ],
+)
+def test_token_reader_rejects_near_miss_fly_token_shapes(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    """Only Fly's exact one-separator, one-line token grammar is admitted."""
     token_file = _token_file(tmp_path, value)
 
     with pytest.raises(ValueError, match="token file"):
