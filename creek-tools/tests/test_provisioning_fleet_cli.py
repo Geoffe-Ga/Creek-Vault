@@ -342,6 +342,61 @@ def test_supervised_report_emits_no_private_inventory_or_alert_subject(
     assert delivered == [("orphan_resource",)]
 
 
+def test_terminal_incomplete_create_exits_alerted_and_logs_closed_kind(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Billable create residue cannot produce a clean scheduled report."""
+    database = tmp_path / "jobs.sqlite3"
+    store = ProvisioningStore(database)
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-incomplete",
+        "subject",
+        requester_identity="a",
+        now=_NOW,
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+    allocation_id = driver.expected_allocation_id(job.activation_id)
+    driver.seed_resource(
+        ProviderResource(
+            allocation_id,
+            ResourceClass.VOLUME,
+            ResourceState.OTHER,
+            5,
+            None,
+            "volume-residue",
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        code = main(
+            [
+                "report",
+                "--database",
+                str(database),
+                "--policy-file",
+                _policy_file(tmp_path),
+            ],
+            compose=_compose(driver),
+        )
+
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert code == 3
+    assert [alert["kind"] for alert in document["alerts"]] == ["incomplete_create"]
+    assert f"fleet alert kind=incomplete_create subject={allocation_id}" in caplog.text
+
+
 def test_emergency_stop_stops_live_machines_never_deletes_and_continues_past_failures(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

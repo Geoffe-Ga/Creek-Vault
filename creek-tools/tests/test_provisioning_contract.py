@@ -332,6 +332,7 @@ def test_pilot_runbook_covers_every_cost_and_recovery_acceptance_boundary() -> N
         "orphan_resource",
         "stuck_deletion",
         "continuous_running",
+        "incomplete_create",
         "unknown and unpriced",
         "monthly_budget_departure",
         "alert delivery",

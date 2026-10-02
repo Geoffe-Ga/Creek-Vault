@@ -277,9 +277,7 @@ def test_budget_departure_fires_at_equal_and_above_only() -> None:
     )
 
 
-def test_alert_vocabulary_is_exactly_five_kinds_and_each_condition_maps_to_one() -> (
-    None
-):
+def test_alert_vocabulary_is_exactly_six_kinds_and_each_condition_maps_to_one() -> None:
     """Alerts are a closed vocabulary keyed by identifiers only."""
     policy = _policy()
     estimate = estimate_monthly_cost(_telemetry(), policy, now=_NOW)
@@ -332,6 +330,14 @@ def test_alert_vocabulary_is_exactly_five_kinds_and_each_condition_maps_to_one()
             "job-hot",
             7200,
         ),
+        Divergence(
+            DivergenceKind.INCOMPLETE_CREATE,
+            Disposition.REPORTED,
+            "fly-incomplete",
+            ResourceClass.VOLUME,
+            "job-incomplete",
+            None,
+        ),
     )
 
     alerts = evaluate_alerts(divergences, estimate, policy)
@@ -341,11 +347,13 @@ def test_alert_vocabulary_is_exactly_five_kinds_and_each_condition_maps_to_one()
         "orphan_resource",
         "stuck_deletion",
         "continuous_running",
+        "incomplete_create",
         "monthly_budget_departure",
     }
     assert alerts == (
         Alert(AlertKind.CONTINUOUS_RUNNING, "fly-hot", 7200, "7200", "7200"),
         Alert(AlertKind.DUPLICATE_RESOURCE, "fly-dup", None, None, None),
+        Alert(AlertKind.INCOMPLETE_CREATE, "fly-incomplete", None, None, None),
         Alert(AlertKind.ORPHAN_RESOURCE, "fly-orphan", None, None, None),
         Alert(AlertKind.STUCK_DELETION, "job-stuck", 1800, "1800", "1800"),
     )

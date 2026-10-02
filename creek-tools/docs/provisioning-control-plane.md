@@ -367,12 +367,16 @@ when the durable store has no allocation and provider inventory contains no
 Machine or volume (an absent app or exactly one deterministic empty app).
 That last repair exists for a fixed deployment recovering an app-only partial
 create; any billable residue, second failure, other reason, or existing durable
-allocation remains terminal for operator investigation. Stopping an overrunning Machine
-interrupts background work, so run `reconcile` on a schedule you accept for
-that, and `report` everywhere else. Both commands print one JSON document with
+allocation remains terminal and raises an `incomplete_create` alert for operator
+investigation. Stopping an overrunning Machine interrupts background work, so
+run `reconcile` on a schedule you accept for that, and `report` everywhere else.
+Both commands print one JSON document with
 the keys `observed_at`, `telemetry`, `divergences`, `alerts`, `estimate`,
 `review_triggers`, and `inventory_mode`, and log each alert as
 `fleet alert kind=<kind> subject=<id>` with nothing else on the line.
+An incomplete create that the bounded reconciler successfully requeues is not
+alerted; a refused repair or any terminal residue remains both reported and
+alerted, so scheduled commands cannot call it clean.
 
 The production fleet driver first calls Fly's documented org-scoped
 `GET /v1/apps?org_slug=...`, validates the closed response shape, and keeps only
@@ -425,6 +429,7 @@ months_over_budget = 3
 | `orphan_resource` | a resource exists under an app the store does not want (no job, or the job is confirmed deleted) | confirm on the provider console, then delete it there; the tool never deletes |
 | `stuck_deletion` | a deletion has been unconfirmed for at least `stuck_deletion_seconds` | `reconcile` requeues a retryable failure; a non-retryable one needs the provider console |
 | `continuous_running` | a Machine has been observed running for at least `max_continuous_running_seconds` | `reconcile` stops it only when the allocation is live (this interrupts background work); an orphan or deleting Machine is reported only - stop it on the provider console; `report` only reports |
+| `incomplete_create` | a provider-rejected create remains terminal with residue or after its single bounded repair opportunity | inspect the deterministic app and job; a successfully requeued empty app is not alerted |
 | `monthly_budget_departure` | the month estimate is greater than or equal to `monthly_budget` (equal fires) | reconcile the invoice below and revisit the budget or the fleet |
 
 `missing_resource` and `unconfirmed_deletion` appear under `divergences` but
