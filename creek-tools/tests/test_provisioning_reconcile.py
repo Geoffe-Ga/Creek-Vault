@@ -555,6 +555,117 @@ def test_expired_ceremony_is_unconfirmed_then_stuck_and_repair_requeues_failure(
     assert driver.delete_count == 0
 
 
+def test_reconcile_repairs_one_empty_app_after_first_provider_rejected_create(
+    store: ProvisioningStore,
+) -> None:
+    """A fixed deployment resumes the exact failed job only from empty app evidence."""
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-empty-app", "subject", requester_identity="adepthood", now=_NOW
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+    allocation_id = driver.expected_allocation_id(job.activation_id)
+    driver.seed_resource(
+        ProviderResource(
+            allocation_id,
+            ResourceClass.APP,
+            ResourceState.OTHER,
+            None,
+            None,
+            f"{allocation_id}-app",
+        )
+    )
+    reconciler = _reconciler(store, driver)
+
+    reported = reconciler.run_once(now=_NOW + timedelta(minutes=1), repair=False)
+    failed = store.get(job.job_id, "adepthood")
+    repaired = reconciler.run_once(now=_NOW + timedelta(minutes=2), repair=True)
+    pending = store.get(job.job_id, "adepthood")
+
+    assert reported.divergences == (
+        Divergence(
+            DivergenceKind.INCOMPLETE_CREATE,
+            Disposition.REPORTED,
+            allocation_id,
+            ResourceClass.APP,
+            job.job_id,
+            None,
+        ),
+    )
+    assert reported.alerts == (
+        Alert(AlertKind.INCOMPLETE_CREATE, allocation_id, None, None, None),
+    )
+    assert failed is not None and failed.state is JobState.FAILED
+    assert repaired.divergences == (
+        Divergence(
+            DivergenceKind.INCOMPLETE_CREATE,
+            Disposition.REPAIRED,
+            allocation_id,
+            ResourceClass.APP,
+            job.job_id,
+            None,
+        ),
+    )
+    assert repaired.alerts == ()
+    assert pending is not None and pending.state is JobState.PENDING
+    assert driver.stop_count == 0
+    assert driver.delete_count == 0
+
+
+def test_reconcile_never_requeues_a_failed_create_with_billable_residue(
+    store: ProvisioningStore,
+) -> None:
+    """A surviving Machine or volume keeps the non-retryable failure terminal."""
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-residue", "subject", requester_identity="adepthood", now=_NOW
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+    allocation_id = driver.expected_allocation_id(job.activation_id)
+    for resource_class, suffix in (
+        (ResourceClass.APP, "app"),
+        (ResourceClass.VOLUME, "volume"),
+    ):
+        driver.seed_resource(
+            ProviderResource(
+                allocation_id,
+                resource_class,
+                ResourceState.OTHER,
+                5 if resource_class is ResourceClass.VOLUME else None,
+                None,
+                f"{allocation_id}-{suffix}",
+            )
+        )
+
+    report = _reconciler(store, driver).run_once(
+        now=_NOW + timedelta(minutes=1), repair=True
+    )
+
+    assert report.divergences[0].kind is DivergenceKind.INCOMPLETE_CREATE
+    assert report.divergences[0].disposition is Disposition.REPORTED
+    assert report.alerts == (
+        Alert(AlertKind.INCOMPLETE_CREATE, allocation_id, None, None, None),
+    )
+    failed = store.get(job.job_id, "adepthood")
+    assert failed is not None and failed.state is JobState.FAILED
+
+
 def test_continuous_running_is_stopped_once_only_by_repair_and_seconds_accrue(
     store: ProvisioningStore,
 ) -> None:
@@ -877,6 +988,68 @@ def test_a_store_that_still_refuses_the_requeue_leaves_the_divergence_reported(
     job = store.get(job_id, "adepthood")
     assert job is not None
     assert job.state is JobState.FAILED
+
+
+def test_a_concurrent_create_transition_stays_reported_and_alerted(
+    store: ProvisioningStore,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A create changed after inventory cannot escape or become silently clean."""
+
+    class RefusingStore(ProvisioningStore):
+        """Model a concurrent transition after the reconciler's snapshot."""
+
+        def requeue_failed_create(
+            self,
+            job_id: str,
+            *,
+            now: datetime | None = None,
+        ) -> ProvisioningJob:
+            del job_id, now
+            raise InvalidJobTransitionError("job is not a recoverable create")
+
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-create-refused",
+        "subject",
+        requester_identity="adepthood",
+        now=_NOW,
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+    allocation_id = driver.expected_allocation_id(job.activation_id)
+    refusing = RefusingStore(tmp_path / "provisioning.sqlite3")
+
+    with caplog.at_level(logging.INFO):
+        report = FleetReconciler(refusing, driver, driver, _policy()).run_once(
+            now=_NOW + timedelta(seconds=10), repair=True
+        )
+
+    assert report.divergences == (
+        Divergence(
+            DivergenceKind.INCOMPLETE_CREATE,
+            Disposition.REPORTED,
+            allocation_id,
+            None,
+            job.job_id,
+            None,
+        ),
+    )
+    assert report.alerts == (
+        Alert(AlertKind.INCOMPLETE_CREATE, allocation_id, None, None, None),
+    )
+    assert (
+        f"fleet repair skipped kind=incomplete_create subject={job.job_id}"
+        in caplog.text
+    )
 
 
 def test_a_stopped_duplicate_machine_does_not_mask_its_running_twin(

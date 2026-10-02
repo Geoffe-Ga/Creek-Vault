@@ -16,7 +16,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Final
 
-from creek_mcp.provisioning.models import DivergenceKind
+from creek_mcp.provisioning.models import Disposition, DivergenceKind
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -340,6 +340,7 @@ class AlertKind(StrEnum):
     ORPHAN_RESOURCE = "orphan_resource"
     STUCK_DELETION = "stuck_deletion"
     CONTINUOUS_RUNNING = "continuous_running"
+    INCOMPLETE_CREATE = "incomplete_create"
     MONTHLY_BUDGET_DEPARTURE = "monthly_budget_departure"
 
 
@@ -357,11 +358,17 @@ class Alert:
 _PER_RESOURCE_ALERTS: Final[dict[DivergenceKind, AlertKind]] = {
     DivergenceKind.ORPHAN_RESOURCE: AlertKind.ORPHAN_RESOURCE,
     DivergenceKind.DUPLICATE_RESOURCE: AlertKind.DUPLICATE_RESOURCE,
+    DivergenceKind.INCOMPLETE_CREATE: AlertKind.INCOMPLETE_CREATE,
 }
 
 
 def _alert_for(divergence: Divergence, policy: FleetPolicy) -> Alert | None:
     """Map one divergence to its alert, or None for report-only kinds."""
+    if (
+        divergence.kind is DivergenceKind.INCOMPLETE_CREATE
+        and divergence.disposition is Disposition.REPAIRED
+    ):
+        return None
     resource_kind = _PER_RESOURCE_ALERTS.get(divergence.kind)
     if resource_kind is not None:
         subject = divergence.provider_allocation_id or _FLEET_SUBJECT

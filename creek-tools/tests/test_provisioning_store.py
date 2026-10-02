@@ -452,6 +452,48 @@ def test_only_a_retryable_failure_can_return_to_pending(
         store.retry(permanent.job_id, "adepthood", now=_NOW)
 
 
+def test_operator_requeues_only_first_provider_rejected_create_without_allocation(
+    store: ProvisioningStore,
+) -> None:
+    """A fixed deploy may recover one pre-allocation provider rejection exactly once."""
+    job = store.submit("activation-operator-recovery", "adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+
+    recovered = store.requeue_failed_create(
+        job.job_id,
+        now=_NOW + timedelta(minutes=1),
+    )
+    replay = store.requeue_failed_create(
+        job.job_id,
+        now=_NOW + timedelta(minutes=2),
+    )
+
+    assert recovered.state is JobState.PENDING
+    assert recovered.retryable is False
+    assert recovered.failure_reason is None
+    assert replay == recovered
+
+    claimed_again = store.claim_next(now=_NOW + timedelta(minutes=3))
+    assert claimed_again is not None
+    store.record_failure(
+        job.job_id,
+        claimed_again.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW + timedelta(minutes=3),
+    )
+    with pytest.raises(InvalidJobTransitionError, match="not a recoverable create"):
+        store.requeue_failed_create(job.job_id, now=_NOW + timedelta(minutes=4))
+
+
 def test_a_prior_create_retry_does_not_make_a_later_delete_retryable(
     store: ProvisioningStore,
 ) -> None:

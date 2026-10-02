@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -48,6 +49,7 @@ _NOW = datetime(2026, 9, 7, 4, tzinfo=UTC)
 _RUNBOOK = (
     Path(__file__).resolve().parents[1] / "docs" / "provisioning-control-plane.md"
 )
+_FLY_VOLUME_NAME = re.compile(r"[a-z0-9_]{1,30}")
 
 
 def _only_app(api: FakeFlyAPI) -> str:
@@ -83,7 +85,7 @@ def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None
     assert api.apps[app_name]["network"] == allocation.allocation_id
     assert volume == {
         "id": "vol-1",
-        "name": f"{allocation.allocation_id}-vault",
+        "name": "vault_" + allocation.allocation_id.removeprefix("fly-"),
         "region": "iad",
         "size_gb": 5,
         "encrypted": True,
@@ -115,6 +117,24 @@ def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None
     assert all("ips" not in path for _, path in api.requests)
     assert allocation.vault_url == f"{ROUTING_PUBLIC_URL}/v1"
     assert ".internal" not in allocation.vault_url
+
+
+def test_volume_names_meet_fly_runtime_contract_and_remain_deterministic() -> None:
+    """Every activation maps stably to one distinct Fly-valid volume name."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api)
+
+    first = driver.provision(fly_job("activation-volume-name-first"))
+    repeated = driver.provision(fly_job("activation-volume-name-first"))
+    second = driver.provision(fly_job("activation-volume-name-second"))
+
+    names = {volume["name"] for volumes in api.volumes.values() for volume in volumes}
+    assert first == repeated
+    assert first.allocation_id != second.allocation_id
+    assert len(names) == 2
+    assert all(isinstance(name, str) for name in names)
+    assert all(_FLY_VOLUME_NAME.fullmatch(name) is not None for name in names)
+    assert all(len(name) == 30 for name in names)
 
 
 def test_cross_network_route_uses_fly_replay_not_private_dns() -> None:

@@ -246,10 +246,13 @@ secret-bearing dataclass excludes its contents from `repr`. The secret manager
 must return the identical bundle when a create is replayed and make repeated
 revocation a no-op.
 
-Every provider name is derived from a SHA-256 activation digest. Machine
-metadata also carries the allocation and activation ids. Provisioning lists and
-adopts those resources before creating anything, so a partial create that left
-an app or volume is resumed rather than duplicated. Deletion revokes the
+Every provider name is derived from a SHA-256 activation digest. The volume is
+named `vault_<24 lowercase hex>`, which stays within Fly's 30-character
+lowercase-alphanumeric/underscore contract; app, allocation, and Machine names
+retain their existing digest-derived identities. Machine metadata also carries
+the allocation and activation ids. Provisioning lists and adopts those
+resources before creating anything, so a partial create that left an app or
+volume is resumed rather than duplicated. Deletion revokes the
 consumer credential first, then stops and destroys the Machine, destroys the
 volume, removes the app, and verifies absence. A partial delete stays retryable
 and visible to the durable queue until reconciliation proves that no Machine or
@@ -357,14 +360,23 @@ creek-provisioning-fleet report \
 `report` observes and exits `0` when clean, `3` when any alert is present, and
 `1` when the provider inventory could not be read (it never prints a "clean"
 report in that case). `reconcile` takes the same arguments and additionally
-performs the only two repairs the tool knows: stopping a live allocation's
-Machine that has run continuously past `max_continuous_running_seconds`, and
-requeueing a retryable failed delete. Stopping an overrunning Machine
-interrupts background work, so run `reconcile` on a schedule you accept for
-that, and `report` everywhere else. Both commands print one JSON document with
+performs three bounded repairs: stopping a live allocation's Machine that has
+run continuously past `max_continuous_running_seconds`, requeueing a retryable
+failed delete, and requeueing one first-attempt `provider_rejected` create only
+when the durable store has no allocation and provider inventory contains no
+Machine or volume (an absent app or exactly one deterministic empty app).
+That last repair exists for a fixed deployment recovering an app-only partial
+create; any billable residue, second failure, other reason, or existing durable
+allocation remains terminal and raises an `incomplete_create` alert for operator
+investigation. Stopping an overrunning Machine interrupts background work, so
+run `reconcile` on a schedule you accept for that, and `report` everywhere else.
+Both commands print one JSON document with
 the keys `observed_at`, `telemetry`, `divergences`, `alerts`, `estimate`,
 `review_triggers`, and `inventory_mode`, and log each alert as
 `fleet alert kind=<kind> subject=<id>` with nothing else on the line.
+An incomplete create that the bounded reconciler successfully requeues is not
+alerted; a refused repair or any terminal residue remains both reported and
+alerted, so scheduled commands cannot call it clean.
 
 The production fleet driver first calls Fly's documented org-scoped
 `GET /v1/apps?org_slug=...`, validates the closed response shape, and keeps only
@@ -417,6 +429,7 @@ months_over_budget = 3
 | `orphan_resource` | a resource exists under an app the store does not want (no job, or the job is confirmed deleted) | confirm on the provider console, then delete it there; the tool never deletes |
 | `stuck_deletion` | a deletion has been unconfirmed for at least `stuck_deletion_seconds` | `reconcile` requeues a retryable failure; a non-retryable one needs the provider console |
 | `continuous_running` | a Machine has been observed running for at least `max_continuous_running_seconds` | `reconcile` stops it only when the allocation is live (this interrupts background work); an orphan or deleting Machine is reported only - stop it on the provider console; `report` only reports |
+| `incomplete_create` | a provider-rejected create remains terminal with residue or after its single bounded repair opportunity | inspect the deterministic app and job; a successfully requeued empty app is not alerted |
 | `monthly_budget_departure` | the month estimate is greater than or equal to `monthly_budget` (equal fires) | reconcile the invoice below and revisit the budget or the fleet |
 
 `missing_resource` and `unconfirmed_deletion` appear under `divergences` but

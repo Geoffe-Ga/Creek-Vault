@@ -2,9 +2,10 @@
 
 One pass compares the store's desired state - live jobs plus deletions the
 provider has not confirmed - with the provider inventory of that bounded set,
-and returns a deterministic, content-free ``FleetReport``.  The only repairs
-are stopping an overrunning Machine of a live allocation and requeueing a
-retryable failed delete; the reconciler is typed against
+and returns a deterministic, content-free ``FleetReport``.  Repairs are
+stopping an overrunning Machine, requeueing a retryable failed delete, and
+resuming one first-attempt rejected create only when inventory proves that its
+deterministic app has no Machine or volume; the reconciler is typed against
 ``FleetInventorySource`` and ``FleetStopper`` and can call no delete.
 """
 
@@ -28,6 +29,7 @@ from creek_mcp.provisioning.models import (
     Disposition,
     Divergence,
     DivergenceKind,
+    FailureReason,
     FleetTelemetry,
     JobOperation,
     JobState,
@@ -283,6 +285,9 @@ class FleetReconciler:
                 )
             )
         divergences.extend(
+            self._classify_failed_creates(desired, groups, now, repair=repair)
+        )
+        divergences.extend(
             self._classify_deletions(pending_deletes, now, repair=repair)
         )
         divergences.extend(
@@ -358,6 +363,52 @@ class FleetReconciler:
                     None,
                     entry.job.job_id,
                     age,
+                )
+            )
+        return divergences
+
+    def _classify_failed_creates(
+        self,
+        desired: Mapping[str, FleetJob],
+        groups: Mapping[str, Sequence[ProviderResource]],
+        now: datetime,
+        *,
+        repair: bool,
+    ) -> list[Divergence]:
+        """Report failed creates and recover only first-attempt empty residue."""
+        divergences: list[Divergence] = []
+        for provider_allocation_id, entry in sorted(desired.items()):
+            job = entry.job
+            if not (
+                job.state is JobState.FAILED
+                and job.operation is JobOperation.CREATE
+                and job.failure_reason is FailureReason.PROVIDER_REJECTED
+            ):
+                continue
+            resources = tuple(groups.get(provider_allocation_id, ()))
+            empty_app = len(resources) == 1 and (
+                resources[0].resource_class is ResourceClass.APP
+            )
+            no_provider_residue = not resources
+            disposition = Disposition.REPORTED
+            if repair and (empty_app or no_provider_residue):
+                try:
+                    self._store.requeue_failed_create(job.job_id, now=now)
+                except InvalidJobTransitionError:
+                    _LOGGER.info(
+                        "fleet repair skipped kind=incomplete_create subject=%s",
+                        job.job_id,
+                    )
+                else:
+                    disposition = Disposition.REPAIRED
+            divergences.append(
+                Divergence(
+                    DivergenceKind.INCOMPLETE_CREATE,
+                    disposition,
+                    provider_allocation_id,
+                    ResourceClass.APP if empty_app else None,
+                    job.job_id,
+                    None,
                 )
             )
         return divergences

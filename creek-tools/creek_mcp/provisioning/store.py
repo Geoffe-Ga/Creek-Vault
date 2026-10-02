@@ -946,6 +946,53 @@ class ProvisioningStore:
                 raise InvalidJobTransitionError("job is not a requeueable delete")
             return self._from_row(row)
 
+    def requeue_failed_create(
+        self,
+        job_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> ProvisioningJob:
+        """Requeue one first-attempt provider rejection with no allocation.
+
+        This operator seam is deliberately narrower than the requester retry
+        endpoint.  The fleet reconciler calls it only after provider inventory
+        proves the deterministic allocation has no Machine or volume.
+        """
+        instant = now or _utc_now()
+        with self._connect(write=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM provisioning_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None or row["operation"] != JobOperation.CREATE.value:
+                raise InvalidJobTransitionError("job is not a recoverable create")
+            allocation = connection.execute(
+                "SELECT 1 FROM provisioning_allocations WHERE job_id = ? LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if allocation is not None:
+                raise InvalidJobTransitionError("job is not a recoverable create")
+            if (
+                row["state"] == JobState.PENDING.value
+                and int(row["attempts"]) == 1
+                and int(row["retry_count"]) == 1
+            ):
+                return self._from_row(row)
+            if (
+                row["state"] != JobState.FAILED.value
+                or row["failure_reason"] != FailureReason.PROVIDER_REJECTED.value
+                or bool(row["retryable"])
+                or int(row["attempts"]) != 1
+                or int(row["retry_count"]) != 0
+            ):
+                raise InvalidJobTransitionError("job is not a recoverable create")
+            connection.execute(
+                "UPDATE provisioning_jobs SET state = ?, retry_count = 1, "
+                "failure_reason = NULL, updated_at = ? WHERE job_id = ?",
+                (JobState.PENDING.value, _timestamp(instant), job_id),
+            )
+            return self._job_by_id(connection, job_id)
+
     @staticmethod
     def _release_expired_claims(connection: sqlite3.Connection, stamp: str) -> None:
         """Make expired create/delete leases claimable after a worker crash."""

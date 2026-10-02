@@ -185,6 +185,7 @@ class DivergenceKind(StrEnum):
     UNCONFIRMED_DELETION = "unconfirmed_deletion"
     STUCK_DELETION = "stuck_deletion"
     CONTINUOUS_RUNNING = "continuous_running"
+    INCOMPLETE_CREATE = "incomplete_create"
 
 
 @unique

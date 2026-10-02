@@ -188,6 +188,8 @@ Each scheduled report captures provider inventory and fails visibly for:
 - `orphan_resource`;
 - `stuck_deletion`;
 - `continuous_running`;
+- `incomplete_create` when a failed create remains terminal after bounded
+  reconciliation;
 - `monthly_budget_departure`;
 - unknown and unpriced cost inputs.
 
