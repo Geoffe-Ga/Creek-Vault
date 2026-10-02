@@ -998,7 +998,7 @@ class FlyProviderDriver:
             activation_id=normalized,
             allocation_id=allocation_id,
             app_name=app_name,
-            volume_name=f"{allocation_id}-vault",
+            volume_name=f"vault_{digest[:_ALLOCATION_DIGEST_LENGTH]}",
             machine_name=f"{allocation_id}-machine",
         )
 

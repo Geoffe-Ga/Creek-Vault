@@ -356,6 +356,7 @@ def test_alert_vocabulary_is_exactly_five_kinds_and_each_condition_maps_to_one()
         "unconfirmed_deletion",
         "stuck_deletion",
         "continuous_running",
+        "incomplete_create",
     }
     assert set(Disposition) == {"reported", "repaired"}
 

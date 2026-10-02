@@ -246,10 +246,13 @@ secret-bearing dataclass excludes its contents from `repr`. The secret manager
 must return the identical bundle when a create is replayed and make repeated
 revocation a no-op.
 
-Every provider name is derived from a SHA-256 activation digest. Machine
-metadata also carries the allocation and activation ids. Provisioning lists and
-adopts those resources before creating anything, so a partial create that left
-an app or volume is resumed rather than duplicated. Deletion revokes the
+Every provider name is derived from a SHA-256 activation digest. The volume is
+named `vault_<24 lowercase hex>`, which stays within Fly's 30-character
+lowercase-alphanumeric/underscore contract; app, allocation, and Machine names
+retain their existing digest-derived identities. Machine metadata also carries
+the allocation and activation ids. Provisioning lists and adopts those
+resources before creating anything, so a partial create that left an app or
+volume is resumed rather than duplicated. Deletion revokes the
 consumer credential first, then stops and destroys the Machine, destroys the
 volume, removes the app, and verifies absence. A partial delete stays retryable
 and visible to the durable queue until reconciliation proves that no Machine or
@@ -357,9 +360,14 @@ creek-provisioning-fleet report \
 `report` observes and exits `0` when clean, `3` when any alert is present, and
 `1` when the provider inventory could not be read (it never prints a "clean"
 report in that case). `reconcile` takes the same arguments and additionally
-performs the only two repairs the tool knows: stopping a live allocation's
-Machine that has run continuously past `max_continuous_running_seconds`, and
-requeueing a retryable failed delete. Stopping an overrunning Machine
+performs three bounded repairs: stopping a live allocation's Machine that has
+run continuously past `max_continuous_running_seconds`, requeueing a retryable
+failed delete, and requeueing one first-attempt `provider_rejected` create only
+when the durable store has no allocation and provider inventory contains no
+Machine or volume (an absent app or exactly one deterministic empty app).
+That last repair exists for a fixed deployment recovering an app-only partial
+create; any billable residue, second failure, other reason, or existing durable
+allocation remains terminal for operator investigation. Stopping an overrunning Machine
 interrupts background work, so run `reconcile` on a schedule you accept for
 that, and `report` everywhere else. Both commands print one JSON document with
 the keys `observed_at`, `telemetry`, `divergences`, `alerts`, `estimate`,

@@ -8,6 +8,7 @@ credential.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,7 @@ ORGANIZATION = "creek-vaults"
 IMAGE = "registry.example/creek@sha256:" + "a" * 64
 API_BASE_URL = "https://fly.test"
 ROUTING_PUBLIC_URL = "https://vault-router.example.com"
+_FLY_VOLUME_NAME = re.compile(r"[a-z0-9_]{1,30}")
 
 
 @dataclass
@@ -176,6 +178,12 @@ class FakeFlyAPI:
             return httpx.Response(200, json=self.volumes[app_name], request=request)
         if not segments and request.method == "POST":
             body = self._json(request)
+            if _FLY_VOLUME_NAME.fullmatch(str(body["name"])) is None:
+                return httpx.Response(
+                    400,
+                    json={"error": "invalid volume name"},
+                    request=request,
+                )
             volume = {
                 "id": f"vol-{len(self.volumes[app_name]) + 1}",
                 "name": body["name"],

@@ -9,6 +9,12 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Fix managed-vault Fly volume names to the provider's 30-character grammar
+  while preserving deterministic allocation identity. Fleet reconciliation can
+  now resume exactly one first-attempt provider-rejected create after proving
+  the deterministic app has no Machine or volume; billable residue and repeat
+  failures remain terminal.
+
 - Fix the managed-vault Fly pilot deployment boundary: one supervised control
   Machine now owns the API, durable worker, replay router, and scheduled fleet
   report over one volume; isolated vault networks route through authenticated

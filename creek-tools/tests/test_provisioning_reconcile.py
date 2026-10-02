@@ -555,6 +555,110 @@ def test_expired_ceremony_is_unconfirmed_then_stuck_and_repair_requeues_failure(
     assert driver.delete_count == 0
 
 
+def test_reconcile_repairs_one_empty_app_after_first_provider_rejected_create(
+    store: ProvisioningStore,
+) -> None:
+    """A fixed deployment resumes the exact failed job only from empty app evidence."""
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-empty-app", "subject", requester_identity="adepthood", now=_NOW
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+    allocation_id = driver.expected_allocation_id(job.activation_id)
+    driver.seed_resource(
+        ProviderResource(
+            allocation_id,
+            ResourceClass.APP,
+            ResourceState.OTHER,
+            None,
+            None,
+            f"{allocation_id}-app",
+        )
+    )
+    reconciler = _reconciler(store, driver)
+
+    reported = reconciler.run_once(now=_NOW + timedelta(minutes=1), repair=False)
+    failed = store.get(job.job_id, "adepthood")
+    repaired = reconciler.run_once(now=_NOW + timedelta(minutes=2), repair=True)
+    pending = store.get(job.job_id, "adepthood")
+
+    assert reported.divergences == (
+        Divergence(
+            DivergenceKind.INCOMPLETE_CREATE,
+            Disposition.REPORTED,
+            allocation_id,
+            ResourceClass.APP,
+            job.job_id,
+            None,
+        ),
+    )
+    assert failed is not None and failed.state is JobState.FAILED
+    assert repaired.divergences == (
+        Divergence(
+            DivergenceKind.INCOMPLETE_CREATE,
+            Disposition.REPAIRED,
+            allocation_id,
+            ResourceClass.APP,
+            job.job_id,
+            None,
+        ),
+    )
+    assert pending is not None and pending.state is JobState.PENDING
+    assert driver.stop_count == 0
+    assert driver.delete_count == 0
+
+
+def test_reconcile_never_requeues_a_failed_create_with_billable_residue(
+    store: ProvisioningStore,
+) -> None:
+    """A surviving Machine or volume keeps the non-retryable failure terminal."""
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-residue", "subject", requester_identity="adepthood", now=_NOW
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+    allocation_id = driver.expected_allocation_id(job.activation_id)
+    for resource_class, suffix in (
+        (ResourceClass.APP, "app"),
+        (ResourceClass.VOLUME, "volume"),
+    ):
+        driver.seed_resource(
+            ProviderResource(
+                allocation_id,
+                resource_class,
+                ResourceState.OTHER,
+                5 if resource_class is ResourceClass.VOLUME else None,
+                None,
+                f"{allocation_id}-{suffix}",
+            )
+        )
+
+    report = _reconciler(store, driver).run_once(
+        now=_NOW + timedelta(minutes=1), repair=True
+    )
+
+    assert report.divergences[0].kind is DivergenceKind.INCOMPLETE_CREATE
+    assert report.divergences[0].disposition is Disposition.REPORTED
+    failed = store.get(job.job_id, "adepthood")
+    assert failed is not None and failed.state is JobState.FAILED
+
+
 def test_continuous_running_is_stopped_once_only_by_repair_and_seconds_accrue(
     store: ProvisioningStore,
 ) -> None:
