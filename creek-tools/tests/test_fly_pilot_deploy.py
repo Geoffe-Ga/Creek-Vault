@@ -86,7 +86,11 @@ def _machine_document(
     *,
     mount_encrypted: bool | None = True,
     provider_list_shape: bool = True,
+    control_image: str | None = None,
+    image_digest: str | None = None,
 ) -> dict[str, Any]:
+    selected_image = control_image or _coordinates().control_image
+    selected_digest = image_digest or selected_image.rsplit("@", 1)[-1]
     mount: dict[str, Any] = {
         "volume": "private-volume",
         "path": "/data",
@@ -133,15 +137,104 @@ def _machine_document(
         "id": "private-machine",
         "region": "iad",
         "state": "started",
-        "image_ref": {"digest": "sha256:" + "b" * 64},
+        "image_ref": {"digest": selected_digest},
         "config": {
-            "image": _coordinates().control_image,
+            "image": selected_image,
             "guest": {"cpu_kind": "shared", "cpus": 1, "memory_mb": 1024},
             "restart": {"policy": "on-failure", "max_retries": 3},
             "mounts": [mount],
             "services": [service],
         },
     }
+
+
+def test_deploy_admits_one_exact_machine_for_an_immutable_image_upgrade(
+    tmp_path: Path,
+) -> None:
+    """A reviewed deploy may transition one otherwise-exact prior digest."""
+    authorization, digest = _authorization(tmp_path)
+    token_file = _token_file(tmp_path)
+    commands: list[list[str]] = []
+    machine_lists = 0
+    previous_image = "registry.fly.io/control@sha256:" + "c" * 64
+
+    def fake_run(command: list[str], _environ: dict[str, str]) -> CommandResult:
+        nonlocal machine_lists
+        commands.append(command)
+        if command[1:3] == ["orgs", "show"]:
+            return CommandResult(_org_document())
+        if command[1:3] == ["apps", "list"]:
+            return CommandResult(_apps_document())
+        if command[1:3] == ["machine", "list"]:
+            machine_lists += 1
+            image = previous_image if machine_lists == 1 else None
+            return CommandResult(
+                json.dumps([_machine_document(control_image=image)]).encode()
+            )
+        if command[1:3] == ["volumes", "list"]:
+            return CommandResult(
+                b'[{"id":"private-volume","name":"creek_control_state",'
+                b'"region":"iad","encrypted":true,'
+                b'"attached_machine_id":"private-machine"}]'
+            )
+        return CommandResult(b"")
+
+    deploy(
+        _TEMPLATE,
+        _coordinates(),
+        token_file,
+        authorization,
+        digest,
+        run=fake_run,
+        now=_NOW,
+    )
+
+    assert machine_lists == 2
+    assert any(command[1:2] == ["deploy"] for command in commands)
+
+
+@pytest.mark.parametrize(
+    ("configured_image", "observed_digest"),
+    [
+        ("registry.fly.io/control:previous", "sha256:" + "c" * 64),
+        ("docker.io/control@sha256:" + "c" * 64, "sha256:" + "c" * 64),
+        ("registry.fly.io/other@sha256:" + "c" * 64, "sha256:" + "c" * 64),
+        ("registry.fly.io/control@sha256:" + "c" * 64, "sha256:" + "d" * 64),
+        ("registry.fly.io/control@sha256:" + "c" * 63, "sha256:" + "c" * 63),
+    ],
+)
+def test_image_upgrade_refuses_every_near_miss_predecessor(
+    configured_image: str,
+    observed_digest: str,
+) -> None:
+    """Mutable, cross-registry, cross-repository, and mismatched images fail."""
+    assert not fly_pilot_deploy._machine_image_is_exact(
+        {"digest": observed_digest},
+        configured_image,
+        _coordinates().control_image,
+        allow_transition=True,
+    )
+
+
+def test_post_state_still_requires_the_new_image_exactly() -> None:
+    """A valid predecessor cannot satisfy the post-deploy verification gate."""
+    previous = "registry.fly.io/control@sha256:" + "c" * 64
+    machine = _machine_document(control_image=previous)
+    volume = {
+        "id": "private-volume",
+        "name": _coordinates().volume,
+        "region": "iad",
+        "encrypted": True,
+        "attached_machine_id": "private-machine",
+    }
+
+    with pytest.raises(RuntimeError, match="post-state drifted"):
+        fly_pilot_deploy._verify_post_state(
+            machine,
+            volume,
+            "private-machine",
+            _coordinates(),
+        )
 
 
 def test_deploy_verifies_post_state_from_supported_json_inventory(

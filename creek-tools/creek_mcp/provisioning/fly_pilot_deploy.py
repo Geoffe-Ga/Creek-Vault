@@ -44,6 +44,10 @@ _PILOT_SPEND_CAP_USD_CENTS: Final[int] = 2500
 _MAX_TOKEN_FILE_BYTES: Final[int] = 4096
 _FLY_TOKEN_PREFIX: Final[str] = "FlyV1 "
 _FLY_TOKEN_PAYLOAD_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_+/,=-]+")
+_FLY_IMAGE_RE: Final[re.Pattern[str]] = re.compile(
+    r"registry\.fly\.io/(?P<repository>[a-z0-9][a-z0-9._/-]*)"
+    r"@(?P<digest>sha256:[0-9a-f]{64})"
+)
 _FLY_CHILD_ENV_KEYS: Final[frozenset[str]] = frozenset(
     {"LANG", "LC_ALL", "NO_COLOR", "PATH", "TERM"}
 )
@@ -236,6 +240,7 @@ def _verify_preflight_state(
         machine_id,
         coordinates,
         admitted_states=frozenset({"started", "stopped", "suspended"}),
+        allow_image_transition=True,
         phase="preflight",
     )
 
@@ -406,6 +411,7 @@ def _verify_post_state(
         machine_id,
         coordinates,
         admitted_states=frozenset({"started"}),
+        allow_image_transition=False,
         phase="post-state",
     )
 
@@ -417,6 +423,7 @@ def _verify_machine_state(
     coordinates: FlyPilotCoordinates,
     *,
     admitted_states: frozenset[str],
+    allow_image_transition: bool,
     phase: str,
 ) -> None:
     """Verify one exact control Machine and attached encrypted volume."""
@@ -429,15 +436,17 @@ def _verify_machine_state(
     guest = config.get("guest") if isinstance(config, dict) else None
     restart = config.get("restart") if isinstance(config, dict) else None
     volume_id = volume.get("id")
-    expected_digest = coordinates.control_image.rsplit("@", 1)[1]
     if (
         machine.get("id") != machine_id
         or machine.get("region") != coordinates.region
         or machine.get("state") not in admitted_states
-        or not isinstance(image_ref, dict)
-        or image_ref.get("digest") != expected_digest
         or not isinstance(config, dict)
-        or config.get("image") != coordinates.control_image
+        or not _machine_image_is_exact(
+            image_ref,
+            config.get("image"),
+            coordinates.control_image,
+            allow_transition=allow_image_transition,
+        )
         or guest != {"cpu_kind": "shared", "cpus": 1, "memory_mb": 1024}
         or restart != {"policy": "on-failure", "max_retries": 3}
         or not isinstance(volume_id, str)
@@ -449,6 +458,32 @@ def _verify_machine_state(
         or volume.get("attached_machine_id") != machine_id
     ):
         raise RuntimeError(f"Fly pilot {phase} drifted from reviewed policy")
+
+
+def _machine_image_is_exact(
+    image_ref: object,
+    configured_image: object,
+    target_image: str,
+    *,
+    allow_transition: bool,
+) -> bool:
+    """Admit the target image or one exact same-repository Fly predecessor."""
+    if not isinstance(image_ref, dict) or not isinstance(configured_image, str):
+        return False
+    observed_digest = image_ref.get("digest")
+    target_digest = target_image.rsplit("@", 1)[-1]
+    if configured_image == target_image:
+        return observed_digest == target_digest
+    if not allow_transition:
+        return False
+    observed = _FLY_IMAGE_RE.fullmatch(configured_image)
+    target = _FLY_IMAGE_RE.fullmatch(target_image)
+    return (
+        observed is not None
+        and target is not None
+        and observed.group("repository") == target.group("repository")
+        and observed.group("digest") == observed_digest
+    )
 
 
 def _mount_is_exact(
