@@ -37,6 +37,7 @@ from tests.fly_support import (
     TLS_KEY,
     FakeFlyAPI,
     FakeSecretManager,
+    ProviderNormalizedFlyAPI,
     fly_client,
     fly_driver,
     fly_job,
@@ -117,6 +118,93 @@ def test_reference_policy_creates_one_private_scale_to_zero_allocation() -> None
     assert all("ips" not in path for _, path in api.requests)
     assert allocation.vault_url == f"{ROUTING_PUBLIC_URL}/v1"
     assert ".internal" not in allocation.vault_url
+
+
+def test_provision_accepts_exact_live_provider_normalization() -> None:
+    """Fly's reviewed response enrichments are equivalent to the request policy."""
+    api = ProviderNormalizedFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+
+    allocation = driver.provision(fly_job())
+    target = driver.prepare_replay(
+        RoutableAllocation(
+            "job-fly-001",
+            "activation-fly-001",
+            "adepthood",
+            "adepthood-user-001",
+            allocation.allocation_id,
+        )
+    )
+
+    machine = _only_machine(api)
+    mount = machine["config"]["mounts"][0]
+    service = machine["config"]["services"][0]
+    digest = allocation.allocation_id.removeprefix("fly-")
+    assert target.machine_id == "machine-1"
+    assert mount == {
+        "volume": "vol-1",
+        "path": "/vault",
+        "encrypted": True,
+        "name": f"vault_{digest}",
+        "size_gb": 5,
+    }
+    assert service == {
+        "protocol": "tcp",
+        "internal_port": 8823,
+        "ports": [{"port": 443, "handlers": ["tls", "http"]}],
+        "autostart": True,
+        "autostop": True,
+        "min_machines_running": 0,
+        "force_instance_key": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("_label", "mutate"),
+    [
+        (
+            "mount-name",
+            lambda machine: machine["config"]["mounts"][0].update(name="other"),
+        ),
+        (
+            "mount-size",
+            lambda machine: machine["config"]["mounts"][0].update(size_gb=6),
+        ),
+        (
+            "autostop",
+            lambda machine: machine["config"]["services"][0].update(autostop=False),
+        ),
+        (
+            "instance-key",
+            lambda machine: machine["config"]["services"][0].update(
+                force_instance_key="unreviewed"
+            ),
+        ),
+        (
+            "service-field",
+            lambda machine: machine["config"]["services"][0].update(unreviewed=True),
+        ),
+        (
+            "config-field",
+            lambda machine: machine["config"].update(unreviewed=True),
+        ),
+    ],
+)
+def test_provision_rejects_drift_inside_provider_normalization(
+    _label: str,
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    """Known enrichment never permits policy drift or unknown provider fields."""
+    api = ProviderNormalizedFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+    job = fly_job()
+    driver.provision(job)
+    mutate(_only_machine(api))
+
+    with pytest.raises(ProviderError) as raised:
+        driver.provision(job)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
 
 
 def test_volume_names_meet_fly_runtime_contract_and_remain_deterministic() -> None:

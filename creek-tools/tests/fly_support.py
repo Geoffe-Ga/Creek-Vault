@@ -270,6 +270,34 @@ class FakeFlyAPI:
         return value
 
 
+class ProviderNormalizedFlyAPI(FakeFlyAPI):
+    """Return the exact vault Machine shape observed from Fly's live API."""
+
+    def _machine_request(
+        self,
+        request: httpx.Request,
+        app_name: str,
+        segments: list[str],
+    ) -> httpx.Response:
+        """Normalize newly created Machines before returning provider state."""
+        response = super()._machine_request(request, app_name, segments)
+        if not segments and request.method == "POST" and response.status_code == 200:
+            machine = self.machines[app_name][-1]
+            config = machine["config"]
+            mount = config["mounts"][0]
+            volume = next(
+                volume
+                for volume in self.volumes[app_name]
+                if volume["id"] == mount["volume"]
+            )
+            mount.update(name=volume["name"], size_gb=volume["size_gb"])
+            service = config["services"][0]
+            service["autostop"] = True
+            service["force_instance_key"] = None
+            return httpx.Response(200, json=machine, request=request)
+        return response
+
+
 def fly_job(activation_id: str = "activation-fly-001") -> ProvisioningJob:
     """Return one provisioning-state job for *activation_id*."""
     return ProvisioningJob(

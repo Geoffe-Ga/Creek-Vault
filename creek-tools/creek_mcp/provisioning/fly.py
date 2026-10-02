@@ -793,7 +793,6 @@ class FlyProviderDriver:
         if not isinstance(config, dict):
             self._rejected("Fly Machine has no inspectable config")
         metadata = config.get("metadata")
-        mount = {"volume": volume_id, "path": _VAULT_MOUNT, "encrypted": True}
         files = config.get("files")
         expected_files = [
             {
@@ -803,9 +802,21 @@ class FlyProviderDriver:
             for path, value in self._runtime_secret_files(runtime_secrets)
         ]
         runtime = self._runtime_config(reference)
+        expected_config_keys = {
+            "image",
+            "rootfs",
+            "guest",
+            "mounts",
+            "metadata",
+            "files",
+            "restart",
+            "services",
+            *runtime,
+        }
         if (
             machine.get("name") != reference.machine_name
             or machine.get("region") != self._policy.region
+            or set(config) != expected_config_keys
             or config.get("image") != self._policy.image
             or metadata
             != {
@@ -820,14 +831,37 @@ class FlyProviderDriver:
                 "cpus": self._policy.cpus,
                 "memory_mb": self._policy.memory_mb,
             }
-            or config.get("mounts") != [mount]
+            or not self._machine_mount_is_exact(
+                config.get("mounts"), reference, volume_id
+            )
             or config.get("restart") != {"policy": "no"}
             or any(config.get(key) != value for key, value in runtime.items())
             or any(key in config for key in {"env", "init", "user"} - runtime.keys())
-            or config.get("services") != [self._runtime_service()]
+            or not self._machine_service_is_exact(config.get("services"))
             or files != expected_files
         ):
             self._rejected("Fly Machine does not match allocation policy")
+
+    def _machine_mount_is_exact(
+        self,
+        value: object,
+        reference: _AllocationRef,
+        volume_id: str,
+    ) -> bool:
+        """Accept only the request mount or Fly's exact reviewed enrichment."""
+        requested = {"volume": volume_id, "path": _VAULT_MOUNT, "encrypted": True}
+        normalized = {
+            **requested,
+            "size_gb": self._policy.volume_size_gb,
+            "name": reference.volume_name,
+        }
+        return value in ([requested], [normalized])
+
+    def _machine_service_is_exact(self, value: object) -> bool:
+        """Accept Fly's boolean normalization without weakening scale-to-zero."""
+        requested = self._runtime_service()
+        normalized = {**requested, "autostop": True, "force_instance_key": None}
+        return value in ([requested], [normalized])
 
     def _require_machine(self, reference: _AllocationRef) -> Mapping[str, Any]:
         if not self._app_exists(reference):
