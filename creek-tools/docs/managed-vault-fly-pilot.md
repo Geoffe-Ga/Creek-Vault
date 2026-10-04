@@ -99,6 +99,12 @@ separate Fly secret-backed files and are not part of that snapshot.
   exact `/vault` mount and the two exact injected consumer/replay files,
   normalizes only those paths, then irreversibly drops groups, gid, and uid to
   `10001` before importing the plaintext-behind-Fly-Proxy vault runtime.
+  The image-user override and bootstrap `exec` command share exactly one
+  `config.processes` entry; Fly ignores `config.user`, and process overrides do
+  not inherit `config.init.exec`. Both the process list and command are verified
+  before accepting a vault. On a fresh ext4 mount, bootstrap removes `lost+found`
+  only when it is the sole entry and an empty, non-symlink directory. Recovered
+  data and existing vault contents are never removed or overwritten.
 - Preserve the hard live-allocation cap of five and Fly replay's inclusive
   1 MiB body ceiling. The pilot journal lifecycle is supported; larger
   `/v1/uploads` requests are unavailable during the pilot and receive Creek's

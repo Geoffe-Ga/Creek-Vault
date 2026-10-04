@@ -765,7 +765,18 @@ class FlyProviderDriver:
         if not self._policy.fly_replay_enabled:
             return {}
         return {
-            "user": "root",
+            # Fly ignores config.user; process overrides need both the user
+            # and command rather than inheriting config.init.exec.
+            "processes": [
+                {
+                    "user": "root",
+                    "exec": [
+                        "python",
+                        "-m",
+                        "creek_mcp.provisioning.fly_vault_bootstrap",
+                    ],
+                }
+            ],
             "env": {
                 "CREEK_CONTAINER_FLY_REPLAY_STATE_FILE": (
                     "/run/secrets/creek_replay_state"
@@ -773,13 +784,7 @@ class FlyProviderDriver:
                 "CREEK_CONTAINER_EXPECTED_FLY_APP": reference.app_name,
                 "CREEK_CONTAINER_EXPECTED_FLY_REGION": self._policy.region,
             },
-            "init": {
-                "exec": [
-                    "python",
-                    "-m",
-                    "creek_mcp.provisioning.fly_vault_bootstrap",
-                ]
-            },
+            "init": {},
         }
 
     def _runtime_service(self) -> dict[str, object]:
