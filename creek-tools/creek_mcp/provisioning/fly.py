@@ -437,8 +437,9 @@ class FlyProviderDriver:
             self._rejected("provider allocation identity does not match activation")
         self._secrets.revoke(job.activation_id)
         outcome = DeletionOutcome(_FLY_PROVIDER, _FLY_DELETED_CLASSES)
-        if not self._app_exists(reference):
+        if reference.app_name not in self._organization_app_names():
             return outcome
+        self._require_app(reference)
         for machine in self._matching_machines(reference):
             self._delete_machine(reference, machine)
         for volume in self._matching_volumes(reference):
@@ -450,7 +451,7 @@ class FlyProviderDriver:
             f"/v1/apps/{reference.app_name}",
             expected=(202, 204, _FLY_ABSENT_STATUS),
         )
-        if self._app_exists(reference):
+        if reference.app_name in self._organization_app_names():
             self._unavailable("Fly app deletion has not converged")
         return outcome
 
@@ -474,13 +475,15 @@ class FlyProviderDriver:
             rf"{re.escape(prefix)}[0-9a-f]{{{_ALLOCATION_DIGEST_LENGTH}}}"
         )
         names = {self._reference(activation).app_name for activation in activation_ids}
+        names.update(name for name in app_names if derived.fullmatch(name))
         if self._policy.discover_organization_apps:
-            names.update(
+            # Complete org inventory proves missing known apps are absent;
+            # Fly's direct lookup can time out after an app has been deleted.
+            names = {
                 name
                 for name in self._organization_app_names()
                 if derived.fullmatch(name)
-            )
-        names.update(name for name in app_names if derived.fullmatch(name))
+            }
         resources: list[ProviderResource] = []
         for name in sorted(names):
             app = self._app_by_name(name)
@@ -526,13 +529,25 @@ class FlyProviderDriver:
             or total != len(apps)
         ):
             self._unavailable("Fly organization app inventory was invalid")
-        names: list[str] = []
-        for app in cast("list[Mapping[str, Any]]", apps):
+        return self._validated_app_names(cast("list[Mapping[str, Any]]", apps))
+
+    @staticmethod
+    def _validated_app_names(apps: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+        """Require usable unique names before inventory can prove absence."""
+        names: set[str] = set()
+        for app in apps:
             name = app.get("name")
-            if not isinstance(name, str):
-                self._unavailable("Fly organization app inventory was invalid")
-            names.append(name)
-        return tuple(names)
+            if (
+                not isinstance(name, str)
+                or not name
+                or name.strip() != name
+                or name in names
+            ):
+                FlyProviderDriver._unavailable(
+                    "Fly organization app inventory was invalid"
+                )
+            names.add(name)
+        return tuple(sorted(names))
 
     def expected_allocation_id(self, activation_id: str) -> str:
         """Return the allocation id a provisioned *activation_id* carries."""
