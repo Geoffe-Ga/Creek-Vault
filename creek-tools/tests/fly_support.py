@@ -296,6 +296,7 @@ class ProviderNormalizedFlyAPI(FakeFlyAPI):
         if not segments and request.method == "POST" and response.status_code == 200:
             machine = self.machines[app_name][-1]
             config = machine["config"]
+            config.pop("user", None)
             mount = config["mounts"][0]
             volume = next(
                 volume

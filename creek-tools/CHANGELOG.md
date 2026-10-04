@@ -9,6 +9,13 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Fix Fly replay vault creation by placing the root bootstrap user override in
+  `config.processes` alongside its command instead of the unsupported top-level
+  `config.user`. Bootstrap admits fresh ext4 volumes with an empty `lost+found`
+  without removing recovery data or existing vault contents. Exact verification
+  still rejects changed users, commands, or additional processes; the bootstrap
+  drops privileges before serving traffic.
+
 - Fix managed-vault teardown when Fly retains a soft-deleted volume such as
   `pending_destroy`. Cleanup now reaches app deletion and verifies its absence;
   retained volume tombstones are neither reused for provisioning nor counted

@@ -49,6 +49,24 @@ def prepare_runtime_paths(
     os.chmod(vault_root, 0o700, follow_symlinks=False)
     for path in secret_files:
         _normalize_secret(path, uid=uid, gid=gid)
+    _remove_empty_recovery_directory(vault_root)
+
+
+def _remove_empty_recovery_directory(vault_root: Path) -> None:
+    """Admit a fresh ext4 mount without removing recovered or existing data."""
+    recovery = vault_root / "lost+found"
+    if (
+        list(vault_root.iterdir()) != [recovery]
+        or recovery.is_symlink()
+        or not recovery.is_dir()
+    ):
+        return
+    try:
+        recovery.rmdir()
+    except OSError as exc:
+        raise ContainerConfigurationError(
+            "Fly vault recovery directory must be empty before initialization"
+        ) from exc
 
 
 def _normalize_secret(path: Path, *, uid: int, gid: int) -> None:

@@ -188,6 +188,24 @@ def test_provision_accepts_exact_live_provider_normalization() -> None:
             "config-field",
             lambda machine: machine["config"].update(unreviewed=True),
         ),
+        (
+            "process-user",
+            lambda machine: machine["config"].update(processes=[{"user": "10001"}]),
+        ),
+        (
+            "missing-process-user",
+            lambda machine: machine["config"].pop("processes"),
+        ),
+        (
+            "extra-process",
+            lambda machine: machine["config"]["processes"].append({"user": "root"}),
+        ),
+        (
+            "process-command",
+            lambda machine: machine["config"]["processes"][0].update(
+                exec=["unreviewed"]
+            ),
+        ),
     ],
 )
 def test_provision_rejects_drift_inside_provider_normalization(
@@ -247,14 +265,18 @@ def test_cross_network_route_uses_fly_replay_not_private_dns() -> None:
     assert target.machine_id == machine["id"]
     assert ".internal" not in repr(target)
     config = machine["config"]
-    assert config["user"] == "root"
-    assert config["init"] == {
-        "exec": [
-            "python",
-            "-m",
-            "creek_mcp.provisioning.fly_vault_bootstrap",
-        ]
-    }
+    assert "user" not in config
+    assert config["init"] == {}
+    assert config["processes"] == [
+        {
+            "user": "root",
+            "exec": [
+                "python",
+                "-m",
+                "creek_mcp.provisioning.fly_vault_bootstrap",
+            ],
+        }
+    ]
     assert {item["guest_path"] for item in config["files"]} == {
         "/run/secrets/creek_consumer_tokens",
         "/run/secrets/creek_replay_state",
@@ -346,7 +368,10 @@ def test_replay_rechecks_allocation_network_after_machine_readiness() -> None:
             lambda machine: machine["config"].update(restart={"policy": "always"}),
         ),
         ("environment", lambda machine: machine["config"].update(env={})),
-        ("init", lambda machine: machine["config"].update(init={})),
+        (
+            "init",
+            lambda machine: machine["config"].update(init={"exec": ["unreviewed"]}),
+        ),
         ("service", lambda machine: machine["config"].update(services=[])),
         (
             "replay-secret",
