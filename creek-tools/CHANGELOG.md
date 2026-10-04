@@ -9,6 +9,11 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Confirm Fly app deletion from complete organization inventory and omit absent
+  apps from discovered fleet inventory. A timed-out lookup of an already-deleted
+  app can no longer strand its deletion receipt or stop the fleet scheduler;
+  incomplete, malformed, or unavailable inventory still fails closed.
+
 - Fix Fly replay vault creation by placing the root bootstrap user override in
   `config.processes` alongside its command instead of the unsupported top-level
   `config.user`. Bootstrap admits fresh ext4 volumes with an empty `lost+found`

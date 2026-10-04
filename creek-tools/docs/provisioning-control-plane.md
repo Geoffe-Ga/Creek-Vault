@@ -266,6 +266,13 @@ storage counts. Teardown continues to app deletion and confirms the receipt
 only after Fly reports the app absent. This confirms removal of the managed
 allocation, not physical erasure of provider-retained data or backups.
 
+App absence is established by the credential's complete organization inventory:
+the declared total must match the returned entries, and names must be nonempty
+and unique. Deleted-app lookups can time out, so deletion verification and
+organization-discovered fleet reports do not query apps absent from that list.
+An accepted DELETE alone is insufficient; a still-listed app or unavailable or
+invalid inventory leaves deletion unconfirmed and retryable.
+
 Authenticated request handling may call `start()` and return without scheduling
 a stop. Durable background execution calls `run_background_job()`, whose fixed
 sequence is drain, commit, close, and stop. Both success and failure close the
