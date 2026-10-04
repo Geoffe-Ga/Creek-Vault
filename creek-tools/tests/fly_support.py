@@ -83,6 +83,7 @@ class FakeFlyAPI:
         self.replacement_drops_mount = False
         self.volume_loses_encryption_on_wait = False
         self.start_stays_stopped = False
+        self.deleted_volume_state: str | None = None
 
     def fail_once(self, method: str, path_suffix: str, *, status: int = 503) -> None:
         """Return *status* once for a matching method and path suffix."""
@@ -162,9 +163,15 @@ class FakeFlyAPI:
         if request.method == "DELETE":
             if app_name not in self.apps:
                 return httpx.Response(404, request=request)
-            if self.volumes[app_name] or self.machines[app_name]:
+            live_volumes = [
+                volume
+                for volume in self.volumes[app_name]
+                if volume.get("state") != self.deleted_volume_state
+            ]
+            if live_volumes or self.machines[app_name]:
                 return httpx.Response(409, request=request)
             del self.apps[app_name]
+            self.volumes.pop(app_name, None)
             return httpx.Response(202, request=request)
         return httpx.Response(405, request=request)
 
@@ -196,6 +203,11 @@ class FakeFlyAPI:
             return httpx.Response(200, json=volume, request=request)
         if len(segments) == 1 and request.method == "DELETE":
             volume_id = segments[0]
+            if self.deleted_volume_state is not None:
+                for volume in self.volumes[app_name]:
+                    if volume["id"] == volume_id:
+                        volume["state"] = self.deleted_volume_state
+                        return httpx.Response(200, json=volume, request=request)
             before = len(self.volumes[app_name])
             self.volumes[app_name] = [
                 volume for volume in self.volumes[app_name] if volume["id"] != volume_id

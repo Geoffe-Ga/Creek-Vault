@@ -55,6 +55,21 @@ _DEFAULT_READINESS_TIMEOUT_SECONDS: Final[int] = 20
 _VAULT_MOUNT: Final[str] = "/vault"
 _FLY_ABSENT_STATUS: Final[int] = 404
 """Fly's upstream resource-absence response; never exposed on Creek's wire."""
+_DELETED_VOLUME_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "scheduling_destroy",
+        "fork_cleanup",
+        "waiting_for_detach",
+        "pending_destroy",
+        "destroying",
+        "destroyed",
+    }
+)
+"""Fly retains soft-deleted volumes in inventory during provider-side cleanup.
+
+Matches superfly/fly-go's flaps/flaps_volumes.go destroyedVolumeStates, plus
+the terminal state. App absence still gates a confirmed deletion receipt.
+"""
 _IMMUTABLE_IMAGE_RE: Final[re.Pattern[str]] = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 _FLY_PROVIDER: Final[str] = "fly"
 _FLY_DELETED_CLASSES: Final[tuple[ResourceClass, ...]] = (
@@ -552,7 +567,7 @@ class FlyProviderDriver:
         volume: Mapping[str, Any],
     ) -> ProviderResource:
         """Map one volume to inventory."""
-        destroyed = volume.get("state") == "destroyed"
+        destroyed = volume.get("state") in _DELETED_VOLUME_STATES
         return ProviderResource(
             allocation_id,
             ResourceClass.VOLUME,
@@ -646,7 +661,7 @@ class FlyProviderDriver:
             volume.get("region") != self._policy.region
             or volume.get("size_gb") != self._policy.volume_size_gb
             or volume.get("encrypted") is not True
-            or volume.get("state") == "destroyed"
+            or volume.get("state") in _DELETED_VOLUME_STATES
         ):
             self._rejected("Fly volume does not match encrypted allocation policy")
 
@@ -970,7 +985,7 @@ class FlyProviderDriver:
             volume
             for volume in self._objects(response, "Fly volume list")
             if volume.get("name") == reference.volume_name
-            and volume.get("state") != "destroyed"
+            and volume.get("state") not in _DELETED_VOLUME_STATES
         ]
 
     def _app_exists(self, reference: _AllocationRef) -> bool:

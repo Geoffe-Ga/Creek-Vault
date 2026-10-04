@@ -98,6 +98,39 @@ def _policy(**overrides: Any) -> FleetPolicy:
     return FleetPolicy.from_mapping({**_POLICY, **overrides})
 
 
+def test_failed_create_teardown_clears_soft_deleted_volume_alerts(
+    store: ProvisioningStore,
+) -> None:
+    """A partial pilot create converges through the real worker and fleet report."""
+    api = FakeFlyAPI()
+    api.deleted_volume_state = "pending_destroy"
+    api.fail_once("POST", "/machines", status=400)
+    driver = fly_driver(api)
+    worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
+    job = store.submit(
+        "activation-soft-delete", "pilot-user", requester_identity="adepthood", now=_NOW
+    )
+    assert worker.run_once(now=_NOW)
+    failed = store.get(job.job_id, "adepthood")
+    assert failed is not None and failed.state is JobState.FAILED
+    reconciler = FleetReconciler(store, driver, driver, _policy())
+    assert [
+        alert.kind for alert in reconciler.run_once(now=_NOW, repair=False).alerts
+    ] == [AlertKind.INCOMPLETE_CREATE]
+
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    assert worker.run_once(now=_NOW)
+
+    deleted = store.get(job.job_id, "adepthood")
+    assert deleted is not None and deleted.state is JobState.DELETED
+    assert not worker.run_once(now=_NOW)
+    report = reconciler.run_once(now=_NOW + timedelta(hours=2), repair=False)
+    assert report.alerts == ()
+    assert report.telemetry.unconfirmed_deletions == 0
+    assert report.telemetry.provisioned_volumes == 0
+    assert api.apps == {}
+
+
 class LoudProviderError(ProviderError):
     """A provider error whose rendering would leak if anything printed it."""
 

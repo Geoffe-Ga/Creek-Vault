@@ -256,7 +256,15 @@ volume is resumed rather than duplicated. Deletion revokes the
 consumer credential first, then stops and destroys the Machine, destroys the
 volume, removes the app, and verifies absence. A partial delete stays retryable
 and visible to the durable queue until reconciliation proves that no Machine or
-volume remains.
+live volume remains and the app is absent.
+
+Fly's volume inventory retains soft-deleted entries (`scheduling_destroy`,
+`fork_cleanup`, `waiting_for_detach`, `pending_destroy`, and `destroying`). Like
+[Fly's official client](https://github.com/superfly/fly-go/blob/main/flaps/flaps_volumes.go),
+the driver excludes those entries and `destroyed` from usable volumes and live
+storage counts. Teardown continues to app deletion and confirms the receipt
+only after Fly reports the app absent. This confirms removal of the managed
+allocation, not physical erasure of provider-retained data or backups.
 
 Authenticated request handling may call `start()` and return without scheduling
 a stop. Durable background execution calls `run_background_job()`, whose fixed
