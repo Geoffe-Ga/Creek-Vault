@@ -9,6 +9,11 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Fix managed-vault teardown when Fly retains a soft-deleted volume such as
+  `pending_destroy`. Cleanup now reaches app deletion and verifies its absence;
+  retained volume tombstones are neither reused for provisioning nor counted
+  as live fleet storage.
+
 - Fix managed-vault Fly volume names to the provider's 30-character grammar
   while preserving deterministic allocation identity. Fleet reconciliation can
   now resume exactly one first-attempt provider-rejected create after proving
