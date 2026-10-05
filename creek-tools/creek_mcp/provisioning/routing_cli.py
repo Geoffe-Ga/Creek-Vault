@@ -29,11 +29,11 @@ from creek_mcp.provisioning.fly import (
     FlyCredentialScope,
     FlyProviderDriver,
     FlyProviderPolicy,
-    RefusingSecretManager,
 )
 from creek_mcp.provisioning.models import FailureReason
 from creek_mcp.provisioning.production_secrets import (
     EncryptedFileRoutingCredentialVerifier,
+    ReadOnlyFlySecretManager,
     read_owner_only_file,
 )
 from creek_mcp.provisioning.store import ProvisioningStore
@@ -235,7 +235,10 @@ def compose(
         driver = FlyProviderDriver(
             policy,
             credential,
-            RefusingSecretManager(),
+            ReadOnlyFlySecretManager(
+                args.secret_state_directory,
+                master_key_file=args.secret_master_key_file,
+            ),
             provider_client,
         )
         guarded = ExpiringRoutingProvider(
@@ -316,7 +319,10 @@ def compose_replay(
         driver = FlyProviderDriver(
             policy,
             credential,
-            RefusingSecretManager(),
+            ReadOnlyFlySecretManager(
+                args.secret_state_directory,
+                master_key_file=args.secret_master_key_file,
+            ),
             provider_client,
         )
         guarded = ExpiringReplayRoutingProvider(
