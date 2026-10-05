@@ -52,13 +52,13 @@ class FlyReplayStateMiddleware:
 
 
 def _parse_replay_source(raw: bytes) -> dict[str, str] | None:
-    """Parse Fly's documented comma-delimited source header, closed-shape."""
+    """Parse Fly's semicolon-delimited source header, closed-shape."""
     try:
         text = raw.decode("ascii")
     except UnicodeError:
         return None
     parsed: dict[str, str] = {}
-    for item in text.split(","):
+    for item in text.split(";"):
         key, separator, value = item.strip().partition("=")
         if (
             separator != "="

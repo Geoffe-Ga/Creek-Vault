@@ -9,6 +9,10 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Accept Fly Proxy's semicolon-separated replay source metadata so authenticated
+  managed-vault requests reach the runtime. Invalid or mixed delimiters, duplicate
+  fields, mismatched state, and missing bearer credentials still fail closed.
+
 - Fix managed-vault requests failing before cold start: production routers now
   read existing encrypted runtime bundles for exact Machine verification, without
   authority to mint or revoke credentials. Missing, revoked, malformed, or

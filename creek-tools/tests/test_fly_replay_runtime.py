@@ -29,11 +29,15 @@ _TOKEN = "consumer-token-that-is-at-least-thirty-two-characters"
     "replay_source",
     [
         None,
+        f"instance=router-machine,region=iad,t=1727395200,state={_STATE}",
+        f"instance=router-machine;region=iad,t=1727395200;state={_STATE}",
+        f"state={_STATE};",
         "state=wrong",
-        f"state={_STATE},state={_STATE}",
-        f"state={_STATE},unknown=value",
-        f"state={_STATE},t=not-a-time",
-        f"state={_STATE},region=iad,region=ord",
+        "state=" + "x" * 64,
+        f"state={_STATE};state={_STATE}",
+        f"state={_STATE};unknown=value",
+        f"state={_STATE};t=not-a-time",
+        f"state={_STATE};region=iad;region=ord",
     ],
 )
 def test_vault_refuses_direct_or_malformed_replay_even_with_valid_bearer(
@@ -55,10 +59,15 @@ def test_vault_refuses_direct_or_malformed_replay_even_with_valid_bearer(
     assert _STATE not in response.text
 
 
-def test_vault_requires_replay_state_and_original_bearer(tmp_path: Path) -> None:
+@pytest.mark.parametrize("separator", [";", "; "])
+def test_vault_requires_replay_state_and_original_bearer(
+    tmp_path: Path, separator: str
+) -> None:
     """A closed Fly-Replay-Src plus the original bearer reaches the vault."""
     vault = seed_vault(tmp_path)
-    replay = f"instance=router-machine,region=iad,t=1727395200,state={_STATE}"
+    replay = separator.join(
+        ("instance=router-machine", "region=iad", "t=1727395200", f"state={_STATE}")
+    )
     app_client = client(vault_path=vault, fly_replay_state=_STATE)
 
     missing_bearer = app_client.get(

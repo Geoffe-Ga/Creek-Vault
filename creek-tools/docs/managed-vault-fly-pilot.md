@@ -169,8 +169,9 @@ closed-shape `Fly-Replay` app/Machine/state target only after exact Machine and
 encrypted-volume verification. The vault accepts plaintext only in its
 Fly-specific runtime, and only when a single closed-shape `Fly-Replay-Src`
 state matches its mounted per-allocation secret **and** the original bearer is
-valid. Direct, spoofed, duplicate, conflicting, or delimiter-bearing headers
-are `401`. The ordinary single-vault Docker runtime keeps its private TLS
+valid. Source metadata fields are semicolon-separated, as emitted by Fly Proxy.
+Direct, spoofed, duplicate, conflicting, comma-separated, or mixed-delimiter
+headers are `401`. The ordinary single-vault Docker runtime keeps its private TLS
 certificate and key requirement unchanged.
 
 Restart the combined process with `--disable-new-activations` to close admission. An exact
