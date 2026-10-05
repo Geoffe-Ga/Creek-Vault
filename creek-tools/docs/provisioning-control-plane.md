@@ -151,6 +151,11 @@ persists and logs none of the presented value. A restarted verifier reads the
 same durable state immediately; it never issues or revokes credentials.
 
 `creek-provisioning-router` is the production composition around that verifier.
+Its read-only secret adapter loads the existing encrypted, owner-bound runtime
+bundle for exact Machine verification before waking a vault. It holds no CA
+signing key, never creates a missing bundle, and refuses revocation. Both the
+private-TLS and Fly replay compositions use this adapter; fleet-only processes
+continue to refuse runtime-secret access entirely.
 The process also mounts the short-lived org deploy token used by its separate
 Fly routing provider and the CA certificate used to authenticate private vault
 Machines; the verifier itself still receives neither. A non-loopback bind

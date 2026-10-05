@@ -24,7 +24,9 @@ from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, r
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.fly import FlyRuntimeSecrets
+from creek_mcp.provisioning.models import FailureReason
 from creek_mcp.provisioning.replay_contract import REPLAY_STATE_BYTES, is_replay_state
 from creek_mcp.provisioning.routing import RoutingPrincipal
 
@@ -391,6 +393,57 @@ class EncryptedFileFlySecretManager:
         return nonce + self._cipher.encrypt(nonce, plaintext, aad)
 
 
+class ReadOnlyFlySecretManager:
+    """Read existing owner-bound bundles for routing; never issue or revoke."""
+
+    def __init__(self, state_directory: Path, *, master_key_file: Path) -> None:
+        """Bind existing encrypted state without loading CA signing authority."""
+        self._state_directory = state_directory.resolve()
+        _require_owner_only_directory(self._state_directory)
+        self._cipher = _routing_cipher(master_key_file)
+
+    def issue(
+        self,
+        activation_id: str,
+        consumer_identity: str,
+        *,
+        requester_identity: str = "",
+    ) -> FlyRuntimeSecrets:
+        """Satisfy the driver protocol only with an already-issued active bundle."""
+        try:
+            digest = _activation_digest(activation_id)
+            path = self._state_directory / f"{digest}.bundle"
+            revoked = path.with_suffix(".revoked")
+            if revoked.exists():
+                raise ValueError("runtime secrets are revoked")
+            document = _load_document(self._cipher, path, digest)
+            if (
+                revoked.exists()
+                or document.activation_id != activation_id
+                or document.requester_identity != requester_identity
+                or document.consumer_identity != consumer_identity
+            ):
+                raise ValueError("runtime secret state is invalid")
+        except ValueError:
+            raise ProviderError(
+                FailureReason.PROVIDER_REJECTED, retryable=False
+            ) from None
+        return document.runtime()
+
+    def revoke(self, activation_id: str) -> None:
+        """Refuse credential revocation outside the provisioning worker."""
+        del activation_id
+        raise ProviderError(FailureReason.PROVIDER_REJECTED, retryable=False)
+
+
+def _routing_cipher(master_key_file: Path) -> AESGCM:
+    """Load the bounded decryption key shared by read-only routing adapters."""
+    master_key = read_owner_only_file(master_key_file)
+    if len(master_key) != _MASTER_KEY_BYTES:
+        raise ValueError("master key file must contain exactly 32 bytes")
+    return AESGCM(master_key)
+
+
 class EncryptedFileRoutingCredentialVerifier:
     """Verify issued routing credentials without holding issuance authority."""
 
@@ -398,10 +451,7 @@ class EncryptedFileRoutingCredentialVerifier:
         """Bind the encrypted bundle directory and its mounted decryption key."""
         self._state_directory = state_directory.resolve()
         _require_owner_only_directory(self._state_directory)
-        master_key = read_owner_only_file(master_key_file)
-        if len(master_key) != _MASTER_KEY_BYTES:
-            raise ValueError("master key file must contain exactly 32 bytes")
-        self._cipher = AESGCM(master_key)
+        self._cipher = _routing_cipher(master_key_file)
 
     async def verify_credential(self, credential: str) -> RoutingPrincipal | None:
         """Return the one exact owner bound to *credential*, or fail closed."""

@@ -9,6 +9,11 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Fix managed-vault requests failing before cold start: production routers now
+  read existing encrypted runtime bundles for exact Machine verification, without
+  authority to mint or revoke credentials. Missing, revoked, malformed, or
+  differently owned bundles still fail closed.
+
 - Confirm Fly app deletion from complete organization inventory and omit absent
   apps from discovered fleet inventory. A timed-out lookup of an already-deleted
   app can no longer strand its deletion receipt or stop the fleet scheduler;
