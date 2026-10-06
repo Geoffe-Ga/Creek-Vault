@@ -81,15 +81,15 @@ The report is organised in eleven sections, in this order (FEAT-006 + FEAT-007 +
 
 1. **Wavelength snapshot** — current dominant phase, mode, dosage shares, and any detected transitions over the trailing 28 days. Placed first because phase context interprets every other section (FEAT-007).
 2. **Vault summary** — fragment / eddy / thread counts plus the per-frequency distribution (sorted F1..F10, then UNCLASSIFIED).
-3. **Pre-LLM yield** — the most recent line of `00-Creek-Meta/Processing-Log/run-summary.jsonl` (deterministic / local-model / residue counts and the `--no-llm` flag).
+3. **What the rules alone could name** (the pre-LLM yield) — the most recent line of `00-Creek-Meta/Processing-Log/run-summary.jsonl` (deterministic / local-model / residue counts and the `--no-llm` flag).
 4. **Liminal Watch** — recently surfaced content under `10-Liminal/Unnamed/` and `10-Liminal/Paradoxes/` (FEAT-007).
 5. **Active eddies** — top 10 by `fragment_count`.
 6. **Active threads** — top 10 by `last_seen` recency.
 7. **Surprising connections** — synchronicities discovered under `10-Liminal/Synchronicities/`.
-8. **Hyperedges** — praxis whose `derived_from` fragments span two or more eddies.
+8. **Praxis that bridge several eddies** (`## Praxis that bridge several eddies`, the hyperedge section) — praxis whose `derived_from` fragments span two or more eddies.
 9. **Drift warnings** — broken wiki-links and stale (link-isolated, ≥90-day-old) fragments.
 10. **Suggested questions** — 4-5 phase-aware essay prompts derived from `creek.generate.mining.phase_filtered_seeds`. Bottoming Out / Diminishing / Withdrawal surface compost and synchronicity prompts; Rising and Peaking surface drafting prompts; Restoration mixes both (FEAT-007).
-11. **Lint summary** — the most recent `creek lint` summary, appended verbatim (FEAT-008).
+11. **Housekeeping** — the most recent `creek lint` summary, appended verbatim (FEAT-008).
 
 Empty sections render an explicit `_No surfacing this week._` placeholder rather than disappearing — operators can tell at a glance whether a section had nothing to surface or whether the generator skipped it. Re-running in the same ISO week overwrites the existing file (idempotent).
 
@@ -97,21 +97,21 @@ Empty sections render an explicit `_No surfacing this week._` placeholder rather
 
 ### What each section does at a tier ceiling (#969)
 
-Every section except **Pre-LLM yield** narrows with the ceiling, and the artefact then records the highest tier it actually admitted (see below). Read this table before choosing a ceiling — several of these exclusions are surprising the first time:
+Every section except **What the rules alone could name** narrows with the ceiling, and the artefact then records the highest tier it actually admitted (see below). Read this table before choosing a ceiling — several of these exclusions are surprising the first time:
 
 | # | Section | Behaviour below the ceiling |
 |---|---------|-----------------------------|
 | 1 | Wavelength snapshot | Surveys the admitted corpus only. `Fragments observed:` is a per-tier count, and a count discloses the existence of what the rest of the report omitted. |
 | 2 | Vault summary | Same: counts and the frequency histogram are over admitted fragments, and the eddy/thread counts count *admitted* eddies and threads, so §2 cannot contradict §5/§6. |
-| 3 | Pre-LLM yield | **Ungated, deliberately.** The last line of `run-summary.jsonl` describes one pipeline *run* — a run id, a timestamp and four integers — and names no fragment, so there is nothing in it to filter by. |
+| 3 | What the rules alone could name | **Ungated, deliberately.** The last line of `run-summary.jsonl` describes one pipeline *run* — a run id, a timestamp and four integers — and names no fragment, so there is nothing in it to filter by. |
 | 4 | Liminal Watch | A note is admitted only if its *raw* front matter is within the ceiling. `10-Liminal/Paradoxes/` has two producers and they gate differently. **Detector-written** notes (`creek report --type paradox`, via `creek.generate.paradox.create_paradox_note`) are `type: paradox` with no `privacy_tier` field in their model at all, so **they fail closed to `intimate` and disappear below `--include-tier intimate`** — not because they were classified but because nobody vouched for them. **Save-written** notes (`creek save --target paradox`) carry an explicit `privacy_tier` and are gated by it, so an `open` paradox save is admitted at `--include-tier open` and an `intimate` one is not (#1491). Any hand-written note missing the key behaves like the detector case. |
 | 5 | Active eddies | `Eddy` carries no `privacy_tier`, so its tier is *derived*: the maximum over the tiers of every fragment whose `eddies` wikilinks name it. An eddy with one `open` and one `intimate` member is `intimate`. **An eddy no fragment names has no tier evidence at all and is admitted only at `intimate` or broader** — including the "no fragments loaded, fall back to the stored `fragment_count`" path. |
 | 6 | Active threads | The same rule over `threads` wikilinks. |
 | 7 | Surprising connections | A row survives only when *both* endpoint ids resolve to admitted fragments. |
-| 8 | Hyperedges | A praxis is admitted only when **every** id in its `derived_from` resolves to an admitted fragment; an empty `derived_from` names no evidence and is excluded. The spanned eddy set is then **intersected with the admitted eddies of §5** — being named by an admitted fragment is not enough, since an `open` fragment's front matter can name an eddy that derived `intimate` from a sibling member. The intersection runs before the "spans 2+ eddies" cut, so an excluded eddy can neither render in `spans:` nor pad the count that decides whether the row appears at all. |
+| 8 | Praxis that bridge several eddies | A praxis is admitted only when **every** id in its `derived_from` resolves to an admitted fragment; an empty `derived_from` names no evidence and is excluded. The spanned eddy set is then **intersected with the admitted eddies of §5** — being named by an admitted fragment is not enough, since an `open` fragment's front matter can name an eddy that derived `intimate` from a sibling member. The intersection runs before the "spans 2+ eddies" cut, so an excluded eddy can neither render in `spans:` nor pad the count that decides whether the row appears at all. |
 | 9 | Drift warnings | Broken-link sources and orphan paths are kept only when they are admitted fragment files. A broken link's *target* has no note to tier, but the target string is text authored inside the source fragment, so it carries the source's tier — which is gated. Every rendered row is attributable to an admitted fragment. |
 | 10 | Suggested questions | **The whole section is dropped below `--include-tier personal`**: the shared tier filter *summarises* a personal fragment as `[Personal-tier summary: <title>]` rather than dropping it, so at an `open` ceiling a personal title could otherwise ride out inside a prompt. At `personal` and above the miner runs under the ceiling *and* is handed a corpus this generator has already narrowed — the mining loaders gate `01-Fragments` and `10-Liminal` but take no override at all for `02-Threads` / `03-Eddies`, so a thread whose every member is above the ceiling would otherwise title a prompt. Threads and eddies are replaced with §5/§6's admitted lists; fragments are intersected by id, because the miner reads the tier off the *model* (missing key → `unclassified`) where §5's cutoff reads the raw front matter (missing key → `intimate`). |
-| 11 | Lint summary | Rendered **only at `--include-tier intimate` or broader**. It is a verbatim copy of a `00-Creek-Meta/Processing-Log/lint-*.md` artefact that embeds titles and tag names, and `creek lint`'s tag survey deliberately runs at `all` so it cannot report "no orphan tags" about a vault that has them. There is no row-level tier to filter on, so the section is admitted whole or not at all. |
+| 11 | Housekeeping | Rendered **only at `--include-tier intimate` or broader**. It is a verbatim copy of a `00-Creek-Meta/Processing-Log/lint-*.md` artefact that embeds titles and tag names, and `creek lint`'s tag survey deliberately runs at `all` so it cannot report "no orphan tags" about a vault that has them. There is no row-level tier to filter on, so the section is admitted whole or not at all. |
 
 ### The artefact stamps its own tier
 

@@ -1,6 +1,6 @@
 # creek-tools
 
-The Python pipeline behind the **Creek** knowledge organization system. `creek-tools` ingests semi-structured personal data — chat exports, documents, notes, screenshots — redacts sensitive content, classifies it along the [APTITUDE / Archetypal Wavelength](../docs/Ontology/creek_ontology_agent_prompt.md) ontology, links semantically related fragments, and writes a richly interlinked Obsidian vault.
+`creek-tools` is the engine behind **Creek**. It takes your personal data — chat exports, documents, notes, screenshots — scrubs out secrets and personal details, sorts each piece by [APTITUDE frequency and Wavelength phase](../docs/Ontology/creek_ontology_agent_prompt.md), connects the pieces that belong together, and writes it all into an Obsidian vault you can actually wander through.
 
 The pipeline is **local-first by default**: classification uses Ollama, embeddings use sentence-transformers, and no content leaves your machine unless you explicitly opt in to the Anthropic API path.
 
@@ -54,7 +54,7 @@ Either path produces an environment whose `./scripts/check-all.sh` matches CI on
 ## Quickstart
 
 ```bash
-# 0. Scaffold your vault somewhere OUTSIDE this repo (FEAT-019).
+# 0. Create your vault somewhere OUTSIDE this repo.
 creek init --vault ~/Obsidian/Creek-Vault
 
 # 1. Scan for secrets before anything else.
@@ -76,19 +76,8 @@ creek report   --type wavelength --period weekly --vault ~/Obsidian/Creek
 
 Every command is also documented under [`docs/`](docs/) with end-to-end examples.
 
-For the isolated one-consumer deployment used by confidential hosting, see the
-[`single-vault container runtime`](docs/container-runtime.md) runbook. Its
-Docker contract covers first boot, restart persistence, per-volume isolation,
-mounted secrets, and layered health/readiness.
-
-The separate demand-provisioning service is documented in the
-[`provisioning control-plane`](docs/provisioning-control-plane.md) runbook. Its
-versioned [OpenAPI contract](docs/contracts/provisioning-v1/openapi.json)
-defines a provider-managed ordinary-Fly custody mode and direct activation
-while keeping provider work and one-time credential handoff outside the
-browser-facing job API. The
-[retired key-ceremony contract](docs/contracts/provisioning-v1/key-ceremony.md)
-is retained only as a historical interoperability record.
+Running Creek on a server, for yourself or for other people? See
+[Hosting Creek for others](#hosting-creek-for-others) under Development.
 
 ---
 
@@ -132,9 +121,9 @@ is retained only as a historical interoperability record.
 | Command | Purpose | Doc |
 |---------|---------|-----|
 | `creek skills generate` | Generate the **Voice Skill Tree** under `<vault>/creek-skills/` (one `SKILL.md` per frequency, phase, mode, register, plus thread/eddy/meta skills). Previously `creek skills`; see [`CHANGELOG.md`](CHANGELOG.md) for the FEAT-019 rename. | [generation](docs/generation.md#voice-skill-tree) |
-| `creek skills sync` | Re-deploy the canonical schema-skill tree and medium contracts from `creek-tools/creek/templates/skills/` into `<vault>/00-Creek-Meta/Skills/` (including `mediums/*.MEDIUM.md`). Refuses to overwrite a locally-modified *canonical* file of either class unless `--force` is passed, in which case the local version is preserved alongside as `<name>.bak`. Files you authored yourself are never deployed over or reported as drift. | [generation](docs/generation.md#voice-skill-tree) |
+| `creek skills sync` | Re-deploy the canonical schema-skill tree and medium contracts from `creek-tools/creek/templates/skills/` into `<vault>/00-Creek-Meta/Skills/` (including `mediums/*.MEDIUM.md`). Won't overwrite a built-in skill or medium file you've edited unless you pass `--force` — and even then it keeps your version next to it as `<name>.bak`. Files you wrote yourself are left alone. | [generation](docs/generation.md#voice-skill-tree) |
 | `creek mine`     | Mine blog/essay seed ideas from the vault using four discovery strategies (liminal cross-eddy, thread terminus, resonance chain, wavelength-phase window). | [generation](docs/generation.md#mining) |
-| `creek draft`    | Draft an essay from a mined idea using the activated skill stack. Saves to `07-Voice/Drafts/` with full provenance. | [generation](docs/generation.md#drafting) |
+| `creek draft`    | Draft an essay from a mined idea, in your voice. Saves to `07-Voice/Drafts/` along with a note of which fragments it drew on. | [generation](docs/generation.md#drafting) |
 
 ### Vault hygiene
 
@@ -285,6 +274,11 @@ All quality gates run from `creek-tools/` via the project scripts:
 ```
 
 Quality thresholds are non-negotiable — see [`CLAUDE.md`](CLAUDE.md) for the full standards. Workflow is TDD-first with a 4-gate flow (tests → local → CI → review LGTM).
+
+### Hosting Creek for others
+
+- Hosting Creek for one person on a server? The [container runtime guide](docs/container-runtime.md) covers it: first boot, what survives a restart, one volume per vault, mounted secrets, and health checks.
+- Operators running Creek for other people: see the [provisioning guide](docs/provisioning-control-plane.md). Its versioned [OpenAPI contract](docs/contracts/provisioning-v1/openapi.json) defines a provider-managed ordinary-Fly custody mode and direct activation while keeping provider work and one-time credential handoff outside the browser-facing job API. The [retired key-ceremony contract](docs/contracts/provisioning-v1/key-ceremony.md) is kept only as a historical interoperability record.
 
 ---
 

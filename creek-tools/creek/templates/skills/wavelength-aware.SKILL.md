@@ -30,9 +30,9 @@ The Archetypal Wavelength has **six** phases — not four, not five — mapping 
 
 (Spec §7.1.)
 
-### Five modes × Do/Feel orientation
+### Six modes × Do/Feel orientation
 
-Modes are functional stances, not emotions. Each pairs with a **Do** or **Feel** orientation, except Absorb which collapses to Do/Feel (Ultraviolet, where Do and Feel merge):
+Modes are functional stances, not emotions. Each pairs with a **Do** or **Feel** orientation, except Absorb, where Do and Feel merge (Ultraviolet), and Be (Clear Light), where there is no one left to orient:
 
 | Mode | Orientations | Spiral Dynamics colours |
 |---|---|---|
@@ -41,8 +41,9 @@ Modes are functional stances, not emotions. Each pairs with a **Do** or **Feel**
 | **Collaborate** | Do (Orange) / Feel (Green) | Working with reality; experiment or empathy. |
 | **Integrate** | Do (Yellow) / Feel (Teal) | Weaving parts into wholes. |
 | **Absorb** | Do/Feel (Ultraviolet) | Dissolving into unified awareness. |
+| **Be** | — (Clear Light) | Emptiness; awareness resting as itself. Named by the course's Complete Map; not yet a `mode:` value in Creek frontmatter. |
 
-(Spec §7.2.)
+(Spec §7.2; the Complete Map gives Clear Light the Mode Be. Creek frontmatter carries only the five oriented Modes.)
 
 ### Medicine vs. Toxic dosage
 
@@ -102,13 +103,13 @@ If the snapshot is missing, stale (`as_of` > 30 days), or fails to load, the age
 ## Canonical taxonomy
 
 - **Phases (six):** Rising, Peaking, Withdrawal, Diminishing, Bottoming Out, Restoration.
-- **Modes (five):** Inhabit, Express, Collaborate, Integrate, Absorb.
+- **Modes (five in frontmatter; six in the course):** Inhabit, Express, Collaborate, Integrate, Absorb. The course's Complete Map names a sixth Mode, **Be** (Clear Light / F10); Creek's `mode:` field does not carry it yet, so never write `mode: be` — a Clear Light fragment keeps `mode: unclassified` unless its text plainly reads as one of the five.
 - **Orientations:** Do, Feel, Do/Feel.
 - **Dosage:** Medicine, Toxic.
 - **Frequencies (ten):** F1 Agency, F2 Receptivity, F3 Self-Love / Power, F4 Community Love / Conformity, F5 Achievism, F6 Pluralism, F7 Integration, F8 True Self / Transcendence, F9 Unity, F10 Emptiness.
 
 ## Reference
 
-- Spec §7.1 (six phases), §7.2 (five modes × Do/Feel), §7.3 (Medicine vs. Toxic full map), §7.4 (how to use modes for classification), §7.5 (temporal wavelength tracking).
+- Spec §7.1 (six phases), §7.2 (modes × Do/Feel orientation, plus Be for Clear Light), §7.3 (Medicine vs. Toxic full map), §7.4 (how to use modes for classification), §7.5 (temporal wavelength tracking).
 - FEAT-007 — `creek state` writes `00-Creek-Meta/State/latest.md`.
 - `compile.SKILL.md` (frontmatter shape), `save.SKILL.md` (dual-phase convention).

@@ -3,8 +3,8 @@
 This category holds material **authored by someone other than you** — quoted
 thinkers, collaborators, endorsed sources, and AI-generated pieces you treat as
 representative of your own interests. It exists so the rest of the vault can
-stay *yours*: the voice corpus, the fingerprint, and every generated draft are
-trained only on **self-authored** fragments.
+stay *yours*: Creek learns your voice, and drafts in it, only from words you
+actually wrote.
 
 ## The attribution model
 
@@ -17,9 +17,9 @@ silently reattributed to you.
 ## Why this folder is special
 
 Creek learns to write like you by measuring your own words. If material written
-by other people leaked into that corpus, the voice model would drift toward an
+by other people got mixed in, the voice Creek learns would drift toward an
 average of everyone you've ever quoted. So this category is the one place in the
-vault that is **excluded from voice training** (see `creek-tools` FEAT-041 §7.5).
+vault that Creek **never learns your voice from**.
 Capture other authors here freely — for their *ideas*, never for your *voice*.
 
 ## Structure — by author, then by work
@@ -47,8 +47,8 @@ Capture other authors here freely — for their *ideas*, never for your *voice*.
 
 `ai-as-user` is a **reserved author slug** for AI-generated pieces that you, the
 owner, choose to treat as representative of your interests or beliefs — output
-you endorse without having written word-for-word. It still lives here, outside
-the voice corpus, because you didn't author its prose.
+you endorse without having written word-for-word. It still lives here, where
+Creek won't learn your voice from it, because you didn't write its prose.
 
 ## Adding an author
 

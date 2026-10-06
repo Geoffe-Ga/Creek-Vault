@@ -45,7 +45,7 @@ The full contract lives in [`00-Creek-Meta/Skills/query.SKILL.md`](00-Creek-Meta
 All schema skills, compile prompts, lint reports, and save destinations use these names verbatim. No synonyms, no abbreviations. INC-019 reconciled drift here; do not re-introduce it.
 
 - **Wavelength phases (six):** Rising, Peaking, Withdrawal, Diminishing, Bottoming Out, Restoration.
-- **Wavelength modes (five):** Inhabit, Express, Collaborate, Integrate, Absorb.
+- **Wavelength modes (five in frontmatter; six in the course):** Inhabit, Express, Collaborate, Integrate, Absorb. The course's Complete Map names a sixth Mode, **Be** (Clear Light / F10); Creek's `mode:` field does not carry it yet, so never write `mode: be` — a Clear Light fragment keeps `mode: unclassified` unless its text plainly reads as one of the five.
 - **Wavelength orientations:** Do, Feel, Do/Feel.
 - **Wavelength dosage:** Medicine, Toxic.
 - **APTITUDE frequencies (ten):** F1 Agency, F2 Receptivity, F3 Self-Love / Power, F4 Community Love / Conformity, F5 Achievism, F6 Pluralism, F7 Integration, F8 True Self / Transcendence, F9 Unity, F10 Emptiness.

@@ -28,7 +28,7 @@ Pass 3 is opt-in per run. Use `creek process --no-llm` to run Passes 1 and 2 to 
 After every run a one-line summary is appended to `<vault>/00-Creek-Meta/Processing-Log/run-summary.jsonl` and printed to stdout, e.g.
 
 ```
-Deterministic: 7431 classified | Local-model: 9323 embedded/OCR'd | Residue: 1892 (would go to LLM if Pass-3 enabled)
+Deterministic: 7431 classified | Local-model: 9323 embedded/OCR'd | Still unclassified: 1892 (these would go to the LLM if you turn it on)
 ```
 
 The summary is consumed by the audit report (FEAT-006).

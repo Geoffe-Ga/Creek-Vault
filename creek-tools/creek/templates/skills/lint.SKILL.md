@@ -89,7 +89,7 @@ Output lives at `00-Creek-Meta/Processing-Log/lint/YYYY-MM-DD.md`. The processin
 Lint reports use these names verbatim (INC-019 reconciliation):
 
 - **Phases (six):** Rising, Peaking, Withdrawal, Diminishing, Bottoming Out, Restoration.
-- **Modes (five):** Inhabit, Express, Collaborate, Integrate, Absorb.
+- **Modes (five in frontmatter; six in the course):** Inhabit, Express, Collaborate, Integrate, Absorb. The course's Complete Map names a sixth Mode, **Be** (Clear Light / F10); Creek's `mode:` field does not carry it yet, so never write `mode: be` — a Clear Light fragment keeps `mode: unclassified` unless its text plainly reads as one of the five.
 - **Orientations:** Do, Feel, Do/Feel.
 - **Dosage:** Medicine, Toxic.
 - **Frequencies (ten):** F1 Agency, F2 Receptivity, F3 Self-Love / Power, F4 Community Love / Conformity, F5 Achievism, F6 Pluralism, F7 Integration, F8 True Self / Transcendence, F9 Unity, F10 Emptiness.
