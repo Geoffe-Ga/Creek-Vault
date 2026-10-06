@@ -88,14 +88,14 @@ CRAWDAD_COMMANDS: tuple[str, ...] = (
 )
 
 _COMMAND_DESCRIPTIONS: dict[str, str] = {
-    "reflect": "Open reflective conversation mode (FEAT-015 loop).",
+    "reflect": "Just talk — open-ended reflection, no agenda.",
     "checkin": "Wavelength check-in — read the current phase + dosage state.",
     "surface": "Surface paradoxes, liminal content, or emerging themes.",
-    "draft": "Draft an essay on a topic (routes through creek.author, essay medium).",
-    "ask": "Ask a question; get a cited, voiced answer (routes through creek.author).",
-    "save": "File the supplied content back to the vault via creek.save.",
-    "register": "Switch the active voice register (FEAT-029).",
-    "workflow": "List or run named workflows (ADAPT-003).",
+    "draft": "Draft an essay on a topic, in your own voice.",
+    "ask": "Ask a question; get an answer in your voice, with sources from your vault.",
+    "save": "Save what you write here into your vault.",
+    "register": "Switch which voice I'm speaking in.",
+    "workflow": "List your workflows, or run one by name.",
 }
 
 # Module-level invariant: every command name must have a description and
@@ -129,18 +129,22 @@ WORKFLOW_ACTION_LIST = "list"
 WORKFLOW_ACTION_RUN = "run"
 _WORKFLOW_ACTIONS = (WORKFLOW_ACTION_LIST, WORKFLOW_ACTION_RUN)
 # Two missing-wiring strings so each action's failure mode is honest
-# about WHY it cannot proceed. ``list`` only reads the registry, so its
-# message talks about the registry; ``run`` drives the walker, so its
-# message talks about the walker. Conflating the two would have a
-# ``list`` failure claim "the walker has nothing to call" even when the
-# registry is the missing piece (PR #309 review feedback).
+# about WHAT it cannot do. ``list`` only reads the registry, so its
+# message says the list never loaded; ``run`` drives the walker, so its
+# message says it cannot run one. Conflating the two would have a
+# ``list`` failure claim "I can't run workflows" even when the registry
+# is the missing piece (PR #309 review feedback). Both tell the user the
+# one thing to check rather than describing the plumbing.
 _WORKFLOW_LISTER_MISSING_REPLY = (
-    "Workflows aren't available in this session — the registry wasn't wired "
-    "up (the MCP tool surface was empty at startup)."
+    "I can't list your workflows right now — your vault's tools didn't show "
+    "up when I started, so I never loaded the workflow list. Check that "
+    "`creek-tools-mcp` is installed where `crawdad.yaml` points "
+    "(`mcp_server_command`), then restart me."
 )
 _WORKFLOW_RUNNER_MISSING_REPLY = (
-    "Workflows aren't wired up in this session — the MCP server probably "
-    "advertised no tools, so the workflow walker has nothing to call."
+    "I can't run workflows right now — your vault's tools didn't show up "
+    "when I started. Check that `creek-tools-mcp` is installed where "
+    "`crawdad.yaml` points (`mcp_server_command`), then restart me."
 )
 
 
@@ -289,8 +293,8 @@ async def handle_register(
     if register_switcher is None:
         _LOGGER.info("register switcher unavailable; ignoring %r", cleaned)
         await replier(
-            "Voice register switching is unavailable in this session. "
-            "(The vault's `creek-skills/` tree wasn't wired up.)"
+            "I can't switch voices right now — your vault's `creek-skills/` "
+            "folder wasn't loaded when I started."
         )
         return
     if register_switcher(cleaned):
@@ -331,7 +335,7 @@ async def handle_workflow(
         await _reply_workflow_run(replier, name=name, workflow_runner=workflow_runner)
         return
     await replier(
-        f"unknown workflow action: {chosen!r}. "
+        f"I don't know the action `{chosen}`. "
         f"Try one of: {', '.join(_WORKFLOW_ACTIONS)}."
     )
 
@@ -376,7 +380,7 @@ async def _reply_workflow_run(
         report = await workflow_runner(cleaned, {})
     except Exception as exc:
         _LOGGER.warning("workflow %r failed: %s", cleaned, exc)
-        await replier(f"workflow `{cleaned}` could not run: {exc}")
+        await replier(f"I couldn't run `{cleaned}` — {exc}")
         return
     # ``.reply`` only: posting the report itself would put its ``repr``
     # — privacy tier included — into a user-visible Discord message.

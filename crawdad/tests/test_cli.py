@@ -658,7 +658,7 @@ async def test_build_workflow_runner_returns_string_on_unknown_workflow(
     assert runner is not None
     report = await runner("does-not-exist", {})
     assert "does-not-exist" in report.reply
-    assert "could not find" in report.reply.lower()
+    assert "couldn't find" in report.reply.lower()
 
 
 async def test_build_workflow_runner_returns_string_on_workflow_failure(
@@ -698,7 +698,7 @@ async def test_build_workflow_runner_returns_string_on_workflow_failure(
     assert runner is not None
     report = await runner("wavelength-checkin", {})
     assert "wavelength-checkin" in report.reply
-    assert "failed" in report.reply.lower()
+    assert "went wrong" in report.reply.lower()
 
 
 async def test_build_workflow_runner_returns_composed_reply(
@@ -839,5 +839,5 @@ async def test_build_workflow_runner_reports_open_on_mid_run_failure(
 
     report = await runner("compost-surfacing", {})
 
-    assert "failed" in report.reply.lower()
+    assert "went wrong" in report.reply.lower()
     assert report.privacy_tier_ceiling is PrivacyTierCeiling.OPEN

@@ -667,7 +667,10 @@ class WorkflowRegistry:
         workflows = self._all()
         if name not in workflows:
             available = ", ".join(sorted(workflows)) or "(none)"
-            msg = f"no workflow named {name!r}; available: {available}"
+            msg = (
+                f"I couldn't find a workflow called `{name}`. "
+                f"The ones I know: {available}."
+            )
             raise WorkflowNotFoundError(msg)
         return workflows[name]
 
@@ -789,8 +792,8 @@ class WorkflowWalker:
         missing_inputs = [name for name in workflow.inputs if name not in inputs]
         if missing_inputs:
             msg = (
-                f"workflow {workflow.name!r} requires inputs {missing_inputs} "
-                "that were not provided"
+                f"`{workflow.name}` needs you to give it: "
+                f"{', '.join(missing_inputs)}. Add that and try again."
             )
             raise WorkflowConstraintError(msg)
         unknown_tools = [
@@ -798,8 +801,8 @@ class WorkflowWalker:
         ]
         if unknown_tools:
             msg = (
-                f"workflow {workflow.name!r} references tools that are not "
-                f"advertised by the MCP server: {unknown_tools}"
+                f"`{workflow.name}` asks for tools your vault doesn't have "
+                f"right now: {', '.join(unknown_tools)}."
             )
             raise WorkflowConstraintError(msg)
         if workflow.phase_aware:
@@ -839,11 +842,9 @@ class WorkflowWalker:
         if tier not in WORKFLOW_ADMITTED_CEILINGS:
             allowed = ", ".join(sorted(t.value for t in WORKFLOW_ADMITTED_CEILINGS))
             msg = (
-                f"workflow {workflow.name!r} declares {_CEILING_KEY} "
-                f"{tier.value!r}, which CrawDad refuses to request: every tool "
-                "result is relayed to a cloud LLM composer and then posted "
-                "into a Discord message, so material above the cap must never "
-                f"be asked for on this path. Allowed ceilings: {allowed}."
+                f"`{workflow.name}` asks for `{tier.value}` material, and I "
+                "won't send that through a cloud model into Discord. Set "
+                f"`{_CEILING_KEY}` to one of: {allowed}."
             )
             raise WorkflowConstraintError(msg)
 
@@ -890,14 +891,15 @@ class WorkflowWalker:
         phase = resolve_phase(state)
         if phase is None:
             msg = (
-                f"workflow {workflow.name!r} is phase-aware but no session "
-                "phase is available — run `creek state` first"
+                f"`{workflow.name}` needs to know your current phase, and I "
+                "don't have one yet — run `creek state` in your vault first."
             )
             raise WorkflowConstraintError(msg)
         if workflow.allowed_phases and phase not in workflow.allowed_phases:
             msg = (
-                f"workflow {workflow.name!r} refuses to run in phase "
-                f"{phase!r}; allowed phases: {list(workflow.allowed_phases)}"
+                f"`{workflow.name}` is meant for "
+                f"{', '.join(workflow.allowed_phases)}, and you're in {phase} "
+                "right now — it can wait for the wavelength to turn."
             )
             raise WorkflowConstraintError(msg)
 
@@ -992,9 +994,9 @@ def _rebrand_step_error(
     a stale identity leak through. In practice only
     :class:`_StepRefError` reaches this path today.
     """
-    location = f"workflow {workflow.name!r} step {step.id!r} (tool {step.tool!r})"
     return WorkflowStepError(
-        f"{location} aborted during arg interpolation: {exc}",
+        f"`{workflow.name}` stopped at step `{step.id}` (`{step.tool}`) — a "
+        f"step reference in its args doesn't line up: {exc}",
         step_id=step.id,
         tool=step.tool,
         workflow_name=workflow.name,
@@ -1016,9 +1018,9 @@ def _wrap_step_failure(
     message and exposed as attributes. The original exception is
     chained via ``__cause__`` for introspection.
     """
-    location = f"workflow {workflow.name!r} step {step.id!r} (tool {step.tool!r})"
     return WorkflowStepError(
-        f"{location} failed: {exc}",
+        f"`{workflow.name}` stopped at step `{step.id}` (`{step.tool}`) — "
+        f"that step didn't go through: {exc}",
         step_id=step.id,
         tool=step.tool,
         workflow_name=workflow.name,
