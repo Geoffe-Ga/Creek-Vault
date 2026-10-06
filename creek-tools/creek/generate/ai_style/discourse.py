@@ -195,9 +195,11 @@ COMM_BOILERPLATE = register(
         feature_key="comm_boilerplate_density",
         handling="surface",
         polarity="avoid",
-        description="Collaborative-comm boilerplate (I hope this helps, Certainly!).",
-        caveat="Comment context only; chat pleasantries and AfC/submission "
-        "boilerplate that leaked into prose. Only flagged above your own rate.",
+        description=(
+            "Chatbot pleasantries left in the prose (I hope this helps, Certainly!)."
+        ),
+        caveat="Comment context only; chat sign-offs and submission boilerplate "
+        "that leaked into prose. Only flagged above your own rate.",
         measure=features.comm_boilerplate_density,
         locate=lambda text: _spans(features.COMM_BOILERPLATE_RE, text),
         contexts=frozenset({"comment"}),

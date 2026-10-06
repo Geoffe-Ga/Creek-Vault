@@ -19,6 +19,7 @@ from creek.generate.ai_style.guard import (
     build_voice_fidelity_frontmatter,
     build_voice_rewrite_prompt,
     run_voice_fidelity_guard,
+    status_in_words,
 )
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
 from creek.generate.ai_style.scanner import scan
@@ -203,7 +204,7 @@ def test_under_ceiling_skips_rewrite() -> None:
 
 
 def test_summary_line_wording() -> None:
-    """The stderr summary names the status and the measured distance."""
+    """The stderr summary says the outcome in words and names the distance."""
     report = VoiceFidelityReport(
         body="x",
         voice_distance=0.22,
@@ -213,9 +214,57 @@ def test_summary_line_wording() -> None:
         status="rewritten",
     )
     assert report.summary_line() == (
-        "voice-fidelity: rewritten — distance 0.22 "
-        "(0 residual divergences) — see frontmatter"
+        "voice check: rewritten toward your voice — the draft sits 0.22 from "
+        "your usual voice, with nothing left worth a look "
+        "(details in the frontmatter)"
     )
+
+
+def test_summary_line_never_prints_a_raw_status_code() -> None:
+    """Every documented status renders as words; no owner reads an enum."""
+    for status in (
+        "rewritten",
+        "measured_only:no_llm",
+        "measured_only:no_rewriter",
+        "measured_only:below_target",
+        "measured_only:above_target",
+        "skipped:disabled",
+        "skipped:no_fingerprint",
+        "skipped:thin_fingerprint",
+    ):
+        line = VoiceFidelityReport(
+            body="x",
+            voice_distance=0.1,
+            findings=(),
+            thin_fingerprint=False,
+            passes=0,
+            status=status,
+        ).summary_line()
+        # The raw code (``kind:reason``) never reaches the owner; only its
+        # plain-words rendering does.
+        if ":" in status:
+            assert status not in line, line
+        assert "_" not in line, line
+        assert status_in_words(status) in line
+
+
+def test_status_in_words_passes_unknown_codes_through() -> None:
+    """An unmapped status is shown as-is rather than hidden behind a blank."""
+    assert status_in_words("mystery:code") == "mystery:code"
+
+
+def test_summary_line_counts_places_worth_a_look() -> None:
+    """One residual finding reads as a single place; several pluralise."""
+    report = run_voice_fidelity_guard(
+        _TROPEY,
+        fingerprint=_fingerprint(),
+        config=_eager_config(),
+        no_llm=True,
+    )
+    count = len(report.findings)
+    assert count >= 1
+    noun = "place" if count == 1 else "places"
+    assert f"with {count} {noun} worth a look" in report.summary_line()
 
 
 def test_frontmatter_stamps_distance_and_findings() -> None:

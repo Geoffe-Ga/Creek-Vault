@@ -331,8 +331,8 @@ class TestCLINoLLMFlag:
         normalized = " ".join(result.output.split())
         assert "Deterministic:" in normalized
         assert "Local-model:" in normalized
-        assert "Residue:" in normalized
-        assert "would go to LLM if Pass-3 enabled" in normalized
+        assert "Still unclassified:" in normalized
+        assert "these would go to the LLM if you turn it on" in normalized
 
     def test_cli_no_llm_writes_run_summary(
         self,

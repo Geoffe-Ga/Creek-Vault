@@ -265,7 +265,7 @@ def test_untiered_compost_note_stamps_the_state_report_intimate(
     assert (
         EMPTY_PLACEHOLDER
         in written.read_text(encoding="utf-8").split(
-            "## Lint summary",
+            "## Housekeeping",
         )[1]
     ), "the lint summary rendered content, so the stamp is not the note's"
     assert stamp[TIER_STAMP_KEY] == PrivacyTier.INTIMATE.value

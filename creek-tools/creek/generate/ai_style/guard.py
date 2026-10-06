@@ -69,6 +69,39 @@ never carries silently-unchanged prose without a recorded reason. Values:
 ``measured_only:no_rewriter`` / ``measured_only:below_target`` /
 ``measured_only:above_target`` (ran but did not rewrite), and ``rewritten``."""
 
+_STATUS_IN_WORDS: dict[str, str] = {
+    "rewritten": "rewritten toward your voice",
+    "measured_only:no_llm": "measured but not rewritten (--no-llm)",
+    "measured_only:no_rewriter": "measured but not rewritten (no rewrite step set up)",
+    "measured_only:below_target": "measured and already close enough to leave alone",
+    "measured_only:above_target": (
+        "measured and further from your voice than the target, but rewrite passes "
+        "are set to 0 in your config, so it was left as is"
+    ),
+    "skipped:disabled": "skipped — turned off in config",
+    "skipped:no_fingerprint": (
+        "skipped — no voice fingerprint yet; run `creek report --type fingerprint` "
+        "to build one"
+    ),
+    "skipped:thin_fingerprint": (
+        "skipped — not enough of your writing yet to measure against"
+    ),
+}
+"""Plain-words rendering of each :data:`VOICE_GUARD_STATUS_KEY` value.
+
+The frontmatter keeps the machine code; anything printed for the owner goes
+through :func:`status_in_words` so they read a sentence, not an enum.
+"""
+
+
+def status_in_words(status: str) -> str:
+    """Return the owner-facing wording for a guard *status* code.
+
+    Unknown codes are returned unchanged so a new status is never silently
+    hidden behind a blank.
+    """
+    return _STATUS_IN_WORDS.get(status, status)
+
 
 class VoiceFindingEntry(TypedDict):
     """Frontmatter shape for one residual voice-fidelity finding.
@@ -126,13 +159,21 @@ class VoiceFidelityReport:
         """Return the stderr one-liner ``creek draft`` prints after composing.
 
         Stable wording is part of the contract — the walkthrough and the
-        integration tests match on it.
+        integration tests match on it. The status is spelled out in words
+        (see :func:`status_in_words`) rather than printed as the raw
+        frontmatter code, because the owner reads this line, not a parser.
         """
         count = len(self.findings)
-        noun = "divergence" if count == 1 else "divergences"
+        noun = "place" if count == 1 else "places"
+        tail = (
+            "nothing left worth a look"
+            if count == 0
+            else f"{count} {noun} worth a look"
+        )
         return (
-            f"voice-fidelity: {self.status} — distance "
-            f"{self.voice_distance:.2f} ({count} residual {noun}) — see frontmatter"
+            f"voice check: {status_in_words(self.status)} — the draft sits "
+            f"{self.voice_distance:.2f} from your usual voice, with {tail} "
+            "(details in the frontmatter)"
         )
 
     def to_frontmatter(self) -> dict[str, object]:

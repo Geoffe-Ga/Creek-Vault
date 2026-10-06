@@ -867,7 +867,7 @@ def _section_body(report: str, header: str) -> str:
 
     Args:
         report: The full rendered markdown body.
-        header: The section header, e.g. ``"## Lint summary"``.
+        header: The section header, e.g. ``"## Housekeeping"``.
 
     Returns:
         Everything from *header* up to the next ``## `` heading, or the empty
@@ -993,7 +993,7 @@ _SECTIONS: tuple[_SectionCase, ...] = (
         carrier="the id of an intimate endpoint fragment, rendered verbatim",
     ),
     _SectionCase(
-        header="## Hyperedges",
+        header="## Praxis that bridge several eddies",
         above_canary=_HYPER_INTIMATE,
         below_canary=_HYPER_OPEN,
         carrier="the title of a praxis derived from an intimate fragment",
@@ -1008,7 +1008,7 @@ _SECTIONS: tuple[_SectionCase, ...] = (
         ),
     ),
     _SectionCase(
-        header="## Lint summary",
+        header="## Housekeeping",
         above_canary=_LINT_CANARY,
         below_canary=None,
         carrier=(
@@ -1024,9 +1024,9 @@ bucket. ``## Wavelength snapshot`` and ``## Vault summary`` **are** gated —
 they narrow with the ceiling — but what they render is a count, not a
 sentinel, so they are asserted by
 :func:`test_wavelength_and_vault_summary_narrow_with_the_ceiling` instead of by
-the canary table. ``## Pre-LLM yield`` is genuinely ungated: it reports one
-pipeline run's totals and names no fragment, so there is nothing in it to
-filter by, which
+the canary table. ``## What the rules alone could name`` is genuinely
+ungated: it reports one pipeline run's totals and names no fragment, so there
+is nothing in it to filter by, which
 :func:`test_pre_llm_yield_is_not_filtered_by_the_ceiling` asserts.
 """
 
@@ -1039,15 +1039,15 @@ _SECTION_IDS = [
 _SECTION_DISPOSITIONS: dict[str, str] = {
     "## Wavelength snapshot": "gated-count",
     "## Vault summary": "gated-count",
-    "## Pre-LLM yield": "ungated-run-log",
+    "## What the rules alone could name": "ungated-run-log",
     "## Liminal Watch": "gated-canary",
     "## Active eddies": "gated-canary",
     "## Active threads": "gated-canary",
     "## Surprising connections": "gated-canary",
-    "## Hyperedges": "gated-canary",
+    "## Praxis that bridge several eddies": "gated-canary",
     "## Drift warnings": "gated-canary",
     "## Suggested questions": "gated-dropped-below-personal",
-    "## Lint summary": "gated-canary",
+    "## Housekeeping": "gated-canary",
 }
 """Every section of the report and how #969 disposed of it.
 
@@ -1216,10 +1216,10 @@ def test_lint_summary_renders_the_placeholder_below_the_intimate_ceiling(
         vault_path=canary_vault,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
-    section = _section_body(_report_body(canary_vault), "## Lint summary")
-    assert section, "the report is missing its '## Lint summary' section entirely"
+    section = _section_body(_report_body(canary_vault), "## Housekeeping")
+    assert section, "the report is missing its '## Housekeeping' section entirely"
     assert EMPTY_PLACEHOLDER in section, (
-        "## Lint summary at privacy_tier_ceiling=open must render "
+        "## Housekeeping at privacy_tier_ceiling=open must render "
         f"{EMPTY_PLACEHOLDER!r}; it rendered:\n\n{section}"
     )
     assert _LINT_CANARY not in section
@@ -1350,7 +1350,7 @@ def test_pre_llm_yield_is_not_filtered_by_the_ceiling(canary_vault: Path) -> Non
     state_render_tool(vault_path=canary_vault, privacy_tier_ceiling=TierCeiling.ALL)
     at_all = _report_body(canary_vault)
 
-    header = "## Pre-LLM yield"
+    header = "## What the rules alone could name"
     assert _section_body(at_open, header) == _section_body(at_all, header), (
         f"{header} differs between privacy_tier_ceiling=open and "
         "privacy_tier_ceiling=all. It reports one pipeline run's totals and "
@@ -2600,7 +2600,7 @@ def test_cli_state_help_mentions_include_tier() -> None:
 # ---------------------------------------------------------------------------
 
 
-# --- Blocker 1: an above-ceiling eddy title riding into ## Hyperedges -------
+# --- Blocker 1: an above-ceiling eddy title riding into the hyperedge section
 
 _SPAN_EDDY_ABOVE = "CANARY-SPANEDDY-INTIMATE-4e6b"
 """Rides in the ``title`` of an eddy with one ``open`` and one ``intimate`` member.
@@ -2609,7 +2609,8 @@ Its derived tier is the maximum over its members — ``intimate`` — so
 ``## Active eddies`` already excludes it at ``ceiling=open`` and has since T1
 went green. That is precisely what made this leak invisible: the sentinel is
 *absent* from the section that owns eddy titles while riding into
-``## Hyperedges`` inside another section's ``spans:`` list, because
+``## Praxis that bridge several eddies`` inside another section's ``spans:``
+list, because
 ``StateReportGenerator._fragment_to_eddies`` maps each **admitted** fragment to
 every eddy its ``eddies:`` wikilinks name and never intersects that set against
 ``self._state.eddies``.
@@ -2627,8 +2628,9 @@ _SPAN_PRAXIS_CONTROL = "CANARY-SPANPRAXIS-CONTROL-9a70"
 """Rides in the ``title`` of a praxis spanning two eddies that are *both* admitted.
 
 The non-vacuity control for the whole section. Without a second row that
-survives at ``ceiling=open``, deleting ``## Hyperedges`` outright — or gating
-the section whole the way ``## Lint summary`` is gated — would satisfy every
+survives at ``ceiling=open``, deleting ``## Praxis that bridge several eddies``
+outright — or gating
+the section whole the way ``## Housekeeping`` is gated — would satisfy every
 exclusion assertion below while being an outage.
 """
 
@@ -2656,7 +2658,8 @@ _SPAN_BRIDGE_ROW = (
     f"- {_SPAN_BRIDGE_TITLE} — spans: "
     f"{_SPAN_EDDY_ABOVE_TITLE}, {_SPAN_EDDY_PLAIN_TITLE}"
 )
-"""The exact ``## Hyperedges`` row the bridge praxis renders at ``ceiling=all``.
+"""The exact ``## Praxis that bridge several eddies`` row the bridge praxis renders
+at ``ceiling=all``.
 
 Spelled as the whole row rather than as "the canary appears somewhere" because
 the two halves of this gate fail differently. ``section_hyperedges`` renders
@@ -2682,7 +2685,7 @@ def _build_hyperedge_span_vault(root: Path) -> Path:
     so that no eddy ends up with one ``intimate`` and one ``open`` member.
     A mixed-membership eddy is exactly the leak here, so reproducing it inside
     the shared vault would change what every existing ``_SECTIONS`` row and
-    both ``## Hyperedges`` mutation rows assert.
+    both ``## Praxis that bridge several eddies`` mutation rows assert.
 
     The layout, and why each piece is load-bearing:
 
@@ -2792,8 +2795,9 @@ def test_hyperedges_do_not_span_an_above_ceiling_eddy_title(
       would still disclose, by contradiction with that definition, that a second
       eddy exists which the caller may not see.
     * the **control row must still render**, or "no leak" and "no section" are
-      indistinguishable and a fix that dropped ``## Hyperedges`` whole — the way
-      ``## Lint summary`` is legitimately dropped — would pass.
+      indistinguishable and a fix that dropped ``## Praxis that bridge several eddies``
+      whole — the way
+      ``## Housekeeping`` is legitimately dropped — would pass.
 
     Args:
         hyperedge_span_vault: The mixed-tier-eddy vault.
@@ -2816,15 +2820,22 @@ def test_hyperedges_do_not_span_an_above_ceiling_eddy_title(
         "Sentinel carrier: the title of an eddy with one open and one "
         "intimate member fragment, so its derived tier is intimate.\n\n"
         "## Active eddies already excludes it — the only remaining way into "
-        "the artifact is the 'spans:' list of a ## Hyperedges row, which is "
+        "the artifact is the 'spans:' list of a ## Praxis that bridge several eddies "
+        "row, which is "
         "built from every eddy an admitted fragment names rather than from "
         f"the admitted eddies.\n\n{text}"
     )
 
-    hyperedges = _section_body(_report_body(hyperedge_span_vault), "## Hyperedges")
-    assert hyperedges, "the report is missing its '## Hyperedges' section entirely"
+    hyperedges = _section_body(
+        _report_body(hyperedge_span_vault), "## Praxis that bridge several eddies"
+    )
+    assert hyperedges, (
+        "the report is missing its '## Praxis that bridge several eddies' section "
+        "entirely"
+    )
     assert _SPAN_CONTROL_ROW in hyperedges, (
-        "## Hyperedges dropped the row whose two spanned eddies are both "
+        "## Praxis that bridge several eddies dropped the row whose two spanned eddies "
+        "are both "
         f"admitted at privacy_tier_ceiling=open. Expected {_SPAN_CONTROL_ROW!r} "
         "in:\n\n"
         f"{hyperedges}\n\n"
@@ -2832,7 +2843,8 @@ def test_hyperedges_do_not_span_an_above_ceiling_eddy_title(
         "empty section rather than by a gate."
     )
     assert _SPAN_PRAXIS_BRIDGE not in hyperedges, (
-        "## Hyperedges still renders a row for the bridging praxis at "
+        "## Praxis that bridge several eddies still renders a row for the bridging "
+        "praxis at "
         "privacy_tier_ceiling=open. With the above-ceiling eddy removed from "
         "its span set the praxis reaches one admitted eddy, which is below "
         "the section's own 'spans 2+ eddies' definition, so the row must "
@@ -2861,9 +2873,12 @@ def test_hyperedges_span_the_full_eddy_pair_at_the_all_ceiling(
         privacy_tier_ceiling=TierCeiling.ALL,
     )
     assert result["status"] == "ok"
-    hyperedges = _section_body(_report_body(hyperedge_span_vault), "## Hyperedges")
+    hyperedges = _section_body(
+        _report_body(hyperedge_span_vault), "## Praxis that bridge several eddies"
+    )
     assert _SPAN_BRIDGE_ROW in hyperedges, (
-        "## Hyperedges must render the bridging praxis with both spanned "
+        "## Praxis that bridge several eddies must render the bridging praxis "
+        "with both spanned "
         f"eddies at privacy_tier_ceiling=all. Expected {_SPAN_BRIDGE_ROW!r} "
         f"in:\n\n{hyperedges}\n\n"
         "A gate that removed the row at every ceiling would satisfy the "
@@ -2871,7 +2886,7 @@ def test_hyperedges_span_the_full_eddy_pair_at_the_all_ceiling(
         "vault owner's report."
     )
     assert _SPAN_CONTROL_ROW in hyperedges, (
-        "## Hyperedges dropped the all-admitted control row at "
+        "## Praxis that bridge several eddies dropped the all-admitted control row at "
         f"privacy_tier_ceiling=all:\n\n{hyperedges}"
     )
 
@@ -2930,11 +2945,12 @@ def _write_mined_thread(
     Args:
         vault: Vault root.
         thread_id: Thread id and, deliberately, **not** a sentinel carrier.
-            ``_seed_from_thread`` renders the id into the seed's
-            ``brief_description`` (``"Thread '<id>' has accumulated ..."``), so
-            a sentinel there would make the seed leak provable through a second
-            field and blur which one the gate has to cover. The leak under test
-            is the seed *title*.
+            ``_seed_from_thread`` never renders the id — the seed's
+            ``brief_description`` (``"You keep coming back to '<title>' ..."``)
+            names the thread by title — so a sentinel in the id would be
+            unobservable and blur which field the gate has to cover. The leak
+            under test is the seed *title*, which reaches the report through
+            both the seed title and its brief.
         title: Thread title, also the file stem so the ``threads:`` wikilink on
             each member fragment resolves under either resolution — the same
             reasoning :func:`_write_thread` records.
@@ -3039,8 +3055,8 @@ def test_suggested_questions_omit_an_above_ceiling_thread_title(
     ``intimate`` — its derived tier is ``intimate`` — ``mine_thread_terminus``
     still sees the thread record, and ``## Suggested questions`` renders:
 
-        - Thread-CANARY-... — Thread 't...' has accumulated 12 fragments
-          without becoming a published essay. ...
+        - Thread-CANARY-... — You keep coming back to 'Thread-CANARY-...' —
+          12 times now — and it still hasn't become an essay. ...
 
     ``ceiling=personal`` is the ceiling that exposes it: the section is dropped
     whole below ``personal`` (see
@@ -3264,7 +3280,7 @@ def test_state_read_fails_closed_on_a_non_yaml_frontmatter_error(
 # verbatim at every tier, which is exactly what these tests supply. So the
 # title remains a cleartext surface here by design, not by defect.
 _PARADOX_TITLE = "Both true at once"
-_PARADOX_SECRET = "CLEARTEXT-CANARY-1491"
+_PARADOX_SECRET = "CLEARTEXT-CANARY-1491"  # pragma: allowlist secret
 _PARADOX_BODY = (
     "Two framings collide.\n\n"
     + _PARADOX_SECRET

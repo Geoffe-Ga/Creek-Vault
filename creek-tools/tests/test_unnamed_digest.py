@@ -419,7 +419,7 @@ class TestGenerateWeeklyDigest:
         content = path.read_text(encoding="utf-8")
         assert "## Reflection Prompt" in content
         assert (
-            "What do these have in common that the current ontology can't express?"
+            "What do these share that none of the names you have yet can hold?"
             in content
         )
 

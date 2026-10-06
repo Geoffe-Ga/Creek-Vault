@@ -225,7 +225,15 @@ class TestKnowledgeCutoffIsFingerprintIndependent:
 
 
 class TestCommentContext:
-    """Collaborative-comm boilerplate is comment-context only."""
+    """Chatbot pleasantries are comment-context only."""
+
+    def test_description_reads_as_plain_words(self) -> None:
+        """The owner-facing description names chatbot pleasantries, not field jargon."""
+        from creek.generate.ai_style.discourse import COMM_BOILERPLATE
+
+        assert COMM_BOILERPLATE.description.startswith("Chatbot pleasantries")
+        assert "AfC" not in COMM_BOILERPLATE.caveat
+        assert "Collaborative-comm" not in COMM_BOILERPLATE.description
 
     def test_not_in_article(self) -> None:
         """Boilerplate in article prose does not fire."""

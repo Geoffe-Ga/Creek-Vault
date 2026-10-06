@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    import pytest
+
 _TROPEY = (
     "Additionally, this delves into the rich tapestry of the subject. "
     "Moreover, it is important to note the vibrant and multifaceted nuances. "
@@ -208,8 +210,14 @@ def test_apply_voice_fidelity_skipped_disabled(tmp_path: Path) -> None:
     assert fields[VOICE_GUARD_STATUS_KEY] == "skipped:disabled"
 
 
-def test_apply_voice_fidelity_skipped_no_fingerprint(tmp_path: Path) -> None:
-    """A missing fingerprint yields a loud ``skipped:no_fingerprint`` status."""
+def test_apply_voice_fidelity_skipped_no_fingerprint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing fingerprint yields a loud ``skipped:no_fingerprint`` status.
+
+    The frontmatter keeps the machine code; the owner's stderr line says in
+    words what happened and what to do next.
+    """
     gen = _generator(tmp_path, fingerprint=None, config=AIStyleConfig())
     _body, fields = gen._apply_voice_fidelity(
         _TROPEY,
@@ -217,6 +225,10 @@ def test_apply_voice_fidelity_skipped_no_fingerprint(tmp_path: Path) -> None:
         source_fragments=(),
     )
     assert fields[VOICE_GUARD_STATUS_KEY] == "skipped:no_fingerprint"
+    err = capsys.readouterr().err
+    assert "skipped:no_fingerprint" not in err
+    assert "voice check: skipped — no voice fingerprint yet" in err
+    assert "creek report --type fingerprint" in err
 
 
 def test_apply_voice_fidelity_skipped_thin(tmp_path: Path) -> None:

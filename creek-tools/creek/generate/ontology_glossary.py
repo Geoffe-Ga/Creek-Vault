@@ -84,8 +84,9 @@ _ALTITUDE_COLORS: dict[str, Frequency] = {
 #: newcomer. Each carries its own short gloss seed grounded in the ontology.
 _NAMED_CONCEPTS: dict[str, str] = {
     "APTITUDE": (
-        "my ten-frequency map of human motivation, from raw survival up to "
-        "egoless emptiness"
+        "my ten-frequency map of human motivation — ten notes on one scale, "
+        "from the body's need to survive to the mind's capacity to rest in "
+        "emptiness, none of them higher than another"
     ),
     "Whole Adept": (
         "someone fluent across the whole range of frequencies, able to move "
@@ -224,7 +225,9 @@ def _altitude_terms() -> list[OntologyTerm]:
                 label=label,
                 category="altitude",
                 gloss_seed=(
-                    f"the altitude of {FREQUENCY_THEMES[freq].split(',')[0].lower()}"
+                    f"the colour I use for "
+                    f"{FREQUENCY_THEMES[freq].split(',')[0].lower()}, one of the "
+                    "ten frequencies"
                 ),
             )
         )
@@ -361,7 +364,8 @@ def ontology_term_registry() -> Mapping[str, OntologyTerm]:
 #: textbook definition — and explicitly first-mention-only ("only once").
 GLOSS_STEER: str = (
     "The first time you use one of my bespoke terms (a Frequency, Phase, Mode, "
-    "altitude, or named concept like APTITUDE / Whole Adept / Archetypal "
+    "colour name like Teal or Ultraviolet, or named concept like APTITUDE / "
+    "Whole Adept / Archetypal "
     "Wavelength), weave in a brief plain-English gloss in my voice so a newcomer "
     "can follow — an appositive or short clause, not a dictionary definition, "
     "and don't lecture. Gloss each term only once."

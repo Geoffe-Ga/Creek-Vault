@@ -400,9 +400,9 @@ def test_process_persists_eddy_and_thread_pages(
     # The printed summary must match the disk, not the in-memory graph.
     assert _parse_count(output, r"(\d+) eddy file\(s\) written") == len(eddy_pages)
     assert _parse_count(output, r"(\d+) page\(s\) written") == len(thread_pages)
-    assert _parse_count(output, r"Link artefacts persisted: (\d+)") == len(
-        eddy_pages
-    ) + len(thread_pages)
+    assert _parse_count(output, r"Link pages written: (\d+)") == len(eddy_pages) + len(
+        thread_pages
+    )
 
 
 def test_second_process_run_is_idempotent_on_disk(
