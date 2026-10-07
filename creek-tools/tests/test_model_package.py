@@ -402,3 +402,18 @@ def test_verify_weights_reports_missing_when_stat_fails(
     monkeypatch.setattr(Path, "stat", _gone)
 
     assert verify_weights(weights, _manifest()) is ModelVerification.MISSING
+
+
+def test_verify_weights_refuses_a_wrong_size_without_hashing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncated multi-GB download is refused from ``stat`` alone, unread."""
+    weights = tmp_path / "weights.gguf"
+    weights.write_bytes(_BLOB[:-1])
+
+    def _no_read(self: Path, *args: object, **kwargs: object) -> object:
+        raise AssertionError(f"wrong-size blob was opened: {self.name}")
+
+    monkeypatch.setattr(Path, "open", _no_read)
+
+    assert verify_weights(weights, _manifest()) is ModelVerification.SIZE_MISMATCH
