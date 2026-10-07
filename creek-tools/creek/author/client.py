@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 from creek.classify.llm.providers import Completion, build_provider
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from creek.classify.llm.base import LLMProvider
     from creek.classify.llm.router import ModelRouter
     from creek.config import AuthorConfig, LLMConfig
@@ -143,6 +145,7 @@ class AuthorLLMClient:
         *,
         author: AuthorConfig | None = None,
         tier: PrivacyTier | None = None,
+        may_serve: Callable[[LLMProvider], bool] | None = None,
     ) -> AuthorLLMClient | None:
         """Build the voice-drafter client, or ``None`` when it is unusable.
 
@@ -159,6 +162,9 @@ class AuthorLLMClient:
             router: The run's :class:`ModelRouter`.
             author: Author-subsystem config for the ``voice_model`` fallback.
             tier: The fragment's privacy tier (gated by the chokepoint).
+            may_serve: Optional stricter readiness check that replaces
+                :attr:`available`, such as the MCP server's pinned-model rule
+                (#1849). ``None`` keeps :attr:`available`.
 
         Returns:
             A usable :class:`AuthorLLMClient`, or ``None``.
@@ -168,7 +174,9 @@ class AuthorLLMClient:
                 ``Intimate`` role is cloud with no local fallback.
         """
         client = cls.for_role(router, "voice_drafter", author=author, tier=tier)
-        return client if client.available else None
+        if may_serve is None:
+            return client if client.available else None
+        return client if may_serve(client._provider) else None
 
     @property
     def available(self) -> bool:
