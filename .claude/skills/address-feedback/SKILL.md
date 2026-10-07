@@ -81,7 +81,7 @@ Use the GitHub MCP tools — never `gh` CLI. The goal is to determine whether a 
 
 ### Step 1A: COMMENTS Verdict — File Prioritized Issues, Then Merge (Never Iterate)
 
-Reached only when the current verdict is `COMMENTS`. **A `COMMENTS` verdict never starts another iteration**: no TDD loop, no code push, no `@claude please re-review`. The reviewer has signed off on what is in the PR; its non-blocking findings become tracked backlog work, prioritized by severity, and the PR proceeds to the merge gate. This holds even when an automated summary comment (`iteration-trigger.yml`'s `**Action**:` line) says "continue iterating" — for `COMMENTS`, this step overrides it.
+Reached only when the current verdict is `COMMENTS`. **A `COMMENTS` verdict never starts another iteration**: no TDD loop, no code push, no `@claude please re-review`. The reviewer has signed off on what is in the PR; its non-blocking findings become tracked backlog work, prioritized by severity, and the PR proceeds to the merge gate. `iteration-trigger.yml`'s summary comment (`scripts/ralph/verdict-wake.sh`) and `scripts/ralph/pr-ready.sh` (token `ready-comments`) both route `COMMENTS` here.
 
 1. Build the same triage table as Step 2 from the comment body (Strengths / Security Concerns / Problems / Code Quality / Requests sections) **and** any unresolved line-level threads via `mcp__github__pull_request_read` with `method: "get_review_comments"`.
 2. Drop rows that are factually wrong or already addressed — reply on the relevant thread/comment with a short justification instead of opening an issue.
@@ -164,7 +164,7 @@ Merge only when **every** condition is true. If any fails, stop and explain whic
   - `mcp__github__pull_request_read` with `method: "get_check_runs"` (per-job detail).
 - No unresolved line-level review threads (`mcp__github__pull_request_read` with `method: "get_review_comments"` — each thread has `isResolved`). For a `COMMENTS` verdict, threads are resolved by linking the follow-up issue or by the moratorium-deferral reply (Step 1A.2/1A.6), not by code change.
 - The PR is `mergeable` and not `draft` (from the `get` response).
-- For a `COMMENTS` verdict (which no readiness helper clears on its own): the PR carries no `do-not-auto-merge` label, and the compare API reports `behind_by == 0` against its base. If it is behind, sync it and wait for the fresh review on the new HEAD instead of merging.
+- For a `COMMENTS` verdict: the PR carries no `do-not-auto-merge` label, and the compare API reports `behind_by == 0` against its base. If it is behind, sync it and wait for the fresh review on the new HEAD instead of merging.
 
 Then squash-merge:
 

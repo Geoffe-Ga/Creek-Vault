@@ -188,6 +188,7 @@ ANSWER=$(jq -r \
   --argjson authors '["Geoffe-Ga","github-actions"]' \
   --arg verdict_re '(?im)^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]' \
   --arg verdict_lgtm_re '(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+lgtm[*\s]*$' \
+  --arg verdict_comments_re '(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+comments[*\s]*$' \
   --arg iter_summary_re '(?m)^<!-- iteration-trigger -->[[:space:]]*$' \
   --arg marker_re '(?m)^<!-- creek-review pr=([0-9]+) -->[[:space:]]*$' \
   --arg marker_any_re 'creek-review' \
@@ -198,9 +199,9 @@ ANSWER=$(jq -r \
 # number, a login and a decimal comment id can none of them contain `|`, so a
 # SIXTH field means the answer is not the shape we asked for and every branch
 # below must fail closed on it rather than reading a shifted value.
-IFS='|' read -r VDATE VLGTM MARKER_PR VREFUSED VID VREST <<<"$ANSWER"
+IFS='|' read -r VDATE VLGTM MARKER_PR VREFUSED VID VCOMMENTS VREST <<<"$ANSWER"
 if [ -n "$VREST" ]; then
-  VDATE=""; VLGTM=""; MARKER_PR=""; VREFUSED=""; VID=""
+  VDATE=""; VLGTM=""; MARKER_PR=""; VREFUSED=""; VID=""; VCOMMENTS=""
 fi
 
 # The refusal diagnostic is printed BEFORE the early exit, because filtering at
@@ -306,10 +307,24 @@ if [ "$VLGTM" = "true" ]; then
     *)
       VERDICT='DISPUTED' ;;
   esac
+elif [ "$VCOMMENTS" = "true" ]; then
+  # COMMENTS now clears a merge (once its findings are filed as P0-P3 follow-up
+  # issues), so it gets LGTM's dissent check: a body whose own last `## Verdict:`
+  # line says something else is DISPUTED, never COMMENTS.
+  case "$VLINE" in
+    *CHANGES_REQUESTED*|*LGTM*) VERDICT='DISPUTED' ;;
+    ''|*COMMENTS*)              VERDICT='COMMENTS' ;;
+    *)                          VERDICT='DISPUTED' ;;
+  esac
 else
+  # Neither clearance flag is set. CHANGES_REQUESTED is the fix loop. Anything
+  # else used to DEFAULT to COMMENTS, which was harmless while COMMENTS only
+  # meant "iterate" and is a clearance now — so an unrecognised line is
+  # `UNPARSED`: no `LGTM`/`COMMENTS` substring, none of the verdicts
+  # await-claude-review recognises, so Step 4a surfaces it to a human.
   case "$VLINE" in
     *CHANGES_REQUESTED*) VERDICT='CHANGES REQUESTED' ;;
-    *)                   VERDICT='COMMENTS' ;;
+    *)                   VERDICT='UNPARSED' ;;
   esac
 fi
 
@@ -368,7 +383,12 @@ BEHIND=$(gh api "repos/$REPO/compare/$BASE...$SHA?per_page=1" --jq '.behind_by' 
 # API hiccup clear the merge.
 HEAD_DATE=$(gh api "repos/$REPO/commits/$SHA" --jq '.commit.committer.date' 2>/dev/null || true)
 
-if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
+# A COMMENTS verdict never asks for another iteration: its findings become
+# follow-up issues prioritized P0-P3 by severity (address-feedback Step 1A).
+FILE_FOLLOWUPS="Do NOT iterate on this review: pull comment ${ID} and file each actionable finding as a follow-up issue with a P0-P3 label matched to its severity (address-feedback Step 1A)."
+# COMMENTS clears through the SAME chain as LGTM, so every refusal below
+# rewrites it exactly as it rewrites LGTM.
+if [ "$GREEN" = "$TOTAL" ] && { [ "$VERDICT" = "LGTM" ] || [ "$VERDICT" = "COMMENTS" ]; }; then
   if [ "$HELD" != "no" ]; then
     # THE ONE CONTROL A HUMAN RETAINS over an autonomous merge loop, so this
     # branch is the most important place in the file to get right — and until
@@ -435,9 +455,16 @@ if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
     # ordering is unknowable, and unknowable must not clear.
     VERDICT='STALE'
     ACTION="NOT cleared to merge: the verdict (${VDATE}) does not postdate this head ${SHA} (${HEAD_DATE:-unreadable}) - it reviewed code that has since been replaced. Push or re-run the review workflow on the current head and wait for the fresh verdict."
+  elif [ "$VERDICT" = "COMMENTS" ]; then
+    ACTION="${FILE_FOLLOWUPS} Then you are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks."
   else
     ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
   fi
+elif [ "$VERDICT" = "COMMENTS" ]; then
+  ACTION="${FILE_FOLLOWUPS} CI is not fully green yet - fix only the failing checks."
+elif [ "$VERDICT" = "UNPARSED" ]; then
+  # VERDICT is already the refusal value; ACTION only explains it.
+  ACTION="Do not merge: comment ${ID} has no Verdict line this pipeline can read. Surface it to a human; do not infer a verdict."
 else
   ACTION="pull comment ${ID} to see in-depth feedback and continue iterating"
 fi
