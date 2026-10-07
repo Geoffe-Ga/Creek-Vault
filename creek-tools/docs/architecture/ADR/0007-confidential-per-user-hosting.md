@@ -112,19 +112,27 @@ Adopt the ratified hosting/custody/routing model (#755):
 
 On 2026-10-07 the owner decided that **the operator cannot read people's
 journal entries**. [adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md) records the decision. This record
-stays as written. What changes:
+stays as written. What the decision changes, as targets:
 
 - **Decision 2 (user-held keys, no escrow)** is no longer a future target
-  limited to the vault volume. It is the custody model for journal content
-  wherever that content is stored. The specific passphrase and recovery-key
-  mechanism is reopened as D03.
+  limited to the vault volume. It is decided to become the custody model for
+  journal content wherever that content is stored. The specific passphrase and
+  recovery-key mechanism is reopened as D03.
 - **Decisions 3-4 (TEE and the attested enclave)** are **not selected**. The
-  privacy guarantee for stored content comes from user-held keys, not from
+  target guarantee for stored content will come from user-held keys, not from
   confidential hardware.
-- **Decision 6 (BYOK)** is tightened. A person's content reaches a cloud
-  model **only** with their own key, on every tier. Without that key, nothing
-  reaches a cloud model. Credit-funded inference (paid by adepthood) runs only
-  on the vault-local model or a no-retention runtime the operator controls.
-  The INTIMATE chokepoint in `ModelRouter` is unchanged.
-- **Decisions 1 and 5** (the per-user VM and the authenticated transport,
-  with INTIMATE never remotely reachable) are unchanged.
+- **Decision 6 (BYOK)** is tightened. It is decided that a person's content
+  will reach a cloud model **only** with their own key, on every tier, sent from
+  their device rather than relayed by a server. Without that key, nothing is to
+  reach a cloud model. Credit-funded inference (paid by adepthood) is to run
+  only on the vault-local model or a no-retention runtime the operator
+  controls. The INTIMATE chokepoint in `ModelRouter` is unchanged.
+- **Decisions 1 and 5** (the per-user VM and the authenticated transport, with
+  INTIMATE never remotely reachable) are unchanged.
+
+**Not implemented yet.** Until adepthood B13 phases (b) and (c) land for an
+account, journal content that reaches a vault stays operator-readable, exactly
+as described above.
+
+Nothing here is a public claim. Each claim waits for adepthood B24
+([adepthood#3076](https://github.com/Geoffe-Ga/adepthood/issues/3076)).

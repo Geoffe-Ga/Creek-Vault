@@ -103,11 +103,14 @@ vault-local inference. It **does not select** attested confidential compute.
 What changes here:
 
 - The enclave provider and its attestation gate stay as code. However,
-  **INTIMATE or journal content is not routed to a remote enclave** under the
-  current decision. Device-side or person-controlled vault inference is the
-  selected path, and cloud is reached only with the person's own key.
+  **INTIMATE or journal content is not to be routed to a remote enclave** under
+  the current decision. The selected path is device-side or person-controlled
+  vault inference, and cloud only with the person's own key.
 - The operator-provisioned trust root described above is **not** evidence for
   any operator-blind claim. A real vendor attestation chain, with nonce
-  freshness, user-authorized key release and a hostile-host lab (D05), is
-  needed before this provider can be reconsidered. That happens only through
-  adepthood ADR 0009's reopen triggers.
+  freshness, user-authorized key release and a hostile-host lab (D05), would be
+  needed before this provider could be reconsidered. That can happen only
+  through adepthood ADR 0009's reopen triggers.
+
+Nothing here is a public claim. Each claim waits for adepthood B24
+([adepthood#3076](https://github.com/Geoffe-Ga/adepthood/issues/3076)).
