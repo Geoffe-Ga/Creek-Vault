@@ -12,9 +12,10 @@ So each appended section must:
 
 * say it is not implemented yet, where it describes a custody target,
 * carry the "no public claim" disclaimer pointing at adepthood B24, and
-* never state a custody property in a sentence without a target or
-  conditional scope, or a negation directly governing the term. The scan is
-  a heuristic tripwire, not a proof.
+* never state a custody property in a sentence without an anchored scope
+  (the decided target or a named phase) or a negation directly governing the
+  term. Bare future or conditional words do not excuse it. The scan is a
+  heuristic tripwire, not a proof.
 
 Only the appended sections are scanned. The original records above them are
 history and keep their own wording.
@@ -64,29 +65,42 @@ _NOT_IMPLEMENTED: Final = "Not implemented yet."
 # Affirmative custody terms: excused by an explicit target or condition
 # marker, or by a negation directly in front of the term, never by a stray
 # negation elsewhere in the sentence.
+# "user-held" counts when predicated of something ("keys are user-held"); the
+# attributive "the user-held key" names the design rather than asserting it.
 _AFFIRMATIVE_CLAIM: Final = re.compile(
-    r"operator-blind|end-to-end|end to end|\bE2EE\b|already user-held",
+    r"operator-blind|end-to-end|end to end|\bE2EE\b|\b(?:is|are|already)\s+user-held\b",
     re.IGNORECASE,
 )
-# Claims that carry their own negation; only a target or condition excuses them.
+# Claims that carry their own negation or exclusivity; only anchored scope
+# excuses them.
 _NEGATIVE_FORM_CLAIM: Final = re.compile(
     r"\bcan(?:not|'t) (?:read|decrypt|see)\b|\bnever carr(?:y|ies)\b|"
     r"\bnone of (?:their|your|the person's) data reaches\b|\bnever reach(?:es)?\b|"
-    r"\bnever pass(?:es)? through\b|\bholds? no (?:key|escrow)\b",
+    r"\bnever pass(?:es)? through\b|\bholds? no (?:key|escrow)\b|\bnever relayed\b|"
+    r"\bnever sees?\b|\bhas no access\b|\bnobody\b.{0,40}?\bcan read\b|"
+    r"\bonly\W+way\b.{0,60}?\breach(?:es)?\b|\bfunds? only non-cloud\b",
     re.IGNORECASE,
 )
-# Explicit scope. Bare "not", "no" and "never" are deliberately absent.
-_TARGET_OR_CONDITION: Final = re.compile(
-    r"\b(?:target|decided|under the decision|will|until phase|once|when B13|"
-    r"not yet|not implemented|if|unless|would|could)\b",
+# Anchored scope only: the decided target or a named phase. Unanchored
+# will/if/once/would/could/unless do not excuse a sentence.
+_ANCHORED_SCOPE: Final = re.compile(
+    r"\b(?:under the decision|under the target|target|decided|until phase|"
+    r"once phase|once B13|when B13|not yet|not implemented)\b",
     re.IGNORECASE,
 )
 # A negation governing the affirmative term right after it (up to three words).
 _NEGATION_BEFORE: Final = re.compile(
     r"\b(?:not|never|no|neither|nor)\b(?:\W+\w+){0,3}\W*$", re.IGNORECASE
 )
-# A double-quoted term is mentioned, not used.
+# A double-quoted span is a mention only right after a mention word.
 _QUOTED: Final = re.compile(r'"[^"]*"')
+_MENTION_BEFORE: Final = re.compile(
+    r"\b(?:says?|said|saying|phrase|term|terms|word|words|claim|claims|call|called|"
+    r"advertise|advertises|label|labelled)\b(?:\W+\w+){0,4}\W*$",
+    re.IGNORECASE,
+)
+# Sentences also end after bold markup, so a bold heading cannot borrow scope.
+_SENTENCE_END: Final = re.compile(r"(?<=[.;!?])\s+|(?<=[.;!?]\*\*)\s+")
 
 
 def _flat(text: str) -> str:
@@ -106,8 +120,20 @@ def _sentences(text: str) -> list[str]:
     return [
         sentence
         for block in blocks
-        for sentence in re.split(r"(?<=[.;!?])\s+", _flat(block))
+        for sentence in re.split(_SENTENCE_END, _flat(block))
     ]
+
+
+def _without_mentions(sentence: str) -> str:
+    """``sentence`` with each quoted span that is a mention replaced by ``Q``."""
+    out = ""
+    cursor = 0
+    for match in _QUOTED.finditer(sentence):
+        prefix = out + sentence[cursor : match.start()]
+        mention = _MENTION_BEFORE.search(prefix) is not None
+        out = prefix + ("Q" if mention else match.group(0))
+        cursor = match.end()
+    return out + sentence[cursor:]
 
 
 def _affirmative_is_negated(sentence: str) -> bool:
@@ -119,8 +145,8 @@ def _affirmative_is_negated(sentence: str) -> bool:
 
 
 def _is_unscoped_claim(sentence: str) -> bool:
-    """Whether a sentence states custody with no target, condition or negation."""
-    if _TARGET_OR_CONDITION.search(sentence):
+    """Whether a sentence claims custody without anchored scope or a negation."""
+    if _ANCHORED_SCOPE.search(sentence):
         return False
     if _NEGATIVE_FORM_CLAIM.search(sentence):
         return True
@@ -134,7 +160,7 @@ def _unscoped_custody_claims(text: str) -> list[str]:
     return [
         sentence
         for sentence in _sentences(text)
-        if _is_unscoped_claim(_QUOTED.sub("", sentence))
+        if _is_unscoped_claim(_without_mentions(sentence))
     ]
 
 
@@ -165,6 +191,13 @@ _PLANTED_CLAIMS: Final = (
     "Journal content never reaches a cloud model.",
     "The managed vault is operator-blind.",
     "Journal content is already user-held.",
+    "Journal keys are user-held today.",
+    "Adepthood is operator-blind, so we will never see it.",
+    "Adepthood is operator-blind, if you ask us.",
+    'We are "operator-blind".',
+    "BYOK plaintext is never relayed by our server.",
+    "It is the only way any of a person's content reaches a cloud model.",
+    "Credits fund only non-cloud inference.",
 )
 _SCOPED_STATEMENTS: Final = (
     "Ordinary Fly is not operator-blind.",
