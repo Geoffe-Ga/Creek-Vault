@@ -337,6 +337,7 @@ creek-tools/
 │       └── ADR/                      # Architecture Decision Records
 ├── scripts/
 │   ├── _lib.sh                       # Shared shell helpers sourced by the gates
+│   ├── bench.sh                      # Model-capacity harness: python -m creek_mcp.bench (#1850)
 │   ├── check-all.sh                  # Run every quality gate (single source of truth)
 │   ├── complexity.sh                 # Radon + Xenon (CI-002)
 │   ├── container-contract.sh         # Real single-vault Docker runtime contract
