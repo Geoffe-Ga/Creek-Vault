@@ -51,6 +51,8 @@ class FakeModel:
             (1 lets the runner's preflight build through).
         raise_first_only: Raise *call_exc* on the first call only.
         echo_canary: Put :data:`CANARY` and the whole prompt in the response.
+        unanchored: Quote text that is not in the entry, so reflect drops the
+            note and answers ``empty``.
         gather: Hold each call until this many are in flight (0 disables).
     """
 
@@ -60,6 +62,7 @@ class FakeModel:
     factory_fails_after: int = 0
     raise_first_only: bool = False
     echo_canary: bool = False
+    unanchored: bool = False
     gather: int = 0
     calls: int = 0
     builds: int = 0
@@ -107,7 +110,10 @@ class FakeModel:
             first = self.calls == 1
             if self.call_exc is not None and (first or not self.raise_first_only):
                 raise self.call_exc
-            note = {"quote": quote_from(prompt), "kind": "pattern", "note": "ok"}
+            quote = (
+                "words the entry never said" if self.unanchored else quote_from(prompt)
+            )
+            note = {"quote": quote, "kind": "pattern", "note": "ok"}
             payload: dict[str, object] = {"notes": [note]}
             if self.echo_canary:
                 payload["essay"] = f"{CANARY} {prompt}"

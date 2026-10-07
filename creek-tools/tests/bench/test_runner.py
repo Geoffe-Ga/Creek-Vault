@@ -20,6 +20,7 @@ import pytest
 
 from creek.classify.llm.router import IntimateRoutingError
 from creek.config import AuthorConfig
+from creek_mcp.bench import runner as runner_module
 from creek_mcp.bench.deadline import Verdict
 from creek_mcp.bench.local_only import CloudProviderRefusedError, LocalOnlyFactory
 from creek_mcp.bench.ollama_client import PinnedModel
@@ -35,7 +36,7 @@ from creek_mcp.bench.runner import (
     run_bench,
 )
 from creek_mcp.bench.trial import Phase, Sweep
-from creek_mcp.tools.reflect import _build_prompt
+from creek_mcp.tools.reflect import GroundingSession, _build_prompt, reflect_tool
 from tests.bench.conftest import FakeModel, Recorded, make_plan, run_metadata
 
 if TYPE_CHECKING:
@@ -530,3 +531,61 @@ def test_model_store_path_supplies_the_disk_figure(
     host = run_bench(plan, tmp_path / "corpus", model_store=store).host
     assert host.disk_scope == "model_store"
     assert measured == [store]
+
+
+def test_each_cold_trial_gets_its_own_fresh_grounding_session(
+    tmp_path: Path, fake_model: FakeModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold means a cold grounding session too; warm trials share one.
+
+    A refactor that handed cold trials the warm session would make cold
+    latencies warm on the grounding side, and nothing else would notice.
+    """
+    seen: list[tuple[str, object]] = []
+    real = runner_module.reflect_tool
+
+    def _spy(**kwargs: Any) -> dict[str, Any]:
+        phase = "cold" if len(seen) < 2 else "warm"
+        seen.append((phase, kwargs["session"]))
+        return real(**kwargs)
+
+    monkeypatch.setattr(runner_module, "reflect_tool", _spy)
+    plan = make_plan(fake_model, cold_trials=2, warm_trials=3, concurrency_levels=())
+    run_bench(plan, tmp_path / "corpus")
+    cold = [session for phase, session in seen if phase == "cold"]
+    warm = [session for phase, session in seen if phase == "warm"]
+    assert len(cold) == 2
+    assert len(warm) == 3
+    assert all(isinstance(s, GroundingSession) for s in cold + warm)
+    assert len({id(s) for s in cold}) == 2
+    assert len({id(s) for s in warm}) == 1
+    assert {id(s) for s in cold}.isdisjoint({id(s) for s in warm})
+
+
+def test_an_empty_reflection_is_a_capacity_success(tmp_path: Path) -> None:
+    """``empty`` (no note survived verbatim checks) is a quality result, not a failure.
+
+    The model was reached and answered inside the deadline. Counting it as a
+    failure would move the error rate, and with it the verdict, on a quality
+    signal that B22 owns.
+    """
+    model = FakeModel(unanchored=True)
+    plan = make_plan(model, **_only_warm())
+    report = run_bench(plan, tmp_path / "corpus")
+    (trial,) = _trials(report, Sweep.COLD_WARM)
+    assert model.calls == 1
+    assert trial.outcome is Outcome.OK
+    assert report.verdict is Verdict.FITS
+
+
+def test_unanchored_quote_really_yields_empty(tmp_path: Path) -> None:
+    """Control: the fake's unanchored mode makes reflect answer ``empty``."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    result = reflect_tool(
+        vault_path=vault,
+        llm_factory=FakeModel(unanchored=True).factory,
+        content="garden river stone window",
+        retrieve=lambda query, vault, override: [],
+    )
+    assert result["status"] == "empty"
