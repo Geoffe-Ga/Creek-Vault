@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
 from creek.config import CONFIG_PATH_ENV_VAR
 from creek_mcp.container_runtime import (
     ContainerConfigurationError,
@@ -86,11 +87,17 @@ def _load_replay_state(path: Path) -> str:
 @contextmanager
 def _runtime_environment(config_path: Path, vault_path: Path) -> Iterator[None]:
     """Install the runtime paths without leaking process state after shutdown."""
-    names = (CONFIG_PATH_ENV_VAR, _VAULT_PATH_ENV_VAR, CONSUMER_TOKENS_ENV)
+    names = (
+        CONFIG_PATH_ENV_VAR,
+        _VAULT_PATH_ENV_VAR,
+        CONSUMER_TOKENS_ENV,
+        LOOPBACK_ONLY_ENV,
+    )
     previous = {name: os.environ.get(name) for name in names}
     try:
         os.environ[CONFIG_PATH_ENV_VAR] = str(config_path)
         os.environ[_VAULT_PATH_ENV_VAR] = str(vault_path)
+        os.environ[LOOPBACK_ONLY_ENV] = "1"
         os.environ.pop(CONSUMER_TOKENS_ENV, None)
         yield
     finally:

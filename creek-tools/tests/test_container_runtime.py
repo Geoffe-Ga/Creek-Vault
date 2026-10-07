@@ -246,3 +246,86 @@ def test_runtime_keeps_credentials_out_of_environment_and_process_args(
     assert server_args["tls_cert"] == settings.tls_cert_file
     assert server_args["tls_key"] == settings.tls_key_file
     assert os.environ[CONFIG_PATH_ENV_VAR] == str(settings.config_path)
+
+
+def _write_config(settings: ContainerSettings, stage: str, url: str) -> None:
+    """Write an existing-vault config whose *stage* dials *url*."""
+    from creek.config import CreekConfig
+
+    data = CreekConfig(vault_path=settings.vault_path).model_dump(mode="json")
+    override = {**data["llm"]["default"], "ollama_url": url}
+    if stage == "default":
+        data["llm"]["default"] = override
+    elif stage.startswith("writing_desk."):
+        data["llm"]["writing_desk"][stage.split(".", 1)[1]] = override
+    else:
+        data["llm"][stage] = override
+    settings.config_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize("stage", ["default", "generation", "writing_desk.critic"])
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("http://10.0.0.5:11434", "10.0.0.5"),
+        ("http://evil.example:11434", "evil.example"),
+        ("http://127.0.0.1@evil.example:11434", "evil.example"),
+    ],
+)
+def test_container_mode_refuses_non_loopback_ollama_url(
+    tmp_path: Path, stage: str, url: str, host: str
+) -> None:
+    """The provider labelled local may not dial a remote host from a container."""
+    settings = _settings(tmp_path)
+    _write_config(settings, stage, url)
+
+    with pytest.raises(ContainerConfigurationError, match="loopback") as caught:
+        prepare_vault(settings)
+
+    assert stage in str(caught.value)
+    assert host not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"],
+)
+@pytest.mark.parametrize("stage", ["default", "generation", "writing_desk.critic"])
+def test_container_mode_accepts_loopback_ollama_url(
+    tmp_path: Path, stage: str, url: str
+) -> None:
+    """Loopback endpoints keep booting an existing vault unchanged."""
+    settings = _settings(tmp_path)
+    _write_config(settings, stage, url)
+
+    assert prepare_vault(settings).state is BootstrapState.EXISTING
+
+
+def test_first_boot_default_config_passes_the_loopback_rule(tmp_path: Path) -> None:
+    """The generated default config already satisfies the narrowing."""
+    assert prepare_vault(_settings(tmp_path)).state is BootstrapState.INITIALIZED
+
+
+def test_run_sets_loopback_only_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The serving process enforces the loopback boundary on every dial."""
+    from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+    from creek_mcp import container_runtime as runtime
+
+    settings = _settings(tmp_path)
+    observed: dict[str, str | None] = {}
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "")
+    monkeypatch.delenv(LOOPBACK_ONLY_ENV)
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier: verifier)
+    monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
+
+    def fake_serve(_app: object, _args: object) -> None:
+        observed["flag"] = os.environ.get(LOOPBACK_ONLY_ENV)
+
+    monkeypatch.setattr(runtime, "serve", fake_serve)
+
+    run(settings)
+
+    assert observed["flag"] == "1"
