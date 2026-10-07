@@ -23,6 +23,7 @@ import pytest
 
 from creek.classify.llm.completion import Completion
 from creek.classify.llm.local_boundary import is_loopback_url
+from creek.config import LLMConfig
 from creek_mcp import container_health as health
 from creek_mcp import model_package
 from creek_mcp.container_health import (
@@ -35,11 +36,10 @@ from creek_mcp.container_health import (
 )
 from creek_mcp.container_runtime import PORT_ENV, ContainerSettings
 from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV, ModelPackageManifest
+from tests.ollama_stub import OllamaStub, serve_ollama
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from creek.config import LLMConfig
+    from collections.abc import Callable, Iterator
 
 _MODEL = "creek-test-model:q4"
 _SERVED_DIGEST = "d" * 64
@@ -296,11 +296,17 @@ def _settings_again(tmp_path: Path) -> ContainerSettings:
     return ContainerSettings(vault_path=vault, config_path=vault / "creek.yaml")
 
 
+@pytest.fixture
+def ollama_runtime() -> Iterator[OllamaStub]:
+    """Serve a real loopback stand-in runtime; set its inventory per test."""
+    yield from serve_ollama(OllamaStub(tags={"models": []}))
+
+
 @pytest.mark.parametrize(
-    ("inventory", "status"),
+    ("digest", "status"),
     [
-        (_served(), ProbeStatus.MODEL_READY),
-        (_served("e" * 64), ProbeStatus.MODEL_DIGEST_MISMATCH),
+        (_SERVED_DIGEST, ProbeStatus.MODEL_READY),
+        ("e" * 64, ProbeStatus.MODEL_DIGEST_MISMATCH),
     ],
 )
 def test_model_probe_logs_contain_no_prompt_or_output(
@@ -308,12 +314,22 @@ def test_model_probe_logs_contain_no_prompt_or_output(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
-    inventory: httpx.Response,
+    ollama_runtime: OllamaStub,
+    digest: str,
     status: ProbeStatus,
 ) -> None:
-    """Only the status line leaves the probe: no prompt, output, hash or URL."""
+    """Only the status line leaves the probe: no prompt, output or blob hash.
+
+    The real dial path runs — ``ollama_get``, ``call_ollama`` and the boundary
+    transport — against a loopback stand-in, so a log line added anywhere on
+    that path is caught, not just one in the probe module.
+    """
     manifest = _pin(tmp_path, monkeypatch)
-    _Runtime(monkeypatch, inventory=inventory, canary=_CANARY_OUTPUT)
+    ollama_runtime.tags = {"models": [{"name": _MODEL, "digest": f"sha256:{digest}"}]}
+    ollama_runtime.generation = _CANARY_OUTPUT
+    monkeypatch.setattr(
+        health, "_LOOPBACK_RUNTIME", LLMConfig(ollama_url=ollama_runtime.url)
+    )
     monkeypatch.delenv(PORT_ENV, raising=False)
     caplog.set_level(logging.DEBUG)
 
@@ -324,14 +340,10 @@ def test_model_probe_logs_contain_no_prompt_or_output(
     assert out.out == f"{status.value}\n"
     assert out.err == ""
     assert caught.value.code == ProbeResult(status).exit_code
-    forbidden = (
-        CANARY_PROMPT,
-        _CANARY_OUTPUT,
-        manifest.model_blob_sha256,
-        "127.0.0.1",
-        "localhost",
-        "11434",
-    )
+    sent = [path for _method, path, _body in ollama_runtime.requests]
+    expected = ["/api/tags", "/api/generate"]
+    assert sent == (expected if status is ProbeStatus.MODEL_READY else expected[:1])
+    forbidden = (CANARY_PROMPT, _CANARY_OUTPUT, manifest.model_blob_sha256)
     for record in caplog.records:
         for needle in forbidden:
             assert needle not in record.getMessage()
