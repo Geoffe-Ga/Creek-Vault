@@ -95,7 +95,7 @@ def _optional_str(value: object) -> str | None:
 class _BenchLLM:
     """One bounded completion callable; positively local."""
 
-    is_cloud: Final[bool] = False
+    is_cloud: bool = False
 
     def __init__(self, client: BenchOllamaClient, num_predict: int) -> None:
         """Bind *client* and this call's output ceiling."""

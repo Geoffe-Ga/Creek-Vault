@@ -26,7 +26,6 @@ hours.
 """
 
 import dataclasses
-import json
 from collections.abc import Mapping
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
@@ -215,11 +214,7 @@ def load_price_sheet(path: Path, *, today: date) -> PriceSheet:
     if not path.is_file():
         raise PriceSheetError(_NOT_FOUND)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise PriceSheetError(_NOT_JSON) from exc
-    try:
-        sheet = PriceSheet.model_validate(raw)
+        sheet = PriceSheet.model_validate_json(path.read_text(encoding="utf-8"))
     except ValidationError as exc:
         raise _invalid(exc) from exc
     age = (today - sheet.observed_on).days
