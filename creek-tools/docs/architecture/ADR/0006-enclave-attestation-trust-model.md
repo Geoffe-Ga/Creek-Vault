@@ -104,8 +104,10 @@ What changes here:
 
 - The enclave provider and its attestation gate stay as code. However,
   **INTIMATE or journal content is not to be routed to a remote enclave** under
-  the current decision. The selected path is device-side or person-controlled
-  vault inference, and cloud only with the person's own key.
+  the current decision. The selected path is device-side inference, the
+  vault-local model, or a managed no-retention runtime the operator runs
+  (labelled on each use, and not operator-blind while it runs; adepthood ADR
+  0009 Decision item 4), with cloud only under the person's own key.
 - The operator-provisioned trust root described above is **not** evidence for
   any operator-blind claim. A real vendor attestation chain, with nonce
   freshness, user-authorized key release and a hostile-host lab (D05), would be

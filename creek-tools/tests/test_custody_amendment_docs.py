@@ -213,3 +213,12 @@ def test_amendment_cites_no_answered_question_as_open(filename: str) -> None:
     section = _flat(_appended_section(filename))
 
     assert [phrase for phrase in _ANSWERED_AS_OPEN if phrase in section] == []
+
+
+def test_enclave_amendment_names_the_whole_selected_inference_path() -> None:
+    """ADR-0006's selected path includes the decided managed runtime and caveat."""
+    section = _flat(_appended_section("0006-enclave-attestation-trust-model.md"))
+
+    assert "managed no-retention runtime" in section
+    assert "labelled on each use" in section
+    assert "not operator-blind while it runs" in section
