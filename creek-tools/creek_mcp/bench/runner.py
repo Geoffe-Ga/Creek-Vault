@@ -241,8 +241,55 @@ def run_trial(
         latency_s=max(latency, 0.0),
         generation_s=probe.generation_s,
         outcome=outcome,
-        model_resident_bytes=plan.backend.resident_bytes(),
+        model_resident_bytes=_resident_bytes(plan),
     )
+
+
+def _resident_bytes(plan: BenchPlan) -> int | None:
+    """Best-effort residency probe: an unreachable runtime means unknown.
+
+    Called after the trial is already decided, so a runtime that dropped
+    mid-run must not turn a classified trial into a crashed run.
+    """
+    try:
+        return plan.backend.resident_bytes()
+    except _TRIAL_FAILURES as exc:
+        logger.debug("bench residency probe raised %s", type(exc).__name__)
+        return None
+
+
+def _evict_then_run(
+    harness: _Harness,
+    spec: _TrialSpec,
+    session: GroundingSession,
+    *,
+    pause_s: float | None = None,
+) -> Trial:
+    """Evict the model, then run *spec*; a failed evict is the trial's outcome.
+
+    The eviction is part of what a cold or resumed trial measures, so when it
+    fails (the runtime dropped, typically) the trial records that classified
+    failure with no latency rather than aborting every remaining sweep.
+    *pause_s*, when given, is waited out between the eviction and the trial
+    (the idle cycle).
+    """
+    try:
+        harness.plan.backend.evict()
+    except _TRIAL_FAILURES as exc:
+        logger.debug("bench evict raised %s", type(exc).__name__)
+        return Trial(
+            sweep=spec.sweep,
+            phase=spec.phase,
+            concurrency=spec.concurrency,
+            input_words=len(spec.content.split()),
+            latency_s=0.0,
+            generation_s=None,
+            outcome=classify_outcome(exc),
+            model_resident_bytes=None,
+        )
+    if pause_s is not None:
+        harness.plan.sleeper(pause_s)
+    return run_trial(harness, spec, session)
 
 
 def _cold_warm(harness: _Harness) -> list[Trial]:
@@ -250,11 +297,10 @@ def _cold_warm(harness: _Harness) -> list[Trial]:
     workload = harness.plan.workload
     trials = []
     for _ in range(workload.cold_trials):
-        harness.plan.backend.evict()
         spec = _TrialSpec(
             Sweep.COLD_WARM, Phase.COLD, 1, harness.content(workload.query_words)
         )
-        trials.append(run_trial(harness, spec, GroundingSession()))
+        trials.append(_evict_then_run(harness, spec, GroundingSession()))
     session = GroundingSession()
     for _ in range(workload.warm_trials):
         spec = _TrialSpec(
@@ -300,12 +346,12 @@ def _idle(harness: _Harness, session: GroundingSession) -> list[Trial]:
     plan = harness.plan
     trials = []
     for _ in range(plan.workload.idle_cycles):
-        plan.backend.evict()
-        plan.sleeper(plan.workload.idle_seconds)
         spec = _TrialSpec(
             Sweep.IDLE, Phase.RESUME, 1, harness.content(plan.workload.query_words)
         )
-        trials.append(run_trial(harness, spec, session))
+        trials.append(
+            _evict_then_run(harness, spec, session, pause_s=plan.workload.idle_seconds)
+        )
     return trials
 
 

@@ -349,3 +349,67 @@ def test_workload_validation(
     with pytest.raises(WorkloadError, match=message):
         run_bench(make_plan(fake_model, **overrides), root)
     assert not root.exists()
+
+
+def _runtime_down() -> None:
+    """A backend side call against an Ollama that has gone away."""
+    raise ProviderUnavailableError("down")
+
+
+def _residency_down() -> int | None:
+    """``/api/ps`` against an Ollama that has gone away."""
+    raise ProviderUnavailableError("down")
+
+
+def test_dropped_runtime_is_recorded_per_trial_not_fatal(tmp_path: Path) -> None:
+    """A runtime that drops mid-run yields classified trials and a report.
+
+    Evict before each cold or idle trial and the residency probe after every
+    trial both fail. The run must still finish: the evict failure is that
+    trial's ``provider_unavailable`` outcome, and residency is simply unknown.
+    """
+    plan = make_plan(
+        FakeModel(),
+        cold_trials=2,
+        warm_trials=2,
+        concurrency_levels=(2,),
+        idle_cycles=1,
+    )
+    plan = replace(
+        plan,
+        backend=replace(
+            plan.backend, evict=_runtime_down, resident_bytes=_residency_down
+        ),
+    )
+    report = run_bench(plan, tmp_path / "corpus")
+    cold_warm = _trials(report, Sweep.COLD_WARM)
+    cold = [t.outcome for t in cold_warm if t.phase is Phase.COLD]
+    warm = [t.outcome for t in cold_warm if t.phase is Phase.WARM]
+    assert cold == [Outcome.PROVIDER_UNAVAILABLE] * 2
+    assert warm == [Outcome.OK] * 2
+    assert [t.outcome for t in _trials(report, Sweep.IDLE)] == [
+        Outcome.PROVIDER_UNAVAILABLE
+    ]
+    assert {t.outcome for t in _trials(report, Sweep.CONCURRENCY)} == {Outcome.OK}
+    assert all(
+        t.model_resident_bytes is None
+        for s in report.per_sweep.values()
+        for t in s.trials
+    )
+    assert report.verdict is Verdict.EXCEEDS
+
+
+def test_dropped_runtime_with_failing_model_still_reports(tmp_path: Path) -> None:
+    """With the model also unreachable, every trial is classified, none raised."""
+    model = FakeModel(call_exc=ProviderUnavailableError("down"))
+    plan = make_plan(model, cold_trials=1, warm_trials=1, concurrency_levels=(2,))
+    plan = replace(
+        plan,
+        backend=replace(
+            plan.backend, evict=_runtime_down, resident_bytes=_residency_down
+        ),
+    )
+    report = run_bench(plan, tmp_path / "corpus")
+    outcomes = {t.outcome for s in report.per_sweep.values() for t in s.trials}
+    assert outcomes == {Outcome.PROVIDER_UNAVAILABLE}
+    assert report.verdict is Verdict.INSUFFICIENT_DATA
