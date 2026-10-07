@@ -25,19 +25,38 @@ from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 from creek_mcp.bench.deadline import Verdict, deadline_budget_seconds, deadline_verdict
 from creek_mcp.bench.metadata import HostMetadata, RunMetadata
 from creek_mcp.bench.stats import LatencySummary
-from creek_mcp.bench.trial import Sweep, Trial
+from creek_mcp.bench.trial import Phase, Sweep, Trial
 from creek_mcp.httpapi.middleware import limits
 
 REPORT_SCHEMA_VERSION: Final[int] = 1
 """Bumped whenever a field changes meaning or is removed."""
 
 
-class SweepSummary(BaseModel):
-    """One sweep's trials, their aggregates, and its verdict."""
+class PhaseSummary(BaseModel):
+    """One residency phase's aggregates within a sweep, and its verdict."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     latency: LatencySummary
+    verdict: Verdict
+
+
+class SweepSummary(BaseModel):
+    """One sweep's trials, their aggregates, and its verdict.
+
+    Attributes:
+        latency: Aggregates over every trial in the sweep, for reference.
+        per_phase: Aggregates and a verdict per residency phase. Cold and warm
+            trials are judged apart: pooled, a few slow cold starts fall
+            outside the p95 rank of many warm trials and would go unseen.
+        verdict: The worse of the per-phase verdicts.
+        trials: The sweep's trials.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    latency: LatencySummary
+    per_phase: dict[Phase, PhaseSummary]
     verdict: Verdict
     trials: tuple[Trial, ...]
 
@@ -141,6 +160,24 @@ def capacity_basis(trials: Sequence[Trial], budget: float) -> CapacityBasis:
     )
 
 
+def _sweep_summary(group: tuple[Trial, ...], budget: float) -> SweepSummary:
+    """Summarise one sweep, judging each residency phase on its own."""
+    per_phase: dict[Phase, PhaseSummary] = {}
+    for phase in Phase:
+        trials = [trial for trial in group if trial.phase is phase]
+        if trials:
+            latency = LatencySummary.from_trials(trials)
+            per_phase[phase] = PhaseSummary(
+                latency=latency, verdict=deadline_verdict(latency, budget)
+            )
+    return SweepSummary(
+        latency=LatencySummary.from_trials(group),
+        per_phase=per_phase,
+        verdict=overall_verdict([summary.verdict for summary in per_phase.values()]),
+        trials=group,
+    )
+
+
 def build_report(
     run: RunMetadata, host: HostMetadata, trials: Sequence[Trial]
 ) -> BenchReport:
@@ -155,12 +192,7 @@ def build_report(
         group = tuple(trial for trial in trials if trial.sweep is sweep)
         if not group:
             continue
-        latency = LatencySummary.from_trials(group)
-        per_sweep[sweep] = SweepSummary(
-            latency=latency,
-            verdict=deadline_verdict(latency, budget),
-            trials=group,
-        )
+        per_sweep[sweep] = _sweep_summary(group, budget)
     concurrency = [trial for trial in trials if trial.sweep is Sweep.CONCURRENCY]
     return BenchReport(
         run=run,

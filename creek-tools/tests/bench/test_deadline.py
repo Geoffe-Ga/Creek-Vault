@@ -96,12 +96,16 @@ def test_any_non_ok_exceeds_even_when_p95_fast() -> None:
     assert deadline_verdict(summary) is Verdict.EXCEEDS
 
 
-def test_no_ok_trials_insufficient() -> None:
-    """With no successful trial there is nothing to judge a fit on."""
+def test_all_failed_trials_exceed_rather_than_read_as_no_data() -> None:
+    """Trials that all failed are evidence the envelope does not fit.
+
+    Calling them "insufficient data" would let a phase that OOMs on every
+    cold start read as unmeasured instead of failing.
+    """
     all_failed = _summary([1.0], failures=1).model_copy(
         update={"ok_count": 0, "p50_s": None, "p95_s": None}
     )
-    assert deadline_verdict(all_failed) is Verdict.INSUFFICIENT_DATA
+    assert deadline_verdict(all_failed) is Verdict.EXCEEDS
 
 
 def _numeric_constants(path: Path) -> list[float]:

@@ -118,3 +118,32 @@ def test_build_report_groups_judges_and_omits_empty_sweeps() -> None:
     assert report.kind == "benchmark"
     assert report.quality_score is None
     assert report.capacity.max_fitting_concurrency == 1
+
+
+def _phase_trial(phase: Phase, latency_s: float) -> Trial:
+    """One ok cold/warm trial in *phase*."""
+    return _trial(1, latency_s=latency_s, sweep=Sweep.COLD_WARM).model_copy(
+        update={"phase": phase}
+    )
+
+
+def test_cold_start_is_judged_separately_from_warm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One slow cold trial cannot hide behind thirty fast warm ones.
+
+    Pooled, nearest-rank p95 of 31 trials is rank 30, a warm trial, so the
+    pooled summary fits. Per phase, the cold p95 is over budget, and the
+    sweep's verdict takes the worse phase.
+    """
+    monkeypatch.setattr(limits, "DEFAULT_TIMEOUT_SECONDS", _BUDGET)
+    trials = [_phase_trial(Phase.COLD, _BUDGET + 1)] + [
+        _phase_trial(Phase.WARM, 1.0)
+    ] * 30
+    summary = build_report(run_metadata(), _HOST, trials).per_sweep[Sweep.COLD_WARM]
+    assert summary.latency.p95_s == 1.0
+    assert summary.per_phase[Phase.COLD].latency.p95_s == _BUDGET + 1
+    assert summary.per_phase[Phase.COLD].verdict is Verdict.EXCEEDS
+    assert summary.per_phase[Phase.WARM].verdict is Verdict.FITS
+    assert set(summary.per_phase) == {Phase.COLD, Phase.WARM}
+    assert summary.verdict is Verdict.EXCEEDS

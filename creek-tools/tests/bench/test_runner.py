@@ -104,7 +104,7 @@ def test_probe_sees_exception_reflect_swallows(tmp_path: Path, site: str) -> Non
     report = run_bench(make_plan(model, **_only_warm()), tmp_path / "corpus")
     (trial,) = _trials(report, Sweep.COLD_WARM)
     assert trial.outcome is Outcome.PROVIDER_UNAVAILABLE
-    assert report.verdict is Verdict.INSUFFICIENT_DATA
+    assert report.verdict is Verdict.EXCEEDS
 
 
 def test_intimate_routing_refusal_is_an_error_not_unavailability(
@@ -424,7 +424,7 @@ def test_dropped_runtime_with_failing_model_still_reports(tmp_path: Path) -> Non
     report = run_bench(plan, tmp_path / "corpus")
     outcomes = {t.outcome for s in report.per_sweep.values() for t in s.trials}
     assert outcomes == {Outcome.PROVIDER_UNAVAILABLE}
-    assert report.verdict is Verdict.INSUFFICIENT_DATA
+    assert report.verdict is Verdict.EXCEEDS
 
 
 def test_context_sweep_upper_boundary_is_inclusive_and_conservative(
@@ -475,4 +475,4 @@ def test_truncated_prompt_is_a_context_overflow_not_ok(tmp_path: Path) -> None:
     report = run_bench(plan, tmp_path / "corpus")
     (trial,) = _trials(report, Sweep.CONTEXT)
     assert trial.outcome is Outcome.CONTEXT_OVERFLOW
-    assert report.per_sweep[Sweep.CONTEXT].verdict is Verdict.INSUFFICIENT_DATA
+    assert report.per_sweep[Sweep.CONTEXT].verdict is Verdict.EXCEEDS

@@ -42,7 +42,11 @@ model is a reflection a user did not get, however fast it failed.
 
 
 class Verdict(StrEnum):
-    """Whether a group of trials fits the deadline."""
+    """Whether a group of trials fits the deadline.
+
+    ``insufficient_data`` means nothing was measured at all; trials that ran
+    and failed are ``exceeds``.
+    """
 
     FITS = "fits"
     EXCEEDS = "exceeds"
@@ -67,13 +71,15 @@ def deadline_verdict(summary: LatencySummary, budget: float | None = None) -> Ve
         budget: Seconds allowed; defaults to :func:`deadline_budget_seconds`.
 
     Returns:
-        ``insufficient_data`` when no trial succeeded; ``exceeds`` when p95 is
-        over the budget or any trial failed; otherwise ``fits``. The budget is
-        inclusive: a p95 exactly at it fits.
+        ``exceeds`` when any trial failed (including when every trial did, so
+        no p95 exists) or p95 is over the budget; otherwise ``fits``. The
+        budget is inclusive: a p95 exactly at it fits. A summary always holds
+        at least one trial, so ``insufficient_data`` is never returned here;
+        it is reserved for a report that measured nothing.
     """
     limit = deadline_budget_seconds() if budget is None else budget
-    if summary.p95_s is None:
-        return Verdict.INSUFFICIENT_DATA
-    if summary.p95_s > limit or summary.error_rate > MAX_FIT_ERROR_RATE:
+    if summary.error_rate > MAX_FIT_ERROR_RATE or summary.p95_s is None:
+        return Verdict.EXCEEDS
+    if summary.p95_s > limit:
         return Verdict.EXCEEDS
     return Verdict.FITS
