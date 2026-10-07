@@ -164,7 +164,7 @@ probed() { # probed <desc> <yes|no> <sentinel path> — did the probe run?
   if [[ -e "$3" ]]; then check "$1" "$2" "yes"; else check "$1" "$2" "no"; fi
 }
 no_merge_token() { # no_merge_token <desc> <token> — any token the loop won't merge on
-  if [[ "$2" != "ready" && "$2" != "ready-unreviewed" ]]; then ok "$1"; else bad "$1 (got '$2')"; fi
+  if [[ "$2" != "ready" && "$2" != "ready-unreviewed" && "$2" != "ready-comments" ]]; then ok "$1"; else bad "$1 (got '$2')"; fi
 }
 says() { # says <desc> <ERE> <text> — the text must carry this phrasing
   # Herestring, never `printf … | grep -q`: that pipeline is the pipefail/SIGPIPE
@@ -201,6 +201,7 @@ says() { # says <desc> <ERE> <text> — the text must carry this phrasing
 # must never read one as the other.
 if ! command -v jq >/dev/null 2>&1; then
   printf 'pr-ready tests: FATAL — jq is not installed.\n' >&2
+  # shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
   printf 'pr-ready tests:   Without it this suite cannot run the production `--jq` expressions (the verdict regex, the provenance-marker extraction, the emitter round trip, the rollup counts) and would report a green summary having tested none of them.\n' >&2
   printf 'pr-ready tests:   Install jq (brew install jq / apt-get install jq) and re-run.\n' >&2
   exit 2
@@ -461,8 +462,10 @@ case "$args" in
       # field, so a stub that still emitted four would have turned both of them
       # from "malformed, fail closed" into "well formed, id happens to read
       # `x`" — a pin that silently stops pinning.
-      printf '%s|%s|%s|%s\n' "${VERDICT:-|false}" "${VERDICT_PR-100}" \
-        "${VERDICT_REFUSED_AUTHOR-}" "${VERDICT_ID-4242}"
+      # The SIXTH field is the strict COMMENTS clearance flag, appended after
+      # databaseId so every surplus fixture still injects past it.
+      printf '%s|%s|%s|%s|%s\n' "${VERDICT:-|false}" "${VERDICT_PR-100}" \
+        "${VERDICT_REFUSED_AUTHOR-}" "${VERDICT_ID-4242}" "${VERDICT_COMMENTS-false}"
     fi
     exit "${VERDICT_EC:-0}" ;;
   "run list"*"--workflow code-review.yml"*)
@@ -756,6 +759,32 @@ check "green + CLEAN + fresh LGTM → ready" "ready" \
 check "green + BEHIND + fresh LGTM → behind" "behind" \
   "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="$FRESH|true" run 100)"
 
+# --- ready-comments: a fresh COMMENTS verdict is a sign-off, never a fix loop
+# Its findings become P0–P3 follow-up issues (address-feedback Step 1A) and the
+# lane merges on exactly the evidence `ready` needs. The flag must be the literal
+# jq `true`, on a fresh, attested, non-LGTM verdict.
+check "green + CLEAN + current + fresh COMMENTS → ready-comments" "ready-comments" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 VERDICT="$FRESH|false" VERDICT_COMMENTS=true run 100)"
+check "fresh COMMENTS but BEHIND → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="$FRESH|false" VERDICT_COMMENTS=true run 100)"
+# Freshness against `main` is exactly LGTM's rule (including the inert-files
+# allowance), so the two tokens must agree on every compare answer.
+for cmp_behind in 0 4; do
+  lgtm_tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=$cmp_behind VERDICT="$FRESH|true" run 100)"
+  comments_tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=$cmp_behind VERDICT="$FRESH|false" VERDICT_COMMENTS=true run 100)"
+  check "COMMENTS follows LGTM's freshness rule at behind_by=$cmp_behind" "${lgtm_tok/#ready/ready-comments}" "$comments_tok"
+done
+check "STALE COMMENTS → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 VERDICT="$STALE|false" VERDICT_COMMENTS=true run 100)"
+check "COMMENTS on another PR's marker → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 VERDICT="$FRESH|false" VERDICT_PR=999 VERDICT_COMMENTS=true run 100 2>/dev/null)"
+check "fresh COMMENTS on an opt-out PR → optout" "optout" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 VERDICT="$FRESH|false" VERDICT_COMMENTS=true PR_LABELS="do-not-auto-merge" run 100)"
+no_merge_token "malformed COMMENTS flag never merges" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 VERDICT="$FRESH|false" VERDICT_COMMENTS=garbage run 100)"
+check "LGTM flag outranks a COMMENTS flag → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 VERDICT="$FRESH|true" VERDICT_COMMENTS=true run 100)"
+
 # --- stale-verdict guard: an LGTM older than HEAD does NOT count ------------
 check "green + CLEAN + STALE LGTM → awaiting-review" "awaiting-review" \
   "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|true" run 100)"
@@ -833,7 +862,10 @@ check "malformed verdict flag → awaiting-review, never changes-requested" "awa
   # The other non-LGTM verdict the reviewer posts. Observed live on PR #1095:
   # a fresh `## Verdict: COMMENTS` + fully green CI sat unnoticed for the
   # watcher's whole timeout because it classified as in-flight `awaiting-review`.
-  check "real ## Verdict: COMMENTS (fresh) → changes-requested" "changes-requested" \
+  # COMMENTS is a sign-off with non-blocking findings: it clears like LGTM under
+  # its own token, so the orchestrator files P0–P3 follow-ups and merges rather
+  # than dispatching a fix loop.
+  check "real ## Verdict: COMMENTS (fresh) → ready-comments" "ready-comments" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
        COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\n## Summary\nnits\n\n## Verdict: COMMENTS\n"}')" \
        run 100)"
@@ -3268,7 +3300,7 @@ check "tally: non-numeric in one field → ci-unreadable, not a crash" "ci-unrea
   "$(CHECKS_EC=1 TALLY_RAW='1|1|0|zzz|2' run 100)"
 t_rc=0
 CHECKS_EC=1 TALLY_RAW='1|1|0|zzz|2' run 100 >/dev/null || t_rc=$?
-check "tally: non-numeric count still exits 0 (never a bare `set -u` abort)" "0" "$t_rc"
+check "tally: non-numeric count still exits 0 (never a bare 'set -u' abort)" "0" "$t_rc"
 # …AND THE SAME HAZARD NOW REACHES THE TOTAL, which is the easy half of #1408 to
 # leave out. The four counts are what the guards compare and the total is "only a
 # diagnostic", so a fix that reads a fifth field and omits it from the numeric
@@ -3280,7 +3312,7 @@ check "tally: non-numeric TOTAL alone → ci-unreadable" "ci-unreadable" \
   "$(CHECKS_EC=1 TALLY_RAW='1|1|0|0|zzz' run 100)"
 t_rc=0
 CHECKS_EC=1 TALLY_RAW='1|1|0|0|zzz' run 100 >/dev/null || t_rc=$?
-check "tally: non-numeric TOTAL still exits 0 (never a bare `set -u` abort)" "0" "$t_rc"
+check "tally: non-numeric TOTAL still exits 0 (never a bare 'set -u' abort)" "0" "$t_rc"
 
 # (h) THE MOTIVATING INSTANCE — #1408, reproduced from #1420 at head 3c35251.
 # `gh pr checks` de-duplicates check runs by name; the rollup carries one entry
@@ -3900,6 +3932,7 @@ iter_param_value() { # iter_param_value <CONSTANT NAME>
 }
 for iter_param in "verdict_re|$(iter_param_value VERDICT_RE)" \
                   "verdict_lgtm_re|$(iter_param_value VERDICT_LGTM_RE)" \
+                  "verdict_comments_re|$(iter_param_value VERDICT_COMMENTS_RE)" \
                   "iter_summary_re|$(iter_param_value ITER_SUMMARY_RE)" \
                   "marker_re|$(iter_param_value MARKER_RE)" \
                   "marker_any_re|$(iter_param_value MARKER_ANY_RE)" \
@@ -4039,6 +4072,7 @@ else
   # Step 4a's item 3 is the line that returns LGTM to the caller. It must require
   # the verdict to be EXACTLY LGTM and say so; "not CHANGES_REQUESTED" is not the
   # same test, and it is the reading under which `HELD` merges.
+  # shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
   if grep -qF -- 'exactly `LGTM`' "$SKILL_MD"; then
     ok "Step 4a requires the verdict to be EXACTLY LGTM before returning a merge"
   else
@@ -4302,6 +4336,7 @@ authz_command_lines() { # authz_command_lines <file> — live lines that are not
   authz_live_lines "$1" | grep -vE '^[[:space:]]*(echo|printf)[[:space:]]'
 }
 for authz_file in "$READY" "$ITER_WAKE"; do
+  # shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
   case "$authz_file" in
     "$READY")     authz_invoke_re='--jq.*cat "\$VERDICT_FILTER"'
                   authz_fetch_re='-f query=.*cat "\$VERDICT_QUERY"' ;;
@@ -4370,6 +4405,7 @@ fi
 #
 # TWO ASSERTIONS, because the claim has two halves and they fail differently.
 skill_summary_author_ok=0
+# shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
 if grep -qE '^1\..*author.*`Geoffe-Ga`' "$SKILL_MD"; then
   skill_summary_author_ok=1
 fi
@@ -4448,6 +4484,7 @@ TICK_MD="$AUTHZ_ROOT/.claude/commands/ralph-tick.md"
 # ROW is the requirement. A token that appears only in the surrounding prose is
 # one an operator scanning that table will not find, and will conclude the lane is
 # in a state that cannot happen.
+# shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
 if [[ ! -f "$FLEET_MD" ]]; then
   bad "cannot find scripts/ralph/FLEET.md — the operator-facing token table is unverified (#1408)"
 elif grep -qE '^[|] `ci-unreadable` [|]' "$FLEET_MD"; then
@@ -4463,6 +4500,7 @@ fi
 # says nothing about the loop knowing what to DO with it — and what to do is the
 # non-obvious half here, since the correct action is "keep waiting", plus an
 # escalation policy for `timeout ci-unreadable` (#1408 §6).
+# shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
 if [[ ! -f "$TICK_MD" ]]; then
   bad "cannot find .claude/commands/ralph-tick.md — the orchestrator's routing table is unverified (#1408)"
 elif grep -qE '^- \*\*`ci-unreadable`\*\*' "$TICK_MD"; then

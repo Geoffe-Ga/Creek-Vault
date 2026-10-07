@@ -62,7 +62,7 @@ Medium-priority suggestions that would improve the PR.
 ### Step 10: Deliver Verdict
 - **LGTM** - Ready to merge
 - **CHANGES_REQUESTED** - Must fix blocking issues
-- **COMMENTS** - Suggestions only, can merge as-is
+- **COMMENTS** - Suggestions only, can merge as-is. The author does **not** iterate on a `COMMENTS` verdict: `address-feedback` files each actionable item as a follow-up issue labelled `P0`–`P3` by severity, then merges. So state each suggestion's severity plainly (cite `file:line`) — it sets the issue's priority. Anything that must change before merge is `CHANGES_REQUESTED`, not `COMMENTS`.
 
 Include reasoning with specific file:line references.
 
@@ -86,7 +86,7 @@ Don't paraphrase ("looks good to me", "approving"); the parser will refuse to in
 
 ### Step 11 (Iterative Reviewer): Wait for the Author's Response
 
-When you've delivered `CHANGES_REQUESTED` or actionable `COMMENTS` and want to follow the iteration without polling, delegate to `await-claude-review`. It subscribes to PR activity (comments + CI failures — the webhook does **not** deliver CI passes) and wakes the session on the next push's verdict comment. End the turn after subscribing.
+When you've delivered `CHANGES_REQUESTED` and want to follow the iteration without polling, delegate to `await-claude-review`. It subscribes to PR activity (comments + CI failures — the webhook does **not** deliver CI passes) and wakes the session on the next push's verdict comment. End the turn after subscribing.
 
 ## Examples
 

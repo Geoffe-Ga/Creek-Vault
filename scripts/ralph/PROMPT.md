@@ -30,8 +30,10 @@ only tracker.
 3. **Gate 3 — CI.** All GitHub Actions jobs green on the PR. A CI failure
    sends you back to Gate 1 (via **`ci-debugging`**, which is itself TDD).
 4. **Gate 4 — Claude review.** The reviewer posts a top-level `Verdict:`
-   comment. `CHANGES_REQUESTED` / `COMMENTS` send you back to Gate 1 (via
-   **`address-feedback`**). On `LGTM` → merge.
+   comment. `CHANGES_REQUESTED` sends you back to Gate 1 (via
+   **`address-feedback`**). `COMMENTS` does **not** — its findings are filed as
+   follow-up issues with a severity-matched `P0`–`P3` label
+   (`address-feedback` Step 1A) and the PR merges. On `LGTM` → merge.
 
 This worker contract covers Gates 1–2.5 and opening the PR; the orchestrator
 drives Gates 3–4. The taxonomy you dispatch is mapped in

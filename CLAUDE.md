@@ -113,6 +113,17 @@ Follow the 4-gate process:
 3. **CI**: All GitHub Actions jobs green
 4. **Review**: LGTM before merge
 
+## Review Verdicts: `COMMENTS` Never Iterates
+
+A Claude review `Verdict: COMMENTS` is a sign-off with non-blocking findings.
+Never iterate on it — no fix loop, no push, no re-review. File each actionable
+finding as a follow-up issue with a `P0`–`P3` label matched to its severity
+(`P0` security/data loss/crash · `P1` correctness bug on a reachable path ·
+`P2` degraded behavior, missing test, or a request · `P3` nit/style/docs);
+loop-tooling rows are deferred under the moratorium above, not filed. Then
+merge on green CI. Only `CHANGES_REQUESTED` re-enters the fix loop. Procedure:
+`.claude/skills/address-feedback/SKILL.md`, Step 1A.
+
 ## Knowledge Graph (graphify) — query first
 
 This repo publishes its code graph (~23k nodes) as assets on the rolling

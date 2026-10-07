@@ -29,11 +29,15 @@ _TOKEN = "consumer-token-that-is-at-least-thirty-two-characters"
     "replay_source",
     [
         None,
+        f"instance=router-machine,region=iad,t=1727395200,state={_STATE}",
+        f"instance=router-machine;region=iad,t=1727395200;state={_STATE}",
+        f"state={_STATE};",
         "state=wrong",
-        f"state={_STATE},state={_STATE}",
-        f"state={_STATE},unknown=value",
-        f"state={_STATE},t=not-a-time",
-        f"state={_STATE},region=iad,region=ord",
+        "state=" + "x" * 64,
+        f"state={_STATE};state={_STATE}",
+        f"state={_STATE};unknown=value",
+        f"state={_STATE};t=not-a-time",
+        f"state={_STATE};region=iad;region=ord",
     ],
 )
 def test_vault_refuses_direct_or_malformed_replay_even_with_valid_bearer(
@@ -55,10 +59,15 @@ def test_vault_refuses_direct_or_malformed_replay_even_with_valid_bearer(
     assert _STATE not in response.text
 
 
-def test_vault_requires_replay_state_and_original_bearer(tmp_path: Path) -> None:
+@pytest.mark.parametrize("separator", [";", "; "])
+def test_vault_requires_replay_state_and_original_bearer(
+    tmp_path: Path, separator: str
+) -> None:
     """A closed Fly-Replay-Src plus the original bearer reaches the vault."""
     vault = seed_vault(tmp_path)
-    replay = f"instance=router-machine,region=iad,t=1727395200,state={_STATE}"
+    replay = separator.join(
+        ("instance=router-machine", "region=iad", "t=1727395200", f"state={_STATE}")
+    )
     app_client = client(vault_path=vault, fly_replay_state=_STATE)
 
     missing_bearer = app_client.get(
@@ -262,3 +271,22 @@ def test_fly_runtime_restores_existing_environment_when_server_fails(
         runtime.run(settings)
 
     assert {name: os.environ.get(name) for name in original} == original
+
+
+def test_fly_runtime_environment_enforces_loopback_and_restores_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Fly runtime sets the loopback boundary only while it serves."""
+    from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+    from creek_mcp.fly_vault_runtime import _runtime_environment
+
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "")
+    monkeypatch.delenv(LOOPBACK_ONLY_ENV)
+    with _runtime_environment(tmp_path / "creek.yaml", tmp_path):
+        assert os.environ[LOOPBACK_ONLY_ENV] == "1"
+    assert LOOPBACK_ONLY_ENV not in os.environ
+
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "operator-value")
+    with _runtime_environment(tmp_path / "creek.yaml", tmp_path):
+        assert os.environ[LOOPBACK_ONLY_ENV] == "1"
+    assert os.environ[LOOPBACK_ONLY_ENV] == "operator-value"

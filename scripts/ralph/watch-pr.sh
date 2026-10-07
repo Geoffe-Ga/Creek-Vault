@@ -15,7 +15,7 @@
 # classifier — never a rollup grep) every INTERVAL seconds and exits the moment
 # the token leaves the IN-FLIGHT set {pending, awaiting-review, main-not-green,
 # review-quota-exhausted, ci-unreadable}; every other token (ready,
-# ready-unreviewed, behind, ci-failed, review-failed, changes-requested, optout)
+# ready-comments, ready-unreviewed, behind, ci-failed, review-failed, changes-requested, optout)
 # is a state the orchestrator acts on, so it is worth a wake. Output is exactly
 # one line:
 #
@@ -322,6 +322,7 @@ while :; do
     # growing a field the other parses.
     echo "WATCH $pr timeout $last_token"
     if [[ -n "$last_reason" ]]; then
+      # shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
       printf 'watch-pr: PR %s held on `%s` for the whole window; last reason: %s\n' \
         "$pr" "$last_token" "$last_reason" >&2
     fi

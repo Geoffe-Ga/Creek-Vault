@@ -254,15 +254,18 @@ The bar is **every acceptance criterion**, not a reasonable subset.
 Merge autonomously — no per-PR confirmation — when **all** hold:
 
 1. CI is green on the **current HEAD**;
-2. the reviewer's verdict is `LGTM` and **postdates the head commit** (verdicts
+2. the reviewer's verdict is `LGTM` — or `COMMENTS` with every actionable
+   item filed as a prioritized follow-up issue — and **postdates the head commit** (verdicts
    routinely land seconds before your next push — compare timestamps, always);
 3. the branch is **not behind** `main` — measure with the compare API's
    `behind_by == 0`, **never** `mergeStateStatus` alone, which reports `CLEAN`
    on branches dozens of commits stale;
 4. the issue's full acceptance criteria are met.
 
-- **`COMMENTS` is not blocking.** File each actionable item as a labelled
-  follow-up issue, then merge. Never hold a green PR for a nit.
+- **`COMMENTS` is not blocking and never iterates.** File each actionable item
+  as a follow-up issue labelled `P0`–`P3` by severity (`address-feedback`
+  Step 1A), then merge. Never push a fix for a `COMMENTS` finding and never
+  hold a green PR for a nit.
 - **`CHANGES_REQUESTED`** → back to Gate 1 via `address-feedback`.
 - A **real** `behind` can still be mergeable when the file sets are disjoint —
   but a **false** `behind` from a stale local ref destroys an LGTM for nothing.

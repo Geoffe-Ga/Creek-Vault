@@ -6,6 +6,11 @@
 # query — a non-zero exit means a usage/tooling error, never a PR verdict):
 #
 #   ready            LGTM (fresh) + CI green + verified current with main → merge now
+#   ready-comments   COMMENTS (fresh, attested, read with the same fail-closed
+#                    polarity as LGTM) + every other `ready` condition → the
+#                    reviewer signed off with non-blocking findings: file each as
+#                    a P0–P3 follow-up issue (address-feedback Step 1A), then
+#                    merge. NEVER a fix loop
 #   ready-unreviewed CI green (with real checks that actually passed) + verified
 #                    current with main, but this PR HAS no review gate: NO
 #                    verdict-bearing comment from an ACCEPTED AUTHOR was ever
@@ -83,8 +88,9 @@
 #                    watch-pr.sh's ~30-minute TIMEOUT, which exits
 #                    `timeout ci-unreadable`; ralph-tick.md carries the escalation
 #                    policy for a lane that stays unreadable for the whole window.
-#   changes-requested CI green + a FRESH verdict (posted after HEAD) exists and is
-#                    not LGTM (CHANGES_REQUESTED / COMMENTS) → Step 2
+#   changes-requested CI green + a FRESH verdict (posted after HEAD) exists and
+#                    clears neither as LGTM nor as COMMENTS (i.e. CHANGES_REQUESTED)
+#                    → Step 2
 #                    (address-feedback). This is Gate 4 FAILED — an actionable
 #                    state, distinct from waiting (issue #1097).
 #   awaiting-review  no verdict posted yet, or only a STALE one (it predates the
@@ -766,6 +772,7 @@ readonly MIN_NON_REVIEW_SUCCESSES=1
 # re-spell `claude-review` here; it is coupled to code-review.yml's job key, and
 # test_pr_ready.sh additionally asserts that no OTHER workflow may answer to that
 # name (a colliding job key would put a real red check in the reviewer's bucket).
+# shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
 readonly ROLLUP_TALLY_JQ='def cls($s):
   if   ["SUCCESS","SKIPPED","NEUTRAL"]|index($s) then "ok"
   elif ["FAILURE","TIMED_OUT","CANCELLED","ACTION_REQUIRED","STARTUP_FAILURE","ERROR"]|index($s) then "fail"
@@ -871,6 +878,13 @@ readonly VERDICT_RE='(?im)^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]'
 # load-bearing rather than incidental. So does the legacy `## Verdict\nLGTM`
 # shape, because `[:*\s]+` spans the newline and `LGTM` then sits at column 0.
 readonly VERDICT_LGTM_RE='(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+lgtm[*\s]*$'
+
+# The COMMENTS clearance flag, read with EXACTLY the polarity above and for the
+# same reason: a COMMENTS verdict now clears a merge (`ready-comments`, once its
+# findings are filed as follow-up issues), so a rationale that merely SAYS
+# "Verdict: COMMENTS would be too lenient" must not clear one. Only the token
+# differs from VERDICT_LGTM_RE.
+readonly VERDICT_COMMENTS_RE='(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+comments[*\s]*$'
 
 # The provenance marker `.github/workflows/code-review.yml` PREPENDS to every
 # review comment it posts, with N interpolated by the WORKFLOW from
@@ -1250,6 +1264,7 @@ readonly VERDICT_QUERY="$RALPH_LIB_DIR/${VERDICT_QUERY_REL##*/}"
 readonly VERDICT_ENV_BINDINGS='($ENV.CREEK_VERDICT_AUTHORS | fromjson) as $authors
   | $ENV.CREEK_VERDICT_RE          as $verdict_re
   | $ENV.CREEK_VERDICT_LGTM_RE     as $verdict_lgtm_re
+  | $ENV.CREEK_VERDICT_COMMENTS_RE as $verdict_comments_re
   | $ENV.CREEK_ITER_SUMMARY_RE     as $iter_summary_re
   | $ENV.CREEK_MARKER_RE           as $marker_re
   | $ENV.CREEK_MARKER_ANY_RE       as $marker_any_re
@@ -1621,6 +1636,7 @@ if [[ "$verdict_repo" != */* ]]; then
   # the answer is safe in the only direction that matters: `awaiting-review` is
   # an IN_FLIGHT token, so the lane keeps polling and the very next poll that CAN
   # name the repository classifies normally. Nothing is merged on a repository we
+  # shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
   # could not name. The reason goes to stderr, which `watch-pr.sh` now surfaces
   # once per transition.
   printf 'pr-ready: could not resolve the repository for PR #%s (no --repo given and `gh repo view` did not answer).\n' "$pr" >&2
@@ -1636,6 +1652,7 @@ verdict_line="$(
   export CREEK_VERDICT_AUTHORS="$VERDICT_AUTHORS_JQ"
   export CREEK_VERDICT_RE="$VERDICT_RE"
   export CREEK_VERDICT_LGTM_RE="$VERDICT_LGTM_RE"
+  export CREEK_VERDICT_COMMENTS_RE="$VERDICT_COMMENTS_RE"
   export CREEK_ITER_SUMMARY_RE="$ITER_SUMMARY_RE"
   export CREEK_MARKER_RE="$MARKER_RE"
   export CREEK_MARKER_ANY_RE="$MARKER_ANY_RE"
@@ -1671,8 +1688,11 @@ verdict_line="$(
 # GitHub, and this parser deliberately does not rely on it: a surplus field
 # blanks the whole answer, including the new field, so an attacker who somehow
 # did smuggle a separator buys a wait rather than a shifted field.
-IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_refused_author verdict_id verdict_rest <<<"$verdict_line"
-[[ -z "$verdict_rest" ]] || { verdict_date=""; verdict_lgtm=""; verdict_pr=""; verdict_refused_author=""; verdict_id=""; }
+#
+# THE SIXTH FIELD IS THE COMMENTS CLEARANCE FLAG (see VERDICT_COMMENTS_RE). It is
+# appended after databaseId, so the surplus guard still blanks it with the rest.
+IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_refused_author verdict_id verdict_comments verdict_rest <<<"$verdict_line"
+[[ -z "$verdict_rest" ]] || { verdict_date=""; verdict_lgtm=""; verdict_pr=""; verdict_refused_author=""; verdict_id=""; verdict_comments=""; }
 # `verdict_id` is deliberately unread by this script — see the note above. Named
 # and blanked with the others so the surplus guard covers it, and referenced here
 # so a reader (and shellcheck) can see the omission is intentional rather than a
@@ -1756,6 +1776,7 @@ IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_refused_author verd
 # one goes and changes the wrong thing — so the separator is a literal the
 # filter's own contract defines, matched here as a fixed string, never a
 # substring of a sentence.
+# shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
 if [[ -n "$verdict_refused_author" ]]; then
   {
     if [[ "$verdict_refused_author" == *" edited-by:"* ]]; then
@@ -1926,6 +1947,7 @@ if [[ -n "$verdict_date" && "$verdict_pr" != "$pr" ]]; then
   esac
   # One printf per LINE, and each fact whole within its own line: the operator
   # reads this in a log, and test_pr_ready.sh greps it line by line.
+  # shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
   {
     printf 'pr-ready: the latest verdict on PR #%s %s.\n' "$pr" "$marker_what"
     printf 'pr-ready:   %s\n' "$marker_tail"
@@ -1935,6 +1957,7 @@ if [[ -n "$verdict_date" && "$verdict_pr" != "$pr" ]]; then
   } >&2
   verdict_date=""
   verdict_lgtm=""
+  verdict_comments=""
 fi
 
 # Without a HEAD commit time we cannot prove the verdict is fresh — fail closed.
@@ -2169,8 +2192,17 @@ branch_is_current() {
 # `review_gate_absent`, which refuses the shortcut on the mere existence of a
 # verdict comment. Both are needed, and a change that drops either one lets a
 # refused verdict end at a token the loop merges on (#1181).
+#
+# A fresh COMMENTS verdict clears Gate 4 like LGTM, under its own token so the
+# orchestrator files the findings as P0–P3 follow-up issues before it merges
+# (never a fix loop). It needs the literal jq `false` LGTM flag AND the literal
+# `true` COMMENTS flag on a fresh, attested verdict; anything else falls through
+# to the branches below exactly as before.
 ready_token="ready"
-if [[ "$verdict_lgtm" != "true" || -z "$verdict_date" ]] || ! [[ "$verdict_date" > "$head_date" ]]; then
+if [[ "$verdict_lgtm" == "false" && "$verdict_comments" == "true" && -n "$verdict_date" ]] &&
+   [[ "$verdict_date" > "$head_date" ]]; then
+  ready_token="ready-comments"
+elif [[ "$verdict_lgtm" != "true" || -z "$verdict_date" ]] || ! [[ "$verdict_date" > "$head_date" ]]; then
   # Exactly `false` (jq's tostring), never `!= true`: anything else in that
   # field is a malformed answer, and the dispatch-a-worker token must fail
   # closed to the wait token below rather than fire on garbage.
@@ -2219,7 +2251,8 @@ else
   # NOT swallowed: it is the only place the operator learns which run proved the
   # exhaustion and when the window lifts.
   quota=""
-  if [[ "$ready_token" == "ready" && "$merge_state" == "CLEAN" && -x "$REVIEW_QUOTA_HELPER" ]]; then
+  if [[ ( "$ready_token" == "ready" || "$ready_token" == "ready-comments" ) &&
+        "$merge_state" == "CLEAN" && -x "$REVIEW_QUOTA_HELPER" ]]; then
     quota="$("$REVIEW_QUOTA_HELPER" ${repo_args[@]+"${repo_args[@]}"})" || quota=""
   fi
   # Compared against the ONE token that holds. Everything else — `available`,

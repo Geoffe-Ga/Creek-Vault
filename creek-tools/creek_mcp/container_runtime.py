@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Final
 
 import yaml
 
+from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV, is_loopback_url
 from creek.config import (
     CONFIG_PATH_ENV_VAR,
     VAULT_CONFIG_RELPATH,
@@ -238,6 +239,22 @@ def _validated_config(config_path: Path, vault: Path) -> None:
         raise ContainerConfigurationError(
             "configured vault_path must equal the mounted persistent volume"
         )
+    _require_loopback_ollama(config)
+
+
+def _require_loopback_ollama(config: CreekConfig) -> None:
+    """Refuse any LLM stage whose Ollama endpoint is not loopback.
+
+    ``OllamaProvider`` is labelled local unconditionally, so in a container
+    its endpoint must be too. Every stage is checked whatever its provider,
+    because routing can fall back to a stage's Ollama endpoint. The message
+    names the stage but never the configured URL.
+    """
+    for label, stage in config.llm.iter_stage_configs():
+        if not is_loopback_url(stage.ollama_url):
+            raise ContainerConfigurationError(
+                f"llm stage {label} must use a loopback Ollama URL in container mode"
+            )
 
 
 def prepare_vault(settings: ContainerSettings) -> PreparedVault:
@@ -311,6 +328,7 @@ def run(settings: ContainerSettings) -> None:
     verifier = secret.verifier()
     os.environ[CONFIG_PATH_ENV_VAR] = str(prepared.config_path)
     os.environ["CREEK_VAULT_PATH"] = str(settings.vault_path)
+    os.environ[LOOPBACK_ONLY_ENV] = "1"
     os.environ.pop(CONSUMER_TOKENS_ENV, None)
     announce_rotation_window(verifier)
     serve(create_app(verifier=verifier), _server_args(settings, prepared.config_path))

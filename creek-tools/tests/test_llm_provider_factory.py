@@ -448,3 +448,129 @@ def test_classifier_available_delegates_to_provider(
         "creek.classify.llm.orchestrator.build_provider", lambda _config: fake
     )
     assert LLMClassifier(config=LLMConfig()).available is False
+
+
+# ---------------------------------------------------------------------------
+# #1849 — digest-pinned availability and the loopback boundary at dial time
+# ---------------------------------------------------------------------------
+
+
+def _inventory_client(
+    rows: list[dict[str, str]], mock_client_cls: MagicMock
+) -> MagicMock:
+    """Wire *mock_client_cls* to serve *rows* from ``/api/tags``."""
+    mock_resp = MagicMock(status_code=200)
+    mock_resp.json.return_value = {"models": rows}
+    ctx = MagicMock()
+    ctx.get.return_value = mock_resp
+    mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
+    mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+    return ctx
+
+
+@pytest.mark.parametrize(
+    ("row_digest", "expected_digest", "available"),
+    [
+        ("sha256:" + "a" * 64, "b" * 64, False),
+        ("sha256:" + "a" * 64, "a" * 64, True),
+        ("sha256:" + "a" * 64, "sha256:" + "A" * 64, True),
+        ("a" * 64, "a" * 64, True),
+        ("sha256:" + "a" * 64, None, True),
+        (None, "a" * 64, False),
+        ("", "a" * 64, False),
+        ("", "", False),
+    ],
+)
+@patch("creek.classify.llm.httpx.Client")
+def test_check_ollama_available_rejects_name_match_with_wrong_digest(
+    mock_client_cls: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    row_digest: str | None,
+    expected_digest: str | None,
+    *,
+    available: bool,
+) -> None:
+    """A name match serving another blob is not the pinned model."""
+    from creek.classify.llm.providers import check_ollama_available
+
+    row = {"name": "creek-test-model:q4"}
+    if row_digest is not None:
+        row["digest"] = row_digest
+    _inventory_client([row], mock_client_cls)
+    config = LLMConfig(model="creek-test-model:q4")
+
+    with caplog.at_level("WARNING", logger="creek.classify.llm.providers"):
+        result = check_ollama_available(
+            config, timeout=1.0, expected_digest=expected_digest
+        )
+
+    assert result is available
+    if not available:
+        assert "pinned digest" in caplog.text
+        assert "a" * 64 not in caplog.text
+
+
+@patch("creek.classify.llm.httpx.Client")
+def test_check_ollama_available_digest_pin_needs_the_name_too(
+    mock_client_cls: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The pinned digest under another name is still a missing model."""
+    from creek.classify.llm.providers import check_ollama_available
+
+    _inventory_client(
+        [{"name": "creek-other-model:q4", "digest": "a" * 64}], mock_client_cls
+    )
+
+    with caplog.at_level("WARNING", logger="creek.classify.llm.providers"):
+        result = check_ollama_available(
+            LLMConfig(model="creek-test-model:q4"),
+            timeout=1.0,
+            expected_digest="a" * 64,
+        )
+
+    assert result is False
+    assert "not installed" in caplog.text
+
+
+@patch("creek.classify.llm.httpx.Client")
+def test_check_ollama_available_refuses_remote_url_in_boundary_mode(
+    mock_client_cls: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """In container mode a remote ``ollama_url`` is never dialled."""
+    from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+    from creek.classify.llm.providers import check_ollama_available
+
+    ctx = _inventory_client([{"name": "mistral:latest"}], mock_client_cls)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+
+    with caplog.at_level("WARNING", logger="creek.classify.llm.providers"):
+        result = check_ollama_available(
+            LLMConfig(ollama_url="http://evil.example:11434"), timeout=1.0
+        )
+
+    assert result is False
+    assert mock_client_cls.call_count == 0
+    assert ctx.get.call_count == 0
+    assert "evil.example" not in caplog.text
+    assert "loopback" in caplog.text
+
+
+@patch("creek.classify.llm.httpx.Client")
+def test_call_ollama_refuses_remote_url_in_boundary_mode(
+    mock_client_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generation raises a transport error callers already degrade on."""
+    import httpx
+
+    from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    provider = OllamaProvider(LLMConfig(ollama_url="http://10.0.0.5:11434"))
+
+    with pytest.raises(httpx.TransportError) as caught:
+        provider.complete("prompt")
+
+    assert mock_client_cls.call_count == 0
+    assert "10.0.0.5" not in str(caught.value)

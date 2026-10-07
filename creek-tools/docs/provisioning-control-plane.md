@@ -151,6 +151,11 @@ persists and logs none of the presented value. A restarted verifier reads the
 same durable state immediately; it never issues or revokes credentials.
 
 `creek-provisioning-router` is the production composition around that verifier.
+Its read-only secret adapter loads the existing encrypted, owner-bound runtime
+bundle for exact Machine verification before waking a vault. It holds no CA
+signing key, never creates a missing bundle, and refuses revocation. Both the
+private-TLS and Fly replay compositions use this adapter; fleet-only processes
+continue to refuse runtime-secret access entirely.
 The process also mounts the short-lived org deploy token used by its separate
 Fly routing provider and the CA certificate used to authenticate private vault
 Machines; the verifier itself still receives neither. A non-loopback bind
@@ -256,7 +261,22 @@ volume is resumed rather than duplicated. Deletion revokes the
 consumer credential first, then stops and destroys the Machine, destroys the
 volume, removes the app, and verifies absence. A partial delete stays retryable
 and visible to the durable queue until reconciliation proves that no Machine or
-volume remains.
+live volume remains and the app is absent.
+
+Fly's volume inventory retains soft-deleted entries (`scheduling_destroy`,
+`fork_cleanup`, `waiting_for_detach`, `pending_destroy`, and `destroying`). Like
+[Fly's official client](https://github.com/superfly/fly-go/blob/main/flaps/flaps_volumes.go),
+the driver excludes those entries and `destroyed` from usable volumes and live
+storage counts. Teardown continues to app deletion and confirms the receipt
+only after Fly reports the app absent. This confirms removal of the managed
+allocation, not physical erasure of provider-retained data or backups.
+
+App absence is established by the credential's complete organization inventory:
+the declared total must match the returned entries, and names must be nonempty
+and unique. Deleted-app lookups can time out, so deletion verification and
+organization-discovered fleet reports do not query apps absent from that list.
+An accepted DELETE alone is insufficient; a still-listed app or unavailable or
+invalid inventory leaves deletion unconfirmed and retryable.
 
 Authenticated request handling may call `start()` and return without scheduling
 a stop. Durable background execution calls `run_background_job()`, whose fixed

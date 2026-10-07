@@ -301,7 +301,7 @@ def test_router_cli_is_installed_and_accepts_only_secret_file_paths() -> None:
         assert argument in script
     assert re.search(r'"--fly-token"', script) is None
     assert "EncryptedFileRoutingCredentialVerifier" in script
-    assert "RefusingSecretManager" in script
+    assert "ReadOnlyFlySecretManager" in script
     assert "require_transport_confidentiality" in script
 
 

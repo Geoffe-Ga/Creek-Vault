@@ -55,6 +55,21 @@ _DEFAULT_READINESS_TIMEOUT_SECONDS: Final[int] = 20
 _VAULT_MOUNT: Final[str] = "/vault"
 _FLY_ABSENT_STATUS: Final[int] = 404
 """Fly's upstream resource-absence response; never exposed on Creek's wire."""
+_DELETED_VOLUME_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "scheduling_destroy",
+        "fork_cleanup",
+        "waiting_for_detach",
+        "pending_destroy",
+        "destroying",
+        "destroyed",
+    }
+)
+"""Fly retains soft-deleted volumes in inventory during provider-side cleanup.
+
+Matches superfly/fly-go's flaps/flaps_volumes.go destroyedVolumeStates, plus
+the terminal state. App absence still gates a confirmed deletion receipt.
+"""
 _IMMUTABLE_IMAGE_RE: Final[re.Pattern[str]] = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 _FLY_PROVIDER: Final[str] = "fly"
 _FLY_DELETED_CLASSES: Final[tuple[ResourceClass, ...]] = (
@@ -422,8 +437,9 @@ class FlyProviderDriver:
             self._rejected("provider allocation identity does not match activation")
         self._secrets.revoke(job.activation_id)
         outcome = DeletionOutcome(_FLY_PROVIDER, _FLY_DELETED_CLASSES)
-        if not self._app_exists(reference):
+        if reference.app_name not in self._organization_app_names():
             return outcome
+        self._require_app(reference)
         for machine in self._matching_machines(reference):
             self._delete_machine(reference, machine)
         for volume in self._matching_volumes(reference):
@@ -435,7 +451,7 @@ class FlyProviderDriver:
             f"/v1/apps/{reference.app_name}",
             expected=(202, 204, _FLY_ABSENT_STATUS),
         )
-        if self._app_exists(reference):
+        if reference.app_name in self._organization_app_names():
             self._unavailable("Fly app deletion has not converged")
         return outcome
 
@@ -459,13 +475,15 @@ class FlyProviderDriver:
             rf"{re.escape(prefix)}[0-9a-f]{{{_ALLOCATION_DIGEST_LENGTH}}}"
         )
         names = {self._reference(activation).app_name for activation in activation_ids}
+        names.update(name for name in app_names if derived.fullmatch(name))
         if self._policy.discover_organization_apps:
-            names.update(
+            # Complete org inventory proves missing known apps are absent;
+            # Fly's direct lookup can time out after an app has been deleted.
+            names = {
                 name
                 for name in self._organization_app_names()
                 if derived.fullmatch(name)
-            )
-        names.update(name for name in app_names if derived.fullmatch(name))
+            }
         resources: list[ProviderResource] = []
         for name in sorted(names):
             app = self._app_by_name(name)
@@ -511,13 +529,25 @@ class FlyProviderDriver:
             or total != len(apps)
         ):
             self._unavailable("Fly organization app inventory was invalid")
-        names: list[str] = []
-        for app in cast("list[Mapping[str, Any]]", apps):
+        return self._validated_app_names(cast("list[Mapping[str, Any]]", apps))
+
+    @staticmethod
+    def _validated_app_names(apps: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+        """Require usable unique names before inventory can prove absence."""
+        names: set[str] = set()
+        for app in apps:
             name = app.get("name")
-            if not isinstance(name, str):
-                self._unavailable("Fly organization app inventory was invalid")
-            names.append(name)
-        return tuple(names)
+            if (
+                not isinstance(name, str)
+                or not name
+                or name.strip() != name
+                or name in names
+            ):
+                FlyProviderDriver._unavailable(
+                    "Fly organization app inventory was invalid"
+                )
+            names.add(name)
+        return tuple(sorted(names))
 
     def expected_allocation_id(self, activation_id: str) -> str:
         """Return the allocation id a provisioned *activation_id* carries."""
@@ -552,7 +582,7 @@ class FlyProviderDriver:
         volume: Mapping[str, Any],
     ) -> ProviderResource:
         """Map one volume to inventory."""
-        destroyed = volume.get("state") == "destroyed"
+        destroyed = volume.get("state") in _DELETED_VOLUME_STATES
         return ProviderResource(
             allocation_id,
             ResourceClass.VOLUME,
@@ -646,7 +676,7 @@ class FlyProviderDriver:
             volume.get("region") != self._policy.region
             or volume.get("size_gb") != self._policy.volume_size_gb
             or volume.get("encrypted") is not True
-            or volume.get("state") == "destroyed"
+            or volume.get("state") in _DELETED_VOLUME_STATES
         ):
             self._rejected("Fly volume does not match encrypted allocation policy")
 
@@ -750,7 +780,18 @@ class FlyProviderDriver:
         if not self._policy.fly_replay_enabled:
             return {}
         return {
-            "user": "root",
+            # Fly ignores config.user; process overrides need both the user
+            # and command rather than inheriting config.init.exec.
+            "processes": [
+                {
+                    "user": "root",
+                    "exec": [
+                        "python",
+                        "-m",
+                        "creek_mcp.provisioning.fly_vault_bootstrap",
+                    ],
+                }
+            ],
             "env": {
                 "CREEK_CONTAINER_FLY_REPLAY_STATE_FILE": (
                     "/run/secrets/creek_replay_state"
@@ -758,13 +799,7 @@ class FlyProviderDriver:
                 "CREEK_CONTAINER_EXPECTED_FLY_APP": reference.app_name,
                 "CREEK_CONTAINER_EXPECTED_FLY_REGION": self._policy.region,
             },
-            "init": {
-                "exec": [
-                    "python",
-                    "-m",
-                    "creek_mcp.provisioning.fly_vault_bootstrap",
-                ]
-            },
+            "init": {},
         }
 
     def _runtime_service(self) -> dict[str, object]:
@@ -970,7 +1005,7 @@ class FlyProviderDriver:
             volume
             for volume in self._objects(response, "Fly volume list")
             if volume.get("name") == reference.volume_name
-            and volume.get("state") != "destroyed"
+            and volume.get("state") not in _DELETED_VOLUME_STATES
         ]
 
     def _app_exists(self, reference: _AllocationRef) -> bool:

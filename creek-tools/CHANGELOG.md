@@ -9,6 +9,32 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Accept Fly Proxy's semicolon-separated replay source metadata so authenticated
+  managed-vault requests reach the runtime. Invalid or mixed delimiters, duplicate
+  fields, mismatched state, and missing bearer credentials still fail closed.
+
+- Fix managed-vault requests failing before cold start: production routers now
+  read existing encrypted runtime bundles for exact Machine verification, without
+  authority to mint or revoke credentials. Missing, revoked, malformed, or
+  differently owned bundles still fail closed.
+
+- Confirm Fly app deletion from complete organization inventory and omit absent
+  apps from discovered fleet inventory. A timed-out lookup of an already-deleted
+  app can no longer strand its deletion receipt or stop the fleet scheduler;
+  incomplete, malformed, or unavailable inventory still fails closed.
+
+- Fix Fly replay vault creation by placing the root bootstrap user override in
+  `config.processes` alongside its command instead of the unsupported top-level
+  `config.user`. Bootstrap admits fresh ext4 volumes with an empty `lost+found`
+  without removing recovery data or existing vault contents. Exact verification
+  still rejects changed users, commands, or additional processes; the bootstrap
+  drops privileges before serving traffic.
+
+- Fix managed-vault teardown when Fly retains a soft-deleted volume such as
+  `pending_destroy`. Cleanup now reaches app deletion and verifies its absence;
+  retained volume tombstones are neither reused for provisioning nor counted
+  as live fleet storage.
+
 - Fix managed-vault Fly volume names to the provider's 30-character grammar
   while preserving deterministic allocation identity. Fleet reconciliation can
   now resume exactly one first-attempt provider-rejected create after proving

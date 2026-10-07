@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from creek_mcp.container_runtime import ContainerConfigurationError
+from creek_mcp.container_runtime import (
+    MOUNTINFO_FILE_ENV,
+    VAULT_PATH_ENV,
+    BootstrapState,
+    ContainerConfigurationError,
+    ContainerSettings,
+    prepare_vault,
+)
 from creek_mcp.provisioning import fly_vault_bootstrap
 
 
@@ -54,6 +61,74 @@ def test_bootstrap_normalizes_only_exact_vault_and_declared_files(
     assert fchowns == [(10001, 10001), (10001, 10001)]
     assert (vault.stat().st_mode & 0o777) == 0o700
     assert all((path.stat().st_mode & 0o777) == 0o400 for path in secrets)
+
+
+def test_bootstrap_removes_only_empty_filesystem_recovery_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh ext4 volume reaches the unchanged empty-vault initializer."""
+    vault, mountinfo, secrets = _paths(tmp_path)
+    (vault / "lost+found").mkdir(mode=0o700)
+    monkeypatch.setattr(fly_vault_bootstrap.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(fly_vault_bootstrap.os, "chown", lambda *_a, **_kw: None)
+    monkeypatch.setattr(fly_vault_bootstrap.os, "fchown", lambda *_a: None)
+
+    fly_vault_bootstrap.prepare_runtime_paths(
+        vault_root=vault, mountinfo=mountinfo, secret_files=secrets
+    )
+
+    assert list(vault.iterdir()) == []
+    settings = ContainerSettings.from_environ(
+        {VAULT_PATH_ENV: str(vault), MOUNTINFO_FILE_ENV: str(mountinfo)}
+    )
+    prepared = prepare_vault(settings)
+    assert prepared.state is BootstrapState.INITIALIZED
+    config = prepared.config_path.read_bytes()
+    fly_vault_bootstrap.prepare_runtime_paths(
+        vault_root=vault, mountinfo=mountinfo, secret_files=secrets
+    )
+    assert prepare_vault(settings).state is BootstrapState.EXISTING
+    assert prepared.config_path.read_bytes() == config
+
+
+@pytest.mark.parametrize("kind", ["populated", "symlink", "file", "existing-vault"])
+def test_bootstrap_preserves_recovery_data_and_existing_vaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """Recovery cleanup never recursively deletes or follows a substituted path."""
+    vault, mountinfo, secrets = _paths(tmp_path)
+    recovery = vault / "lost+found"
+    target = tmp_path / "recovery-target"
+    target.mkdir()
+    if kind == "symlink":
+        recovery.symlink_to(target, target_is_directory=True)
+    elif kind == "file":
+        recovery.write_text("preserve", encoding="utf-8")
+    else:
+        recovery.mkdir()
+        if kind == "populated":
+            (recovery / "recovered").write_text("preserve", encoding="utf-8")
+        else:
+            (vault / "existing").write_text("preserve", encoding="utf-8")
+    monkeypatch.setattr(fly_vault_bootstrap.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(fly_vault_bootstrap.os, "chown", lambda *_a, **_kw: None)
+    monkeypatch.setattr(fly_vault_bootstrap.os, "fchown", lambda *_a: None)
+
+    if kind == "populated":
+        with pytest.raises(ContainerConfigurationError, match="recovery directory"):
+            fly_vault_bootstrap.prepare_runtime_paths(
+                vault_root=vault, mountinfo=mountinfo, secret_files=secrets
+            )
+        assert (recovery / "recovered").read_text(encoding="utf-8") == "preserve"
+    else:
+        fly_vault_bootstrap.prepare_runtime_paths(
+            vault_root=vault, mountinfo=mountinfo, secret_files=secrets
+        )
+    assert recovery.exists()
+    assert target.is_dir()
 
 
 def test_bootstrap_refuses_symlinked_or_incomplete_runtime_before_chown(

@@ -232,7 +232,7 @@ wake() { # wake [VAR=VALUE ...] — run the script; sets WAKE_RC / WAKE_OUT
     "$@" bash "$WAKE" 2>&1)" || WAKE_RC=$?
 }
 posted() { # posted — the body of the comment the run posted, or the empty string
-  [[ -f "$POSTED" ]] && cat "$POSTED" || true
+  if [[ -f "$POSTED" ]]; then cat "$POSTED"; fi
 }
 
 # --- fixtures ---------------------------------------------------------------
@@ -558,8 +558,61 @@ says "CHANGES_REQUESTED is displayed as such" \
 
 wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$COMMENTS_LINE")")")" \
      CHECK_RUNS="$GREEN_RUNS"
+comments_ok="$(posted)"
 says "a COMMENTS verdict is displayed as COMMENTS" \
-     '^\*\*VERDICT\*\*: COMMENTS$' "$(posted)"
+     '^\*\*VERDICT\*\*: COMMENTS$' "$comments_ok"
+
+# ===========================================================================
+# COMMENTS — a sign-off with non-blocking findings, NEVER another iteration
+# ===========================================================================
+# A fresh, attested COMMENTS verdict on green, current, unheld CI clears the
+# merge once its findings are filed as P0–P3 follow-up issues (address-feedback
+# Step 1A). It must never tell the loop to "continue iterating", and it must pass
+# through the SAME clearance chain as LGTM, so every refusal still neutralises it.
+says  "COMMENTS: the Action forbids iterating" 'Do NOT iterate' "$comments_ok"
+says  "COMMENTS: the Action asks for severity-prioritized follow-up issues" \
+      'P0-P3 label matched to its severity' "$comments_ok"
+says  "COMMENTS: green + current + attested + fresh clears the merge after filing" \
+      'cleared to squash merge' "$comments_ok"
+lacks "COMMENTS: never 'continue iterating'" 'continue iterating' "$comments_ok"
+
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$COMMENTS_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS" \
+     PR_JSON='{"base":{"ref":"main"},"labels":[{"name":"do-not-auto-merge"}]}'
+says "COMMENTS: a hold neutralises the VERDICT field" '^\*\*VERDICT\*\*: HELD$' "$(posted)"
+
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$COMMENTS_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS" BEHIND_BY=7
+says "COMMENTS: a head behind its base reads NOT CURRENT" '^\*\*VERDICT\*\*: NOT CURRENT$' "$(posted)"
+
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$COMMENTS_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS" HEAD_DATE='2026-08-30T11:00:00Z'
+says "COMMENTS: a verdict older than its head reads STALE" '^\*\*VERDICT\*\*: STALE$' "$(posted)"
+
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 999 "$COMMENTS_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS"
+says "COMMENTS: another PR's marker reads NOT ATTESTED" '^\*\*VERDICT\*\*: NOT ATTESTED$' "$(posted)"
+
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$COMMENTS_LINE")")")" \
+     CHECK_RUNS="$MIXED_RUNS"
+comments_red="$(posted)"
+says  "COMMENTS + red CI: still no iteration on the review" 'Do NOT iterate' "$comments_red"
+lacks "COMMENTS + red CI: not cleared" 'cleared to squash merge' "$comments_red"
+lacks "COMMENTS + red CI: never 'continue iterating'" 'continue iterating' "$comments_red"
+
+# A LINE THAT MERELY TALKS ABOUT COMMENTS IS NOT ONE. COMMENTS now clears, so it
+# is read with LGTM's fail-closed polarity: prose after the token is a sentence
+# ABOUT a verdict. It must surface to a human, never clear and never iterate.
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "## Verdict: COMMENTS would be too lenient here")")")" \
+     CHECK_RUNS="$GREEN_RUNS"
+comments_prose="$(posted)"
+says  "COMMENTS prose: the VERDICT field is UNPARSED" '^\*\*VERDICT\*\*: UNPARSED$' "$comments_prose"
+lacks "COMMENTS prose: not cleared" 'cleared to squash merge' "$comments_prose"
+if grep -qF -- "UNPARSED" "$ROOT/.claude/skills/await-claude-review/SKILL.md"; then
+  ok "await-claude-review SKILL.md names UNPARSED in its refusal vocabulary"
+else
+  bad "await-claude-review SKILL.md never mentions UNPARSED, which verdict-wake.sh emits"
+fi
 
 # A QUOTED LGTM IS NOT A VERDICT. `VERDICT_RE` admits leading whitespace, so a
 # review that QUOTES an indented `## Verdict: LGTM` while itself concluding
@@ -878,6 +931,7 @@ check "query: userContentEdits takes first: 100, NOT a smaller number — edit h
 # The shared filter really does read every revision, which is the half of the
 # argument the query cannot make on its own: `first: 100` buys nothing if the
 # selector only looks at the newest edit.
+# shellcheck disable=SC2016  # literal backticks/$ on purpose: message text and regex, not expansions
 if grep -qF 'all(. == $a)' <<<"$(grep -vE '^[[:space:]]*#' "$FILTER_FILE" || true)"; then
   ok 'filter: the edit check is jq all() over EVERY revision, so the query 100-deep window is actually used'
 else

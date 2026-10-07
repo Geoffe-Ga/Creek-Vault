@@ -103,13 +103,14 @@ Follow the 4-gate workflow rigorously.
 **The Rule**:
 - 🚫 **NEVER** create PR while CI is red
 - 🚫 **NEVER** request review with failing checks
-- 🚫 **NEVER** merge without LGTM
+- 🚫 **NEVER** merge without LGTM — or a `COMMENTS` verdict whose findings are all filed as prioritized follow-up issues
+- 🚫 **NEVER** iterate on a `COMMENTS` verdict — file `P0`–`P3` follow-up issues instead
 
 **The Process**:
 1. Gate 1: TDD (write tests first, then implement)
 2. Gate 2: Local checks pass (`./scripts/check-all.sh` → exit 0)
 3. Gate 3: CI pipeline green (all jobs ✅)
-4. Gate 4: Code review LGTM
+4. Gate 4: Code review LGTM (`COMMENTS` → file prioritized follow-up issues, then merge)
 
 See [4. Stay Green Workflow](#4-stay-green-workflow) for complete documentation.
 
@@ -258,7 +259,7 @@ For those committed to maximum quality engineering:
 
 ## 4. Stay Green Workflow
 
-**Policy**: Never request review with failing checks. Never merge without LGTM.
+**Policy**: Never request review with failing checks. Never merge without LGTM — except a `COMMENTS` verdict, whose findings are filed as follow-up issues instead of iterated on.
 
 The Stay Green workflow enforces iterative quality improvement through **4 sequential gates**. Each gate must pass before proceeding to the next.
 
@@ -281,11 +282,13 @@ The Stay Green workflow enforces iterative quality improvement through **4 seque
    - If CI fails: fix locally, re-run Gate 2, push again
    - Only proceed when all CI jobs show ✅
 
-4. **Gate 4: Code Review** (Iterate Until LGTM)
+4. **Gate 4: Code Review** (Iterate on `CHANGES_REQUESTED` Only)
    - Wait for code review (AI or human)
-   - If feedback provided: address ALL concerns
-   - Re-run Gate 2, push, wait for CI
-   - Only merge when review shows LGTM with no reservations
+   - `CHANGES_REQUESTED`: address ALL concerns, re-run Gate 2, push, wait for CI
+   - `COMMENTS`: do **not** iterate. File each actionable finding as a
+     follow-up issue labelled `P0`–`P3` by severity (`address-feedback`
+     Step 1A), then merge
+   - `LGTM`: merge
 
 ### 4.2 Quick Checklist
 
@@ -295,7 +298,7 @@ Before creating/updating a PR:
 - [ ] Gate 2: `./scripts/check-all.sh` passes locally (exit 0)
 - [ ] Push changes: `git push origin feature-branch`
 - [ ] Gate 3: All CI jobs show ✅ (green)
-- [ ] Gate 4: Code review shows LGTM
+- [ ] Gate 4: Code review shows LGTM (or `COMMENTS` with every finding filed as a prioritized issue)
 - [ ] Ready to merge!
 
 ### 4.3 Anti-Patterns (DO NOT DO)
@@ -304,7 +307,8 @@ Before creating/updating a PR:
 ❌ **Don't** skip local checks (`git commit --no-verify`)
 ❌ **Don't** lower quality thresholds to pass
 ❌ **Don't** ignore review feedback
-❌ **Don't** merge without LGTM
+❌ **Don't** merge without LGTM (a `COMMENTS` verdict with every finding filed counts)
+❌ **Don't** push fixes for a `COMMENTS` verdict — file prioritized issues instead
 
 ---
 
@@ -337,6 +341,7 @@ creek-tools/
 │       └── ADR/                      # Architecture Decision Records
 ├── scripts/
 │   ├── _lib.sh                       # Shared shell helpers sourced by the gates
+│   ├── bench.sh                      # Model-capacity harness: python -m creek_mcp.bench (#1850)
 │   ├── check-all.sh                  # Run every quality gate (single source of truth)
 │   ├── complexity.sh                 # Radon + Xenon (CI-002)
 │   ├── container-contract.sh         # Real single-vault Docker runtime contract
