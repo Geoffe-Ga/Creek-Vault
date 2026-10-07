@@ -720,4 +720,4 @@ def test_classify_summary_reports_the_heal_even_at_zero(tmp_path: Path) -> None:
     # Rich soft-wraps the summary at the terminal width, so compare against
     # the line with its wrapping collapsed rather than against raw output.
     unwrapped = " ".join(result.output.split())
-    assert "0 false LLM-classified mark(s) cleared" in unwrapped
+    assert "0 unearned llm stamp(s) healed" in unwrapped

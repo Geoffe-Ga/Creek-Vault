@@ -430,7 +430,7 @@ async def _handle_attachments(
        staging directory under ``00-Creek-Meta/Inbound/``. Size and
        extension limits are enforced before bytes are read.
     2. If every accepted file was an idempotent re-upload (same content
-       hash already on disk), reply "already staged" and stop — no
+       hash already on disk), say the bot already had them and stop — no
        redundant scan or ingest.
     3. Otherwise invoke ``creek.redact.scan`` on the staging directory
        via MCP. If MCP is unreachable, the tool is not advertised, there

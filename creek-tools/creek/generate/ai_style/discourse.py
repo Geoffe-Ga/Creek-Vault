@@ -195,9 +195,10 @@ COMM_BOILERPLATE = register(
         feature_key="comm_boilerplate_density",
         handling="surface",
         polarity="avoid",
-        description=(
-            "Chatbot pleasantries left in the prose (I hope this helps, Certainly!)."
-        ),
+        # Kept short on purpose: the avoid block of the prompt preamble is
+        # capped by ``preamble_max_chars`` and every tell after this one in
+        # registry order (ai_vocabulary first) competes for the same budget.
+        description="Chatbot pleasantries (I hope this helps, Certainly!).",
         caveat="Comment context only; chat sign-offs and submission boilerplate "
         "that leaked into prose. Only flagged above your own rate.",
         measure=features.comm_boilerplate_density,

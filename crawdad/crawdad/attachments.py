@@ -417,7 +417,7 @@ class ProcessedAttachments:
             transient download error).
         all_already_present: ``True`` when every accepted attachment was
             an idempotent re-upload. The bot uses this to skip the
-            redact scan and reply with "already staged" instead.
+            redact scan and reply that it already had every file.
     """
 
     staging_dir: Path
