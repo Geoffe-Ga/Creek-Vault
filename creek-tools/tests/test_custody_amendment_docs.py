@@ -12,8 +12,9 @@ So each appended section must:
 
 * say it is not implemented yet, where it describes a custody target,
 * carry the "no public claim" disclaimer pointing at adepthood B24, and
-* never state a custody property in a sentence without a negation or a
-  target/conditional scope.
+* never state a custody property in a sentence without a target or
+  conditional scope, or a negation directly governing the term. The scan is
+  a heuristic tripwire, not a proof.
 
 Only the appended sections are scanned. The original records above them are
 history and keep their own wording.
@@ -54,15 +55,38 @@ _DESCRIBES_A_CUSTODY_TARGET: Final = frozenset(
 _NO_CLAIM: Final = "Nothing here is a public claim. Each claim waits for adepthood B24"
 _NOT_IMPLEMENTED: Final = "Not implemented yet."
 
-_CUSTODY_CLAIM: Final = re.compile(
-    r"operator-blind|end-to-end|\bE2EE\b|already user-held|cannot read it",
+# The present-tense custody-claim tripwire, kept in step with adepthood's
+# ``backend/tests/test_custody_decision_record.py``. A HEURISTIC, not a proof:
+# it catches the phrasings these records have used to overclaim and the
+# plain-English forms a reader would take as a promise, sentence by sentence.
+# Review remains the real check.
+#
+# Affirmative custody terms: excused by an explicit target or condition
+# marker, or by a negation directly in front of the term, never by a stray
+# negation elsewhere in the sentence.
+_AFFIRMATIVE_CLAIM: Final = re.compile(
+    r"operator-blind|end-to-end|end to end|\bE2EE\b|already user-held",
     re.IGNORECASE,
 )
-_SCOPING_MARKER: Final = re.compile(
-    r"\b(?:not|no|never|neither|nor|until|unless|once|will|would|if|whether|"
-    r"target|decided|must|only while|stop|stops)\b",
+# Claims that carry their own negation; only a target or condition excuses them.
+_NEGATIVE_FORM_CLAIM: Final = re.compile(
+    r"\bcan(?:not|'t) (?:read|decrypt|see)\b|\bnever carr(?:y|ies)\b|"
+    r"\bnone of (?:their|your|the person's) data reaches\b|\bnever reach(?:es)?\b|"
+    r"\bnever pass(?:es)? through\b|\bholds? no (?:key|escrow)\b",
     re.IGNORECASE,
 )
+# Explicit scope. Bare "not", "no" and "never" are deliberately absent.
+_TARGET_OR_CONDITION: Final = re.compile(
+    r"\b(?:target|decided|under the decision|will|until phase|once|when B13|"
+    r"not yet|not implemented|if|unless|would|could)\b",
+    re.IGNORECASE,
+)
+# A negation governing the affirmative term right after it (up to three words).
+_NEGATION_BEFORE: Final = re.compile(
+    r"\b(?:not|never|no|neither|nor)\b(?:\W+\w+){0,3}\W*$", re.IGNORECASE
+)
+# A double-quoted term is mentioned, not used.
+_QUOTED: Final = re.compile(r'"[^"]*"')
 
 
 def _flat(text: str) -> str:
@@ -76,18 +100,41 @@ def _appended_section(filename: str) -> str:
     return text[text.index(_AMENDED[filename]) :]
 
 
-def _unscoped_custody_claims(text: str) -> list[str]:
-    """Sentences that state a custody property flatly, with no negation or scope."""
+def _sentences(text: str) -> list[str]:
+    """Split prose and bullets into sentences, each flattened."""
     blocks = re.split(r"\n\s*\n|\n(?=\s*(?:[-*] |#))", text)
-    sentences = [
+    return [
         sentence
         for block in blocks
         for sentence in re.split(r"(?<=[.;!?])\s+", _flat(block))
     ]
+
+
+def _affirmative_is_negated(sentence: str) -> bool:
+    """Whether every affirmative custody term is directly preceded by a negation."""
+    return all(
+        _NEGATION_BEFORE.search(sentence[: match.start()])
+        for match in _AFFIRMATIVE_CLAIM.finditer(sentence)
+    )
+
+
+def _is_unscoped_claim(sentence: str) -> bool:
+    """Whether a sentence states custody with no target, condition or negation."""
+    if _TARGET_OR_CONDITION.search(sentence):
+        return False
+    if _NEGATIVE_FORM_CLAIM.search(sentence):
+        return True
+    return bool(_AFFIRMATIVE_CLAIM.search(sentence)) and not _affirmative_is_negated(
+        sentence
+    )
+
+
+def _unscoped_custody_claims(text: str) -> list[str]:
+    """Sentences that state a custody property flatly (heuristic; see above)."""
     return [
         sentence
-        for sentence in sentences
-        if _CUSTODY_CLAIM.search(sentence) and not _SCOPING_MARKER.search(sentence)
+        for sentence in _sentences(text)
+        if _is_unscoped_claim(_QUOTED.sub("", sentence))
     ]
 
 
@@ -109,12 +156,35 @@ def test_amendment_states_no_custody_property_flatly(filename: str) -> None:
     assert _unscoped_custody_claims(_appended_section(filename)) == []
 
 
-def test_the_custody_claim_scan_bites() -> None:
-    """A flat claim is caught; a negated or scoped one is not."""
-    assert _unscoped_custody_claims("Journal content is already user-held.") != []
-    assert _unscoped_custody_claims("The managed vault is operator-blind.") != []
-    assert _unscoped_custody_claims("Ordinary Fly is not operator-blind.") == []
-    assert _unscoped_custody_claims("It is decided to become user-held.") == []
+# Planted violations the scan must catch, including the reviewers' bypasses.
+_PLANTED_CLAIMS: Final = (
+    "Managed vault journal content is end-to-end encrypted, not provider-readable.",
+    "Adepthood is end-to-end encrypted, with no operator escrow.",
+    "The vault cannot read the journal it stores.",
+    "The operator holds no key to the journal.",
+    "Journal content never reaches a cloud model.",
+    "The managed vault is operator-blind.",
+    "Journal content is already user-held.",
+)
+_SCOPED_STATEMENTS: Final = (
+    "Ordinary Fly is not operator-blind.",
+    "It is decided to become user-held.",
+    "Once phase (c) lands, the vault cannot read the journal.",
+    "Neither is operator-blind while it runs.",
+    'No support copy may say "operator-blind".',
+)
+
+
+@pytest.mark.parametrize("sentence", _PLANTED_CLAIMS)
+def test_the_custody_claim_scan_catches_a_planted_claim(sentence: str) -> None:
+    """Each planted flat claim is reported."""
+    assert _unscoped_custody_claims(sentence) == [sentence]
+
+
+@pytest.mark.parametrize("sentence", _SCOPED_STATEMENTS)
+def test_the_custody_claim_scan_lets_scoped_statements_through(sentence: str) -> None:
+    """A statement scoped to a target or condition, or directly negated, passes."""
+    assert _unscoped_custody_claims(sentence) == []
 
 
 def test_the_original_records_are_kept_above_the_amendment() -> None:
