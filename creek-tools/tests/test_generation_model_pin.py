@@ -1,4 +1,4 @@
-"""Compile, draft and the Writing Desk voice carry the reflection pin (#1849).
+"""Compile, draft, author and LLM classify carry the reflection pin (#1849).
 
 B05 pinned ``creek.reflect`` to the operator's model package: with a manifest
 configured, or in container mode, reflection is served only by an Ollama stage
@@ -306,4 +306,73 @@ def test_author_llm_degrades_on_a_keyed_cloud_stage_in_container_mode(
     vault = _cloud_vault(tmp_path, monkeypatch, "anthropic", "generation")
 
     assert _build_author_llm(vault, PrivacyTier.OPEN) is None
+    assert tags.urls == []
+
+
+# ---------------------------------------------------------------------------
+# ``creek.classify --method llm`` (served on /v1/classifications)
+# ---------------------------------------------------------------------------
+
+
+def _classify(vault: Path, method: str = "llm") -> dict[str, Any]:
+    """Run the real classify tool over *vault*."""
+    from creek_mcp.tools.classify import classify_tool
+
+    return classify_tool(vault_path=vault, method=method)
+
+
+def test_classify_llm_runs_against_the_pinned_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control: a served pin lets an LLM classify pass run."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    _Tags(monkeypatch, _served())
+
+    assert _classify(_vault(tmp_path))["status"] == "ok"
+
+
+@pytest.mark.parametrize("provider", sorted(_CLOUD_KEYS))
+def test_classify_llm_refuses_a_keyed_cloud_stage_in_container_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Container mode refuses cloud classification even with a key and consent."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+    vault = _cloud_vault(tmp_path, monkeypatch, provider, "classification")
+
+    result = _classify(vault)
+
+    assert result["status"] == "refused"
+    assert result["reason"].startswith(f"LLM provider {provider!r} is unavailable: ")
+    assert tags.urls == []
+
+
+def test_classify_llm_refuses_another_model_when_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A classification stage on another local model is refused under a pin."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    _Tags(monkeypatch, _tags({"name": "creek-other-model:q4", "digest": "d" * 64}))
+    vault = _vault(tmp_path, "classification", model="creek-other-model:q4")
+
+    result = _classify(vault)
+
+    assert result["status"] == "refused"
+    assert result["reason"].startswith("LLM provider 'ollama' is unavailable: ")
+
+
+def test_classify_rules_is_unaffected_by_the_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rules pass shows nothing to a model, so the pin never gates it."""
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+
+    assert _classify(_vault(tmp_path), method="rules")["status"] == "ok"
     assert tags.urls == []

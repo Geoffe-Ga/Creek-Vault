@@ -16,16 +16,54 @@ from creek.classify.classify_engine import (
     LLMProviderUnavailableError,
     run_classify,
 )
+from creek.classify.constants import LLM_METHOD
 from creek.config import load_vault_config
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.model_pin import model_pin_enforced, pinned_model_serves
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek.config import CreekConfig
+
 TOOL_NAME = "creek.classify"
 _VALID_METHODS = ("rules", "llm")
+_UNPINNED_DETAIL = (
+    "only the pinned local model may classify while a model package is "
+    "configured or the server runs in container mode"
+)
+"""Why a pinned-mode LLM pass refused. Fixed text: it never names the URL."""
+
+
+def _require_pinned_classifier(config: CreekConfig) -> None:
+    """Refuse an LLM pass whose classification stage is not the pinned model.
+
+    The model-pin rule of :mod:`creek_mcp.model_pin` (#1849), applied before
+    any fragment is read. Only the tier-less ``classification`` stage is
+    checked: the router redirects only a *cloud* stage for INTIMATE
+    fragments, so when this stage is the pinned local model the INTIMATE
+    route resolves to the same one, and when it is not, the pass is refused
+    here anyway. The config is loaded once per call and handed to the
+    engine, so the stage checked is the stage every fragment uses.
+
+    Args:
+        config: The classified vault's own configuration.
+
+    Raises:
+        LLMProviderUnavailableError: In a pin mode, when the stage is not the
+            pinned model served at its digest over loopback.
+    """
+    from creek.classify.llm.providers import build_provider
+
+    if not model_pin_enforced():
+        return
+    cfg = config.model_router.resolve("classification")
+    if not pinned_model_serves(build_provider(cfg)):
+        raise LLMProviderUnavailableError(
+            provider=cfg.provider, detail=_UNPINNED_DETAIL
+        )
 
 
 def classify_tool(
@@ -58,7 +96,9 @@ def classify_tool(
     ``ModelRouter._enforce_local_for_intimate`` (#647/#666); ``PERSONAL``
     is not. See ``creek_mcp.read_gate._CLASSIFY_PROMPT_CHANNEL_RATIONALE``
     for the full statement of what does and does not gate that walk
-    (#1274).
+    (#1274). With a model package configured, or in container mode, the
+    stage must also be the pinned local model (#1849), so in those modes no
+    fragment text reaches a cloud provider at any tier.
 
     Args:
         vault_path: Vault root to classify.
@@ -90,6 +130,8 @@ def classify_tool(
     # vault's text — so it must be the classified vault's own file (#1409).
     config = load_vault_config(vault_path)
     try:
+        if method == LLM_METHOD:
+            _require_pinned_classifier(config)
         summary = run_classify(
             vault_path=vault_path,
             config=config,
