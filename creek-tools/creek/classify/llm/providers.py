@@ -31,6 +31,10 @@ from creek.classify.llm.consent import (
     consent_error_message,
     has_cloud_consent,
 )
+from creek.classify.llm.local_boundary import (
+    NonLoopbackOllamaError,
+    ollama_endpoint,
+)
 
 if TYPE_CHECKING:
     import anthropic
@@ -640,7 +644,9 @@ def call_ollama(
 
     Raises:
         httpx.HTTPStatusError: On HTTP error responses.
-        httpx.HTTPError: On connection or transport errors.
+        httpx.HTTPError: On connection or transport errors, including
+            :class:`~creek.classify.llm.local_boundary.NonLoopbackOllamaError`
+            when loopback-only mode refuses a remote ``ollama_url``.
     """
     payload: dict[str, object] = {
         "model": _resolve_configured_model(config.model, DEFAULT_MODELS["ollama"]),
@@ -654,11 +660,9 @@ def call_ollama(
         # thought. Ollama's bounded-call contract therefore disables thinking;
         # unbounded classification calls retain their historical model default.
         payload["think"] = False
+    url = ollama_endpoint(config, "/api/generate")
     with httpx.Client(timeout=timeout) as client:
-        response = client.post(
-            f"{config.ollama_url}/api/generate",
-            json=payload,
-        )
+        response = client.post(url, json=payload)
         response.raise_for_status()
         data = response.json()
         text = str(data.get("response", "")) if isinstance(data, dict) else ""
@@ -678,25 +682,68 @@ def _read_ollama_inventory(response: httpx.Response) -> object:
         return _UNREADABLE_OLLAMA_INVENTORY
 
 
-def check_ollama_available(config: LLMConfig, *, timeout: float) -> bool:
+def check_ollama_available(
+    config: LLMConfig,
+    *,
+    timeout: float,
+    expected_digest: str | None = None,
+) -> bool:
     """Check that Ollama can serve the configured model.
 
     Args:
         config: LLM provider configuration with the Ollama URL.
         timeout: HTTP request timeout in seconds.
+        expected_digest: Optional pinned inventory digest (``sha256:`` prefix
+            and case are ignored). When given, a row whose name matches but
+            whose ``digest`` differs — or is absent — does not count, so a
+            retagged or substituted blob is not mistaken for the pinned
+            model. ``None`` keeps the historical name-only check.
 
     Returns:
         ``True`` when Ollama replies ``200`` and its model inventory contains
-        the configured (or default) model; ``False`` otherwise. Ollama treats
-        an omitted tag as ``latest``, so those two spellings are equivalent.
+        the configured (or default) model, at *expected_digest* when one is
+        pinned; ``False`` otherwise. Ollama treats an omitted tag as
+        ``latest``, so those two spellings are equivalent.
     """
     model = _resolve_configured_model(config.model, DEFAULT_MODELS["ollama"])
+    payload = _fetch_ollama_inventory(config, timeout=timeout)
+    if payload is _UNREADABLE_OLLAMA_INVENTORY:
+        return False
+    served = ollama_model_digest(payload, model)
+    if served is None:
+        logger.warning(
+            "Ollama is reachable at %s but configured model %r is not installed",
+            config.ollama_url,
+            model,
+        )
+        return False
+    if expected_digest is not None and not ollama_digest_matches(
+        served, expected_digest
+    ):
+        logger.warning(
+            "Ollama lists configured model %r but not at its pinned digest",
+            model,
+        )
+        return False
+    return True
+
+
+def _fetch_ollama_inventory(config: LLMConfig, *, timeout: float) -> object:
+    """Return the decoded ``/api/tags`` payload, or the unreadable sentinel.
+
+    Every failure — a refused non-loopback endpoint, a transport error, a
+    non-200 reply or undecodable JSON — is logged and returned as
+    :data:`_UNREADABLE_OLLAMA_INVENTORY`, so callers fail closed.
+    """
+    url = _inventory_url(config)
+    if url is None:
+        return _UNREADABLE_OLLAMA_INVENTORY
     try:
         with httpx.Client(timeout=timeout) as client:
-            resp = client.get(f"{config.ollama_url}/api/tags")
+            resp = client.get(url)
     except httpx.HTTPError:
         logger.warning("Ollama daemon is unreachable at %s", config.ollama_url)
-        return False
+        return _UNREADABLE_OLLAMA_INVENTORY
 
     if resp.status_code != 200:
         logger.warning(
@@ -704,49 +751,98 @@ def check_ollama_available(config: LLMConfig, *, timeout: float) -> bool:
             config.ollama_url,
             resp.status_code,
         )
-        return False
+        return _UNREADABLE_OLLAMA_INVENTORY
     payload = _read_ollama_inventory(resp)
     if payload is _UNREADABLE_OLLAMA_INVENTORY:
         logger.warning(
             "Ollama is reachable at %s but its model inventory is unreadable",
             config.ollama_url,
         )
-        return False
-    if _ollama_has_model(payload, model):
-        return True
-    logger.warning(
-        "Ollama is reachable at %s but configured model %r is not installed",
-        config.ollama_url,
-        model,
-    )
-    return False
+    return payload
 
 
-def _ollama_has_model(payload: object, requested: str) -> bool:
-    """Return whether an Ollama tags payload contains *requested*.
+def _inventory_url(config: LLMConfig) -> str | None:
+    """Return the ``/api/tags`` URL, or ``None`` when the boundary refuses it.
 
-    Ollama's inventory has used both ``name`` and ``model`` for the canonical
-    identifier, so either field is accepted. Malformed rows are ignored and a
-    malformed envelope fails closed. An untagged generation request means the
-    ``latest`` tag; explicit tags and digests must match verbatim.
+    The refusal is logged without the URL: in loopback-only mode the
+    configured host is exactly what must not be dialled or echoed.
     """
-    if not isinstance(payload, dict):
-        return False
-    models = payload.get("models")
-    if not isinstance(models, list):
-        return False
+    try:
+        return ollama_endpoint(config, "/api/tags")
+    except NonLoopbackOllamaError:
+        logger.warning(
+            "Ollama URL is not a loopback address; "
+            "refusing to dial it in loopback-only mode"
+        )
+        return None
+
+
+def _normalise_digest(value: object) -> str:
+    """Return *value* as a bare lowercase hex digest, or ``""`` if absent."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower().removeprefix("sha256:")
+
+
+def ollama_digest_matches(served: str, expected: str) -> bool:
+    """Return whether a served inventory digest equals the pinned one.
+
+    Args:
+        served: The digest :func:`ollama_model_digest` returned.
+        expected: The pinned digest, with or without a ``sha256:`` prefix.
+
+    Returns:
+        ``True`` only when both are non-empty and equal after normalisation.
+    """
+    normalised = _normalise_digest(expected)
+    return (
+        bool(served)
+        and bool(normalised)
+        and hmac.compare_digest(_normalise_digest(served), normalised)
+    )
+
+
+def _accepted_model_names(requested: str) -> set[str]:
+    """Return the inventory spellings that mean *requested*.
+
+    An untagged generation request means the ``latest`` tag; explicit tags and
+    digests must match verbatim.
+    """
     accepted = {requested}
     tail = requested.rsplit("/", maxsplit=1)[-1]
     if ":" not in tail and "@" not in tail:
         accepted.add(f"{requested}:latest")
+    return accepted
+
+
+def ollama_model_digest(payload: object, requested: str) -> str | None:
+    """Return the inventory digest Ollama lists for *requested*.
+
+    Ollama's inventory has used both ``name`` and ``model`` for the canonical
+    identifier, so either field is accepted. Malformed rows are ignored and a
+    malformed envelope fails closed.
+
+    Args:
+        payload: The decoded ``/api/tags`` response.
+        requested: The model identifier the caller will generate with.
+
+    Returns:
+        The matching row's digest, normalised to bare lowercase hex; ``""``
+        when the row carries no digest; ``None`` when no row matches.
+    """
+    if not isinstance(payload, dict):
+        return None
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return None
+    accepted = _accepted_model_names(requested)
     for item in models:
         if not isinstance(item, dict):
             continue
-        for field in ("name", "model"):
-            installed = item.get(field)
-            if isinstance(installed, str) and installed in accepted:
-                return True
-    return False
+        names = (item.get("name"), item.get("model"))
+        if any(isinstance(name, str) and name in accepted for name in names):
+            return _normalise_digest(item.get("digest"))
+    return None
 
 
 class OllamaProvider:

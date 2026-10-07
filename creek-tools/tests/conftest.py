@@ -125,6 +125,29 @@ def _isolate_creek_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_local_model_boundary_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide and restore the container-mode model flags around every test (#1849).
+
+    ``creek_mcp.container_runtime.run`` sets the loopback-only flag directly in
+    :data:`os.environ`, because the serving process must keep it for its whole
+    life. A test that drives ``run`` would otherwise leave it set for every
+    later test on the same worker, silently refusing any non-loopback
+    ``ollama_url`` in an unrelated suite — an order-dependent flake.
+
+    ``setenv`` before ``delenv`` makes monkeypatch record the variable's
+    original state even when it was absent, so whatever a test writes is
+    undone at teardown.
+
+    Args:
+        monkeypatch: Restores both variables when the test finishes.
+    """
+    from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "")
+    monkeypatch.delenv(LOOPBACK_ONLY_ENV)
+
+
+@pytest.fixture(autouse=True)
 def _reset_elevated_attempt_budget() -> None:
     """Clear the elevated-auth failed-attempt budget before every test (#914).
 
