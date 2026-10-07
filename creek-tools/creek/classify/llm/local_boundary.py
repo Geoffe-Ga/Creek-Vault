@@ -15,7 +15,9 @@ which own both halves of the dial:
   way here instead of crashing. Without the flag a self-hosted LAN Ollama keeps
   working.
 - **The transport.** It always ignores the proxy environment, so a loopback
-  URL cannot be carried to an ``HTTP_PROXY`` or ``ALL_PROXY`` host.
+  URL cannot be carried to an ``HTTP_PROXY`` or ``ALL_PROXY`` host. It still
+  honours ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` for TLS trust, and never reads
+  ``.netrc``.
 
 ``tests/test_ollama_endpoint_invariant.py`` keeps this module the only place
 an ``ollama_url`` is turned into a request URL, and every client it builds
@@ -25,6 +27,7 @@ proxy-free.
 from __future__ import annotations
 
 import os
+import ssl
 from ipaddress import ip_address
 from typing import TYPE_CHECKING, Final
 from urllib.parse import urlsplit
@@ -145,7 +148,26 @@ def _ollama_client(timeout: float) -> httpx.Client:
     Ollama is local by contract, so this holds whether or not loopback-only
     mode is on.
     """
-    return httpx.Client(timeout=timeout, trust_env=False)
+    return httpx.Client(timeout=timeout, trust_env=False, verify=_ollama_verify())
+
+
+def _ollama_verify() -> ssl.SSLContext | bool:
+    """Return the CA trust an Ollama client verifies TLS against.
+
+    ``trust_env=False`` keeps proxies out, but it also stops httpx reading
+    ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``, which would silently break an HTTPS
+    Ollama whose private CA is trusted that way. So that trust is rebuilt
+    here, mapped exactly as httpx does under ``trust_env=True``: the file wins
+    over the directory, and with neither set httpx's certifi default applies.
+    ``.netrc`` credentials are deliberately not read.
+    """
+    cafile = os.environ.get("SSL_CERT_FILE", "")
+    if cafile:
+        return ssl.create_default_context(cafile=cafile)
+    capath = os.environ.get("SSL_CERT_DIR", "")
+    if capath:
+        return ssl.create_default_context(capath=capath)
+    return True
 
 
 def ollama_get(config: LLMConfig, path: str, *, timeout: float) -> httpx.Response:

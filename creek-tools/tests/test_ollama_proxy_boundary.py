@@ -33,6 +33,7 @@ from tests.ollama_stub import (
     PROXY_ENV_NAMES,
     OllamaStub,
     dead_proxy_url,
+    private_ca_tls,
     serve_ollama,
 )
 
@@ -132,3 +133,95 @@ def test_model_probe_bypasses_environment_proxies(
     ]
     assert ollama.requests[1][2] is not None
     assert ollama.requests[1][2]["prompt"] == CANARY_PROMPT
+
+
+@pytest.fixture
+def tls_ollama(tmp_path: Path) -> Iterator[tuple[OllamaStub, Path]]:
+    """Serve the runtime over HTTPS with a certificate from a private CA."""
+    ca_bundle, server_tls = private_ca_tls(tmp_path)
+    stub = OllamaStub(tags={"models": [{"name": _MODEL, "digest": _DIGEST}]})
+    for served in serve_ollama(stub, tls=server_tls):
+        yield served, ca_bundle
+
+
+def test_private_ca_from_ssl_cert_file_is_still_trusted(
+    tls_ollama: tuple[OllamaStub, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ignoring proxy env must not also drop the operator's CA bundle.
+
+    httpx reads ``SSL_CERT_FILE`` only under ``trust_env=True``, so the
+    boundary rebuilds that trust itself. Proxies stay ignored: the autouse
+    environment still points them at a dead port.
+    """
+    stub, ca_bundle = tls_ollama
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_bundle))
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
+    available = check_ollama_available(
+        LLMConfig(ollama_url=stub.url, model=_MODEL), timeout=2.0
+    )
+
+    assert available is True
+    assert stub.requests == [("GET", "/api/tags", None)]
+
+
+def test_private_ca_is_not_trusted_without_ssl_cert_file(
+    tls_ollama: tuple[OllamaStub, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: without the bundle the private CA fails verification."""
+    stub, _ca_bundle = tls_ollama
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
+    available = check_ollama_available(
+        LLMConfig(ollama_url=stub.url, model=_MODEL), timeout=2.0
+    )
+
+    assert available is False
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"SSL_CERT_FILE": "/ca/bundle.pem"}, {"cafile": "/ca/bundle.pem"}),
+        ({"SSL_CERT_DIR": "/ca/dir"}, {"capath": "/ca/dir"}),
+        (
+            {"SSL_CERT_FILE": "/ca/bundle.pem", "SSL_CERT_DIR": "/ca/dir"},
+            {"cafile": "/ca/bundle.pem"},
+        ),
+    ],
+)
+def test_ca_environment_is_mapped_like_httpx_trust_env(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], expected: dict[str, str]
+) -> None:
+    """``SSL_CERT_FILE`` wins over ``SSL_CERT_DIR``, exactly as httpx does."""
+    from creek.classify.llm import local_boundary
+
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    seen: list[dict[str, str]] = []
+    sentinel = object()
+
+    def _record(**kwargs: str) -> object:
+        seen.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(local_boundary.ssl, "create_default_context", _record)
+
+    assert local_boundary._ollama_verify() is sentinel
+    assert seen == [expected]
+
+
+def test_default_trust_is_httpx_certifi_without_ca_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no CA variables the boundary defers to httpx's certifi default."""
+    from creek.classify.llm import local_boundary
+
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        monkeypatch.setenv(name, "")
+
+    assert local_boundary._ollama_verify() is True

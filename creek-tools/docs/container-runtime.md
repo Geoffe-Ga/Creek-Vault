@@ -210,7 +210,10 @@ be local. Two layers enforce this:
   `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`, in and out of containers. A
   loopback URL therefore cannot be relayed to a proxy host. An operator who
   needs a proxy for other egress keeps it, and Ollama traffic is not sent
-  through it.
+  through it. TLS trust still follows `SSL_CERT_FILE` (or, when that is
+  unset, `SSL_CERT_DIR`), so an HTTPS Ollama behind a private CA keeps
+  working. With neither set, the bundled certifi roots apply. `.netrc`
+  credentials are never read for Ollama.
 
 ## Backup, restore, and deletion
 

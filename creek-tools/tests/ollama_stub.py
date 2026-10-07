@@ -18,15 +18,24 @@ collected.
 
 from __future__ import annotations
 
+import datetime
+import ipaddress
 import json
 import socket
+import ssl
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 _LOOPBACK = "127.0.0.1"
 
@@ -68,20 +77,26 @@ class _Handler(BaseHTTPRequestHandler):
         """Stay silent: the tests assert on what the code under test logs."""
 
 
-def serve_ollama(stub: OllamaStub) -> Iterator[OllamaStub]:
+def serve_ollama(
+    stub: OllamaStub, *, tls: ssl.SSLContext | None = None
+) -> Iterator[OllamaStub]:
     """Serve *stub* on loopback for the duration of a fixture.
 
     Args:
         stub: The inventory and generation text to serve.
+        tls: A server-side TLS context; when given the stub speaks HTTPS.
 
     Yields:
         *stub*, with :attr:`OllamaStub.url` set to the server's base URL.
     """
     handler = type("_BoundHandler", (_Handler,), {"stub": stub})
     server = ThreadingHTTPServer((_LOOPBACK, 0), handler)
+    if tls is not None:
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    stub.url = f"http://{_LOOPBACK}:{server.server_address[1]}"
+    scheme = "http" if tls is None else "https"
+    stub.url = f"{scheme}://{_LOOPBACK}:{server.server_address[1]}"
     try:
         yield stub
     finally:
@@ -110,3 +125,90 @@ PROXY_ENV_NAMES = (
 
 NO_PROXY_ENV_NAMES = ("NO_PROXY", "no_proxy")
 """Variables that would exempt loopback from a proxy, cleared by the tests."""
+
+
+_CERT_LIFETIME = datetime.timedelta(days=1)
+
+
+def _certificate(
+    subject: str,
+    key: ec.EllipticCurvePrivateKey,
+    issuer: tuple[str, ec.EllipticCurvePrivateKey] | None = None,
+) -> x509.Certificate:
+    """Return a short-lived certificate; self-signed CA when *issuer* is None."""
+    now = datetime.datetime.now(datetime.UTC)
+    issuer_name, signer = issuer if issuer is not None else (subject, key)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subject)]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_name)]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - _CERT_LIFETIME)
+        .not_valid_after(now + _CERT_LIFETIME)
+        .add_extension(
+            x509.BasicConstraints(ca=issuer is None, path_length=None), critical=True
+        )
+    )
+    builder = builder.add_extension(
+        x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+    )
+    if issuer is None:
+        builder = builder.add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+    else:
+        builder = builder.add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()),
+            critical=False,
+        )
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.ip_address(_LOOPBACK))]
+            ),
+            critical=False,
+        )
+    return builder.sign(signer, hashes.SHA256())
+
+
+def private_ca_tls(directory: Path) -> tuple[Path, ssl.SSLContext]:
+    """Mint a private CA and a loopback server certificate it signed.
+
+    Args:
+        directory: Where to write the PEM files.
+
+    Returns:
+        The CA bundle path (what an operator would put in ``SSL_CERT_FILE``)
+        and a server-side TLS context presenting the signed certificate.
+    """
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca = _certificate("creek-test-private-ca", ca_key)
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf = _certificate(
+        "creek-test-ollama", leaf_key, ("creek-test-private-ca", ca_key)
+    )
+    ca_path = directory / "private-ca.pem"
+    ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    chain = directory / "ollama-chain.pem"
+    chain.write_bytes(
+        leaf.public_bytes(serialization.Encoding.PEM)
+        + leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server.load_cert_chain(chain)
+    return ca_path, server
