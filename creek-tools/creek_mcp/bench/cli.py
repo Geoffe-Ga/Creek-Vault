@@ -128,6 +128,12 @@ def _add_reflect(
     parser.add_argument(
         "--cpu-kind", choices=("shared", "performance", "unknown"), default="unknown"
     )
+    parser.add_argument(
+        "--model-store-path",
+        type=Path,
+        default=None,
+        help="directory holding the model weights; its free disk is reported",
+    )
     parser.add_argument("--out", type=Path, required=True)
     _add_workload_flags(parser)
 
@@ -233,11 +239,20 @@ def _workload(args: argparse.Namespace) -> Workload:
 
 def _run_reflect(args: argparse.Namespace) -> str:
     """Run the sweeps and write the report; return the summary line."""
+    store = args.model_store_path
+    if store is not None and not store.is_dir():
+        msg = "--model-store-path must be an existing directory"
+        raise _RefusalError(msg)
     plan = BenchPlan(
         metadata=_metadata(args), workload=_workload(args), backend=_backend(args)
     )
     with tempfile.TemporaryDirectory(prefix="creek-bench-") as scratch:
-        report = run_bench(plan, Path(scratch) / _CORPUS_DIR, cpu_kind=args.cpu_kind)
+        report = run_bench(
+            plan,
+            Path(scratch) / _CORPUS_DIR,
+            cpu_kind=args.cpu_kind,
+            model_store=store,
+        )
     write_report(report, args.out)
     return f"verdict={report.verdict.value} report={args.out}"
 

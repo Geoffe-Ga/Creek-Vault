@@ -14,6 +14,8 @@ from tests.bench.conftest import run_metadata
 
 _BUDGET = 10.0
 _HOST = HostMetadata(
+    describes_model_host=True,
+    disk_scope="harness_temp",
     cpu_count=2,
     cpu_arch="x86_64",
     cpu_kind="shared",

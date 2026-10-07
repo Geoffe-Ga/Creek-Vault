@@ -418,8 +418,16 @@ def _pinned_metadata(plan: BenchPlan) -> RunMetadata:
     )
 
 
+_SAME_HOST_SCOPES: Final[frozenset[str]] = frozenset({"fake", "loopback"})
+"""Endpoint scopes where the model runs on the harness's own host."""
+
+
 def run_bench(
-    plan: BenchPlan, corpus_root: Path, *, cpu_kind: CpuKind = "unknown"
+    plan: BenchPlan,
+    corpus_root: Path,
+    *,
+    cpu_kind: CpuKind = "unknown",
+    model_store: Path | None = None,
 ) -> BenchReport:
     """Run every sweep in *plan* and return the content-free report.
 
@@ -428,6 +436,8 @@ def run_bench(
         corpus_root: Absent or empty directory under the temp dir for the
             synthetic corpus; the caller owns its removal.
         cpu_kind: The Fly CPU class, recorded in the host metadata.
+        model_store: The model store whose free disk to report; defaults to
+            the corpus's temp directory (and is labelled as such).
 
     Returns:
         The benchmark report.
@@ -455,5 +465,10 @@ def run_bench(
         *_concurrency(harness, session),
         *_idle(harness, session),
     ]
-    host = capture_host(corpus.root, cpu_kind=cpu_kind)
+    host = capture_host(
+        model_store or corpus.root,
+        cpu_kind=cpu_kind,
+        model_store=model_store is not None,
+        describes_model_host=metadata.endpoint_scope in _SAME_HOST_SCOPES,
+    )
     return build_report(metadata, host, trials)

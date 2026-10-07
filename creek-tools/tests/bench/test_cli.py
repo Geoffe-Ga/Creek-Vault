@@ -438,3 +438,23 @@ def test_allowed_remote_endpoint_is_recorded(
     )
     assert cli.main(argv) == 0
     assert load_report(tmp_path / "report.json").run.endpoint_scope == "remote"
+
+
+def test_model_store_path_must_exist(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A model store that is not a directory is refused by flag name."""
+    argv = _reflect(tmp_path, "--model-store-path", str(tmp_path / "absent"))
+    assert cli.main(argv) == 2
+    assert "--model-store-path" in capsys.readouterr().err
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_model_store_path_is_recorded(tmp_path: Path) -> None:
+    """With a model store named, the disk figure is labelled as that store."""
+    store = tmp_path / "models"
+    store.mkdir()
+    assert cli.main(_reflect(tmp_path, "--model-store-path", str(store))) == 0
+    host = load_report(tmp_path / "report.json").host
+    assert host.disk_scope == "model_store"
+    assert str(store) not in (tmp_path / "report.json").read_text(encoding="utf-8")

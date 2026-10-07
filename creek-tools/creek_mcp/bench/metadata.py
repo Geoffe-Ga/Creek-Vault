@@ -98,12 +98,22 @@ class RunMetadata(BaseModel):
 
 
 class HostMetadata(BaseModel):
-    """The capacity of the machine the run measured — and nothing else.
+    """The capacity of the machine the *harness* ran on — and nothing else.
+
+    These facts are read from the harness process. They describe the model's
+    host only when the model ran there too (the fake mode, or a loopback
+    endpoint); ``describes_model_host`` says which. For a private or remote
+    endpoint they describe the client machine, not the one serving the model.
 
     No hostname, user, path or address: the report may be shared as evidence,
     and none of those is a capacity fact.
 
     Attributes:
+        scope: Always ``harness``: where these facts were read.
+        describes_model_host: Whether the model ran on this same host.
+        disk_scope: ``model_store`` when the free-disk figure is the
+            operator-named model store, ``harness_temp`` when it is the
+            harness's temp directory.
         cpu_count: Logical CPUs visible to the process.
         cpu_arch: Machine architecture (``x86_64``, ``arm64``).
         cpu_kind: Fly CPU class as stated by the operator.
@@ -114,6 +124,9 @@ class HostMetadata(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    scope: Literal["harness"] = "harness"
+    describes_model_host: bool
+    disk_scope: Literal["harness_temp", "model_store"]
     cpu_count: PositiveInt | None
     cpu_arch: Annotated[str, Field(pattern=_ARCH_PATTERN)]
     cpu_kind: CpuKind
@@ -142,18 +155,28 @@ def _disk_free_bytes(path: Path) -> int | None:
     return None
 
 
-def capture_host(disk_path: Path, *, cpu_kind: CpuKind = "unknown") -> HostMetadata:
-    """Capture the capacity facts of the current host.
+def capture_host(
+    disk_path: Path,
+    *,
+    cpu_kind: CpuKind = "unknown",
+    model_store: bool = False,
+    describes_model_host: bool = False,
+) -> HostMetadata:
+    """Capture the capacity facts of the host the harness runs on.
 
     Args:
-        disk_path: A directory on the filesystem whose free space matters
-            (the model store, in a live run).
+        disk_path: The directory whose filesystem's free space is reported.
         cpu_kind: The Fly CPU class, which only the operator knows.
+        model_store: Whether *disk_path* is the operator-named model store
+            (otherwise it is the harness's temp directory).
+        describes_model_host: Whether the model ran on this host.
 
     Returns:
         Host metadata with unknowable values as ``None`` or ``unknown``.
     """
     return HostMetadata(
+        describes_model_host=describes_model_host,
+        disk_scope="model_store" if model_store else "harness_temp",
         cpu_count=os.cpu_count(),
         cpu_arch=_closed(platform.machine(), _ARCH_PATTERN),
         cpu_kind=cpu_kind,

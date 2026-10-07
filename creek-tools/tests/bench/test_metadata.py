@@ -108,6 +108,9 @@ def test_host_metadata_has_no_identifying_fields(tmp_path: Path) -> None:
     """Host capture names capacity only — no hostname, no path."""
     host = capture_host(tmp_path)
     assert set(HostMetadata.model_fields) == {
+        "scope",
+        "describes_model_host",
+        "disk_scope",
         "cpu_count",
         "cpu_arch",
         "cpu_kind",
@@ -121,6 +124,16 @@ def test_host_metadata_has_no_identifying_fields(tmp_path: Path) -> None:
     assert host.disk_free_bytes is not None
     assert host.disk_free_bytes > 0
     assert host.cpu_kind == "unknown"
+    assert host.scope == "harness"
+    assert host.disk_scope == "harness_temp"
+    assert host.describes_model_host is False
+
+
+def test_capture_host_labels_a_model_store_and_a_local_runtime(tmp_path: Path) -> None:
+    """The operator's model-store path and a local runtime are labelled as such."""
+    host = capture_host(tmp_path, model_store=True, describes_model_host=True)
+    assert host.disk_scope == "model_store"
+    assert host.describes_model_host is True
 
 
 def test_capture_host_records_operator_cpu_kind(tmp_path: Path) -> None:

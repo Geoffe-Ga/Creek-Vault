@@ -11,6 +11,7 @@ the harness writes a byte or sends a request.
 from __future__ import annotations
 
 import errno
+import shutil
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -477,3 +478,55 @@ def test_truncated_prompt_is_a_context_overflow_not_ok(tmp_path: Path) -> None:
     (trial,) = _trials(report, Sweep.CONTEXT)
     assert trial.outcome is Outcome.CONTEXT_OVERFLOW
     assert report.per_sweep[Sweep.CONTEXT].verdict is Verdict.EXCEEDS
+
+
+@pytest.mark.parametrize(
+    ("scope", "describes"), [("loopback", True), ("private", False), ("remote", False)]
+)
+def test_host_block_says_whether_it_describes_the_model_host(
+    tmp_path: Path, fake_model: FakeModel, scope: str, describes: bool
+) -> None:
+    """Host facts are the harness's; they describe the model only on loopback."""
+
+    def _pin(expected: str) -> PinnedModel:
+        return PinnedModel(expected, None, None, "unknown")
+
+    metadata = run_metadata(
+        mode="live",
+        provider="ollama",
+        endpoint_scope=scope,
+        digest=_DIGEST,
+        git_sha=_SHA,
+    )
+    plan = make_plan(fake_model, metadata=metadata, **_only_warm())
+    plan = replace(plan, backend=replace(plan.backend, pin=_pin))
+    host = run_bench(plan, tmp_path / "corpus").host
+    assert host.scope == "harness"
+    assert host.describes_model_host is describes
+    assert host.disk_scope == "harness_temp"
+
+
+def test_fake_run_host_is_the_model_host(tmp_path: Path, fake_model: FakeModel) -> None:
+    """The fake model runs in the harness process, so the host block is its."""
+    host = run_bench(make_plan(fake_model, **_only_warm()), tmp_path / "c").host
+    assert host.describes_model_host is True
+
+
+def test_model_store_path_supplies_the_disk_figure(
+    tmp_path: Path, fake_model: FakeModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator-named model store is the disk the report measures."""
+    store = tmp_path / "models"
+    store.mkdir()
+    measured: list[Path] = []
+    real_usage = shutil.disk_usage
+
+    def _spy(path: Path) -> Any:
+        measured.append(path)
+        return real_usage(path)
+
+    monkeypatch.setattr("creek_mcp.bench.metadata.shutil.disk_usage", _spy)
+    plan = make_plan(fake_model, **_only_warm())
+    host = run_bench(plan, tmp_path / "corpus", model_store=store).host
+    assert host.disk_scope == "model_store"
+    assert measured == [store]
