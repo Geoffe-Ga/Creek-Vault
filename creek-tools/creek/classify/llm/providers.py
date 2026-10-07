@@ -33,7 +33,8 @@ from creek.classify.llm.consent import (
 )
 from creek.classify.llm.local_boundary import (
     NonLoopbackOllamaError,
-    ollama_endpoint,
+    ollama_get,
+    ollama_post,
 )
 
 if TYPE_CHECKING:
@@ -660,15 +661,13 @@ def call_ollama(
         # thought. Ollama's bounded-call contract therefore disables thinking;
         # unbounded classification calls retain their historical model default.
         payload["think"] = False
-    url = ollama_endpoint(config, "/api/generate")
-    with httpx.Client(timeout=timeout) as client:
-        response = client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        text = str(data.get("response", "")) if isinstance(data, dict) else ""
-        done_reason = data.get("done_reason") if isinstance(data, dict) else None
-        stop_reason = "max_tokens" if done_reason == "length" else "end_turn"
-        return Completion(text=text, stop_reason=stop_reason)
+    response = ollama_post(config, "/api/generate", payload=payload, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    text = str(data.get("response", "")) if isinstance(data, dict) else ""
+    done_reason = data.get("done_reason") if isinstance(data, dict) else None
+    stop_reason = "max_tokens" if done_reason == "length" else "end_turn"
+    return Completion(text=text, stop_reason=stop_reason)
 
 
 _UNREADABLE_OLLAMA_INVENTORY = object()
@@ -735,12 +734,14 @@ def _fetch_ollama_inventory(config: LLMConfig, *, timeout: float) -> object:
     non-200 reply or undecodable JSON — is logged and returned as
     :data:`_UNREADABLE_OLLAMA_INVENTORY`, so callers fail closed.
     """
-    url = _inventory_url(config)
-    if url is None:
-        return _UNREADABLE_OLLAMA_INVENTORY
     try:
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.get(url)
+        resp = ollama_get(config, "/api/tags", timeout=timeout)
+    except NonLoopbackOllamaError:
+        logger.warning(
+            "Ollama URL is not a loopback address; "
+            "refusing to dial it in loopback-only mode"
+        )
+        return _UNREADABLE_OLLAMA_INVENTORY
     except httpx.HTTPError:
         logger.warning("Ollama daemon is unreachable at %s", config.ollama_url)
         return _UNREADABLE_OLLAMA_INVENTORY
@@ -759,22 +760,6 @@ def _fetch_ollama_inventory(config: LLMConfig, *, timeout: float) -> object:
             config.ollama_url,
         )
     return payload
-
-
-def _inventory_url(config: LLMConfig) -> str | None:
-    """Return the ``/api/tags`` URL, or ``None`` when the boundary refuses it.
-
-    The refusal is logged without the URL: in loopback-only mode the
-    configured host is exactly what must not be dialled or echoed.
-    """
-    try:
-        return ollama_endpoint(config, "/api/tags")
-    except NonLoopbackOllamaError:
-        logger.warning(
-            "Ollama URL is not a loopback address; "
-            "refusing to dial it in loopback-only mode"
-        )
-        return None
 
 
 def _normalise_digest(value: object) -> str:

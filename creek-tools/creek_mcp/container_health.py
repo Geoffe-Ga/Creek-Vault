@@ -20,7 +20,7 @@ from typing import Final
 
 import httpx
 
-from creek.classify.llm.local_boundary import ollama_endpoint
+from creek.classify.llm.local_boundary import ollama_get
 from creek.classify.llm.providers import (
     call_ollama,
     ollama_digest_matches,
@@ -166,10 +166,7 @@ def _v1_is_ready(settings: ContainerSettings) -> bool:
 def _inventory_status(manifest: ModelPackageManifest) -> ProbeStatus | None:
     """Check the loopback runtime serves the pinned digest; ``None`` when it does."""
     try:
-        response = httpx.get(
-            ollama_endpoint(_LOOPBACK_RUNTIME, "/api/tags"),
-            timeout=_PROBE_TIMEOUT,
-        )
+        response = ollama_get(_LOOPBACK_RUNTIME, "/api/tags", timeout=_PROBE_TIMEOUT)
         payload: object = response.json() if response.status_code == 200 else None
     except (httpx.HTTPError, ValueError):
         return ProbeStatus.RUNTIME_DOWN

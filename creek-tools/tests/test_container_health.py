@@ -285,7 +285,7 @@ def test_ready_probe_is_independent_of_model_state(
     def dead_runtime(*_args: object, **_kwargs: object) -> httpx.Response:
         raise httpx.ConnectError("runtime is down")
 
-    monkeypatch.setattr(health.httpx, "get", dead_runtime)
+    monkeypatch.setattr(health, "ollama_get", dead_runtime)
     monkeypatch.delenv(MODEL_PACKAGE_FILE_ENV, raising=False)
 
     ready = probe(settings, ProbeTarget.READY)

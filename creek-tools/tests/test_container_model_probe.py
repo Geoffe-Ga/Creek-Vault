@@ -102,11 +102,11 @@ class _Runtime:
         self.canary_calls: list[dict[str, Any]] = []
         self._inventory = inventory
         self._canary = canary
-        monkeypatch.setattr(health.httpx, "get", self._get)
+        monkeypatch.setattr(health, "ollama_get", self._get)
         monkeypatch.setattr(health, "call_ollama", self._call)
 
-    def _get(self, url: str, **_kwargs: object) -> httpx.Response:
-        self.inventory_urls.append(url)
+    def _get(self, config: LLMConfig, path: str, **_kwargs: object) -> httpx.Response:
+        self.inventory_urls.append(config.ollama_url + path)
         if isinstance(self._inventory, Exception):
             raise self._inventory
         return self._inventory

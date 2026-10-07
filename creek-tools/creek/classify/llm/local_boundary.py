@@ -5,15 +5,21 @@ False`` unconditionally, and the router's intimate-forces-local rule trusts
 that label. ``LLMConfig.ollama_url`` is free-form, though, so without a check
 the provider labelled *local* could dial any host on the network.
 
-In container mode the runtime sets :data:`LOOPBACK_ONLY_ENV`, and every Ollama
-request URL is then built through :func:`ollama_endpoint`, which refuses any
-endpoint that is not a literal loopback address. The refusal is a
-:class:`httpx.TransportError` so every caller that already degrades on an
-unreachable daemon degrades the same way here, instead of crashing. Outside
-container mode the boundary is off and a self-hosted LAN Ollama keeps working.
+Every Ollama request goes through :func:`ollama_get` / :func:`ollama_post`,
+which own both halves of the dial:
+
+- **The URL.** :func:`ollama_endpoint` builds it and, when the container
+  runtime sets :data:`LOOPBACK_ONLY_ENV`, refuses any endpoint that is not a
+  literal loopback address. The refusal is a :class:`httpx.TransportError`, so
+  every caller that already degrades on an unreachable daemon degrades the same
+  way here instead of crashing. Without the flag a self-hosted LAN Ollama keeps
+  working.
+- **The transport.** It always ignores the proxy environment, so a loopback
+  URL cannot be carried to an ``HTTP_PROXY`` or ``ALL_PROXY`` host.
 
 ``tests/test_ollama_endpoint_invariant.py`` keeps this module the only place
-an ``ollama_url`` is turned into a request URL.
+an ``ollama_url`` is turned into a request URL, and every client it builds
+proxy-free.
 """
 
 from __future__ import annotations
@@ -128,3 +134,62 @@ def ollama_endpoint(config: LLMConfig, path: str) -> str:
     if loopback_only_enforced() and not is_loopback_url(config.ollama_url):
         raise NonLoopbackOllamaError
     return f"{config.ollama_url}{path}"
+
+
+def _ollama_client(timeout: float) -> httpx.Client:
+    """Return a client that never routes through an environment proxy.
+
+    httpx's default ``trust_env=True`` sends even a loopback URL through
+    ``HTTP_PROXY`` / ``ALL_PROXY`` unless ``NO_PROXY`` exempts it, which would
+    carry a prompt to the proxy host while the provider stays labelled local.
+    Ollama is local by contract, so this holds whether or not loopback-only
+    mode is on.
+    """
+    return httpx.Client(timeout=timeout, trust_env=False)
+
+
+def ollama_get(config: LLMConfig, path: str, *, timeout: float) -> httpx.Response:
+    """``GET`` *path* on the configured Ollama runtime, bypassing env proxies.
+
+    Args:
+        config: The stage's LLM configuration carrying ``ollama_url``.
+        path: The API path, starting with ``/``.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        The fully read response.
+
+    Raises:
+        NonLoopbackOllamaError: As :func:`ollama_endpoint`, before any dial.
+        httpx.HTTPError: On a transport failure.
+    """
+    url = ollama_endpoint(config, path)
+    with _ollama_client(timeout) as client:
+        return client.get(url)
+
+
+def ollama_post(
+    config: LLMConfig,
+    path: str,
+    *,
+    payload: dict[str, object],
+    timeout: float,
+) -> httpx.Response:
+    """``POST`` JSON *payload* to *path* on the Ollama runtime, bypassing proxies.
+
+    Args:
+        config: The stage's LLM configuration carrying ``ollama_url``.
+        path: The API path, starting with ``/``.
+        payload: The JSON request body.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        The fully read response.
+
+    Raises:
+        NonLoopbackOllamaError: As :func:`ollama_endpoint`, before any dial.
+        httpx.HTTPError: On a transport failure.
+    """
+    url = ollama_endpoint(config, path)
+    with _ollama_client(timeout) as client:
+        return client.post(url, json=payload)

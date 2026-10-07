@@ -206,6 +206,11 @@ be local. Two layers enforce this:
   its pinned model at its pinned digest over loopback. Without one, reflection
   in a container is unavailable rather than served by an unpinned or cloud
   model.
+- **On the transport**, every Ollama request ignores `HTTP_PROXY`,
+  `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`, in and out of containers. A
+  loopback URL therefore cannot be relayed to a proxy host. An operator who
+  needs a proxy for other egress keeps it, and Ollama traffic is not sent
+  through it.
 
 ## Backup, restore, and deletion
 
