@@ -17,13 +17,12 @@ populated directory — is refused untouched.
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
-
-import frontmatter
 
 from creek._containment import escaping_child
 
@@ -104,6 +103,9 @@ META_DIR: Final[str] = "00-Creek-Meta"
 _INDEX_BYTES: Final[int] = 4
 """Digest bytes read per word choice; ample for a 64-word vocabulary."""
 
+_FENCE: Final[str] = "---"
+"""Front-matter delimiter."""
+
 _STAMP: Final[str] = datetime(2026, 1, 1, tzinfo=UTC).isoformat()
 """Fixed creation time, so the files are byte-identical across runs."""
 
@@ -165,7 +167,13 @@ def _confined_root(root: Path) -> Path:
 
 
 def _note(seed: int, index: int, words: int) -> str:
-    """Render one model-valid ``open`` fragment note."""
+    """Render one model-valid ``open`` fragment note.
+
+    Each front-matter value is written as JSON, which is valid YAML flow
+    syntax. Serialising by hand rather than through a YAML emitter keeps the
+    bytes independent of the installed PyYAML's formatting choices, so the
+    corpus stays byte-stable across environments.
+    """
     note_id = f"bench-{index:04d}"
     metadata: dict[str, Any] = {
         "type": "fragment",
@@ -179,7 +187,8 @@ def _note(seed: int, index: int, words: int) -> str:
         "eddies": [],
     }
     body = entry_text(seed=seed, index=index, words=words)
-    return frontmatter.dumps(frontmatter.Post(content=body, **metadata)) + "\n"
+    header = "\n".join(f"{key}: {json.dumps(value)}" for key, value in metadata.items())
+    return f"{_FENCE}\n{header}\n{_FENCE}\n{body}\n"
 
 
 def build_corpus(

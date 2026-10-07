@@ -4,17 +4,15 @@ These mirror the private ``_LLM`` / ``_LLMFactory`` protocols in
 :mod:`creek_mcp.tools.reflect` structurally rather than importing them, so the
 harness depends on the *shape* ``reflect_tool`` accepts and not on that
 module's private names. Any object satisfying these satisfies reflect's.
+Annotations are evaluated eagerly (no postponed annotations), so every name
+they use is a real import.
 """
 
-from __future__ import annotations
+from pathlib import Path
+from typing import Protocol
 
-from typing import TYPE_CHECKING, Protocol
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    from creek.classify.privacy_filter import PrivacyTierOverride
-    from creek.models import PrivacyTier
+from creek.classify.privacy_filter import PrivacyTierOverride
+from creek.models import PrivacyTier
 
 
 class LLMCallable(Protocol):
