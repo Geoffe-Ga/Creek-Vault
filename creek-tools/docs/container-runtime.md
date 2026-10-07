@@ -129,6 +129,84 @@ The states are deliberately distinct:
 Exit codes are `0` for a satisfied target, `20` for process-down, `21` for an
 unmounted vault, and `22` for an unready `/v1` application.
 
+### Storage-ready is not model-ready
+
+`--check ready` is **storage** readiness only. It stays the image
+`HEALTHCHECK` default, and it never consults a model. A separate target asks
+whether the pinned local model can generate:
+
+```console
+docker exec creek-user-001 python -m creek_mcp.container_health --check model
+```
+
+| State | Exit | Meaning |
+|---|---|---|
+| `model-ready` | `0` | The loopback runtime serves the pinned model at its pinned digest **and** completed a fixed synthetic canary prompt |
+| `runtime-down` | `23` | The loopback runtime did not answer, answered non-200, or returned an unreadable inventory |
+| `model-missing` | `24` | No model package is configured, the manifest failed to load, or the runtime does not list the pinned tag |
+| `model-digest-mismatch` | `25` | The pinned tag is listed, but at another (or no) digest |
+| `generation-failed` | `26` | The inventory matched, but the canary generation errored or returned nothing |
+
+The model probe does not read the vault or its config. It sends only the
+constant canary prompt to the runtime at `http://localhost:11434`, and it
+prints one state line with no logging. A broken container environment under
+`--check model` reports `model-missing`, never a storage state.
+
+**The image ships no model runtime yet.** Until a runtime and model are
+selected and installed (Creek-Vault#1849, gated on the #1850 capacity
+decision), `--check model` reports `model-missing` (no package configured) or
+`runtime-down`. An existing storage-only vault therefore stays storage-ready
+and model-unavailable. `/v1/health` stays the constant described in the
+2026-07-31 HTTP application API ADR, and it carries no model state.
+
+### Model package manifest
+
+A model package is pinned by a JSON manifest that the operator mounts
+**outside `/vault`** and names with `CREEK_MODEL_PACKAGE_FILE`. Keeping it
+outside the vault means a vault-config edit can neither set nor loosen the
+pin. Every field is required, and the loader refuses a missing, unpinned or
+malformed field:
+
+- runtime name, exact version and digest;
+- a model tag that is explicit and not `latest`;
+- the weights' SHA-256;
+- the digest the runtime's inventory reports;
+- quantization, parameter count and size in bytes;
+- the SPDX licence id and an `https` licence URL.
+
+The approved-licence allowlist (`APPROVED_MODEL_LICENSES` in
+`creek_mcp/model_package.py`) is **empty** until the owner approves a licence.
+Until then every manifest is refused and the model stays unavailable.
+
+To verify a weights file against the configured manifest:
+
+```console
+python -m creek_mcp.model_package verify --weights /path/to/weights
+```
+
+The command streams SHA-256 over the file and prints one of `verified`,
+`missing`, `size-mismatch` or `digest-mismatch`. It exits `0` only for
+`verified`, and `27` otherwise. A truncated, partial, substituted or
+mid-read-modified blob is never verified.
+
+### Loopback-only Ollama in container mode
+
+In a container, every LLM stage's `ollama_url` must be a literal loopback
+address (`localhost`, `127.0.0.0/8` or `[::1]`), whatever the stage's
+provider. The Ollama provider is labelled local, so its endpoint must actually
+be local. Two layers enforce this:
+
+- **At startup**, a config with a non-loopback stage is refused. The refusal
+  names the stage, never the URL. **This deliberately breaks a self-hosted
+  container that points at a LAN Ollama.** Run the runtime inside the
+  container's loopback instead.
+- **At dial time**, the serving process sets `CREEK_OLLAMA_LOOPBACK_ONLY=1`,
+  so a vault-config edit after boot cannot reach a remote host. Reflection
+  also refuses unless a model package is configured and the stage resolves to
+  its pinned model at its pinned digest over loopback. Without one, reflection
+  in a container is unavailable rather than served by an unpinned or cloud
+  model.
+
 ## Backup, restore, and deletion
 
 Stop the container before taking a provider volume snapshot. Restore into a new
