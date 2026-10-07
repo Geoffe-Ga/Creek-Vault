@@ -28,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from creek.care.guardrail import acute_distress_guard
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
-from creek_mcp.model_pin import provider_may_serve
+from creek_mcp.model_pin import pin_refuses_stage, provider_may_serve
 from creek_mcp.policy import (
     Admission,
     CallerIdentity,
@@ -364,8 +364,9 @@ def _generation_provider(
     :func:`~creek_mcp.model_pin.provider_may_serve` owns the model pin: with a
     model package configured, or in container mode, only the pinned local
     model at its pinned digest over loopback may serve, and a cloud stage is
-    refused before any dial. Outside both modes this is
-    ``provider.available``, as before.
+    refused from its config before it is even built, so a keyless cloud
+    stage gets this refusal rather than its SDK's error. Outside both modes
+    this is ``provider.available``, as before.
 
     The check runs per request, because the vault config it reads is
     writable after boot.
@@ -386,12 +387,15 @@ def _generation_provider(
     """
     from creek.classify.llm.providers import build_provider
 
-    provider = build_provider(router.resolve("generation", tier))
+    msg = (
+        f"LLM provider unavailable for {verb}. "
+        "Check Ollama or ANTHROPIC_API_KEY configuration."
+    )
+    cfg = router.resolve("generation", tier)
+    if pin_refuses_stage(cfg):
+        raise RuntimeError(msg)
+    provider = build_provider(cfg)
     if not provider_may_serve(provider):
-        msg = (
-            f"LLM provider unavailable for {verb}. "
-            "Check Ollama or ANTHROPIC_API_KEY configuration."
-        )
         raise RuntimeError(msg)
     return provider
 
@@ -462,9 +466,12 @@ def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient 
         IntimateRoutingError: When Intimate content has no local backend to
             fall back to. ``author_tool`` turns it into a structured error.
     """
-    from creek.author.client import AuthorLLMClient
+    from creek.author.client import VOICE_DRAFTER_ROLE, AuthorLLMClient
 
     config = load_vault_config(vault)
+    voice = config.model_router.resolve_role(VOICE_DRAFTER_ROLE, tier)
+    if pin_refuses_stage(voice):
+        return None
     return AuthorLLMClient.for_voice_or_none(
         config.model_router,
         author=config.author,

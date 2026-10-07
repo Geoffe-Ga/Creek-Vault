@@ -20,7 +20,11 @@ from creek.classify.constants import LLM_METHOD
 from creek.config import load_vault_config
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.model_pin import model_pin_enforced, pinned_model_serves
+from creek_mcp.model_pin import (
+    model_pin_enforced,
+    pin_refuses_stage,
+    pinned_model_serves,
+)
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
 if TYPE_CHECKING:
@@ -48,6 +52,12 @@ def _require_pinned_classifier(config: CreekConfig) -> None:
     here anyway. The config is loaded once per call and handed to the
     engine, so the stage checked is the stage every fragment uses.
 
+    A cloud stage is refused from its config before any provider is built:
+    its constructor raises a bare ``RuntimeError`` when the key or consent
+    is missing, which is the normal state in a container, and that would
+    escape this tool instead of becoming its structured refusal. Any other
+    build failure is turned into the same refusal.
+
     Args:
         config: The classified vault's own configuration.
 
@@ -60,10 +70,17 @@ def _require_pinned_classifier(config: CreekConfig) -> None:
     if not model_pin_enforced():
         return
     cfg = config.model_router.resolve("classification")
-    if not pinned_model_serves(build_provider(cfg)):
-        raise LLMProviderUnavailableError(
-            provider=cfg.provider, detail=_UNPINNED_DETAIL
-        )
+    unpinned = LLMProviderUnavailableError(
+        provider=cfg.provider, detail=_UNPINNED_DETAIL
+    )
+    if pin_refuses_stage(cfg):
+        raise unpinned
+    try:
+        provider = build_provider(cfg)
+    except RuntimeError as exc:
+        raise unpinned from exc
+    if not pinned_model_serves(provider):
+        raise unpinned
 
 
 def classify_tool(

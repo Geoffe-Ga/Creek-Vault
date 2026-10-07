@@ -10,7 +10,7 @@ specialists and the reflection node are deterministic and do not use it.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from creek.classify.llm.providers import Completion, build_provider
 
@@ -22,7 +22,10 @@ if TYPE_CHECKING:
     from creek.config import AuthorConfig, LLMConfig
     from creek.models import PrivacyTier
 
-_VOICE_ROLES = frozenset({"voice_drafter", "voice_line_editor"})
+VOICE_DRAFTER_ROLE: Final[str] = "voice_drafter"
+"""The Writing Desk role :meth:`AuthorLLMClient.for_voice_or_none` resolves."""
+
+_VOICE_ROLES = frozenset({VOICE_DRAFTER_ROLE, "voice_line_editor"})
 """Writing Desk roles whose model the legacy ``AuthorConfig.voice_model``
 field falls back to (#474) when the role has no ``writing_desk`` entry (#649)."""
 
@@ -173,7 +176,7 @@ class AuthorLLMClient:
             IntimateRoutingError: Propagated from :meth:`for_role` when an
                 ``Intimate`` role is cloud with no local fallback.
         """
-        client = cls.for_role(router, "voice_drafter", author=author, tier=tier)
+        client = cls.for_role(router, VOICE_DRAFTER_ROLE, author=author, tier=tier)
         if may_serve is None:
             return client if client.available else None
         return client if may_serve(client._provider) else None

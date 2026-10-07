@@ -23,7 +23,7 @@ probe-only.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from creek.classify.llm.local_boundary import is_loopback_url, loopback_only_enforced
 from creek_mcp.model_package import (
@@ -36,6 +36,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from creek.classify.llm.base import LLMProvider
+    from creek.config import LLMConfig
+
+PINNED_PROVIDER: Final[str] = "ollama"
+"""The only provider a pin mode admits; checked on the config before any build."""
 
 
 def model_pin_enforced(environ: Mapping[str, str] | None = None) -> bool:
@@ -51,6 +55,23 @@ def model_pin_enforced(environ: Mapping[str, str] | None = None) -> bool:
     source = os.environ if environ is None else environ
     configured = bool(source.get(MODEL_PACKAGE_FILE_ENV, "").strip())
     return configured or loopback_only_enforced(source)
+
+
+def pin_refuses_stage(cfg: LLMConfig) -> bool:
+    """Return whether a pin mode refuses *cfg* on its provider alone.
+
+    Decided from the config, before any provider is built. A cloud provider's
+    constructor raises a bare ``RuntimeError`` when its key or consent is
+    missing, which is the normal state in a container, so building it first
+    would surface the SDK's message instead of the caller's own refusal.
+
+    Args:
+        cfg: The resolved stage configuration.
+
+    Returns:
+        ``True`` when a pin mode applies and *cfg* is not an Ollama stage.
+    """
+    return model_pin_enforced() and cfg.provider != PINNED_PROVIDER
 
 
 def provider_may_serve(provider: LLMProvider) -> bool:
