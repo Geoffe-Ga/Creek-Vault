@@ -51,7 +51,7 @@ one.
 | 1 | **TDD** (Red→Green→Refactor, `stay-green`) | → Gate 2 | — |
 | 2 | **`cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`** | → push → Gate 3 | **drop to Gate 1** |
 | 3 | **CI** all green | → Gate 4 | **drop to Gate 1** (via `ci-debugging`) |
-| 4 | **Claude review `Verdict:`** | `LGTM` + green + up-to-date → **merge + mark issue done + refill** | **drop to Gate 1** (via `address-feedback`) |
+| 4 | **Claude review `Verdict:`** | `LGTM` + green + up-to-date → **merge + mark issue done + refill**. `COMMENTS` + green + up-to-date → **file `P0`–`P3` follow-up issues, then merge** — never iterate (Step 2) | `CHANGES_REQUESTED` → **drop to Gate 1** (via `address-feedback`) |
 
 "Drop to Gate 1" means: fix the root cause with a failing-test-first cycle, re-clear Gate 2 locally, push, and climb again. Never weaken a gate to pass it.
 
@@ -390,8 +390,11 @@ Then act on `$STATUS`:
   rather than editing this PR.
 - **`changes-requested`** — CI is green and a **fresh** verdict (posted after
   the PR's HEAD commit) exists and is not `LGTM` — i.e. `CHANGES_REQUESTED` or
-  `COMMENTS`. This is **Gate 4 failed**, an actionable state, not a wait:
-  advance it via Step 2's `address-feedback` path **now**. (Precedence: the
+  `COMMENTS`. This is an actionable state, not a wait. On
+  `CHANGES_REQUESTED` it is **Gate 4 failed**: advance it via Step 2's
+  `address-feedback` path **now**. On `COMMENTS` the reviewer signed off: file
+  prioritized follow-ups and merge per Step 2's `COMMENTS` bullet — never a fix
+  worker. (Precedence: the
   verdict is only consulted once CI is green, so `pending`/`ci-failed` classify
   exactly as before even when a verdict has already landed; a stale non-LGTM
   still reads `awaiting-review` because the re-review is owed on the new HEAD;
@@ -418,8 +421,26 @@ into that PR's worktree only if it needs a fix (re-attach a worktree with
 `scripts/ralph/fleet.sh assign "$N" "<slug>"` if reconcile removed it — `assign`
 reuses the existing branch):
 
+- **`COMMENTS` verdict** (`pr-ready.sh` printed `changes-requested` and the
+  fresh verdict line reads `COMMENTS`): **never iterate — dispatch no worker,
+  push nothing, request no re-review.** The orchestrator runs
+  `address-feedback` Step 1A itself: file each actionable item as a follow-up
+  issue labelled `P0`–`P3` by severity (plus `agent-ready`), link duplicates,
+  moratorium-defer loop-tooling rows, reply on and resolve every thread, and
+  post the `Follow-ups filed: …` summary. Then merge the lane on the same
+  evidence `ready` requires, with the filed follow-ups standing in for `LGTM`:
+  ```bash
+  gh pr checks "$PR_NUM" >/dev/null && echo CI-GREEN          # exit 0 only
+  HEAD_SHA=$(gh pr view "$PR_NUM" --json headRefOid -q .headRefOid)
+  gh api "repos/{owner}/{repo}/compare/main...$HEAD_SHA" --jq .behind_by   # must print 0
+  gh pr view "$PR_NUM" --json labels -q '[.labels[].name] | index("do-not-auto-merge")'  # must print null
+  ```
+  All three hold → run Step 1's `ready` merge block verbatim (merge, close,
+  `release`, state bump). Behind → `fleet.sh sync` and let the fresh verdict on
+  the new HEAD decide; the follow-up issues already filed stand. Any other
+  answer → leave the lane for a later wake.
 - **Gate 4 failed** — `pr-ready.sh` printed **`changes-requested`** (a fresh
-  `CHANGES_REQUESTED`/`COMMENTS` verdict): worker runs the
+  `CHANGES_REQUESTED` verdict): worker runs the
   **`address-feedback`** flow in the worktree — triage, TDD fix loop dispatching
   the specialist that owns each comment, re-clear Gate 2 + Gate 2.5, push, reply,
   resolve threads.
@@ -611,8 +632,12 @@ slot and the loop behaves exactly like the classic one-issue-at-a-time Ralph —
 still worktree-isolated, same gates, same drop-backs.
 
 ## Hard rules (do not deviate)
-- **Merge a lane only when `scripts/ralph/pr-ready.sh` prints `ready`.** No
-  other evidence merges a lane. "Up to date with `main`" means the compare
+- **Merge a lane only when `scripts/ralph/pr-ready.sh` prints `ready`** — or
+  `changes-requested` on a fresh `COMMENTS` verdict once Step 2's `COMMENTS`
+  bullet has filed its follow-ups and proved green CI, `behind_by == 0`, and no
+  hold. No other evidence merges a lane.
+- **A `COMMENTS` verdict never iterates.** No worker, no push, no re-review:
+  its findings become `P0`–`P3` follow-up issues and the lane merges. "Up to date with `main`" means the compare
   API's `behind_by == 0` — **never** `mergeStateStatus` alone: this repo does
   not enforce strict/up-to-date status checks, so GitHub only computes
   `BEHIND` in the narrow case it would already block the merge on its own, and

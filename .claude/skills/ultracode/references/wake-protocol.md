@@ -82,7 +82,10 @@ For each lane that is red:
 - **A CI failure whose steps are `null` after setup, with `BlobNotFound` logs and
   wall-clock wildly off** is runner eviction — infrastructure, not your code.
   Re-run; do not debug it.
-- **Verdict `CHANGES_REQUESTED` / `COMMENTS`** → `address-feedback`.
+- **Verdict `CHANGES_REQUESTED`** → `address-feedback` fix loop.
+- **Verdict `COMMENTS`** → never iterate: `address-feedback` Step 1A files each
+  actionable item as a follow-up issue with a severity-matched `P0`–`P3` label,
+  then merge.
 - **Lane returned BLOCKED on a denied `git push`** → this is common and is not a
   lane failure. Finish the push from the orchestrator:
   `cd <worktree> && git push origin <branch>`. Orchestrator pushes succeed where
