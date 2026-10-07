@@ -139,5 +139,6 @@ def test_outcome_counts_zero_filled() -> None:
         Outcome.OOM: 1,
         Outcome.DISK_FULL: 0,
         Outcome.PROVIDER_UNAVAILABLE: 0,
+        Outcome.CONTEXT_OVERFLOW: 0,
         Outcome.ERROR: 0,
     }

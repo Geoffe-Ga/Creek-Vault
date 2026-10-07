@@ -29,7 +29,7 @@ import httpx
 
 from creek.classify.llm import providers
 from creek_mcp.bench.metadata import UNKNOWN
-from creek_mcp.bench.outcome import ProviderUnavailableError
+from creek_mcp.bench.outcome import ContextOverflowError, ProviderUnavailableError
 
 if TYPE_CHECKING:
     from creek.models import PrivacyTier
@@ -50,6 +50,7 @@ _DEFAULT_TAG: Final[str] = "latest"
 _UNREACHABLE: Final[str] = "the benchmark's Ollama endpoint is unreachable"
 _NOT_INSTALLED: Final[str] = "the pinned model is not installed"
 _MISMATCH: Final[str] = "the installed model digest does not match the pin"
+_OVERFLOW: Final[str] = "the prompt filled the context window and was truncated"
 
 
 class DigestMismatchError(ValueError):
@@ -163,6 +164,7 @@ class BenchOllamaClient:
         Returns:
             The completion text; empty when the body is malformed.
         """
+        ceiling = min(num_predict, self._num_predict)
         payload = {
             "model": self._model_tag,
             "prompt": prompt,
@@ -170,11 +172,29 @@ class BenchOllamaClient:
             "think": False,
             "options": {
                 "num_ctx": self._num_ctx,
-                "num_predict": min(num_predict, self._num_predict),
+                "num_predict": ceiling,
             },
         }
         data = self._request("POST", "/api/generate", payload)
-        return str(data.get("response", "")) if isinstance(data, dict) else ""
+        if not isinstance(data, dict):
+            return ""
+        self._refuse_truncation(data.get("prompt_eval_count"), ceiling)
+        return str(data.get("response", ""))
+
+    def _refuse_truncation(self, evaluated: object, ceiling: int) -> None:
+        """Raise when the evaluated prompt left no room for the output.
+
+        Ollama silently truncates a prompt longer than ``num_ctx``; the only
+        trace is ``prompt_eval_count`` reaching the window. A prompt evaluated
+        at or past ``num_ctx - ceiling`` is treated as truncated. A runtime that
+        reuses a cached prefix reports fewer evaluated tokens, so this can miss
+        an overflow but never flags a prompt that left room for its output.
+
+        Raises:
+            ContextOverflowError: When the prompt filled the window.
+        """
+        if isinstance(evaluated, int) and evaluated >= self._num_ctx - ceiling:
+            raise ContextOverflowError(_OVERFLOW)
 
     def factory(self) -> LLMFactory:
         """Return a reflect-shaped factory over this client."""

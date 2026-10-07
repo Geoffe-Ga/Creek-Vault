@@ -77,7 +77,19 @@ _TRIAL_FAILURES: Final[tuple[type[BaseException], ...]] = (
 _BAD_LEVEL: Final[str] = "concurrency levels must be at least 1"
 _BAD_COUNT: Final[str] = "trial counts must be non-negative"
 _BAD_IDLE: Final[str] = "idle_seconds must be non-negative"
-_BAD_CONTEXT: Final[str] = "context sizes must be between 1 and num_ctx"
+_BAD_CONTEXT: Final[str] = (
+    "context sizes must be between 1 and num_ctx minus the prompt overhead "
+    "and num_predict"
+)
+
+PROMPT_OVERHEAD_TOKENS: Final[int] = 1536
+"""Token allowance for reflect's prompt around the entry.
+
+An upper bound, not an estimate: it covers the template's *byte* length with
+every grounding slot filled and the largest note budget (1,448 bytes at
+``a5d28a5``), and a byte-level tokenizer never spends less than one byte per
+token. ``tests/bench/test_runner.py`` fails if reflect's template outgrows it.
+"""
 _LIVE_NEEDS_PIN: Final[str] = "a live run needs a digest-verifying backend"
 
 
@@ -355,6 +367,17 @@ def _idle(harness: _Harness, session: GroundingSession) -> list[Trial]:
     return trials
 
 
+def max_context_words(metadata: RunMetadata) -> int:
+    """Return the largest entry (in words) the context sweep may request.
+
+    Every word is at least one token, so a size above this certainly
+    overflows ``num_ctx`` once the template and the output are added. A size
+    at or below it can still overflow when words tokenize to several tokens;
+    the live client reports that as ``context_overflow`` rather than ``ok``.
+    """
+    return metadata.num_ctx - PROMPT_OVERHEAD_TOKENS - metadata.num_predict
+
+
 def _validate(plan: BenchPlan) -> None:
     """Refuse a malformed or unpinnable plan before any I/O."""
     workload = plan.workload
@@ -372,7 +395,8 @@ def _validate(plan: BenchPlan) -> None:
         raise WorkloadError(_BAD_COUNT)
     if workload.idle_seconds < 0:
         raise WorkloadError(_BAD_IDLE)
-    if any(not 0 < size <= plan.metadata.num_ctx for size in workload.context_sizes):
+    limit = max_context_words(plan.metadata)
+    if any(not 0 < size <= limit for size in workload.context_sizes):
         raise WorkloadError(_BAD_CONTEXT)
     if plan.metadata.mode == "live" and plan.backend.pin is None:
         raise WorkloadError(_LIVE_NEEDS_PIN)

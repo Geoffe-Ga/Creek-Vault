@@ -18,7 +18,7 @@ import pytest
 from creek.classify.llm.providers import OllamaProvider
 from creek.models import PrivacyTier
 from creek_mcp.bench.ollama_client import BenchOllamaClient, DigestMismatchError
-from creek_mcp.bench.outcome import ProviderUnavailableError
+from creek_mcp.bench.outcome import ContextOverflowError, ProviderUnavailableError
 
 _HEX = "b" * 64
 _LICENSE_CANARY = "CANARY-license-text-7d1e"
@@ -223,3 +223,28 @@ def test_http_error_status_raises() -> None:
     """A non-2xx answer surfaces as ``HTTPStatusError`` for classification."""
     with pytest.raises(httpx.HTTPStatusError):
         _client(_Recorder()).evict()
+
+
+@pytest.mark.parametrize("evaluated", [2048 - 96, 2048, 5000])
+def test_prompt_that_filled_the_window_is_a_context_overflow(evaluated: int) -> None:
+    """A prompt evaluated at or past ``num_ctx - num_predict`` was truncated.
+
+    Ollama truncates an oversized prompt to the window rather than failing,
+    and still answers; the evaluated-token count is the only trace of it.
+    """
+    recorder = _Recorder(
+        {"/api/generate": {"response": "x", "prompt_eval_count": evaluated}}
+    )
+    llm = _client(recorder).factory()(PrivacyTier.OPEN, max_tokens=96)
+    with pytest.raises(ContextOverflowError):
+        llm("p")
+
+
+@pytest.mark.parametrize("evaluated", [2048 - 97, 1, None, "n/a"])
+def test_prompt_inside_the_window_is_answered(evaluated: object) -> None:
+    """Room left for the output, or no count reported, is not an overflow."""
+    body: dict[str, object] = {"response": "x"}
+    if evaluated is not None:
+        body["prompt_eval_count"] = evaluated
+    recorder = _Recorder({"/api/generate": body})
+    assert _client(recorder).factory()(PrivacyTier.OPEN, max_tokens=96)("p") == "x"

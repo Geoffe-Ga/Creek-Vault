@@ -38,6 +38,7 @@ class Outcome(StrEnum):
     OOM = "oom"
     DISK_FULL = "disk_full"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    CONTEXT_OVERFLOW = "context_overflow"
     ERROR = "error"
 
 
@@ -47,6 +48,14 @@ class ProviderUnavailableError(RuntimeError):
     A ``RuntimeError`` so ``reflect_tool`` degrades it to its ordinary
     "reflection unavailable" refusal, exactly as production does for a
     missing provider; the probe is what keeps the distinction.
+    """
+
+
+class ContextOverflowError(RuntimeError):
+    """The prompt filled the pinned context window, so the runtime truncated it.
+
+    Ollama answers a truncated prompt instead of failing; a trial that timed a
+    shorter prompt than it reports must not count as ``ok``.
     """
 
 
@@ -101,6 +110,8 @@ def classify_outcome(exc: BaseException | None) -> Outcome:
         return Outcome.DISK_FULL
     if isinstance(exc, httpx.ConnectError | ProviderUnavailableError):
         return Outcome.PROVIDER_UNAVAILABLE
+    if isinstance(exc, ContextOverflowError):
+        return Outcome.CONTEXT_OVERFLOW
     return Outcome.ERROR
 
 

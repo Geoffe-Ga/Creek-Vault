@@ -18,12 +18,23 @@ import httpx
 import pytest
 
 from creek.classify.llm.router import IntimateRoutingError
+from creek.config import AuthorConfig
 from creek_mcp.bench.deadline import Verdict
 from creek_mcp.bench.local_only import CloudProviderRefusedError, LocalOnlyFactory
 from creek_mcp.bench.ollama_client import PinnedModel
-from creek_mcp.bench.outcome import Outcome, ProviderUnavailableError
-from creek_mcp.bench.runner import WorkloadError, run_bench
+from creek_mcp.bench.outcome import (
+    ContextOverflowError,
+    Outcome,
+    ProviderUnavailableError,
+)
+from creek_mcp.bench.runner import (
+    PROMPT_OVERHEAD_TOKENS,
+    WorkloadError,
+    max_context_words,
+    run_bench,
+)
 from creek_mcp.bench.trial import Phase, Sweep
+from creek_mcp.tools.reflect import _build_prompt
 from tests.bench.conftest import FakeModel, Recorded, make_plan, run_metadata
 
 if TYPE_CHECKING:
@@ -414,3 +425,54 @@ def test_dropped_runtime_with_failing_model_still_reports(tmp_path: Path) -> Non
     outcomes = {t.outcome for s in report.per_sweep.values() for t in s.trials}
     assert outcomes == {Outcome.PROVIDER_UNAVAILABLE}
     assert report.verdict is Verdict.INSUFFICIENT_DATA
+
+
+def test_context_sweep_upper_boundary_is_inclusive_and_conservative(
+    tmp_path: Path, fake_model: FakeModel
+) -> None:
+    """The largest admitted entry leaves room for the template and the output.
+
+    ``num_ctx`` minus the prompt-overhead allowance minus ``num_predict`` is
+    admitted (the inclusive edge AC8 promises); one word more is refused.
+    """
+    metadata = run_metadata(num_ctx=2048, num_predict=64)
+    limit = max_context_words(metadata)
+    assert limit == 2048 - PROMPT_OVERHEAD_TOKENS - 64
+    plan = make_plan(
+        fake_model,
+        metadata=metadata,
+        **_only_warm(warm_trials=0, context_sizes=(limit,)),
+    )
+    (trial,) = _trials(run_bench(plan, tmp_path / "ok"), Sweep.CONTEXT)
+    assert trial.input_words == limit
+    over = make_plan(
+        fake_model,
+        metadata=metadata,
+        **_only_warm(warm_trials=0, context_sizes=(limit + 1,)),
+    )
+    with pytest.raises(WorkloadError, match="num_ctx"):
+        run_bench(over, tmp_path / "over")
+    assert not (tmp_path / "over").exists()
+
+
+def test_prompt_overhead_bounds_the_real_reflect_template() -> None:
+    """The allowance covers reflect's template at its largest, in bytes.
+
+    A byte-level tokenizer spends at least one byte per token, so the byte
+    length of the template (with every grounding slot filled and the largest
+    note budget) is an upper bound on its tokens. If reflect's prompt grows
+    past the allowance, this fails rather than the sweep silently truncating.
+    """
+    top_k = AuthorConfig().retrieval_top_k
+    template = _build_prompt("", ["bench note 0000"] * top_k, max_notes=10)
+    assert len(template.encode("utf-8")) <= PROMPT_OVERHEAD_TOKENS
+
+
+def test_truncated_prompt_is_a_context_overflow_not_ok(tmp_path: Path) -> None:
+    """A runtime-reported truncation survives reflect's refusal and is non-ok."""
+    model = FakeModel(call_exc=ContextOverflowError("full"))
+    plan = make_plan(model, **_only_warm(warm_trials=0, context_sizes=(32,)))
+    report = run_bench(plan, tmp_path / "corpus")
+    (trial,) = _trials(report, Sweep.CONTEXT)
+    assert trial.outcome is Outcome.CONTEXT_OVERFLOW
+    assert report.per_sweep[Sweep.CONTEXT].verdict is Verdict.INSUFFICIENT_DATA

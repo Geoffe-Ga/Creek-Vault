@@ -39,7 +39,7 @@ The run is made of four sweeps:
 | Sweep | Flags | What it answers |
 |---|---|---|
 | cold/warm | `--cold-trials`, `--warm-trials` | Each cold trial evicts the model (`keep_alive: 0`) and starts a fresh grounding session first. Warm trials share one session. |
-| context | `--context-sizes 512,2048` | Latency at each entry size, in words. A size above `--num-ctx` is refused. |
+| context | `--context-sizes 512,2048` | Latency at each entry size, in words. Sizes are refused unless size + a 1,536-token prompt-overhead allowance + `--num-predict` fits in `--num-ctx`. Words can tokenize to several tokens, so a size that passes can still overflow; a live run reports that trial as `context_overflow` (from Ollama's `prompt_eval_count`), never `ok`. |
 | concurrency | `--concurrency 1,2,4` | Runs `N` reflections in flight together on `N` threads, the way `/v1` serves reads. |
 | idle | `--idle-cycles`, `--idle-seconds` | Evict, wait, then resume. |
 
@@ -87,7 +87,7 @@ JSON schema.
 | `per_sweep.<sweep>.verdict` | `fits` only when p95 ≤ budget **and** no trial failed. |
 | `verdict` | Any `exceeds` dominates, then any `insufficient_data`. |
 | `capacity` | The largest concurrency level that fits, together with every level below it. It is compared against `/v1`'s admission caps (`DEFAULT_MAX_CONCURRENCY`, `DEFAULT_MAX_PER_CONSUMER`). It reports and changes nothing. |
-| `trials[].outcome` | One of `ok`, `timeout`, `oom`, `disk_full`, `provider_unavailable` or `error`. |
+| `trials[].outcome` | One of `ok`, `timeout`, `oom`, `disk_full`, `provider_unavailable`, `context_overflow` or `error`. |
 | `trials[].model_resident_bytes` | The model's size from `/api/ps`. This is the runtime's figure, not the harness process's RSS. |
 | `quality_score` | Reserved for the B22 quality evaluation. Always `null` here. |
 

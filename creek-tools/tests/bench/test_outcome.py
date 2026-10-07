@@ -19,6 +19,7 @@ import pytest
 from creek.classify.llm.router import IntimateRoutingError
 from creek.models import PrivacyTier
 from creek_mcp.bench.outcome import (
+    ContextOverflowError,
     Outcome,
     ProviderUnavailableError,
     TrialProbe,
@@ -51,6 +52,7 @@ def _status_error(status: int, body: str) -> httpx.HTTPStatusError:
         (httpx.ReadTimeout("slow", request=_REQUEST), Outcome.TIMEOUT),
         (httpx.ConnectError("refused", request=_REQUEST), Outcome.PROVIDER_UNAVAILABLE),
         (ProviderUnavailableError("down"), Outcome.PROVIDER_UNAVAILABLE),
+        (ContextOverflowError("full"), Outcome.CONTEXT_OVERFLOW),
         (
             _status_error(500, '{"error":"model requires more system memory"}'),
             Outcome.OOM,
@@ -74,6 +76,7 @@ def test_enum_is_closed() -> None:
         "oom",
         "disk_full",
         "provider_unavailable",
+        "context_overflow",
         "error",
     }
 
