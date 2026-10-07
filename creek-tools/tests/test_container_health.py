@@ -266,3 +266,79 @@ def test_v1_probe_treats_transport_failure_as_unready(
     monkeypatch.setattr(health.httpx, "get", fail)
 
     assert health._v1_is_ready(settings) is False
+
+
+def test_ready_probe_is_independent_of_model_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Storage-ready is not model-ready, and a dead model never fails READY."""
+    from creek_mcp import container_health as health
+    from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV
+
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(health, "_process_is_up", lambda _settings: True)
+    monkeypatch.setattr(health, "_volume_is_mounted", lambda _settings: True)
+    monkeypatch.setattr(health, "_v1_is_ready", lambda _settings: True)
+    monkeypatch.setattr(health, "configured_manifest", lambda: _any_manifest())
+
+    def dead_runtime(*_args: object, **_kwargs: object) -> httpx.Response:
+        raise httpx.ConnectError("runtime is down")
+
+    monkeypatch.setattr(health.httpx, "get", dead_runtime)
+    monkeypatch.delenv(MODEL_PACKAGE_FILE_ENV, raising=False)
+
+    ready = probe(settings, ProbeTarget.READY)
+    model = probe(settings, ProbeTarget.MODEL)
+
+    assert ready.status is ProbeStatus.V1_READY
+    assert ready.exit_code == 0
+    assert model.status is ProbeStatus.RUNTIME_DOWN
+    assert model.exit_code != 0
+    assert health._parser().parse_args([]).check == "ready"
+
+
+def _any_manifest() -> object:
+    """Return a syntactically valid pin; the runtime is what is under test."""
+    from creek_mcp.model_package import ModelPackageManifest
+
+    return ModelPackageManifest(
+        schema_version=1,
+        runtime_name="creek-test-runtime",
+        runtime_version="0.0.1",
+        runtime_digest="c" * 64,
+        model_name="creek-test-model:q4",
+        model_blob_sha256="b" * 64,
+        runtime_inventory_digest="d" * 64,
+        quantization="Q4_K_M",
+        parameter_count=1,
+        size_bytes=1,
+        license_spdx="Apache-2.0",
+        license_url="https://example.test/LICENSE",
+    )
+
+
+def test_exit_code_table_is_exhaustive_and_stable() -> None:
+    """Every status has one stable code; every target has a fallback status."""
+    from creek_mcp import container_health as health
+
+    codes = health._EXIT_CODES
+    assert set(codes) == set(ProbeStatus)
+    assert codes[ProbeStatus.PROCESS_DOWN] == 20
+    assert codes[ProbeStatus.VOLUME_UNMOUNTED] == 21
+    assert codes[ProbeStatus.V1_UNREADY] == 22
+    assert codes[ProbeStatus.MODEL_READY] == 0
+    model_failures = {
+        ProbeStatus.RUNTIME_DOWN: 23,
+        ProbeStatus.MODEL_MISSING: 24,
+        ProbeStatus.MODEL_DIGEST_MISMATCH: 25,
+        ProbeStatus.GENERATION_FAILED: 26,
+    }
+    assert {status: codes[status] for status in model_failures} == model_failures
+    failures = [code for code in codes.values() if code != 0]
+    assert len(failures) == len(set(failures))
+    assert set(health._UNAVAILABLE) == set(ProbeTarget)
+    assert health._UNAVAILABLE[ProbeTarget.MODEL] is ProbeStatus.MODEL_MISSING
+    assert health._UNAVAILABLE[ProbeTarget.READY] is ProbeStatus.V1_UNREADY
+    for target, status in health._UNAVAILABLE.items():
+        assert codes[status] != 0, target
