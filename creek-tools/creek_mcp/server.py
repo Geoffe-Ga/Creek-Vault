@@ -26,8 +26,10 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 
 from creek.care.guardrail import acute_distress_guard
+from creek.classify.llm.local_boundary import is_loopback_url, loopback_only_enforced
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
+from creek_mcp.model_package import ModelPackageError, configured_manifest
 from creek_mcp.policy import (
     Admission,
     CallerIdentity,
@@ -86,6 +88,7 @@ if TYPE_CHECKING:
     from creek.author.client import AuthorLLMClient
     from creek.classify.llm.base import LLMProvider
     from creek.compile.engine import CompileLLM
+    from creek.config import LLMConfig
     from creek.models import PrivacyTier
     from creek_mcp.tools.author import AuthorLLMFactory
     from creek_mcp.tools.compile import CompileLLMFactory
@@ -353,7 +356,7 @@ def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
     def _factory(tier: PrivacyTier, *, max_tokens: int) -> _LLM:
         cfg = router.resolve("generation", tier)
         provider = build_provider(cfg)
-        if not provider.available:
+        if not _reflection_provider_available(cfg, provider):
             msg = (
                 "LLM provider unavailable for reflection. "
                 "Check Ollama or ANTHROPIC_API_KEY configuration."
@@ -366,6 +369,47 @@ def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
         )
 
     return _factory
+
+
+def _reflection_provider_available(cfg: LLMConfig, provider: LLMProvider) -> bool:
+    """Return whether *provider* may serve a reflection right now (#1849).
+
+    Outside container mode with no model package configured this is just
+    ``provider.available``. Once either applies, reflection is served only by
+    the pinned local model: an Ollama stage on a loopback URL whose resolved
+    model is the manifest's pinned tag, listed by the runtime at the pinned
+    inventory digest. That is one ``/api/tags`` call; the generation canary
+    stays probe-only so the per-request budget is untouched.
+
+    The check runs per request, because the vault config it reads is writable
+    after boot: an edit pointing ``ollama_url`` at a remote host, or the stage
+    at another model or a cloud provider, is refused before any dial. A
+    configured manifest that cannot be loaded fails closed.
+
+    Args:
+        cfg: The resolved generation-stage configuration.
+        provider: The provider built from *cfg*.
+
+    Returns:
+        ``True`` only when the provider may be used for this reflection.
+    """
+    from creek.classify.llm.providers import OllamaProvider, check_ollama_available
+
+    try:
+        manifest = configured_manifest()
+    except ModelPackageError:
+        return False
+    if manifest is None and not loopback_only_enforced():
+        return provider.available
+    if manifest is None or cfg.provider != "ollama":
+        return False
+    if not is_loopback_url(cfg.ollama_url) or provider.model != manifest.model_name:
+        return False
+    return check_ollama_available(
+        cfg,
+        timeout=OllamaProvider.AVAILABILITY_TIMEOUT,
+        expected_digest=manifest.runtime_inventory_digest,
+    )
 
 
 def _complete_reflection(

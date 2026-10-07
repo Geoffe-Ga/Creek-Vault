@@ -271,3 +271,22 @@ def test_fly_runtime_restores_existing_environment_when_server_fails(
         runtime.run(settings)
 
     assert {name: os.environ.get(name) for name in original} == original
+
+
+def test_fly_runtime_environment_enforces_loopback_and_restores_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Fly runtime sets the loopback boundary only while it serves."""
+    from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+    from creek_mcp.fly_vault_runtime import _runtime_environment
+
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "")
+    monkeypatch.delenv(LOOPBACK_ONLY_ENV)
+    with _runtime_environment(tmp_path / "creek.yaml", tmp_path):
+        assert os.environ[LOOPBACK_ONLY_ENV] == "1"
+    assert LOOPBACK_ONLY_ENV not in os.environ
+
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "operator-value")
+    with _runtime_environment(tmp_path / "creek.yaml", tmp_path):
+        assert os.environ[LOOPBACK_ONLY_ENV] == "1"
+    assert os.environ[LOOPBACK_ONLY_ENV] == "operator-value"

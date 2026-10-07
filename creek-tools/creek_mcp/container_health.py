@@ -1,4 +1,11 @@
-"""Layered health probe for the one-vault Creek container (#1772)."""
+"""Layered health probe for the one-vault Creek container (#1772, #1849).
+
+``ready`` is storage readiness: the process, the mounted vault and
+authenticated ``/v1``. ``model`` is a separate, fail-closed question — can the
+pinned local model generate? — answered without reading the vault or its
+config. The image healthcheck keeps probing ``ready``, so a missing model never
+marks the vault API unhealthy, and storage-ready never implies model-ready.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +20,13 @@ from typing import Final
 
 import httpx
 
+from creek.classify.llm.local_boundary import ollama_get
+from creek.classify.llm.providers import (
+    call_ollama,
+    ollama_digest_matches,
+    ollama_model_digest,
+)
+from creek.config import LLMConfig
 from creek_mcp.container_runtime import (
     ContainerConfigurationError,
     ContainerSettings,
@@ -20,8 +34,21 @@ from creek_mcp.container_runtime import (
     load_consumer_secret,
 )
 from creek_mcp.fly_vault_runtime import REPLAY_STATE_FILE_ENV, _load_replay_state
+from creek_mcp.model_package import (
+    ModelPackageError,
+    ModelPackageManifest,
+    configured_manifest,
+)
 
 _PROBE_TIMEOUT: Final[float] = 2.0
+
+CANARY_PROMPT: Final[str] = "Reply with the single word: ready"
+"""The fixed synthetic generation the model probe asks for; never vault data."""
+
+_CANARY_MAX_TOKENS: Final[int] = 8
+_CANARY_TIMEOUT: Final[float] = 20.0
+_LOOPBACK_RUNTIME: Final[LLMConfig] = LLMConfig()
+"""The in-container runtime endpoint; deliberately not read from vault config."""
 
 
 class ProbeTarget(StrEnum):
@@ -30,6 +57,7 @@ class ProbeTarget(StrEnum):
     PROCESS = "process"
     VOLUME = "volume"
     READY = "ready"
+    MODEL = "model"
 
 
 class ProbeStatus(StrEnum):
@@ -41,6 +69,11 @@ class ProbeStatus(StrEnum):
     VOLUME_UNMOUNTED = "vault-unmounted"
     V1_READY = "v1-ready"
     V1_UNREADY = "v1-unready"
+    MODEL_READY = "model-ready"
+    RUNTIME_DOWN = "runtime-down"
+    MODEL_MISSING = "model-missing"
+    MODEL_DIGEST_MISMATCH = "model-digest-mismatch"
+    GENERATION_FAILED = "generation-failed"
 
 
 _EXIT_CODES: Final[dict[ProbeStatus, int]] = {
@@ -50,7 +83,20 @@ _EXIT_CODES: Final[dict[ProbeStatus, int]] = {
     ProbeStatus.PROCESS_DOWN: 20,
     ProbeStatus.VOLUME_UNMOUNTED: 21,
     ProbeStatus.V1_UNREADY: 22,
+    ProbeStatus.MODEL_READY: 0,
+    ProbeStatus.RUNTIME_DOWN: 23,
+    ProbeStatus.MODEL_MISSING: 24,
+    ProbeStatus.MODEL_DIGEST_MISMATCH: 25,
+    ProbeStatus.GENERATION_FAILED: 26,
 }
+
+_UNAVAILABLE: Final[dict[ProbeTarget, ProbeStatus]] = {
+    ProbeTarget.PROCESS: ProbeStatus.V1_UNREADY,
+    ProbeTarget.VOLUME: ProbeStatus.V1_UNREADY,
+    ProbeTarget.READY: ProbeStatus.V1_UNREADY,
+    ProbeTarget.MODEL: ProbeStatus.MODEL_MISSING,
+}
+"""Each target's status when the container environment itself is invalid."""
 
 
 @dataclass(frozen=True)
@@ -117,8 +163,64 @@ def _v1_is_ready(settings: ContainerSettings) -> bool:
         return False
 
 
+def _inventory_status(manifest: ModelPackageManifest) -> ProbeStatus | None:
+    """Check the loopback runtime serves the pinned digest; ``None`` when it does."""
+    try:
+        response = ollama_get(_LOOPBACK_RUNTIME, "/api/tags", timeout=_PROBE_TIMEOUT)
+        payload: object = response.json() if response.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return ProbeStatus.RUNTIME_DOWN
+    if payload is None:
+        return ProbeStatus.RUNTIME_DOWN
+    served = ollama_model_digest(payload, manifest.model_name)
+    if served is None:
+        return ProbeStatus.MODEL_MISSING
+    if not ollama_digest_matches(served, manifest.runtime_inventory_digest):
+        return ProbeStatus.MODEL_DIGEST_MISMATCH
+    return None
+
+
+def _canary_succeeds(manifest: ModelPackageManifest) -> bool:
+    """Return whether the pinned model completes :data:`CANARY_PROMPT`."""
+    config = _LOOPBACK_RUNTIME.model_copy(update={"model": manifest.model_name})
+    try:
+        completion = call_ollama(
+            config,
+            CANARY_PROMPT,
+            timeout=_CANARY_TIMEOUT,
+            max_tokens=_CANARY_MAX_TOKENS,
+        )
+    except (httpx.HTTPError, ValueError):
+        return False
+    return bool(completion.text.strip())
+
+
+def _model_status() -> ProbeStatus:
+    """Return the pinned local model's closed readiness state.
+
+    No manifest, or one that fails to load, is ``model-missing`` without any
+    network call: an upgraded storage-only vault stays model-unavailable until
+    a verified package is configured. Nothing is logged; the prompt and the
+    model's output never leave this function.
+    """
+    try:
+        manifest = configured_manifest()
+    except ModelPackageError:
+        return ProbeStatus.MODEL_MISSING
+    if manifest is None:
+        return ProbeStatus.MODEL_MISSING
+    inventory = _inventory_status(manifest)
+    if inventory is not None:
+        return inventory
+    if _canary_succeeds(manifest):
+        return ProbeStatus.MODEL_READY
+    return ProbeStatus.GENERATION_FAILED
+
+
 def probe(settings: ContainerSettings, target: ProbeTarget) -> ProbeResult:
     """Probe *target*, preserving which dependency made readiness fail."""
+    if target is ProbeTarget.MODEL:
+        return ProbeResult(_model_status())
     if target is ProbeTarget.PROCESS:
         status = (
             ProbeStatus.PROCESS_UP
@@ -156,11 +258,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     """Print one content-free state and exit with its stable code."""
     args = _parser().parse_args(argv)
+    target = ProbeTarget(args.check)
     try:
         settings = ContainerSettings.from_environ()
-        result = probe(settings, ProbeTarget(args.check))
+        result = probe(settings, target)
     except ContainerConfigurationError:
-        result = ProbeResult(ProbeStatus.V1_UNREADY)
+        result = ProbeResult(_UNAVAILABLE[target])
     print(result.status.value)
     raise SystemExit(result.exit_code)
 
