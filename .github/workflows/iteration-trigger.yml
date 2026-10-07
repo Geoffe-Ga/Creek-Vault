@@ -3,8 +3,11 @@ name: Iteration Trigger
 # Posts a brief executive summary on a PR (commenting as the repo owner via PAT)
 # whenever CI completes fully green AND a Claude review has been posted.
 # The comment is intended to fire a webhook that wakes the Claude Code mobile
-# app via MCP so it can continue iterating on feedback. Capped at 10 self-posts
-# per PR to avoid runaway loops.
+# app via MCP so it can act on the verdict: iterate on CHANGES_REQUESTED; on
+# COMMENTS file each finding as a P0-P3 follow-up issue and merge (never
+# iterate); on LGTM merge. COMMENTS clears through the same chain as LGTM
+# (scripts/ralph/verdict-wake.sh). Capped at 10 self-posts per PR to avoid
+# runaway loops.
 #
 # The "cleared to squash merge" line this job emits is a merge instruction, so it
 # must enforce the SAME invariants as scripts/ralph/pr-ready.sh or it becomes a

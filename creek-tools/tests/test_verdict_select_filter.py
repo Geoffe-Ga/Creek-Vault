@@ -87,6 +87,9 @@ _VERDICT_RE = r"(?im)^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]"
 #: much unmarks the whole fleet); clearance must fail closed. See the block above
 #: ``readonly VERDICT_LGTM_RE`` in ``pr-ready.sh``.
 _VERDICT_LGTM_RE = r"(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+lgtm[*\s]*$"
+#: The COMMENTS clearance flag, with exactly LGTM's fail-closed polarity: a
+#: COMMENTS verdict clears a merge once its findings are filed as follow-ups.
+_VERDICT_COMMENTS_RE = r"(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+comments[*\s]*$"
 _ITER_SUMMARY_RE = r"(?m)^<!-- iteration-trigger -->[[:space:]]*$"
 _MARKER_RE = r"(?m)^<!-- creek-review pr=([0-9]+) -->[[:space:]]*$"
 _MARKER_ANY_RE = "creek-review"
@@ -159,6 +162,7 @@ def _run_filter(
     *,
     verdict_re: str = _VERDICT_RE,
     verdict_lgtm_re: str = _VERDICT_LGTM_RE,
+    verdict_comments_re: str = _VERDICT_COMMENTS_RE,
     raw_graphql: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run the shared filter over ``comments`` from the repository root.
@@ -172,6 +176,7 @@ def _run_filter(
         comments: The comment nodes to feed the filter.
         verdict_re: Override for the verdict-shape regex.
         verdict_lgtm_re: Override for the LGTM regex.
+        verdict_comments_re: Override for the COMMENTS clearance regex.
         raw_graphql: Feed the raw ``gh api graphql`` response body instead of
             the legacy ``{"comments": …}`` envelope. Both consumers store the
             raw answer now, so this is the shape production really parses.
@@ -196,6 +201,9 @@ def _run_filter(
             "verdict_lgtm_re",
             verdict_lgtm_re,
             "--arg",
+            "verdict_comments_re",
+            verdict_comments_re,
+            "--arg",
             "iter_summary_re",
             _ITER_SUMMARY_RE,
             "--arg",
@@ -219,7 +227,11 @@ def _run_filter(
 
 
 def _answer(result: subprocess.CompletedProcess[str]) -> list[str]:
-    """Return the filter's five fields, failing loudly on any other shape.
+    """Return the filter's first five fields, failing loudly on any other shape.
+
+    The answer has six fields; the sixth (the COMMENTS clearance flag) is read
+    by :func:`_comments_flag`, so the many five-field unpackings below stay
+    focused on what each test pins.
 
     Args:
         result: The completed ``jq`` process.
@@ -240,12 +252,26 @@ def _answer(result: subprocess.CompletedProcess[str]) -> list[str]:
     )
     line = result.stdout.strip("\n")
     fields = line.split("|")
-    assert len(fields) == 5, (
-        f"the filter answered {line!r} — {len(fields)} field(s), expected 5 "
-        "(createdAt|lgtm|marker|refused|databaseId). pr-ready.sh splits this "
-        "answer by field count and blanks the whole thing on a surplus field"
+    assert len(fields) == 6, (
+        f"the filter answered {line!r} — {len(fields)} field(s), expected 6 "
+        "(createdAt|lgtm|marker|refused|databaseId|comments). pr-ready.sh "
+        "splits this answer by field count and blanks the whole thing on a "
+        "surplus field"
     )
-    return fields
+    return fields[:5]
+
+
+def _comments_flag(result: subprocess.CompletedProcess[str]) -> str:
+    """Return the sixth field, the COMMENTS clearance flag.
+
+    Args:
+        result: The completed ``jq`` process.
+
+    Returns:
+        ``"true"`` or ``"false"`` as the filter printed it.
+    """
+    _answer(result)
+    return result.stdout.strip("\n").split("|")[5]
 
 
 def _shell_constant(name: str) -> str:
@@ -906,6 +932,43 @@ def test_the_answer_carries_the_selected_comments_database_id(
     )
 
 
+@pytest.mark.parametrize(
+    ("verdict_line", "expected"),
+    [
+        ("## Verdict: COMMENTS", "true"),
+        ("**Verdict:** COMMENTS", "true"),
+        ("## Verdict: LGTM", "false"),
+        ("## Verdict: CHANGES_REQUESTED", "false"),
+        ("## Verdict: COMMENTS would be too lenient here", "false"),
+    ],
+)
+def test_the_comments_flag_reads_only_a_bare_comments_verdict(
+    tmp_path: Path, verdict_line: str, expected: str
+) -> None:
+    """COMMENTS now clears a merge, so it is read with LGTM's polarity.
+
+    A sentence ABOUT a COMMENTS verdict must not set the flag, exactly as a
+    rationale that merely says "Verdict: LGTM would be premature" must not set
+    the LGTM flag. Run through the constants ``pr-ready.sh`` really declares.
+    """
+    body = f"<!-- creek-review pr=100 -->\n\n## Summary\nnits\n\n{verdict_line}\n"
+    result = _run_filter(
+        tmp_path,
+        [_comment(body=body)],
+        verdict_re=_shell_constant("VERDICT_RE"),
+        verdict_lgtm_re=_shell_constant("VERDICT_LGTM_RE"),
+        verdict_comments_re=_shell_constant("VERDICT_COMMENTS_RE"),
+    )
+    assert _comments_flag(result) == expected, (
+        f"{verdict_line!r} gave the COMMENTS flag {result.stdout.strip()!r}"
+    )
+
+
+def test_the_module_comments_regex_matches_pr_ready() -> None:
+    """The copy above must be the regex production passes."""
+    assert _shell_constant("VERDICT_COMMENTS_RE") == _VERDICT_COMMENTS_RE
+
+
 def test_nothing_selected_still_answers_five_empty_shaped_fields(
     tmp_path: Path,
 ) -> None:
@@ -924,6 +987,9 @@ def test_nothing_selected_still_answers_five_empty_shaped_fields(
         "",
         "",
     ), f"the no-selection answer changed shape: {result.stdout.strip()!r}"
+    assert _comments_flag(result) == "false", (
+        f"nothing selected must not read as a COMMENTS clearance: {result.stdout!r}"
+    )
 
 
 def test_the_filter_reads_the_raw_graphql_answer_itself(tmp_path: Path) -> None:

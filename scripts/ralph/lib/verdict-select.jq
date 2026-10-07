@@ -29,7 +29,7 @@
 #         the bytes production actually parses.
 #
 # PARAMS  `$authors` (array of accepted logins), `$verdict_re`,
-#         `$verdict_lgtm_re`, `$iter_summary_re`, `$marker_re`,
+#         `$verdict_lgtm_re`, `$verdict_comments_re`, `$iter_summary_re`, `$marker_re`,
 #         `$marker_any_re`, `$marker_malformed`. Bound with `--argjson`/`--arg`
 #         by `jq -f`, or by an `$ENV`-reading prelude where the caller runs this
 #         through `gh --jq` (which has no `--arg`). Either way the values arrive
@@ -42,9 +42,16 @@
 #         runs the constants `pr-ready.sh` actually declares through `--arg` for
 #         precisely that reason.
 #
-# OUTPUT  ONE `-r` line, five `|`-separated fields:
+# OUTPUT  ONE `-r` line, six `|`-separated fields:
 #
-#           createdAt | lgtm | marker | refused | databaseId
+#           createdAt | lgtm | marker | refused | databaseId | comments
+#
+#         `comments` is the COMMENTS clearance flag. A COMMENTS verdict is a
+#         sign-off with non-blocking findings: it clears a merge once those
+#         findings are filed as P0–P3 follow-up issues, so it is read with the
+#         same fail-closed polarity as `lgtm` (`$verdict_comments_re`: column 0,
+#         line ends at the token) off the same last verdict line. It is LAST so a
+#         consumer still splitting five fields sees a surplus and fails closed.
 #
 #         An empty first field means nothing was selected — a WAIT, never a
 #         clearance. The field COUNT is load-bearing: `pr-ready.sh` splits on it
@@ -284,4 +291,5 @@
     + "|" + (($last_verdict_line | test($verdict_lgtm_re)) | tostring)
     + "|" + $mk
     + "|" + $refused
-    + "|" + (($v.databaseId // "") | tostring) )
+    + "|" + (($v.databaseId // "") | tostring)
+    + "|" + (($last_verdict_line | test($verdict_comments_re)) | tostring) )
