@@ -191,9 +191,10 @@ class CostEstimate(BaseModel):
 
 def _invalid(exc: ValidationError) -> PriceSheetError:
     """Name the offending fields only — never echo the operator's values."""
-    fields = sorted(
-        {".".join(str(part) for part in err["loc"]) for err in exc.errors()}
-    )
+    located = {".".join(str(part) for part in err["loc"]) for err in exc.errors()}
+    fields = sorted(located - {""})
+    if not fields:
+        return PriceSheetError(_NOT_JSON)
     return PriceSheetError(f"price sheet is invalid: {', '.join(fields)}")
 
 

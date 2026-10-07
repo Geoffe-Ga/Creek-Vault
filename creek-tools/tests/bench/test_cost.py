@@ -194,7 +194,7 @@ def test_malformed_json_refused(tmp_path: Path) -> None:
     """A sheet that is not JSON is refused, not half-read."""
     path = tmp_path / "prices.json"
     path.write_text("{not json", encoding="utf-8")
-    with pytest.raises(PriceSheetError, match="invalid"):
+    with pytest.raises(PriceSheetError, match=r"^price sheet is invalid: not JSON$"):
         load_price_sheet(path, today=_TODAY)
 
 
