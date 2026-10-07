@@ -14,6 +14,7 @@ repository root, outside `creek-tools/`.
 
 | Date | Title | Status | Link |
 |---|---|---|---|
+| 2026-10-06 | D04: Local Model Capacity Envelope | Proposed — not approved | [`decisions/2026-10-06-d04-local-model-capacity-envelope.md`](decisions/2026-10-06-d04-local-model-capacity-envelope.md) |
 | 2026-07-31 | Adepthood HTTP Application API (`/v1`) | Accepted (Creek side) | [`decisions/2026-07-31-adepthood-http-application-api.md`](decisions/2026-07-31-adepthood-http-application-api.md) |
 | 2026-06-30 | Adepthood ↔ Creek MCP Contract | Draft — pending agreement | [`decisions/2026-06-30-adepthood-creek-mcp-contract.md`](decisions/2026-06-30-adepthood-creek-mcp-contract.md) |
 | 2026-05-23 | Frequency Naming: Canonical Names Win | Accepted | [`decisions/2026-05-23-frequency-naming.md`](decisions/2026-05-23-frequency-naming.md) |

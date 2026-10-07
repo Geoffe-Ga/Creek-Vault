@@ -16,5 +16,6 @@ Task-oriented how-to guides for the `creek-tools` pipeline. The top-level [`cree
 | [wiring-contract.md](wiring-contract.md) | Adding a CLI command or MCP tool: how to declare the effect it must produce, and how the contract test proves it. |
 | [provisioning-control-plane.md](provisioning-control-plane.md) | Operating the durable activation queue, provider-managed ordinary-Fly custody, scale-to-zero Fly driver, and the fleet reconciliation, telemetry, and budget alarms operator CLI (#1769, #1808). |
 | [managed-vault-fly-pilot.md](managed-vault-fly-pilot.md) | Authorization, deployment, cap/alert, backup/restore, emergency-stop, invoice, and sanitized-evidence checklist for the bounded Fly pilot (#1806). |
+| [bench.md](bench.md) | Running the hermetic model-capacity, latency and concurrency harness, reading its content-free report, and modelling USD per account-month from a dated price sheet (#1850). |
 
 Every guide is intentionally task-oriented: it answers "how do I do X" rather than "what classes does the module contain" — for the latter, read the module docstrings in [`creek/`](../creek/), which are kept above the 95% interrogate threshold.
