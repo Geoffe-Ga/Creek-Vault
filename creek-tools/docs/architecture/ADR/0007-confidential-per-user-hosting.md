@@ -116,8 +116,10 @@ stays as written. What the decision changes, as targets:
 
 - **Decision 2 (user-held keys, no escrow)** is no longer a future target
   limited to the vault volume. It is decided to become the custody model for
-  journal content wherever that content is stored. The specific passphrase and
-  recovery-key mechanism is reopened as D03.
+  journal content wherever that content is stored. The recovery factors are a
+  recovery phrase the person writes down plus their passphrase. Losing both
+  means the data is gone, agreed up front (adepthood ADR 0009 Decision item
+  11). Pairing, revocation and the rest of D03 stay open.
 - **Decisions 3-4 (TEE and the attested enclave)** are **not selected**. The
   target guarantee for stored content will come from user-held keys, not from
   confidential hardware.
@@ -125,8 +127,10 @@ stays as written. What the decision changes, as targets:
   will reach a cloud model **only** with their own key, on every tier, sent from
   their device rather than relayed by a server. Without that key, nothing is to
   reach a cloud model. Credit-funded inference (paid by adepthood) is to run
-  only on the vault-local model or a no-retention runtime the operator
-  controls. The INTIMATE chokepoint in `ModelRouter` is unchanged.
+  only on the vault-local model or a managed no-retention runtime the
+  operator runs. Each such use is labelled, and it is not operator-blind
+  while it runs (adepthood ADR 0009 Decision item 4). The INTIMATE chokepoint
+  in `ModelRouter` is unchanged.
 - **Decisions 1 and 5** (the per-user VM and the authenticated transport, with
   INTIMATE never remotely reachable) are unchanged.
 

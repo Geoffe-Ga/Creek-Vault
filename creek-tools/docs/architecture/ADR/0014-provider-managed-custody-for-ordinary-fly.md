@@ -120,9 +120,9 @@ content, which stays operator-readable.
 - `custody_mode=provider_managed` **remains** for the vault's operational state:
   consumer credentials, job state and configuration. It also remains for any
   non-journal material the owner explicitly scopes in later.
-- A vault-local model that needs plaintext is the subject of adepthood ADR
-  0009's open RUNTIME question. Until the owner answers it, plaintext inference
-  in an ordinary Fly vault is not described as operator-blind.
+- A vault-local model that needs plaintext is governed by adepthood ADR 0009
+  Decision item 4. Each use is labelled, and plaintext inference in an
+  ordinary Fly vault is not operator-blind while it runs.
 - INTIMATE remains local, as above.
 
 The "Revisit when" conditions above still govern any return to a

@@ -126,3 +126,20 @@ def test_the_original_records_are_kept_above_the_amendment() -> None:
     assert text.index("### Ordinary Fly uses one explicit provider-managed mode") < (
         text.index(_SUPERSESSION_HEADING)
     )
+
+
+# Owner answers recorded in adepthood ADR 0009 on 2026-10-07. An amendment
+# that still calls one of them open sends a reader looking for a decision
+# that has already been made.
+_ANSWERED_AS_OPEN: Final = (
+    "open RUNTIME question",
+    "mechanism is reopened",
+)
+
+
+@pytest.mark.parametrize("filename", sorted(_AMENDED))
+def test_amendment_cites_no_answered_question_as_open(filename: str) -> None:
+    """RUNTIME and the recovery factors are decided; no amendment calls them open."""
+    section = _flat(_appended_section(filename))
+
+    assert [phrase for phrase in _ANSWERED_AS_OPEN if phrase in section] == []

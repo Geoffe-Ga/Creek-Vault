@@ -86,15 +86,18 @@ stays as written. What the decision changes, as targets:
   vault volume. Under the target, the keys will be generated on the person's
   device, and neither Adepthood nor Creek will hold escrow or be able to reset
   them.
-- **The specific mechanism is reopened.** That mechanism is a random VMK
-  wrapped by an Argon2id passphrase and an HKDF recovery key. Adepthood ADR
-  0009 records recovery, pairing, revocation and double loss as open owner
-  questions (D03). This record is prior art for that choice, not the choice.
+- **The recovery factors are re-decided for the journal.** On 2026-10-07 the
+  owner chose a recovery phrase the person writes down, plus their
+  passphrase. Losing both means the data is gone, agreed up front (adepthood
+  ADR 0009 Decision item 11). The VMK, Argon2id passphrase and HKDF recovery
+  key above are prior art for that choice. Pairing, revocation and the rest
+  of D03 stay open owner questions.
 - **For a managed vault,** the target is that journal content will arrive as
   ciphertext under the person's key, which the vault would store without
   reading it. A vault volume key under this ADR would then protect only what
-  the vault itself must store in plaintext. Whether a vault-local model may see
-  plaintext is adepthood ADR 0009's open RUNTIME question.
+  the vault itself must store in plaintext. A vault-local model that sees
+  plaintext is governed by adepthood ADR 0009 Decision item 4: it is labelled
+  on each use and is not operator-blind while it runs.
 
 **Not implemented yet.** Until adepthood B13 phases (b) and (c) land for an
 account, journal content that reaches a vault stays operator-readable, exactly
