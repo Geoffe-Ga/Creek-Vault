@@ -112,11 +112,10 @@ def test_reflect_factory_refuses_when_pinned_digest_not_served(
         factory(PrivacyTier.OPEN, max_tokens=16)
 
 
-def test_reflect_factory_refuses_another_model_or_provider_when_pinned(
+def test_reflect_factory_refuses_another_model_when_pinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With a pin set, only the pinned local model may serve reflection."""
-    from creek.classify.llm import providers as providers_mod
+    """With a pin set, a stage resolving to another local model is refused."""
     from creek_mcp.server import _build_reflect_llm_factory
 
     _isolate(monkeypatch, tmp_path)
@@ -127,6 +126,23 @@ def test_reflect_factory_refuses_another_model_or_provider_when_pinned(
     with pytest.raises(RuntimeError, match=_REFUSAL):
         other(PrivacyTier.OPEN, max_tokens=16)
 
+
+def test_reflect_factory_refuses_a_cloud_stage_even_when_the_pin_is_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cloud-routed stage is refused on its provider alone, before any dial.
+
+    Everything else about the stage would pass: the model is the pinned tag,
+    ``ollama_url`` keeps its loopback default, and the runtime serves the
+    pinned digest. Only ``provider`` differs, so this isolates that check.
+    """
+    from creek.classify.llm import providers as providers_mod
+    from creek_mcp.server import _build_reflect_llm_factory
+
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    tags = _Tags(monkeypatch, _served())
+
     class _Cloud:
         """A cloud provider that would report itself available."""
 
@@ -135,17 +151,23 @@ def test_reflect_factory_refuses_another_model_or_provider_when_pinned(
 
     monkeypatch.setattr(providers_mod, "build_provider", lambda _cfg: _Cloud())
     cloud = _build_reflect_llm_factory(_vault_cloud(tmp_path))
+
     with pytest.raises(RuntimeError, match=_REFUSAL):
         cloud(PrivacyTier.OPEN, max_tokens=16)
+    assert tags.urls == []
 
 
 def _vault_cloud(tmp_path: Path) -> Path:
-    """Scaffold a second vault routing generation to a cloud provider."""
+    """Scaffold a vault routing generation to the pinned tag on a cloud provider."""
     vault = tmp_path / "cloud"
     (vault / "00-Creek-Meta").mkdir(parents=True)
     data: dict[str, Any] = CreekConfig().model_dump(mode="json")
     data["vault_path"] = str(vault)
-    data["llm"]["generation"] = {**data["llm"]["default"], "provider": "anthropic"}
+    data["llm"]["generation"] = {
+        **data["llm"]["default"],
+        "provider": "anthropic",
+        "model": _MODEL,
+    }
     vault.joinpath(*_CONFIG_SUBPATH).write_text(
         yaml.dump(data, sort_keys=False), encoding="utf-8"
     )
