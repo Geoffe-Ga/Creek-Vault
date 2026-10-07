@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Final
 import httpx
 
 from creek.classify.llm import providers
+from creek.classify.llm.local_boundary import ollama_client
 from creek_mcp.bench.metadata import UNKNOWN
 from creek_mcp.bench.outcome import ContextOverflowError, ProviderUnavailableError
 
@@ -145,8 +146,8 @@ class BenchOllamaClient:
         """
         timeout = providers.OllamaProvider.REQUEST_TIMEOUT
         try:
-            with httpx.Client(
-                base_url=self._base_url, timeout=timeout, transport=self._transport
+            with ollama_client(
+                timeout, base_url=self._base_url, transport=self._transport
             ) as client:
                 response = client.request(method, path, json=body)
         except httpx.ConnectError as exc:

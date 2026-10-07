@@ -139,16 +139,39 @@ def ollama_endpoint(config: LLMConfig, path: str) -> str:
     return f"{config.ollama_url}{path}"
 
 
-def _ollama_client(timeout: float) -> httpx.Client:
+def ollama_client(
+    timeout: float,
+    *,
+    base_url: str = "",
+    transport: httpx.BaseTransport | None = None,
+) -> httpx.Client:
     """Return a client that never routes through an environment proxy.
+
+    Every Ollama dial — the provider, the readiness probe and the capacity
+    bench — uses this client, so the proxy and TLS-trust rules live once.
 
     httpx's default ``trust_env=True`` sends even a loopback URL through
     ``HTTP_PROXY`` / ``ALL_PROXY`` unless ``NO_PROXY`` exempts it, which would
     carry a prompt to the proxy host while the provider stays labelled local.
     Ollama is local by contract, so this holds whether or not loopback-only
     mode is on.
+
+    Args:
+        timeout: HTTP timeout in seconds.
+        base_url: Optional base URL for relative request paths.
+        transport: Optional injected transport (tests use
+            ``httpx.MockTransport``).
+
+    Returns:
+        A proxy-free client verifying TLS per :func:`_ollama_verify`.
     """
-    return httpx.Client(timeout=timeout, trust_env=False, verify=_ollama_verify())
+    return httpx.Client(
+        base_url=base_url,
+        timeout=timeout,
+        transport=transport,
+        trust_env=False,
+        verify=_ollama_verify(),
+    )
 
 
 def _ollama_verify() -> ssl.SSLContext | bool:
@@ -186,7 +209,7 @@ def ollama_get(config: LLMConfig, path: str, *, timeout: float) -> httpx.Respons
         httpx.HTTPError: On a transport failure.
     """
     url = ollama_endpoint(config, path)
-    with _ollama_client(timeout) as client:
+    with ollama_client(timeout) as client:
         return client.get(url)
 
 
@@ -213,5 +236,5 @@ def ollama_post(
         httpx.HTTPError: On a transport failure.
     """
     url = ollama_endpoint(config, path)
-    with _ollama_client(timeout) as client:
+    with ollama_client(timeout) as client:
         return client.post(url, json=payload)

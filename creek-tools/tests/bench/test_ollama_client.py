@@ -248,3 +248,34 @@ def test_prompt_inside_the_window_is_answered(evaluated: object) -> None:
         body["prompt_eval_count"] = evaluated
     recorder = _Recorder({"/api/generate": body})
     assert _client(recorder).factory()(PrivacyTier.OPEN, max_tokens=96)("p") == "x"
+
+
+def test_live_bench_dials_bypass_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With proxy variables set, a live bench dial still reaches loopback (#1849).
+
+    The bench measures the local runtime; a proxy-honouring client would relay
+    a ``127.0.0.1`` dial to the proxy host and time the wrong path. The proxy
+    here points at a dead port, so honouring it fails the generation.
+    """
+    from tests.ollama_stub import (
+        NO_PROXY_ENV_NAMES,
+        PROXY_ENV_NAMES,
+        OllamaStub,
+        dead_proxy_url,
+        serve_ollama,
+    )
+
+    proxy = dead_proxy_url()
+    for name in PROXY_ENV_NAMES:
+        monkeypatch.setenv(name, proxy)
+    for name in NO_PROXY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    for stub in serve_ollama(OllamaStub(tags={"models": []}, generation="ok")):
+        client = BenchOllamaClient(stub.url, "mistral:7b", num_ctx=2048, num_predict=8)
+
+        assert client.generate("synthetic prompt", num_predict=8) == "ok"
+        assert [(method, path) for method, path, _ in stub.requests] == [
+            ("POST", "/api/generate")
+        ]
