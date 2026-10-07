@@ -297,6 +297,7 @@ def _live_metadata() -> RunMetadata:
     return run_metadata(
         mode="live",
         provider="ollama",
+        endpoint_scope="loopback",
         grounding="none",
         digest=_DIGEST,
         git_sha=_SHA,

@@ -60,8 +60,17 @@ A live run drives an operator-supplied Ollama at `--ollama-url`. It needs
 checkout. The harness refuses to run in these cases:
 
 - if the served weights' digest differs from `--digest`;
-- if the provider is registered as cloud;
-- if the provider does not positively declare itself local.
+- if `--model` is an Ollama cloud-offload tag (`*-cloud`, `*:cloud`), which a
+  local daemon forwards off-host;
+- if `--ollama-url` does not resolve only to loopback or private addresses,
+  unless you pass `--allow-remote-host`. The report records the result as
+  `run.endpoint_scope` (`loopback`, `private` or `remote`);
+- if the provider is registered as cloud, or a built model callable does not
+  declare itself local.
+
+These checks establish where requests are *addressed*. They cannot see what a
+runtime at a local address does next. A self-hosted proxy that forwards
+elsewhere would pass, so point the harness only at a runtime you operate.
 
 Every request pins `options.num_ctx`. Production does not pin it today; whether
 it should is B05's call. Live grounding defaults to the production grounder.

@@ -40,6 +40,7 @@ CpuKind = Literal["shared", "performance", "unknown"]
 
 _LIVE_NEEDS_DIGEST: Final[str] = "digest is required for a live run"
 _LIVE_NEEDS_SHA: Final[str] = "git_sha is required for a live run"
+_SCOPE_MISMATCH: Final[str] = "endpoint_scope must be fake exactly when mode is fake"
 
 
 class RunMetadata(BaseModel):
@@ -48,6 +49,9 @@ class RunMetadata(BaseModel):
     Attributes:
         mode: ``fake`` (hermetic, deterministic provider) or ``live``.
         provider: The provider that served the trials.
+        endpoint_scope: Where live requests went, judged from the resolved
+            endpoint addresses (``remote`` only with the operator's explicit
+            ``--allow-remote-host``); ``fake`` for the hermetic mode.
         grounding: ``default`` drives reflect's production grounder; ``none``
             injects an empty grounder (the hermetic fake mode, which must not
             load an embedding model).
@@ -67,6 +71,7 @@ class RunMetadata(BaseModel):
 
     mode: Literal["fake", "live"]
     provider: Literal["fake", "ollama"]
+    endpoint_scope: Literal["fake", "loopback", "private", "remote"] = "fake"
     grounding: Literal["none", "default"]
     model_tag: Annotated[str, Field(pattern=_MODEL_TAG_PATTERN)]
     digest: Annotated[str, Field(pattern=DIGEST_PATTERN)] | None = None
@@ -87,6 +92,8 @@ class RunMetadata(BaseModel):
             raise ValueError(_LIVE_NEEDS_DIGEST)
         if self.mode == "live" and self.git_sha is None:
             raise ValueError(_LIVE_NEEDS_SHA)
+        if (self.mode == "fake") != (self.endpoint_scope == "fake"):
+            raise ValueError(_SCOPE_MISMATCH)
         return self
 
 

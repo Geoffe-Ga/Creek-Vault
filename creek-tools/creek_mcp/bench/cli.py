@@ -37,7 +37,7 @@ from creek_mcp.bench.cost import (
     load_price_sheet,
 )
 from creek_mcp.bench.fake import fake_factory
-from creek_mcp.bench.local_only import LocalOnlyFactory
+from creek_mcp.bench.local_only import LocalOnlyFactory, require_local_target
 from creek_mcp.bench.metadata import RunMetadata
 from creek_mcp.bench.ollama_client import BenchOllamaClient
 from creek_mcp.bench.report import write_report
@@ -115,6 +115,11 @@ def _add_reflect(
     parser.add_argument("--mode", choices=("fake", "live"), default="fake")
     parser.add_argument("--grounding", choices=("none", "default"), default=None)
     parser.add_argument("--ollama-url", default=_DEFAULT_OLLAMA_URL)
+    parser.add_argument(
+        "--allow-remote-host",
+        action="store_true",
+        help="measure an --ollama-url that is not loopback or private (recorded)",
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument("--digest", default=None)
     parser.add_argument("--git-sha", default=None)
@@ -165,10 +170,18 @@ def _metadata(args: argparse.Namespace) -> RunMetadata:
                 msg = f"{flag} is required for --mode live"
                 raise _RefusalError(msg)
     grounding = args.grounding or ("default" if live else "none")
+    scope = (
+        require_local_target(
+            args.ollama_url, args.model, allow_remote=args.allow_remote_host
+        )
+        if live
+        else "fake"
+    )
     return RunMetadata.model_validate(
         {
             "mode": args.mode,
             "provider": "ollama" if live else "fake",
+            "endpoint_scope": scope,
             "grounding": grounding,
             "model_tag": args.model if live else _FAKE_MODEL_TAG,
             "digest": args.digest,

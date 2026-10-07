@@ -63,5 +63,12 @@ If a deployed envelope stops fitting:
 - lower the concurrency caps, or
 - suspend the reflection feature.
 
-**Never fall back to a cloud model.** The harness enforces the same rule. It
-refuses any provider that is not positively local.
+**Never fall back to a cloud model.** The harness applies the same rule as far
+as it can check it. It refuses:
+
+- a provider registered as cloud;
+- an Ollama cloud-offload model tag;
+- an endpoint that does not resolve to loopback or private addresses, unless
+  the operator opts in with `--allow-remote-host` (recorded in the report).
+
+It cannot see past a local address it is pointed at.

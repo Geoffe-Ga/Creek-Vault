@@ -205,6 +205,7 @@ def test_live_mode_end_to_end_on_a_mock_ollama(
     assert cli.main(argv) == 0
     report = load_report(tmp_path / "report.json")
     assert report.run.mode == "live"
+    assert report.run.endpoint_scope == "loopback"
     assert report.run.grounding == "default"
     assert report.run.license_id == "Apache-2.0"
     assert report.run.quantization == "Q4_K_M"
@@ -364,3 +365,76 @@ def test_bad_integer_list_is_an_argparse_error(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["reflect", "--out", str(tmp_path / "r.json"), "--concurrency", "1,x"])
     assert excinfo.value.code == 2
+
+
+def test_remote_endpoint_refused_by_default_exit_2_no_http(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], no_http: list[str]
+) -> None:
+    """A public --ollama-url is refused before any request without the flag."""
+    argv = _reflect(
+        tmp_path,
+        "--mode",
+        "live",
+        "--ollama-url",
+        "http://8.8.4.4:11434",
+        "--model",
+        "mistral:7b",
+        "--digest",
+        _DIGEST,
+        "--git-sha",
+        _SHA,
+    )
+    assert cli.main(argv) == 2
+    assert "--allow-remote-host" in capsys.readouterr().err
+    assert no_http == []
+
+
+def test_cloud_offload_tag_refused_exit_2_no_http(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], no_http: list[str]
+) -> None:
+    """A ``-cloud`` tag is refused even against a loopback daemon."""
+    argv = _reflect(
+        tmp_path,
+        "--mode",
+        "live",
+        "--ollama-url",
+        "http://127.0.0.1:9",
+        "--model",
+        "gpt-oss:120b-cloud",
+        "--digest",
+        _DIGEST,
+        "--git-sha",
+        _SHA,
+    )
+    assert cli.main(argv) == 2
+    assert "cloud" in capsys.readouterr().err
+    assert no_http == []
+
+
+def test_allowed_remote_endpoint_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With --allow-remote-host the run proceeds and says so in its report."""
+    real_init = BenchOllamaClient.__init__
+
+    def _init(self: BenchOllamaClient, *args: Any, **kwargs: Any) -> None:
+        kwargs["transport"] = httpx.MockTransport(_mock_ollama)
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(BenchOllamaClient, "__init__", _init)
+    argv = _reflect(
+        tmp_path,
+        "--mode",
+        "live",
+        "--ollama-url",
+        "http://8.8.4.4:11434",
+        "--allow-remote-host",
+        "--model",
+        "mistral:7b",
+        "--digest",
+        _DIGEST,
+        "--git-sha",
+        _SHA,
+    )
+    assert cli.main(argv) == 0
+    assert load_report(tmp_path / "report.json").run.endpoint_scope == "remote"

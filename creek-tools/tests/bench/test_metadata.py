@@ -33,6 +33,7 @@ def _run(**overrides: object) -> RunMetadata:
     fields: dict[str, object] = {
         "mode": "live",
         "provider": "ollama",
+        "endpoint_scope": "loopback",
         "grounding": "default",
         "model_tag": "mistral:7b",
         "digest": _DIGEST,
@@ -59,8 +60,20 @@ def test_live_run_requires_git_sha() -> None:
 
 def test_fake_run_allows_missing_digest() -> None:
     """The hermetic fake mode has no weights to pin."""
-    run = _run(mode="fake", provider="fake", digest=None, git_sha=None)
+    run = _run(
+        mode="fake", provider="fake", endpoint_scope="fake", digest=None, git_sha=None
+    )
     assert run.digest is None
+    assert run.endpoint_scope == "fake"
+
+
+def test_endpoint_scope_must_agree_with_mode() -> None:
+    """A live run names where it sent requests; a fake run sent none."""
+    with pytest.raises(ValidationError, match="endpoint_scope"):
+        _run(endpoint_scope="fake")
+    with pytest.raises(ValidationError, match="endpoint_scope"):
+        _run(mode="fake", provider="fake", digest=None, git_sha=None)
+    assert _run(endpoint_scope="remote").endpoint_scope == "remote"
 
 
 @pytest.mark.parametrize("digest", ["mistral", "sha256:" + "a" * 63, "A" * 64])
