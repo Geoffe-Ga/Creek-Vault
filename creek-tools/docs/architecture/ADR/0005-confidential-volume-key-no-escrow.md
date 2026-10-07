@@ -74,3 +74,23 @@ Adopt **user-held keys with no operator escrow and no reset** (issue-#758
   escrow trade-off must be re-litigated explicitly, not added silently.
 - The KDF choice needs strengthening (raise Argon2id cost; params are persisted
   per-vault so old vaults keep unlocking).
+
+## Amended by adepthood ADR 0009 (2026-10-07)
+
+On 2026-10-07 the owner decided that **the operator cannot read people's
+journal entries**. [adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md) records the decision. This record
+stays as written. What changes:
+
+- **The no-escrow, no-reset principle is kept and widened.** It now governs
+  the person's **journal keys** everywhere, not only a confidential vault
+  volume. The keys are generated on the person's device. Neither Adepthood
+  nor Creek holds escrow, and no operator reset can recover them.
+- **The specific mechanism is reopened.** That mechanism is a random VMK
+  wrapped by an Argon2id passphrase and an HKDF recovery key. Adepthood ADR
+  0009 records recovery, pairing, revocation and double loss as open owner
+  questions (D03). This record is prior art for that choice, not the choice.
+- **For a managed vault,** journal content arrives as ciphertext under the
+  person's key, so the vault stores it without reading it. A vault volume key
+  under this ADR would protect only what the vault itself must store in
+  plaintext. Whether a vault-local model may see plaintext is adepthood ADR
+  0009's open RUNTIME question.

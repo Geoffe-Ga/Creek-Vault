@@ -107,3 +107,24 @@ Adopt the ratified hosting/custody/routing model (#755):
   escrow trade-off explicitly; see ADR-0005).
 - The per-user-VM cost model or the GPU-CC availability changes materially enough
   to reconsider the hosting shape.
+
+## Amended by adepthood ADR 0009 (2026-10-07)
+
+On 2026-10-07 the owner decided that **the operator cannot read people's
+journal entries**. [adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md) records the decision. This record
+stays as written. What changes:
+
+- **Decision 2 (user-held keys, no escrow)** is no longer a future target
+  limited to the vault volume. It is the custody model for journal content
+  wherever that content is stored. The specific passphrase and recovery-key
+  mechanism is reopened as D03.
+- **Decisions 3-4 (TEE and the attested enclave)** are **not selected**. The
+  privacy guarantee for stored content comes from user-held keys, not from
+  confidential hardware.
+- **Decision 6 (BYOK)** is tightened. A person's content reaches a cloud
+  model **only** with their own key, on every tier. Without that key, nothing
+  reaches a cloud model. Credit-funded inference (paid by adepthood) runs only
+  on the vault-local model or a no-retention runtime the operator controls.
+  The INTIMATE chokepoint in `ModelRouter` is unchanged.
+- **Decisions 1 and 5** (the per-user VM and the authenticated transport,
+  with INTIMATE never remotely reachable) are unchanged.
