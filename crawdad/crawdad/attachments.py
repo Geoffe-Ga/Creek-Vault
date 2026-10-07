@@ -417,7 +417,7 @@ class ProcessedAttachments:
             transient download error).
         all_already_present: ``True`` when every accepted attachment was
             an idempotent re-upload. The bot uses this to skip the
-            redact scan and reply with "already staged" instead.
+            redact scan and reply that it already had every file.
     """
 
     staging_dir: Path
@@ -670,7 +670,7 @@ async def _process_one(
         return RejectedAttachment(
             filename=attachment.filename,
             size=attachment.size,
-            reason="extension not allowed",
+            reason="I don't take that file type here",
         )
     if attachment.size > config.max_size_bytes:
         _LOGGER.info(
@@ -683,8 +683,8 @@ async def _process_one(
             filename=attachment.filename,
             size=attachment.size,
             reason=(
-                f"size {attachment.size} bytes exceeds max "
-                f"{config.max_size_bytes} bytes"
+                f"too big — {_format_size(attachment.size)} is over the "
+                f"{_format_size(config.max_size_bytes)} limit"
             ),
         )
 
@@ -715,8 +715,8 @@ async def _process_one(
             filename=attachment.filename,
             size=len(data),
             reason=(
-                f"downloaded size {len(data)} bytes exceeds max "
-                f"{config.max_size_bytes} bytes"
+                f"too big — it came in at {_format_size(len(data))}, over the "
+                f"{_format_size(config.max_size_bytes)} limit"
             ),
         )
 
@@ -782,7 +782,9 @@ def _format_mime_mismatch_reason(verification: MimeVerification) -> str:
     """Render a Discord-friendly rejection reason for a MIME mismatch."""
     detected = verification.detected_mime or "unknown"
     expected = verification.expected_mime or "unknown"
-    return f"MIME mismatch: extension claims {expected}, content detected as {detected}"
+    return (
+        f"this file isn't what its name says — it looks like {detected}, not {expected}"
+    )
 
 
 def format_attachment_summary(
@@ -810,12 +812,12 @@ def format_attachment_summary(
         rel_staging = processed.staging_dir
 
     # When every attachment was rejected nothing landed on disk, so the
-    # "staged at" header would be factually wrong. Use a neutral header
+    # "saved to" header would be factually wrong. Use a neutral header
     # that still includes the staging path for reference.
     header = (
-        f"**Attachments staged at** `{rel_staging}/`"
+        f"**Files saved to** `{rel_staging}/`"
         if processed.accepted
-        else f"**Attachments** (would stage to `{rel_staging}/`)"
+        else f"**Attachments** — nothing saved; they would go to `{rel_staging}/`"
     )
     lines: list[str] = [header]
     if processed.accepted:
@@ -823,7 +825,7 @@ def format_attachment_summary(
         lines.append("**Accepted:**")
         for a in processed.accepted:
             type_hint = a.inferred_type or "unknown type"
-            marker = " (already staged)" if a.already_present else ""
+            marker = " (already had it)" if a.already_present else ""
             lines.append(
                 f"- `{a.filename}` — {_format_size(a.size)}, {type_hint}{marker}"
             )
@@ -851,8 +853,8 @@ def _format_mime_mismatch_warning(verification: MimeVerification) -> str | None:
     detected = verification.detected_mime or "unknown"
     expected = verification.expected_mime or "unknown"
     return (
-        f"  - ⚠ MIME mismatch: extension claims `{expected}`, "
-        f"content detected as `{detected}`"
+        f"  - ⚠ this file isn't what its name says — it looks like `{detected}`, "
+        f"not `{expected}`"
     )
 
 

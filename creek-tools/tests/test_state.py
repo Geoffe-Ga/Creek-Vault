@@ -7,7 +7,8 @@ vault layer — it never re-runs classification, linking, or compile.
 Sections covered:
 
 1. Vault summary (counts + frequency distribution)
-2. Pre-LLM yield (latest line of ``run-summary.jsonl``)
+2. What the rules alone could name — the pre-LLM yield (latest line of
+   ``run-summary.jsonl``)
 3. Active eddies (top-N by ``fragment_count``)
 4. Active threads (top-N by ``last_seen`` recency)
 5. Surprising connections (synchronicities)
@@ -39,6 +40,7 @@ from creek.generate.state import (
     StateReportGenerator,
     _admit_praxis,
     _admitted_liminal_notes,
+    _confidence_word,
     _frequency_label,
     _load_latest_yield,
     _load_synchronicities,
@@ -415,7 +417,7 @@ def test_section_pre_llm_yield_reads_latest_run(populated_vault: Path) -> None:
         vault_path=populated_vault,
     ).section_pre_llm_yield()
 
-    assert section.startswith("## Pre-LLM yield")
+    assert section.startswith("## What the rules alone could name")
     assert "Deterministic: 7" in section
     assert "Local-model: 5" in section
     assert "Residue: 2" in section
@@ -601,7 +603,7 @@ def test_section_hyperedges_lists_multi_eddy_praxis(populated_vault: Path) -> No
         vault_path=populated_vault,
     ).section_hyperedges()
 
-    assert section.startswith("## Hyperedges")
+    assert section.startswith("## Praxis that bridge several eddies")
     assert "Bridge Practice" in section
     # Single-eddy praxis is filtered out — it is not a hyperedge.
     assert "Single-Eddy Practice" not in section
@@ -1229,7 +1231,7 @@ def test_render_wavelength_snapshot_is_first(populated_vault: Path) -> None:
 def test_render_emits_feat007_section_order(populated_vault: Path) -> None:
     """The FEAT-007 documented section order is preserved end-to-end.
 
-    Includes FEAT-008's ``## Lint summary`` as the final appendix so the
+    Includes FEAT-008's ``## Housekeeping`` as the final appendix so the
     assertion pins the entire eleven-section contract, not just the
     FEAT-007 subset.
     """
@@ -1237,15 +1239,15 @@ def test_render_emits_feat007_section_order(populated_vault: Path) -> None:
     ordered_headers = [
         "## Wavelength snapshot",
         "## Vault summary",
-        "## Pre-LLM yield",
+        "## What the rules alone could name",
         "## Liminal Watch",
         "## Active eddies",
         "## Active threads",
         "## Surprising connections",
-        "## Hyperedges",
+        "## Praxis that bridge several eddies",
         "## Drift warnings",
         "## Suggested questions",
-        "## Lint summary",
+        "## Housekeeping",
     ]
     indices = [rendered.index(header) for header in ordered_headers]
     assert indices == sorted(indices)
@@ -1280,7 +1282,7 @@ def test_check_budget_fails_when_file_exceeds_budget(tmp_path: Path) -> None:
         "# Creek state\n\n"
         "## Wavelength snapshot\n\nshort.\n\n"
         "## Vault summary\n\nshort.\n\n"
-        "## Hyperedges\n\n"
+        "## Praxis that bridge several eddies\n\n"
         f"{big_payload}\n",
         encoding="utf-8",
     )
@@ -1290,7 +1292,7 @@ def test_check_budget_fails_when_file_exceeds_budget(tmp_path: Path) -> None:
     assert result.ok is False
     assert result.tokens > SIZE_BUDGET_TOKENS
     # The failure message must surface the section that consumed the budget.
-    assert "## Hyperedges" in result.largest_sections[0][0]
+    assert "## Praxis that bridge several eddies" in result.largest_sections[0][0]
 
 
 def test_check_budget_missing_file_passes(tmp_path: Path) -> None:
@@ -1517,7 +1519,7 @@ def test_active_eddies_annotates_level(populated_vault: Path) -> None:
     section = StateReportGenerator(
         vault_path=populated_vault,
     ).section_active_eddies()
-    assert "_Counted at: leaves._" in section
+    assert "_Counting by leaves here._" in section
 
 
 def test_active_threads_counts_leaves_not_parents(empty_vault: Path) -> None:
@@ -1551,7 +1553,7 @@ def test_active_threads_counts_leaves_not_parents(empty_vault: Path) -> None:
     # 1 leaf links to Thread X (the parent is excluded).
     assert "Thread X" in section
     assert "(1 fragment(s))" in section
-    assert "_Counted at: leaves._" in section
+    assert "_Counting by leaves here._" in section
 
 
 def test_synchronicities_drop_non_leaf_endpoints(empty_vault: Path) -> None:
@@ -1596,7 +1598,7 @@ def test_synchronicities_drop_non_leaf_endpoints(empty_vault: Path) -> None:
     assert "frag-other" in section
     # The non-leaf sync is filtered out.
     assert "frag-parent" not in section
-    assert "_Counted at: leaves._" in section
+    assert "_Counting by leaves here._" in section
 
 
 def test_wavelength_snapshot_reads_at_documents(empty_vault: Path) -> None:
@@ -1622,7 +1624,7 @@ def test_wavelength_snapshot_reads_at_documents(empty_vault: Path) -> None:
         today=date(2026, 5, 1),
     ).section_wavelength_snapshot()
 
-    assert "_Counted at: documents._" in section
+    assert "_Counting by documents here._" in section
     # Only one fragment passes the documents filter.
     assert "Fragments observed: 1" in section
     # The dominant phase reflects the single document, not the sentences.
@@ -2175,3 +2177,67 @@ class TestRefreshLatestSurvivesUnlinkFailure:
         assert result == latest
         assert result.exists()
         assert result.read_text(encoding="utf-8") == "# Week 18\n"
+
+
+# ---------------------------------------------------------------------------
+# Voice sweep: the snapshot speaks in words a reader can feel, not scores
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("confidence", "word"),
+    [
+        (0.0, "tentative"),
+        (0.49, "tentative"),
+        (0.5, "fairly steady"),
+        (0.79, "fairly steady"),
+        (0.8, "clear"),
+        (1.0, "clear"),
+    ],
+)
+def test_confidence_word_maps_scores_to_plain_words(
+    confidence: float, word: str
+) -> None:
+    """Each band of the score becomes one plain word, boundaries inclusive."""
+    assert _confidence_word(confidence) == word
+
+
+def test_section_wavelength_snapshot_phrases_confidence_as_a_reading(
+    empty_vault: Path,
+) -> None:
+    """The phase line reads like a friend's observation, not a classifier dump.
+
+    Voice sweep: ``(confidence 0.75)`` is gone; the line says what kind of
+    reading the recent writing gives, and the counting note is a sentence.
+    """
+    base = datetime(2026, 5, 1, tzinfo=UTC)
+    for index in range(3):
+        _write_fragment(
+            empty_vault,
+            frag_id=f"frag-r{index}",
+            created=base + timedelta(days=index),
+            phase="rising",
+            mode="express",
+            dosage="medicine",
+            frequency="F1",
+        )
+    _write_fragment(
+        empty_vault,
+        frag_id="frag-other",
+        created=base + timedelta(days=3),
+        phase="peaking",
+        mode="inhabit",
+        dosage="toxic",
+        frequency="F2",
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+        today=date(2026, 5, 7),
+    ).section_wavelength_snapshot()
+
+    assert "- Phase: **rising** — a fairly steady reading from your recent writing" in (
+        section
+    )
+    assert "confidence" not in section.lower()
+    assert "_Counting by documents here._" in section

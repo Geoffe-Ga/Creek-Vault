@@ -1,6 +1,6 @@
 """New lint checks must not carry fragment content into a shareable artifact.
 
-``creek state``'s ``## Lint summary`` appends the lint report **verbatim**
+``creek state``'s ``## Housekeeping`` appends the lint report **verbatim**
 (``creek/generate/state.py:1385-1401``). #969 admits that section at
 ``ceiling=intimate`` or broader — and the CLI's default ceiling is ``all``, so
 a plain ``creek state`` includes it. Whatever the checks added by #1277 and
@@ -80,7 +80,7 @@ NEW_CHECKS: tuple[str, ...] = ("ancestry", "root-hygiene")
 """The checks #1277 and #883 add. Both are surveyed by every test here."""
 
 NARROWEST_ADMITTING_CEILING = PrivacyTierOverride.INTIMATE
-"""The strictest ceiling at which ``creek state`` still renders the Lint summary.
+"""The strictest ceiling at which ``creek state`` still renders ``## Housekeeping``.
 
 ``section_lint_summary`` gates on
 ``tier_within_override(PrivacyTier.INTIMATE, override)``, so ``OPEN`` and

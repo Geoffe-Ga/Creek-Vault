@@ -1,28 +1,30 @@
 # CrawDad
 
-CrawDad is the Discord-side interface to a Creek vault. It consumes
-the creek-tools MCP surface (see `creek-tools/creek_mcp`) and answers
-Discord messages in your voice using the FEAT-015 agent loop (Haiku
-router → MCP dispatcher → Sonnet composer with voice-skill activation).
+CrawDad is the Discord side of your Creek vault: a bot you talk to in
+your own server that answers in your own voice, drawing on what you've
+already written.
 
-CrawDad v1.0 ships:
+CrawDad v1.0 does the following for you:
 
-- A `discord.py` client that connects to Discord and forwards messages
-  to a pure-logic handler.
-- The two-LLM agent loop (FEAT-014 + FEAT-015) — Haiku for intent
-  extraction, Sonnet for voice-faithful composition, capped at
-  `MAX_LOOP_ROUNDS` (default 5; operator-configurable via
-  `crawdad.yaml::max_loop_rounds`, bounded `[1, 50]` — FEAT-036) with
-  paradox routing to `10-Liminal/Paradoxes/`.
-- An async MCP stdio client wrapping the Anthropic `mcp` SDK.
-- Voice-skill activation per session from `<vault>/creek-skills/`.
-- The six `/crawdad` slash commands (FEAT-016): `reflect`, `checkin`,
-  `surface`, `draft`, `save`, `workflow`.
-- A user + channel allowlist; non-allowlisted callers get no response
-  — and, as of #1052, no bot-capture record either (see
+- Answers your Discord messages in your own voice, drawing on what's
+  already in your vault. When something you say holds a paradox, it
+  files that under `10-Liminal/Paradoxes/` so it isn't lost.
+- Runs the `/crawdad` commands: `reflect`, `checkin`, `surface`,
+  `draft`, `ask`, `save`, `register`, `workflow`. Each one asks your
+  vault a question for you and answers in your voice.
+- Takes files you drop into a channel, holds them at the door, and asks
+  before anything goes into your vault.
+- Speaks in the voice you've set up under `<vault>/creek-skills/`, and
+  lets you switch registers mid-conversation.
+- Only answers people and channels you've allowed — everyone else gets
+  silence, and nothing of theirs is kept (see
   [Bot capture](#bot-capture) below).
-- A graceful "creek-tools is unreachable" reply when the MCP
-  subprocess dies.
+- Tells you plainly when it can't reach your vault instead of going
+  quiet.
+
+Ticket numbers, model tiers, and the `max_loop_rounds` bound live under
+[Architecture](#architecture) and
+[Configuration keys](#configuration-keys).
 
 ## Quick start
 
@@ -189,17 +191,18 @@ Each smoke skips cleanly when its key is absent; the default `./scripts/test.sh`
 ## Slash commands (FEAT-016)
 
 The `/crawdad` family registers automatically with Discord on startup.
-Each routes through the FEAT-015 agent loop with a pre-baked user
-message, so the Sonnet composer wraps the tool results in your voice.
+Each one asks your vault a question for you and answers in your voice.
 
 | Command | Purpose |
 |---|---|
-| `/crawdad reflect` | Open reflective conversation mode — the loop with no preselected intent. Same as bare `/crawdad`. |
-| `/crawdad checkin` | Wavelength check-in via `creek.state.read`. |
-| `/crawdad surface` | Surface paradoxes / liminal content via `creek.lint`. |
-| `/crawdad draft <topic>` | Mine + draft on the supplied topic (`creek.mine` → `creek.draft`). |
-| `/crawdad save <content>` | File the supplied content back to the vault (`creek.save`). |
-| `/crawdad workflow [list\|run <name>]` | List registered workflows, or walk one. See [Workflow files](#workflow-files). |
+| `/crawdad reflect` | Just talk — open-ended reflection, no agenda. Same as plain `/crawdad`. |
+| `/crawdad checkin` | Where you are on the wavelength right now — phase and dosage, read from your latest `creek state`. |
+| `/crawdad surface` | Bring up paradoxes, liminal items, or themes that are emerging in your vault. |
+| `/crawdad draft <topic>` | Draft an essay on your topic, in your voice. |
+| `/crawdad ask <question>` | Ask a question; get an answer in your voice, with sources from your vault. |
+| `/crawdad save <content>` | Save what you write here into your vault. |
+| `/crawdad register <name>` | Switch which voice CrawDad is speaking in. |
+| `/crawdad workflow [list\|run <name>]` | List your workflows, or run one by name. See [Workflow files](#workflow-files). |
 
 Full grammar reference (including the developer-side `/creek` surface
 for Claude Code) is in

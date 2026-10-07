@@ -473,3 +473,30 @@ def test_scanned_flag_survives_resolution_and_state_transitions() -> None:
     assert resolved.scanned is False
     assert resolved.with_state("awaiting_type").scanned is False
     assert resolved.with_ingested(frozenset({"abc"})).scanned is False
+
+
+def test_format_type_question_asks_in_plain_words() -> None:
+    """Voice sweep: the bot asks "what kind of file", never "what ingest type"."""
+    batch = _batch(files=(_file(filename="report.xyz", inferred_type=None),))
+
+    question = format_type_question(batch)
+
+    assert question.startswith("What kind of file is `report.xyz`?")
+    assert "ingest type" not in question
+    assert "batch" not in question
+    assert question.endswith("or `cancel` to leave it out.")
+
+
+def test_format_type_question_agrees_in_number_for_several_files() -> None:
+    """Two unresolved files → "files are" and "leave them out"."""
+    batch = _batch(
+        files=(
+            _file(filename="report.xyz", inferred_type=None),
+            _file(filename="notes.qux", inferred_type=None),
+        )
+    )
+
+    question = format_type_question(batch)
+
+    assert question.startswith("What kind of files are `report.xyz`, `notes.qux`?")
+    assert question.endswith("or `cancel` to leave them out.")

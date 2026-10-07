@@ -11,10 +11,11 @@ anti-goal. The ceiling is converted with
 :func:`~creek_mcp.tier_ceiling.to_privacy_override` and threaded into
 :class:`~creek.generate.state.StateReportGenerator`, which admits ten of its
 eleven sections against it and then stamps the written artifact with the
-highest tier it actually admitted. The eleventh, ``## Pre-LLM yield``, is
-ungated on purpose: it renders the last line of ``run-summary.jsonl`` — a run
-id, a timestamp and four integers describing one pipeline run — which names no
-fragment, so there is nothing in it to filter by.
+highest tier it actually admitted. The eleventh,
+``## What the rules alone could name``, is ungated on purpose: it renders the
+last line of ``run-summary.jsonl`` — a run id, a timestamp and four integers
+describing one pipeline run — which names no fragment, so there is nothing in
+it to filter by.
 
 The gap this closed was **write-side**, which is why it survived a response-
 level sweep: the envelope happens to echo ``content`` today, but the durable

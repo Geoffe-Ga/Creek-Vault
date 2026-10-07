@@ -107,7 +107,7 @@ Query results carry the same tag vocabulary as everything else:
 
 - **Phases (six):** Rising, Peaking, Withdrawal, Diminishing,
   Bottoming Out, Restoration.
-- **Modes (five):** Inhabit, Express, Collaborate, Integrate, Absorb.
+- **Modes (five in frontmatter; six in the course):** Inhabit, Express, Collaborate, Integrate, Absorb. The course's Complete Map names a sixth Mode, **Be** (Clear Light / F10); Creek's `mode:` field does not carry it yet, so never write `mode: be` — a Clear Light fragment keeps `mode: unclassified` unless its text plainly reads as one of the five.
 - **Orientations:** Do, Feel, Do/Feel.
 - **Dosage:** Medicine, Toxic.
 - **Frequencies (ten):** F1 Agency, F2 Receptivity, F3 Self-Love /

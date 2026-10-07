@@ -228,6 +228,7 @@ creek ingest --type code         --input ~/projects/diary     --vault ~/Obsidian
 
 - Fallback for any file whose extension no other ingestor claims (`.txt`, `.log`, plain text, and anything not in the specialized ingestors' extension sets). Binary files (detected via a null-byte / control-character heuristic) and empty or whitespace-only files are skipped — no fragment is written.
 - Routes to `01-Fragments/Unsorted/` with `source.platform: other` (`SourcePlatform.OTHER`).
+- `SourcePlatform.OTHER` is a metadata label, not a standalone ingestor — `DocumentIngestor` assigns it to HTML / TXT inputs too, and it is also reserved for downstream-synthesised fragments.
 - The fragment id is derived from the file's **mtime**, not the wall-clock time you ran `creek ingest` — re-ingesting an unchanged file reuses the same mtime and therefore the same id, so the write is a genuine no-op. (Wall clock is used only as a fallback for a pathless/synthetic document where `stat()` fails.)
 - `created` and `authored_at` in the frontmatter are both the file's mtime, kept in UTC.
 - Known limitation: this source has no ingest ledger (see [Idempotency](#idempotency)), so a bare `touch` — or any edit — bumps the mtime and mints a *new* fragment rather than updating the existing one. Tracked in [#953](https://github.com/Geoffe-Ga/Creek-Vault/issues/953).

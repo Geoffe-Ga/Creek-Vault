@@ -85,7 +85,7 @@ wavelength:
 status: held | dormant | resolved-with-abandoned-energy
 ```
 
-Liminal notes use the canonical taxonomy verbatim (INC-019). Phases: Rising, Peaking, Withdrawal, Diminishing, Bottoming Out, Restoration. Modes: Inhabit, Express, Collaborate, Integrate, Absorb. Frequencies: F1–F10 by their canonical names.
+Liminal notes use the canonical taxonomy verbatim (INC-019). Phases: Rising, Peaking, Withdrawal, Diminishing, Bottoming Out, Restoration. Modes: Inhabit, Express, Collaborate, Integrate, Absorb (the course also names **Be** for Clear Light; it is not a `mode:` value yet, so never write `mode: be`). Frequencies: F1–F10 by their canonical names.
 
 ## What Liminal is not
 

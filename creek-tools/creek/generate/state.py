@@ -10,7 +10,7 @@ structural sections:
 3. Active eddies
 4. Active threads
 5. Surprising connections
-6. Hyperedges
+6. Praxis that bridge several eddies
 7. Drift warnings
 
 This module is intentionally a *view* over the compiled layer — it
@@ -100,15 +100,15 @@ logger = logging.getLogger(__name__)
 
 _HEADER_WAVELENGTH: str = "## Wavelength snapshot"
 _HEADER_VAULT_SUMMARY: str = "## Vault summary"
-_HEADER_PRE_LLM_YIELD: str = "## Pre-LLM yield"
+_HEADER_PRE_LLM_YIELD: str = "## What the rules alone could name"
 _HEADER_LIMINAL_WATCH: str = "## Liminal Watch"
 _HEADER_ACTIVE_EDDIES: str = "## Active eddies"
 _HEADER_ACTIVE_THREADS: str = "## Active threads"
 _HEADER_SYNCHRONICITIES: str = "## Surprising connections"
-_HEADER_HYPEREDGES: str = "## Hyperedges"
+_HEADER_HYPEREDGES: str = "## Praxis that bridge several eddies"
 _HEADER_DRIFT_WARNINGS: str = "## Drift warnings"
 _HEADER_SUGGESTED_QUESTIONS: str = "## Suggested questions"
-_HEADER_LINT_SUMMARY: str = "## Lint summary"
+_HEADER_LINT_SUMMARY: str = "## Housekeeping"
 
 
 SECTION_ORDER: tuple[str, ...] = (
@@ -129,7 +129,7 @@ SECTION_ORDER: tuple[str, ...] = (
 FEAT-007 prepends ``## Wavelength snapshot`` (the audit report's
 interpretive prime) and inserts ``## Liminal Watch`` between the
 pre-LLM yield and the active-eddies section. ``## Suggested questions``
-closes the FEAT-007 content; FEAT-008's ``## Lint summary`` is the
+closes the FEAT-007 content; FEAT-008's ``## Housekeeping`` is the
 final appendix.
 """
 
@@ -732,6 +732,26 @@ def _section(header: str, body_lines: list[str]) -> str:
     return header + "\n\n" + "\n".join(body_lines)
 
 
+_CONFIDENCE_STEADY_FLOOR: float = 0.5
+"""Phase-confidence score at or above which the reading is "fairly steady"."""
+_CONFIDENCE_CLEAR_FLOOR: float = 0.8
+"""Phase-confidence score at or above which the reading is "clear"."""
+
+
+def _confidence_word(confidence: float) -> str:
+    """Translate a phase-confidence score into a word the reader can feel.
+
+    The snapshot used to print the raw score (``confidence 0.84``). A
+    number invites the reader to audit the classifier instead of noticing
+    the phase; three plain words carry the same information.
+    """
+    if confidence >= _CONFIDENCE_CLEAR_FLOOR:
+        return "clear"
+    if confidence >= _CONFIDENCE_STEADY_FLOOR:
+        return "fairly steady"
+    return "tentative"
+
+
 def _level_annotation(level: str) -> str:
     """FEAT-025: render the "level used" note that opens hierarchy-aware sections.
 
@@ -740,7 +760,7 @@ def _level_annotation(level: str) -> str:
     full sentence so downstream tools (state-budget, voice-proxy) don't
     treat it as a heading.
     """
-    return f"_Counted at: {level}._"
+    return f"_Counting by {level} here._"
 
 
 def _vault_relative(path_str: str, vault_path: Path) -> str:
@@ -754,7 +774,7 @@ def _vault_relative(path_str: str, vault_path: Path) -> str:
     operator's home directory".
 
     This closes the drift section's half of that claim. The other half was
-    ``## Lint summary``: ``creek/lint/checks/broken_links.py`` rendered the
+    ``## Housekeeping``: ``creek/lint/checks/broken_links.py`` rendered the
     *same* scanner's absolute source into the Processing-Log artifact that
     :meth:`StateReportGenerator.section_lint_summary` appends verbatim, and was
     the only lint check not already using ``relative_to(vault_path)``. It does
@@ -775,7 +795,7 @@ def _vault_relative(path_str: str, vault_path: Path) -> str:
 
 
 def _lint_summary_is_populated(sections: Iterable[str]) -> bool:
-    """Whether the rendered ``## Lint summary`` section carries a report body.
+    """Whether the rendered ``## Housekeeping`` section carries a report body.
 
     Computed as a pure function over the **rendered section strings** rather
     than by re-asking :func:`creek.lint.latest_lint_report`, so the artifact
@@ -899,10 +919,12 @@ class StateReportGenerator:
         summary = self._resolve_wavelength_summary()
         if summary.fragment_count == 0:
             return _section(_HEADER_WAVELENGTH, [])
+        reading = _confidence_word(summary.confidence)
         body = [
             _level_annotation("documents"),
             "",
-            f"- Phase: **{summary.phase}** (confidence {summary.confidence:.2f})",
+            f"- Phase: **{summary.phase}** — a {reading} reading from your "
+            "recent writing",
             f"- Mode: **{summary.mode}**",
             f"- Fragments observed: {summary.fragment_count} "
             f"(last {DEFAULT_CURRENT_PHASE_WINDOW_DAYS} days)",
@@ -1439,7 +1461,7 @@ class StateReportGenerator:
         reproduced, since an orphan's filename is its fragment's slugified
         title. :func:`_vault_relative` closes this section's half of
         ``docs/generation.md``'s standing "never the absolute path" claim; the
-        other half was ``## Lint summary``, and is recorded there.
+        other half was ``## Housekeeping``, and is recorded there.
         """
         admitted = self._state.tiers.admitted_paths
         broken = BrokenLinkScanner().scan(self.vault_path)

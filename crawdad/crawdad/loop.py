@@ -96,8 +96,9 @@ _TOO_DEEP_REPLY = (
 )
 _ROUTER_PARSE_REPLY = "I lost the thread on that one — can you rephrase your question?"
 _UNKNOWN_INTENT_REPLY = (
-    "I tried to use a tool I don't have. Try a different question, or check "
-    "`creek-tools` for the available tool surface."
+    "I reached for a tool I don't actually have. Try asking a different way — "
+    "if this keeps happening, your creek-tools install may be missing a tool "
+    "I expect."
 )
 _COMPOSER_FAILURE_REPLY = (
     "I'm having trouble composing right now — try again in a moment."

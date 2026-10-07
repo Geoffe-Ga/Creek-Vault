@@ -144,11 +144,27 @@ class TestRegistryDriftGuard:
             assert registry[concept].category == "concept"
 
     def test_altitude_terms_are_registered(self) -> None:
-        """The developmental altitudes (Teal, Ultraviolet) keep their exact form."""
+        """The colour-named frequencies (Teal, Ultraviolet) keep their exact form."""
         registry = ontology_term_registry()
         for altitude in ("Teal", "Ultraviolet"):
             assert altitude in registry
             assert registry[altitude].category == "altitude"
+
+    def test_colour_gloss_seeds_are_notes_not_rungs(self) -> None:
+        """Teal and Ultraviolet are glossed as colours on the scale, never heights."""
+        registry = ontology_term_registry()
+        for label in ("Teal", "Ultraviolet"):
+            seed = registry[label].gloss_seed.lower()
+            assert "altitude" not in seed
+            assert seed.startswith("the colour i use for")
+            assert "one of the ten frequencies" in seed
+
+    def test_aptitude_gloss_seed_carries_no_ladder(self) -> None:
+        """The APTITUDE seed frames ten notes on one scale, none above another."""
+        seed = ontology_term_registry()["APTITUDE"].gloss_seed.lower()
+        assert "up to" not in seed
+        assert "ten notes on one scale" in seed
+        assert "none of them higher than another" in seed
 
 
 class TestRegistryMemoization:
@@ -266,6 +282,11 @@ class TestGlossSteerPinned:
         assert "Mode" in GLOSS_STEER
         assert "Mood" not in GLOSS_STEER
 
+    def test_steer_names_colours_not_altitudes(self) -> None:
+        """The steer calls Teal/Ultraviolet colour names, never altitudes."""
+        assert "altitude" not in GLOSS_STEER.lower()
+        assert "colour name like Teal or Ultraviolet" in GLOSS_STEER
+
     def test_draft_ask_carries_gloss_steer_in_every_mode(self) -> None:
         """Every ``_compose_ask_section`` variant carries the gloss steer."""
         from creek.generate.drafts import _compose_ask_section
@@ -288,6 +309,10 @@ class TestGlossSteerPinned:
         ):
             section = _compose_ask_section(idea, **kwargs)
             assert _GLOSS_PHRASE in section
+            # Provenance lives in the saved frontmatter; the essay body the
+            # owner publishes must never be asked to carry fragment IDs.
+            assert "by their IDs" not in section
+            assert "Cite source fragments" not in section
 
     def test_voice_ask_carries_gloss_steer(self) -> None:
         """The voice agent's ``## Ask`` block carries the gloss steer."""

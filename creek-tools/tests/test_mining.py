@@ -29,6 +29,9 @@ from creek.generate.mining import (
     _jaccard_similarity,
     _load_fragments,
     _load_typed,
+    _plain_phase,
+    _quoted_title,
+    _seed_from_ontology_tuple,
     phase_filtered_seeds,
 )
 from creek.models import (
@@ -340,7 +343,10 @@ class TestMineThreadTerminus:
         assert seed.threads == ("thread-grief",)
         assert seed.frequency_affinity == (Frequency.F3,)
         assert seed.score > 0
-        assert "thread-grief" in seed.brief_description or "Grief" in seed.title
+        # The brief names the thread the way its author would — by title, never
+        # by the raw id — and asks the question a friend would ask.
+        assert "Grief as a long rhythm" in seed.brief_description
+        assert "thread-grief" not in seed.brief_description
 
     def test_thread_at_or_below_threshold_is_skipped(
         self,
@@ -2164,3 +2170,58 @@ class TestFragmentFrequencies:
         fragment = _build_fragment(frag_id="frag-solo", title="Solo")
 
         assert _fragment_frequencies(fragment) == (Frequency.F5,)
+
+
+class TestSeedCopySpeaksPlainly:
+    """Voice sweep: seed descriptions read like a friend, not a database row."""
+
+    def test_quoted_title_quotes_the_fragment_title(self) -> None:
+        """A titled fragment is named by its title, in quotes."""
+        fragment = _build_fragment(frag_id="frag-x", title="Morning light")
+
+        assert _quoted_title(fragment) == "'Morning light'"
+
+    def test_quoted_title_falls_back_when_the_fragment_has_no_title(self) -> None:
+        """An untitled fragment gets a plain stand-in, never its raw id."""
+        fragment = _build_fragment(frag_id="frag-x", title="")
+
+        quoted = _quoted_title(fragment)
+
+        assert quoted == "an untitled piece"
+        assert "frag-x" not in quoted
+
+    def test_plain_phase_reads_as_a_reader_would_say_it(self) -> None:
+        """Underscored enum values become spoken words."""
+        assert _plain_phase(Phase.BOTTOMING_OUT) == "bottoming out"
+        assert _plain_phase(Phase.RISING) == "rising"
+
+    @pytest.mark.parametrize(
+        ("count", "clause"),
+        [
+            (0, "never written from"),
+            (1, "barely written from (1 piece)"),
+            (2, "barely written from (2 pieces)"),
+        ],
+    )
+    def test_unexplored_seed_describes_the_corner_in_plain_words(
+        self, count: int, clause: str
+    ) -> None:
+        """The brief names the frequency, not ``F5``, and agrees in number."""
+        position = OntologyTuple(
+            phase=Phase.BOTTOMING_OUT,
+            frequency=Frequency.F5,
+            mode=Mode.EXPRESS,
+            voice_register=VoiceRegister.ANALYTICAL,
+            dosage=Dosage.MEDICINE,
+        )
+
+        seed = _seed_from_ontology_tuple(position, count)
+
+        assert clause in seed.brief_description
+        assert "Achievism material" in seed.brief_description
+        # A hard-coded article would render "in a analytical register".
+        assert "in your analytical register" in seed.brief_description
+        assert "a analytical" not in seed.brief_description
+        assert "bottoming out stretch" in seed.brief_description
+        assert "F5 material" not in seed.brief_description
+        assert seed.brief_description.endswith("sound like?")

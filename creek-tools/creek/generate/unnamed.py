@@ -56,9 +56,7 @@ _HISTORY_SUBPATH = ("00-Creek-Meta", "Processing-Log", "unnamed-history.json")
 _DEFAULT_SIMILARITY_THRESHOLD = 0.7
 _EXCERPT_MAX_CHARS = 200
 _WEEK_LENGTH_DAYS = 7
-_REFLECTION_PROMPT = (
-    "What do these have in common that the current ontology can't express?"
-)
+_REFLECTION_PROMPT = "What do these share that none of the names you have yet can hold?"
 
 
 @dataclass(frozen=True)

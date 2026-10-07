@@ -29,6 +29,7 @@ from creek.author.models import (
 from creek.classify.privacy_filter import PrivacyTierOverride, tier_within_override
 from creek.classify.rules import RuleClassifier
 from creek.classify.weighted import WeightedDimension
+from creek.generate.indexes import FREQUENCY_COLORS
 from creek.generate.paradox import OPPOSITE_CONFIDENCE_PAIRS, OPPOSITE_PHASE_PAIRS
 from creek.link.embeddings import (
     EmbeddingLinker,
@@ -1066,18 +1067,42 @@ def _ontology_claim(
         One :class:`EvidenceClaim` summarising the dominant signal.
     """
     count = len(fragment_ids)
+    scope = "In this one note" if count == 1 else f"Across these {count} notes"
     if analysis.frequencies:
-        freq = analysis.frequencies[0].value.value
-        phase = analysis.phases[0].value.value if analysis.phases else "no clear phase"
+        freq = _frequency_name(analysis.frequencies[0].value)
+        phase_clause = (
+            f", and most of it was written in the "
+            f"{_phase_name(analysis.phases[0].value)} phase"
+            if analysis.phases
+            else ", with no single phase standing out"
+        )
         summary = (
-            f"Ontological scan of {count} fragments: dominant frequency {freq}, "
-            f"phase {phase}."
+            f"{scope}, {freq} is the frequency I keep coming back to{phase_clause}."
         )
     else:
         summary = (
-            f"Ontological scan of {count} fragments; no dominant frequency detected."
+            f"{scope}, no single frequency stands out — "
+            "the writing moves between several."
         )
     return EvidenceClaim(claim=summary, source_fragments=fragment_ids.copy())
+
+
+def _frequency_name(freq: Frequency) -> str:
+    """Return the colour name a reader knows a frequency by, e.g. ``Yellow (F7)``.
+
+    The desk's summary claim is rendered into the owner's draft, so it names
+    the frequency the way the course does — by colour — and keeps the ``F``
+    code in brackets so the claim still ties back to the classified axis.
+    """
+    colour = FREQUENCY_COLORS.get(freq)
+    if colour is None:
+        return freq.value
+    return f"{colour.replace('_', ' ').title()} ({freq.value})"
+
+
+def _phase_name(phase: Phase) -> str:
+    """Return a Wavelength phase as prose, e.g. ``Bottoming Out``."""
+    return phase.value.replace("_", " ").title()
 
 
 _CONFIDENCE_SENTINELS: tuple[tuple[str, object], ...] = (

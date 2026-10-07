@@ -30,7 +30,8 @@ creek_lane_workers() {
     printf '%s' "$slice"
 }
 
-# shellcheck source=scripts/_lib.sh
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=_lib.sh
 source "$SCRIPT_DIR/_lib.sh"
 
 TEST_TYPE="unit"

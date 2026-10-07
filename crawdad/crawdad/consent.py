@@ -349,14 +349,17 @@ def format_type_question(batch: PendingBatch) -> str:
     The question lists the original filenames of every unresolved file
     so the user recognises which uploads need typing, plus the full
     set of valid ingest types so they know what answers are accepted.
+    It asks in plain words ("what kind of file") — the user only needs
+    to say where the file came from, not learn the word "ingest type".
     """
     unresolved = batch.unresolved_files
     names = ", ".join(f"`{f.original_filename}`" for f in unresolved)
     valid = ", ".join(sorted(VALID_INGEST_TYPES))
-    plural = "are" if len(unresolved) > 1 else "is"
+    many = len(unresolved) > 1
+    noun, plural, them = ("files", "are", "them") if many else ("file", "is", "it")
     return (
-        f"What ingest type {plural} {names}? Reply with one of: {valid}. "
-        "Or reply `cancel` to drop the batch."
+        f"What kind of {noun} {plural} {names}? Reply with one of: {valid} — "
+        f"or `cancel` to leave {them} out."
     )
 
 

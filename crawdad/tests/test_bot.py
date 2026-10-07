@@ -158,7 +158,7 @@ def test_render_state_unavailable_reply_directs_to_creek_state() -> None:
     reply = render_state_unavailable_reply(StateUnavailableError("missing"))
 
     assert "creek state" in reply
-    assert "no audit report" in reply.lower()
+    assert "read on your vault" in reply.lower()
 
 
 async def test_handle_message_with_none_state_does_not_dead_end(
@@ -167,7 +167,7 @@ async def test_handle_message_with_none_state_does_not_dead_end(
     """#527: ``session_state=None`` no longer hard-blocks free-text.
 
     Previously the handler dead-ended every free-text turn on the
-    "no audit report yet — run ``creek state``" reply whenever
+    "I don't have a read on your vault yet" reply whenever
     ``latest.md`` was absent, diverging from the slash-command path
     that never gates on session state. With loop components absent the
     handler now falls through to the FEAT-013 stub reply (and, when the
@@ -194,7 +194,7 @@ async def test_handle_message_with_none_state_does_not_dead_end(
 
     assert len(channel.sent) == 1
     assert channel.sent[0] != _STATE_UNAVAILABLE_REPLY
-    assert "scaffold" in channel.sent[0].lower()
+    assert "didn't show up" in channel.sent[0].lower()
 
 
 async def test_handle_subprocess_unavailable_replies_gracefully(
@@ -205,8 +205,8 @@ async def test_handle_subprocess_unavailable_replies_gracefully(
 
     reply = render_mcp_unavailable_reply(MCPUnavailableError("subprocess died"))
 
-    assert "creek-tools" in reply
-    assert "unreachable" in reply.lower()
+    assert "your vault" in reply
+    assert "can't reach" in reply.lower()
 
 
 @pytest.mark.parametrize(
@@ -613,7 +613,7 @@ async def test_handle_message_mcp_unavailable_uses_soft_reply(
     )
 
     assert len(channel.sent) == 1
-    assert "unreachable" in channel.sent[0].lower()
+    assert "can't reach your vault" in channel.sent[0].lower()
 
 
 async def test_handle_message_truncates_long_composer_output(
@@ -844,7 +844,7 @@ async def test_handle_message_without_loop_components_uses_stub_reply(
     )
 
     assert len(channel.sent) == 1
-    assert "scaffold" in channel.sent[0].lower()
+    assert "didn't show up" in channel.sent[0].lower()
 
 
 def test_crawdad_client_registers_slash_commands_when_loop_runner_provided(
@@ -1036,15 +1036,15 @@ async def test_attachment_path_replies_when_redact_tool_missing(
     # Two messages: body (with missing-tool soft error) + the #1054
     # refusal. This test used to assert the *consent prompt* here — the
     # bot told the user to scan first and then offered `ingest` in the
-    # very next message. Exact equality, plus an explicit negative,
-    # because a substring check for "ingest" is vacuous against the new
-    # copy ("I won't ingest them").
+    # very next message. Exact equality, plus an explicit negative on the
+    # consent prompt's own opening ("Reply `ingest`"), so the assertion
+    # fails if the prompt ever leaks into the refusal turn.
     assert len(channel.sent) == 2
     body, closing = channel.sent
-    assert "creek.redact.scan" in body
+    assert "safety check" in body
     assert "Run `creek redact --scan" in body
     assert closing == _SCAN_BLOCKED_REPLY
-    assert "Reply with `ingest`" not in closing
+    assert "Reply `ingest`" not in closing
 
 
 async def test_attachment_path_uses_soft_reply_when_mcp_dies_during_scan(
@@ -1077,15 +1077,15 @@ async def test_attachment_path_uses_soft_reply_when_mcp_dies_during_scan(
     # refusal, not the consent prompt — the scan never ran.
     assert len(channel.sent) == 2
     body, closing = channel.sent
-    assert "unreachable" in body.lower()
+    assert "can't reach your vault" in body.lower()
     assert closing == _SCAN_BLOCKED_REPLY
-    assert "Reply with `ingest`" not in closing
+    assert "Reply `ingest`" not in closing
 
 
 async def test_attachment_path_short_circuits_when_all_already_present(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
-    """A re-upload of identical bytes replies 'already staged' without scanning."""
+    """A re-upload of identical bytes replies 'already had' without scanning."""
     channel = _FakeChannel(id=999, sent=[])
     attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
 
@@ -1121,7 +1121,7 @@ async def test_attachment_path_short_circuits_when_all_already_present(
     )
     assert scan_call_count == 1
 
-    # Second upload of identical bytes — already staged; no scan call.
+    # Second upload of identical bytes — already had it; no scan call.
     channel.sent.clear()
     await handle_message(
         _build_message(),
@@ -1132,7 +1132,7 @@ async def test_attachment_path_short_circuits_when_all_already_present(
         known_tools=("creek.redact.scan",),
     )
     assert scan_call_count == 1
-    assert "already staged" in channel.sent[0].lower()
+    assert "already had" in channel.sent[0].lower()
 
 
 async def test_attachment_path_replies_with_rejection_summary_when_all_rejected(
@@ -1168,7 +1168,7 @@ async def test_attachment_path_replies_with_rejection_summary_when_all_rejected(
         known_tools=("creek.redact.scan",),
     )
     assert len(channel.sent) == 1
-    assert "extension not allowed" in channel.sent[0]
+    assert "don't take that file type" in channel.sent[0]
     # No consent prompt when nothing landed.
     assert "ingest" not in channel.sent[0].lower()
 
@@ -1205,7 +1205,7 @@ async def test_attachment_path_oversized_file_is_rejected_in_reply(
         known_tools=("creek.redact.scan",),
     )
     assert len(channel.sent) == 1
-    assert "exceeds max" in channel.sent[0]
+    assert "too big" in channel.sent[0]
 
 
 async def test_attachment_path_uses_channel_tier_override_when_configured(
@@ -1366,9 +1366,9 @@ async def test_run_safety_scan_swallows_unexpected_exceptions(
     # not the consent prompt — the scan raised, so it never ran.
     assert len(channel.sent) == 2
     body, closing = channel.sent
-    assert "unreachable" in body.lower()
+    assert "can't reach your vault" in body.lower()
     assert closing == _SCAN_BLOCKED_REPLY
-    assert "Reply with `ingest`" not in closing
+    assert "Reply `ingest`" not in closing
 
 
 async def test_run_safety_scan_extracts_report_markdown_from_dict_response(
@@ -1508,7 +1508,7 @@ async def test_attachment_reply_consent_prompt_survives_long_scan_output(
 
     When ``summary + scan_section`` exceeds the Discord cap, the
     ``_truncate_for_discord`` step would silently drop the
-    "I did **not** ingest anything" prompt from the tail. The safety
+    "Nothing's been added to your vault yet" prompt from the tail. The safety
     invariant (no auto-ingest) still holds because the router never
     fires on attachment turns, but the user trust signal would vanish.
 
@@ -1545,7 +1545,9 @@ async def test_attachment_reply_consent_prompt_survives_long_scan_output(
 
     # The combined output exceeds the cap, so at least one message
     # must carry the consent prompt verbatim — never truncated away.
-    consent_seen = any("did **not** ingest anything" in sent for sent in channel.sent)
+    consent_seen = any(
+        "Nothing's been added to your vault yet" in sent for sent in channel.sent
+    )
     assert consent_seen, channel.sent
     # The scan content also reaches the user (in some message, possibly
     # truncated). Find a chunk of the body in the joined output.
@@ -1913,7 +1915,7 @@ async def test_consent_abandon_clears_pending_batch(
     )
 
     assert len(channel.sent) == 1
-    assert "cleared" in channel.sent[0].lower()
+    assert "leaving those out" in channel.sent[0].lower()
     assert store.get(999) is None
 
 
@@ -1960,7 +1962,7 @@ async def test_consent_idempotent_re_consent_returns_already_ingested(
     assert ingest_call_count == 1
     channel.sent.clear()
 
-    # Second consent — must NOT dispatch again, must reply "already ingested".
+    # Second consent — must NOT dispatch again, must reply "already in your vault".
     second: Any = _FakeMessage(
         author=_FakeAuthor(id=111),
         channel=channel,
@@ -1978,7 +1980,7 @@ async def test_consent_idempotent_re_consent_returns_already_ingested(
 
     assert ingest_call_count == 1
     assert len(channel.sent) == 1
-    assert "already ingested" in channel.sent[0].lower()
+    assert "already in your vault" in channel.sent[0].lower()
 
 
 async def test_consent_pending_batch_expires_after_ttl(
@@ -2101,7 +2103,7 @@ async def test_consent_soft_error_when_ingest_tool_not_advertised(
     )
 
     assert len(channel.sent) == 1
-    assert "creek.ingest" in channel.sent[0]
+    assert "creek ingest --type" in channel.sent[0]
 
 
 async def test_consent_soft_error_when_mcp_unavailable_during_ingest(
@@ -2138,7 +2140,7 @@ async def test_consent_soft_error_when_mcp_unavailable_during_ingest(
     )
 
     assert len(channel.sent) == 1
-    assert "unreachable" in channel.sent[0].lower()
+    assert "can't reach your vault" in channel.sent[0].lower()
     # The batch did NOT transition to "ingested" — nothing landed.
     stored = store.get(999)
     assert stored is not None
@@ -2327,7 +2329,7 @@ async def test_consent_retry_after_partial_failure_skips_already_ingested(
         pending_batches=store,
     )
     # User saw the soft-error reply.
-    assert any("unreachable" in s.lower() for s in channel.sent)
+    assert any("can't reach your vault" in s.lower() for s in channel.sent)
     # Batch stays in awaiting_consent so retries are accepted.
     stored = store.get(999)
     assert stored is not None
@@ -2444,7 +2446,7 @@ async def test_consent_concurrent_followups_dispatch_only_once(
     (PR #308). The per-channel lock from
     :meth:`PendingBatchStore.lock_for` serialises the critical
     section; the second message sees ``state == "ingested"`` and
-    replies "already ingested".
+    replies "already in your vault".
     """
     import asyncio
 
@@ -2519,8 +2521,8 @@ async def test_consent_concurrent_followups_dispatch_only_once(
 
     # Only one ``creek.ingest`` dispatch happened across both messages.
     assert call_count == 1
-    # The second message received the "already ingested" reply.
-    assert any("already ingested" in s.lower() for s in channel.sent)
+    # The second message received the "already in your vault" reply.
+    assert any("already in your vault" in s.lower() for s in channel.sent)
     stored = store.get(999)
     assert stored is not None
     assert stored.state == "ingested"
@@ -2569,7 +2571,7 @@ async def test_run_ingest_dispatch_swallows_unexpected_exceptions(
     )
 
     assert len(channel.sent) == 1
-    assert "unreachable" in channel.sent[0].lower()
+    assert "can't reach your vault" in channel.sent[0].lower()
     # The batch was not marked ingested — user can retry.
     stored = store.get(999)
     assert stored is not None
@@ -2579,7 +2581,7 @@ async def test_run_ingest_dispatch_swallows_unexpected_exceptions(
 async def test_already_present_batch_does_not_record_pending_state(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
-    """A duplicate upload returns ``already staged`` without seeding a batch."""
+    """A duplicate upload returns ``already had`` without seeding a batch."""
     channel = _FakeChannel(id=999, sent=[])
     store = _make_store()
     attachment = _FakeAttachment(filename="dup.md", size=4, payload=b"same")
@@ -2639,7 +2641,7 @@ async def test_already_present_batch_does_not_record_pending_state(
     )
 
     assert store.get(999) is None
-    assert any("already staged" in s.lower() for s in channel.sent)
+    assert any("already had" in s.lower() for s in channel.sent)
 
 
 # ---------------------------------------------------------------------------
@@ -2747,7 +2749,7 @@ def _assert_refused(
     # refusal copy, so a substring probe would pass against the old
     # consent prompt too.
     assert channel.sent == [_SCAN_BLOCKED_REPLY]
-    assert "Reply with `ingest`" not in channel.sent[0]
+    assert "Reply `ingest`" not in channel.sent[0]
 
 
 async def test_unscanned_batch_cannot_reach_creek_ingest_under_open_ceiling(

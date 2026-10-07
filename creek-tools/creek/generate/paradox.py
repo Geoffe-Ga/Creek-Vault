@@ -847,7 +847,7 @@ class ParadoxDetector:
         """
         return _CONTRADICTION_DESCRIPTIONS.get(
             paradox.contradiction_type,
-            "A tension has been detected between these fragments.",
+            "These pieces of your writing pull in different directions.",
         )
 
     @staticmethod

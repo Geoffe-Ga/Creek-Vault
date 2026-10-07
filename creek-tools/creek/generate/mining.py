@@ -49,6 +49,7 @@ from creek.generate.compile_routing import (
     load_compiled_pages,
     record_compile_gap,
 )
+from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES
 from creek.models import (
     Dosage,
     Eddy,
@@ -808,9 +809,9 @@ class IdeaMiner:
                     surfaced_by="mine.thread_terminus",
                 )
         description = (
-            f"Thread '{thread.id}' has accumulated {thread.fragment_count} "
-            "fragments without becoming a published essay. Its sustained "
-            "return suggests an argument waiting to crystallise."
+            f"You keep coming back to '{thread.title}' — "
+            f"{thread.fragment_count} times now — and it still hasn't become "
+            "an essay. Something here wants to be argued out loud."
         )
         score = float(thread.fragment_count) / max(self.min_thread_fragments, 1)
         return IdeaSeed(
@@ -1116,8 +1117,8 @@ class IdeaMiner:
             (frag.title for frag in frags if frag.title), "Resonance chain"
         )
         description = (
-            f"A cross-source echo of {len(frags)} fragments across "
-            f"{len(sources)} platforms converges on a shared motif."
+            f"The same idea showed up {len(frags)} times, in {len(sources)} "
+            "different places you write. What is it circling?"
         )
         return IdeaSeed(
             strategy=MiningStrategy.RESONANCE_CHAIN,
@@ -1265,9 +1266,11 @@ class IdeaMiner:
         phase: Phase,
     ) -> IdeaSeed:
         """Build an :class:`IdeaSeed` for a wavelength window match."""
+        stretch = _plain_phase(phase)
         description = (
-            f"Fragment '{fragment.id}' surfaces during the {phase.value} "
-            "phase and carries explicit praxis — a seasonal essay prompt."
+            f"You wrote {_quoted_title(fragment)} during a {stretch} stretch, "
+            "and it names something to actually do. You're in that stretch "
+            "again now — worth revisiting?"
         )
         return IdeaSeed(
             strategy=MiningStrategy.WAVELENGTH_WINDOW,
@@ -1412,8 +1415,9 @@ class IdeaMiner:
     ) -> IdeaSeed:
         """Build an :class:`IdeaSeed` for a liminal x eddy resonance."""
         description = (
-            f"Liminal fragment '{fragment.id}' echoes eddy '{eddy.id}'. "
-            "Name what the fragment is trying to say about this cluster."
+            f"Something you couldn't name yet, {_quoted_title(fragment)}, "
+            f"keeps brushing against '{eddy.title}'. What is it trying to "
+            "say about that?"
         )
         title = f"Naming what orbits '{eddy.title}'"
         return IdeaSeed(
@@ -1596,16 +1600,17 @@ def _seed_from_ontology_tuple(position: OntologyTuple, count: int) -> IdeaSeed:
     """Build an :class:`IdeaSeed` for an under-explored ontology tuple."""
     label = position.label()
     if count == 0:
-        coverage_clause = "never inhabited"
+        coverage_clause = "never written from"
     else:
-        coverage_clause = f"barely touched ({count} fragments)"
+        pieces = "piece" if count == 1 else "pieces"
+        coverage_clause = f"barely written from ({count} {pieces})"
     description = (
-        f"Your voice in {position.phase.value}, working "
-        f"{position.frequency.value} material in {position.mode.value} mode, "
-        f"in the {position.voice_register.value} register at the "
-        f"{position.dosage.value} dosage - a corner you have "
-        f"{coverage_clause}. "
-        "What would the essay you have not yet written here sound like?"
+        f"A corner of your voice you've {coverage_clause}: "
+        f"{CANONICAL_FREQUENCY_NAMES[position.frequency]} material, in your "
+        f"{position.voice_register.value} register, taken from the "
+        f"{position.mode.value} stance, during a {_plain_phase(position.phase)} "
+        f"stretch, on the {position.dosage.value} side. What would the essay "
+        "you haven't written here sound like?"
     )
     return IdeaSeed(
         strategy=MiningStrategy.UNEXPLORED_ONTOLOGY,
@@ -1617,6 +1622,21 @@ def _seed_from_ontology_tuple(position: OntologyTuple, count: int) -> IdeaSeed:
         brief_description=description,
         score=1.0 / (1 + count),
     )
+
+
+def _plain_phase(phase: Phase) -> str:
+    """Return the phase name as a reader would say it (``bottoming out``)."""
+    return phase.value.replace("_", " ")
+
+
+def _quoted_title(fragment: Fragment) -> str:
+    """Return the fragment's title in quotes, or a plain stand-in when it has none.
+
+    Seed descriptions are read by the vault owner (state page, CrawDad),
+    so they name the piece the way its author would — by title — and
+    never by the raw fragment id.
+    """
+    return f"'{fragment.title}'" if fragment.title else "an untitled piece"
 
 
 def _connected_components(edges: list[tuple[str, str]]) -> list[frozenset[str]]:

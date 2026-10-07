@@ -557,7 +557,7 @@ def _unexplored_ontology_seed() -> object:
         threads=(),
         eddies=(),
         frequency_affinity=(),
-        brief_description="a corner you have never inhabited",
+        brief_description="A corner of your voice you've never written from.",
         score=1.0,
     )
 

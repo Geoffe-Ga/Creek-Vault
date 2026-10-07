@@ -10,10 +10,13 @@ the prose back to :mod:`creek.models`.
 These tests tie it back. The canonical source is
 ``docs/Ontology/creek_ontology_agent_prompt.md``: §6.1 defines the ten
 colour-keyed APTITUDE frequencies, and §7 defines the Archetypal
-Wavelength — §7.1 the six phases, §7.2 the **five** functional Modes
-mapped over the nine frequencies Beige through Ultraviolet.
-:class:`creek.models.Mode` implements exactly those five (plus
-``unclassified``). Three axes, three cardinalities.
+Wavelength — §7.1 the six phases, §7.2 the six functional Modes. Five
+of them carry a Do/Feel Orientation and are mapped over the nine
+frequencies Beige through Ultraviolet; the sixth, Be, is Clear
+Light's Mode, carries no Orientation and no Medicine/Toxic terms, and
+is therefore not a classifier target. :class:`creek.models.Mode`
+implements exactly the five oriented Modes (plus ``unclassified``).
+Three axes, three cardinalities.
 
 **What this module forbids is a shape, not a word.** The bug it exists
 to stop is an *equation* between the frequency axis and a Wavelength
@@ -168,10 +171,18 @@ SECTION_7_2_ENUMERATION: Final[re.Pattern[str]] = re.compile(
     r"§7\.2[^(]{0,60}\((Inhabit[^)]*)\)"
 )
 
-#: A row of the §7.2 "five Modes and their Orientations" table: the Mode
-#: name is the bolded first cell.
+#: An *oriented* row of the §7.2 "six Modes and their Orientations"
+#: table: the Mode name is the bolded first cell and the Orientation
+#: cell reads Do, Feel or Do/Feel. The Be row (Clear Light) has no
+#: Orientation, so it is deliberately outside this match.
 MODE_TABLE_ROW: Final[re.Pattern[str]] = re.compile(
     r"^\|\s*\*\*(\w+)\*\*\s*\|\s*Do\s*/?\s*Feel", re.MULTILINE
+)
+
+#: The Mode §7.2 lists for Clear Light alone: no Orientation, no
+#: Medicine/Toxic terms, not a :class:`creek.models.Mode` member.
+BE_ROW: Final[re.Pattern[str]] = re.compile(
+    r"^\|\s*\*\*Be\*\*\s*\|\s*—\s*\|\s*Clear Light\s*\|", re.MULTILINE
 )
 
 #: The sibling ADR's ruling, quoted verbatim from its Accepted text. The
@@ -274,9 +285,11 @@ def test_shared_vocabulary_claim_equates_no_wavelength_axis(filename: str) -> No
 def test_adr_mode_enumeration_invents_no_mode() -> None:
     """The MCP-contract ADR's §7.2 citation lists exactly the real Modes.
 
-    Guards the specific regression: the ADR once cited §7.2 for a tenth
-    Mode ("Clear Light's Be") that §7.2 does not define and
-    :class:`creek.models.Mode` does not implement.
+    Guards the specific regression: the ADR once cited §7.2 for a Mode
+    ("Clear Light's Be (Both/Neither)") as if the classifier implemented
+    it. §7.2 now names Be as Clear Light's Mode, explicitly without an
+    Orientation, and :class:`creek.models.Mode` still does not implement
+    it — so the ADR's list of *classified* Modes must stay at five.
     """
     text = _normalised(DECISIONS_DIR / MCP_CONTRACT_ADR)
     enumerations = SECTION_7_2_ENUMERATION.findall(text)
@@ -290,15 +303,34 @@ def test_adr_mode_enumeration_invents_no_mode() -> None:
 
 
 def test_ontology_prompt_section_7_2_matches_the_mode_enum() -> None:
-    """§7.2's Mode table is exactly :class:`creek.models.Mode`'s members.
+    """§7.2's oriented Mode rows are exactly :class:`creek.models.Mode`'s members.
 
     This is the anchor the ADR gate cites. If the canonical section ever
-    gains or loses a Mode, this fails first and the ADR wording that
-    quotes it must be revisited in the same change.
+    gains or loses an oriented Mode, this fails first and the ADR wording
+    that quotes it must be revisited in the same change.
     """
     rows = MODE_TABLE_ROW.findall(ONTOLOGY_PROMPT.read_text(encoding="utf-8"))
     assert set(rows) == _canonical_mode_names()
     assert len(rows) == len(_canonical_mode_names())
+
+
+def test_ontology_prompt_section_7_2_names_be_for_clear_light_unoriented() -> None:
+    """§7.2 lists Be as Clear Light's Mode, and keeps it off the classifier.
+
+    The APTITUDE Complete Map gives Clear Light the Mode *Be*; an earlier
+    revision of §7.2 dropped it and counted "five Modes" over "nine
+    Frequencies", silently losing the tenth frequency's stance. The row
+    must exist, and it must carry no Do/Feel Orientation, because the
+    Modes-of-the-Wavelength map charts no Medicine/Toxic terms for it and
+    :class:`creek.models.Mode` does not implement it. Both halves are
+    asserted so the row can neither vanish again nor quietly grow an
+    Orientation that :func:`MODE_TABLE_ROW` would then read as a sixth
+    classified Mode.
+    """
+    text = ONTOLOGY_PROMPT.read_text(encoding="utf-8")
+    assert BE_ROW.search(text), "§7.2 no longer lists Be as Clear Light's Mode"
+    assert "Be" not in MODE_TABLE_ROW.findall(text)
+    assert "**The six Modes and their Orientations:**" in text
 
 
 def test_contract_module_equates_no_wavelength_axis() -> None:

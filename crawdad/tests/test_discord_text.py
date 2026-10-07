@@ -14,8 +14,8 @@ from crawdad.discord_text import (
 
 def test_truncation_keeps_the_existing_wire_contract() -> None:
     """The shared helper preserves the old cap and marker."""
-    assert (
-        _MCP_UNAVAILABLE_REPLY == "creek-tools is unreachable; try again in a moment."
+    assert _MCP_UNAVAILABLE_REPLY == (
+        "I can't reach your vault right now — give it a moment and try again."
     )
     assert _truncate_for_discord("ok") == "ok"
     reply = _truncate_for_discord("x" * (_DISCORD_REPLY_LIMIT + 1))

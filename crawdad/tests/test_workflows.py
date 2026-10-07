@@ -938,7 +938,7 @@ async def test_walker_refuses_phase_aware_without_state() -> None:
     )
     wf = _simple_workflow(phase_aware=True)
 
-    with pytest.raises(WorkflowConstraintError, match="phase-aware"):
+    with pytest.raises(WorkflowConstraintError, match="current phase"):
         await walker.run(wf, state=None, inputs={})
 
 
@@ -957,7 +957,7 @@ async def test_walker_refuses_phase_aware_with_disallowed_phase(
         phase_aware=True, allowed_phases=("bottoming_out", "withdrawal")
     )
 
-    with pytest.raises(WorkflowConstraintError, match="refuses to run in phase"):
+    with pytest.raises(WorkflowConstraintError, match="meant for"):
         await walker.run(wf, state=state, inputs={})
 
 
@@ -1319,8 +1319,8 @@ async def test_walker_ceiling_refusal_names_workflow_tier_and_allowed_set() -> N
         await walker.run(wf, state=None, inputs={})
 
     message = str(excinfo.value)
-    assert "'leaky-flow'" in message
-    assert "'all'" in message
+    assert "`leaky-flow`" in message
+    assert "`all`" in message
     assert "open" in message
     assert "personal" in message
     assert session.calls == []
@@ -1351,7 +1351,7 @@ async def test_ceiling_refusal_reported_before_other_constraint_failures() -> No
         await walker.run(wf, state=None, inputs={})
 
     message = str(excinfo.value)
-    assert "'intimate'" in message
+    assert "`intimate`" in message
     assert "not.a.real.tool" not in message
     assert "topic" not in message
     assert client.connect_calls == 0
@@ -1392,7 +1392,7 @@ async def test_workflow_over_cap_stays_visible_in_registry(tmp_path: Path) -> No
     client = _FakeMCPClient(session)
     walker = WorkflowWalker(mcp_client=client, known_tools=("creek.state.read",))
 
-    with pytest.raises(WorkflowConstraintError, match="'too-private'"):
+    with pytest.raises(WorkflowConstraintError, match="`too-private`"):
         await walker.run(wf, state=None, inputs={})
 
     assert client.connect_calls == 0
@@ -1648,7 +1648,7 @@ async def test_compost_surfacing_refuses_when_session_state_unavailable() -> Non
         known_tools=("creek.state.read", "creek.mine"),
     )
 
-    with pytest.raises(WorkflowConstraintError, match="phase-aware"):
+    with pytest.raises(WorkflowConstraintError, match="current phase"):
         await walker.run(wf, state=None, inputs={})
 
 

@@ -23,6 +23,7 @@
 #
 # Args:
 #   $1 (optional) — the Python module to probe for; defaults to "pytest".
+# shellcheck disable=SC2120  # $1 is optional; callers may omit it
 creek_require_python_toolchain() {
     local module="${1:-pytest}"
 
