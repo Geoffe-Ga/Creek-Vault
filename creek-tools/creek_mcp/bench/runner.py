@@ -363,6 +363,7 @@ def _validate(plan: BenchPlan) -> None:
         workload.warm_trials,
         workload.idle_cycles,
         workload.entries,
+        workload.words_per_entry,
         workload.query_words,
     )
     if any(level < 1 for level in workload.concurrency_levels):

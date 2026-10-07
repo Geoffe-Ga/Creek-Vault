@@ -212,6 +212,8 @@ def build_corpus(
     """
     if entries < 0:
         raise ValueError(_NEGATIVE_ENTRIES)
+    if words_per_entry < 0:
+        raise ValueError(_NEGATIVE_WORDS)
     resolved = _confined_root(root)
     notes_dir = resolved / FRAGMENTS_DIR
     meta_dir = resolved / META_DIR

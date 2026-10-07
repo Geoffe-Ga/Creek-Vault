@@ -334,6 +334,7 @@ def test_live_mode_without_pin_hook_refused(
         ({"concurrency_levels": (0,)}, "concurrency"),
         ({"cold_trials": -1}, "trial counts"),
         ({"idle_cycles": -1}, "trial counts"),
+        ({"words_per_entry": -1}, "trial counts"),
         ({"idle_seconds": -0.5}, "idle_seconds"),
         ({"context_sizes": (0,)}, "num_ctx"),
     ],

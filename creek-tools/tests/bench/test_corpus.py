@@ -142,6 +142,14 @@ def test_vocabulary_never_trips_the_care_guard() -> None:
     assert acute_distress_guard(entry_text(seed=9, index=2, words=2048)) is None
 
 
+def test_negative_note_size_refused_before_any_write(tmp_path: Path) -> None:
+    """A bad size is refused before a single directory is created."""
+    root = tmp_path / "v"
+    with pytest.raises(ValueError, match="words"):
+        build_corpus(root, seed=1, entries=1, words_per_entry=-1)
+    assert not root.exists()
+
+
 def test_rejects_negative_sizes(tmp_path: Path) -> None:
     """Sizes are counts; a negative one is a caller bug."""
     with pytest.raises(ValueError, match="entries"):
