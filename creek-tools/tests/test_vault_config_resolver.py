@@ -656,7 +656,7 @@ def test_server_author_llm_uses_the_served_vaults_routing_and_author_config(
         client_mod.AuthorLLMClient,
         "for_voice_or_none",
         classmethod(
-            lambda _cls, router, *, author, tier: (
+            lambda _cls, router, *, author, tier, may_serve: (
                 seen.append(router.resolve("generation", tier).model),
                 None,
             )[1],

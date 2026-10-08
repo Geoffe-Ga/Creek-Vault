@@ -201,11 +201,24 @@ be local. Two layers enforce this:
   container that points at a LAN Ollama.** Run the runtime inside the
   container's loopback instead.
 - **At dial time**, the serving process sets `CREEK_OLLAMA_LOOPBACK_ONLY=1`,
-  so a vault-config edit after boot cannot reach a remote host. Reflection
-  also refuses unless a model package is configured and the stage resolves to
-  its pinned model at its pinned digest over loopback. Without one, reflection
-  in a container is unavailable rather than served by an unpinned or cloud
-  model.
+  so a vault-config edit after boot cannot reach a remote host.
+- **Per request, on the model**, every path that shows vault content to a
+  model is served only by the pinned model. These paths are reflection,
+  compile, draft, the Writing Desk's voice client and `--method llm`
+  classification (`POST /v1/classifications`). Each one refuses unless a model
+  package is configured and its stage resolves to an Ollama provider on a
+  loopback URL, with the pinned model tag, listed at the pinned digest. A
+  cloud stage (Anthropic, OpenAI, Gemini or enclave) is refused before any
+  dial, whether or not a key and consent are present. Without a manifest,
+  these paths are unavailable in a container rather than served by an unpinned
+  or cloud model. Refusals keep each path's existing shape: reflection,
+  compile and draft return their usual "provider unavailable" refusal, the
+  Writing Desk renders deterministically, and classification returns its usual
+  provider-unavailable refusal (`internal_error` on `/v1`). The same rule
+  applies outside a container whenever `CREEK_MODEL_PACKAGE_FILE` is set.
+  Without that variable and outside a container, nothing changes: a
+  self-hoster's own cloud key keeps working. The rule lives in
+  `creek_mcp/model_pin.py`.
 - **On the transport**, every Ollama request ignores `HTTP_PROXY`,
   `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`, in and out of containers. A
   loopback URL therefore cannot be relayed to a proxy host. An operator who

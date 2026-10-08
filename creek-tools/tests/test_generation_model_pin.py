@@ -1,0 +1,507 @@
+"""Compile, draft, author and LLM classify carry the reflection pin (#1849).
+
+B05 pinned ``creek.reflect`` to the operator's model package: with a manifest
+configured, or in container mode, reflection is served only by an Ollama stage
+on a loopback URL whose model is the pinned tag at the pinned inventory digest.
+The other MCP paths that show vault text to a model resolve their provider
+from the same writable vault config, so the same rule applies to each of them
+here. Outside both modes nothing changes.
+
+The cloud cases build the **real** cloud provider with its key and consent
+set, and assert it would report itself available. That way the refusal can
+only come from the pin's provider check, not from a missing key.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Final
+
+import pytest
+import yaml
+
+from creek.classify.llm.consent import CLOUD_CONSENT_ENV
+from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+from creek.classify.llm.providers import build_provider
+from creek.config import CreekConfig, LLMConfig
+from creek.models import PrivacyTier
+from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV
+from tests.test_container_model_probe import _MODEL, _pin, _served, _tags
+from tests.test_reflect_model_pin import _Tags
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+_CONFIG_SUBPATH: Final = ("00-Creek-Meta", "creek_config.yaml")
+_BUILDERS: Final = [("_build_draft_llm", "draft"), ("_build_compile_llm", "compile")]
+_CLOUD_KEYS: Final = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+_REMOTE_URL: Final = "http://evil.example:11434"
+
+
+def _refusal(verb: str) -> str:
+    """Return the unchanged refusal text for *verb*, matched in full."""
+    return (
+        f"^LLM provider unavailable for {verb}\\. "
+        "Check Ollama or ANTHROPIC_API_KEY configuration\\.$"
+    )
+
+
+def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Run from an empty cwd with no ambient config, pin, flag, key or consent."""
+    for name in (
+        "CREEK_CONFIG",
+        MODEL_PACKAGE_FILE_ENV,
+        LOOPBACK_ONLY_ENV,
+        CLOUD_CONSENT_ENV,
+        *_CLOUD_KEYS.values(),
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+
+
+def _vault(tmp_path: Path, stage: str = "generation", **override: str) -> Path:
+    """Scaffold a vault whose *stage* is the pinned-tag default plus *override*."""
+    vault = tmp_path / "served"
+    (vault / "01-Fragments").mkdir(parents=True)
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    data: dict[str, Any] = CreekConfig().model_dump(mode="json")
+    data["vault_path"] = str(vault)
+    data["llm"]["default"].update(model=_MODEL)
+    if override:
+        data["llm"][stage] = {**data["llm"]["default"], **override}
+    vault.joinpath(*_CONFIG_SUBPATH).write_text(
+        yaml.dump(data, sort_keys=False), encoding="utf-8"
+    )
+    return vault
+
+
+def _cloud_vault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, stage: str
+) -> Path:
+    """Route *stage* to a keyed, consented cloud *provider* at the pinned tag.
+
+    Every other pin condition would pass: the model is the pinned tag and
+    ``ollama_url`` keeps its loopback default. The precondition assertion
+    proves the real provider is available, so only the pin can refuse it.
+    """
+    monkeypatch.setenv(_CLOUD_KEYS[provider], "sk-test-not-a-real-key")
+    monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
+    vault = _vault(tmp_path, stage, provider=provider)
+    cloud = build_provider(LLMConfig(provider=provider, model=_MODEL))
+    assert cloud.available, f"precondition: a keyed {provider} stage is available"
+    assert cloud.model == _MODEL
+    return vault
+
+
+def _builder(name: str) -> Callable[[Path, PrivacyTier], Callable[[str], Any]]:
+    """Return the named generation builder from ``creek_mcp.server``."""
+    import creek_mcp.server as server_mod
+
+    builder: Callable[[Path, PrivacyTier], Callable[[str], Any]] = getattr(
+        server_mod, name
+    )
+    return builder
+
+
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_serves_the_pinned_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, verb: str
+) -> None:
+    """Positive control: a served pin over loopback yields a callable."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+
+    llm = _builder(name)(_vault(tmp_path), PrivacyTier.INTIMATE)
+
+    assert callable(llm), verb
+    assert len(tags.urls) == 1
+    assert tags.urls[0].startswith("http://localhost:11434/api/tags")
+
+
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_refuses_when_pinned_digest_not_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, verb: str
+) -> None:
+    """The right name at the wrong digest is a substituted model: refuse."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    tags = _Tags(monkeypatch, _served("e" * 64))
+
+    with pytest.raises(RuntimeError, match=_refusal(verb)):
+        _builder(name)(_vault(tmp_path), PrivacyTier.OPEN)
+    assert len(tags.urls) == 1
+
+
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_refuses_another_model_when_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, verb: str
+) -> None:
+    """With a pin set, a stage resolving to another served model is refused."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    other = "creek-other-model:q4"
+    tags = _Tags(monkeypatch, _tags({"name": other, "digest": "d" * 64}))
+
+    with pytest.raises(RuntimeError, match=_refusal(verb)):
+        _builder(name)(_vault(tmp_path, model=other), PrivacyTier.OPEN)
+    assert tags.urls == []
+
+
+@pytest.mark.parametrize("provider", sorted(_CLOUD_KEYS))
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_refuses_a_keyed_cloud_stage_in_container_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    verb: str,
+    provider: str,
+) -> None:
+    """Container mode with a served pin still refuses a cloud stage, undialled."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+    vault = _cloud_vault(tmp_path, monkeypatch, provider, "generation")
+
+    with pytest.raises(RuntimeError, match=_refusal(verb)):
+        _builder(name)(vault, PrivacyTier.OPEN)
+    assert tags.urls == []
+
+
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_refuses_a_keyed_cloud_stage_without_a_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, verb: str
+) -> None:
+    """Container mode with no pin is model-unavailable, cloud key or not."""
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+    vault = _cloud_vault(tmp_path, monkeypatch, "anthropic", "generation")
+
+    with pytest.raises(RuntimeError, match=_refusal(verb)):
+        _builder(name)(vault, PrivacyTier.OPEN)
+    assert tags.urls == []
+
+
+@pytest.mark.parametrize("flag", [True, False])
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_refuses_a_remote_url_after_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    verb: str,
+    *,
+    flag: bool,
+) -> None:
+    """A post-boot edit to a remote host is refused before any dial."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    if flag:
+        monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+
+    with pytest.raises(RuntimeError, match=_refusal(verb)) as caught:
+        _builder(name)(_vault(tmp_path, ollama_url=_REMOTE_URL), PrivacyTier.OPEN)
+    assert tags.urls == []
+    assert "evil.example" not in str(caught.value)
+
+
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_refuses_an_unloadable_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, verb: str
+) -> None:
+    """A configured but invalid pin fails closed rather than unpinned."""
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv(MODEL_PACKAGE_FILE_ENV, str(tmp_path / "absent.json"))
+    tags = _Tags(monkeypatch, _served())
+
+    with pytest.raises(RuntimeError, match=_refusal(verb)):
+        _builder(name)(_vault(tmp_path), PrivacyTier.OPEN)
+    assert tags.urls == []
+
+
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_keeps_existing_behaviour_without_pin_or_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, verb: str
+) -> None:
+    """Outside container mode with no manifest an unpinned model still serves."""
+    _isolate(monkeypatch, tmp_path)
+    tags = _Tags(monkeypatch, _tags({"name": _MODEL}))
+
+    llm = _builder(name)(_vault(tmp_path), PrivacyTier.OPEN)
+
+    assert callable(llm), verb
+    assert len(tags.urls) == 1
+
+
+def test_generation_builder_keeps_a_keyed_cloud_stage_without_pin_or_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Self-hosted with the person's own key and no pin: cloud still serves.
+
+    The counterpart of the container cases above: without this the cloud
+    refusals could pass because cloud stages are refused everywhere.
+    """
+    _isolate(monkeypatch, tmp_path)
+    tags = _Tags(monkeypatch, _served())
+    vault = _cloud_vault(tmp_path, monkeypatch, "anthropic", "generation")
+
+    assert callable(_builder("_build_draft_llm")(vault, PrivacyTier.OPEN))
+    assert tags.urls == []
+
+
+# ---------------------------------------------------------------------------
+# The Writing Desk's voice client degrades to deterministic rendering
+# ---------------------------------------------------------------------------
+
+
+def test_author_llm_serves_the_pinned_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control: a served pin yields the voice client."""
+    from creek_mcp.server import _build_author_llm
+
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+
+    client = _build_author_llm(_vault(tmp_path), PrivacyTier.OPEN)
+
+    assert client is not None
+    assert len(tags.urls) == 1
+
+
+@pytest.mark.parametrize("override", [{"model": "creek-other-model:q4"}, {}])
+def test_author_llm_degrades_when_the_pin_is_not_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: dict[str, str]
+) -> None:
+    """Another model, or the pinned name at another digest, renders without a model."""
+    from creek_mcp.server import _build_author_llm
+
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    inventory = (
+        _tags({"name": "creek-other-model:q4", "digest": "d" * 64})
+        if override
+        else _served("e" * 64)
+    )
+    _Tags(monkeypatch, inventory)
+
+    assert _build_author_llm(_vault(tmp_path, **override), PrivacyTier.OPEN) is None
+
+
+def test_author_llm_degrades_on_a_keyed_cloud_stage_in_container_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A keyed cloud voice stage is not used in container mode, undialled."""
+    from creek_mcp.server import _build_author_llm
+
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+    vault = _cloud_vault(tmp_path, monkeypatch, "anthropic", "generation")
+
+    assert _build_author_llm(vault, PrivacyTier.OPEN) is None
+    assert tags.urls == []
+
+
+# ---------------------------------------------------------------------------
+# ``creek.classify --method llm`` (served on /v1/classifications)
+# ---------------------------------------------------------------------------
+
+
+def _classify(vault: Path, method: str = "llm") -> dict[str, Any]:
+    """Run the real classify tool over *vault*."""
+    from creek_mcp.tools.classify import classify_tool
+
+    return classify_tool(vault_path=vault, method=method)
+
+
+def test_classify_llm_runs_against_the_pinned_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control: a served pin lets an LLM classify pass run."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    _Tags(monkeypatch, _served())
+
+    assert _classify(_vault(tmp_path))["status"] == "ok"
+
+
+@pytest.mark.parametrize("provider", sorted(_CLOUD_KEYS))
+def test_classify_llm_refuses_a_keyed_cloud_stage_in_container_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Container mode refuses cloud classification even with a key and consent."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+    vault = _cloud_vault(tmp_path, monkeypatch, provider, "classification")
+
+    result = _classify(vault)
+
+    assert result["status"] == "refused"
+    assert result["reason"].startswith(f"LLM provider {provider!r} is unavailable: ")
+    assert tags.urls == []
+
+
+def test_classify_llm_refuses_another_model_when_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A classification stage on another local model is refused under a pin."""
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    _Tags(monkeypatch, _tags({"name": "creek-other-model:q4", "digest": "d" * 64}))
+    vault = _vault(tmp_path, "classification", model="creek-other-model:q4")
+
+    result = _classify(vault)
+
+    assert result["status"] == "refused"
+    assert result["reason"].startswith("LLM provider 'ollama' is unavailable: ")
+
+
+def test_classify_rules_is_unaffected_by_the_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rules pass shows nothing to a model, so the pin never gates it."""
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+
+    assert _classify(_vault(tmp_path), method="rules")["status"] == "ok"
+    assert tags.urls == []
+
+
+# ---------------------------------------------------------------------------
+# A cloud stage with no key or consent: the normal container state
+# ---------------------------------------------------------------------------
+
+_KEYLESS_CLOUD: Final = ("anthropic", "openai", "gemini")
+_KEYLESS_ENVS: Final = ("GOOGLE_API_KEY", "GEMINI_API_KEY")
+_UNPINNED_REASON: Final = (
+    "LLM provider {provider!r} is unavailable: only the pinned local model "
+    "may classify while a model package is configured or the server runs "
+    "in container mode"
+)
+
+
+def _keyless_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, stage: str
+) -> tuple[Path, _Tags]:
+    """Container mode with a served pin, *stage* on a keyless cloud *provider*.
+
+    The precondition proves the cloud constructor itself would raise, so an
+    unguarded build would escape as a bare ``RuntimeError``.
+    """
+    from creek.classify.llm.router import IntimateRoutingError
+
+    _isolate(monkeypatch, tmp_path)
+    for name in _KEYLESS_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+    with pytest.raises(RuntimeError) as built:
+        build_provider(LLMConfig(provider=provider, model=_MODEL))
+    assert not isinstance(built.value, IntimateRoutingError)
+    return _vault(tmp_path, stage, provider=provider), tags
+
+
+@pytest.mark.parametrize("provider", _KEYLESS_CLOUD)
+def test_classify_llm_refuses_a_keyless_cloud_stage_as_a_structured_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """A keyless cloud stage is the usual refusal, never a bare exception."""
+    from creek.classify.llm import providers as providers_mod
+
+    vault, tags = _keyless_container(tmp_path, monkeypatch, provider, "classification")
+    built: list[str] = []
+    real_build = providers_mod.build_provider
+
+    def _spy(cfg: LLMConfig) -> Any:
+        built.append(cfg.provider)
+        return real_build(cfg)
+
+    monkeypatch.setattr(providers_mod, "build_provider", _spy)
+
+    result = _classify(vault)
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _UNPINNED_REASON.format(provider=provider)
+    assert tags.urls == []
+    assert built == [], "a pin-mode cloud stage is refused before it is built"
+
+
+def test_classify_llm_turns_a_failed_provider_build_into_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any other build failure in a pin mode is the same structured refusal."""
+    from creek.classify.llm import providers as providers_mod
+
+    _isolate(monkeypatch, tmp_path)
+    _pin(tmp_path, monkeypatch)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    tags = _Tags(monkeypatch, _served())
+
+    def _fail(_cfg: LLMConfig) -> Any:
+        msg = "constructor refused"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(providers_mod, "build_provider", _fail)
+
+    result = _classify(_vault(tmp_path))
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _UNPINNED_REASON.format(provider="ollama")
+    assert tags.urls == []
+
+
+@pytest.mark.parametrize("provider", _KEYLESS_CLOUD)
+@pytest.mark.parametrize(("name", "verb"), _BUILDERS)
+def test_generation_builder_refuses_a_keyless_cloud_stage_with_the_fixed_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    verb: str,
+    provider: str,
+) -> None:
+    """Compile and draft refuse with their usual text, not the SDK's."""
+    vault, tags = _keyless_container(tmp_path, monkeypatch, provider, "generation")
+
+    with pytest.raises(RuntimeError, match=_refusal(verb)):
+        _builder(name)(vault, PrivacyTier.OPEN)
+    assert tags.urls == []
+
+
+@pytest.mark.parametrize("provider", _KEYLESS_CLOUD)
+def test_reflect_factory_refuses_a_keyless_cloud_stage_with_the_fixed_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Reflection refuses with its usual text, not the SDK's."""
+    from creek_mcp.server import _build_reflect_llm_factory
+
+    vault, tags = _keyless_container(tmp_path, monkeypatch, provider, "generation")
+    factory = _build_reflect_llm_factory(vault)
+
+    with pytest.raises(RuntimeError, match=_refusal("reflection")):
+        factory(PrivacyTier.OPEN, max_tokens=16)
+    assert tags.urls == []
+
+
+@pytest.mark.parametrize("provider", _KEYLESS_CLOUD)
+def test_author_llm_degrades_on_a_keyless_cloud_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """A keyless cloud voice stage renders deterministically, not as an error."""
+    from creek_mcp.server import _build_author_llm
+
+    vault, tags = _keyless_container(tmp_path, monkeypatch, provider, "generation")
+
+    assert _build_author_llm(vault, PrivacyTier.OPEN) is None
+    assert tags.urls == []

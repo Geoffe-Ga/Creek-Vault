@@ -26,10 +26,9 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 
 from creek.care.guardrail import acute_distress_guard
-from creek.classify.llm.local_boundary import is_loopback_url, loopback_only_enforced
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
-from creek_mcp.model_package import ModelPackageError, configured_manifest
+from creek_mcp.model_pin import pin_refuses_stage, provider_may_serve
 from creek_mcp.policy import (
     Admission,
     CallerIdentity,
@@ -87,8 +86,8 @@ if TYPE_CHECKING:
 
     from creek.author.client import AuthorLLMClient
     from creek.classify.llm.base import LLMProvider
+    from creek.classify.llm.router import ModelRouter
     from creek.compile.engine import CompileLLM
-    from creek.config import LLMConfig
     from creek.models import PrivacyTier
     from creek_mcp.tools.author import AuthorLLMFactory
     from creek_mcp.tools.compile import CompileLLMFactory
@@ -252,6 +251,9 @@ def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
     ``state``/``lint``/``mine`` stay callable on hosts with neither an
     Anthropic key nor a running Ollama.
 
+    With a model package configured, or in container mode, the provider must
+    also be the pinned local model (#1849): see :func:`_generation_provider`.
+
     Args:
         vault: The served vault, whose own ``creek_config.yaml`` owns the
             routing. Bound by ``build_server`` at construction time (#1409):
@@ -265,21 +267,14 @@ def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
         A prompt → completion-text callable bound to the resolved provider.
 
     Raises:
-        RuntimeError: When the resolved provider is unavailable, or — as
+        RuntimeError: When the resolved provider is unavailable or is not the
+            pinned model, or — as
             :class:`~creek.classify.llm.router.IntimateRoutingError`, a
             subclass — when intimate content has no local backend to fall
             back to. ``draft_tool`` turns either into a refusal.
     """
-    from creek.classify.llm.providers import build_provider
-
-    cfg = load_vault_config(vault).model_router.resolve("generation", tier)
-    provider = build_provider(cfg)
-    if not provider.available:
-        msg = (
-            "LLM provider unavailable for draft. "
-            "Check Ollama or ANTHROPIC_API_KEY configuration."
-        )
-        raise RuntimeError(msg)
+    router = load_vault_config(vault).model_router
+    provider = _generation_provider(router, tier, "draft")
     return lambda prompt: provider.complete(prompt).text
 
 
@@ -298,6 +293,9 @@ def _build_compile_llm(vault: Path, tier: PrivacyTier) -> CompileLLM:
     Lazy imports keep the server bootable with no provider configured — only a
     ``creek.compile`` call then fails, and it fails as a structured refusal.
 
+    With a model package configured, or in container mode, the provider must
+    also be the pinned local model (#1849): see :func:`_generation_provider`.
+
     Args:
         vault: The served vault, whose own ``creek_config.yaml`` owns the
             routing. Bound by ``build_server`` at construction time (#1409):
@@ -314,21 +312,14 @@ def _build_compile_llm(vault: Path, tier: PrivacyTier) -> CompileLLM:
         A prompt → completion-text callable bound to the resolved provider.
 
     Raises:
-        RuntimeError: When the resolved provider is unavailable, or — as
+        RuntimeError: When the resolved provider is unavailable or is not the
+            pinned model, or — as
             :class:`~creek.classify.llm.router.IntimateRoutingError`, a
             subclass — when intimate content has no local backend to fall
             back to. ``compile_tool`` turns either into a refusal.
     """
-    from creek.classify.llm.providers import build_provider
-
-    cfg = load_vault_config(vault).model_router.resolve("generation", tier)
-    provider = build_provider(cfg)
-    if not provider.available:
-        msg = (
-            "LLM provider unavailable for compile. "
-            "Check Ollama or ANTHROPIC_API_KEY configuration."
-        )
-        raise RuntimeError(msg)
+    router = load_vault_config(vault).model_router
+    provider = _generation_provider(router, tier, "compile")
     return lambda prompt: provider.complete(prompt).text
 
 
@@ -349,19 +340,10 @@ def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
     Returns:
         A tier → LLM-callable factory bound to *vault*'s router.
     """
-    from creek.classify.llm.providers import build_provider
-
     router = load_vault_config(vault).model_router
 
     def _factory(tier: PrivacyTier, *, max_tokens: int) -> _LLM:
-        cfg = router.resolve("generation", tier)
-        provider = build_provider(cfg)
-        if not _reflection_provider_available(cfg, provider):
-            msg = (
-                "LLM provider unavailable for reflection. "
-                "Check Ollama or ANTHROPIC_API_KEY configuration."
-            )
-            raise RuntimeError(msg)
+        provider = _generation_provider(router, tier, "reflection")
         return partial(
             _complete_reflection,
             provider,
@@ -371,45 +353,51 @@ def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
     return _factory
 
 
-def _reflection_provider_available(cfg: LLMConfig, provider: LLMProvider) -> bool:
-    """Return whether *provider* may serve a reflection right now (#1849).
+def _generation_provider(
+    router: ModelRouter, tier: PrivacyTier, verb: str
+) -> LLMProvider:
+    """Return the ``generation`` provider for *tier*, or refuse (#1849).
 
-    Outside container mode with no model package configured this is just
-    ``provider.available``. Once either applies, reflection is served only by
-    the pinned local model: an Ollama stage on a loopback URL whose resolved
-    model is the manifest's pinned tag, listed by the runtime at the pinned
-    inventory digest. That is one ``/api/tags`` call; the generation canary
-    stays probe-only so the per-request budget is untouched.
+    The one chokepoint compile, draft and reflection share. The router owns
+    the tier decision (an INTIMATE request is forced onto the local
+    ``default`` model, or ``IntimateRoutingError`` is raised), and
+    :func:`~creek_mcp.model_pin.provider_may_serve` owns the model pin: with a
+    model package configured, or in container mode, only the pinned local
+    model at its pinned digest over loopback may serve, and a cloud stage is
+    refused from its config before it is even built, so a keyless cloud
+    stage gets this refusal rather than its SDK's error. Outside both modes
+    this is ``provider.available``, as before.
 
-    The check runs per request, because the vault config it reads is writable
-    after boot: an edit pointing ``ollama_url`` at a remote host, or the stage
-    at another model or a cloud provider, is refused before any dial. A
-    configured manifest that cannot be loaded fails closed.
+    The check runs per request, because the vault config it reads is
+    writable after boot.
 
     Args:
-        cfg: The resolved generation-stage configuration.
-        provider: The provider built from *cfg*.
+        router: The served vault's model router.
+        tier: The request's routing tier.
+        verb: The operation named in the refusal (``draft``, ``compile`` or
+            ``reflection``). The refusal text is otherwise fixed and never
+            carries the configured URL.
 
     Returns:
-        ``True`` only when the provider may be used for this reflection.
-    """
-    from creek.classify.llm.providers import OllamaProvider, check_ollama_available
+        A provider that may serve this request.
 
-    try:
-        manifest = configured_manifest()
-    except ModelPackageError:
-        return False
-    if manifest is None and not loopback_only_enforced():
-        return provider.available
-    if manifest is None or cfg.provider != "ollama":
-        return False
-    if not is_loopback_url(cfg.ollama_url) or provider.model != manifest.model_name:
-        return False
-    return check_ollama_available(
-        cfg,
-        timeout=OllamaProvider.AVAILABILITY_TIMEOUT,
-        expected_digest=manifest.runtime_inventory_digest,
+    Raises:
+        RuntimeError: When the provider is unavailable or not the pinned
+            model. Each tool turns this into its existing refusal.
+    """
+    from creek.classify.llm.providers import build_provider
+
+    msg = (
+        f"LLM provider unavailable for {verb}. "
+        "Check Ollama or ANTHROPIC_API_KEY configuration."
     )
+    cfg = router.resolve("generation", tier)
+    if pin_refuses_stage(cfg):
+        raise RuntimeError(msg)
+    provider = build_provider(cfg)
+    if not provider_may_serve(provider):
+        raise RuntimeError(msg)
+    return provider
 
 
 def _complete_reflection(
@@ -457,6 +445,11 @@ def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient 
     made unobservable — the honest reading is that it is a *degradation*, not a
     failure, and the caller is told so in prose rather than by an exception.
 
+    The voice client sees the run's evidence, so it carries the same model pin
+    as its siblings (#1849): with a model package configured, or in container
+    mode, only the pinned local model may voice, and anything else — a cloud
+    stage included — degrades to deterministic rendering.
+
     Args:
         vault: The served vault. The one builder reading *two* config sections
             — ``model_router`` and ``author`` — so resolving it from the
@@ -467,19 +460,23 @@ def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient 
 
     Returns:
         The resolved :class:`~creek.author.client.AuthorLLMClient`, or ``None``
-        when no provider is available.
+        when no provider may serve.
 
     Raises:
         IntimateRoutingError: When Intimate content has no local backend to
             fall back to. ``author_tool`` turns it into a structured error.
     """
-    from creek.author.client import AuthorLLMClient
+    from creek.author.client import VOICE_DRAFTER_ROLE, AuthorLLMClient
 
     config = load_vault_config(vault)
+    voice = config.model_router.resolve_role(VOICE_DRAFTER_ROLE, tier)
+    if pin_refuses_stage(voice):
+        return None
     return AuthorLLMClient.for_voice_or_none(
         config.model_router,
         author=config.author,
         tier=tier,
+        may_serve=provider_may_serve,
     )
 
 
