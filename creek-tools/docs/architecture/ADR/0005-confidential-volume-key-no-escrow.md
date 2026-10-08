@@ -74,3 +74,34 @@ Adopt **user-held keys with no operator escrow and no reset** (issue-#758
   escrow trade-off must be re-litigated explicitly, not added silently.
 - The KDF choice needs strengthening (raise Argon2id cost; params are persisted
   per-vault so old vaults keep unlocking).
+
+## Amended by adepthood ADR 0009 (2026-10-07)
+
+On 2026-10-07 the owner decided that **the operator cannot read people's
+journal entries**. [adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md) records the decision. This record
+stays as written. What the decision changes, as targets:
+
+- **The no-escrow, no-reset principle is kept and widened.** It is decided to
+  govern the person's **journal keys** everywhere, not only a confidential
+  vault volume. Under the target, the keys will be generated on the person's
+  device, and neither Adepthood nor Creek will hold escrow or be able to reset
+  them.
+- **The recovery factors are re-decided for the journal.** On 2026-10-07 the
+  owner chose a recovery phrase the person writes down, plus their
+  passphrase. Losing both means the data is gone, agreed up front (adepthood
+  ADR 0009 Decision item 11). The VMK, Argon2id passphrase and HKDF recovery
+  key above are prior art for that choice. Pairing, revocation and the rest
+  of D03 stay open owner questions.
+- **For a managed vault,** the target is that journal content will arrive as
+  ciphertext under the person's key, which the vault would store without
+  reading it. A vault volume key under this ADR would then protect only what
+  the vault itself must store in plaintext. A vault-local model that sees
+  plaintext is governed by adepthood ADR 0009 Decision item 4: it is labelled
+  on each use and is not operator-blind while it runs.
+
+**Not implemented yet.** Until adepthood B13 phases (b) and (c) land for an
+account, journal content that reaches a vault stays operator-readable, exactly
+as described above.
+
+Nothing here is a public claim. Each claim waits for adepthood B24
+([adepthood#3076](https://github.com/Geoffe-Ga/adepthood/issues/3076)).
