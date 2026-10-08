@@ -66,7 +66,8 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger("crawdad.bot")
 
 _STATE_UNAVAILABLE_REPLY = (
-    "no audit report yet — run `creek state` in the vault and try again."
+    "I don't have a read on your vault yet. Run `creek state` in your vault, "
+    "then come back and I'll know where things stand."
 )
 # FEAT-027: name of the MCP tool the bot invokes for the safety pass on
 # Discord attachments. Sourced from
@@ -86,14 +87,14 @@ _REDACT_SCAN_TOOL = "creek.redact.scan"
 _SCAN_REFUSED_STATUS = "refused"
 
 _REDACT_TOOL_MISSING_REPLY = (
-    "I downloaded the file(s), but the `creek.redact.scan` tool isn't advertised "
-    "by creek-tools yet. Run `creek redact --scan <staging path>` from the "
-    "terminal before ingesting."
+    "I downloaded your file(s), but I can't run the safety check from here "
+    "right now. Run `creek redact --scan <saved path>` in your terminal "
+    "first if you want to go ahead."
 )
 
 # FEAT-027 ships the safety-pass + staging half of the consent flow.
 # FEAT-034 (issue #281) closes the loop by wiring the conversational
-# "Reply with `ingest`" follow-up directly through to ``creek.ingest``
+# "Reply `ingest`" follow-up directly through to ``creek.ingest``
 # via the per-channel :class:`PendingBatchStore` threaded through this
 # module. The CLI escape hatch in the prompt below is preserved for
 # users who prefer the deterministic terminal path.
@@ -105,9 +106,9 @@ _REDACT_TOOL_MISSING_REPLY = (
 # "run `creek redact --scan` before ingesting" and offer `ingest` in
 # the very next message.
 _INGEST_CONSENT_PROMPT = (
-    "I did **not** ingest anything. Reply with `ingest` (or run "
-    "`creek ingest --type <type> --input <staging path>`) to proceed. "
-    "Reply `cancel` to drop the batch."
+    "Nothing's been added to your vault yet. Reply `ingest` and I'll bring "
+    "these files in, or `cancel` to leave them out. (Prefer the terminal? "
+    "`creek ingest --type <type> --input <saved path>` does the same.)"
 )
 
 # #1054: the refusal for a batch whose redaction scan never ran. ONE
@@ -122,9 +123,10 @@ _INGEST_CONSENT_PROMPT = (
 # findings, because ``creek.redact.scan`` returns a permissive status
 # even when it finds secrets. See crawdad/CLAUDE.md §5.3.
 _SCAN_BLOCKED_REPLY = (
-    "I couldn't run the redaction scan on these files, so I won't ingest "
-    "them. Run `creek redact --scan <staging path>` from the terminal to "
-    "check them yourself, or reply `cancel` to drop the batch."
+    "I couldn't run the safety check on these files, so I'm not adding "
+    "them to your vault. You can check them yourself from the terminal "
+    "(`creek redact --scan <saved path>`), or reply `cancel` and we'll "
+    "leave them out."
 )
 
 # #1088: the scan section for a turn where ``creek.redact.scan`` answered
@@ -145,17 +147,16 @@ _SCAN_BLOCKED_REPLY = (
 # refusal actually fired. Register matches _REDACT_TOOL_MISSING_REPLY; the
 # turn still closes with the shared _SCAN_BLOCKED_REPLY.
 _SCAN_REFUSED_REPLY = (
-    "creek-tools **refused** the redaction scan, so no scan ran on these "
-    "files. The most common cause is a staging root outside "
-    "`00-Creek-Meta/Inbound/` — the only subtree `creek.redact.scan` will "
-    "read at this channel's privacy ceiling — so check "
-    "`attachments.staging_subpath` in `crawdad.yaml`. To check the files "
-    "yourself, run `creek redact --scan <staging path>` from the terminal."
+    "The safety check wouldn't run on these files, so nothing was checked. "
+    "The most common cause is a staging folder outside "
+    "`00-Creek-Meta/Inbound/` — look at `attachments.staging_subpath` in "
+    "`crawdad.yaml`. To check the files yourself, run "
+    "`creek redact --scan <saved path>` in your terminal."
 )
 
 _ALREADY_STAGED_REPLY = (
-    "All attachments were already staged from a prior upload — nothing new "
-    "to scan or ingest."
+    "I already had all of these from an earlier upload — nothing new to "
+    "check or bring in."
 )
 
 # FEAT-034: name of the MCP tool the consent flow dispatches when the
@@ -164,19 +165,19 @@ _ALREADY_STAGED_REPLY = (
 _INGEST_TOOL = "creek.ingest"
 
 _INGEST_TOOL_MISSING_REPLY = (
-    "I staged the file(s), but `creek.ingest` isn't advertised by "
-    "creek-tools yet. Run `creek ingest --type <type> --input <staging path>` "
-    "from the terminal to complete the ingest."
+    "I've got the file(s) saved, but I can't bring them into your vault from "
+    "here right now. Run `creek ingest --type <type> --input <saved path>` "
+    "in your terminal to finish."
 )
 
 _BATCH_ABANDONED_REPLY = (
-    "Cleared the pending batch — nothing was ingested. The staged files "
-    "are still on disk under the same path; re-upload to start a new batch."
+    "Okay, leaving those out — nothing went into your vault. The files are "
+    "still where I saved them; upload again any time to start over."
 )
 
 _ALREADY_INGESTED_REPLY = (
-    "This batch was already ingested — nothing more to do. Upload a new "
-    "file to start a fresh batch."
+    "Those files are already in your vault — nothing more to do. Upload "
+    "something new whenever you like."
 )
 
 
@@ -429,7 +430,7 @@ async def _handle_attachments(
        staging directory under ``00-Creek-Meta/Inbound/``. Size and
        extension limits are enforced before bytes are read.
     2. If every accepted file was an idempotent re-upload (same content
-       hash already on disk), reply "already staged" and stop — no
+       hash already on disk), say the bot already had them and stop — no
        redundant scan or ingest.
     3. Otherwise invoke ``creek.redact.scan`` on the staging directory
        via MCP. If MCP is unreachable, the tool is not advertised, there
@@ -497,7 +498,8 @@ async def _handle_attachments(
     # Send the summary + scan section first (may be truncated for long
     # scan bodies) and then the closing message as a separate message.
     # The closing string is short and well under the Discord cap; sending
-    # it on its own guarantees the "I did **not** ingest anything" trust
+    # it on its own guarantees the "Nothing's been added to your vault yet"
+    # trust
     # signal — or, for an unscanned batch, the refusal — can never be
     # silently dropped by truncation of the scan section, even for a
     # multi-file batch with many findings.
@@ -1059,8 +1061,9 @@ def render_mcp_unavailable_reply(error: MCPUnavailableError) -> str:
 def _stub_reply() -> str:
     """Fallback used when the loop components aren't wired (test-only path)."""
     return (
-        "crawdad here — wiring scaffold is up. "
-        "(Agent loop components not configured this session.)"
+        "I'm here, but your vault's tools didn't show up when I started, so I "
+        "can't do much yet. Check that `creek-tools-mcp` is installed where "
+        "`crawdad.yaml` points (`mcp_server_command`), then restart me."
     )
 
 

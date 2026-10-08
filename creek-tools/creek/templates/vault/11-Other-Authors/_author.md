@@ -18,12 +18,12 @@ above to describe who they are and how their material should be handled.
 
 ## Fields
 
-- **author_slug** — must match the author's folder name; this is the identity key.
-- **display_name** — human-readable name for citations and surfaced output.
+- **author_slug** — must match the author's folder name; it's how Creek knows who this is.
+- **display_name** — the name you want to see in citations and anywhere Creek mentions them.
 - **author_kind** — `human_source` (a real other person), `ai_as_user` (AI output
   you endorse as your own interests), or `collaborator` (co-authored with you).
 - **voice_weight** — how much this author may influence generated voice. Leave at
-  `0.0`; material here is excluded from the voice corpus by design.
+  `0.0`; Creek never learns your voice from anything in this folder.
 - **representativeness** — how closely this stands for *your* views: `self`,
   `endorsed`, `aspirational`, or `reference` (merely cited).
 - **default_privacy_tier** — `open`, `personal`, or `intimate`.

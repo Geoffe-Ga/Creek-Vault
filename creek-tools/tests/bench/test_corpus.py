@@ -124,6 +124,7 @@ def test_corpus_bytes_are_pinned(tmp_path: Path) -> None:
         digest.update(path.relative_to(corpus.root).as_posix().encode())
         digest.update(path.read_bytes())
     assert digest.hexdigest() == (
+        # pragma: allowlist nextline secret
         "4c88185c99a2dbee12dc18518332d783ddf393bd7bddb62481ef6646723645dd"
     )
 

@@ -832,7 +832,7 @@ class TestStateAppendsLint:
             vault_path=tmp_path,
             today=date(2026, 5, 10),
         ).render()
-        assert "## Lint summary" in text
+        assert "## Housekeeping" in text
 
     def test_state_omits_lint_section_when_no_report(self, tmp_path: Path) -> None:
         """No lint report → the state report still renders without crashing."""
@@ -846,4 +846,4 @@ class TestStateAppendsLint:
         ).render()
         # The section header should still appear (consistent rendering),
         # but with the empty-state placeholder.
-        assert "## Lint summary" in text
+        assert "## Housekeeping" in text

@@ -41,7 +41,11 @@ from crawdad.mcp_client import MCPClient, MCPUnavailableError
 from crawdad.router import IntentRouter
 from crawdad.skill_loader import SkillStackRegistry, load_skills_for_session
 from crawdad.state import StateUnavailableError, load_session_state
-from crawdad.workflows import WorkflowRegistry, run_workflow_and_compose
+from crawdad.workflows import (
+    WorkflowNotFoundError,
+    WorkflowRegistry,
+    run_workflow_and_compose,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -280,8 +284,15 @@ def _build_workflow_runner(
             workflow = registry.get(name)
         except Exception as exc:
             _LOGGER.warning("workflow lookup failed for %r: %s", name, exc)
+            # A not-found error already carries friendly wording (and the
+            # names that *do* exist); anything else gets a plain lead-in.
+            lookup_reply = (
+                str(exc)
+                if isinstance(exc, WorkflowNotFoundError)
+                else f"I couldn't load the workflow `{name}` — {exc}"
+            )
             return WorkflowRunReport(
-                reply=_truncate_for_discord(f"could not find workflow `{name}`: {exc}"),
+                reply=_truncate_for_discord(lookup_reply),
                 privacy_tier_ceiling=PrivacyTierCeiling.OPEN,
             )
         try:
@@ -298,7 +309,9 @@ def _build_workflow_runner(
         except Exception as exc:
             _LOGGER.warning("workflow %r failed mid-run: %s", name, exc)
             return WorkflowRunReport(
-                reply=_truncate_for_discord(f"workflow `{name}` failed: {exc}"),
+                reply=_truncate_for_discord(
+                    f"Something went wrong running `{name}` — {exc}"
+                ),
                 privacy_tier_ceiling=PrivacyTierCeiling.OPEN,
             )
         return WorkflowRunReport(
@@ -372,8 +385,8 @@ def _build_loop_runner(
         except Exception:
             _LOGGER.exception("agent loop crashed for slash command turn")
             return _truncate_for_discord(
-                "something went wrong on my end — creek-tools may be "
-                "unreachable. Try again in a moment."
+                "Something went wrong on my end — I may have lost touch with "
+                "your vault. Try again in a moment."
             )
 
     return _runner

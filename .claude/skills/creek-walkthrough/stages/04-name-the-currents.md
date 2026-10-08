@@ -65,12 +65,12 @@ Translate the dimensions, once, simply — and do not lecture:
 
 - **Frequency** — which of ten developmental textures the content sits in
   (survival, belonging, power, structure, achievement, empathy, systems,
-  the holistic, witness, unity). Many fragments touch more than one.
+  true-self listening, unity, emptiness). Many fragments touch more than one.
 - **Phase** — where on a rising-and-falling cycle it sits: rising,
   peaking, withdrawal, diminishing, bottoming-out, restoration. This is
   the wavelength — the heartbeat of the whole vault.
 - **Mode** — the stance the writer was taking: inhabiting, expressing,
-  collaborating, integrating, absorbing.
+  collaborating, integrating, absorbing, or simply being.
 
 Then say the most important thing of this stage: **`unclassified` is a
 real and honoured answer.** If a fragment refuses to be named, the system

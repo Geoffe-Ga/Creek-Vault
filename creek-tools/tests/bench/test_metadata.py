@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _DIGEST = "sha256:" + "a" * 64
+# pragma: allowlist nextline secret
 _SHA = "0123456789abcdef0123456789abcdef01234567"
 
 

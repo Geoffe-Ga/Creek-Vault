@@ -55,6 +55,7 @@ from creek.classify.privacy_filter import (
 from creek.generate.ai_style.guard import (
     VOICE_GUARD_STATUS_KEY,
     run_voice_fidelity_guard,
+    status_in_words,
 )
 from creek.generate.cohesion import run_cohesion_pass
 from creek.generate.compile_routing import (
@@ -2533,7 +2534,7 @@ class DraftGenerator:
         Returns:
             The unchanged *body* and a frontmatter payload carrying the reason.
         """
-        print(f"voice-fidelity: skipped — {reason}", file=sys.stderr)
+        print(f"voice check: {status_in_words(reason)}", file=sys.stderr)
         return body, {VOICE_GUARD_STATUS_KEY: reason}
 
     def _apply_voice_fidelity(
@@ -2943,7 +2944,6 @@ def _compose_ask_section(
             "combination's style. Do not paraphrase any single source "
             "verbatim — recombine across the corpus. Honour the "
             "activated skills. Write as the human — not as an AI. "
-            "Cite source fragments by their IDs where relevant. "
             f"{_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER} {_GLOSS_STEER}"
         )
     if per_dimension:
@@ -2955,8 +2955,7 @@ def _compose_ask_section(
             "sections above; weave them together at composition time "
             "rather than treating any one section as the source of "
             "truth. Honour the activated skills. Write as the human — "
-            "not as an AI. Cite source fragments by their IDs where "
-            f"relevant. {_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER} "
+            f"not as an AI. {_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER} "
             f"{_GLOSS_STEER}"
         )
     return (
@@ -2964,8 +2963,7 @@ def _compose_ask_section(
         f'Write a draft essay titled "{idea.title}". '
         f"{idea.brief_description} "
         "Write as the human — not as an AI. Honour the activated "
-        f"skills. Cite source fragments by their IDs where relevant. "
-        f"{_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER} {_GLOSS_STEER}"
+        f"skills. {_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER} {_GLOSS_STEER}"
     )
 
 

@@ -166,7 +166,7 @@ async def test_oversized_attachment_is_rejected_without_download(
     )
     assert result.accepted == ()
     assert len(result.rejected) == 1
-    assert "exceeds max" in result.rejected[0].reason
+    assert "too big" in result.rejected[0].reason
     # The staging directory is not created when nothing was written.
     assert not result.staging_dir.exists()
 
@@ -185,7 +185,7 @@ async def test_denied_extension_is_rejected(
     )
     assert result.accepted == ()
     assert len(result.rejected) == 1
-    assert "extension" in result.rejected[0].reason
+    assert "file type" in result.rejected[0].reason
 
 
 async def test_idempotent_reupload_returns_already_present(
@@ -268,7 +268,7 @@ async def test_post_download_size_check_rejects_underreported_size(
     )
     assert result.accepted == ()
     assert len(result.rejected) == 1
-    assert "downloaded size" in result.rejected[0].reason
+    assert "came in at" in result.rejected[0].reason
     # And no file landed on disk.
     staged = tmp_path / "00-Creek-Meta" / "Inbound" / "1" / "2" / "liar.md"
     assert not staged.exists()
@@ -364,7 +364,7 @@ def test_format_attachment_summary_renders_relative_paths(
         already_present=False,
     )
     rejected = RejectedAttachment(
-        filename="big.exe", size=999, reason="extension not allowed"
+        filename="big.exe", size=999, reason="I don't take that file type here"
     )
 
     processed = ProcessedAttachments(
@@ -377,7 +377,7 @@ def test_format_attachment_summary_renders_relative_paths(
     assert "note.md" in summary
     assert "markdown" in summary
     assert "big.exe" in summary
-    assert "extension not allowed" in summary
+    assert "I don't take that file type here" in summary
     # Bytes rendered in human-readable form.
     assert "42 B" in summary
 
@@ -597,9 +597,9 @@ def test_format_attachment_summary_with_only_rejections(
     summary = format_attachment_summary(processed, vault_path=tmp_path)
     assert "Rejected" in summary
     assert "Accepted" not in summary
-    # Header must NOT claim "staged at" when nothing landed on disk.
-    assert "staged at" not in summary
-    assert "would stage to" in summary
+    # Header must NOT claim "saved to" when nothing landed on disk.
+    assert "saved to" not in summary
+    assert "would go to" in summary
     # The staging path is still shown for operator reference.
     assert "00-Creek-Meta/Inbound/1/2" in summary
 
@@ -1006,7 +1006,7 @@ async def test_process_attachment_with_mismatched_mime_rejected_when_configured(
     )
     assert result.accepted == ()
     assert len(result.rejected) == 1
-    assert "MIME mismatch" in result.rejected[0].reason
+    assert "isn't what its name says" in result.rejected[0].reason
     assert "application/pdf" in result.rejected[0].reason
     assert "application/zip" in result.rejected[0].reason
     # The polyglot never landed on disk in reject mode.
@@ -1033,7 +1033,7 @@ async def test_process_attachment_text_polyglot_rejected_when_configured(
     )
     assert result.accepted == ()
     assert len(result.rejected) == 1
-    assert "MIME mismatch" in result.rejected[0].reason
+    assert "isn't what its name says" in result.rejected[0].reason
 
 
 async def test_process_attachment_boundary_straddle_accepted_in_reject_mode(
@@ -1126,7 +1126,7 @@ def test_format_attachment_summary_surfaces_mime_mismatch_warning(
         rejected=(),
     )
     summary = format_attachment_summary(processed, vault_path=tmp_path)
-    assert "⚠ MIME mismatch" in summary
+    assert "⚠ this file isn't what its name says" in summary
     assert "application/zip" in summary
     assert "application/pdf" in summary
 
@@ -1157,7 +1157,7 @@ def test_format_attachment_summary_hides_warning_when_mime_matches(
     )
     summary = format_attachment_summary(processed, vault_path=tmp_path)
     assert "⚠" not in summary
-    assert "MIME mismatch" not in summary
+    assert "isn't what its name says" not in summary
 
 
 def test_attachment_config_reject_on_mime_mismatch_defaults_false() -> None:

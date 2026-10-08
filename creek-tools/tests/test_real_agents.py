@@ -21,8 +21,10 @@ from creek.author.agents import (
     _build_link_graph,
     _load_config,
     _load_corpus,
+    _ontology_claim,
 )
-from creek.author.models import EvidenceBundle
+from creek.author.models import EvidenceBundle, OntologyAnalysis
+from creek.classify.weighted import WeightedDimension
 from creek.link.embeddings import (
     CachedEmbedding,
     EmbeddingLinker,
@@ -240,6 +242,29 @@ def test_ontology_returns_canonical_taxonomy(tmp_path: Path) -> None:
     assert all(claim.source_fragments for claim in bundle.claims)
     cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
     assert cited == {"frag-f6", "frag-rise"}
+    # The summary claim is voiced into the owner's draft, so it reads as a
+    # human thought — colour name, plain phase — never as a classifier report.
+    summary = bundle.claims[0].claim
+    assert summary == (
+        "Across these 2 notes, Green (F6) is the frequency I keep coming back "
+        "to, and most of it was written in the Rising phase."
+    )
+    assert "Ontological scan" not in summary
+
+
+def test_ontology_claim_without_phase_says_so_plainly() -> None:
+    """A frequency with no phase signal renders the no-phase clause."""
+    analysis = OntologyAnalysis(
+        frequencies=(WeightedDimension(value=Frequency.F7, weight=1.0),),
+    )
+
+    claim = _ontology_claim(analysis, ["frag-a"])
+
+    assert claim.claim == (
+        "In this one note, Yellow (F7) is the frequency I keep coming back to, "
+        "with no single phase standing out."
+    )
+    assert claim.source_fragments == ["frag-a"]
 
 
 def test_ontology_surfaces_dosage_paradox_without_resolving(tmp_path: Path) -> None:
@@ -344,6 +369,10 @@ def test_ontology_unclassified_corpus_still_grounds_claim(tmp_path: Path) -> Non
     assert bundle.claims
     cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
     assert cited == {"frag-a", "frag-b"}
+    assert bundle.claims[0].claim == (
+        "Across these 2 notes, no single frequency stands out — the writing "
+        "moves between several."
+    )
 
 
 def test_retrieval_reuses_linker_across_gather_calls(

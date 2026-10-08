@@ -286,7 +286,7 @@ async def test_handle_register_without_switcher_returns_soft_error() -> None:
 
     assert len(replier.sent) == 1
     body = replier.sent[0].lower()
-    assert "unavailable" in body or "wired" in body
+    assert "can't switch voices" in body
 
 
 async def test_handle_workflow_list_enumerates_registered_workflows() -> None:
@@ -328,8 +328,7 @@ async def test_handle_workflow_list_without_lister_returns_soft_error() -> None:
 
     Closes PR #309 review feedback: the list action only reads the
     registry — it never touches the walker — so its failure message
-    must talk about registry wiring, not "the walker has nothing to
-    call".
+    must say the list never loaded, not "I can't run workflows".
     """
     replier = _FakeReplier()
 
@@ -343,8 +342,8 @@ async def test_handle_workflow_list_without_lister_returns_soft_error() -> None:
 
     assert len(replier.sent) == 1
     body = replier.sent[0].lower()
-    assert "registry" in body
-    assert "walker" not in body
+    assert "list your workflows" in body
+    assert "run workflows" not in body
 
 
 async def test_handle_workflow_default_action_is_list() -> None:
@@ -456,7 +455,7 @@ async def test_handle_workflow_run_without_runner_returns_soft_error() -> None:
     )
 
     assert len(replier.sent) == 1
-    assert "aren't wired" in replier.sent[0] or "unavailable" in replier.sent[0].lower()
+    assert "can't run workflows" in replier.sent[0]
 
 
 async def test_handle_workflow_run_maps_runner_exceptions_to_soft_reply() -> None:
@@ -479,7 +478,7 @@ async def test_handle_workflow_run_maps_runner_exceptions_to_soft_reply() -> Non
 
     assert len(replier.sent) == 1
     assert "missing" in replier.sent[0]
-    assert "could not run" in replier.sent[0]
+    assert "couldn't run" in replier.sent[0]
 
 
 async def test_handle_workflow_unknown_action_returns_help() -> None:
@@ -687,7 +686,7 @@ async def test_register_callback_without_switcher_replies_softly() -> None:
     assert interaction.response.deferred == 1
     assert len(interaction.followup.sent) == 1
     body = interaction.followup.sent[0].lower()
-    assert "unavailable" in body or "wired" in body
+    assert "can't switch voices" in body
 
 
 async def test_workflow_callback_defers_and_lists_when_wired() -> None:
@@ -751,8 +750,9 @@ async def test_workflow_callback_soft_errors_when_unwired() -> None:
     """When no lister / runner is wired, the callback still defers and replies.
 
     The default action is ``list``, which routes through
-    ``_reply_workflow_list``; the missing-lister reply mentions the
-    registry rather than the walker (PR #309 review feedback).
+    ``_reply_workflow_list``; the missing-lister reply says the list
+    never loaded rather than "I can't run workflows" (PR #309 review
+    feedback).
     """
 
     async def _loop(_msg: str) -> str:
@@ -767,8 +767,8 @@ async def test_workflow_callback_soft_errors_when_unwired() -> None:
     assert interaction.response.deferred == 1
     assert len(interaction.followup.sent) == 1
     body = interaction.followup.sent[0].lower()
-    assert "registry" in body
-    assert "walker" not in body
+    assert "list your workflows" in body
+    assert "run workflows" not in body
 
 
 # -----------------------------------------------------------------------------
@@ -934,7 +934,7 @@ async def test_handle_ask_degrades_softly_when_runner_raises() -> None:
     await handle_ask(replier, question="why?", loop_runner=_raising_loop_runner)
 
     assert len(replier.sent) == 1
-    assert "unreachable" in replier.sent[0].lower()
+    assert "can't reach your vault" in replier.sent[0].lower()
 
 
 async def test_handle_draft_degrades_softly_when_runner_raises() -> None:
@@ -944,12 +944,12 @@ async def test_handle_draft_degrades_softly_when_runner_raises() -> None:
     await handle_draft(replier, topic="drift", loop_runner=_raising_loop_runner)
 
     assert len(replier.sent) == 1
-    assert "unreachable" in replier.sent[0].lower()
+    assert "can't reach your vault" in replier.sent[0].lower()
 
 
 async def test_handle_ask_relays_soft_error_string_from_runner() -> None:
     """When the runner RETURNS a soft-error string, ``handle_ask`` relays it."""
-    soft = "creek-tools is unreachable; try again in a moment."
+    soft = "I can't reach your vault right now — give it a moment and try again."
 
     async def _soft_runner(_message: str) -> str:
         return soft
@@ -963,7 +963,7 @@ async def test_handle_ask_relays_soft_error_string_from_runner() -> None:
 
 async def test_handle_draft_relays_soft_error_string_from_runner() -> None:
     """When the runner RETURNS a soft-error string, ``handle_draft`` relays it."""
-    soft = "creek-tools is unreachable; try again in a moment."
+    soft = "I can't reach your vault right now — give it a moment and try again."
 
     async def _soft_runner(_message: str) -> str:
         return soft

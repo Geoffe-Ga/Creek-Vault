@@ -283,7 +283,7 @@ survives every transition and cannot be laundered.
 `status = "empty" if not scanned.matches else "ok"`, so there is no
 failing status to read: a scan that runs and reports secrets still
 clears the gate. User-facing copy must claim only what is enforced —
-`_SCAN_BLOCKED_REPLY` says "I couldn't run the redaction scan", never
+`_SCAN_BLOCKED_REPLY` says "I couldn't run the safety check", never
 "these files are clean". Substituting a new false claim for the old one
 would miss the point of the fix.
 
@@ -332,8 +332,8 @@ The bot does **not** exit on MCP subprocess failure. The pattern is:
 1. `MCPClient(config.mcp_server_command).connect()` is an async
    context manager. SDK failures surface as `MCPUnavailableError`.
 2. The handler catches `MCPUnavailableError` and replies with the
-   documented soft error (`creek-tools is unreachable; try again in a
-   moment.`).
+   documented soft error (`I can't reach your vault right now — give it a
+   moment and try again.`).
 3. FEAT-014's dispatcher will add the exponential-backoff restart loop
    (capped at 3 retries / 30s) on top of this skeleton.
 

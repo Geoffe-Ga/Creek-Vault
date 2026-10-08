@@ -146,7 +146,7 @@ is append-only — successive runs in the same day overwrite that day's
 file but do not touch prior days.
 
 The next `creek state` run reads the most recent lint report and
-appends it to the audit report under the `## Lint summary` section
+appends it to the audit report under the `## Housekeeping` section
 (FEAT-008 acceptance criterion).
 
 ## Composition with other verbs

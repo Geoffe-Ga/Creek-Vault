@@ -107,7 +107,7 @@ Every Fragment carries metadata across these dimensions:
 2. **Temporality** — When it was created/modified, normalized to America/Los_Angeles timezone
 3. **Frequency** — Which APTITUDE Frequency it most resonates with (can be multiple)
 4. **Wavelength Phase** — Where on the six-phase Archetypal Wavelength cycle (Rising → Peaking → Withdrawal → Diminishing → Bottoming Out → Restoration)
-5. **Wavelength Mode** — The functional stance: Inhabit, Express, Collaborate, Integrate, or Absorb
+5. **Wavelength Mode** — The functional stance: Inhabit, Express, Collaborate, Integrate, Absorb, or Be
 6. **Wavelength Orientation** — Do, Feel, or Do/Feel
 7. **Wavelength Dosage** — Medicine (healthy) or Toxic (overdose) expression
 8. **Wavelength Color** — The Spiral Dynamics frequency-color most active
@@ -450,9 +450,9 @@ The Archetypal Wavelength has **six phases**, not four or five. These map to a n
 
 ### 7.2 Wavelength Modes and Orientations
 
-Modes are NOT emotions or textures — they are **functional stances** the self takes toward experience. Each Mode pairs with an Orientation (Do or Feel) and manifests differently at each of the nine APTITUDE Frequencies (Spiral Dynamics colors). Critically, every Mode has a **Medicine** (right-sized, healthy) dose and a **Toxic** (overdosed, shadow) expression.
+Modes are NOT emotions or textures — they are **functional stances** the self takes toward experience. Five of the six Modes pair with an Orientation (Do or Feel) and manifest differently across the first nine APTITUDE Frequencies (Spiral Dynamics colors), which the Modes-of-the-Wavelength map charts with Medicine and Toxic terms; the sixth, Be, is Clear Light's Mode and has no Orientation. Critically, every charted Mode has a **Medicine** (right-sized, healthy) dose and a **Toxic** (overdosed, shadow) expression.
 
-**The five Modes and their Orientations:**
+**The six Modes and their Orientations:**
 
 | Mode | Orientation | Frequencies | Description |
 |---|---|---|---|
@@ -461,6 +461,7 @@ Modes are NOT emotions or textures — they are **functional stances** the self 
 | **Collaborate** | Do / Feel | Orange (Do), Green (Feel) | Working with others and with reality. The Do orientation collaborates through experimentation and analysis; the Feel orientation collaborates through empathy and belonging. |
 | **Integrate** | Do / Feel | Yellow (Do), Teal (Feel) | Weaving parts into wholes. The Do orientation integrates through systemic thinking and creative destruction; the Feel orientation integrates through gnosis and pattern recognition. |
 | **Absorb** | Do/Feel | Ultraviolet (Do/Feel) | Dissolving into unified awareness. Do and Feel merge at this level. |
+| **Be** | — | Clear Light | Resting as awareness itself. Nothing to do and nothing to feel: the Do/Feel split is recognised as empty here, like every other distinction. The Modes map charts no Medicine/Toxic terms for this Mode. Creek's own classifier records only the five oriented Modes above, so a fragment whose stance is Be is recorded with `frequency.primary: F10` (Clear Light) and `wavelength.mode: unclassified`; that pairing is how Be shows up in the vault. |
 
 ### 7.3 Medicine vs. Toxic Dose — Full Map
 
@@ -496,7 +497,7 @@ Modes are NOT emotions or textures — they are **functional stances** the self 
 
 When classifying a Fragment's Wavelength Mode:
 
-1. **Identify the functional stance** — Is the human Inhabiting (grounding), Expressing (projecting outward), Collaborating (working with), Integrating (synthesizing), or Absorbing (dissolving)?
+1. **Identify the functional stance** — Is the human Inhabiting (grounding), Expressing (projecting outward), Collaborating (working with), Integrating (synthesizing), Absorbing (dissolving), or simply Being (resting as awareness)?
 2. **Identify the orientation** — Is the energy directed through Doing or Feeling?
 3. **Identify the dosage** — Is this a healthy, medicine-dose expression? Or has it tipped into toxic overdose territory?
 4. **Identify the frequency/color** — Which Spiral Dynamics level is most active?
@@ -550,15 +551,15 @@ Before any content enters the vault, it must pass through a redaction scanner. T
 REDACTION_PATTERNS = {
     "api_key": r'(?:api[_-]?key|token|secret)["\s:=]+["\']?([A-Za-z0-9_\-]{20,})["\']?',
     "password": r'(?:password|passwd|pwd)["\s:=]+["\']?(.+?)["\']?(?:\s|$)',
-    "ssn": r'\b\d{3}-\d{2}-\d{4}\b',
-    "credit_card": r'\b(?:\d{4}[- ]?){3}\d{4}\b',
-    "email_password_combo": r'[\w.+-]+@[\w-]+\.[\w.]+\s*[:/]\s*\S+',
-    "aws_key": r'(?:AKIA|ASIA)[A-Z0-9]{16}',
-    "private_key": r'-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----',
-    "bearer_token": r'[Bb]earer\s+[A-Za-z0-9_\-\.]+',
-    "env_secret": r'(?:export\s+)?[A-Z_]+(?:KEY|SECRET|TOKEN|PASSWORD|PASS|PWD)\s*=\s*\S+',
-    "slack_token": r'xox[bporas]-[0-9a-zA-Z-]+',
-    "phone_number": r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
+    "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
+    "credit_card": r"\b(?:\d{4}[- ]?){3}\d{4}\b",
+    "email_password_combo": r"[\w.+-]+@[\w-]+\.[\w.]+\s*[:/]\s*\S+",
+    "aws_key": r"(?:AKIA|ASIA)[A-Z0-9]{16}",
+    "private_key": r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----",
+    "bearer_token": r"[Bb]earer\s+[A-Za-z0-9_\-\.]+",
+    "env_secret": r"(?:export\s+)?[A-Z_]+(?:KEY|SECRET|TOKEN|PASSWORD|PASS|PWD)\s*=\s*\S+",
+    "slack_token": r"xox[bporas]-[0-9a-zA-Z-]+",
+    "phone_number": r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
 }
 ```
 
@@ -651,33 +652,224 @@ This is the core intelligence of the pipeline. Use a multi-pass approach:
 ```python
 # Keyword and pattern matching for obvious signals
 FREQUENCY_SIGNALS = {
-    "F1": ["goal", "plan", "build", "ship", "discipline", "habit", "survival", "willpower", "resource", "security"],
-    "F2": ["surrender", "receive", "allow", "trust", "rest", "kinship", "ancestral", "ritual", "myth", "tribe"],
-    "F3": ["power", "assert", "dominat", "strength", "boundar", "compet", "conquer", "victory", "overreach"],
-    "F4": ["structur", "moral", "authority", "rule", "hierarch", "faith", "devot", "purpose", "conform"],
-    "F5": ["theory", "framework", "analysis", "model", "innovati", "rational", "experiment", "achieve", "status"],
-    "F6": ["empath", "inclusi", "shadow", "embod", "felt sense", "vulnerab", "belong", "plural", "connect"],
-    "F7": ["system", "synthesiz", "integrat", "meta", "pattern", "holistic", "unique", "yellow"],
-    "F8": ["true self", "higher self", "monad", "hga", "atman", "deep intuition", "gnosis", "transcend", "turquoise", "teal", "free will", "alignment", "fearless"],
-    "F9": ["oneness", "source", "unity", "cosmic", "divine", "devotion", "yoke", "ultraviolet", "bliss"],
-    "F10": ["impermanence", "empty", "void", "no-self", "anatta", "groundless", "death", "egoless", "clear light"],
+    "F1": [
+        "goal",
+        "plan",
+        "build",
+        "ship",
+        "discipline",
+        "habit",
+        "survival",
+        "willpower",
+        "resource",
+        "security",
+    ],
+    "F2": [
+        "surrender",
+        "receive",
+        "allow",
+        "trust",
+        "rest",
+        "kinship",
+        "ancestral",
+        "ritual",
+        "myth",
+        "tribe",
+    ],
+    "F3": [
+        "power",
+        "assert",
+        "dominat",
+        "strength",
+        "boundar",
+        "compet",
+        "conquer",
+        "victory",
+        "overreach",
+    ],
+    "F4": [
+        "structur",
+        "moral",
+        "authority",
+        "rule",
+        "hierarch",
+        "faith",
+        "devot",
+        "purpose",
+        "conform",
+    ],
+    "F5": [
+        "theory",
+        "framework",
+        "analysis",
+        "model",
+        "innovati",
+        "rational",
+        "experiment",
+        "achieve",
+        "status",
+    ],
+    "F6": [
+        "empath",
+        "inclusi",
+        "shadow",
+        "embod",
+        "felt sense",
+        "vulnerab",
+        "belong",
+        "plural",
+        "connect",
+    ],
+    "F7": [
+        "system",
+        "synthesiz",
+        "integrat",
+        "meta",
+        "pattern",
+        "holistic",
+        "unique",
+        "yellow",
+    ],
+    "F8": [
+        "true self",
+        "higher self",
+        "monad",
+        "hga",
+        "atman",
+        "deep intuition",
+        "gnosis",
+        "transcend",
+        "turquoise",
+        "teal",
+        "free will",
+        "alignment",
+        "fearless",
+    ],
+    "F9": [
+        "oneness",
+        "source",
+        "unity",
+        "cosmic",
+        "divine",
+        "devotion",
+        "yoke",
+        "ultraviolet",
+        "bliss",
+    ],
+    "F10": [
+        "impermanence",
+        "empty",
+        "void",
+        "no-self",
+        "anatta",
+        "groundless",
+        "death",
+        "egoless",
+        "clear light",
+    ],
 }
 
 WAVELENGTH_PHASE_SIGNALS = {
-    "rising": ["starting", "beginning", "momentum", "excited", "new project", "inspiration", "commitment"],
-    "peaking": ["flow", "immersed", "peak", "glory", "abundance", "bliss", "attunement", "belonging"],
-    "withdrawal": ["doubt", "anxious", "turning inward", "come down", "distraction", "tension"],
-    "diminishing": ["depressed", "declining", "alienat", "hangover", "fading", "self-doubt", "avoidance"],
-    "bottoming_out": ["despair", "crisis", "self-loathing", "collapse", "dark night", "fallow", "exhausted"],
-    "restoration": ["returning", "waking up", "recuperat", "new energy", "vulnerability", "reconciliation"],
+    "rising": [
+        "starting",
+        "beginning",
+        "momentum",
+        "excited",
+        "new project",
+        "inspiration",
+        "commitment",
+    ],
+    "peaking": [
+        "flow",
+        "immersed",
+        "peak",
+        "glory",
+        "abundance",
+        "bliss",
+        "attunement",
+        "belonging",
+    ],
+    "withdrawal": [
+        "doubt",
+        "anxious",
+        "turning inward",
+        "come down",
+        "distraction",
+        "tension",
+    ],
+    "diminishing": [
+        "depressed",
+        "declining",
+        "alienat",
+        "hangover",
+        "fading",
+        "self-doubt",
+        "avoidance",
+    ],
+    "bottoming_out": [
+        "despair",
+        "crisis",
+        "self-loathing",
+        "collapse",
+        "dark night",
+        "fallow",
+        "exhausted",
+    ],
+    "restoration": [
+        "returning",
+        "waking up",
+        "recuperat",
+        "new energy",
+        "vulnerability",
+        "reconciliation",
+    ],
 }
 
 MODE_SIGNALS = {
-    "inhabit": ["body", "grounding", "survival", "comfort", "somatic", "rest", "home", "safety"],
-    "express": ["leading", "asserting", "creating", "performing", "devotion", "ambition", "structure"],
-    "collaborate": ["experiment", "team", "research", "community", "connection", "hypothesis"],
-    "integrate": ["system", "pattern", "rebellion", "epiphany", "meta-", "synthesis", "gnosis"],
-    "absorb": ["meditation", "jhana", "metta", "unification", "absorption", "dissolution"],
+    "inhabit": [
+        "body",
+        "grounding",
+        "survival",
+        "comfort",
+        "somatic",
+        "rest",
+        "home",
+        "safety",
+    ],
+    "express": [
+        "leading",
+        "asserting",
+        "creating",
+        "performing",
+        "devotion",
+        "ambition",
+        "structure",
+    ],
+    "collaborate": [
+        "experiment",
+        "team",
+        "research",
+        "community",
+        "connection",
+        "hypothesis",
+    ],
+    "integrate": [
+        "system",
+        "pattern",
+        "rebellion",
+        "epiphany",
+        "meta-",
+        "synthesis",
+        "gnosis",
+    ],
+    "absorb": [
+        "meditation",
+        "jhana",
+        "metta",
+        "unification",
+        "absorption",
+        "dissolution",
+    ],
 }
 ```
 
@@ -993,7 +1185,7 @@ This section defines infrastructure specifically designed to let patterns surfac
 Generate a weekly `Unnamed Digest` note that:
 - Lists all fragments added to Unnamed that week
 - Runs embedding similarity against Unnamed fragments to see if they cluster with each other
-- Asks (via generated prompt): "What do these have in common that the current ontology can't express?"
+- Asks (via generated prompt): "What do these share that none of the names you have yet can hold?"
 
 ### 10.2 Paradox Preservation
 

@@ -69,6 +69,11 @@ repos:
   rev: v0.9.0.6
   hooks:
   - id: shellcheck
+    # Follow `source`d helpers (scripts/_lib.sh) instead of stopping at
+    # SC1091; the hook passes only the changed files, so without -x every
+    # edit to a script that sources the helper trips the gate.
+    args:
+    - -x
 - repo: https://github.com/asottile/pyupgrade
   rev: v3.15.0
   hooks:
