@@ -7,6 +7,10 @@
   [ADR-0007](0007-confidential-per-user-hosting.md), and
   [ADR-0013](0013-demand-provisioned-vault-lifecycle.md) for ordinary Fly
   Machines only
+- **Superseded for journal content, as a decided target, by**:
+  [adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md)
+  (2026-10-07). See the section at the end. Everything below stays as written
+  and still governs until adepthood B13 phases (b) and (c) land.
 
 ## Context
 
@@ -95,3 +99,35 @@ properties together: the submitted artifact controls first initialization and
 every restart; no reusable unlock material is operator-accessible; conflicting
 binding or attestation fails closed; double loss is actually unrecoverable; and
 the deployed confidential-compute chain, not a fake sink, consumes the release.
+
+## Superseded for journal content by adepthood ADR 0009 (2026-10-07)
+
+On 2026-10-07 the owner decided that **the operator cannot read people's
+journal entries**. [adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md) records the decision.
+Provider-managed custody is not operator-blind, so under that premise this
+record is decided to stop governing journal content. Every statement above
+remains an accurate description of what an ordinary Fly vault does.
+
+**Not implemented yet.** Until adepthood B13 phases (b) and (c) complete for an
+account, this record keeps describing **and governing** that account's journal
+content, which stays operator-readable.
+
+**What is decided to replace it for journal content:**
+
+- Journal content and its prose derivatives will reach a managed vault **only
+  as ciphertext** under the person's user-held key. The vault would store and
+  sync that ciphertext without being able to read it.
+- `custody_mode=provider_managed` **remains** for the vault's operational state:
+  consumer credentials, job state and configuration. It also remains for any
+  non-journal material the owner explicitly scopes in later.
+- A vault-local model that needs plaintext is governed by adepthood ADR 0009
+  Decision item 4. Each use is labelled, and plaintext inference in an
+  ordinary Fly vault is not operator-blind while it runs.
+- INTIMATE remains local, as above.
+
+The "Revisit when" conditions above still govern any return to a
+user-held-unlock *volume* ceremony. They do not govern journal content, which
+is decided to become user-held under adepthood ADR 0009.
+
+Nothing here is a public claim. Each claim waits for adepthood B24
+([adepthood#3076](https://github.com/Geoffe-Ga/adepthood/issues/3076)).

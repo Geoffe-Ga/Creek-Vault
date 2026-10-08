@@ -95,3 +95,24 @@ cloud-provider rule).
   the trust root becomes the vendor PKI rather than an operator-held key.
 - A short-lived attested-session/token model replaces per-call attestation to
   cut the extra round-trip while preserving freshness.
+
+## Amended by adepthood ADR 0009 (2026-10-07)
+
+[Adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md) selects user-held keys with device-side and
+vault-local inference. It **does not select** attested confidential compute.
+What changes here:
+
+- The enclave provider and its attestation gate stay as code. However,
+  **INTIMATE or journal content is not to be routed to a remote enclave** under
+  the current decision. The selected path is device-side inference, the
+  vault-local model, or a managed no-retention runtime the operator runs
+  (labelled on each use, and not operator-blind while it runs; adepthood ADR
+  0009 Decision item 4), with cloud only under the person's own key.
+- The operator-provisioned trust root described above is **not** evidence for
+  any operator-blind claim. A real vendor attestation chain, with nonce
+  freshness, user-authorized key release and a hostile-host lab (D05), would be
+  needed before this provider could be reconsidered. That can happen only
+  through adepthood ADR 0009's reopen triggers.
+
+Nothing here is a public claim. Each claim waits for adepthood B24
+([adepthood#3076](https://github.com/Geoffe-Ga/adepthood/issues/3076)).
