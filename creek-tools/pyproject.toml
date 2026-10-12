@@ -228,7 +228,7 @@ dev = [
     # than provisioning a third copy (#1759). Bumping requires moving the
     # declared band and lock together, both ends at once, for the reason on
     # the ruff pin above. 2.1.0 -> 2.3.1 (#1440).
-    "mypy>=2.3.1,<2.4.0",
+    "mypy>=2.3.1,<2.5.0",
     "pylint>=4.0.7",
     # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
     # PyCQA/bandit rev so the three install paths run the same bandit
