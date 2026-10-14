@@ -206,6 +206,7 @@ def test_runtime_secret_manager_refuses_unsafe_files_and_identity(
             ca_certificate_file=cert,
             ca_private_key_file=key,
             app_prefix="creek-vault",
+            clock=lambda: _NOW,
         )
     master.chmod(0o600)
     manager = EncryptedFileFlySecretManager(
@@ -214,6 +215,7 @@ def test_runtime_secret_manager_refuses_unsafe_files_and_identity(
         ca_certificate_file=cert,
         ca_private_key_file=key,
         app_prefix="creek-vault",
+        clock=lambda: _NOW,
     )
     with pytest.raises(ValueError, match="consumer identity"):
         manager.issue(
