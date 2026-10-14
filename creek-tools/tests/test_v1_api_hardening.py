@@ -2654,6 +2654,7 @@ _WRITE_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
         "drive",
         "drive_grant",
         "journal",
+        "letters",
         "pipeline",
         "provisioning",
         "upload",

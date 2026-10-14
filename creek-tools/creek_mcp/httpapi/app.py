@@ -135,6 +135,7 @@ if TYPE_CHECKING:
     from creek_mcp.httpapi.context import RequestContext
     from creek_mcp.httpapi.handlers import Handler
     from creek_mcp.remote_auth import ConsumerTokenVerifier
+    from creek_mcp.tools.letter import LetterLLMFactory
     from creek_mcp.tools.reflect import _LLMFactory
 
 IMPLICIT_HEAD: Final[str] = "HEAD"
@@ -522,6 +523,7 @@ def create_app(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     max_per_consumer: int = DEFAULT_MAX_PER_CONSUMER,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
+    letter_llm_factory: Callable[[], LetterLLMFactory] | None = None,
     fly_replay_state: str | None = None,
 ) -> Starlette:
     """Build the ``/v1`` application.
@@ -552,6 +554,10 @@ def create_app(
             suite can run the whole vertical offline against a stub, which is
             what keeps the care and ceiling gates testable by *observing that
             the model was never reached*.
+        letter_llm_factory: The same, for ``POST /v1/letters/{external_id}``
+            (#1862): a thunk returning the tier-keyed letter factory, or
+            ``None`` to build the production one, bound to the resolved vault,
+            only once a letter has passed every gate.
 
     Returns:
         The configured application.
@@ -588,6 +594,7 @@ def create_app(
     app.state.pipeline_active_job_ids = set()
     app.state.pipeline_active_job_by_consumer = {}
     app.state.reflect_llm_factory = reflect_llm_factory
+    app.state.letter_llm_factory = letter_llm_factory
     # One grounding session per app (#1034), so ``POST /v1/reflections`` builds
     # and warms its retrieval specialist once for this process rather than once
     # per request. Set on ``app.state`` rather than taken as a ``create_app``

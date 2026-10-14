@@ -20,8 +20,21 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.16.0"
+CONTRACT_VERSION: Final[str] = "0.17.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.17.0 (#1862): ``/v1`` publishes ``letters`` and
+``POST /v1/letters/{external_id}``: the vault itself expands one margin note
+into its Voice Draft letter, so a vault-bound writer's letter never leaves the
+vault for an app-side provider. Generation routes through the same tier-keyed
+``generation`` chokepoint reflection uses, so an above-ceiling request is
+refused before any model and an intimate-routed one is forced local or
+refused. The letter is stored as the AI-attributed Voice Draft at the same
+caller-owned id, retractable by the existing ``DELETE
+/v1/voice-drafts/{external_id}``, and a repeat returns the first letter
+unchanged without a second model call. The new route and two closed models
+widen the HTTP contract; ``0.16`` remains served without seeing or reaching
+them.
 
 0.16.0 (#1799): ``/v1`` publishes ``journal-withdraw`` and
 ``DELETE /v1/journal-entries/{external_id}``, the consumer-scoped,

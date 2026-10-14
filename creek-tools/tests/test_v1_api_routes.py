@@ -54,6 +54,8 @@ from creek_mcp.api.models import (
     JournalUpsertRequest,
     JournalUpsertResponse,
     JournalWithdrawResponse,
+    LetterRequest,
+    LetterResponse,
     LinkRequest,
     LinkResponse,
     ReflectionRequest,
@@ -171,6 +173,15 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/letters/{external_id}",
+        "POST",
+        "writeLetter",
+        Capability.LETTERS,
+        LetterRequest,
+        LetterResponse,
+        True,
+    ),
+    (
         "/v1/connectors/drive",
         "GET",
         "getDriveConnector",
@@ -263,6 +274,7 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "voice-draft-upsert",
     "voice-draft-read",
     "voice-draft-delete",
+    "letters",
     "drive-status",
     "drive-sync",
     "drive-authorize",
@@ -274,7 +286,7 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 18
+_EXPECTED_ROUTE_COUNT: Final[int] = 19
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -309,10 +321,10 @@ def _by_operation(operation_id: str) -> RouteSpec:
 # --------------------------------------------------------------------------- #
 
 
-def test_routes_declares_exactly_eighteen_specs() -> None:
-    """``/v1`` publishes eighteen endpoints and no nineteenth.
+def test_routes_declares_exactly_nineteen_specs() -> None:
+    """``/v1`` publishes nineteen endpoints and no twentieth.
 
-    A nineteenth would be an endpoint no fixture, no OpenAPI response set and
+    A twentieth would be an endpoint no fixture, no OpenAPI response set and
     no capability entry describes — reachable, undocumented surface.
     """
     assert len(ROUTES) == _EXPECTED_ROUTE_COUNT
@@ -327,7 +339,7 @@ def test_routes_is_a_tuple() -> None:
     assert isinstance(ROUTES, tuple)
 
 
-def test_route_paths_and_methods_are_the_published_eighteen() -> None:
+def test_route_paths_and_methods_are_the_published_nineteen() -> None:
     """Every ``(path, method)`` pair matches the ADR, in order."""
     assert [(spec.path, spec.method) for spec in ROUTES] == [
         (path, method) for path, method, *_rest in _EXPECTED
@@ -606,11 +618,11 @@ def test_exactly_one_route_declares_no_capability() -> None:
     assert uncapable == ["/v1/health"]
 
 
-def test_implemented_capabilities_is_exactly_the_published_nine() -> None:
-    """Every published capability answers for real, withdrawal included (#1799).
+def test_implemented_capabilities_is_exactly_the_published_ten() -> None:
+    """Every published capability answers for real, letters included (#1862).
 
     An exhaustive literal, not a containment check, and still named one by
-    one: a tenth capability added to ``Capability`` has to change this line
+    one: an eleventh capability added to ``Capability`` has to change this line
     before it can be advertised, which is what keeps a new endpoint's landing a
     visible edit rather than a silent widening.
     """
@@ -626,6 +638,7 @@ def test_implemented_capabilities_is_exactly_the_published_nine() -> None:
                 Capability.PIPELINE,
                 Capability.VOICE_DRAFTS,
                 Capability.JOURNAL_WITHDRAW,
+                Capability.LETTERS,
             }
         )
         == IMPLEMENTED_CAPABILITIES

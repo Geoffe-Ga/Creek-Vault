@@ -1,0 +1,30 @@
+{
+  "additionalProperties": false,
+  "description": "The margin note a letter expands, as the caller stored it.\n\nAttributes:\n    kind: The note's kind, as a short lowercase token. Deliberately not\n        :class:`NoteKind`: the caller's own note vocabulary may differ from\n        the reflect tool's, and the field is a label for the prompt, not a\n        classification Creek relies on. The pattern keeps it a token and\n        never a second channel of prose.\n    anchor_text: The passage of the entry the note is anchored to.\n    note: The margin note itself.",
+  "properties": {
+    "anchor_text": {
+      "description": "The passage the note anchors to.",
+      "title": "Anchor Text",
+      "type": "string"
+    },
+    "kind": {
+      "description": "Short lowercase token naming the note's kind.",
+      "pattern": "^[a-z][a-z-]{0,31}$",
+      "title": "Kind",
+      "type": "string"
+    },
+    "note": {
+      "description": "The margin note the letter expands.",
+      "maxLength": 2000,
+      "title": "Note",
+      "type": "string"
+    }
+  },
+  "required": [
+    "kind",
+    "anchor_text",
+    "note"
+  ],
+  "title": "LetterNote",
+  "type": "object"
+}
