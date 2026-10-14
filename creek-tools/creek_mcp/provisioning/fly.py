@@ -22,6 +22,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from creek.classify.llm.consent import MANAGED_VAULT_ENV
 from creek_mcp.provisioning.driver import ProviderAllocation, ProviderError
 from creek_mcp.provisioning.inventory import ProviderResource
 from creek_mcp.provisioning.models import (
@@ -53,6 +54,7 @@ _DEFAULT_VOLUME_GB: Final[int] = 5
 _DEFAULT_VAULT_PORT: Final[int] = 8823
 _DEFAULT_READINESS_TIMEOUT_SECONDS: Final[int] = 20
 _VAULT_MOUNT: Final[str] = "/vault"
+_MANAGED_VAULT_MARKER: Final[str] = "1"
 _FLY_ABSENT_STATUS: Final[int] = 404
 """Fly's upstream resource-absence response; never exposed on Creek's wire."""
 _DELETED_VOLUME_STATES: Final[frozenset[str]] = frozenset(
@@ -776,9 +778,16 @@ class FlyProviderDriver:
         )
 
     def _runtime_config(self, reference: _AllocationRef) -> dict[str, object]:
-        """Return Fly-only bootstrap fields without changing ordinary TLS."""
+        """Return the managed marker plus Fly-only bootstrap fields.
+
+        Every managed Machine carries :data:`MANAGED_VAULT_ENV` (#1863). The
+        non-replay path runs the image's default entry point, which
+        self-hosted containers share, so the marker is the only way that
+        runtime knows to refuse cloud consent. Fly coordinates alone cannot
+        stand in for it: self-hosted Fly deployments have them too.
+        """
         if not self._policy.fly_replay_enabled:
-            return {}
+            return {"env": {MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER}}
         return {
             # Fly ignores config.user; process overrides need both the user
             # and command rather than inheriting config.init.exec.
@@ -798,6 +807,7 @@ class FlyProviderDriver:
                 ),
                 "CREEK_CONTAINER_EXPECTED_FLY_APP": reference.app_name,
                 "CREEK_CONTAINER_EXPECTED_FLY_REGION": self._policy.region,
+                MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER,
             },
             "init": {},
         }
