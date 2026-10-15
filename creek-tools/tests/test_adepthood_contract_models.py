@@ -99,6 +99,9 @@ from creek_mcp.api.models import (
     JournalUpsertRequest,
     JournalUpsertResponse,
     JournalWithdrawResponse,
+    LetterNote,
+    LetterRequest,
+    LetterResponse,
     LinkRequest,
     LinkResponse,
     NotApplicableExample,
@@ -194,6 +197,7 @@ CAPABILITIES_RESPONSE_PAYLOAD: dict[str, Any] = {
         "pipeline",
         "voice-drafts",
         "journal-withdraw",
+        "letters",
     ],
 }
 
@@ -259,6 +263,31 @@ VOICE_DRAFT_UPSERT_RESPONSE_PAYLOAD: dict[str, Any] = {
     "fragment_id": "voice-draft-88f3a410be6c2e9a95d7d0ab",
     "action": "created",
     "tier": "personal",
+    "attribution": VOICE_DRAFT_ATTRIBUTION_PAYLOAD,
+}
+
+LETTER_NOTE_PAYLOAD: dict[str, Any] = {
+    "kind": "pattern",
+    "anchor_text": "walked the ridge until the fog lifted",
+    "note": "You keep choosing to wait for clarity.",
+}
+
+LETTER_REQUEST_PAYLOAD: dict[str, Any] = {
+    "content": "Woke before the alarm and walked the ridge until the fog lifted.",
+    "note": LETTER_NOTE_PAYLOAD,
+    "tier": "personal",
+    "title": "Ridge letter",
+}
+
+LETTER_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "personal",
+    "external_id": "adepthood-voicedraft-4ab787c21ef0",
+    "fragment_id": "voice-draft-88f3a410be6c2e9a95d7d0ab",
+    "action": "created",
+    "tier": "personal",
+    "title": "Ridge letter",
+    "letter": "Synthetic letter about waiting for the fog to lift.",
     "attribution": VOICE_DRAFT_ATTRIBUTION_PAYLOAD,
 }
 
@@ -447,8 +476,8 @@ WHEEL_RESPONSE_PAYLOAD: dict[str, Any] = {
 NOT_APPLICABLE_EXAMPLE_PAYLOAD: dict[str, Any] = {
     "unreachable": True,
     "reason": (
-        "the acute-distress guard runs only inside reflect_tool, so this "
-        "capability has no care-escalation response shape"
+        "the acute-distress guard runs only on the reflection and letter "
+        "paths, so this capability has no care-escalation response shape"
     ),
 }
 
@@ -473,6 +502,9 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     JournalUpsertRequest.__name__: JOURNAL_UPSERT_REQUEST_PAYLOAD,
     JournalUpsertResponse.__name__: JOURNAL_UPSERT_RESPONSE_PAYLOAD,
     JournalWithdrawResponse.__name__: JOURNAL_WITHDRAW_RESPONSE_PAYLOAD,
+    LetterNote.__name__: LETTER_NOTE_PAYLOAD,
+    LetterRequest.__name__: LETTER_REQUEST_PAYLOAD,
+    LetterResponse.__name__: LETTER_RESPONSE_PAYLOAD,
     JobAcceptedResponse.__name__: JOB_ACCEPTED_RESPONSE_PAYLOAD,
     JobStatusResponse.__name__: JOB_STATUS_RESPONSE_PAYLOAD,
     LinkRequest.__name__: LINK_REQUEST_PAYLOAD,
@@ -1039,7 +1071,7 @@ def test_bundle_root_name_matches_the_declared_dir_name() -> None:
 
 
 def test_capability_and_state_axes_are_pinned() -> None:
-    """The fixture matrix is 9 capabilities x 7 states = 63 cells."""
+    """The fixture matrix is 10 capabilities x 7 states = 70 cells."""
     assert CAPABILITIES == (
         "capabilities",
         "journal-upsert",
@@ -1050,6 +1082,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "pipeline",
         "voice-drafts",
         "journal-withdraw",
+        "letters",
     )
     assert EXAMPLE_STATES == (
         "success",
@@ -1060,7 +1093,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 63
+    assert len(_matrix()) == 70
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
@@ -1149,7 +1182,7 @@ def test_retry_policy_json_mirrors_the_runtime_table() -> None:
 
 
 def test_unreachable_cells_are_the_structurally_impossible_states() -> None:
-    """Only reflections escalate; withdrawal additionally cannot refuse."""
+    """Only reflections and letters escalate; withdrawal cannot refuse."""
     assert UNREACHABLE_CELLS == EXPECTED_UNREACHABLE_CELLS
 
 
@@ -1255,7 +1288,7 @@ def test_no_committed_fixture_carries_an_intimate_tier_value() -> None:
     The model-level tests pin three typed fields, but a fixture is a hand-built
     payload and the security invariant is about the bytes a consumer vendors:
     no ``intimate``-tier success response may be published, and every INTIMATE
-    example must be a refusal. This walks every string value of all 63
+    example must be a refusal. This walks every string value of all 70
     committed examples rather than trusting the fields that happen to be typed.
     """
     offenders = [
@@ -1833,9 +1866,9 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.16 widened the compatibility window rather than shifting it.
+    """0.17 widened the compatibility window rather than shifting it.
 
-    A ``0.15`` client has no journal withdrawal resource in its vendored route or
+    A ``0.16`` client has no letters resource in its vendored route or
     model set, and every route it does know keeps its byte-identical response
     under #1727. Earlier minors are checked alongside it because the window
     only ever widens.
@@ -1846,6 +1879,7 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.16" in SUPPORTED_CONTRACT_MINORS
     assert "0.15" in SUPPORTED_CONTRACT_MINORS
     assert "0.14" in SUPPORTED_CONTRACT_MINORS
     assert "0.13" in SUPPORTED_CONTRACT_MINORS
@@ -1854,7 +1888,7 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.16"
+    assert CONTRACT_MINOR == "0.17"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

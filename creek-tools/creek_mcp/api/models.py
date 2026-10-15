@@ -82,6 +82,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.16",
     "0.15",
     "0.14",
     "0.13",
@@ -256,7 +257,7 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The nine capabilities ``/v1`` publishes.
+    """The ten capabilities ``/v1`` publishes.
 
     The list was identical for every minor in
     :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
@@ -310,6 +311,9 @@ class Capability(StrEnum):
             caller-owned external id. Since contract 0.15 (#1727).
         JOURNAL_WITHDRAW: Consumer-scoped, idempotent journal erasure. Since
             contract 0.16 (#1799).
+        LETTERS: The vault writes one margin note's Voice Draft letter and
+            stores it at a caller-owned external id. Since contract 0.17
+            (#1862).
     """
 
     CAPABILITIES = "capabilities"
@@ -321,6 +325,7 @@ class Capability(StrEnum):
     PIPELINE = "pipeline"
     VOICE_DRAFTS = "voice-drafts"
     JOURNAL_WITHDRAW = "journal-withdraw"
+    LETTERS = "letters"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -369,6 +374,13 @@ Literal so a later contract bump cannot hide the capability from clients that
 correctly vendored 0.16.
 """
 
+_LETTERS_MINOR: Final[str] = "0.17"
+"""The minor ``letters`` was published at (#1862).
+
+Literal so a later contract bump cannot hide the capability from clients that
+correctly vendored 0.17.
+"""
+
 RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
 """First contract minor whose ``ReflectionResponse`` carries the #873 fields.
 
@@ -395,6 +407,7 @@ CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.PIPELINE: _PIPELINE_MINOR,
     Capability.VOICE_DRAFTS: _VOICE_DRAFTS_MINOR,
     Capability.JOURNAL_WITHDRAW: _JOURNAL_WITHDRAW_MINOR,
+    Capability.LETTERS: _LETTERS_MINOR,
 }
 """The contract minor each capability was first published at.
 
@@ -825,6 +838,24 @@ a JSON field, and two bounds would let the same id be addressable through one
 and not the other.
 """
 
+MAX_LETTER_CHARS: Final[int] = 10_000
+"""Inclusive upper bound on a vault-written letter, in characters.
+
+Equal to Adepthood's own ``ESSAY_MAX``, so a letter Creek returns is never one
+the consumer has to truncate before caching. The producer
+(:mod:`creek_mcp.tools.letter`) caps the model's output to this bound.
+"""
+
+MAX_LETTER_NOTE_CHARS: Final[int] = 2_000
+"""Inclusive upper bound on the margin note a letter expands.
+
+A margin note is one or two sentences; the bound keeps the field a note rather
+than a second entry body.
+"""
+
+LETTER_NOTE_KIND_PATTERN: Final[str] = r"^[a-z][a-z-]{0,31}$"
+"""What a margin-note kind may look like on the wire: a short lowercase token."""
+
 MAX_FILENAME_CHARS: Final[int] = 255
 """Inclusive upper bound on the uploaded ``filename``.
 
@@ -1169,6 +1200,126 @@ class VoiceDraftDeleteResponse(_WireModel):
     tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
     external_id: str = Field(description="Consumer-owned identity that was retracted.")
     action: Literal["deleted"] = Field(description="Always deleted.")
+
+
+class LetterNote(_WireModel):
+    """The margin note a letter expands, as the caller stored it.
+
+    Attributes:
+        kind: The note's kind, as a short lowercase token. Deliberately not
+            :class:`NoteKind`: the caller's own note vocabulary may differ from
+            the reflect tool's, and the field is a label for the prompt, not a
+            classification Creek relies on. The pattern keeps it a token and
+            never a second channel of prose.
+        anchor_text: The passage of the entry the note is anchored to.
+        note: The margin note itself.
+    """
+
+    kind: str = Field(
+        pattern=LETTER_NOTE_KIND_PATTERN,
+        description="Short lowercase token naming the note's kind.",
+    )
+    anchor_text: str = Field(description="The passage the note anchors to.")
+    note: str = Field(
+        max_length=MAX_LETTER_NOTE_CHARS,
+        description="The margin note the letter expands.",
+    )
+
+    @field_validator("anchor_text", "note")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        """Refuse a whitespace-only anchor or note.
+
+        Args:
+            value: The submitted text.
+
+        Returns:
+            *value* unchanged when it carries a non-space character.
+
+        Raises:
+            ValueError: When *value* is empty or whitespace-only.
+        """
+        if not value.strip():
+            raise ValueError("anchor_text and note must not be blank")
+        return value
+
+
+class LetterRequest(_WireModel):
+    """Expand one margin note into its letter, stored under the path's id.
+
+    The caller's own text: no vault tier applies to it, so the declared
+    ``tier`` is both the write tier of the stored Voice Draft and the content
+    tier routing reconciles with the ceiling.
+
+    Attributes:
+        content: The full journal entry the note belongs to.
+        note: The margin note being expanded.
+        tier: The source entry's tier. ``intimate`` is unrepresentable on the
+            remote wire, so an intimate entry cannot ask for a letter at all.
+        title: Optional operator-safe title; omission uses the Voice Draft
+            store's content-free placeholder.
+    """
+
+    content: str = Field(description="The full entry; must not be blank.")
+    note: LetterNote = Field(description="The margin note to expand.")
+    tier: WireTierCeiling = Field(description="Tier inherited from the source entry.")
+    title: str | None = Field(
+        default=None,
+        max_length=MAX_FILENAME_CHARS,
+        description="Optional title; omission uses a content-free placeholder.",
+    )
+
+    @field_validator("content")
+    @classmethod
+    def _reject_blank_content(cls, value: str) -> str:
+        """Return non-blank content and refuse an empty source entry."""
+        if not value.strip():
+            raise ValueError("content must not be blank")
+        return value
+
+    @field_validator("title")
+    @classmethod
+    def _reject_blank_title(cls, value: str | None) -> str | None:
+        """Return a meaningful optional title; blank is not an alternate null."""
+        if value is not None and not value.strip():
+            raise ValueError("title must not be blank")
+        return value
+
+
+class LetterResponse(_WireModel):
+    """The letter the vault wrote, and the Voice Draft now holding it.
+
+    Attributes:
+        status: Always ``"ok"``. Failure is an :class:`ErrorEnvelope`, and an
+            acute-distress entry is a :class:`CareEscalationResponse`.
+        tier_ceiling: The caller's declared ceiling, echoed.
+        external_id: The caller-owned id; ``DELETE
+            /v1/voice-drafts/{external_id}`` retracts the letter.
+        fragment_id: The stable vault-side fragment identity.
+        action: ``created`` for a new letter, ``unchanged`` when the id already
+            held one, which is returned as stored without a model call.
+        tier: The stored letter's tier.
+        title: The stored title.
+        letter: The letter text. Free model prose, never a verbatim quote. A
+            new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``
+            one is returned exactly as stored, so a draft put by
+            ``PUT /v1/voice-drafts`` is never truncated on the way out.
+        attribution: Fixed AI attribution and zero voice weight.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-owned durable identity.")
+    fragment_id: str = Field(description="Stable vault-side fragment identity.")
+    action: Literal[JournalAction.CREATED, JournalAction.UNCHANGED] = Field(
+        description="Created, or unchanged when the id already held a letter.",
+    )
+    tier: WireTierCeiling = Field(description="Tier of the stored letter.")
+    title: str = Field(description="Stored letter title.")
+    letter: str = Field(description="The letter text; free model prose.")
+    attribution: VoiceDraftAttribution = Field(
+        description="Fixed AI attribution and zero voice weight.",
+    )
 
 
 class UploadRequest(_WireModel):
@@ -2232,6 +2383,9 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "JournalWithdrawResponse": JournalWithdrawResponse,
     "JobAcceptedResponse": JobAcceptedResponse,
     "JobStatusResponse": JobStatusResponse,
+    "LetterNote": LetterNote,
+    "LetterRequest": LetterRequest,
+    "LetterResponse": LetterResponse,
     "LinkRequest": LinkRequest,
     "LinkResponse": LinkResponse,
     "NotApplicableExample": NotApplicableExample,

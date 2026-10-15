@@ -46,6 +46,8 @@ from creek_mcp.api.models import (
     JournalUpsertRequest,
     JournalUpsertResponse,
     JournalWithdrawResponse,
+    LetterRequest,
+    LetterResponse,
     LinkRequest,
     LinkResponse,
     ReflectionRequest,
@@ -125,6 +127,9 @@ OP_VOICE_DRAFT_READ: Final[str] = "getVoiceDraft"
 
 OP_VOICE_DRAFT_DELETE: Final[str] = "deleteVoiceDraft"
 """``operation_id`` of ``DELETE /v1/voice-drafts/{external_id}``."""
+
+OP_LETTERS: Final[str] = "writeLetter"
+"""``operation_id`` of ``POST /v1/letters/{external_id}``."""
 
 OP_DRIVE_STATUS: Final[str] = "getDriveConnector"
 """``operation_id`` of ``GET /v1/connectors/drive``."""
@@ -487,6 +492,16 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         response_model=VoiceDraftDeleteResponse,
         requires_contract_version=True,
         summary="Retract one admitted Voice Draft by external id.",
+    ),
+    RouteSpec(
+        path="/v1/letters/{external_id}",
+        method="POST",
+        operation_id=OP_LETTERS,
+        capability=Capability.LETTERS,
+        request_model=LetterRequest,
+        response_model=LetterResponse,
+        requires_contract_version=True,
+        summary="Write one margin note's letter and store it as a Voice Draft.",
     ),
     RouteSpec(
         path="/v1/connectors/drive",

@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.16.0",
+  "contract_version": "0.17.0",
   "files": [
     {
       "capability": "capabilities",
       "model": "NotApplicableExample",
       "path": "examples/capabilities/care-escalation.json",
-      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
       "state": "care-escalation"
     },
     {
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "1f66031d1028f28dbe7d7b3298ea30edc48fd2301d1cb7979e28ee8e9e4957e6",
+      "sha256": "e45b8f75146724ae793df1277ab0da7cc012922533a0553898d3fda5ceb8c45c",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "3f8033cc6b6cc54642a1ada4a3686ed3df741880c98c99cab84b37aeba750237",
+      "sha256": "bfbd9e05dfc5120dd9ec0dcc8a83b34d6aae1dfc3416e9a8160c6b53a3eb28ee",
       "state": "success"
     },
     {
@@ -55,7 +55,7 @@
       "capability": "drive-connector",
       "model": "NotApplicableExample",
       "path": "examples/drive-connector/care-escalation.json",
-      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
       "state": "care-escalation"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "journal-upsert",
       "model": "NotApplicableExample",
       "path": "examples/journal-upsert/care-escalation.json",
-      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
       "state": "care-escalation"
     },
     {
@@ -153,7 +153,7 @@
       "capability": "journal-withdraw",
       "model": "NotApplicableExample",
       "path": "examples/journal-withdraw/care-escalation.json",
-      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
       "state": "care-escalation"
     },
     {
@@ -199,10 +199,59 @@
       "state": "unavailable-service"
     },
     {
+      "capability": "letters",
+      "model": "CareEscalationResponse",
+      "path": "examples/letters/care-escalation.json",
+      "sha256": "8558c3fa48b4be421fed76e7116f48568ce9eb4fba9ebe9f274e1c5e385b9b91",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "letters",
+      "model": "LetterResponse",
+      "path": "examples/letters/empty.json",
+      "sha256": "b49aa4e4e7607b01085aea11d8150cb9514df346d58488d1f54f02b24670e025",
+      "state": "empty"
+    },
+    {
+      "capability": "letters",
+      "model": "ErrorEnvelope",
+      "path": "examples/letters/incompatible-version.json",
+      "sha256": "79d38b8e952d7920a1fb646a3fff4554a8f6349625f3c3598dfce906292eae58",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "letters",
+      "model": "ErrorEnvelope",
+      "path": "examples/letters/malformed-input.json",
+      "sha256": "2eaefab61fb2f80a09cea68a8ce52fff0c4042147ed958fd080531420b4df934",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "letters",
+      "model": "ErrorEnvelope",
+      "path": "examples/letters/refusal.json",
+      "sha256": "db83f189118431c466284456d7b30176e3894d8bb4c7baf1e166da32cf23e9f8",
+      "state": "refusal"
+    },
+    {
+      "capability": "letters",
+      "model": "LetterResponse",
+      "path": "examples/letters/success.json",
+      "sha256": "2299b30efa08b967e497f7bc855dbf72672dff7fe6dc555c11669a81c14e2297",
+      "state": "success"
+    },
+    {
+      "capability": "letters",
+      "model": "ErrorEnvelope",
+      "path": "examples/letters/unavailable-service.json",
+      "sha256": "7d93dd6105db1fbb41e4d1661cf8eb24b716d2d3ed6d80fad3fe6ed212d0b341",
+      "state": "unavailable-service"
+    },
+    {
       "capability": "pipeline",
       "model": "NotApplicableExample",
       "path": "examples/pipeline/care-escalation.json",
-      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
       "state": "care-escalation"
     },
     {
@@ -300,7 +349,7 @@
       "capability": "upload",
       "model": "NotApplicableExample",
       "path": "examples/upload/care-escalation.json",
-      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
       "state": "care-escalation"
     },
     {
@@ -349,7 +398,7 @@
       "capability": "voice-drafts",
       "model": "NotApplicableExample",
       "path": "examples/voice-drafts/care-escalation.json",
-      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
       "state": "care-escalation"
     },
     {
@@ -398,7 +447,7 @@
       "capability": "wheel",
       "model": "NotApplicableExample",
       "path": "examples/wheel/care-escalation.json",
-      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
       "state": "care-escalation"
     },
     {
@@ -454,7 +503,7 @@
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "9452bb982cf229a696dc33a873086fb2e4e756449c5fbaec8585704f94ba935a",
+      "sha256": "e60a5a65be56a144da7f10045e2687e236c2da33f4153c16f3cfbcd5df4927ee",
       "state": null
     },
     {
@@ -574,6 +623,27 @@
       "model": "JournalWithdrawResponse",
       "path": "schemas/JournalWithdrawResponse.schema.json",
       "sha256": "47a8a8bca1dded1ab4371cdf08a7f676e01287fa0915ac0780550e8134c03e3a",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "LetterNote",
+      "path": "schemas/LetterNote.schema.json",
+      "sha256": "632fa1a7c01c97a1f6f257205c9bfb6f06d15bf76c72316b339e0e72f7c6e1bc",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "LetterRequest",
+      "path": "schemas/LetterRequest.schema.json",
+      "sha256": "6f9c87c7bc0e98ce0d7449c1319e56f4a61ac6627790203cc1b8f80e763d58e2",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "LetterResponse",
+      "path": "schemas/LetterResponse.schema.json",
+      "sha256": "4461b9480c7179da2d8fb2de6f99a3b50b05b1ae13825e18ba777ed1c12fc9dc",
       "state": null
     },
     {

@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.16.0`
+- **Contract version**: `0.17.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -39,7 +39,7 @@ remote tier ceiling in order to demo a capability early — see
 ## Versioning
 
 `/v1` in the route path is the HTTP major. Below that, exactly one
-`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.16.0`
+`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.17.0`
 — covers both the MCP surface and `/v1`, because the epic's premise is one
 behavioral implementation: a shape change in a shared `creek_mcp.tools.*`
 function changes what both adapters can honestly promise at the same moment.
@@ -221,6 +221,7 @@ every content route refuses an undeclared minor anyway.
 | `pipeline` | `0.10` |
 | `voice-drafts` | `0.15` |
 | `journal-withdraw` | `0.16` |
+| `letters` | `0.17` |
 <!-- /capability-set -->
 
 **The build-out divergence is closed (#1112).** While epic #1071 was being
@@ -232,8 +233,8 @@ completed steady state, because re-publishing and re-hashing a consumer-pinned
 artifact four times inside one epic would have trained that consumer to re-pin
 without reading. **#1077 and epic #1071 are both closed**, so there is no gap
 left: `IMPLEMENTED_CAPABILITIES` is `frozenset(Capability)`, the fixture lists
-the same nine, and a live response over a vault declaring the current minor
-returns the same nine. `tests/test_v1_api_capabilities.py` asserts those three
+the same ten, and a live response over a vault declaring the current minor
+returns the same ten. `tests/test_v1_api_capabilities.py` asserts those three
 and the enum as **one four-way equality**, which is what replaced the old test
 that existed to record the divergence.
 
@@ -356,6 +357,53 @@ deleted, or above-ceiling slot collapses to the same `privacy_refused`
 envelope. `DELETE` is the retraction path when Adepthood later classifies a
 source entry as `intimate`: no intimate prose crosses the remote wire merely
 to remove the previously mirrored AI draft.
+
+## Letters
+
+`POST /v1/letters/{external_id}` is the vault-side half of Adepthood epic
+#3203, whose owner decision on 2026-10-14 was "Vault writes letters" (#1862).
+Every Adepthood account that can mirror a Voice Draft to a vault is
+vault-bound, and a vault-bound writer's AI operations must stay inside their
+vault; so the letter that expands a margin note is written here, by the
+vault's own model routing, rather than by an app-side provider whose output is
+then mirrored.
+
+The body is the caller's own material: `{content, note: {kind, anchor_text,
+note}, tier, title?}`. `tier` is the source entry's tier, typed
+`WireTierCeiling`, so an intimate entry cannot ask for a letter at all. The
+gates run in this order, and none of them is new policy:
+
+1. The declared tier must be writable under the ceiling
+   (`write_tier_allowed`); otherwise `403 privacy_refused`, before any model.
+2. `acute_distress_guard` runs on the entry and on the note. A hit is a `200`
+   `CareEscalationResponse`, exactly as on `POST /v1/reflections`, and the
+   model is never called.
+3. A slot that already holds an admitted letter is returned as stored with
+   `action: "unchanged"` and no model call; one above the ceiling is the same
+   `privacy_refused` the Voice Draft `GET` gives.
+4. The routing tier is `routing_tier(ceiling, tier)` — the prompt carries no
+   vault content, so the declared tier is its whole content tier — and the
+   tier-keyed factory resolves the `generation` stage through the same
+   `_generation_provider` chokepoint reflection uses. The model router forces
+   an intimate call onto the local default or raises `IntimateRoutingError`,
+   the model pin applies in container mode, and every cloud provider refuses
+   to build without cloud consent, so a managed vault whose consent is latched
+   off never egresses a letter. Any of those is a retryable `503
+   temporarily_unavailable`, and nothing is stored.
+5. The letter is capped at `MAX_LETTER_CHARS` and stored first-writer-wins as
+   the AI-attributed Voice Draft at the same id (`author=ai`,
+   `author_slug=ai-as-user`, `voice_weight=0`). The emptiness check and the
+   write share the Voice Draft mutation lock, so two concurrent letters for one
+   id store exactly one and both callers are answered with it. A blank model
+   turn stores nothing and is retryable.
+
+The response is `LetterResponse`: the stored letter text, its `fragment_id`,
+`tier`, `title`, `action` (`created` or `unchanged`) and the fixed attribution.
+`DELETE /v1/voice-drafts/{external_id}` retracts it, so the existing mirror and
+withdrawal ledger on the Adepthood side applies to a vault-written letter
+unchanged. The audit row records lengths, the declared tier and the consumer;
+the log records one closed-vocabulary outcome; neither carries the entry, the
+note, the prompt or the letter.
 
 ## Reflection
 
@@ -754,7 +802,8 @@ network MCP call. It is out of scope for #1117 and is tracked as follow-up
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
 truth for the wire shapes in this repository:
 `manifest.json`, `retry-policy.json`, one `schemas/*.schema.json` file per
-`CONTRACT_MODELS` entry (thirty-eight at contract `0.16.0`, adding the closed
+`CONTRACT_MODELS` entry (forty-one at contract `0.17.0`, adding the three
+letter request/response models; thirty-eight at contract `0.16.0`, adding the closed
 Journal withdrawal response; thirty-seven at contract `0.15.0`, adding the five
 Voice Draft request/response and attribution models; thirty-two at contract `0.14.0`, adding
 `JobAcceptedResponse` and `JobStatusResponse`; thirty at contract `0.12.0`, unchanged since
@@ -764,8 +813,8 @@ Voice Draft request/response and attribution models; thirty-two at contract `0.1
 and the three `Drive*Response` models from #1527 — plus
 `ClassificationRequest`/`ClassificationResponse` and `LinkRequest`/`LinkResponse`
 from #1570 — plus `DriveAuthorizationRequest`, `DriveAuthorizationResponse` and
-`DriveAuthorizationExchangeRequest` from #1568), and sixty-three
-`examples/<capability>/<state>.json` fixtures (nine capabilities × seven
+`DriveAuthorizationExchangeRequest` from #1568), and seventy
+`examples/<capability>/<state>.json` fixtures (ten capabilities × seven
 states). Everything in the directory except its own `README.md` is
 **generated** by `build_bundle()`
 ([`creek_mcp/api/bundle.py`](../../creek-tools/creek_mcp/api/bundle.py)), and
@@ -884,6 +933,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.17.0` | 2026-10-14 | #1862 publishes the **tenth capability**, `letters`, as `POST /v1/letters/{external_id}`: the vault writes one margin note's Voice Draft letter from the caller's own entry and note, so a vault-bound Adepthood writer's letter never needs an app-side provider (adepthood epic #3203). Above-ceiling input is `privacy_refused` before any model, acute distress is a `200` care escalation, and generation routes through the shared tier-keyed `generation` chokepoint, so an intimate-routed call is forced local or refused and a cloud provider is built only with consent. The letter is stored first-writer-wins as the AI-attributed Voice Draft at the same caller-owned id and is retractable by the existing `DELETE`; a repeat is `unchanged` with no second model call. Three closed models join the bundle, `letters` joins `reflections` as a capability whose care-escalation cell is reachable (so every other capability's unreachable marker now names both paths), `0.16` stays served without seeing or reaching the route, and the OpenAPI golden advances deliberately. |
 | `0.16.0` | 2026-09-11 | #1799 publishes the **ninth capability**, `journal-withdraw`, as `DELETE /v1/journal-entries/{external_id}`. The consumer-scoped, body-free operation removes a Journal source and all of its fragments, ledger/index/provenance references, and retrieval-facing derived state. It shares the upsert mutation lock, persists only content-free recovery state, and refuses to report success until absence is verified; partial work is a retryable `503`. Foreign, unknown, already-withdrawn, and never-present identifiers are identical `200` successes, preventing an ownership oracle. One closed response model joins the bundle, `0.15` stays served without seeing or reaching the route, and the OpenAPI golden advances deliberately. |
 | `0.15.0` | 2026-09-06 | #1727 publishes the **eighth capability**, `voice-drafts`, as `PUT`, `GET`, and `DELETE /v1/voice-drafts/{external_id}`. The caller owns the idempotency key; Creek hashes it into a deterministic filename and stable fragment id, so the same id creates once and then updates or returns unchanged without duplicating the document. The stored fragment is structurally outside owner voice: it lives under `11-Other-Authors/ai-as-user`, carries `source.author=ai`, `source.author_slug=ai-as-user`, and `voice_weight=0.0`, and the wire attribution model admits no other values. Reads and mutations enforce the canonical tier ceiling; the existing-tier admission check happens while the storage lock is held, so an open caller cannot race or overwrite a personal draft. Missing, corrupt, deleted, and above-ceiling slots collapse to the same refusal. `DELETE` supports Adepthood's required retraction when a source entry later becomes intimate, without intimate text crossing the network. The route set adds three operations and five closed models; no error code or status is added. `CAPABILITY_SINCE_MINOR` both withholds and refuses the resource for `0.14` clients, whose known routes remain byte-identical, so `SUPPORTED_CONTRACT_MINORS` widens to retain `0.14`. The generated bundle adds five schemas and seven content-free `voice-drafts` examples, and the OpenAPI golden advances deliberately. |
 | `0.14.0` | 2026-09-05 | #1605 closes the long-running pipeline gap with a durable job surface. `POST /v1/classifications` now admits `method=llm`, and `POST /v1/links` admits `method=embeddings`; both persist a consumer-bound record before returning `202` with an opaque UUID. `GET /v1/jobs/{job_id}` returns only `{status, job_id, state, result}` where state is one of `queued`, `running`, `succeeded`, or `failed`, and `result` is either null or the existing counts-only classification/link model. No fragment id, path, title, prose, or tool error is published. Another authenticated consumer and an unknown id collapse to the same `unavailable` response. An active record belonging to an earlier server instance becomes `failed` after restart rather than remaining live forever. Admission permits one active detached pipeline job per authenticated consumer; another long-method request receives static `unavailable` until the worker finishes, bounding the otherwise-cheap `202` fan-out. The event loop alone mutates the admission sets, and status workers receive immutable snapshots. Existing `rules`, `temporal`, `eddies`, and `threads` calls retain their byte-identical synchronous `200` bodies. The worker deliberately reuses `classify_tool` / `link_tool`; in particular, LLM jobs still traverse `ModelRouter._enforce_local_for_intimate`, and the HTTP test observes an intimate fragment reach only the local provider under a cloud classification config. This adds one route, two enum members, `202`, and two wire models, so the shared minor advances and `SUPPORTED_CONTRACT_MINORS` widens to retain `0.13`. The generated fixture bundle gains the two schemas and republishes its version-bearing capability examples and manifest; `openapi.json` remains generated on demand for the standing contract-event reason. |

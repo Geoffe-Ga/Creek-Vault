@@ -28,6 +28,7 @@ does and does not yet do.
 | `PUT /v1/voice-drafts/{external_id}` | **Implemented.** Idempotently store one AI-authored Voice Draft under a caller-owned key. The deterministic fragment lives under `11-Other-Authors/ai-as-user` with `author=ai`, `author_slug=ai-as-user`, and `voice_weight=0.0`; those values are fixed literals in the response schema, not caller claims. Both incoming and existing tiers are admitted under the canonical ceiling while the mutation lock is held. Published at contract `0.15.0` (#1727). |
 | `GET /v1/voice-drafts/{external_id}` | **Implemented.** Recall one admitted Voice Draft. Missing, corrupt, deleted, and above-ceiling resources return the same `privacy_refused` shape; a success returns stored content and fixed AI attribution. Published at contract `0.15.0` (#1727). |
 | `DELETE /v1/voice-drafts/{external_id}` | **Implemented.** Retract an admitted Voice Draft, notably when its Adepthood source later becomes `intimate`; no intimate prose is sent to request deletion. Published at contract `0.15.0` (#1727). |
+| `POST /v1/letters/{external_id}` | **Implemented.** The vault writes one margin note's letter and stores it as the AI-attributed Voice Draft at the same caller-owned id, so a vault-bound writer's letter never needs an app-side provider. Body is `{content, note: {kind, anchor_text, note}, tier, title?}`; `tier` is the source entry's and cannot be `intimate`. A tier above your ceiling is `403 privacy_refused` before any model; acute distress in the entry or the note is a `200` care escalation and the model is never called. Generation routes through the vault's tier-keyed `generation` stage — the same chokepoint, model pin and cloud-consent check reflection uses — so an intimate-routed call is forced local or refused, never egressed. The response carries the letter text and its `fragment_id`; `DELETE /v1/voice-drafts/{external_id}` retracts it. First-writer-wins: a repeat for an id that already holds a letter returns it as `unchanged` with no second model call. An unavailable provider or a blank model turn stores nothing and is retryable `503`. Published at contract `0.17.0` (#1862). |
 | `GET /v1/connectors/drive` | **Implemented.** The read-only Google Drive connector's *state*: `connected` / `not_connected` / `expired` / `unsupported`, the granted OAuth scopes (always `.readonly` — the config refuses anything else), and `can_sync`. **No credential is published and none is accepted**: the response has no field a token could sit in, and the model forbids extras. This is the one route that discloses connection state deliberately — a client cannot render a connect button without it — which is exactly why the other two verbs' refusals disclose nothing. Published at contract `0.9.0` (#1527). |
 | `POST /v1/connectors/drive/syncs` | **Implemented.** One **incremental** Drive sync over the existing downloader, followed by an ordinary ledger-backed ingest of whatever it fetched. Takes **no request body** — there is no parameter you could usefully set, and a caller-supplied path or file id would be a way to steer the server at part of the owner's Drive they never asked it to touch. The response is **counts only**: no Drive file name, folder name or id, and no `affected_fragment_ids` — a sync's fragments are the vault owner's content, and a list of them would be a corpus enumeration primitive. Files land at the tier `creek ingest` would give them; the route passes **no** `privacy_tier`, so it cannot make any tier less restrictive. A second sync over an unchanged Drive fetches nothing and writes nothing. Refuses with `503 unavailable` when there is no usable credential, rather than falling through to an OAuth flow that would try to open a browser on the server. Published at contract `0.9.0` (#1527). |
 | `POST /v1/connectors/drive/authorizations` | **Implemented.** Begin a Google Drive authorization. Body is `{"redirect_uri": ...}` — **the caller's own** absolute `https` URI, fragment-free; the response is the Google authorization URL to send the user to, plus an opaque single-use `state` that expires. No credential is accepted and none is published: the client secret stays on this host. The scope list is re-validated against the read-only allowlist on the way out, so a remote connect button cannot widen the grant. Published at contract `0.11.0` (#1568, [ADR-0012](./architecture/ADR/0012-remote-google-drive-authorisation.md)). |
@@ -71,13 +72,14 @@ list of names:
 | `pipeline` | `0.10` |
 | `voice-drafts` | `0.15` |
 | `journal-withdraw` | `0.16` |
+| `letters` | `0.17` |
 <!-- /capability-set -->
 
 **The advertised list is caller-dependent, and the count above is the ceiling,
 not the answer.** What a given caller is shown is the intersection of that set
 with what its *declared* contract minor published, off `CAPABILITY_SINCE_MINOR`
 in `creek_mcp/api/models.py`: a caller declaring `0.2` is shown the first four,
-one declaring `0.16` — or declaring no minor at all — is shown all nine. The
+one declaring `0.17` — or declaring no minor at all — is shown all ten. The
 route that serves a withheld capability refuses the same caller off the same
 table, so what is hidden here is unreachable there.
 
@@ -86,7 +88,7 @@ single constant, `IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so
 they cannot disagree. The table above is machine-checked against the enum by
 `tests/test_v1_api_capabilities.py`, along with the committed
 `docs/contracts/adepthood-v1/examples/capabilities/success.json` fixture and a
-live response — one four-way equality, so a ninth capability cannot be added
+live response — one four-way equality, so an eleventh capability cannot be added
 without this page moving with it.
 
 > **On the issue's `not_implemented` spelling.** Issue #1074 was written before
@@ -325,18 +327,18 @@ could put on any wire position that names it.
 `/v1` is the HTTP major. Below it, one `contract_version` covers both this
 surface and MCP.
 
-The sixteen capability routes — `PUT` and `DELETE /v1/journal-entries/{external_id}`,
+The seventeen capability routes — `PUT` and `DELETE /v1/journal-entries/{external_id}`,
 `POST /v1/reflections`, `GET /v1/wheel`, `POST /v1/uploads`, the five
 `/v1/connectors/drive` verbs, `POST /v1/classifications`, `POST /v1/links`, and
 `GET /v1/jobs/{job_id}`, plus the three verbs on
-`/v1/voice-drafts/{external_id}` —
+`/v1/voice-drafts/{external_id}` and `POST /v1/letters/{external_id}` —
 require `X-Creek-Contract-Version: <major.minor>`, for example `0.11`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
 header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.16`, `0.15`, `0.14`, `0.13`, `0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and
+`0.17`, `0.16`, `0.15`, `0.14`, `0.13`, `0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and
 `0.2`. The
 `0.3.0`, `0.4.0` and `0.6.0` moves all
 came from the MCP surface and changed no `/v1` shape — `0.3.0` added
@@ -470,6 +472,22 @@ digest-keyed, content-free recovery record and returns retryable `503`. A
 `0.15` client knows neither the route nor its closed response model, so the
 since-minor gate withholds and refuses it while its known routes remain
 byte-identical.
+
+`0.17.0` (#1862) adds `letters` and `POST /v1/letters/{external_id}`, the
+vault-side half of Adepthood's "vault writes letters" decision: a vault-bound
+writer's first letter is written by the vault's own model routing instead of an
+app-side provider. The prompt carries only the caller's own entry and note, so
+the routing tier is the more sensitive of the declared entry tier and the
+ceiling-derived tier; the factory resolves the `generation` stage through the
+vault's model router, which forces an intimate call local or refuses it, and
+every cloud provider refuses to build without cloud consent. The letter is
+stored first-writer-wins as the same AI-attributed Voice Draft the `PUT` route
+writes, so the existing `DELETE` retracts it and a lost acknowledgement is
+retried for free. The audit row records lengths, the declared tier and the
+consumer; the log records a closed-vocabulary outcome; neither carries the
+entry, the note, the prompt or the letter. A `0.16` client knows neither the
+route nor its three closed models, so the since-minor gate withholds and
+refuses it while its known routes remain byte-identical.
 
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.

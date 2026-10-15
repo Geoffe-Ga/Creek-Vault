@@ -243,14 +243,10 @@ def upsert_voice_draft(
     lower-ceiling caller cannot race an admitted reader and overwrite a draft
     whose existing bytes it could not have read.
     """
-    effective_title = (
-        document.title.strip() if document.title is not None else _DEFAULT_TITLE
-    )
+    effective_title = _effective_title(document)
     effective_content = _normalise_content(document.content)
     with vault_lock(_lock_path(vault_path)):
-        namespace = _draft_namespace(vault_path)
-        namespace.mkdir(parents=True, exist_ok=True)
-        path = _draft_path(vault_path, external_id)
+        path = _prepared_path(vault_path, external_id)
         existing = _load_path(path, external_id)
         if existing is not None and not existing_is_admitted(existing.tier):
             raise VoiceDraftAccessDeniedError
@@ -261,20 +257,90 @@ def upsert_voice_draft(
             and existing.tier == document.tier
         ):
             return VoiceDraftWriteResult(VoiceDraftAction.UNCHANGED, existing)
-        rendered = _render_record(
-            external_id=external_id,
-            content=effective_content,
-            title=effective_title,
-            tier=document.tier,
-        )
-        atomic_write_text(path, rendered)
-        stored = _load_path(path, external_id)
-        if stored is None:
-            raise VoiceDraftStorageError(_VoiceDraftFailure.DISAPPEARED)
+        stored = _write_record(path, external_id, document)
         action = (
             VoiceDraftAction.CREATED if existing is None else VoiceDraftAction.UPDATED
         )
         return VoiceDraftWriteResult(action, stored)
+
+
+def create_voice_draft_if_absent(
+    *,
+    vault_path: Path,
+    external_id: str,
+    document: VoiceDraftDocument,
+    existing_is_admitted: ReadAdmission,
+) -> VoiceDraftWriteResult:
+    """Create one Voice Draft only when its slot is empty (#1862).
+
+    The first-writer-wins sibling of :func:`upsert_voice_draft`, for a document
+    whose content is expensive to regenerate and must not be silently replaced:
+    a vault-written letter. The emptiness check and the write share the one
+    mutation lock, so two concurrent letters for the same id store exactly one
+    of them and both callers are answered with it.
+
+    Args:
+        vault_path: The vault root.
+        external_id: The caller-owned identity of the draft.
+        document: The draft to store when the slot is empty.
+        existing_is_admitted: Read admission for a draft already in the slot,
+            evaluated under the lock.
+
+    Returns:
+        ``CREATED`` with the new record, or ``UNCHANGED`` with the record that
+        already held the slot.
+
+    Raises:
+        VoiceDraftAccessDeniedError: When the slot holds a draft above the
+            caller's admitted ceiling.
+        VoiceDraftStorageError: When the slot exists but is not a valid draft.
+    """
+    with vault_lock(_lock_path(vault_path)):
+        path = _prepared_path(vault_path, external_id)
+        existing = _load_path(path, external_id)
+        if existing is not None:
+            if not existing_is_admitted(existing.tier):
+                raise VoiceDraftAccessDeniedError
+            return VoiceDraftWriteResult(VoiceDraftAction.UNCHANGED, existing)
+        stored = _write_record(path, external_id, document)
+        return VoiceDraftWriteResult(VoiceDraftAction.CREATED, stored)
+
+
+def _effective_title(document: VoiceDraftDocument) -> str:
+    """Return the stored title: the caller's, stripped, or the placeholder."""
+    return document.title.strip() if document.title is not None else _DEFAULT_TITLE
+
+
+def _prepared_path(vault_path: Path, external_id: str) -> Path:
+    """Ensure the canonical namespace exists and return the draft's slot.
+
+    Called with the mutation lock held.
+    """
+    _draft_namespace(vault_path).mkdir(parents=True, exist_ok=True)
+    return _draft_path(vault_path, external_id)
+
+
+def _write_record(
+    path: Path, external_id: str, document: VoiceDraftDocument
+) -> VoiceDraftRecord:
+    """Atomically write *document* into *path* and return the reloaded record.
+
+    Called with the mutation lock held.
+
+    Raises:
+        VoiceDraftStorageError: When the written slot cannot be read back.
+    """
+    rendered = _render_record(
+        external_id=external_id,
+        content=_normalise_content(document.content),
+        title=_effective_title(document),
+        tier=document.tier,
+    )
+    atomic_write_text(path, rendered)
+    stored = _load_path(path, external_id)
+    if stored is None:
+        raise VoiceDraftStorageError(_VoiceDraftFailure.DISAPPEARED)
+    return stored
 
 
 def delete_voice_draft(

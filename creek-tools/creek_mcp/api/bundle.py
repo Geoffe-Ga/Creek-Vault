@@ -2,7 +2,7 @@
 
 :func:`build_bundle` renders the whole of ``docs/contracts/adepthood-v1/`` from
 the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, a
-9x7 matrix of worked example responses, the retry table, and a manifest that
+10x7 matrix of worked example responses, the retry table, and a manifest that
 hashes every one of them. :func:`write_bundle` materialises it.
 
 **Why generate it instead of hand-writing it.** A hand-written fixture bundle
@@ -30,9 +30,9 @@ its whole error-handling surface against fixtures:
 - ``refusal`` — an :class:`~creek_mcp.api.models.ErrorEnvelope` carrying
   ``privacy_refused``. **These are the intimate examples, and every one of them
   is a refusal rather than a success** — that is the point of publishing them.
-- ``care-escalation`` — ``reflections`` only; the other eight cells are
-  :class:`~creek_mcp.api.models.NotApplicableExample`, because the
-  acute-distress guard runs only inside ``reflect_tool``.
+- ``care-escalation`` — ``reflections`` and ``letters`` only; the other eight
+  cells are :class:`~creek_mcp.api.models.NotApplicableExample`, because the
+  acute-distress guard runs only on those two paths.
 - ``malformed-input`` / ``incompatible-version`` / ``unavailable-service`` —
   the three remaining error envelopes.
 
@@ -137,7 +137,7 @@ _STATE_REFUSAL: Final[str] = "refusal"
 """An above-ceiling refusal; the intimate example for every capability."""
 
 _STATE_CARE_ESCALATION: Final[str] = "care-escalation"
-"""The acute-distress escalation; reachable only for ``reflections``."""
+"""The acute-distress escalation; reachable for ``reflections`` and ``letters``."""
 
 _STATE_MALFORMED_INPUT: Final[str] = "malformed-input"
 """A request that does not satisfy the published schema."""
@@ -159,12 +159,21 @@ EXAMPLE_STATES: Final[tuple[str, ...]] = (
 )
 """The state axis of the fixture matrix, in the order a consumer meets them."""
 
+_ESCALATING_CAPABILITIES: Final[frozenset[str]] = frozenset(
+    {Capability.REFLECTIONS.value, Capability.LETTERS.value}
+)
+"""The capabilities whose handler runs the acute-distress guard before a model.
+
+``letters`` joined ``reflections`` at contract 0.17 (#1862): a letter is written
+from the caller's entry and note, and either can carry acute distress.
+"""
+
 UNREACHABLE_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         *(
             (capability, _STATE_CARE_ESCALATION)
             for capability in CAPABILITIES
-            if capability != Capability.REFLECTIONS.value
+            if capability not in _ESCALATING_CAPABILITIES
         ),
         (Capability.JOURNAL_WITHDRAW.value, _STATE_REFUSAL),
     }
@@ -172,9 +181,9 @@ UNREACHABLE_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
 """The matrix cells that have no reachable response shape.
 
 Derived from the axes rather than listed, so it cannot fall out of step with
-the matrix it describes. The acute-distress guard runs only inside
-:func:`creek_mcp.tools.reflect.reflect_tool`, so ``capabilities``,
-every other capability can never escalate. Journal withdrawal additionally
+the matrix it describes. The acute-distress guard runs only on the
+reflection and letter paths (:data:`_ESCALATING_CAPABILITIES`), so every other
+capability can never escalate. Journal withdrawal additionally
 has no privacy-refusal state: foreign, absent, and already-withdrawn resources
 are deliberately indistinguishable successes. Each cell is filled with a
 :class:`~creek_mcp.api.models.NotApplicableExample` that says why.
@@ -210,7 +219,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "tier_model": _TIER_MODEL_PAYLOAD,
     "capabilities": list(CAPABILITIES),
 }
-"""A ready server: vault present, all nine capabilities served."""
+"""A ready server: vault present, all ten capabilities served."""
 
 _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     **_CAPABILITIES_SUCCESS,
@@ -295,6 +304,32 @@ _VOICE_DRAFT_EMPTY: Final[dict[str, Any]] = {
     "action": JournalAction.UNCHANGED.value,
 }
 """An idempotent Voice Draft re-sync that wrote no new document."""
+
+_EXAMPLE_LETTER_TEXT: Final[str] = (
+    "You took the long way home so you could hear the river before deciding. "
+    "That is not delay; it is a practice you already keep. Let the next choice "
+    "wait for the same quiet."
+)
+"""A synthetic, non-intimate letter: the fixture is a shape, not a person."""
+
+_LETTER_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "external_id": _EXAMPLE_VOICE_DRAFT_EXTERNAL_ID,
+    "fragment_id": _EXAMPLE_VOICE_DRAFT_FRAGMENT_ID,
+    "action": JournalAction.CREATED.value,
+    "tier": WireTierCeiling.PERSONAL.value,
+    "title": "Voice draft",
+    "letter": _EXAMPLE_LETTER_TEXT,
+    "attribution": _VOICE_DRAFT_ATTRIBUTION,
+}
+"""A first letter, stored as the Voice Draft at the caller's id."""
+
+_LETTER_EMPTY: Final[dict[str, Any]] = {
+    **_LETTER_SUCCESS,
+    "action": JournalAction.UNCHANGED.value,
+}
+"""A repeat: the first letter returned as stored, with no model call."""
 
 _EXAMPLE_UPLOAD_EXTERNAL_ID: Final[str] = "adepthood:doc:2026-08-18T09:30:00Z"
 """A synthetic consumer-side document id, in the shape Adepthood mints."""
@@ -536,8 +571,8 @@ distress is handed here are exactly the ones the guardrail ships.
 _CARE_UNREACHABLE_PAYLOAD: Final[dict[str, Any]] = {
     "unreachable": True,
     "reason": (
-        "the acute-distress guard runs only inside reflect_tool, so this "
-        "capability has no care-escalation response shape"
+        "the acute-distress guard runs only on the reflection and letter "
+        "paths, so this capability has no care-escalation response shape"
     ),
 }
 """Why a non-reflection capability cannot emit care escalation."""
@@ -603,7 +638,7 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 
 
 # --------------------------------------------------------------------------
-# The 9 x 7 matrix
+# The 10 x 7 matrix
 # --------------------------------------------------------------------------
 
 _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
@@ -642,6 +677,10 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.JOURNAL_WITHDRAW.value: _Example(
         model="JournalWithdrawResponse",
         payload=_JOURNAL_WITHDRAW_SUCCESS,
+    ),
+    Capability.LETTERS.value: _Example(
+        model="LetterResponse",
+        payload=_LETTER_SUCCESS,
     ),
 }
 """The ``success`` column: one canonical happy response per capability.
@@ -691,6 +730,10 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
         model="JournalWithdrawResponse",
         payload=_JOURNAL_WITHDRAW_SUCCESS,
     ),
+    Capability.LETTERS.value: _Example(
+        model="LetterResponse",
+        payload=_LETTER_EMPTY,
+    ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""
 
@@ -712,8 +755,8 @@ def _care_example(capability: str) -> _Example:
         capability: The capability whose cell is being filled.
 
     Returns:
-        The real escalation envelope for ``reflections``; an explicit
-        unreachability marker for the eight capabilities that cannot escalate.
+        The real escalation envelope for ``reflections`` and ``letters``; an
+        explicit unreachability marker for the eight that cannot escalate.
     """
     if (capability, _STATE_CARE_ESCALATION) in UNREACHABLE_CELLS:
         return _unreachable_example(capability, _STATE_CARE_ESCALATION)
@@ -914,7 +957,7 @@ def build_bundle() -> dict[str, str]:
 
     Returns:
         Every generated file: ``schemas/<Model>.schema.json`` for each
-        published model, ``examples/<capability>/<state>.json`` for all 63
+        published model, ``examples/<capability>/<state>.json`` for all 70
         matrix cells, ``retry-policy.json``, and ``manifest.json``. The
         committed bundle must equal this exactly, minus the docs-owned
         ``README.md``.

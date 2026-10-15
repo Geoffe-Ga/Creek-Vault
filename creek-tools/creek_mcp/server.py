@@ -340,10 +340,42 @@ def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
     Returns:
         A tier → LLM-callable factory bound to *vault*'s router.
     """
+    return _bounded_generation_factory(vault, "reflection")
+
+
+def _build_letter_llm_factory(vault: Path) -> _LLMFactory:
+    """Return the tier-keyed LLM factory ``POST /v1/letters`` dials (#1862).
+
+    The same ``generation`` chokepoint reflection uses — router, model pin and
+    the cloud-consent check inside every cloud provider — so a letter is
+    exactly as local as a reflection on the same vault: an INTIMATE tier is
+    forced onto the local ``default`` model or refused, and a managed vault
+    whose consent is latched off never builds a cloud provider at all.
+
+    Args:
+        vault: The served vault, whose own config owns the routing.
+
+    Returns:
+        A tier → LLM-callable factory bound to *vault*'s router.
+    """
+    return _bounded_generation_factory(vault, "letter")
+
+
+def _bounded_generation_factory(vault: Path, verb: str) -> _LLMFactory:
+    """Return a tier-keyed, output-bounded ``generation`` factory for *verb*.
+
+    Args:
+        vault: The served vault, whose config is read once here.
+        verb: The operation named in an unavailable-provider refusal.
+
+    Returns:
+        ``factory(tier, *, max_tokens)``, resolving the provider per call
+        through :func:`_generation_provider`.
+    """
     router = load_vault_config(vault).model_router
 
     def _factory(tier: PrivacyTier, *, max_tokens: int) -> _LLM:
-        provider = _generation_provider(router, tier, "reflection")
+        provider = _generation_provider(router, tier, verb)
         return partial(
             _complete_reflection,
             provider,
@@ -406,12 +438,16 @@ def _complete_reflection(
     *,
     max_tokens: int,
 ) -> str:
-    """Return one complete reflection turn, refusing truncated model output.
+    """Return one complete bounded turn, refusing truncated model output.
+
+    Shared by reflection and the vault-written letter (#1862): both are one
+    output-bounded ``generation`` turn whose truncation must never be stored or
+    parsed as if it were whole.
 
     Args:
         provider: The tier-routed provider selected for this request.
-        prompt: The fully formatted reflection prompt.
-        max_tokens: Trusted output ceiling derived by the reflection tool.
+        prompt: The fully formatted reflection or letter prompt.
+        max_tokens: Trusted output ceiling derived by the calling tool.
 
     Returns:
         The provider's complete response text.
@@ -424,7 +460,7 @@ def _complete_reflection(
     """
     completion = provider.complete(prompt, max_tokens=max_tokens)
     if completion.stop_reason == "max_tokens":
-        msg = "reflection output reached its token ceiling"
+        msg = "generation output reached its token ceiling"
         raise RuntimeError(msg)
     return completion.text
 
