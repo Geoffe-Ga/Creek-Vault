@@ -105,6 +105,15 @@ separate Fly secret-backed files and are not part of that snapshot.
   before accepting a vault. On a fresh ext4 mount, bootstrap removes `lost+found`
   only when it is the sole entry and an empty, non-symlink directory. Recovered
   data and existing vault contents are never removed or overwritten.
+- Managed vaults are local-only. The provisioner sets `CREEK_MANAGED_VAULT=1`
+  on every vault Machine, on both the replay bootstrap and the default image
+  entry point, and rejects a Machine whose marker has drifted. A managed vault
+  refuses to start, with "startup refused" and exit `2`, while
+  `CREEK_CLOUD_CONSENT` or the legacy `CREEK_ANTHROPIC_CONSENT` is set to
+  consent. The replay runtime refuses it even without the marker. Never set
+  either consent variable on a managed vault Machine. While a managed vault
+  serves, cloud consent stays off even if a variable appears after boot.
+  Self-connected vaults keep their opt-in.
 - Preserve the hard live-allocation cap of five and Fly replay's inclusive
   1 MiB body ceiling. The pilot journal lifecycle is supported; larger
   `/v1/uploads` requests are unavailable during the pilot and receive Creek's

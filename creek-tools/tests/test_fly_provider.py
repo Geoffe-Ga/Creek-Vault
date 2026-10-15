@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from creek.classify.llm.consent import MANAGED_VAULT_ENV
 from creek_mcp.provisioning.driver import FakeOneTimeHandoff, ProviderError
 from creek_mcp.provisioning.fly import (
     FlyCredential,
@@ -218,6 +219,51 @@ def test_provision_rejects_drift_inside_provider_normalization(
     job = fly_job()
     driver.provision(job)
     mutate(_only_machine(api))
+
+    with pytest.raises(ProviderError) as raised:
+        driver.provision(job)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+
+
+@pytest.mark.parametrize("fly_replay_enabled", [False, True])
+def test_every_managed_machine_carries_the_local_only_marker(
+    fly_replay_enabled: bool,
+) -> None:
+    """Both launch paths mark the Machine managed so it refuses cloud (#1863)."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=fly_replay_enabled)
+
+    driver.provision(fly_job())
+
+    config = _only_machine(api)["config"]
+    assert config["env"][MANAGED_VAULT_ENV] == "1"
+    if not fly_replay_enabled:
+        # The default image entry point (shared with self-hosted containers)
+        # only knows it is managed through this one exact marker.
+        assert config["env"] == {MANAGED_VAULT_ENV: "1"}
+        assert "processes" not in config
+
+
+@pytest.mark.parametrize("fly_replay_enabled", [False, True])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda env: env.pop(MANAGED_VAULT_ENV),
+        lambda env: env.update({MANAGED_VAULT_ENV: "0"}),
+    ],
+    ids=["removed", "rewritten"],
+)
+def test_provision_rejects_a_machine_missing_the_managed_marker(
+    fly_replay_enabled: bool,
+    mutate: Callable[[dict[str, str]], object],
+) -> None:
+    """A Machine whose marker drifted is never accepted as a managed vault."""
+    api = FakeFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=fly_replay_enabled)
+    job = fly_job()
+    driver.provision(job)
+    mutate(_only_machine(api)["config"]["env"])
 
     with pytest.raises(ProviderError) as raised:
         driver.provision(job)

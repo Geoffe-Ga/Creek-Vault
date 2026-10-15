@@ -5,6 +5,10 @@ container entry point so that first-boot, mount, identity, and TLS checks happen
 before the HTTP server can bind.  Consumer tokens are parsed directly from a
 secret file into the verifier and are never copied into the process environment
 or command line.
+
+A machine carrying the managed-vault marker (#1863) is local-only by
+construction: it refuses to start while cloud consent is set, and pins consent
+off for as long as it serves.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from ipaddress import IPv4Address
@@ -20,6 +25,11 @@ from typing import TYPE_CHECKING, Final
 
 import yaml
 
+from creek.classify.llm.consent import (
+    affirmative_consent_variables,
+    is_managed_vault,
+    managed_local_only,
+)
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV, is_loopback_url
 from creek.config import (
     CONFIG_PATH_ENV_VAR,
@@ -76,6 +86,28 @@ class ContainerConfigurationError(RuntimeError):
     """A startup condition that must be corrected before Creek may bind."""
 
 
+def require_local_only(environ: Mapping[str, str]) -> None:
+    """Refuse a managed vault whose environment grants cloud consent.
+
+    Only variable names reach the message; their values are never echoed.
+
+    Args:
+        environ: The managed runtime's environment.
+
+    Raises:
+        ContainerConfigurationError: When either consent variable is
+            affirmative.
+    """
+    offending = affirmative_consent_variables(environ)
+    if offending:
+        names = ", ".join(offending)
+        raise ContainerConfigurationError(
+            f"cloud consent is set ({names}), but managed vaults are "
+            "local-only and never route content to a cloud model; "
+            "remove it from the machine environment"
+        )
+
+
 class BootstrapState(StrEnum):
     """Whether this boot created the vault or only validated it."""
 
@@ -127,6 +159,7 @@ class ContainerSettings:
     tls_key_file: Path = _DEFAULT_TLS_KEY
     mountinfo_file: Path = _DEFAULT_MOUNTINFO
     network: ContainerNetwork = field(default_factory=ContainerNetwork)
+    managed: bool = False
 
     @property
     def host(self) -> str:
@@ -155,6 +188,9 @@ class ContainerSettings:
                 "consumer credentials must use the mounted secret file, "
                 "not an environment value"
             )
+        managed = is_managed_vault(source)
+        if managed:
+            require_local_only(source)
         vault = Path(source.get(VAULT_PATH_ENV, str(_DEFAULT_VAULT)))
         config_value = source.get(CONFIG_FILE_ENV)
         config = Path(config_value) if config_value else vault / VAULT_CONFIG_RELPATH
@@ -171,6 +207,7 @@ class ContainerSettings:
                 source.get(MOUNTINFO_FILE_ENV, str(_DEFAULT_MOUNTINFO))
             ),
             network=ContainerNetwork(port=port),
+            managed=managed,
         )
 
     def with_config_path(self, path: Path) -> ContainerSettings:
@@ -331,7 +368,11 @@ def run(settings: ContainerSettings) -> None:
     os.environ[LOOPBACK_ONLY_ENV] = "1"
     os.environ.pop(CONSUMER_TOKENS_ENV, None)
     announce_rotation_window(verifier)
-    serve(create_app(verifier=verifier), _server_args(settings, prepared.config_path))
+    with managed_local_only() if settings.managed else nullcontext():
+        serve(
+            create_app(verifier=verifier),
+            _server_args(settings, prepared.config_path),
+        )
 
 
 def main() -> None:

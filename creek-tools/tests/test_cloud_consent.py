@@ -13,9 +13,13 @@ import pytest
 from creek.classify.llm.consent import (
     CLOUD_CONSENT_ENV,
     LEGACY_CONSENT_ENV,
+    MANAGED_VAULT_ENV,
+    affirmative_consent_variables,
     cloud_warning,
     consent_error_message,
     has_cloud_consent,
+    is_managed_vault,
+    managed_local_only,
     require_cloud_consent,
 )
 from creek.classify.llm.providers import (
@@ -31,6 +35,7 @@ def _clear_consent(monkeypatch: pytest.MonkeyPatch) -> None:
     """Start each test with neither consent variable set (hermetic)."""
     monkeypatch.delenv(CLOUD_CONSENT_ENV, raising=False)
     monkeypatch.delenv(LEGACY_CONSENT_ENV, raising=False)
+    monkeypatch.delenv(MANAGED_VAULT_ENV, raising=False)
 
 
 class TestHasCloudConsent:
@@ -153,3 +158,66 @@ def test_ollama_never_requires_consent() -> None:
     # No consent env set (autouse fixture cleared both); must not raise and
     # is_cloud stays False so no gate ever applies.
     assert provider.is_cloud is False
+
+
+class TestManagedVaultIsLocalOnly:
+    """A managed vault never has cloud consent (#1863)."""
+
+    @pytest.mark.parametrize("value", ["1", "0", "", "false"])
+    def test_marker_presence_alone_marks_a_managed_vault(self, value: str) -> None:
+        """Any marker value, even a falsy one, fails closed to managed."""
+        assert is_managed_vault({MANAGED_VAULT_ENV: value}) is True
+        assert is_managed_vault({}) is False
+
+    @pytest.mark.parametrize("var", [CLOUD_CONSENT_ENV, LEGACY_CONSENT_ENV])
+    def test_marker_overrides_either_consent_variable(
+        self, monkeypatch: pytest.MonkeyPatch, var: str
+    ) -> None:
+        """With the marker set, an affirmative consent value is ignored."""
+        monkeypatch.setenv(var, "1")
+        monkeypatch.setenv(MANAGED_VAULT_ENV, "1")
+        assert has_cloud_consent() is False
+        with pytest.raises(RuntimeError, match="consent"):
+            require_cloud_consent("Anthropic")
+
+    @pytest.mark.parametrize("var", [CLOUD_CONSENT_ENV, LEGACY_CONSENT_ENV])
+    def test_consent_appearing_after_boot_is_ignored_while_latched(
+        self, monkeypatch: pytest.MonkeyPatch, var: str
+    ) -> None:
+        """Inside a managed runtime, late consent and a removed marker are moot."""
+        with managed_local_only():
+            monkeypatch.setenv(var, "yes")
+            monkeypatch.delenv(MANAGED_VAULT_ENV, raising=False)
+            assert has_cloud_consent() is False
+        assert has_cloud_consent() is True
+
+    def test_nested_latch_holds_until_the_outermost_release(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Releasing an inner hold never lifts an outer managed runtime's pin."""
+        monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
+        with managed_local_only():
+            with managed_local_only():
+                assert has_cloud_consent() is False
+            assert has_cloud_consent() is False
+        assert has_cloud_consent() is True
+
+    def test_self_connected_vault_still_honours_consent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the marker or latch, the opt-in behaves exactly as before."""
+        monkeypatch.setenv(CLOUD_CONSENT_ENV, "true")
+        assert has_cloud_consent() is True
+        require_cloud_consent("Anthropic")
+
+    def test_affirmative_variables_name_only_consenting_vars(self) -> None:
+        """Only affirmative variables are named, in a stable order."""
+        assert affirmative_consent_variables(
+            {LEGACY_CONSENT_ENV: "YES", CLOUD_CONSENT_ENV: "1"}
+        ) == (CLOUD_CONSENT_ENV, LEGACY_CONSENT_ENV)
+        assert (
+            affirmative_consent_variables(
+                {CLOUD_CONSENT_ENV: "0", LEGACY_CONSENT_ENV: "no"}
+            )
+            == ()
+        )

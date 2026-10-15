@@ -1,4 +1,9 @@
-"""Fly-replay-only bootstrap for one isolated managed vault."""
+"""Fly-replay-only bootstrap for one isolated managed vault.
+
+Every vault this entry point serves is Adepthood-managed, so it is local-only
+whether or not the managed-vault marker is present (#1863): cloud consent in
+the environment refuses startup, and consent is pinned off while it serves.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +11,11 @@ import argparse
 import os
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from creek.classify.llm.consent import managed_local_only
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
 from creek.config import CONFIG_PATH_ENV_VAR
 from creek_mcp.container_runtime import (
@@ -17,6 +23,7 @@ from creek_mcp.container_runtime import (
     ContainerSettings,
     load_consumer_secret,
     prepare_vault,
+    require_local_only,
 )
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.cli import serve
@@ -48,6 +55,7 @@ class FlyVaultSettings:
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> FlyVaultSettings:
         """Load path-only settings and require Fly's injected coordinates."""
         source = os.environ if environ is None else environ
+        require_local_only(source)
         app_name = source.get("FLY_APP_NAME", "")
         machine_id = source.get("FLY_MACHINE_ID", "")
         region = source.get("FLY_REGION", "")
@@ -64,7 +72,7 @@ class FlyVaultSettings:
             fly_private_ip=private_ip,
         )
         return cls(
-            ContainerSettings.from_environ(source),
+            replace(ContainerSettings.from_environ(source), managed=True),
             Path(source.get(REPLAY_STATE_FILE_ENV, str(_DEFAULT_REPLAY_STATE))),
             app_name,
             machine_id,
@@ -120,7 +128,10 @@ def run(settings: FlyVaultSettings) -> None:
         tls_cert=None,
         tls_key=None,
     )
-    with _runtime_environment(prepared.config_path, settings.container.vault_path):
+    with (
+        _runtime_environment(prepared.config_path, settings.container.vault_path),
+        managed_local_only(),
+    ):
         announce_rotation_window(verifier)
         serve(
             create_app(verifier=verifier, fly_replay_state=replay_state),

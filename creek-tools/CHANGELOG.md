@@ -9,6 +9,12 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Managed vaults are now local-only by construction (#1863). Every
+  Adepthood-provisioned vault Machine carries `CREEK_MANAGED_VAULT=1`, and a
+  managed vault refuses to start while `CREEK_CLOUD_CONSENT` or the legacy
+  `CREEK_ANTHROPIC_CONSENT` holds consent. Cloud consent also stays off while
+  it serves. Self-connected vaults keep their opt-in unchanged.
+
 - Accept Fly Proxy's semicolon-separated replay source metadata so authenticated
   managed-vault requests reach the runtime. Invalid or mixed delimiters, duplicate
   fields, mismatched state, and missing bearer credentials still fail closed.
