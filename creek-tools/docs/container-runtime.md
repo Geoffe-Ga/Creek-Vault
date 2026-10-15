@@ -189,6 +189,21 @@ The command streams SHA-256 over the file and prints one of `verified`,
 `verified`, and `27` otherwise. A truncated, partial, substituted or
 mid-read-modified blob is never verified.
 
+### Managed vaults are local-only
+
+A vault that Adepthood provisions carries `CREEK_MANAGED_VAULT=1` in its Fly
+Machine config. Any value counts, so `0` or an empty string still marks the
+vault as managed; only removing the variable from the machine config lifts it,
+and the provisioner rejects a Machine whose marker has drifted. With the
+marker present, the container refuses to start while `CREEK_CLOUD_CONSENT` or
+the legacy `CREEK_ANTHROPIC_CONSENT` holds consent (`1`, `true` or `yes`). It
+prints `creek-container: startup refused`, names the variable but never its
+value, and exits `2`. While a managed vault serves, cloud consent stays off
+even if a consent variable, or the removal of the marker, appears after boot.
+
+A self-connected container never carries the marker, so its owner's
+`CREEK_CLOUD_CONSENT` opt-in keeps working exactly as before.
+
 ### Loopback-only Ollama in container mode
 
 In a container, every LLM stage's `ollama_url` must be a literal loopback

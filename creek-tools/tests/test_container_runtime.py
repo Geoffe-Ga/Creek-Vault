@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
+from creek.classify.llm.consent import (
+    CLOUD_CONSENT_ENV,
+    LEGACY_CONSENT_ENV,
+    MANAGED_VAULT_ENV,
+    has_cloud_consent,
+)
 from creek.config import CONFIG_PATH_ENV_VAR, VAULT_CONFIG_RELPATH, load_config
 from creek_mcp.container_runtime import (
     CONFIG_FILE_ENV,
@@ -329,3 +336,101 @@ def test_run_sets_loopback_only_flag(
     run(settings)
 
     assert observed["flag"] == "1"
+
+
+@pytest.mark.parametrize("var", [CLOUD_CONSENT_ENV, LEGACY_CONSENT_ENV])
+def test_managed_container_refuses_cloud_consent_without_echoing_it(
+    var: str,
+) -> None:
+    """A managed vault names the consent variable and never its value (#1863)."""
+    with pytest.raises(ContainerConfigurationError) as raised:
+        ContainerSettings.from_environ({MANAGED_VAULT_ENV: "1", var: " Yes "})
+
+    message = str(raised.value)
+    assert var in message
+    assert "managed vaults are local-only" in message
+    assert "Yes" not in message
+
+
+@pytest.mark.parametrize("var", [CLOUD_CONSENT_ENV, LEGACY_CONSENT_ENV])
+def test_managed_container_main_exits_two_for_cloud_consent(
+    var: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The default image entry point refuses a consenting managed vault."""
+    from creek_mcp import container_runtime as runtime
+
+    monkeypatch.setenv(MANAGED_VAULT_ENV, "1")
+    monkeypatch.setenv(var, "1")
+    monkeypatch.setattr(
+        runtime, "run", lambda _settings: pytest.fail("managed vault must not run")
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        runtime.main()
+
+    assert raised.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "creek-container: startup refused" in stderr
+    assert var in stderr
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {MANAGED_VAULT_ENV: "1"},
+        {MANAGED_VAULT_ENV: "0", CLOUD_CONSENT_ENV: "0", LEGACY_CONSENT_ENV: "no"},
+    ],
+)
+def test_managed_container_starts_without_affirmative_consent(
+    environ: Mapping[str, str],
+) -> None:
+    """Neither consent variable affirmative leaves a managed vault bootable."""
+    assert ContainerSettings.from_environ(environ).managed is True
+
+
+def test_self_connected_container_still_honours_cloud_consent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the marker, a container keeps the user's cloud opt-in."""
+    from creek_mcp import container_runtime as runtime
+
+    monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
+    assert ContainerSettings.from_environ({CLOUD_CONSENT_ENV: "1"}).managed is False
+    observed: dict[str, bool] = {}
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier: verifier)
+    monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
+    monkeypatch.setattr(
+        runtime,
+        "serve",
+        lambda _app, _args: observed.update(consent=has_cloud_consent()),
+    )
+
+    run(_settings(tmp_path))
+
+    assert observed == {"consent": True}
+
+
+def test_managed_container_pins_consent_off_while_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consent set after a managed boot is still refused by every provider."""
+    from creek_mcp import container_runtime as runtime
+
+    settings = replace(_settings(tmp_path), managed=True)
+    observed: dict[str, bool] = {}
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier: verifier)
+    monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
+
+    def fake_serve(_app: object, _args: object) -> None:
+        monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
+        observed["consent"] = has_cloud_consent()
+
+    monkeypatch.setattr(runtime, "serve", fake_serve)
+
+    run(settings)
+
+    assert observed == {"consent": False}

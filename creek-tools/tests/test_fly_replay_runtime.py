@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from creek.classify.llm.consent import (
+    CLOUD_CONSENT_ENV,
+    LEGACY_CONSENT_ENV,
+    MANAGED_VAULT_ENV,
+    has_cloud_consent,
+)
 from creek.config import CONFIG_PATH_ENV_VAR
 from creek_mcp.container_runtime import (
     BootstrapState,
@@ -290,3 +296,99 @@ def test_fly_runtime_environment_enforces_loopback_and_restores_it(
     with _runtime_environment(tmp_path / "creek.yaml", tmp_path):
         assert os.environ[LOOPBACK_ONLY_ENV] == "1"
     assert os.environ[LOOPBACK_ONLY_ENV] == "operator-value"
+
+
+def _attested_environ() -> dict[str, str]:
+    """Return a complete, matching set of Fly-injected coordinates."""
+    return {
+        "FLY_APP_NAME": "creek-vault-pilot",
+        "FLY_MACHINE_ID": "machine-001",
+        "FLY_REGION": "iad",
+        "FLY_PRIVATE_IP": "fdaa:0:1::2",
+        "CREEK_CONTAINER_EXPECTED_FLY_APP": "creek-vault-pilot",
+        "CREEK_CONTAINER_EXPECTED_FLY_REGION": "iad",
+    }
+
+
+@pytest.mark.parametrize("var", [CLOUD_CONSENT_ENV, LEGACY_CONSENT_ENV])
+@pytest.mark.parametrize("marker", [{}, {MANAGED_VAULT_ENV: "1"}])
+def test_fly_runtime_main_exits_two_for_cloud_consent(
+    var: str,
+    marker: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The replay runtime is managed-only, so consent refuses boot (#1863)."""
+    from creek_mcp import fly_vault_runtime as runtime
+
+    for name, value in {**_attested_environ(), **marker}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv(var, "true")
+    monkeypatch.setattr(
+        runtime, "run", lambda _settings: pytest.fail("managed vault must not run")
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        runtime.main()
+
+    assert raised.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "creek-fly-vault: startup refused" in stderr
+    assert var in stderr
+    assert "managed vaults are local-only" in stderr
+    assert "true" not in stderr
+
+
+def test_fly_runtime_starts_without_affirmative_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither consent variable affirmative leaves the replay runtime bootable."""
+    monkeypatch.delenv(CLOUD_CONSENT_ENV, raising=False)
+    monkeypatch.delenv(LEGACY_CONSENT_ENV, raising=False)
+    environ = {**_attested_environ(), MANAGED_VAULT_ENV: "1", CLOUD_CONSENT_ENV: "0"}
+
+    settings = FlyVaultSettings.from_environ(environ)
+
+    assert settings.fly_app_name == "creek-vault-pilot"
+    assert settings.container.managed is True
+
+
+def test_fly_runtime_pins_consent_off_while_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consent that appears after a managed boot never reaches a provider."""
+    from creek_mcp import fly_vault_runtime as runtime
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    replay = tmp_path / "replay-state"
+    replay.write_text(_STATE, encoding="ascii")
+    replay.chmod(0o600)
+    settings = FlyVaultSettings.from_environ(
+        {
+            **_attested_environ(),
+            "CREEK_CONTAINER_VAULT_PATH": str(vault),
+            "CREEK_CONTAINER_FLY_REPLAY_STATE_FILE": str(replay),
+        }
+    )
+    secret = SingleConsumerSecret("adepthood", (_TOKEN,))
+    monkeypatch.setattr(
+        runtime,
+        "prepare_vault",
+        lambda _settings: PreparedVault(vault / "creek.yaml", BootstrapState.EXISTING),
+    )
+    monkeypatch.setattr(runtime, "load_consumer_secret", lambda _path: secret)
+    monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
+    monkeypatch.setattr(runtime, "create_app", lambda **_kwargs: object())
+    observed: dict[str, bool] = {}
+
+    def fake_serve(_app: object, _args: object) -> None:
+        monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
+        observed["consent"] = has_cloud_consent()
+
+    monkeypatch.setattr(runtime, "serve", fake_serve)
+
+    runtime.run(settings)
+
+    assert observed == {"consent": False}
