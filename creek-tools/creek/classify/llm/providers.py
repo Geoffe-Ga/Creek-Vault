@@ -306,6 +306,37 @@ def _safe_cause(exc: Exception, request_key: RequestKey | None) -> Exception | N
     return exc
 
 
+def _wrapped_vendor_error(
+    exc: Exception,
+    vendor: str,
+    *,
+    rate_limited: bool,
+    request_key: RequestKey | None,
+) -> tuple[Exception, Exception | None]:
+    """Build the error a failed vendor call is re-raised as, and its cause.
+
+    The caller must raise the result *after* its ``except`` block: raised
+    inside it, Python attaches the vendor error as ``__context__`` whatever the
+    ``from`` clause says, and that error's request headers carry the key.
+
+    Args:
+        exc: The vendor SDK exception.
+        vendor: Display name of the vendor (e.g. ``"OpenAI"``).
+        rate_limited: Whether *exc* is the vendor's rate-limit error.
+        request_key: The request-scoped key the call carried, or ``None``.
+
+    Returns:
+        The wrapped error and the cause it may keep (``None`` to suppress it).
+    """
+    name = type(exc).__name__
+    if rate_limited:
+        msg = f"{vendor} API call rate-limited: {name}"
+        return ProviderRateLimitError(msg, retry_after=_retry_after_seconds(exc)), None
+    detail = _error_detail(exc, request_scoped=request_key is not None)
+    msg = f"{vendor} API call failed: {name}{detail}"
+    return RuntimeError(msg), _safe_cause(exc, request_key)
+
+
 def _request_key_prerequisite(
     request_key: RequestKey, provider_name: str
 ) -> str | None:
@@ -581,21 +612,23 @@ class AnthropicProvider:
         ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
             response = self._create_message(prompt, ceiling, system)
-        except anthropic.RateLimitError as exc:
-            msg = f"Anthropic API call rate-limited: {type(exc).__name__}"
-            raise ProviderRateLimitError(
-                msg, retry_after=_retry_after_seconds(exc)
-            ) from None
         except anthropic.AnthropicError as exc:
-            detail = _error_detail(exc, request_scoped=self._request_key is not None)
-            msg = f"Anthropic API call failed: {type(exc).__name__}{detail}"
-            raise RuntimeError(msg) from _safe_cause(exc, self._request_key)
-        stop_reason = getattr(response, "stop_reason", None) or "end_turn"
-        return AnthropicCompletion(
-            text=_extract_anthropic_text(response),
-            stop_reason=str(stop_reason),
-            usage=_extract_anthropic_usage(response),
-        )
+            failure, cause = _wrapped_vendor_error(
+                exc,
+                "Anthropic",
+                rate_limited=isinstance(exc, anthropic.RateLimitError),
+                request_key=self._request_key,
+            )
+        else:
+            stop_reason = getattr(response, "stop_reason", None) or "end_turn"
+            return AnthropicCompletion(
+                text=_extract_anthropic_text(response),
+                stop_reason=str(stop_reason),
+                usage=_extract_anthropic_usage(response),
+            )
+        # Raised outside the ``except`` so the vendor error is not attached as
+        # ``__context__``: its request headers carry the key (#1876).
+        raise failure from cause
 
     def _create_message(
         self,
@@ -1490,20 +1523,21 @@ class OpenAIProvider:
         ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
             response = self._create_chat(prompt, ceiling, system)
-        except openai.RateLimitError as exc:
-            msg = f"OpenAI API call rate-limited: {type(exc).__name__}"
-            raise ProviderRateLimitError(
-                msg, retry_after=_retry_after_seconds(exc)
-            ) from None
         except openai.OpenAIError as exc:
-            detail = _error_detail(exc, request_scoped=self._request_key is not None)
-            msg = f"OpenAI API call failed: {type(exc).__name__}{detail}"
-            raise RuntimeError(msg) from _safe_cause(exc, self._request_key)
-        return Completion(
-            text=_extract_openai_text(response),
-            stop_reason=_map_openai_stop_reason(response),
-            usage=_extract_openai_usage(response),
-        )
+            failure, cause = _wrapped_vendor_error(
+                exc,
+                "OpenAI",
+                rate_limited=isinstance(exc, openai.RateLimitError),
+                request_key=self._request_key,
+            )
+        else:
+            return Completion(
+                text=_extract_openai_text(response),
+                stop_reason=_map_openai_stop_reason(response),
+                usage=_extract_openai_usage(response),
+            )
+        # Raised outside the ``except``; see :meth:`AnthropicProvider.complete`.
+        raise failure from cause
 
     def _create_chat(
         self,

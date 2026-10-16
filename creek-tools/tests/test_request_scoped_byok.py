@@ -441,7 +441,35 @@ def test_a_vendor_error_quoting_the_key_is_reduced_to_its_status(
 
     assert str(caught.value).endswith(f"(HTTP {HTTP_UNAUTHORIZED})")
     assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
     assert CANARY_TAIL not in str(caught.value)
+    assert _chain_leaks(caught.value, CANARY_KEY, CANARY_TAIL) == []
+
+
+def _chain_leaks(exc: BaseException, *needles: str) -> list[str]:
+    """Return every rendering in *exc*'s whole chain that carries a needle.
+
+    Walks ``__cause__`` and ``__context__`` recursively, checking each link's
+    ``str``/``repr`` and, for a vendor error, its request's headers.
+    """
+    leaks: list[str] = []
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
+        seen.add(id(link))
+        request = getattr(link, "request", None)
+        headers = getattr(request, "headers", {})
+        rendered = [str(link), repr(link), *(str(v) for v in dict(headers).values())]
+        leaks.extend(
+            text for text in rendered if any(needle in text for needle in needles)
+        )
+        pending.extend(
+            nxt for nxt in (link.__cause__, link.__context__) if nxt is not None
+        )
+    return leaks
 
 
 def test_an_operator_keyed_4xx_keeps_its_actionable_message(
