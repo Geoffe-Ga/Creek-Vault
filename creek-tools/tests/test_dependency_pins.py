@@ -12,7 +12,8 @@ exists decides which half of it is load-bearing.
 cross-principal session injection on the Streamable HTTP bearer-token
 transport. That transport is reachable here: ``creek_mcp`` runs
 streamable-http with a ``TokenVerifier``. The same release also carries
-CVE-2026-52870 and CVE-2026-59950. All three are fixed in mcp 1.28.1.
+CVE-2026-52870 and CVE-2026-59950. All three are fixed in mcp 1.28.1;
+CVE-2026-59951 is fixed in 1.30.0, which is the floor.
 mcp is a direct dependency, so its floor lives in
 ``[project].dependencies`` (with the ``<2.0.0`` ceiling intact).
 
@@ -138,7 +139,7 @@ is a *separate distribution* rather than a version bump: taking it
 also drags httpcore2==2.10.0, truststore>=0.10 and idna>=3.18 into
 the graph. This project declares ``httpx>=0.27.0`` directly as well,
 so openai 3.x here would mean two independent HTTP stacks in one
-environment — not a migration. ``mcp>=1.28.1,<2.0.0`` caps the other
+environment — not a migration. ``mcp>=1.30.0,<2.0.0`` caps the other
 half of the same httpx2 swap (issue #998), so the two majors have to
 be adopted jointly or not at all, which is what the ceiling holds
 open. openai 2.54.0, the newest 2.x, still requires
@@ -278,8 +279,9 @@ _CRAWDAD_PYPROJECT = _CRAWDAD_ROOT / "pyproject.toml"
 _CRAWDAD_UV_LOCK = _CRAWDAD_ROOT / "uv.lock"
 
 #: First mcp release containing the fixes for CVE-2026-52869,
-#: CVE-2026-52870, and CVE-2026-59950.
-_PATCHED_VERSION = Version("1.28.1")
+#: CVE-2026-52870, and CVE-2026-59950 (1.28.1) and for CVE-2026-59951
+#: (1.30.0): the floor is the later of the two.
+_PATCHED_VERSION = Version("1.30.0")
 
 #: First pyasn1 release containing the fixes for CVE-2026-59885 and
 #: CVE-2026-59886.
@@ -1053,16 +1055,20 @@ def _locked_cryptography_version() -> Version:
 
 
 def test_mcp_floor_rejects_last_vulnerable_range() -> None:
-    """The pyproject floor excludes 1.28.0 (and everything below it).
+    """The pyproject floor excludes 1.29.0 (and everything below it).
 
     A ``>=1.0.0`` floor would let a relock resolve to 1.27.1, which is
     vulnerable to CVE-2026-52869 / CVE-2026-52870 / CVE-2026-59950. The
-    specifier must genuinely be ``>=1.28.1``.
+    specifier must genuinely be ``>=1.30.0``.
     """
     specifier = _mcp_specifier()
+    assert "1.29.0" not in specifier, (
+        f"mcp specifier {specifier!r} admits 1.29.0, the release carrying "
+        "CVE-2026-59951; the floor must be >=1.30.0"
+    )
     assert "1.28.0" not in specifier, (
         f"mcp specifier {specifier!r} admits 1.28.0; the floor must be "
-        ">=1.28.1 so relocks cannot resolve below the CVE-patched release"
+        ">=1.30.0 so relocks cannot resolve below the CVE-patched release"
     )
     assert "1.27.1" not in specifier, (
         f"mcp specifier {specifier!r} admits 1.27.1, the release carrying "
@@ -1084,10 +1090,10 @@ def test_mcp_ceiling_rejects_next_major() -> None:
 
 
 def test_mcp_floor_accepts_patched_release() -> None:
-    """The specifier accepts 1.28.1, the first CVE-patched release."""
+    """The specifier accepts the first release patched for every pinned CVE."""
     specifier = _mcp_specifier()
-    assert "1.28.1" in specifier, (
-        f"mcp specifier {specifier!r} rejects 1.28.1; the patched release "
+    assert _PATCHED_VERSION in specifier, (
+        f"mcp specifier {specifier!r} rejects {_PATCHED_VERSION}; the patched release "
         "itself must satisfy the pin"
     )
 

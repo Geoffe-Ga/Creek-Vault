@@ -111,9 +111,7 @@ def test_runbook_and_contract_grant_only_the_image_uid_secret_access() -> None:
     assert 'chmod 0444 "$root/secrets"/*' not in script
 
 
-def test_http_api_cold_import_does_not_require_the_optional_author_stack() -> None:
-    """The base API image must start without importing optional NumPy code."""
-    code = """
+_BLOCK_NUMPY = """
 import importlib.abc
 import sys
 
@@ -124,14 +122,38 @@ class BlockNumpy(importlib.abc.MetaPathFinder):
         return None
 
 sys.meta_path.insert(0, BlockNumpy())
-import creek_mcp.httpapi.app
-assert "creek.author" not in sys.modules
 """
-    result = subprocess.run(
-        [sys.executable, "-c", code],
+
+
+def _run_without_numpy(body: str) -> subprocess.CompletedProcess[str]:
+    """Run *body* in a fresh interpreter where NumPy is unavailable, as in the image."""
+    return subprocess.run(
+        [sys.executable, "-c", _BLOCK_NUMPY + body],
         capture_output=True,
         text=True,
         check=False,
         timeout=30,
+    )
+
+
+def test_http_api_cold_import_does_not_require_the_optional_author_stack() -> None:
+    """The base API image must start without importing optional NumPy code."""
+    result = _run_without_numpy(
+        'import creek_mcp.httpapi.app\nassert "creek.author" not in sys.modules\n'
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_reflection_route_imports_the_author_stack_without_numpy() -> None:
+    """``POST /v1/reflections`` loads ``creek.author`` on first use; NumPy is an extra.
+
+    The image installs no extras, so a module-level NumPy import anywhere on that
+    lazy path fails the first reflection a vault ever serves (#1870).
+    """
+    result = _run_without_numpy(
+        "import creek_mcp.httpapi.reflect\n"
+        "import creek_mcp.tools.reflect\n"
+        "import creek_mcp.tools.author\n"
+        "from creek.author.agents import RetrievalSpecialist\n"
     )
     assert result.returncode == 0, result.stderr

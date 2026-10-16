@@ -17,8 +17,6 @@ import re
 from collections import Counter
 from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
 
-import numpy as np
-
 from creek.author.models import (
     EvidenceBundle,
     EvidenceClaim,
@@ -192,7 +190,15 @@ def _fragment_claim(fragment: Fragment) -> EvidenceClaim:
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
-    """Return the cosine similarity of two vectors (``0.0`` if degenerate)."""
+    """Return the cosine similarity of two vectors (``0.0`` if degenerate).
+
+    NumPy is imported here rather than at module level because it lives in the
+    ``[embeddings]`` extra, which the vault image does not install, and this
+    module is on ``POST /v1/reflections``'s import path. Only embedding ranking
+    reaches this function, and that needs the same extra to produce a vector.
+    """
+    import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
     a = np.asarray(left, dtype=float)
     b = np.asarray(right, dtype=float)
     denom = float(np.linalg.norm(a) * np.linalg.norm(b))
