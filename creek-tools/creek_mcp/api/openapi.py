@@ -45,6 +45,8 @@ from creek_mcp.api.routes import (
     CEILING_HEADER,
     CONTRACT_VERSION_HEADER,
     IMPLEMENTED_CAPABILITIES,
+    PROVIDER_HEADER,
+    PROVIDER_KEY_HEADER,
     ROUTES,
     RouteSpec,
 )
@@ -528,7 +530,8 @@ def _parameters(spec: RouteSpec) -> list[dict[str, Any]]:
         spec: The route under consideration.
 
     Returns:
-        Path parameters first, then the two ``/v1`` headers.
+        Path parameters first, then the two ``/v1`` headers, then the two
+        request-key headers on a route that accepts one.
     """
     parameters: list[dict[str, Any]] = [
         _path_parameter(name) for name in _PATH_PARAMETER.findall(spec.path)
@@ -548,7 +551,36 @@ def _parameters(spec: RouteSpec) -> list[dict[str, Any]]:
             description="Declared tier ceiling; absent reads as 'open'.",
         )
     )
+    if spec.accepts_request_key:
+        parameters.extend(_request_key_parameters())
     return parameters
+
+
+def _request_key_parameters() -> list[dict[str, Any]]:
+    """Return the two optional request-scoped key headers (ADR-0015).
+
+    Returns:
+        The provider and key header declarations, in that order.
+    """
+    return [
+        _header_parameter(
+            PROVIDER_HEADER,
+            required=False,
+            description=(
+                "Vendor of a writer's own key: 'anthropic' or 'openai'. Sent "
+                f"only with {PROVIDER_KEY_HEADER}."
+            ),
+        ),
+        _header_parameter(
+            PROVIDER_KEY_HEADER,
+            required=False,
+            description=(
+                "A writer's own provider key, used on a managed vault for this "
+                "request's open and personal model calls only. Never stored, "
+                "logged or echoed; intimate content never reaches the vendor."
+            ),
+        ),
+    ]
 
 
 def _operation(spec: RouteSpec) -> dict[str, Any]:

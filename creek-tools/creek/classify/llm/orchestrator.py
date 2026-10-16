@@ -91,7 +91,13 @@ class LLMClassifier:
     RATE_LIMIT_DELAY: float = 0.1
     """Seconds between batch request submissions."""
 
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(
+        self,
+        config: LLMConfig,
+        *,
+        provider: LLMProvider | None = None,
+        available: bool | None = None,
+    ) -> None:
         """Initialize the LLM classifier.
 
         The backend is selected by :func:`build_provider` and constructed
@@ -104,10 +110,17 @@ class LLMClassifier:
 
         Args:
             config: LLM provider configuration (provider, model, URL, etc.).
+            provider: An already-built provider to use instead of building one
+                from *config* — a writer's request-scoped provider (ADR-0015).
+                ``None`` builds from *config*, as before.
+            available: A caller's availability verdict, or ``None`` to probe.
+                ``False`` marks the classifier unavailable without building or
+                dialling anything, so every fragment routed to it is returned
+                unchanged.
         """
         self.config = config
-        self._available: bool | None = None
-        self._provider_instance: LLMProvider | None = None
+        self._available: bool | None = available
+        self._provider_instance: LLMProvider | None = provider
         if provider_is_cloud(config.provider):
             logger.warning(cloud_warning(provider_display_name(config.provider)))
 

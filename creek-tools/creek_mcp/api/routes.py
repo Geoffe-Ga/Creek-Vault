@@ -101,6 +101,23 @@ is a reason this constant will gain a third reader, not a reason to file it
 somewhere else.
 """
 
+PROVIDER_HEADER: Final[str] = "X-Creek-Provider"
+"""Header naming the vendor of a writer's request-scoped key (ADR-0015, #1873).
+
+``anthropic`` or ``openai``. Sent only together with
+:data:`PROVIDER_KEY_HEADER`; either one alone is ``invalid_request``.
+"""
+
+PROVIDER_KEY_HEADER: Final[str] = "X-Creek-Provider-Key"
+"""Header carrying a writer's own provider key, for one request (ADR-0015).
+
+A header and never a body field, so the key cannot appear in body logging, in
+a request-model validation error, or in anything derived from the parsed body.
+It is honoured only on a managed vault and only by the routes that declare
+:attr:`RouteSpec.accepts_request_key`; the vault uses it for that request's
+OPEN and PERSONAL model calls and keeps it nowhere.
+"""
+
 OP_CAPABILITIES: Final[str] = "getCapabilities"
 """``operation_id`` of ``GET /v1/capabilities``."""
 
@@ -296,6 +313,11 @@ class RouteSpec:
             response's schema from a model: a route answering two success
             statuses answers with two different bodies, and a bare tuple of
             ints would carry the statuses without them.
+        accepts_request_key: Whether the route honours a writer's
+            request-scoped provider key (:data:`PROVIDER_HEADER` and
+            :data:`PROVIDER_KEY_HEADER`, ADR-0015). Only the routes that call a
+            model do; a route that makes no model call has nothing to spend a
+            key on and does not publish the headers.
     """
 
     path: str
@@ -308,6 +330,7 @@ class RouteSpec:
     summary: str
     max_body_bytes: int | None = None
     success_responses: tuple[tuple[int, type[BaseModel] | None], ...] | None = None
+    accepts_request_key: bool = False
 
     @property
     def published_success_responses(
@@ -441,6 +464,7 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         response_model=ReflectionResponse,
         requires_contract_version=True,
         summary="Return anchored margin notes for one entry.",
+        accepts_request_key=True,
     ),
     RouteSpec(
         path="/v1/wheel",
@@ -502,6 +526,7 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         response_model=LetterResponse,
         requires_contract_version=True,
         summary="Write one margin note's letter and store it as a Voice Draft.",
+        accepts_request_key=True,
     ),
     RouteSpec(
         path="/v1/connectors/drive",
@@ -566,6 +591,7 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         ),
         requires_contract_version=True,
         summary="Classify every fragment in the vault, idempotently.",
+        accepts_request_key=True,
     ),
     RouteSpec(
         path="/v1/links",

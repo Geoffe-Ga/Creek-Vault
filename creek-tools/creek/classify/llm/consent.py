@@ -92,6 +92,24 @@ def is_managed_vault(environ: Mapping[str, str] | None = None) -> bool:
     return MANAGED_VAULT_ENV in source
 
 
+def admits_request_keys(environ: Mapping[str, str] | None = None) -> bool:
+    """Report whether *environ* affirmatively marks a vault that takes BYOK keys.
+
+    Unlike :func:`is_managed_vault`, whose mere presence *restricts*, this gate
+    *admits* a writer's request-scoped key to cloud egress (ADR-0015), so it
+    fails closed the other way: only a :data:`CONSENT_TRUTHY` value opens it,
+    and ``0``, ``false`` or an empty marker do not.
+
+    Args:
+        environ: Environment to inspect; defaults to :data:`os.environ`.
+
+    Returns:
+        ``True`` when :data:`MANAGED_VAULT_ENV` holds an affirmative value.
+    """
+    source = os.environ if environ is None else environ
+    return source.get(MANAGED_VAULT_ENV, "").strip().lower() in CONSENT_TRUTHY
+
+
 def affirmative_consent_variables(
     environ: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:

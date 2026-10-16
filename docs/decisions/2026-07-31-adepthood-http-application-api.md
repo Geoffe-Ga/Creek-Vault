@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.17.0`
+- **Contract version**: `0.18.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -39,7 +39,7 @@ remote tier ceiling in order to demo a capability early — see
 ## Versioning
 
 `/v1` in the route path is the HTTP major. Below that, exactly one
-`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.17.0`
+`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.18.0`
 — covers both the MCP surface and `/v1`, because the epic's premise is one
 behavioral implementation: a shape change in a shared `creek_mcp.tools.*`
 function changes what both adapters can honestly promise at the same moment.
@@ -802,7 +802,9 @@ network MCP call. It is out of scope for #1117 and is tracked as follow-up
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
 truth for the wire shapes in this repository:
 `manifest.json`, `retry-policy.json`, one `schemas/*.schema.json` file per
-`CONTRACT_MODELS` entry (forty-one at contract `0.17.0`, adding the three
+`CONTRACT_MODELS` entry (forty-one at contract `0.18.0`, unchanged because
+#1873 adds only an optional handshake field and a nested enum; forty-one at
+contract `0.17.0`, adding the three
 letter request/response models; thirty-eight at contract `0.16.0`, adding the closed
 Journal withdrawal response; thirty-seven at contract `0.15.0`, adding the five
 Voice Draft request/response and attribution models; thirty-two at contract `0.14.0`, adding
@@ -933,6 +935,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.18.0` | 2026-10-16 | #1873 ([ADR-0015](../../creek-tools/docs/architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)) lets a **managed** vault spend a writer's own Anthropic or OpenAI key on that request's OPEN and PERSONAL model calls. `POST /v1/reflections`, `POST /v1/letters/{external_id}` and `POST /v1/classifications` publish two optional headers, `X-Creek-Provider` (`anthropic` \| `openai`) and `X-Creek-Provider-Key`; a header and never a body field, so the key cannot reach body logging or a validation error. A malformed pair is `invalid_request`. The key's stage resolves through the same router chokepoint, so INTIMATE is forced local or refused; the operator's own configured cloud key stays refused (#1858/#1864); a self-connected vault ignores the headers. An `llm` classification job carries the key to its worker in memory only, never in the persisted job record. `GET /v1/capabilities` gains `request_key_providers` (empty on a self-connected vault), withheld from callers below `0.18` because the published schema is closed. No `CONTRACT_MODELS` entry is added, `0.17` stays served byte-identically, and the OpenAPI golden advances deliberately. |
 | `0.17.0` | 2026-10-14 | #1862 publishes the **tenth capability**, `letters`, as `POST /v1/letters/{external_id}`: the vault writes one margin note's Voice Draft letter from the caller's own entry and note, so a vault-bound Adepthood writer's letter never needs an app-side provider (adepthood epic #3203). Above-ceiling input is `privacy_refused` before any model, acute distress is a `200` care escalation, and generation routes through the shared tier-keyed `generation` chokepoint, so an intimate-routed call is forced local or refused and a cloud provider is built only with consent. The letter is stored first-writer-wins as the AI-attributed Voice Draft at the same caller-owned id and is retractable by the existing `DELETE`; a repeat is `unchanged` with no second model call. Three closed models join the bundle, `letters` joins `reflections` as a capability whose care-escalation cell is reachable (so every other capability's unreachable marker now names both paths), `0.16` stays served without seeing or reaching the route, and the OpenAPI golden advances deliberately. |
 | `0.16.0` | 2026-09-11 | #1799 publishes the **ninth capability**, `journal-withdraw`, as `DELETE /v1/journal-entries/{external_id}`. The consumer-scoped, body-free operation removes a Journal source and all of its fragments, ledger/index/provenance references, and retrieval-facing derived state. It shares the upsert mutation lock, persists only content-free recovery state, and refuses to report success until absence is verified; partial work is a retryable `503`. Foreign, unknown, already-withdrawn, and never-present identifiers are identical `200` successes, preventing an ownership oracle. One closed response model joins the bundle, `0.15` stays served without seeing or reaching the route, and the OpenAPI golden advances deliberately. |
 | `0.15.0` | 2026-09-06 | #1727 publishes the **eighth capability**, `voice-drafts`, as `PUT`, `GET`, and `DELETE /v1/voice-drafts/{external_id}`. The caller owns the idempotency key; Creek hashes it into a deterministic filename and stable fragment id, so the same id creates once and then updates or returns unchanged without duplicating the document. The stored fragment is structurally outside owner voice: it lives under `11-Other-Authors/ai-as-user`, carries `source.author=ai`, `source.author_slug=ai-as-user`, and `voice_weight=0.0`, and the wire attribution model admits no other values. Reads and mutations enforce the canonical tier ceiling; the existing-tier admission check happens while the storage lock is held, so an open caller cannot race or overwrite a personal draft. Missing, corrupt, deleted, and above-ceiling slots collapse to the same refusal. `DELETE` supports Adepthood's required retraction when a source entry later becomes intimate, without intimate text crossing the network. The route set adds three operations and five closed models; no error code or status is added. `CAPABILITY_SINCE_MINOR` both withholds and refuses the resource for `0.14` clients, whose known routes remain byte-identical, so `SUPPORTED_CONTRACT_MINORS` widens to retain `0.14`. The generated bundle adds five schemas and seven content-free `voice-drafts` examples, and the OpenAPI golden advances deliberately. |

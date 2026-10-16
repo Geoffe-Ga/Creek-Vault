@@ -49,10 +49,12 @@ from typing import TYPE_CHECKING
 from creek_mcp.api.models import (
     CAPABILITY_SINCE_MINOR,
     CONTRACT_MINOR,
+    REQUEST_KEYS_SINCE_MINOR,
     SUPPORTED_CONTRACT_MINORS,
     CapabilitiesResponse,
     CapabilitiesStatus,
     Capability,
+    RequestKeyProvider,
     TierModel,
     VaultState,
     WireTierCeiling,
@@ -67,7 +69,11 @@ from creek_mcp.httpapi import SERVER_NAME
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, json_response
-from creek_mcp.httpapi.vault import UNREADABLE_CONFIG, configured_vault
+from creek_mcp.httpapi.vault import (
+    UNREADABLE_CONFIG,
+    configured_vault,
+    request_key_providers,
+)
 from creek_mcp.policy import Transport
 from creek_mcp.tools.handshake import handshake_tool, vault_available
 
@@ -119,6 +125,30 @@ def advertised_capabilities(declared_minor: str | None) -> list[Capability]:
             or minor_at_least(declared_minor, CAPABILITY_SINCE_MINOR[capability])
         )
     ]
+
+
+def advertised_request_key_providers(
+    declared_minor: str | None,
+) -> list[RequestKeyProvider] | None:
+    """Return the request-key providers to tell this caller about, or ``None``.
+
+    The field-level twin of :func:`advertised_capabilities`: a caller that
+    declared no minor is told everything, and one below
+    :data:`~creek_mcp.api.models.REQUEST_KEYS_SINCE_MINOR` is told nothing, so
+    the key is omitted from a handshake its vendored, closed schema predates.
+
+    Args:
+        declared_minor: The caller's ``X-Creek-Contract-Version``, or ``None``.
+
+    Returns:
+        ``None`` to omit the field; otherwise the providers this vault will
+        spend a writer's key on, which is empty on a self-connected vault.
+    """
+    if declared_minor is not None and not minor_at_least(
+        declared_minor, REQUEST_KEYS_SINCE_MINOR
+    ):
+        return None
+    return [RequestKeyProvider(name) for name in request_key_providers()]
 
 
 def _negotiate(vault: Path, context: RequestContext, advertised: list[str]) -> bool:
@@ -288,6 +318,7 @@ def _render(
     advertised: list[Capability],
     *,
     available: bool,
+    request_keys: list[RequestKeyProvider] | None = None,
 ) -> Response:
     """Return the handshake body for *status*.
 
@@ -299,6 +330,8 @@ def _render(
         status: The readiness being reported.
         advertised: The capabilities this caller is entitled to be told about.
         available: Whether a usable vault stands behind this server.
+        request_keys: The request-key providers to report, or ``None`` to omit
+            the field for a caller whose minor predates it.
 
     Returns:
         A ``200`` carrying the published response model and nothing else.
@@ -312,8 +345,12 @@ def _render(
         vault=VaultState(available=available),
         tier_model=_tier_model(),
         capabilities=(advertised if status is CapabilitiesStatus.OK else []),
+        request_key_providers=request_keys,
     )
-    return json_response(payload.model_dump(mode="json"), HTTP_OK)
+    body = payload.model_dump(mode="json")
+    if request_keys is None:
+        body.pop("request_key_providers")
+    return json_response(body, HTTP_OK)
 
 
 async def handle_capabilities(request: Request) -> Response:
@@ -390,7 +427,8 @@ async def handle_capabilities(request: Request) -> Response:
         The handshake response.
     """
     context = context_of(request.scope)
-    advertised = advertised_capabilities(request.headers.get(CONTRACT_VERSION_HEADER))
+    declared = request.headers.get(CONTRACT_VERSION_HEADER)
+    advertised = advertised_capabilities(declared)
     negotiable = _minor_is_negotiable(request)
     available = await read_off_loop(
         partial(
@@ -405,4 +443,5 @@ async def handle_capabilities(request: Request) -> Response:
         _status_for(available=available, negotiable=negotiable),
         advertised,
         available=available,
+        request_keys=advertised_request_key_providers(declared),
     )

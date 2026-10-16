@@ -11,11 +11,16 @@
     "journal-withdraw",
     "letters"
   ],
-  "contract_minor": "0.17",
-  "contract_version": "0.17.0",
+  "contract_minor": "0.18",
+  "contract_version": "0.18.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
+  "request_key_providers": [
+    "anthropic",
+    "openai"
+  ],
   "status": "ok",
   "supported_contract_minors": [
+    "0.18",
     "0.17",
     "0.16",
     "0.15",

@@ -204,6 +204,18 @@ even if a consent variable, or the removal of the marker, appears after boot.
 A self-connected container never carries the marker, so its owner's
 `CREEK_CLOUD_CONSENT` opt-in keeps working exactly as before.
 
+**Amended 2026-10-16 ([ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)):
+a writer's request-scoped key.** The latch above governs the *operator's*
+cloud key and still holds. A `/v1` request that carries the writer's own key
+(`X-Creek-Provider: anthropic|openai` and `X-Creek-Provider-Key`) on
+`POST /v1/reflections`, `POST /v1/letters/{external_id}` or
+`POST /v1/classifications` is answered by that vendor, for OPEN and PERSONAL
+content, for that request only. The provider holding the key never reads the
+environment for a key or for consent, so setting a consent variable still does
+nothing but refuse startup. INTIMATE is forced onto the loopback model below or
+refused, and the key never reaches disk, a log line, an audit record or an
+error body. A self-connected container ignores the headers.
+
 ### Loopback-only Ollama in container mode
 
 In a container, every LLM stage's `ollama_url` must be a literal loopback

@@ -278,6 +278,7 @@ it is serialised to disk and would go stale if a tier-only rewrite
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from creek.classify.llm.base import LLMProvider
     from creek.config import ClassificationConfig, CreekConfig, LLMConfig
 
     # Annotation-only: the praxis verdict is compared, never constructed here.
@@ -507,6 +508,16 @@ class TierClassifiers:
     non_intimate: LLMClassifier
     intimate: LLMClassifier | None
     routing_error: IntimateRoutingError | None
+    intimate_degrades: bool = False
+    """Whether an unavailable INTIMATE classifier degrades rather than refuses.
+
+    ``False`` (the default) keeps the pre-ADR-0015 fail-fast: any unreachable
+    classifier refuses the whole run. ``True`` only for a request-scoped run,
+    whose OPEN/PERSONAL work is the writer's own provider: there an unavailable
+    *local* INTIMATE route leaves those fragments unclassified (counted as
+    ``llm_call_failed``) instead of refusing the writer's whole pass. Nothing
+    INTIMATE is ever sent to the writer's provider either way.
+    """
 
     def for_tier(self, tier: PrivacyTier) -> LLMClassifier:
         """Return the classifier for *tier* — the local one for INTIMATE.
@@ -540,7 +551,32 @@ class TierClassifiers:
         return self.routing_error
 
 
-def build_tier_classifiers(config: CreekConfig) -> TierClassifiers:
+@dataclass(frozen=True)
+class RequestScopedClassifier:
+    """A writer's own provider for one classify run's OPEN/PERSONAL work (ADR-0015).
+
+    Built and admitted by the caller (:mod:`creek_mcp.tools.classify`, on a
+    managed vault only), never by the engine, which neither reads keys nor
+    decides who may use one. It holds the provider for one run and is never
+    persisted.
+
+    Attributes:
+        provider: The provider bound to the writer's request-scoped key.
+        config: The stage configuration that provider was built from.
+        intimate_route_serves: Whether the vault's own local INTIMATE route may
+            serve this run. ``False`` marks it unavailable up front, so those
+            fragments degrade rather than reaching any provider.
+    """
+
+    provider: LLMProvider
+    config: LLMConfig
+    intimate_route_serves: bool
+
+
+def build_tier_classifiers(
+    config: CreekConfig,
+    request_scoped: RequestScopedClassifier | None = None,
+) -> TierClassifiers:
     """Build the per-tier classifiers via the ModelRouter chokepoint (#666).
 
     Resolves ``classification`` tier-less for non-Intimate fragments and with
@@ -552,12 +588,20 @@ def build_tier_classifiers(config: CreekConfig) -> TierClassifiers:
     :class:`TierClassifiers`) rather than failing a run that has no Intimate
     content.
 
+    With *request_scoped* (ADR-0015), OPEN/PERSONAL fragments use the writer's
+    provider and INTIMATE fragments still resolve through the router exactly as
+    before — the one tier gate — so the writer's provider is never handed an
+    INTIMATE fragment.
+
     Args:
         config: The loaded Creek configuration (carrying the model router).
+        request_scoped: A writer's request-scoped provider, or ``None``.
 
     Returns:
         The :class:`TierClassifiers` for this run.
     """
+    if request_scoped is not None:
+        return _request_scoped_tier_classifiers(config, request_scoped)
     router = config.model_router
     non_intimate = LLMClassifier(config=router.resolve("classification"))
     try:
@@ -576,6 +620,45 @@ def build_tier_classifiers(config: CreekConfig) -> TierClassifiers:
     )
 
 
+def _request_scoped_tier_classifiers(
+    config: CreekConfig, request_scoped: RequestScopedClassifier
+) -> TierClassifiers:
+    """Build the per-tier classifiers for a request-scoped run (ADR-0015).
+
+    Args:
+        config: The loaded Creek configuration (carrying the model router).
+        request_scoped: The writer's provider for OPEN/PERSONAL fragments.
+
+    Returns:
+        Classifiers whose INTIMATE route is the router's local one, marked to
+        degrade rather than refuse when it cannot serve.
+    """
+    non_intimate = LLMClassifier(
+        config=request_scoped.config, provider=request_scoped.provider
+    )
+    try:
+        intimate_cfg = config.model_router.resolve(
+            "classification", PrivacyTier.INTIMATE
+        )
+    except IntimateRoutingError as exc:
+        return TierClassifiers(
+            non_intimate=non_intimate,
+            intimate=None,
+            routing_error=exc,
+            intimate_degrades=True,
+        )
+    intimate = LLMClassifier(
+        config=intimate_cfg,
+        available=None if request_scoped.intimate_route_serves else False,
+    )
+    return TierClassifiers(
+        non_intimate=non_intimate,
+        intimate=intimate,
+        routing_error=None,
+        intimate_degrades=True,
+    )
+
+
 def run_classify(
     *,
     vault_path: Path,
@@ -583,6 +666,7 @@ def run_classify(
     method: str,
     force: bool,
     retier: bool = False,
+    request_scoped: RequestScopedClassifier | None = None,
 ) -> ClassifySummary:
     """Classify a vault inside its shared load-to-write mutation boundary.
 
@@ -598,6 +682,8 @@ def run_classify(
         method: ``"rules"`` or ``"llm"``.
         force: Whether to overwrite preserved classifications.
         retier: Whether to apply the opt-in escalate-only retiering pass.
+        request_scoped: A writer's request-scoped provider for OPEN/PERSONAL
+            fragments (ADR-0015), or ``None`` for the configured routing.
 
     Returns:
         A :class:`ClassifySummary` reporting per-method counts.
@@ -615,6 +701,7 @@ def run_classify(
             method=method,
             force=force,
             retier=retier,
+            request_scoped=request_scoped,
         )
 
 
@@ -625,6 +712,7 @@ def _run_classify_with_content_lock_held(
     method: str,
     force: bool,
     retier: bool = False,
+    request_scoped: RequestScopedClassifier | None = None,
 ) -> ClassifySummary:
     """Implement :func:`run_classify` while its content lock is held.
 
@@ -643,6 +731,7 @@ def _run_classify_with_content_lock_held(
             curation survive and no LLM call is made. It is not the
             default because re-deriving a tier the operator settled by
             hand is a decision only the operator can take.
+        request_scoped: See :func:`run_classify`.
 
     Returns:
         A :class:`ClassifySummary` reporting per-method counts.
@@ -665,7 +754,9 @@ def _run_classify_with_content_lock_held(
     # to a local provider by the ModelRouter chokepoint (Intimate-never-cloud,
     # #647). Resolving here also fails the run loudly (IntimateRoutingError) when
     # classification is cloud and no local default exists to route Intimate to.
-    tier_classifiers = build_tier_classifiers(config) if method == LLM_METHOD else None
+    tier_classifiers = (
+        build_tier_classifiers(config, request_scoped) if method == LLM_METHOD else None
+    )
     _assert_classifiers_available(tier_classifiers)
     counts = _RunCounts()
     progress_path: Path | None = None
@@ -953,11 +1044,29 @@ def _assert_classifiers_available(tier_classifiers: TierClassifiers | None) -> N
     if tier_classifiers is None:
         return
     for classifier in tier_classifiers.distinct():
-        if not classifier.available:
+        # ``.available`` is read for every classifier — it is also the serial
+        # pre-warm the concurrent pass relies on — before deciding whether an
+        # unavailable one refuses the run.
+        if not classifier.available and not _degrades(tier_classifiers, classifier):
             raise LLMProviderUnavailableError(
                 provider=classifier.config.provider,
                 detail=_describe_llm_unavailability(classifier.config.provider),
             )
+
+
+def _degrades(tier_classifiers: TierClassifiers, classifier: LLMClassifier) -> bool:
+    """Return whether *classifier* being unavailable degrades instead of refusing.
+
+    Args:
+        tier_classifiers: The run's classifier set.
+        classifier: One of its distinct classifiers.
+
+    Returns:
+        ``True`` only for the INTIMATE classifier of a request-scoped run.
+    """
+    return (
+        tier_classifiers.intimate_degrades and classifier is tier_classifiers.intimate
+    )
 
 
 def _dispatch_files(

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from google import genai
 
     from creek.classify.llm.base import LLMProvider
+    from creek.classify.llm.request_key import RequestKey
     from creek.config import LLMConfig
 
 logger = logging.getLogger(__name__)
@@ -223,7 +224,7 @@ def _error_status(exc: Exception) -> int | None:
     return status if isinstance(status, int) else None
 
 
-def _error_detail(exc: Exception) -> str:
+def _error_detail(exc: Exception, *, request_scoped: bool = False) -> str:
     """Return a redaction-safe detail string for a provider SDK error.
 
     Two tiers, by HTTP status:
@@ -238,8 +239,14 @@ def _error_detail(exc: Exception) -> str:
     - **5xx / unknown** — status only (or nothing). Server-error bodies are
       opaque and may carry unredacted internals, so they stay redacted.
 
+    A request-scoped key (ADR-0015) gets the status only, at every tier: a
+    vendor's 401 message can quote part of the key it rejected (OpenAI's
+    ``Incorrect API key provided: sk-...``), and that key is the writer's, not
+    the operator's, so no part of it may reach a log or an error body.
+
     Args:
         exc: The vendor SDK exception.
+        request_scoped: Whether the failing call carried a request-scoped key.
 
     Returns:
         A suffix ready to append after the exception type name — one of
@@ -248,7 +255,7 @@ def _error_detail(exc: Exception) -> str:
     status = _error_status(exc)
     if status is None:
         return ""
-    if not _CLIENT_ERROR_MIN <= status < _SERVER_ERROR_MIN:
+    if request_scoped or not _CLIENT_ERROR_MIN <= status < _SERVER_ERROR_MIN:
         return f" (HTTP {status})"
     message = getattr(exc, "message", None)
     if not isinstance(message, str) or not message.strip():
@@ -278,6 +285,82 @@ def _chain_is_safe(exc: Exception) -> bool:
     """
     status = _error_status(exc)
     return status is not None and _CLIENT_ERROR_MIN <= status < _SERVER_ERROR_MIN
+
+
+def _safe_cause(exc: Exception, request_key: RequestKey | None) -> Exception | None:
+    """Return the cause a wrapped provider error may keep, or ``None``.
+
+    The 4xx chain :func:`_chain_is_safe` admits carries the vendor's message,
+    which a request-scoped key's error must not (see :func:`_error_detail`), so
+    a request-scoped call never keeps a cause.
+
+    Args:
+        exc: The vendor SDK exception.
+        request_key: The request-scoped key the call carried, or ``None``.
+
+    Returns:
+        *exc* when the chain is safe to keep, else ``None``.
+    """
+    if request_key is not None or not _chain_is_safe(exc):
+        return None
+    return exc
+
+
+def _wrapped_vendor_error(
+    exc: Exception,
+    vendor: str,
+    *,
+    rate_limited: bool,
+    request_key: RequestKey | None,
+) -> tuple[Exception, Exception | None]:
+    """Build the error a failed vendor call is re-raised as, and its cause.
+
+    The caller must raise the result *after* its ``except`` block: raised
+    inside it, Python attaches the vendor error as ``__context__`` whatever the
+    ``from`` clause says, and that error's request headers carry the key.
+
+    Args:
+        exc: The vendor SDK exception.
+        vendor: Display name of the vendor (e.g. ``"OpenAI"``).
+        rate_limited: Whether *exc* is the vendor's rate-limit error.
+        request_key: The request-scoped key the call carried, or ``None``.
+
+    Returns:
+        The wrapped error and the cause it may keep (``None`` to suppress it).
+    """
+    name = type(exc).__name__
+    if rate_limited:
+        msg = f"{vendor} API call rate-limited: {name}"
+        return ProviderRateLimitError(msg, retry_after=_retry_after_seconds(exc)), None
+    detail = _error_detail(exc, request_scoped=request_key is not None)
+    msg = f"{vendor} API call failed: {name}{detail}"
+    return RuntimeError(msg), _safe_cause(exc, request_key)
+
+
+def _request_key_prerequisite(
+    request_key: RequestKey, provider_name: str
+) -> str | None:
+    """Return why a request-scoped key cannot serve this provider, or ``None``.
+
+    A request key is its own consent: the writer sent their own key for this
+    one request, so the operator's consent variables and the managed-vault
+    latch (#1864), which govern the *operator's* key, are not consulted. That
+    is the whole exception ADR-0015 makes, and it is narrow by construction —
+    only :func:`creek_mcp.model_pin.build_request_scoped_provider` passes a
+    key, and only on a managed vault. The environment is never read, so an
+    operator key can never stand in for a writer's.
+
+    Args:
+        request_key: The writer's key.
+        provider_name: This provider's display name.
+
+    Returns:
+        ``None`` when the key is non-empty; otherwise a fixed message that
+        names the provider and never the key.
+    """
+    if request_key.reveal():
+        return None
+    return f"a request-scoped {provider_name} key is empty"
 
 
 # Per-provider default model IDs. This matrix is the ONLY place model literals
@@ -329,7 +412,9 @@ class AnthropicProvider:
     MAX_TOKENS: int = 1024
     """Maximum tokens requested from the Anthropic API per call."""
 
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(
+        self, config: LLMConfig, *, request_key: RequestKey | None = None
+    ) -> None:
         """Validate environment prerequisites and prepare the client.
 
         The SDK client itself is instantiated lazily on first use to
@@ -337,12 +422,17 @@ class AnthropicProvider:
 
         Args:
             config: LLM provider configuration.
+            request_key: A writer's request-scoped key (ADR-0015), or ``None``
+                for the environment key. With one, the environment is never
+                read for a key or for consent: see
+                :func:`_request_key_prerequisite`.
 
         Raises:
             RuntimeError: If the API key or consent environment
                 variables are not set.
         """
         self.config = config
+        self._request_key = request_key
         unmet = self._missing_prerequisite()
         if unmet is not None:
             raise RuntimeError(unmet)
@@ -365,6 +455,8 @@ class AnthropicProvider:
             A human-readable explanation when the key is missing or consent is
             not affirmative; ``None`` when both prerequisites are satisfied.
         """
+        if self._request_key is not None:
+            return _request_key_prerequisite(self._request_key, self.PROVIDER_NAME)
         key_env = _effective_key_env(self.config, self.API_KEY_ENV)
         if not os.environ.get(key_env, "").strip():
             return (
@@ -415,7 +507,9 @@ class AnthropicProvider:
         if self._client is None:
             import anthropic
 
-            if self.config.api_key_env:
+            if self._request_key is not None:
+                self._client = anthropic.Anthropic(api_key=self._request_key.reveal())
+            elif self.config.api_key_env:
                 self._client = anthropic.Anthropic(
                     api_key=_read_key_env(
                         _effective_key_env(self.config, self.API_KEY_ENV)
@@ -518,21 +612,23 @@ class AnthropicProvider:
         ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
             response = self._create_message(prompt, ceiling, system)
-        except anthropic.RateLimitError as exc:
-            msg = f"Anthropic API call rate-limited: {type(exc).__name__}"
-            raise ProviderRateLimitError(
-                msg, retry_after=_retry_after_seconds(exc)
-            ) from None
         except anthropic.AnthropicError as exc:
-            detail = _error_detail(exc)
-            msg = f"Anthropic API call failed: {type(exc).__name__}{detail}"
-            raise RuntimeError(msg) from (exc if _chain_is_safe(exc) else None)
-        stop_reason = getattr(response, "stop_reason", None) or "end_turn"
-        return AnthropicCompletion(
-            text=_extract_anthropic_text(response),
-            stop_reason=str(stop_reason),
-            usage=_extract_anthropic_usage(response),
-        )
+            failure, cause = _wrapped_vendor_error(
+                exc,
+                "Anthropic",
+                rate_limited=isinstance(exc, anthropic.RateLimitError),
+                request_key=self._request_key,
+            )
+        else:
+            stop_reason = getattr(response, "stop_reason", None) or "end_turn"
+            return AnthropicCompletion(
+                text=_extract_anthropic_text(response),
+                stop_reason=str(stop_reason),
+                usage=_extract_anthropic_usage(response),
+            )
+        # Raised outside the ``except`` so the vendor error is not attached as
+        # ``__context__``: its request headers carry the key (#1876).
+        raise failure from cause
 
     def _create_message(
         self,
@@ -1288,7 +1384,9 @@ class OpenAIProvider:
     MAX_TOKENS: int = 1024
     """Maximum tokens requested from the OpenAI API per call."""
 
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(
+        self, config: LLMConfig, *, request_key: RequestKey | None = None
+    ) -> None:
         """Validate environment prerequisites and prepare the client.
 
         The SDK client is instantiated lazily on first use. The cloud-egress
@@ -1296,11 +1394,16 @@ class OpenAIProvider:
 
         Args:
             config: LLM provider configuration.
+            request_key: A writer's request-scoped key (ADR-0015), or ``None``
+                for the environment key. With one, the environment is never
+                read for a key or for consent: see
+                :func:`_request_key_prerequisite`.
 
         Raises:
             RuntimeError: If the API key is unset or cloud consent is missing.
         """
         self.config = config
+        self._request_key = request_key
         unmet = self._missing_prerequisite()
         if unmet is not None:
             raise RuntimeError(unmet)
@@ -1318,6 +1421,8 @@ class OpenAIProvider:
             A human-readable explanation when the key is missing or consent is
             not affirmative; ``None`` when both prerequisites are satisfied.
         """
+        if self._request_key is not None:
+            return _request_key_prerequisite(self._request_key, self.PROVIDER_NAME)
         key_env = _effective_key_env(self.config, self.API_KEY_ENV)
         if not os.environ.get(key_env, "").strip():
             return (
@@ -1365,6 +1470,11 @@ class OpenAIProvider:
         if self._client is None:
             import openai
 
+            if self._request_key is not None:
+                # Never the config's ``api_base``: the vault config is writable
+                # and must not be able to redirect a writer's key elsewhere.
+                self._client = openai.OpenAI(api_key=self._request_key.reveal())
+                return self._client
             base_url = self.config.api_base
             byok_key = (
                 _read_key_env(_effective_key_env(self.config, self.API_KEY_ENV))
@@ -1413,19 +1523,21 @@ class OpenAIProvider:
         ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
             response = self._create_chat(prompt, ceiling, system)
-        except openai.RateLimitError as exc:
-            msg = f"OpenAI API call rate-limited: {type(exc).__name__}"
-            raise ProviderRateLimitError(
-                msg, retry_after=_retry_after_seconds(exc)
-            ) from None
         except openai.OpenAIError as exc:
-            msg = f"OpenAI API call failed: {type(exc).__name__}{_error_detail(exc)}"
-            raise RuntimeError(msg) from (exc if _chain_is_safe(exc) else None)
-        return Completion(
-            text=_extract_openai_text(response),
-            stop_reason=_map_openai_stop_reason(response),
-            usage=_extract_openai_usage(response),
-        )
+            failure, cause = _wrapped_vendor_error(
+                exc,
+                "OpenAI",
+                rate_limited=isinstance(exc, openai.RateLimitError),
+                request_key=self._request_key,
+            )
+        else:
+            return Completion(
+                text=_extract_openai_text(response),
+                stop_reason=_map_openai_stop_reason(response),
+                usage=_extract_openai_usage(response),
+            )
+        # Raised outside the ``except``; see :meth:`AnthropicProvider.complete`.
+        raise failure from cause
 
     def _create_chat(
         self,

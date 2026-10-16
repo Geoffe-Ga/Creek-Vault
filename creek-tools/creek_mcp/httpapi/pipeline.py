@@ -75,6 +75,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
+from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek_mcp.api.models import (
     OK_STATUS,
     ClassificationMethod,
@@ -99,7 +100,7 @@ from creek_mcp.httpapi.jobs import (
     finish_job,
     status_for,
 )
-from creek_mcp.httpapi.vault import configured_vault
+from creek_mcp.httpapi.vault import configured_vault, request_key_of
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.handshake import vault_available
@@ -112,6 +113,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+    from creek.classify.llm.request_key import RequestKey
     from creek_mcp.httpapi.context import RequestContext
 
 logger = logging.getLogger(__name__)
@@ -402,8 +404,16 @@ def _finish_pipeline_job(
         logger.exception("pipeline job %s could not record its result", claimed.job_id)
 
 
-def _execute_pipeline_job(vault: Path, record: StoredJob) -> None:
-    """Claim, execute and terminally record one queued pipeline job."""
+def _execute_pipeline_job(
+    vault: Path, record: StoredJob, request_key: RequestKey | None = None
+) -> None:
+    """Claim, execute and terminally record one queued pipeline job.
+
+    *request_key* is the writer's request-scoped key (ADR-0015), or ``None``.
+    It rides to the worker in memory, as an argument, and is never part of the
+    persisted :class:`~creek_mcp.httpapi.jobs.StoredJob`: a job reclaimed after
+    a restart has no key and runs, or refuses, exactly as a keyless one.
+    """
     claimed = _claimed_job(vault, record)
     if claimed is None:
         return
@@ -417,6 +427,7 @@ def _execute_pipeline_job(vault: Path, record: StoredJob) -> None:
                 retier=claimed.retier,
                 privacy_tier_ceiling=ceiling,
                 consumer=claimed.consumer,
+                request_key=request_key,
             )
             result = (
                 _classification_model(raw, method=ClassificationMethod(claimed.method))
@@ -462,6 +473,7 @@ async def _accepted_job(
     method: str,
     retier: bool,
     context: RequestContext,
+    request_key: RequestKey | None = None,
 ) -> Response:
     """Durably queue at most one active pass per consumer and return its handle.
 
@@ -485,7 +497,7 @@ async def _accepted_job(
             return error_response(ErrorCode.UNAVAILABLE, context)
         vault, record = queued
         task = asyncio.create_task(
-            asyncio.to_thread(_execute_pipeline_job, vault, record)
+            asyncio.to_thread(_execute_pipeline_job, vault, record, request_key)
         )
         tasks: set[asyncio.Task[None]] = request.app.state.pipeline_job_tasks
         active_job_ids: set[str] = request.app.state.pipeline_active_job_ids
@@ -544,6 +556,10 @@ async def handle_classification(request: Request) -> Response:
     parsed = await _parsed(request, ClassificationRequest)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
+    try:
+        request_key = request_key_of(request)
+    except InvalidRequestKeyError:
+        return error_response(ErrorCode.INVALID_REQUEST, context)
     if parsed.method is ClassificationMethod.LLM:
         return await _accepted_job(
             request,
@@ -551,6 +567,7 @@ async def handle_classification(request: Request) -> Response:
             method=parsed.method.value,
             retier=parsed.retier,
             context=context,
+            request_key=request_key,
         )
     result = await write_off_loop(_classify, request, parsed, context)
     return _rendered(
