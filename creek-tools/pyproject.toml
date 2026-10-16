@@ -222,14 +222,14 @@ dev = [
     # the drift this pin exists to prevent. 0.15.13 -> 0.16.4 (#1440);
     # the agreement is asserted by
     # tests/test_dependency_pins.py::_LOCKSTEP_TOOLS.
-    "ruff>=0.16.5,<0.17",
+    "ruff>=0.16.5,<0.18",
     # Pinned to the same major.minor as uv.lock so the two provisioning
     # paths (uv sync and pip install -e '.[dev]') run the same mypy version.
     # Pre-commit reuses that project environment through typecheck.sh rather
     # than provisioning a third copy (#1759). Bumping requires moving the
     # declared band and lock together, both ends at once, for the reason on
     # the ruff pin above. 2.1.0 -> 2.3.1 (#1440).
-    "mypy>=2.3.1,<2.4.0",
+    "mypy>=2.3.1,<2.5.0",
     "pylint>=4.0.7",
     # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
     # PyCQA/bandit rev so the three install paths run the same bandit
