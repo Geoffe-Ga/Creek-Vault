@@ -299,6 +299,37 @@ these headers.
 `/v1`.** The [access-log scope note](#request-logging) applies here too: a proxy
 that ignores `no-store` is outside this process and nothing here can stop it.
 
+## Request-scoped provider keys (managed vaults)
+
+Since contract `0.18.0` (#1873, [ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)),
+`POST /v1/reflections`, `POST /v1/letters/{external_id}` and
+`POST /v1/classifications` accept two optional headers:
+
+| Header | Value |
+|---|---|
+| `X-Creek-Provider` | `anthropic` or `openai` |
+| `X-Creek-Provider-Key` | The writer's own key for that vendor |
+
+On a **managed** vault (`CREEK_MANAGED_VAULT` set) the key powers that
+request's OPEN and PERSONAL model calls: the vault grounds the entry in the
+writer's corpus and voice and sends the prompt to the writer's vendor,
+authenticated as the writer. An `llm` classification job carries the key to its
+worker in memory, for OPEN and PERSONAL fragments. INTIMATE is never sent: it
+is forced onto the local model or refused (`503 temporarily_unavailable` for a
+reflection or letter; left unclassified in a classification pass). The
+operator's own configured cloud key stays refused.
+
+Send both headers or neither. One alone, a vendor other than these two, or a
+value that is not a key is `422 invalid_request`, with the fixed message and
+neither header echoed. A self-connected vault ignores well-formed headers.
+`GET /v1/capabilities` reports `request_key_providers` (the two vendors on a
+managed vault, `[]` otherwise) to a caller declaring `0.18` or later, so check
+it before forwarding a key.
+
+The key is never written to the vault, the audit log, a log line, an error
+body or the persisted job record, and a vendor error raised under it is reduced
+to its exception type and HTTP status.
+
 ## Privacy tiers
 
 The ceiling arrives on `X-Creek-Tier-Ceiling` and defaults to `open` when absent

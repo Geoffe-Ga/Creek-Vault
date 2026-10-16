@@ -105,7 +105,14 @@ separate Fly secret-backed files and are not part of that snapshot.
   before accepting a vault. On a fresh ext4 mount, bootstrap removes `lost+found`
   only when it is the sole entry and an empty, non-symlink directory. Recovered
   data and existing vault contents are never removed or overwritten.
-- Managed vaults are local-only. The provisioner sets `CREEK_MANAGED_VAULT=1`
+- Managed vaults are local-only for the operator, with one exception for the
+  writer ([ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md),
+  amended 2026-10-16). A request that carries the writer's own Anthropic or
+  OpenAI key in `X-Creek-Provider` and `X-Creek-Provider-Key` is answered by
+  that vendor for OPEN and PERSONAL content, for that request only; INTIMATE
+  is still forced local or refused, and the key is never stored or logged.
+  Everything below governs the operator's key and is unchanged. The
+  provisioner sets `CREEK_MANAGED_VAULT=1`
   on every vault Machine, on both the replay bootstrap and the default image
   entry point, and rejects a Machine whose marker has drifted. A managed vault
   refuses to start, with "startup refused" and exit `2`, while
