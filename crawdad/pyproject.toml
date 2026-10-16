@@ -13,8 +13,9 @@ authors = [
 dependencies = [
     "discord.py>=2.3.0",
     # Security: pin mcp above CVE-2026-52869 (cross-principal session
-    # injection on Streamable HTTP bearer transport). Fixed in 1.28.1.
-    "mcp>=1.28.1,<2.0.0",
+    # injection on Streamable HTTP bearer transport; fixed in 1.28.1) and
+    # CVE-2026-59951 (fixed in 1.30.0).
+    "mcp>=1.30.0,<2.0.0",
     "anthropic>=0.40.0",
     # Transport hold, not a CVE (OSV reports no advisories for openai):
     # openai 3.0.0 swapped `httpx<1,>=0.23.0` for `httpx2<3,>=2.7.0` — a
@@ -29,7 +30,7 @@ dependencies = [
     # Anyone installing crawdad from published metadata without ever
     # touching the lock (`pip install crawdad[dev]` against PyPI, say)
     # still resolves openai live, and the ceiling is the only thing
-    # standing between that install and 3.0.0. (3) `mcp>=1.28.1,<2.0.0`
+    # standing between that install and 3.0.0. (3) `mcp>=1.30.0,<2.0.0`
     # caps the other half of the same httpx2 swap (#998); the two
     # ceilings must lift together, or one side silently reacquires the
     # dependency the other is still holding off. Floor is the release

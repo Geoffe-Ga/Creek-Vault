@@ -180,7 +180,7 @@ purpose because every normalisation step is a step where two equal-looking
 headers stop being equal.
 
 **The two ``on_mcp=True`` divergence cells pin third-party behaviour.**
-``pyproject.toml`` allows ``mcp>=1.28.1,<2.0.0`` and the lock resolves 1.29.0,
+``pyproject.toml`` allows ``mcp>=1.30.0,<2.0.0`` and the lock resolves 1.30.0,
 whose backend guards on truthiness and lowercases the scheme. An upgrade in
 which the SDK tightens either rule flips those cells and reddens this table.
 That is the intended alarm and not a false one — it means the two gates now
