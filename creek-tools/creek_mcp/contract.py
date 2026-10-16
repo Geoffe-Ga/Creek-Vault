@@ -20,8 +20,22 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.17.0"
+CONTRACT_VERSION: Final[str] = "0.18.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.18.0 (#1873, ADR-0015): a writer's request-scoped provider key.
+``POST /v1/reflections``, ``POST /v1/letters/{external_id}`` and
+``POST /v1/classifications`` publish two optional headers,
+``X-Creek-Provider`` (``anthropic`` | ``openai``) and
+``X-Creek-Provider-Key``. On a managed vault the key powers that request's
+OPEN and PERSONAL model calls through the vault's own grounding and voice
+pipeline, and is never stored, logged or echoed; INTIMATE is still forced
+local or refused by the one router chokepoint, and the operator's own cloud
+key stays refused. A malformed pair is ``invalid_request``. ``GET
+/v1/capabilities`` gains ``request_key_providers``, the providers this vault
+will spend a writer's key on (empty on a self-connected vault), served only to
+callers declaring 0.18 or later so a ``0.17`` consumer validating closed sees
+its vendored shape. ``0.17`` remains served.
 
 0.17.0 (#1862): ``/v1`` publishes ``letters`` and
 ``POST /v1/letters/{external_id}``: the vault itself expands one margin note

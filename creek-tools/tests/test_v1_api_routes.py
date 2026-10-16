@@ -725,7 +725,7 @@ def test_every_route_model_is_a_published_contract_model() -> None:
 
 
 def test_route_spec_declares_the_published_fields() -> None:
-    """``RouteSpec`` carries exactly the ten fields the adapter consumes."""
+    """``RouteSpec`` carries exactly the eleven fields the adapter consumes."""
     assert {field.name for field in fields(RouteSpec)} == {
         "path",
         "method",
@@ -737,6 +737,7 @@ def test_route_spec_declares_the_published_fields() -> None:
         "summary",
         "max_body_bytes",
         "success_responses",
+        "accepts_request_key",
     }
 
 

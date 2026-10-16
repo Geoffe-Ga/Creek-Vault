@@ -28,7 +28,12 @@ from mcp.server.fastmcp import FastMCP
 from creek.care.guardrail import acute_distress_guard
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
-from creek_mcp.model_pin import pin_refuses_stage, provider_may_serve
+from creek_mcp.model_pin import (
+    build_request_scoped_provider,
+    pin_refuses_stage,
+    provider_may_serve,
+    request_key_admitted,
+)
 from creek_mcp.policy import (
     Admission,
     CallerIdentity,
@@ -86,8 +91,10 @@ if TYPE_CHECKING:
 
     from creek.author.client import AuthorLLMClient
     from creek.classify.llm.base import LLMProvider
+    from creek.classify.llm.request_key import RequestKey
     from creek.classify.llm.router import ModelRouter
     from creek.compile.engine import CompileLLM
+    from creek.config import LLMConfig
     from creek.models import PrivacyTier
     from creek_mcp.tools.author import AuthorLLMFactory
     from creek_mcp.tools.compile import CompileLLMFactory
@@ -323,7 +330,9 @@ def _build_compile_llm(vault: Path, tier: PrivacyTier) -> CompileLLM:
     return lambda prompt: provider.complete(prompt).text
 
 
-def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
+def _build_reflect_llm_factory(
+    vault: Path, request_key: RequestKey | None = None
+) -> _LLMFactory:
     """Return a tier-keyed LLM factory for ``creek.reflect``.
 
     The returned ``factory(tier)`` resolves the ``generation`` stage through the
@@ -336,14 +345,18 @@ def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
     Args:
         vault: The served vault, whose own config owns the routing (#1409).
             Bound once here; the tier arrives per call.
+        request_key: The writer's request-scoped key (ADR-0015), or ``None``.
+            See :func:`_generation_provider` for when it is used.
 
     Returns:
         A tier → LLM-callable factory bound to *vault*'s router.
     """
-    return _bounded_generation_factory(vault, "reflection")
+    return _bounded_generation_factory(vault, "reflection", request_key)
 
 
-def _build_letter_llm_factory(vault: Path) -> _LLMFactory:
+def _build_letter_llm_factory(
+    vault: Path, request_key: RequestKey | None = None
+) -> _LLMFactory:
     """Return the tier-keyed LLM factory ``POST /v1/letters`` dials (#1862).
 
     The same ``generation`` chokepoint reflection uses — router, model pin and
@@ -354,19 +367,24 @@ def _build_letter_llm_factory(vault: Path) -> _LLMFactory:
 
     Args:
         vault: The served vault, whose own config owns the routing.
+        request_key: The writer's request-scoped key (ADR-0015), or ``None``.
 
     Returns:
         A tier → LLM-callable factory bound to *vault*'s router.
     """
-    return _bounded_generation_factory(vault, "letter")
+    return _bounded_generation_factory(vault, "letter", request_key)
 
 
-def _bounded_generation_factory(vault: Path, verb: str) -> _LLMFactory:
+def _bounded_generation_factory(
+    vault: Path, verb: str, request_key: RequestKey | None = None
+) -> _LLMFactory:
     """Return a tier-keyed, output-bounded ``generation`` factory for *verb*.
 
     Args:
         vault: The served vault, whose config is read once here.
         verb: The operation named in an unavailable-provider refusal.
+        request_key: The writer's request-scoped key, or ``None``. Held only by
+            this closure, which lives for the one request that built it.
 
     Returns:
         ``factory(tier, *, max_tokens)``, resolving the provider per call
@@ -375,7 +393,7 @@ def _bounded_generation_factory(vault: Path, verb: str) -> _LLMFactory:
     router = load_vault_config(vault).model_router
 
     def _factory(tier: PrivacyTier, *, max_tokens: int) -> _LLM:
-        provider = _generation_provider(router, tier, verb)
+        provider = _generation_provider(router, tier, verb, request_key)
         return partial(
             _complete_reflection,
             provider,
@@ -386,7 +404,10 @@ def _bounded_generation_factory(vault: Path, verb: str) -> _LLMFactory:
 
 
 def _generation_provider(
-    router: ModelRouter, tier: PrivacyTier, verb: str
+    router: ModelRouter,
+    tier: PrivacyTier,
+    verb: str,
+    request_key: RequestKey | None = None,
 ) -> LLMProvider:
     """Return the ``generation`` provider for *tier*, or refuse (#1849).
 
@@ -403,12 +424,22 @@ def _generation_provider(
     The check runs per request, because the vault config it reads is
     writable after boot.
 
+    **A writer's request key (ADR-0015).** On a managed vault, a request that
+    carries the writer's own key is answered by that vendor for OPEN and
+    PERSONAL. The key's stage is resolved through the *same* router chokepoint
+    — the vault's routing with ``generation`` set to the key's provider — so
+    INTIMATE is redirected to the local ``default`` (then pinned like any other
+    local stage) or refused with ``IntimateRoutingError``; there is no second
+    tier gate. Without a key, or on a self-connected vault, nothing here
+    changes.
+
     Args:
         router: The served vault's model router.
         tier: The request's routing tier.
         verb: The operation named in the refusal (``draft``, ``compile`` or
             ``reflection``). The refusal text is otherwise fixed and never
             carries the configured URL.
+        request_key: The writer's request-scoped key, or ``None``.
 
     Returns:
         A provider that may serve this request.
@@ -423,13 +454,56 @@ def _generation_provider(
         f"LLM provider unavailable for {verb}. "
         "Check Ollama or ANTHROPIC_API_KEY configuration."
     )
-    cfg = router.resolve("generation", tier)
+    cfg = _resolve_generation_stage(router, tier, request_key)
+    if request_key is not None and request_key_admitted(cfg, request_key):
+        return build_request_scoped_provider(request_key)
     if pin_refuses_stage(cfg):
         raise RuntimeError(msg)
     provider = build_provider(cfg)
     if not provider_may_serve(provider):
         raise RuntimeError(msg)
     return provider
+
+
+def _resolve_generation_stage(
+    router: ModelRouter, tier: PrivacyTier, request_key: RequestKey | None
+) -> LLMConfig:
+    """Return the ``generation`` stage for *tier*, with a request key considered.
+
+    Without a request key, or on a vault that does not admit one, this is
+    ``router.resolve("generation", tier)`` exactly. With an admitted key the
+    stage is resolved through a router whose ``generation`` is the key's
+    provider and whose ``default`` is the vault's own, so the
+    :meth:`~creek.classify.llm.router.ModelRouter.resolve` INTIMATE rule —
+    the one tier gate — decides whether the key's cloud stage stands.
+
+    Args:
+        router: The served vault's model router.
+        tier: The request's routing tier.
+        request_key: The writer's request-scoped key, or ``None``.
+
+    Returns:
+        The key's stage for OPEN/PERSONAL; otherwise a local or operator stage
+        that the model pin then judges as before.
+
+    Raises:
+        IntimateRoutingError: For INTIMATE with a key when the vault's
+            ``default`` is itself cloud, so no local stage exists.
+    """
+    from creek.classify.llm.router import ModelRouter
+    from creek.config import LLMRoutingConfig
+
+    if request_key is None or not request_key_admitted(
+        request_key.stage_config(), request_key
+    ):
+        return router.resolve("generation", tier)
+    keyed = ModelRouter(
+        LLMRoutingConfig(
+            default=router.routing.for_stage("default"),
+            generation=request_key.stage_config(),
+        )
+    )
+    return keyed.resolve("generation", tier)
 
 
 def _complete_reflection(

@@ -1866,12 +1866,12 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.17 widened the compatibility window rather than shifting it.
+    """0.18 widened the compatibility window rather than shifting it.
 
-    A ``0.16`` client has no letters resource in its vendored route or
-    model set, and every route it does know keeps its byte-identical response
-    under #1727. Earlier minors are checked alongside it because the window
-    only ever widens.
+    A ``0.17`` client has no request-key headers or ``request_key_providers``
+    in its vendored contract, and every response it can receive keeps its
+    byte-identical shape under #1873. Earlier minors are checked alongside it
+    because the window only ever widens.
 
     The head entry of :data:`SUPPORTED_CONTRACT_MINORS` is *derived* from
     :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the version
@@ -1879,6 +1879,7 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.17" in SUPPORTED_CONTRACT_MINORS
     assert "0.16" in SUPPORTED_CONTRACT_MINORS
     assert "0.15" in SUPPORTED_CONTRACT_MINORS
     assert "0.14" in SUPPORTED_CONTRACT_MINORS
@@ -1888,7 +1889,7 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.17"
+    assert CONTRACT_MINOR == "0.18"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

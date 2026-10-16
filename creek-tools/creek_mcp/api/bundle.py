@@ -80,6 +80,7 @@ from creek_mcp.api.models import (
     PraxisKind,
     PraxisLifecycle,
     ReflectionStatus,
+    RequestKeyProvider,
     WireTierCeiling,
 )
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
@@ -218,8 +219,10 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "vault": {"available": True},
     "tier_model": _TIER_MODEL_PAYLOAD,
     "capabilities": list(CAPABILITIES),
+    "request_key_providers": [provider.value for provider in RequestKeyProvider],
 }
-"""A ready server: vault present, all ten capabilities served."""
+"""A ready managed server: vault present, all ten capabilities served, and a
+writer's own Anthropic or OpenAI key accepted per request (#1873)."""
 
 _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     **_CAPABILITIES_SUCCESS,

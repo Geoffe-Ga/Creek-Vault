@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 from pydantic import ValidationError
 
 from creek.care.guardrail import acute_distress_guard
+from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek_mcp.api.models import (
     RELATED_FIELDS_SINCE_MINOR,
     CareEscalationResponse,
@@ -56,7 +57,7 @@ from creek_mcp.api.routes import CONTRACT_VERSION_HEADER
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
-from creek_mcp.httpapi.vault import configured_vault
+from creek_mcp.httpapi.vault import configured_vault, request_key_of
 from creek_mcp.tools.reflect import reflect_tool
 
 if TYPE_CHECKING:
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+    from creek.classify.llm.request_key import RequestKey
     from creek_mcp.httpapi.context import RequestContext
     from creek_mcp.tools.reflect import GroundingSession, _LLMFactory
 
@@ -153,7 +155,9 @@ async def _parsed_body(request: Request) -> ReflectionRequest | None:
         return None
 
 
-def _default_llm_factory(vault: Path) -> _LLMFactory:
+def _default_llm_factory(
+    vault: Path, request_key: RequestKey | None = None
+) -> _LLMFactory:
     """Return the production tier-keyed LLM factory for *vault*.
 
     Imported inside the function rather than at module scope: the builder lives
@@ -171,13 +175,15 @@ def _default_llm_factory(vault: Path) -> _LLMFactory:
 
     Args:
         vault: The vault being reflected against.
+        request_key: The writer's request-scoped key (ADR-0015), or ``None``.
+            Handed to the same builder, which decides whether it is used.
 
     Returns:
         The tier-keyed factory, bound to *vault*'s routing.
     """
     from creek_mcp.server import _build_reflect_llm_factory
 
-    return _build_reflect_llm_factory(vault)
+    return _build_reflect_llm_factory(vault, request_key)
 
 
 def _reflect(
@@ -186,6 +192,7 @@ def _reflect(
     context: RequestContext,
     build_factory: Callable[[], _LLMFactory] | None,
     session: GroundingSession | None,
+    request_key: RequestKey | None,
 ) -> dict[str, Any] | None:
     """Resolve the vault and run the reflect tool, both off the event loop.
 
@@ -213,6 +220,8 @@ def _reflect(
             (#1034), or ``None`` to build a cold one per call. Passed
             positionally through :func:`read_off_loop`, which takes ``*args``
             and forbids keywords by design.
+        request_key: The writer's request-scoped key, or ``None``. Bound into
+            the production builder only; an injected factory never sees it.
 
     Returns:
         The tool's return dict, a synthetic refusal when the factory itself
@@ -224,7 +233,7 @@ def _reflect(
     if vault is None:
         return None
     try:
-        factory = (build_factory or partial(_default_llm_factory, vault))()
+        factory = (build_factory or partial(_default_llm_factory, vault, request_key))()
     except (RuntimeError, OSError, ValueError) as exc:
         return {
             "status": "refused",
@@ -433,6 +442,10 @@ async def handle_reflection(request: Request) -> Response:
     parsed = await _parsed_body(request)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
+    try:
+        request_key = request_key_of(request)
+    except InvalidRequestKeyError:
+        return error_response(ErrorCode.INVALID_REQUEST, context)
     result = await read_off_loop(
         _reflect,
         request,
@@ -440,6 +453,7 @@ async def handle_reflection(request: Request) -> Response:
         context,
         request.app.state.reflect_llm_factory,
         request.app.state.reflect_grounding_session,
+        request_key,
     )
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)

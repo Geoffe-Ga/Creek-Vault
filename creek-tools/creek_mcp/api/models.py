@@ -82,6 +82,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.17",
     "0.16",
     "0.15",
     "0.14",
@@ -194,6 +195,12 @@ Contract 0.15 (#1727) adds the ``voice-drafts`` capability, three resource
 verbs, and five wire models. Every older response remains byte-identical;
 ``0.14`` is kept in the window and the since-minor gate both withholds and
 refuses the new resource for clients whose vendored schema predates it.
+
+Contract 0.18 (#1873) adds two optional request headers on the three
+model-calling routes and one optional handshake field,
+``request_key_providers``, withheld from callers below
+:data:`REQUEST_KEYS_SINCE_MINOR`. Every ``0.17`` response is byte-identical,
+so ``0.17`` stays in the window.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -379,6 +386,16 @@ _LETTERS_MINOR: Final[str] = "0.17"
 
 Literal so a later contract bump cannot hide the capability from clients that
 correctly vendored 0.17.
+"""
+
+REQUEST_KEYS_SINCE_MINOR: Final[str] = "0.18"
+"""First contract minor whose handshake carries ``request_key_providers`` (#1873).
+
+The field-level gate :data:`RELATED_FIELDS_SINCE_MINOR` set the pattern for:
+every published response schema is closed, so a ``0.17`` consumer validating
+against its vendored :class:`CapabilitiesResponse` would reject the whole
+handshake on the new key. It is a literal for the reason
+:data:`_UPLOAD_MINOR` is.
 """
 
 RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
@@ -974,6 +991,22 @@ class VaultState(_WireModel):
     available: bool = Field(description="True when a scaffolded vault is readable.")
 
 
+class RequestKeyProvider(StrEnum):
+    """A vendor a writer may bring their own key for (ADR-0015, #1873).
+
+    Mirrors :data:`creek.classify.llm.request_key.REQUEST_KEY_PROVIDERS`, pinned
+    equal by a test: this module stays framework- and pipeline-free, so it does
+    not import that one.
+
+    Attributes:
+        ANTHROPIC: An Anthropic API key.
+        OPENAI: An OpenAI API key.
+    """
+
+    ANTHROPIC = "anthropic"
+    OPENAI = "openai"
+
+
 class CapabilitiesResponse(_WireModel):
     """The handshake: versions, vault readiness and the capability list.
 
@@ -994,6 +1027,11 @@ class CapabilitiesResponse(_WireModel):
         tier_model: The standing tier promise.
         capabilities: The capabilities actually served. Empty on an
             uninitialised vault.
+        request_key_providers: The vendors whose writer-supplied key this vault
+            will spend on OPEN and PERSONAL model calls, sent per request in
+            ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a
+            self-connected vault, which ignores request keys. Since contract
+            0.18, and omitted for a caller declaring an earlier minor.
     """
 
     status: CapabilitiesStatus = Field(description="Overall server readiness.")
@@ -1009,6 +1047,14 @@ class CapabilitiesResponse(_WireModel):
     tier_model: TierModel = Field(description="Standing privacy-tier promise.")
     capabilities: list[Capability] = Field(
         description="Capabilities served; empty on an uninitialised vault.",
+    )
+    request_key_providers: list[RequestKeyProvider] | None = Field(
+        default=None,
+        description=(
+            "Vendors whose writer-supplied request key this vault will use for "
+            "open and personal model calls; empty when request keys are "
+            "ignored. Since contract 0.18."
+        ),
     )
 
 

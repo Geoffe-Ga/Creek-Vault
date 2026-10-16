@@ -27,6 +27,15 @@
       "title": "Capability",
       "type": "string"
     },
+    "RequestKeyProvider": {
+      "description": "A vendor a writer may bring their own key for (ADR-0015, #1873).\n\nMirrors :data:`creek.classify.llm.request_key.REQUEST_KEY_PROVIDERS`, pinned\nequal by a test: this module stays framework- and pipeline-free, so it does\nnot import that one.\n\nAttributes:\n    ANTHROPIC: An Anthropic API key.\n    OPENAI: An OpenAI API key.",
+      "enum": [
+        "anthropic",
+        "openai"
+      ],
+      "title": "RequestKeyProvider",
+      "type": "string"
+    },
     "TierModel": {
       "additionalProperties": false,
       "description": "What the server promises about privacy tiers, advertised up front.\n\nAttributes:\n    ceilings: Every ceiling this surface admits \u2014 the two members of\n        :class:`WireTierCeiling`, in ascending breadth.\n    default: The ceiling applied when a caller declares none. Pinned to\n        ``open``, the most restrictive value, so an omitted ceiling can\n        only ever fail closed.\n    intimate_never_egresses: ``Literal[True]``. A promise, not a flag: the\n        schema admits no other value, so a server cannot advertise the\n        opposite and a client need not branch on it.",
@@ -87,7 +96,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n\u2014 which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` \u2014 the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.",
+  "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n\u2014 which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` \u2014 the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.\n    request_key_providers: The vendors whose writer-supplied key this vault\n        will spend on OPEN and PERSONAL model calls, sent per request in\n        ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a\n        self-connected vault, which ignores request keys. Since contract\n        0.18, and omitted for a caller declaring an earlier minor.",
   "properties": {
     "capabilities": {
       "description": "Capabilities served; empty on an uninitialised vault.",
@@ -111,6 +120,22 @@
       "description": "Shared APTITUDE frequency / Wavelength phase vocabulary.",
       "title": "Ontology Version",
       "type": "string"
+    },
+    "request_key_providers": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/RequestKeyProvider"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Vendors whose writer-supplied request key this vault will use for open and personal model calls; empty when request keys are ignored. Since contract 0.18.",
+      "title": "Request Key Providers"
     },
     "status": {
       "$ref": "#/$defs/CapabilitiesStatus",

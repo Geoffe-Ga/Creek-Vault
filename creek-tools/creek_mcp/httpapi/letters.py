@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Final, Literal
 from pydantic import ValidationError
 
 from creek.care.guardrail import CARE_SIGNAL, acute_distress_guard
+from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek.models import PrivacyTier
 from creek.voice_drafts import VoiceDraftAction
 from creek_mcp.api.models import (
@@ -43,7 +44,7 @@ from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.journal import admissible_external_id
-from creek_mcp.httpapi.vault import configured_vault
+from creek_mcp.httpapi.vault import configured_vault, request_key_of
 from creek_mcp.tools.handshake import vault_available
 from creek_mcp.tools.letter import (
     LetterCall,
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+    from creek.classify.llm.request_key import RequestKey
     from creek_mcp.httpapi.context import RequestContext
     from creek_mcp.tools.letter import LetterLLMFactory, LetterOutcome, LetterWrite
 
@@ -93,16 +95,19 @@ a lookup miss is caught as an ``internal_error`` rather than coerced.
 """
 
 
-def _default_factory(vault: Path) -> LetterLLMFactory:
+def _default_factory(
+    vault: Path, request_key: RequestKey | None = None
+) -> LetterLLMFactory:
     """Return the production tier-keyed letter factory bound to *vault*.
 
     Imported lazily, as :mod:`creek_mcp.httpapi.reflect` does, so the HTTP
     adapter stays startable without the MCP framework the server module
-    imports.
+    imports. *request_key* is the writer's request-scoped key (ADR-0015), or
+    ``None``; the builder decides whether it is used.
     """
     from creek_mcp.server import _build_letter_llm_factory
 
-    return _build_letter_llm_factory(vault)
+    return _build_letter_llm_factory(vault, request_key)
 
 
 async def _parsed_body(request: Request) -> LetterRequest | None:
@@ -131,6 +136,7 @@ def _write(
     parsed: LetterRequest,
     context: RequestContext,
     build_factory: Callable[[], LetterLLMFactory] | None,
+    request_key: RequestKey | None,
 ) -> LetterOutcome | None:
     """Resolve the vault and run the letter tool, both off the event loop.
 
@@ -147,7 +153,7 @@ def _write(
         external_id=external_id,
         ceiling=context.ceiling,
         consumer=context.consumer,
-        build_factory=build_factory or partial(_default_factory, vault),
+        build_factory=build_factory or partial(_default_factory, vault, request_key),
         care_guard=acute_distress_guard,
     )
     return write_letter(call, _source(parsed))
@@ -215,6 +221,10 @@ async def handle_letter(request: Request) -> Response:
     parsed = await _parsed_body(request)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
+    try:
+        request_key = request_key_of(request)
+    except InvalidRequestKeyError:
+        return error_response(ErrorCode.INVALID_REQUEST, context)
     outcome = await write_off_loop(
         _write,
         request,
@@ -222,6 +232,7 @@ async def handle_letter(request: Request) -> Response:
         parsed,
         context,
         request.app.state.letter_llm_factory,
+        request_key,
     )
     if outcome is None:
         return error_response(ErrorCode.UNAVAILABLE, context)

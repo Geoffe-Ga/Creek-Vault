@@ -14,22 +14,28 @@ from typing import TYPE_CHECKING, Any
 from creek._fslock import VaultLockTimeoutError
 from creek.classify.classify_engine import (
     LLMProviderUnavailableError,
+    RequestScopedClassifier,
     run_classify,
 )
 from creek.classify.constants import LLM_METHOD
+from creek.classify.llm.router import IntimateRoutingError
 from creek.config import load_vault_config
+from creek.models import PrivacyTier
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.model_pin import (
+    build_request_scoped_provider,
     model_pin_enforced,
     pin_refuses_stage,
     pinned_model_serves,
+    request_key_admitted,
 )
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek.classify.llm.request_key import RequestKey
     from creek.config import CreekConfig
 
 TOOL_NAME = "creek.classify"
@@ -83,6 +89,66 @@ def _require_pinned_classifier(config: CreekConfig) -> None:
         raise unpinned
 
 
+def _request_scoped_classifier(
+    config: CreekConfig, request_key: RequestKey | None
+) -> RequestScopedClassifier | None:
+    """Return the writer's provider for this LLM pass, or ``None`` (ADR-0015).
+
+    ``None`` — the configured, pinned routing exactly as before — unless a
+    request key was supplied *and* this managed vault admits it. The INTIMATE
+    route is not the key's to decide: it is the router's local route, judged
+    here against the model pin so the engine can mark it unavailable up front.
+
+    Args:
+        config: The classified vault's configuration.
+        request_key: The writer's request-scoped key, or ``None``.
+
+    Returns:
+        The request-scoped provider for OPEN/PERSONAL fragments, or ``None``.
+    """
+    if request_key is None or not request_key_admitted(
+        request_key.stage_config(), request_key
+    ):
+        return None
+    return RequestScopedClassifier(
+        provider=build_request_scoped_provider(request_key),
+        config=request_key.stage_config(),
+        intimate_route_serves=_intimate_route_serves(config),
+    )
+
+
+def _intimate_route_serves(config: CreekConfig) -> bool:
+    """Return whether the vault's own INTIMATE classification route may serve.
+
+    Outside both pin modes that is the classifier's own availability probe, so
+    ``True`` here defers to it. In a pin mode the route must be the pinned
+    model at its digest over loopback, exactly as :func:`_require_pinned_classifier`
+    demands of the whole pass when no request key is involved.
+
+    Args:
+        config: The classified vault's configuration.
+
+    Returns:
+        ``False`` when a pin mode applies and the INTIMATE route is not the
+        pinned model, or when no local INTIMATE route exists.
+    """
+    from creek.classify.llm.providers import build_provider
+
+    if not model_pin_enforced():
+        return True
+    try:
+        cfg = config.model_router.resolve("classification", PrivacyTier.INTIMATE)
+    except IntimateRoutingError:
+        return False
+    if pin_refuses_stage(cfg):
+        return False
+    try:
+        provider = build_provider(cfg)
+    except (RuntimeError, ValueError):
+        return False
+    return pinned_model_serves(provider)
+
+
 def classify_tool(
     *,
     vault_path: Path,
@@ -91,6 +157,7 @@ def classify_tool(
     retier: bool = False,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
+    request_key: RequestKey | None = None,
 ) -> dict[str, Any]:
     """Run the chosen classifier and return per-method counts.
 
@@ -130,6 +197,11 @@ def classify_tool(
             explicit tier and never re-derives it (#1497).
         privacy_tier_ceiling: Recorded for the audit trail.
         consumer: Who is calling, for the audit trail.
+        request_key: A writer's request-scoped key (ADR-0015), or ``None``.
+            On a managed vault, an LLM pass classifies OPEN and PERSONAL
+            fragments with the writer's provider; INTIMATE fragments still
+            take the router's local route or are left unclassified. Never
+            written to the audit record.
 
     Returns:
         A structured result: per-method counts on success, or a
@@ -147,7 +219,12 @@ def classify_tool(
     # vault's text — so it must be the classified vault's own file (#1409).
     config = load_vault_config(vault_path)
     try:
-        if method == LLM_METHOD:
+        request_scoped = (
+            _request_scoped_classifier(config, request_key)
+            if method == LLM_METHOD
+            else None
+        )
+        if method == LLM_METHOD and request_scoped is None:
             _require_pinned_classifier(config)
         summary = run_classify(
             vault_path=vault_path,
@@ -155,6 +232,7 @@ def classify_tool(
             method=method,
             force=force,
             retier=retier,
+            request_scoped=request_scoped,
         )
     except LLMProviderUnavailableError as exc:
         # The engine refuses to iterate when the configured LLM provider is

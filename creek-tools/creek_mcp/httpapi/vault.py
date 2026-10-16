@@ -25,7 +25,14 @@ from typing import TYPE_CHECKING, Final
 
 from yaml import YAMLError
 
+from creek.classify.llm.consent import is_managed_vault
+from creek.classify.llm.request_key import (
+    REQUEST_KEY_PROVIDERS,
+    RequestKey,
+    parse_request_key,
+)
 from creek.config import load_config
+from creek_mcp.api.routes import PROVIDER_HEADER, PROVIDER_KEY_HEADER
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -73,3 +80,36 @@ def configured_vault(request: Request) -> Path | None:
     except UNREADABLE_CONFIG:
         return None
     return resolved
+
+
+def request_key_of(request: Request) -> RequestKey | None:
+    """Return the request-scoped key *request* carries, or ``None``.
+
+    Args:
+        request: The request in flight.
+
+    Returns:
+        The parsed key, or ``None`` when neither header was sent.
+
+    Raises:
+        InvalidRequestKeyError: When the headers are present but malformed.
+            The handler answers ``invalid_request``, whose body is one fixed
+            message per code and echoes neither header.
+    """
+    return parse_request_key(
+        request.headers.get(PROVIDER_HEADER),
+        request.headers.get(PROVIDER_KEY_HEADER),
+    )
+
+
+def request_key_providers() -> list[str]:
+    """Return the providers this vault will spend a writer's own key on.
+
+    Reported on ``GET /v1/capabilities`` so a consumer can tell, before it
+    forwards a key, whether the key would be used. Empty on a self-connected
+    vault, which ignores request keys.
+
+    Returns:
+        The request-key providers on a managed vault, else an empty list.
+    """
+    return list(REQUEST_KEY_PROVIDERS) if is_managed_vault() else []
