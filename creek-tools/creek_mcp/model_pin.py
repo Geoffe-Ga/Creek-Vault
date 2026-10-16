@@ -36,7 +36,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Final
 
-from creek.classify.llm.consent import is_managed_vault
+from creek.classify.llm.consent import admits_request_keys
 from creek.classify.llm.local_boundary import is_loopback_url, loopback_only_enforced
 from creek.classify.llm.request_key import REQUEST_KEY_PROVIDERS
 from creek_mcp.model_package import (
@@ -145,7 +145,8 @@ def request_key_admitted(
     unchanged pre-ADR-0015 behaviour:
 
     - a request key was supplied;
-    - this is a managed vault (a self-connected vault keeps its own
+    - this is a managed vault whose marker is affirmative (a self-connected
+      vault, or a marker of ``0`` or ``""``, keeps its own
       operator-chosen routing and ignores a request key);
     - *cfg* names the key's own provider, and that provider is one a writer may
       bring (:data:`~creek.classify.llm.request_key.REQUEST_KEY_PROVIDERS`).
@@ -165,7 +166,7 @@ def request_key_admitted(
     """
     return (
         request_key is not None
-        and is_managed_vault(environ)
+        and admits_request_keys(environ)
         and cfg.provider == request_key.provider
         and cfg.provider in REQUEST_KEY_PROVIDERS
     )

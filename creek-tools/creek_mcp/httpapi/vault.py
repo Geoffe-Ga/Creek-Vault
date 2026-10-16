@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Final
 
 from yaml import YAMLError
 
-from creek.classify.llm.consent import is_managed_vault
+from creek.classify.llm.consent import admits_request_keys
 from creek.classify.llm.request_key import (
     REQUEST_KEY_PROVIDERS,
     RequestKey,
@@ -112,4 +112,4 @@ def request_key_providers() -> list[str]:
     Returns:
         The request-key providers on a managed vault, else an empty list.
     """
-    return list(REQUEST_KEY_PROVIDERS) if is_managed_vault() else []
+    return list(REQUEST_KEY_PROVIDERS) if admits_request_keys() else []

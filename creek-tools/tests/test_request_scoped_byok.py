@@ -36,6 +36,7 @@ from creek.classify.llm.consent import (
     CLOUD_CONSENT_ENV,
     MANAGED_VAULT_ENV,
     has_cloud_consent,
+    is_managed_vault,
 )
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
 from creek.classify.llm.providers import AnthropicProvider, OpenAIProvider
@@ -507,6 +508,36 @@ def test_admission_requires_a_managed_vault_and_a_matching_byok_provider() -> No
     assert request_key_admitted(gemini_stage, gemini_key, managed_env) is False
 
 
+@pytest.mark.parametrize("marker", ["0", "", "false", "no", "off"])
+def test_a_non_truthy_marker_admits_no_request_key(marker: str) -> None:
+    """Only an affirmative marker opens BYOK egress; presence alone does not."""
+    key = RequestKey("anthropic", CANARY_KEY)
+    stage = LLMConfig(provider="anthropic")
+
+    assert request_key_admitted(stage, key, {MANAGED_VAULT_ENV: marker}) is False
+
+
+@pytest.mark.parametrize("marker", ["1", "true", "YES", " True "])
+def test_a_truthy_marker_admits_a_request_key(marker: str) -> None:
+    """The affirmative spellings, case- and whitespace-insensitive, admit."""
+    key = RequestKey("anthropic", CANARY_KEY)
+    stage = LLMConfig(provider="anthropic")
+
+    assert request_key_admitted(stage, key, {MANAGED_VAULT_ENV: marker}) is True
+
+
+@pytest.mark.parametrize("marker", ["0", ""])
+def test_a_non_truthy_marker_still_restricts_like_any_marker(
+    monkeypatch: pytest.MonkeyPatch, marker: str
+) -> None:
+    """#1864's latch is unchanged: any presence still withholds cloud consent."""
+    monkeypatch.setenv(MANAGED_VAULT_ENV, marker)
+    monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
+
+    assert is_managed_vault() is True
+    assert has_cloud_consent() is False
+
+
 class _Inventory:
     """Count every Ollama inventory request, answering with *response*."""
 
@@ -957,22 +988,24 @@ def test_only_the_model_calling_routes_publish_the_key_headers() -> None:
 
 
 @pytest.mark.parametrize(
-    ("is_managed", "expected"),
-    [(True, ["anthropic", "openai"]), (False, [])],
-    ids=["managed", "self-connected"],
+    ("marker", "expected"),
+    [("1", ["anthropic", "openai"]), (None, []), ("0", []), ("", [])],
+    ids=["managed", "self-connected", "marker-zero", "marker-empty"],
 )
 def test_capabilities_report_request_key_support(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    is_managed: bool,
+    marker: str | None,
     expected: list[str],
 ) -> None:
     """A 0.18 caller can tell, before forwarding a key, whether it is used."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv(MODEL_PACKAGE_FILE_ENV, raising=False)
-    if is_managed:
-        monkeypatch.setenv(MANAGED_VAULT_ENV, "1")
+    if marker is None:
+        monkeypatch.delenv(MANAGED_VAULT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(MANAGED_VAULT_ENV, marker)
     vault = seed_vault(tmp_path / "vault")
 
     with _client(vault) as http:
