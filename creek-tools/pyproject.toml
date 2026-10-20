@@ -179,7 +179,10 @@ ocr = [
     # >=12.3.0: fixes 8 pip-audit advisories incl. PYSEC-2026-2253..2257,
     # PYSEC-2026-3451..3453 (font decompression-bomb DoS, WindowsViewer
     # shell injection) reachable via OCR/pptx/markdownify ingestion (#843).
-    "pillow>=12.3.0",
+    # Security: pillow 12.3.0 carries eight 2026-10 advisories —
+    # CVE-2026-112395, -112397, -112400, -112404 and -112895 through
+    # -112899 — all fixed in 13.0.0 (#1883).
+    "pillow>=13.0.0",
 ]
 documents = [
     "python-docx>=1.0.0",
@@ -373,6 +376,12 @@ constraint-dependencies = [
     # 21.7.12, and 21.7.13; 21.7.13 is the first release fixing all four
     # (#1823).
     "virtualenv>=21.7.13",
+    # Security: certifi below 2026.10.19 ships an emSign CA root whose
+    # intermediate keys are compromised — PYSEC-2026-4320
+    # (GHSA-6q48-6c7w-9gw2). Transitive via requests/httpx; 2026.10.19
+    # removes the root (#1883). Held in both manifests, so the #1328
+    # parity guard keeps them from drifting apart.
+    "certifi>=2026.10.19",
 ]
 
 [tool.setuptools.packages.find]

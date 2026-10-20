@@ -2622,3 +2622,147 @@ def test_the_manifest_scanner_sees_every_declared_requirement() -> None:
             f"{sorted(scanned - parsed)}. A floor the scanner cannot see "
             "is one the parity guard cannot require of the sibling"
         )
+
+
+#: First certifi release with the compromised emSign CA root removed.
+#: PYSEC-2026-4320 (GHSA-6q48-6c7w-9gw2): the bundle trusted a root whose
+#: intermediate CA keys are compromised, so a holder of those keys could
+#: present a certificate every requests/httpx caller would accept.
+_CERTIFI_PATCHED_VERSION = Version("2026.10.19")
+
+#: The last certifi release still shipping that root in creek-tools.
+_CERTIFI_LAST_VULNERABLE = Version("2026.7.22")
+
+
+def _locked_version_of(name: str) -> Version:
+    """Return the version ``uv.lock`` resolves for *name*.
+
+    One reader for the floors added in #1883, rather than another
+    per-package copy of the same fifteen lines.
+
+    Args:
+        name: Distribution name as it appears in the lockfile.
+
+    Returns:
+        The resolved version. Fails the calling test when the lockfile
+        carries no entry for *name*.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == name:
+            return Version(str(package["version"]))
+    pytest.fail(f"{name} has no [[package]] entry in uv.lock")
+
+
+def _declared_specifier_of(name: str) -> SpecifierSet:
+    """Return the specifier declared for *name* anywhere in ``[project]``.
+
+    Searches ``dependencies`` first, then every
+    ``optional-dependencies`` group, so a floor on an extra-only package
+    is found in the same call as one on a base dependency.
+
+    Args:
+        name: Distribution name as declared in ``pyproject.toml``.
+
+    Returns:
+        The specifier set attached to that requirement. Fails the
+        calling test when no group declares *name*.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    project = pyproject["project"]
+    groups: list[list[str]] = [project.get("dependencies", [])]
+    groups.extend(project.get("optional-dependencies", {}).values())
+    for group in groups:
+        for entry in group:
+            requirement = Requirement(entry)
+            if canonicalize_name(requirement.name) == canonicalize_name(name):
+                return requirement.specifier
+    pytest.fail(f"{name} is declared in no [project] dependency group")
+
+
+def _constraint_specifier_of(name: str) -> SpecifierSet:
+    """Return the ``[tool.uv]`` constraint specifier for *name*.
+
+    Args:
+        name: Distribution name as constrained in ``pyproject.toml``.
+
+    Returns:
+        The specifier set attached to that constraint entry. Fails the
+        calling test when the constraint is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if canonicalize_name(requirement.name) == canonicalize_name(name):
+            return requirement.specifier
+    pytest.fail(
+        f"{name} has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def test_certifi_constraint_excludes_the_compromised_ca_root() -> None:
+    """The certifi constraint rejects the last release shipping the root."""
+    specifier = _constraint_specifier_of("certifi")
+    assert not specifier.contains(str(_CERTIFI_LAST_VULNERABLE)), (
+        f"certifi constraint {specifier!s} still admits "
+        f"{_CERTIFI_LAST_VULNERABLE}, which ships the compromised emSign "
+        "root (PYSEC-2026-4320)"
+    )
+
+
+def test_certifi_constraint_admits_the_patched_release() -> None:
+    """The constraint accepts 2026.10.19, the release that drops the root."""
+    specifier = _constraint_specifier_of("certifi")
+    assert specifier.contains(str(_CERTIFI_PATCHED_VERSION)), (
+        f"certifi constraint {specifier!s} rejects "
+        f"{_CERTIFI_PATCHED_VERSION}; the patched release itself must "
+        "satisfy the constraint"
+    )
+
+
+def test_locked_certifi_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves certifi to >= 2026.10.19.
+
+    A correct constraint with a stale lock still installs the
+    compromised bundle, and pip-audit reads the lock.
+    """
+    locked = _locked_version_of("certifi")
+    assert locked >= _CERTIFI_PATCHED_VERSION, (
+        f"uv.lock pins certifi {locked}, below the patched "
+        f"{_CERTIFI_PATCHED_VERSION} (PYSEC-2026-4320); relock after "
+        "raising the constraint"
+    )
+
+
+#: First pillow release clear of the eight 2026-10 advisories —
+#: CVE-2026-112395, -112397, -112400, -112404 and -112895 through -112899,
+#: all image-parsing flaws reachable from the OCR and document extras.
+_PILLOW_PATCHED_VERSION = Version("13.0.0")
+
+#: The last pillow release carrying all eight.
+_PILLOW_LAST_VULNERABLE = Version("12.3.0")
+
+
+def test_pillow_floor_rejects_last_vulnerable_release() -> None:
+    """The declared pillow floor excludes 12.3.0."""
+    specifier = _declared_specifier_of("pillow")
+    assert not specifier.contains(str(_PILLOW_LAST_VULNERABLE)), (
+        f"pillow floor {specifier!s} still admits "
+        f"{_PILLOW_LAST_VULNERABLE}, which carries eight 2026-10 advisories"
+    )
+
+
+def test_locked_pillow_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves pillow to >= 13.0.0."""
+    locked = _locked_version_of("pillow")
+    assert locked >= _PILLOW_PATCHED_VERSION, (
+        f"uv.lock pins pillow {locked}, below the patched "
+        f"{_PILLOW_PATCHED_VERSION}; relock after raising the floor"
+    )

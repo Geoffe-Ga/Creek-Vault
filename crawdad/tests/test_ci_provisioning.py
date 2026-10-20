@@ -106,7 +106,7 @@ _CRAWDAD_JOB = "crawdad"
 _CRAWDAD_SCOPE_MARKER = "crawdad"
 
 #: The workflow-scoped env var holding the pinned uv release. Asserted
-#: by *name*: the version itself (``0.11.16`` today) lives at
+#: by *name*: the version itself (``0.13.4`` today) lives at
 #: ``ci.yml``'s ``env:`` block and is shared by five jobs — four before
 #: #1501, plus crawdad — so hardcoding it here would turn every
 #: deliberate uv bump into a crawdad test failure in an unrelated file.
