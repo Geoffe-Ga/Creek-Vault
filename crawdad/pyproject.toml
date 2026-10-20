@@ -93,7 +93,7 @@ dev = [
     # or nothing forces pip-audit and uv into the lock CI installs from
     # (#979, #1501).
     "pip-audit>=2.10.0",
-    "uv>=0.11.16",
+    "uv>=0.13.4",
     # Declared because #1501 deleted `pip install --upgrade pip
     # setuptools wheel` from the CI job. The primary reason is
     # completeness: with these two declared, the environment CI tests is
