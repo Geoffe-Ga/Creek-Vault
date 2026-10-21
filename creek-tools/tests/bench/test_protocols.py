@@ -12,10 +12,10 @@ from __future__ import annotations
 import inspect
 
 from creek.models import PrivacyTier
+from creek_mcp.bench.corpus import no_grounding
 from creek_mcp.bench.fake import fake_factory
 from creek_mcp.bench.ollama_client import BenchOllamaClient
 from creek_mcp.bench.protocols import LLMCallable, LLMFactory, Retriever
-from creek_mcp.bench.runner import _no_grounding
 from creek_mcp.tools import reflect
 
 
@@ -30,7 +30,7 @@ def test_bench_factories_satisfy_the_factory_protocol() -> None:
 
 def test_hermetic_grounder_satisfies_the_retriever_protocol() -> None:
     """The no-grounding retriever is a valid ``retrieve=`` seam."""
-    retriever: Retriever = _no_grounding
+    retriever: Retriever = no_grounding
     assert inspect.signature(retriever).parameters.keys() == {
         "query",
         "vault",

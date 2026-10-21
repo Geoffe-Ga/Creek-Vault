@@ -35,7 +35,9 @@ from creek_mcp.bench.runner import (
     max_context_words,
     run_bench,
 )
+from creek_mcp.bench.tokens import Surface
 from creek_mcp.bench.trial import Phase, Sweep
+from creek_mcp.bench.usage import TokenBasis
 from creek_mcp.tools.reflect import GroundingSession, _build_prompt, reflect_tool
 from tests.bench.conftest import FakeModel, Recorded, make_plan, run_metadata
 
@@ -589,3 +591,69 @@ def test_unanchored_quote_really_yields_empty(tmp_path: Path) -> None:
         retrieve=lambda query, vault, override: [],
     )
     assert result["status"] == "empty"
+
+
+def test_every_ok_trial_carries_measured_tokens(tmp_path: Path) -> None:
+    """Fake mode measures real counts, so no figure rests on an assumption."""
+    model = FakeModel()
+    plan = make_plan(model, cold_trials=1, warm_trials=2, concurrency_levels=(2,))
+    report = run_bench(plan, tmp_path / "corpus")
+    seen = 0
+    for summary in report.per_sweep.values():
+        for trial in summary.trials:
+            if trial.outcome is Outcome.OK:
+                seen += 1
+                assert trial.prompt_tokens is not None
+                assert trial.output_tokens is not None
+                assert trial.max_output_tokens == _REFLECT_MAX_OUTPUT_TOKENS
+    assert seen >= 4
+
+
+def test_token_summaries_are_reported_per_sweep_and_per_phase(
+    tmp_path: Path,
+) -> None:
+    """Token aggregates sit beside the latency ones, at both grains."""
+    plan = make_plan(FakeModel(), cold_trials=1, warm_trials=2)
+    report = run_bench(plan, tmp_path / "corpus")
+    sweep = report.per_sweep[Sweep.COLD_WARM]
+    assert sweep.tokens.reported_count == len(sweep.trials)
+    assert sweep.tokens.prompt.p50 is not None
+    assert sweep.tokens.prompt.p95 is not None
+    assert sweep.tokens.output.p50 is not None
+    for phase in (Phase.COLD, Phase.WARM):
+        phase_tokens = report.per_sweep[Sweep.COLD_WARM].per_phase[phase].tokens
+        assert phase_tokens.prompt.p95 is not None
+        assert phase_tokens.output.p95 is not None
+
+
+def test_the_run_level_token_block_names_every_surface(tmp_path: Path) -> None:
+    """The block #1895 and #1897 consume is on the report by default."""
+    plan = make_plan(FakeModel(), measure_tokens=True)
+    report = run_bench(plan, tmp_path / "corpus")
+    block = report.tokens_per_reflection
+    assert block.basis is TokenBasis.BYTE_UPPER_BOUND
+    assert set(block.per_surface) == set(Surface)
+    assert block.prompt_overhead_within_bound is True
+
+
+def test_a_backend_without_usage_still_completes_the_run(tmp_path: Path) -> None:
+    """No usage report means ``None`` counts — not a failed sweep."""
+    model = FakeModel(reports_usage=False)
+    plan = make_plan(model, warm_trials=2, measure_tokens=True)
+    report = run_bench(plan, tmp_path / "corpus")
+    assert report.verdict is Verdict.FITS
+    sweep = report.per_sweep[Sweep.COLD_WARM]
+    assert sweep.tokens.unreported_count == len(sweep.trials)
+    assert sweep.tokens.prompt.p50 is None
+    for trial in sweep.trials:
+        assert trial.prompt_tokens is None
+        assert trial.output_tokens is None
+    assert report.tokens_per_reflection.basis is TokenBasis.UNREPORTED
+
+
+def test_the_token_pass_can_be_switched_off(tmp_path: Path) -> None:
+    """A latency-only run says the block was not measured."""
+    plan = make_plan(FakeModel(), measure_tokens=False)
+    report = run_bench(plan, tmp_path / "corpus")
+    assert report.tokens_per_reflection.basis is TokenBasis.NOT_MEASURED
+    assert report.tokens_per_reflection.per_surface == {}

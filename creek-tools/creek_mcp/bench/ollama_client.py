@@ -8,6 +8,11 @@ does not: evicting the model for a cold trial (``keep_alive: 0``), resolving
 the weights' digest and details for the report, and reading the resident
 model size from ``/api/ps``.
 
+It also reads back the runtime's own token counters —
+``prompt_eval_count`` and ``eval_count`` — so a run reports measured tokens
+per reflection rather than ADR-0016's planning assumption (#1893). Those are
+the provider's numbers, not the harness's arithmetic.
+
 It shares production's request timeout (read from ``OllamaProvider`` at call
 time) so a trial is shed exactly when a real reflection would be. It never
 changes production behaviour; whether production should pin ``num_ctx`` too is
@@ -23,7 +28,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import httpx
 
@@ -31,6 +36,7 @@ from creek.classify.llm import providers
 from creek.classify.llm.local_boundary import ollama_client
 from creek_mcp.bench.metadata import UNKNOWN
 from creek_mcp.bench.outcome import ContextOverflowError, ProviderUnavailableError
+from creek_mcp.bench.usage import TokenBasis, TokenUsage
 
 if TYPE_CHECKING:
     from creek.models import PrivacyTier
@@ -94,8 +100,47 @@ def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _counter(value: object) -> int | None:
+    """Return *value* when it is a non-negative token counter, else ``None``.
+
+    ``bool`` is an ``int`` in Python, so it is excluded explicitly: a body that
+    sent ``true`` reported no count, and must not be read as one token.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _reported(prompt_tokens: int | None, output_tokens: int | None) -> TokenUsage:
+    """Label the counters the runtime sent, or say it sent none.
+
+    The basis is the claim a cost line leans on, so it says
+    ``provider_reported`` only when a counter actually arrived: a body that
+    omitted both reported nothing, whatever its shape.
+    """
+    reported = prompt_tokens is not None or output_tokens is not None
+    return TokenUsage(
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        basis=TokenBasis.PROVIDER_REPORTED if reported else TokenBasis.UNREPORTED,
+    )
+
+
+class Completion(NamedTuple):
+    """One generation's text and the runtime's own token counters.
+
+    Attributes:
+        text: The completion.
+        usage: What the runtime reported it evaluated and generated. Either
+            count is ``None`` when the body omitted it; nothing is derived.
+    """
+
+    text: str
+    usage: TokenUsage
+
+
 class _BenchLLM:
-    """One bounded completion callable; positively local."""
+    """One bounded completion callable; positively local, usage-reporting."""
 
     is_cloud: bool = False
 
@@ -103,10 +148,17 @@ class _BenchLLM:
         """Bind *client* and this call's output ceiling."""
         self._client = client
         self._num_predict = num_predict
+        self._usage: TokenUsage | None = None
 
     def __call__(self, prompt: str) -> str:
-        """Generate a completion for *prompt*."""
-        return self._client.generate(prompt, num_predict=self._num_predict)
+        """Generate a completion for *prompt*, keeping its reported usage."""
+        completion = self._client.generate(prompt, num_predict=self._num_predict)
+        self._usage = completion.usage
+        return completion.text
+
+    def token_usage(self) -> TokenUsage | None:
+        """Return the last completion's counters, or ``None`` before one."""
+        return self._usage
 
 
 class BenchOllamaClient:
@@ -155,15 +207,16 @@ class BenchOllamaClient:
         response.raise_for_status()
         return response.json()
 
-    def generate(self, prompt: str, *, num_predict: int) -> str:
-        """Return the model's completion for *prompt*.
+    def generate(self, prompt: str, *, num_predict: int) -> Completion:
+        """Return the model's completion for *prompt*, with its token counts.
 
         Args:
             prompt: The fully-formatted prompt.
             num_predict: The caller's output ceiling, capped by the run's.
 
         Returns:
-            The completion text; empty when the body is malformed.
+            The completion text and the runtime's reported usage. The text is
+            empty, and both counts ``None``, when the body is malformed.
         """
         ceiling = min(num_predict, self._num_predict)
         payload = {
@@ -178,9 +231,15 @@ class BenchOllamaClient:
         }
         data = self._request("POST", "/api/generate", payload)
         if not isinstance(data, dict):
-            return ""
+            return Completion(text="", usage=_reported(None, None))
         self._refuse_truncation(data.get("prompt_eval_count"), ceiling)
-        return str(data.get("response", ""))
+        return Completion(
+            text=str(data.get("response", "")),
+            usage=_reported(
+                _counter(data.get("prompt_eval_count")),
+                _counter(data.get("eval_count")),
+            ),
+        )
 
     def _refuse_truncation(self, evaluated: object, ceiling: int) -> None:
         """Raise when the evaluated prompt left no room for the output.
