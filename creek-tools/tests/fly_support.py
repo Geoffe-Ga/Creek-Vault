@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +24,11 @@ from creek_mcp.provisioning.fly import (
     FlyRuntimeSecrets,
 )
 from creek_mcp.provisioning.models import JobOperation, JobState, ProvisioningJob
+from creek_mcp.provisioning.pool_bundle import (
+    PoolCredential,
+    PoolCredentialInventory,
+    PoolRuntimeBundle,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,11 +44,56 @@ ROUTING_PUBLIC_URL = "https://vault-router.example.com"
 _FLY_VOLUME_NAME = re.compile(r"[a-z0-9_]{1,30}")
 
 
+POOL_URL = "https://pool.vendor.example"
+POOL_VENDOR_KEY = "vendor-pool-key-secret-canary"
+POOL_MANIFEST_JSON = json.dumps(
+    {
+        "schema_version": 1,
+        "runtime_name": "vendor-enclave",
+        "runtime_version": "1.4.0",
+        "runtime_digest": "b" * 64,
+        "model_name": "pool-model-a",
+        "model_blob_sha256": "c" * 64,
+        "runtime_inventory_digest": "d" * 64,
+        "quantization": "mxfp4",
+        "parameter_count": 120_000_000_000,
+        "size_bytes": 65_000_000_000,
+        "license_spdx": "Apache-2.0",
+        "license_url": "https://example.invalid/license",
+    },
+    sort_keys=True,
+)
+
+
+def pool_bundle(
+    *,
+    bundle_version: int = 1,
+    pool_url: str = POOL_URL,
+    model_name: str = "pool-model-a",
+    key: str = POOL_VENDOR_KEY,
+) -> PoolRuntimeBundle:
+    """Return one synthetic per-activation pool bundle."""
+    return PoolRuntimeBundle(
+        bundle_version=bundle_version,
+        pool_url=pool_url,
+        manifest_json=POOL_MANIFEST_JSON.replace("pool-model-a", model_name),
+        credential=PoolCredential.vendor_key(key),
+    )
+
+
 @dataclass
 class FakeSecretManager:
-    """Return stable per-activation runtime secrets and record revocation."""
+    """Return stable per-activation runtime secrets and record revocation.
+
+    With an *issuer* the first issuance for an activation mints that
+    activation's pool bundle and every later issuance returns the stored one,
+    which is what makes ``_verify_machine`` per-activation (ADR-0016 D1.1).
+    """
 
     revoked: set[str]
+    issuer: Any | None = None
+    issued: dict[str, FlyRuntimeSecrets] = field(default_factory=dict)
+    call_log: list[tuple[str, str]] | None = None
 
     def issue(
         self,
@@ -53,18 +103,35 @@ class FakeSecretManager:
         requester_identity: str,
     ) -> FlyRuntimeSecrets:
         """Return the same secret bundle on every retry."""
-        del activation_id, requester_identity
-        return FlyRuntimeSecrets(
+        del requester_identity
+        stored = self.issued.get(activation_id)
+        if stored is not None:
+            return stored
+        pool = None if self.issuer is None else self.issuer.issue(activation_id)
+        bundle = FlyRuntimeSecrets(
             consumer_credential=CONSUMER_TOKEN,
             replay_state="r" * 64,
             consumer_registry=f"{consumer_identity}={CONSUMER_TOKEN}\n".encode(),
             tls_certificate=b"test-certificate",
             tls_private_key=TLS_KEY.encode(),
+            pool=pool,
         )
+        self.issued[activation_id] = bundle
+        return bundle
 
     def revoke(self, activation_id: str) -> None:
-        """Record an idempotent revocation."""
+        """Record an idempotent revocation, confirming the pool refusal first.
+
+        When a *call_log* is shared with :class:`FakeFlyAPI`, the revocation is
+        appended to it, so a test can prove the pool refused the credential
+        before any Machine was destroyed (T11).
+        """
+        stored = self.issued.get(activation_id)
+        if self.issuer is not None and stored is not None and stored.pool is not None:
+            self.issuer.revoke(stored.pool)
         self.revoked.add(activation_id)
+        if self.call_log is not None:
+            self.call_log.append(("REVOKE", "pool-credential"))
 
 
 class FakeFlyAPI:
@@ -341,6 +408,7 @@ def fly_driver(
     *,
     discover_organization_apps: bool = False,
     fly_replay_enabled: bool = False,
+    credentials: PoolCredentialInventory | None = None,
 ) -> FlyProviderDriver:
     """Return a driver over *api* with the synthetic org-scoped credential."""
     credential = FlyCredential(
@@ -358,7 +426,11 @@ def fly_driver(
         fly_replay_enabled=fly_replay_enabled,
     )
     return FlyProviderDriver(
-        policy, credential, secrets or FakeSecretManager(set()), fly_client(api)
+        policy,
+        credential,
+        secrets or FakeSecretManager(set()),
+        fly_client(api),
+        pool_credentials=credentials,
     )
 
 
