@@ -11,6 +11,7 @@ import functools
 import json
 import socket
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -750,3 +751,172 @@ def test_pool_report_holds_no_url_or_hostname(
     assert host not in written
     assert "pool-canary" not in written
     assert "vendor.example" not in written
+
+
+# --------------------------------------------------------------------------
+# Metered per-token pricing (#1897).
+# --------------------------------------------------------------------------
+
+_METERED_MODEL = "synthetic-fixture-model"
+"""Not a vendor id: no ADR-0016 Options-table figure is a current price."""
+
+
+def _metered_price_file(tmp_path: Path, **overrides: object) -> Path:
+    """Write a metered sheet with obviously synthetic round prices."""
+    sheet: dict[str, object] = {
+        "observed_on": "2026-10-01",
+        "currency": "USD",
+        "source": "synthetic-fixture",
+        "metered_per_million": {
+            _METERED_MODEL: {
+                "input_per_million": "1.00",
+                "output_per_million": "4.00",
+            }
+        },
+    }
+    sheet.update(overrides)
+    path = tmp_path / "metered.json"
+    path.write_text(json.dumps(sheet), encoding="utf-8")
+    return path
+
+
+def _token_report(tmp_path: Path, *, basis: str) -> Path:
+    """Run the hermetic harness, then rewrite only its token basis.
+
+    The fake backend honestly reports ``byte_upper_bound``, so a
+    ``provider_reported`` fixture has to be written: the point of the test is
+    what a *citable* basis unlocks, and no hermetic run can produce one.
+    """
+    out = tmp_path / "report.json"
+    assert cli.main(_reflect(tmp_path)) == 0
+    document = json.loads(out.read_text(encoding="utf-8"))
+    document["tokens_per_reflection"]["basis"] = basis
+    out.write_text(json.dumps(document), encoding="utf-8")
+    return out
+
+
+def _metered_argv(tmp_path: Path, report: Path, out: Path, *extra: str) -> list[str]:
+    """Build a metered ``cost`` invocation."""
+    return [
+        "cost",
+        "--price-file",
+        str(_metered_price_file(tmp_path)),
+        "--today",
+        "2026-10-07",
+        "--metered-model",
+        _METERED_MODEL,
+        "--token-report",
+        str(report),
+        "--out",
+        str(out),
+        *extra,
+    ]
+
+
+def test_metered_cost_reports_per_1000_and_per_account_month(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC1: ``cost`` prices a metered sheet at 100/mo, 10,000/mo and 20/account."""
+    report = _token_report(tmp_path, basis="provider_reported")
+    out = tmp_path / "metered-cost.json"
+    assert cli.main(_metered_argv(tmp_path, report, out)) == 0
+    estimate = json.loads(out.read_text(encoding="utf-8"))
+    assert estimate["kind"] == "model"
+    assert estimate["shape"] == "metered_tokens"
+    assert estimate["token_basis"] == "provider_reported"
+    volumes = {one["reflections_per_month"]: one for one in estimate["per_volume"]}
+    assert set(volumes) == {100, 10_000}
+    assert estimate["monthly_reflection_cap"] == 20
+    assert Decimal(estimate["cost_per_account_month"]) > 0
+    assert estimate["vendor_key_input_token_cap"] > 0
+    assert estimate["vendor_key_output_token_cap"] > 0
+    stdout = capsys.readouterr().out
+    assert "shape=metered_tokens" in stdout
+    assert "basis=provider_reported" in stdout
+    assert "per_account_month=" in stdout
+
+
+@pytest.mark.parametrize("basis", ["byte_upper_bound", "unreported", "not_measured"])
+def test_metered_cost_refuses_an_uncitable_basis(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], basis: str
+) -> None:
+    """AC3: no price is quoted from a bound or an absence, and nothing is written."""
+    report = _token_report(tmp_path, basis=basis)
+    out = tmp_path / "metered-cost.json"
+    assert cli.main(_metered_argv(tmp_path, report, out)) == 2
+    assert "provider-reported" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_metered_cost_refuses_a_currency_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC4: a USD sheet asked for as EUR is refused, never converted."""
+    report = _token_report(tmp_path, basis="provider_reported")
+    out = tmp_path / "metered-cost.json"
+    argv = _metered_argv(tmp_path, report, out, "--metered-currency", "EUR")
+    assert cli.main(argv) == 2
+    assert "currency" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_metered_cost_refuses_a_stale_sheet(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC2: the dated-sheet rules bind the metered sheet too, with exit 2."""
+    report = _token_report(tmp_path, basis="provider_reported")
+    out = tmp_path / "metered-cost.json"
+    argv = [
+        "cost",
+        "--price-file",
+        str(_metered_price_file(tmp_path, observed_on="2026-01-01")),
+        "--today",
+        "2026-10-07",
+        "--metered-model",
+        _METERED_MODEL,
+        "--token-report",
+        str(report),
+        "--out",
+        str(out),
+    ]
+    assert cli.main(argv) == 2
+    assert "stale" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_partial_metered_flags_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The metered pair is all or none, like the allowance trio."""
+    argv = [
+        "cost",
+        "--price-file",
+        str(_metered_price_file(tmp_path)),
+        "--today",
+        "2026-10-07",
+        "--metered-model",
+        _METERED_MODEL,
+        "--out",
+        str(tmp_path / "metered-cost.json"),
+    ]
+    assert cli.main(argv) == 2
+    assert "--token-report" in capsys.readouterr().err
+
+
+def test_metered_only_flag_without_the_pair_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A metered-only flag on the Machine-month path is refused, not ignored."""
+    argv = [
+        "cost",
+        "--price-file",
+        str(_price_file(tmp_path, "2026-10-01")),
+        "--today",
+        "2026-10-07",
+        "--monthly-cap",
+        "5",
+        "--out",
+        str(tmp_path / "cost.json"),
+    ]
+    assert cli.main(argv) == 2
+    assert "--monthly-cap" in capsys.readouterr().err

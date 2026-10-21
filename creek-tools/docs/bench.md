@@ -220,6 +220,11 @@ yet.
 The cost model is arithmetic over an operator-supplied price sheet. It is never
 a measurement: every estimate says `"kind": "model"`. It fetches nothing.
 
+Two cost **shapes** share that one sheet, named by the estimate's `shape`
+field: `machine_month` (a Fly Machine and volume per vault) and
+`metered_tokens` (ADR-0016's per-token vendor pool). A sheet may carry either
+block, both, or neither.
+
 A sheet is refused in four cases:
 
 - it is undated;
@@ -242,6 +247,10 @@ The result is rounded half-up to the cent. It is computed at `--duty-low` and
 --linger-seconds L`, it is also computed at the duty that allowance implies,
 against Fly's 730-hour billing month.
 
+`cost_bands` prices USD only — its output fields say `usd` — so it refuses a
+sheet whose `currency` is anything else, and refuses a metered-only sheet by
+naming the missing `machine_monthly_usd` block rather than guessing a price.
+
 Price-sheet schema. The **values below are an example, not current prices**:
 
 ```json
@@ -252,6 +261,80 @@ Price-sheet schema. The **values below are an example, not current prices**:
   "machine_monthly_usd": {"shared-1x-1024mb": "5.70"},
   "volume_gb_month_usd": "0.15",
   "rootfs_gb_month_usd": "0.15"
+}
+```
+
+## Metered per-token pricing (ADR-0016 / #1897)
+
+ADR-0016 is ratified as **O5**, a vendor-attested confidential pool billed per
+token, so cost tracks price per token rather than a machine's parameter count.
+`--metered-model` and `--token-report` switch `cost` to that shape:
+
+```bash
+./scripts/bench.sh cost \
+  --price-file prices.json \
+  --metered-model MODEL_ID \
+  --token-report report.json \
+  --out metered-cost.json
+```
+
+`--token-report` is a benchmark report, and the estimate is priced from its
+`tokens_per_reflection` block — the worst measured prompt count and the worst
+measured output count across the three surfaces. The worst surface is
+deliberate: adepthood's monthly allowance is shared across reflections and
+letters, so any one charged generation could be the expensive one. INTIMATE
+content never reaches the pool (ADR-0016 Decision 5), so it contributes no pool
+cost.
+
+**Only `provider_reported` counts may price anything.** A fake run's
+`byte_upper_bound` is a bound on *bytes*; `unreported` and `not_measured` are
+absences. Each is refused with exit 2 — never estimated, and never silently
+backed off to the superseded 2,500 + 128 planning assumption. Refusing to
+produce a figure is the correct outcome; a plausible figure quoted from a basis
+that cannot support it is not, because someone budgets against it.
+
+**Currency is declared, never converted.** A sheet says `USD` or `EUR`;
+`--metered-currency` says which the caller expects, and a mismatch is refused.
+Nothing here holds an exchange rate.
+
+What the estimate reports:
+
+| Field | Meaning |
+|---|---|
+| `shape` | `metered_tokens`. |
+| `token_basis` | The measured block's basis — always `provider_reported`, because nothing else is constructible. |
+| `prompt_tokens_per_reflection` / `output_tokens_per_reflection` | The worst measured counts the figures rest on. |
+| `per_volume[]` | One row per monthly fleet volume: `reflections_per_month`, `tokens_per_month`, `cost_per_1000_reflections` (R6's figure), `cost_per_month`. Defaults are ADR-0016's two volumes, 100/month (the pilot ceiling) and 10,000/month (500 accounts at the default allowance). |
+| `monthly_reflection_cap` / `cost_per_account_month` | The per-account allowance priced (default 20, mirroring adepthood's `DEFAULT_MONTHLY_CAP`) and one account's bill at it. |
+| `vendor_key_input_token_cap` / `vendor_key_output_token_cap` | ADR-0016 Decision 3 item 4's independent per-activation caps: `tokens spent so far + monthly cap x measured tokens per reflection x 2`, computed by `creek_mcp/provisioning/pool_bundle.py`'s `pool_cap_tokens` — the same function that sizes the real vendor key, so the reported number is the number set. Pass `--tokens-spent-input` / `--tokens-spent-output` to roll a key forward. |
+
+**Cost per 1,000 reflections is the same at every volume.** Metering has no
+fixed component, so volume buys no discount. That equality is R6's finding
+about O5, not a defect: it is what makes the cap, not the volume, the brake.
+
+Metered amounts are rounded **up** to the micro-unit. A reflection can cost
+well under a cent, and rounding a price down understates a bill.
+
+**No spend.** ADR-0016 Decision 4 authorizes none: there is no live price
+fetch, no vendor call and no provisioned resource anywhere in this path. Prices
+come only from the dated operator file, and the token counts only from a
+hermetic or pinned-local measurement.
+
+Metered price-sheet schema. The **values below are deliberately synthetic**;
+every figure in ADR-0016's Options table was read through a web-search summary
+and must be re-read from a dated sheet before it prices anything:
+
+```json
+{
+  "observed_on": "2026-10-01",
+  "currency": "USD",
+  "source": "synthetic-fixture",
+  "metered_per_million": {
+    "example-model-id": {
+      "input_per_million": "1.00",
+      "output_per_million": "4.00"
+    }
+  }
 }
 ```
 

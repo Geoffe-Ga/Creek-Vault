@@ -6,7 +6,11 @@ Two subcommands:
   ``--mode fake`` (the default) is hermetic; ``--mode live`` drives an
   operator-supplied Ollama and requires ``--model``, ``--digest`` and
   ``--git-sha`` (``scripts/bench.sh`` supplies the last from the checkout).
-- ``cost`` models USD per account-month from an operator price sheet.
+- ``cost`` models cost from an operator price sheet: a Fly Machine-month per
+  account by default, or — with ``--metered-model`` and ``--token-report`` —
+  ADR-0016's metered per-token pool, priced from the *measured* token block in
+  a benchmark report. A report whose basis is not ``provider_reported`` is
+  refused: a fake run's byte bound and an absent measurement are not prices.
 
 Exit codes: ``0`` success; ``2`` refusal — a fixed message naming the flag or
 field at fault, never the value; ``1`` any other failure, named by exception
@@ -30,11 +34,13 @@ from pydantic import ValidationError
 
 from creek_mcp.bench import HARNESS_VERSION
 from creek_mcp.bench.cost import (
+    DEFAULT_MONTHLY_REFLECTION_CAP,
     Allocation,
     AllowanceUse,
     DutyBand,
     cost_bands,
     load_price_sheet,
+    metered_estimate,
 )
 from creek_mcp.bench.fake import FakePool, fake_factory
 from creek_mcp.bench.local_only import (
@@ -45,11 +51,13 @@ from creek_mcp.bench.local_only import (
 from creek_mcp.bench.metadata import RunMetadata
 from creek_mcp.bench.ollama_client import BenchOllamaClient
 from creek_mcp.bench.pool_client import BenchPoolClient
-from creek_mcp.bench.report import write_report
+from creek_mcp.bench.report import load_report, write_report
 from creek_mcp.bench.runner import Backend, BenchPlan, Workload, run_bench
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from creek_mcp.bench.cost import PriceSheet
 
 EXIT_OK: Final[int] = 0
 EXIT_FAILED: Final[int] = 1
@@ -81,6 +89,19 @@ _ALLOWANCE_FLAGS: Final[tuple[str, ...]] = (
     "--seconds-per-reflection",
     "--linger-seconds",
 )
+_METERED_FLAGS: Final[tuple[str, ...]] = ("--metered-model", "--token-report")
+_METERED_ONLY_FLAGS: Final[tuple[tuple[str, str, object], ...]] = (
+    ("metered_currency", "--metered-currency", "USD"),
+    ("monthly_cap", "--monthly-cap", DEFAULT_MONTHLY_REFLECTION_CAP),
+    ("tokens_spent_input", "--tokens-spent-input", 0),
+    ("tokens_spent_output", "--tokens-spent-output", 0),
+)
+"""Flags that mean nothing to the Machine-month shape, with their defaults.
+
+Given without the metered pair they would be silently ignored, and a cost flag
+that looks applied but is not is exactly the shape of a wrong number someone
+budgets against. Refused instead.
+"""
 _FAILURES: Final[tuple[type[BaseException], ...]] = (
     OSError,
     RuntimeError,
@@ -182,6 +203,23 @@ def _add_cost(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -
     parser.add_argument("--allowance", type=int, default=None)
     parser.add_argument("--seconds-per-reflection", type=Decimal, default=None)
     parser.add_argument("--linger-seconds", type=Decimal, default=None)
+    parser.add_argument(
+        "--metered-model",
+        default=None,
+        help="price ADR-0016's per-token pool for this model id",
+    )
+    parser.add_argument(
+        "--token-report",
+        type=Path,
+        default=None,
+        help="benchmark report whose measured token block prices the pool",
+    )
+    parser.add_argument("--metered-currency", choices=("USD", "EUR"), default="USD")
+    parser.add_argument(
+        "--monthly-cap", type=int, default=DEFAULT_MONTHLY_REFLECTION_CAP
+    )
+    parser.add_argument("--tokens-spent-input", type=int, default=0)
+    parser.add_argument("--tokens-spent-output", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)
 
 
@@ -408,8 +446,11 @@ def _allocation(args: argparse.Namespace) -> Allocation:
 
 def _run_cost(args: argparse.Namespace) -> str:
     """Model the cost and write the estimate; return the summary line."""
-    allowance = _allowance(args)
+    metered = _metered_requested(args)
+    allowance = None if metered else _allowance(args)
     sheet = load_price_sheet(args.price_file, today=args.today or date.today())
+    if metered:
+        return _write_metered(args, sheet)
     estimate = cost_bands(
         sheet,
         _allocation(args),
@@ -420,6 +461,55 @@ def _run_cost(args: argparse.Namespace) -> str:
     return (
         f"kind={estimate.kind} low_usd={estimate.low_usd} "
         f"high_usd={estimate.high_usd} report={args.out}"
+    )
+
+
+def _metered_requested(args: argparse.Namespace) -> bool:
+    """Return whether the metered estimate was asked for, all flags or none.
+
+    Raises:
+        _RefusalError: When only one of the metered pair was given, or a
+            metered-only flag was given without the pair.
+    """
+    values = (args.metered_model, args.token_report)
+    if not any(value is None for value in values):
+        return True
+    for attribute, flag, default in _METERED_ONLY_FLAGS:
+        if getattr(args, attribute) != default:
+            msg = f"{flag} applies only with {', '.join(_METERED_FLAGS)}"
+            raise _RefusalError(msg)
+    if all(value is None for value in values):
+        return False
+    msg = f"{', '.join(_METERED_FLAGS)} must be given together"
+    raise _RefusalError(msg)
+
+
+def _write_metered(args: argparse.Namespace, sheet: PriceSheet) -> str:
+    """Price the metered pool from the report's measured block and write it.
+
+    The report is read for one field — its token block — and nothing else: a
+    cost figure must cite a measurement rather than restate an assumption.
+    """
+    estimate = metered_estimate(
+        sheet,
+        model_id=args.metered_model,
+        currency=args.metered_currency,
+        tokens=load_report(args.token_report).tokens_per_reflection,
+        monthly_reflection_cap=args.monthly_cap,
+        input_tokens_spent=args.tokens_spent_input,
+        output_tokens_spent=args.tokens_spent_output,
+    )
+    args.out.write_text(estimate.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    per_1000 = ", ".join(
+        f"{one.reflections_per_month}/mo={one.cost_per_1000_reflections}"
+        for one in estimate.per_volume
+    )
+    return (
+        f"kind={estimate.kind} shape={estimate.shape} "
+        f"basis={estimate.token_basis.value} currency={estimate.currency} "
+        f"per_1000[{per_1000}] "
+        f"per_account_month={estimate.cost_per_account_month} "
+        f"report={args.out}"
     )
 
 

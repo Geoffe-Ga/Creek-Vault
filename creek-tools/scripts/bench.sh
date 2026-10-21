@@ -3,6 +3,10 @@
 # Usage: ./scripts/bench.sh reflect [--mode fake|live] [--provider ollama|pool]
 #            --out REPORT.json [...]
 #        ./scripts/bench.sh cost --price-file PRICES.json --out COST.json [...]
+#        ./scripts/bench.sh cost --price-file PRICES.json \
+#            --metered-model MODEL_ID --token-report REPORT.json \
+#            [--metered-currency USD|EUR] [--monthly-cap N] \
+#            [--tokens-spent-input N] [--tokens-spent-output N] --out COST.json
 #        ./scripts/bench.sh --help
 #
 # Hermetic by default (--mode fake), for both providers: --provider pool runs
@@ -11,6 +15,10 @@
 # issue #1892). A live run drives an operator-supplied Ollama or pool and must
 # be reproducible from its report, so this wrapper injects the checkout's
 # commit as --git-sha when a live `reflect` run did not pass one.
+# `cost` with --metered-model prices ADR-0016's per-token pool instead of a Fly
+# Machine-month, from the *measured* token block in a benchmark report. Only a
+# `provider_reported` basis is citable: a fake run's byte bound and an absent
+# measurement are refused (exit 2) rather than estimated (#1897).
 # Exit codes are the harness's own: 0 ok, 2 refused, 1 failed (issue #1850).
 # See docs/bench.md.
 
