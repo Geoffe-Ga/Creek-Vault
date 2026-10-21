@@ -34,5 +34,11 @@ from __future__ import annotations
 
 from typing import Final
 
-HARNESS_VERSION: Final[str] = "1.0.0"
-"""Version of the harness and its report schema, recorded in every run."""
+HARNESS_VERSION: Final[str] = "1.1.0"
+"""Version of the harness and its report schema, recorded in every run.
+
+1.1.0 added the measured per-reflection token block (#1893): ``prompt_tokens``,
+``output_tokens`` and ``max_output_tokens`` on every trial, a token summary per
+sweep and phase, and the run-level ``tokens_per_reflection``. Additive, so
+``report.schema_version`` is unchanged — a 1.0.0 consumer still parses a 1.1.0
+report, and a reader needing measured counts can require this version."""

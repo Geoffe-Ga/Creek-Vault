@@ -43,6 +43,9 @@ def _summary(latencies: list[float], failures: int = 0) -> LatencySummary:
             generation_s=None,
             outcome=Outcome.OK,
             model_resident_bytes=None,
+            prompt_tokens=None,
+            output_tokens=None,
+            max_output_tokens=None,
         )
         for latency in latencies
     ]
