@@ -23,13 +23,24 @@ from typing import Final, Literal
 from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 
 from creek_mcp.bench.deadline import Verdict, deadline_budget_seconds, deadline_verdict
+from creek_mcp.bench.eval.rubric import QualityScore
 from creek_mcp.bench.metadata import HostMetadata, RunMetadata
 from creek_mcp.bench.stats import LatencySummary
 from creek_mcp.bench.trial import Phase, Sweep, Trial
 from creek_mcp.httpapi.middleware import limits
 
 REPORT_SCHEMA_VERSION: Final[int] = 1
-"""Bumped whenever a field changes meaning or is removed."""
+"""Bumped whenever a field changes meaning or is removed.
+
+Not bumped when ``quality_score`` started carrying a
+:class:`~creek_mcp.bench.eval.rubric.QualityScore` (#1898). The field was
+shipped documented as reserved for exactly that evaluation and was always
+``null``, so filling it widens the type compatibly rather than changing what
+the field means: a reader that handled ``null`` still reads every report this
+version produces. What *would* be a bump is the rubric's own arithmetic
+changing, and that has its own version —
+:data:`creek_mcp.bench.eval.RUBRIC_VERSION`, recorded inside the score.
+"""
 
 
 class PhaseSummary(BaseModel):
@@ -97,8 +108,13 @@ class BenchReport(BaseModel):
         verdict: ``exceeds`` if any sweep exceeds; else ``insufficient_data``
             if any sweep lacked a success; else ``fits``.
         capacity: The concurrency sweep's basis for the admission caps.
-        quality_score: Reserved for the B22 quality evaluation; always
-            ``None`` here.
+        quality_score: The voice-fidelity eval's per-dimension scores and
+            rubric version (#1898), or ``None`` for a capacity-only run. It is
+            closed by construction like everything else here — enums, numbers
+            and a semver — so filling it does not weaken the content-free
+            invariant. The prompts and raw scores #1875 asks to be recorded
+            live in the eval's own
+            :class:`~creek_mcp.bench.eval.record.EvalRecord` artifact instead.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -111,7 +127,7 @@ class BenchReport(BaseModel):
     per_sweep: dict[Sweep, SweepSummary]
     verdict: Verdict
     capacity: CapacityBasis
-    quality_score: None = None
+    quality_score: QualityScore | None = None
 
 
 def overall_verdict(verdicts: Sequence[Verdict]) -> Verdict:
@@ -179,12 +195,27 @@ def _sweep_summary(group: tuple[Trial, ...], budget: float) -> SweepSummary:
 
 
 def build_report(
-    run: RunMetadata, host: HostMetadata, trials: Sequence[Trial]
+    run: RunMetadata,
+    host: HostMetadata,
+    trials: Sequence[Trial],
+    *,
+    quality: QualityScore | None = None,
 ) -> BenchReport:
     """Group *trials* by sweep, judge each, and assemble the report.
 
     The budget is read once, so every verdict in one report is judged against
     the same number the report records.
+
+    Args:
+        run: The run's pinned metadata.
+        host: Capacity-only host metadata.
+        trials: Every trial the sweeps produced.
+        quality: The voice-fidelity eval's score (#1898), when one was run.
+            ``None`` — the default — is a capacity-only report, which is what
+            every existing caller produces.
+
+    Returns:
+        The assembled report.
     """
     budget = deadline_budget_seconds()
     per_sweep: dict[Sweep, SweepSummary] = {}
@@ -201,6 +232,7 @@ def build_report(
         per_sweep=per_sweep,
         verdict=overall_verdict([summary.verdict for summary in per_sweep.values()]),
         capacity=capacity_basis(concurrency, budget),
+        quality_score=quality,
     )
 
 

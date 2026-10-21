@@ -100,7 +100,7 @@ JSON schema.
 | `capacity` | The largest concurrency level that fits, together with every level below it. It is compared against `/v1`'s admission caps (`DEFAULT_MAX_CONCURRENCY`, `DEFAULT_MAX_PER_CONSUMER`). It reports and changes nothing. |
 | `trials[].outcome` | One of `ok`, `timeout`, `oom`, `disk_full`, `provider_unavailable`, `context_overflow` or `error`. |
 | `trials[].model_resident_bytes` | The model's size from `/api/ps`. This is the runtime's figure, not the harness process's RSS. |
-| `quality_score` | Reserved for the B22 quality evaluation. Always `null` here. |
+| `quality_score` | The voice-fidelity eval's per-dimension scores, rubric version, seed and verdict ([#1898](https://github.com/Geoffe-Ga/Creek-Vault/issues/1898)), or `null` for a capacity-only run. See below. |
 
 ## Cost model
 
@@ -141,3 +141,129 @@ Price-sheet schema. The **values below are an example, not current prices**:
   "rootfs_gb_month_usd": "0.15"
 }
 ```
+
+## Voice-fidelity eval
+
+Issue [#1898](https://github.com/Geoffe-Ga/Creek-Vault/issues/1898), which
+unblocks the model choice in
+[#1875](https://github.com/Geoffe-Ga/Creek-Vault/issues/1875). The eval is the
+*quality* half of this harness: it fills the `quality_score` hook the capacity
+report reserved. It gathers evidence and takes no decision — it picks no model
+and adds nothing to `APPROVED_MODEL_LICENSES`.
+
+A score is comparable **only within one rubric version and one seed**. Both are
+recorded in both artifacts. Across a rubric-version bump the number means
+something different, so do not compare it.
+
+### The four dimensions
+
+Reported separately, never averaged into one figure.
+
+| Dimension | Basis | What it measures |
+|---|---|---|
+| `voice_match` | judge | How close the candidate sits to the synthetic corpus's own voice. |
+| `instruction_obedience` | deterministic | Length band, required headings, banned phrases, plus the shipped `creek.lint.checks.voice_fidelity` guard over the candidate written as a draft. |
+| `grounding_accuracy` | deterministic | The share of cited fragment ids the corpus actually contains. An invented citation scores zero; an uncited output scores zero too. |
+| `refusal_behaviour` | deterministic | Three probes that must each be refused — the care guard's acute-distress path, an above-ceiling prompt, and an INTIMATE fragment. The expectations are computed from `acute_distress_guard` and `tier_allowed`, not written down. |
+
+`voice_match` can report a third basis, `unsupported`, and does so by default.
+[#1880](https://github.com/Geoffe-Ga/Creek-Vault/issues/1880) records that the
+letter prompt carries no evidence of the writer's voice today, so scoring voice
+match against it would be scoring a prompt production never supplies. A caller
+states `voice_evidence_present=True` only when the prompt really carried voice
+evidence; otherwise the dimension says so and the run's verdict is
+`insufficient_evidence` rather than a pass or a failure.
+
+### Blinding
+
+Candidate outputs reach the judge as `BlindedCandidate`, which has **no model
+field at all** — the blinding is structural, not a convention. The opaque id is
+derived from the run's seed and the candidate's presentation slot, never from
+the model tag. The shuffle is seeded, so a run is reproducible; a different seed
+changes the order and the labels and nothing else, because every scorer reads
+the candidate's text.
+
+### The judge
+
+The default judge is `HermeticJudge`: deterministic, offline, no key, scoring on
+four surface-rate features of the text. The whole eval therefore runs in CI with
+no API call.
+
+A frontier judge is `RoutedJudge`, selected explicitly. It resolves its provider
+through `ModelRouter.resolve_role("voice_judge", PrivacyTier.OPEN)` like every
+other stage rather than constructing a client, so the INTIMATE chokepoint and
+consent gating apply to it unchanged. Decision 4 on
+[#1849](https://github.com/Geoffe-Ga/Creek-Vault/issues/1849) authorizes **no
+spend yet**, so the only test that reaches a real judge is in the `live` lane:
+
+```bash
+CREEK_EVAL_JUDGE_PROVIDER=anthropic CREEK_EVAL_JUDGE_MODEL=<model> \
+  ./scripts/test.sh --live -k live_judge
+```
+
+### Starting cheap
+
+Per the ratification comment on #1849 the owner's quality bar is **explicitly
+not frontier** — a Sonnet 4.x-class model produced voice drafts he was happy
+with. So `next_candidate` (and `EvalResult.next_model`) climbs a cheapest-first
+ladder **only on a rubric failure**. A pass stops the climb; missing evidence
+does not spend money either, because the remedy for an unsupported dimension is
+to supply the evidence, not to buy a bigger model.
+
+### Running it
+
+The eval is a library surface, driven from Python; it has no `bench.sh`
+subcommand, because supplying candidate outputs needs a model and no spend is
+authorized yet.
+
+```python
+import tempfile
+from pathlib import Path
+
+from creek_mcp.bench.eval.blinding import Candidate
+from creek_mcp.bench.eval.judge import HermeticJudge
+from creek_mcp.bench.eval.record import write_record
+from creek_mcp.bench.eval.rubric import RefusalProbe
+from creek_mcp.bench.eval.runner import EvalPlan, run_eval
+
+plan = EvalPlan(
+    candidates=(
+        Candidate(
+            model_tag="cheapest-catalogue-model",
+            text="<the candidate's reflection>",
+            citations=("voice-0000",),
+            refusals={probe: True for probe in RefusalProbe},
+        ),
+    ),
+    judge=HermeticJudge(),
+    seed=17,
+)
+with tempfile.TemporaryDirectory() as tmp:
+    result = run_eval(plan, Path(tmp) / "corpus")
+write_record(result.record, Path("eval.json"))
+print(result.quality.verdict, result.quality.per_dimension)
+```
+
+### The corpus, and the two artifacts
+
+The corpus is sixteen entries of prose **written for this harness** in one
+invented voice. There is no real journal content in any fixture, prompt or
+artifact — #1875's first constraint and #1850's privacy invariant. The root goes
+through the same confinement gate as the capacity corpus (`confined_root`):
+strictly under the system temp directory, absent or empty, checked before
+anything is written, so a real vault is refused untouched with
+`CorpusConfinementError`.
+
+There are deliberately **two** artifacts:
+
+- `BenchReport.quality_score` — the score, closed by construction like the rest
+  of the report (enums, numbers, a semver). Shareable as evidence.
+- `EvalRecord`, written by `write_record` and read back by `load_record` — the
+  prompts and raw scores #1875 asks to be recorded. It is honest about being
+  prompt-bearing, and everything in it is synthetic. It carries no model
+  identity: the payloads it holds are the blinded ones the judge saw.
+  `load_record` validates the score through pydantic rather than trusting the
+  file, so a hand-edited artifact is refused instead of read back as evidence.
+
+Splitting them is the point. Putting prompts in the report would have meant
+weakening its content-free invariant to satisfy a reporting requirement.
