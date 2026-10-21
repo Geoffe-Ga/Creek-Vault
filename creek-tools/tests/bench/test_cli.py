@@ -7,6 +7,7 @@ refusal must happen before the harness touches the network.
 
 from __future__ import annotations
 
+import functools
 import json
 import socket
 import tempfile
@@ -492,6 +493,28 @@ def _knobbed_pool(**overrides: Any) -> Any:
 
 
 @pytest.fixture
+def public_pool_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve a pool hostname to a public address without asking a resolver.
+
+    The run is otherwise hermetic, and a test must not depend on what DNS
+    says about a reserved ``.example`` name: a resolver that hijacks NXDOMAIN
+    to a private address would flip ``endpoint_scope`` from ``remote`` to
+    ``private`` and fail the assertion for a reason that is not the code's.
+
+    ``require_local_target``'s ``resolve`` default is bound when the function
+    is defined, so patching ``local_only._resolve`` would never reach this
+    call; the CLI's own imported symbol is the seam.
+    """
+    monkeypatch.setattr(
+        cli,
+        "require_local_target",
+        functools.partial(
+            cli.require_local_target, resolve=lambda host: ["93.184.216.34"]
+        ),
+    )
+
+
+@pytest.fixture
 def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail the test if anything opens a real socket connection.
 
@@ -635,7 +658,7 @@ def test_remote_pool_refused_by_default_exit_2_no_http(
 
 
 def test_allowed_remote_pool_records_remote_scope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, public_pool_dns: None
 ) -> None:
     """AC4: with the opt-in, the run proceeds and records ``remote``."""
     pool = FakePool(
@@ -692,7 +715,7 @@ def test_cloud_offload_tag_refused_in_pool_mode(
 
 
 def test_pool_report_holds_no_url_or_hostname(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, public_pool_dns: None
 ) -> None:
     """AC7: the pool's URL and hostname appear nowhere in the report."""
     host = "pool-canary-7f3e.vendor.example"

@@ -1,8 +1,10 @@
 """The harness can only ever measure a local model.
 
-``LocalOnlyFactory`` refuses a provider registered as cloud at construction,
-and refuses any built callable that does not positively declare
-``is_cloud = False`` — a missing attribute fails *closed*.
+``LocalOnlyFactory`` refuses a registered cloud provider at construction, and
+refuses any built callable that does not positively declare
+``is_cloud = False`` — a missing attribute fails *closed*. The shared
+inference pool is admitted at construction and contained at the dial instead
+(ADR-0016 Decision 6, Decision 7), which the tests below pin at both ends.
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ def _bare(prompt: str) -> str:
 
 @pytest.mark.parametrize("name", ["anthropic", "openai", "gemini"])
 def test_cloud_name_refused_at_construction(name: str) -> None:
-    """A cloud provider name is refused before anything is built."""
+    """A registered cloud provider is refused before anything is built."""
     built: list[int] = []
 
     def _factory(tier: PrivacyTier, *, max_tokens: int) -> LLMCallable:
@@ -55,6 +57,54 @@ def test_cloud_name_refused_at_construction(name: str) -> None:
     with pytest.raises(CloudProviderRefusedError, match="cloud"):
         LocalOnlyFactory(_factory, provider_name=name)
     assert built == []
+
+
+@pytest.mark.parametrize("name", ["ollama", "enclave", "pool"])
+def test_non_cloud_name_is_admitted_at_construction(name: str) -> None:
+    """``pool`` is admitted here, with ``ollama`` and the attested enclave.
+
+    ADR-0016 Decision 6 keeps ``is_cloud`` to its consent meaning, and the ADR
+    says this factory admits ``pool`` while
+    :func:`~creek_mcp.bench.local_only.require_local_target` judges the dial
+    target. Refusing the name outright would make Decision 7's pool mode —
+    the measurement #1892 exists to take — impossible to run, so containment
+    is proven at the dial (the next test) instead of here. The fail-closed
+    build-time rule is untouched: the callable must still declare itself.
+    """
+    factory = LocalOnlyFactory(
+        lambda tier, *, max_tokens: _Callable(is_cloud=False), provider_name=name
+    )
+    assert factory(PrivacyTier.OPEN, max_tokens=8)("ping") == "ping"
+
+
+def test_an_admitted_pool_is_still_refused_at_an_unflagged_remote_dial() -> None:
+    """What construction no longer refuses, the dial does (ADR-0016 D6).
+
+    A vendor pool hostname resolves public, so it needs the operator's
+    explicit ``--allow-remote-host``; with it the run proceeds and reports
+    ``remote``, which is the scope the report records beside
+    ``describes_model_host=False``.
+    """
+    LocalOnlyFactory(
+        lambda tier, *, max_tokens: _Callable(is_cloud=False), provider_name="pool"
+    )
+    public = _resolver("93.184.216.34")
+    with pytest.raises(CloudProviderRefusedError, match="allow-remote-host"):
+        require_local_target(
+            "https://pool.vendor.example",
+            "gpt-oss-120b",
+            allow_remote=False,
+            resolve=public,
+            flag="--pool-url",
+        )
+    scope = require_local_target(
+        "https://pool.vendor.example",
+        "gpt-oss-120b",
+        allow_remote=True,
+        resolve=public,
+        flag="--pool-url",
+    )
+    assert scope == "remote"
 
 
 def test_cloud_flagged_callable_refused() -> None:

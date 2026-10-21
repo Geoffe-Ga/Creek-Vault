@@ -19,6 +19,13 @@ takes a method, a path and a decoded body, so the same fake serves both an
 
 Their latency is the harness's own overhead (corpus walk, prompt build,
 parse), which is the useful floor a fake run measures.
+
+:class:`FakeLLM` is also a *provider*, so it reports its own token usage
+(#1893) — the byte-level upper bound, which is the only count a model with no
+tokenizer can state honestly. A fake run therefore measures real counts for
+the shape of the shipped prompt while labelling them
+:attr:`TokenBasis.BYTE_UPPER_BOUND`, so no cost line mistakes them for the
+vendor's.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Final
 import httpx
 
 from creek_mcp.bench.pool_client import POOL_GENERATE_PATH, POOL_MODELS_PATH
+from creek_mcp.bench.usage import TokenUsage, byte_upper_bound_usage
 
 if TYPE_CHECKING:
     from creek.models import PrivacyTier
@@ -63,13 +71,23 @@ def anchored_note(prompt: str) -> str:
 
 
 class FakeLLM:
-    """A deterministic, local completion callable."""
+    """A deterministic, local completion callable that reports its usage."""
 
     is_cloud: bool = False
 
+    def __init__(self) -> None:
+        """Start with no turn measured."""
+        self._usage: TokenUsage | None = None
+
     def __call__(self, prompt: str) -> str:
         """Return one note quoting the start of the prompt's entry."""
-        return anchored_note(prompt)
+        response = anchored_note(prompt)
+        self._usage = byte_upper_bound_usage(prompt, response)
+        return response
+
+    def token_usage(self) -> TokenUsage | None:
+        """Return the last turn's byte-level bound, or ``None`` before one."""
+        return self._usage
 
 
 def fake_factory(tier: PrivacyTier, *, max_tokens: int) -> FakeLLM:

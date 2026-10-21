@@ -4,8 +4,16 @@ The harness exists to size a *local* model envelope, so a cloud provider
 answering a trial would both corrupt the measurement and egress synthetic
 prompts. :class:`LocalOnlyFactory` therefore refuses twice:
 
-- at construction, a provider name registered as cloud
-  (:func:`creek.classify.llm.providers.provider_is_cloud`);
+- at construction, a provider name the registry declares cloud
+  (:func:`creek.classify.llm.providers.provider_is_cloud`). The shared
+  inference pool is deliberately **not** one of them: ADR-0016 Decision 6
+  keeps ``is_cloud`` to its consent meaning (``False`` for ``pool``: no
+  operator cloud key, no consent variable), and the ADR states that this
+  factory admits it and that :func:`require_local_target` then judges the
+  dial target. Containment for a pool is therefore proven at the dial, not
+  at construction — which is what lets Decision 7's pool mode exist at all.
+  An *unregistered* name (the harness's own ``fake``) is admitted too and
+  judged by the callable's own flag below;
 - on every build, a callable that does not positively declare
   ``is_cloud = False``. A missing attribute counts as cloud — fail closed.
 
@@ -22,10 +30,12 @@ records), and a model tag Ollama would forward to its cloud (``*-cloud``,
 
 The shared inference pool (ADR-0016, ``--provider pool``) is the one target
 that is remote *by design*. It passes these checks the only way anything
-remote can: the operator asks for it explicitly and the report records
-``endpoint_scope="remote"`` (Decision 6). Nothing is relaxed for it — the
-cloud-provider refusal, the fail-closed ``is_cloud`` rule and the
-cloud-offload tag refusal all still apply.
+remote can: the operator asks for it explicitly with ``--allow-remote-host``
+and the report records ``endpoint_scope="remote"`` (Decision 6), beside
+``describes_model_host=False`` — so a pool measurement is *labelled* as the
+vendor's, never passed off as this host's. Nothing else is relaxed for it:
+the fail-closed ``is_cloud`` rule on every build, the cloud-offload tag
+refusal, and the refusal of an unflagged remote dial all still apply.
 """
 
 from __future__ import annotations
@@ -173,12 +183,18 @@ class LocalOnlyFactory:
     def __init__(self, inner: LLMFactory, *, provider_name: str) -> None:
         """Refuse a cloud *provider_name* before anything is built.
 
+        ``pool`` is admitted here on purpose: it is not cloud (ADR-0016
+        Decision 6), and :func:`require_local_target` judges where its
+        requests actually go.
+
         Args:
             inner: The factory producing completion callables.
-            provider_name: The provider's registry name (``ollama``, ``fake``).
+            provider_name: The provider's registry name (``ollama``, ``pool``,
+                ``fake``).
 
         Raises:
-            CloudProviderRefusedError: When *provider_name* is a cloud provider.
+            CloudProviderRefusedError: When *provider_name* is a registered
+                cloud provider.
         """
         if provider_is_cloud(provider_name):
             raise CloudProviderRefusedError(_CLOUD_REFUSED)

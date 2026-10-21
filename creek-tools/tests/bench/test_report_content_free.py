@@ -70,6 +70,7 @@ def test_report_never_contains_corpus_or_output(
         context_sizes=(32,),
         concurrency_levels=(2,),
         idle_cycles=1,
+        measure_tokens=True,
     )
     caplog.set_level(logging.DEBUG)
     report = run_bench(plan, root)
@@ -164,3 +165,24 @@ def test_pool_report_never_contains_the_endpoint_or_the_answer(
                 assert window not in haystack, name
         for sent in pool.requests:
             assert str(sent.get("prompt")) not in haystack, name
+
+
+def test_measured_tokens_are_counts_and_never_content(tmp_path: Path) -> None:
+    """The token block holds integers; the prompts it measured stay behind.
+
+    The fake echoes the whole prompt back, so its measured output overruns the
+    budget reflect asked for. That overrun must be *reported* — a number — and
+    the text that caused it must not travel with it.
+    """
+    model = FakeModel(echo_canary=True)
+    plan = make_plan(model, seed=3, measure_tokens=True)
+    report = run_bench(plan, tmp_path / "corpus")
+    block = report.tokens_per_reflection
+    rendered = report.model_dump_json()
+    assert CANARY not in rendered
+    for measured in block.per_surface.values():
+        assert isinstance(measured.prompt_tokens, int)
+        assert isinstance(measured.output_tokens, int)
+        assert measured.output_cap_exceeded
+    sweep_tokens = next(iter(report.per_sweep.values())).tokens
+    assert sweep_tokens.output_cap_exceeded_count > 0
