@@ -1321,6 +1321,23 @@ CLI_CONTRACT: Final[Mapping[str, Surface]] = {
         derived_from=("creek.generate.voice_authenticity:VOICE_DISTANCE_KEY",),
         argv=("{essay}", "--vault", "{vault}"),
         prepare=(("report", "--vault", "{vault}", "--type", "fingerprint"),),
+        # Exit 0 is load-bearing here, and #1936 nearly lost it. ``{essay}``
+        # is ``frag-essay-001`` — a fragment of this very corpus — so this
+        # surface also asserts the invariant on
+        # ``AIStyleConfig.voice_distance_upper``: the user's own writing must
+        # not flag. Every other fragment seeded here is a short standalone
+        # line, which makes the profiler measure a one-line-fragment rate of
+        # 36.47 per 1k words and turns the ``one_line_fragment`` *signature*
+        # tell live for this voice; the essay is one dense block, so it
+        # "under-uses" that rhythm by the user's whole rate. Under #1936's
+        # union aggregation at full weight that alone scored 0.8794 and the
+        # command exited 1 on the corpus's own prose. The family ships
+        # down-weighted to 0.25 (``AIStyleConfig.feature_weights``) for
+        # exactly this reason, capping it under the ceiling, and the
+        # under-use is still *reported* in the findings — surfaced for
+        # review, not turned into a verdict. The deeper defect (the measure
+        # counts headings, and the fingerprint averages per-fragment rates,
+        # so the "rhythm" is a fragment-length artifact) is #1945.
         effect=Effect(prints=("voice_distance",), absent=("Skipping the check",)),
         contrast=Contrast(
             why=(

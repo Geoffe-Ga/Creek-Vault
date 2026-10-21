@@ -38,7 +38,7 @@ import operator
 import re
 import sys
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -53,6 +53,7 @@ from creek.classify.privacy_filter import (
     resolved_source_tiers,
 )
 from creek.generate.ai_style.guard import (
+    VOICE_GUARD_REWRITE_FAILED,
     VOICE_GUARD_STATUS_KEY,
     run_voice_fidelity_guard,
     status_in_words,
@@ -2561,15 +2562,42 @@ class DraftGenerator:
             return self._skipped_voice_guard(body, "skipped:no_fingerprint")
         if fingerprint.is_thin(config.min_fingerprint_fragments):
             return self._skipped_voice_guard(body, "skipped:thin_fingerprint")
-        report = run_voice_fidelity_guard(
-            body,
-            fingerprint=fingerprint,
-            config=config,
-            llm=self._voice_rewrite_llm(),
-            no_llm=self._voice_guard_no_llm,
-            style_preamble=self.style_preamble,
-            grounding_check=self._voice_grounding_check(vault_path, source_fragments),
-        )
+        try:
+            report = run_voice_fidelity_guard(
+                body,
+                fingerprint=fingerprint,
+                config=config,
+                llm=self._voice_rewrite_llm(),
+                no_llm=self._voice_guard_no_llm,
+                style_preamble=self.style_preamble,
+                grounding_check=self._voice_grounding_check(
+                    vault_path, source_fragments
+                ),
+            )
+        except Exception as exc:
+            # An optional polish pass must never lose a composed draft. The
+            # rewrite hop calls an injected LLM, so its failure modes belong
+            # to the provider, not to us: a timeout, a 429, a transport reset
+            # or `_invoke_draft_llm`'s RuntimeError on an empty rewrite all
+            # arrive here, and before #1936 any of them aborted `save_draft`
+            # and discarded the body the user had already paid to compose.
+            # Narrowing the catch would trade the user's data for tidiness.
+            # The retry is deterministic (`no_llm=True`): it still sanitizes
+            # and still measures, so the draft keeps everything except the
+            # rewrite, and the status says which one it lost. Only the
+            # exception's *type* is printed: a provider error message can
+            # quote the prompt, and the prompt is the user's draft.
+            report = replace(
+                run_voice_fidelity_guard(
+                    body,
+                    fingerprint=fingerprint,
+                    config=config,
+                    no_llm=True,
+                    style_preamble=self.style_preamble,
+                ),
+                status=VOICE_GUARD_REWRITE_FAILED,
+            )
+            print(f"voice rewrite failed ({type(exc).__name__})", file=sys.stderr)
         print(report.summary_line(), file=sys.stderr)
         return report.body, report.to_frontmatter()
 

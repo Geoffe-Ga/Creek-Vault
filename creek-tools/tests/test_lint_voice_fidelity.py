@@ -1,11 +1,18 @@
 """Tests for the ``voice-fidelity`` lint check (FEAT-040.10).
 
 The check is the audit surface for the voice-fidelity subsystem: it walks
-``07-Voice/Drafts/``, reads the ``voice_distance`` / ``voice_findings``
-frontmatter stamped by the FEAT-040.9 guard (re-scanning unstamped files
-against the fingerprint), and surfaces any draft whose distance exceeds
+``07-Voice/Drafts/``, measures each draft's body against the fingerprint,
+and surfaces any draft whose distance exceeds
 ``ai_style.voice_distance_upper``. It is framed as "this diverges from your
 voice", never as AI accusation, and it never mutates a file.
+
+Two #1936 properties are pinned here. The check must actually fire on a real
+draft — a 60-word body tripping two tell families is surfaced at the shipped
+0.35 ceiling, where the pre-#1936 weighted mean scored it 0.0987 and said
+nothing. And the stamped ``voice_distance`` no longer decides: a stamp
+records what some earlier run measured, against the fingerprint, config and
+aggregation of that moment, so the audit pass re-measures the prose in front
+of it and the same content cannot reach two verdicts.
 """
 
 from __future__ import annotations
@@ -16,8 +23,9 @@ import frontmatter
 import yaml
 
 from creek.config import AIStyleConfig
-from creek.generate.ai_style.fingerprint import save_fingerprint
+from creek.generate.ai_style.fingerprint import load_fingerprint, save_fingerprint
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
+from creek.generate.ai_style.scanner import scan
 from creek.lint import ALL_CHECKS, DETERMINISTIC_CHECKS, LintRunner
 from creek.lint.checks import voice_fidelity as voice_fidelity_check
 
@@ -29,6 +37,25 @@ _TROPEY = (
     "Moreover, it is important to note the vibrant and multifaceted nuances. "
     "Furthermore, the landscape stands as a testament to its significance."
 )
+
+_ON_VOICE = (
+    "I woke before the alarm. The kettle took its time. I stood at the window "
+    "and watched the street fill up. I did not write anything down. I made "
+    "toast and ate it standing. I washed the one cup and left it to dry."
+)
+"""Invented plain prose that fires no tell, so it must never be surfaced."""
+
+_TWO_FAMILIES = (
+    f"{_ON_VOICE} I had to delve into the tapestry of it. "
+    "The hour plays a vital role in the day."
+)
+"""The same prose plus two obviously synthetic slop sentences (#1936).
+
+Trips exactly two tell families — AI vocabulary and significance puffery —
+at 62 words. Measures 0.9682 under the union aggregation and 0.0987 under
+the weighted mean it replaced, so the shipped 0.35 ceiling now surfaces it
+and used not to.
+"""
 
 
 def _seed(vault: Path) -> None:
@@ -98,36 +125,83 @@ class TestVoiceFidelityRegistry:
 class TestVoiceFidelityFindings:
     """Threshold comparison over stamped and unstamped drafts."""
 
-    def test_high_distance_stamped_is_flagged(self, tmp_path: Path) -> None:
-        """A stamped draft above the ceiling appears in the findings."""
+    def test_a_draft_tripping_two_families_is_flagged(self, tmp_path: Path) -> None:
+        """#1936's headline: a short real draft clears the *shipped* ceiling.
+
+        No config is written, so this runs at the stock 0.35 — the ceiling
+        the pre-#1936 mean scored this body 0.0987 against and said nothing.
+        """
         _seed(tmp_path)
         _write_fingerprint(tmp_path)
-        _write_config(tmp_path, voice_distance_upper=0.1)
-        _write_draft(
-            tmp_path,
-            name="2026-05-30-divergent",
-            voice_distance=0.5,
-            voice_findings=[
-                {"feature_key": "ai_vocab_density", "direction": "over"},
-            ],
-        )
+        _write_draft(tmp_path, name="2026-05-30-divergent", body=_TWO_FAMILIES)
         result = voice_fidelity_check.run(tmp_path)
         assert result.name == "voice-fidelity"
         assert len(result.findings) == 1
         finding = result.findings[0]
         assert "2026-05-30-divergent" in finding
-        assert "0.50" in finding
+        assert "0.97" in finding
         assert "ai_vocab_density" in finding
 
-    def test_on_voice_stamped_is_silent(self, tmp_path: Path) -> None:
-        """A stamped draft under the ceiling produces no finding."""
+    def test_an_on_voice_draft_is_silent(self, tmp_path: Path) -> None:
+        """The same prose without the slop sentences is not surfaced."""
         _seed(tmp_path)
         _write_fingerprint(tmp_path)
-        _write_config(tmp_path, voice_distance_upper=0.35)
-        _write_draft(tmp_path, name="2026-05-30-onvoice", voice_distance=0.05)
+        _write_draft(tmp_path, name="2026-05-30-onvoice", body=_ON_VOICE)
         result = voice_fidelity_check.run(tmp_path)
         assert result.findings == []
         assert "0 " in result.summary
+
+    def test_a_stale_stamp_does_not_decide(self, tmp_path: Path) -> None:
+        """The body is measured, not the stamp — in both directions (#1936).
+
+        A stamp is one earlier run's measurement. Trusting it would mean the
+        same content reached two verdicts depending on whether a guard had
+        been past, and would leave every draft stamped under the old
+        diluting mean permanently unflaggable.
+        """
+        _seed(tmp_path)
+        _write_fingerprint(tmp_path)
+        _write_draft(
+            tmp_path,
+            name="2026-05-30-understamped",
+            body=_TWO_FAMILIES,
+            voice_distance=0.0987,
+            voice_findings=[{"feature_key": "ai_vocab_density", "direction": "over"}],
+        )
+        _write_draft(
+            tmp_path,
+            name="2026-05-30-overstamped",
+            body=_ON_VOICE,
+            voice_distance=0.99,
+        )
+        findings = voice_fidelity_check.run(tmp_path).findings
+        assert len(findings) == 1
+        assert "2026-05-30-understamped" in findings[0]
+
+    def test_a_stamped_and_an_unstamped_copy_agree(self, tmp_path: Path) -> None:
+        """Same content, one stamped by the guard and one not: one verdict.
+
+        The stamp is written by the real guard rather than hand-set, so this
+        is the production shape of the AC: a draft the guard measured and a
+        hand-authored copy of the same prose are judged identically.
+        """
+        _seed(tmp_path)
+        _write_fingerprint(tmp_path)
+        fingerprint = load_fingerprint(tmp_path, AIStyleConfig())
+        measured = scan(_TWO_FAMILIES, fingerprint=fingerprint, config=AIStyleConfig())
+        _write_draft(
+            tmp_path,
+            name="2026-05-30-stamped-copy",
+            body=_TWO_FAMILIES,
+            voice_distance=round(measured.voice_distance, 4),
+        )
+        _write_draft(tmp_path, name="2026-05-30-plain-copy", body=_TWO_FAMILIES)
+        findings = voice_fidelity_check.run(tmp_path).findings
+        assert len(findings) == 2
+        assert {finding.split("`")[1] for finding in findings} == {
+            "2026-05-30-stamped-copy",
+            "2026-05-30-plain-copy",
+        }
 
     def test_unstamped_draft_is_rescanned(self, tmp_path: Path) -> None:
         """A draft with no stamped distance is re-scanned against the fingerprint."""

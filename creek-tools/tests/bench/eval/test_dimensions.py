@@ -229,8 +229,12 @@ _COMPONENT_DIRECTIONS: Final[
 _ON_VOICE_DISTANCE: Final[float] = 0.0
 """Measured ``voice_distance`` of the on-voice fixture against this corpus."""
 
-_OFF_VOICE_DISTANCE: Final[float] = 0.1012
-"""Measured ``voice_distance`` of the off-voice fixture against this corpus."""
+_OFF_VOICE_DISTANCE: Final[float] = 0.9778
+"""Measured ``voice_distance`` of the off-voice fixture against this corpus.
+
+0.1012 under the weighted mean #1936 replaced — two tripped families diluted
+by the fifteen that did not diverge. The fixture text is unchanged.
+"""
 
 _DISTANCE_TOLERANCE: Final[float] = 5e-4
 """Slack on the pinned measurements; a real drift should red this, not round away."""
@@ -333,23 +337,33 @@ def test_obedience_does_not_call_the_voice_fidelity_check(
     assert score.probes == len(ObedienceCheck)
 
 
-def test_the_shipped_voice_check_cannot_separate_the_fixtures(
+def test_the_shipped_voice_check_now_separates_the_fixtures(
     corpus: VoiceCorpus,
 ) -> None:
-    """The measurement that retired #1911's component, pinned in the suite.
+    """#1936 flipped the measurement that retired #1911's component.
 
-    ``creek.lint.checks.voice_fidelity.run`` flags a draft only once its
-    ``voice_distance`` clears ``voice_distance_upper``. At candidate length the
-    off-voice fixture does not get close, so the check returned no findings for
-    *either* fixture and the component was a constant. If a scanner or ceiling
-    change ever makes it discriminate here, this test reds and the decision in
-    ``dimensions.py``'s module docstring is up for review again.
+    ``creek.lint.checks.voice_fidelity.run`` flags a draft once its
+    ``voice_distance`` clears ``voice_distance_upper``. At the time of #1911
+    the off-voice fixture measured 0.1012 against this corpus — a third of the
+    0.35 ceiling — so the check returned no findings for *either* fixture and
+    the component was a constant. #1936 replaced the diluting weighted mean
+    with a union of per-family evidence: the same fixture now measures 0.9778
+    and only the off-voice draft is surfaced.
+
+    The retirement still stands on its own: that component's arithmetic made a
+    single violated instruction score 3/4 and clear ``PASS_THRESHOLD`` (see
+    ``test_one_violated_component_scores_below_the_pass_threshold``), which is
+    a defect in the *scorer*, independent of whether the voice check
+    discriminates. This test exists so the ceiling, the scanner and the
+    aggregation stay pinned from the suite in whichever direction they sit —
+    it is the same tripwire, re-aimed, not a deleted one.
     """
     drafts = corpus.root / DRAFTS_DIR
     for name, text in (("on-voice", IN_VOICE_TEXT), ("off-voice", SLOP_TEXT)):
         (drafts / f"{name}.md").write_text(text, encoding="utf-8")
     result = voice_fidelity.run(corpus.root)
-    assert result.findings == []
+    assert [finding for finding in result.findings if "off-voice" in finding]
+    assert not [finding for finding in result.findings if "on-voice" in finding]
     config = AIStyleConfig()
     fingerprint = load_fingerprint(corpus.root, config)
     on_voice = scan(IN_VOICE_TEXT, fingerprint=fingerprint, config=config)
@@ -360,9 +374,8 @@ def test_the_shipped_voice_check_cannot_separate_the_fixtures(
     assert off_voice.voice_distance == pytest.approx(
         _OFF_VOICE_DISTANCE, abs=_DISTANCE_TOLERANCE
     )
-    # The signal exists; it is simply far too small for the shipped ceiling.
-    assert on_voice.voice_distance < off_voice.voice_distance
-    assert off_voice.voice_distance < config.voice_distance_upper
+    assert on_voice.voice_distance < config.voice_distance_upper
+    assert off_voice.voice_distance > config.voice_distance_upper
 
 
 def test_obedience_scores_an_in_voice_candidate_above_the_threshold() -> None:
