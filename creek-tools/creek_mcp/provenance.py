@@ -19,12 +19,26 @@ that then fails produces a refusal, and a refusal carries no
 ``inference_source`` at all — so there is no window in which this records a
 destination that was never dialled.
 
-**An unlabelled answer is an honest answer.** Three of the four published
-values name a route this contract can stand behind; the fourth case — an
-operator's own cloud key on a self-hosted vault — is none of them, so nothing
-is recorded and the field is omitted. The consumer's use for the field is to
-notice a route it did not expect, and a guessed label would defeat exactly
-that.
+**An unlabelled answer is an honest answer.** ADR-0016's four values name the
+routes this contract can stand behind. Two configured routes are none of them
+— an operator's own cloud key on a self-hosted vault, and the attested
+enclave — so nothing is recorded and the field is omitted. The consumer's use
+for the field is to notice a route it did not expect, and a guessed label
+would defeat exactly that.
+
+**Why the enclave is an omission rather than a fifth value.** The enclave
+declares ``is_cloud=False``, which is true of what it is for — attest-then-
+mount means no operator cloud key and no readable vendor — and false of where
+it goes: ``EnclaveProvider.complete`` dials a remote confidential-compute
+endpoint over ``https``. Publishing ``local`` there is the one answer a socket
+spy could contradict, and ADR-0016 T15 asks for exactly that correspondence,
+so the route is left unlabelled instead. Whether the enclave deserves a
+provenance value of its own is a contract question, and a contract question is
+answered by a minor that publishes one — not by widening this vocabulary in
+passing. The predicate is therefore
+:func:`~creek.classify.llm.providers.provider_egresses`, which asks about the
+destination, rather than ``provider_is_cloud``, which asks about the consent
+gate.
 """
 
 from __future__ import annotations
@@ -33,7 +47,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from creek.classify.llm.pool_boundary import pool_attesting_vendor
-from creek.classify.llm.providers import provider_is_cloud
+from creek.classify.llm.providers import provider_egresses
 from creek_mcp.api.models import (
     INFERENCE_SOURCE_LOCAL,
     INFERENCE_SOURCE_POOL_CREEK,
@@ -90,9 +104,10 @@ def stage_inference_source(
 
     Returns:
         ``pool:creek`` or ``pool:attested:<vendor>`` for the shared pool,
-        ``local`` for a provider that runs inside the vault's own trust
-        boundary, and ``None`` for an operator's own cloud key — a route none
-        of ADR-0016's four values names.
+        ``local`` for a provider whose dial never leaves the device, and
+        ``None`` for any other route that egresses — an operator's own cloud
+        key, or the attested enclave — because none of ADR-0016's four values
+        names one.
     """
     if provider == POOL_PROVIDER:
         vendor = pool_attesting_vendor(environ)
@@ -101,7 +116,13 @@ def stage_inference_source(
             if vendor is None
             else attested_pool_source(vendor)
         )
-    return None if provider_is_cloud(provider) else INFERENCE_SOURCE_LOCAL
+    # Asked of the destination, not of the consent gate.
+    # ``provider_is_cloud`` means "an operator cloud key, consent-gated",
+    # which the attested enclave answers ``False`` to while dialling a remote
+    # confidential-compute host — so keying on it published ``local`` about an
+    # answer that had left the device, the one claim ADR-0016 T15 has a socket
+    # spy to refute (#1894).
+    return None if provider_egresses(provider) else INFERENCE_SOURCE_LOCAL
 
 
 def request_key_inference_source(request_key: RequestKey) -> str | None:

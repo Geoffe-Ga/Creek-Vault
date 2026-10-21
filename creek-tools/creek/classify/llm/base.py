@@ -31,15 +31,24 @@ class LLMProvider(Protocol):
     class attribute on each implementation so the factory can read it without
     instantiating (which, for cloud backends, would require credentials).
 
-    It is **not** the tier gate. Every registered implementation also declares
-    a companion ``intimate_eligible`` flag, read by
-    :func:`~creek.classify.llm.providers.provider_intimate_eligible` and
-    enforced once at the :class:`~creek.classify.llm.router.ModelRouter`
-    chokepoint. The two differ: the shared inference pool is not cloud — no
-    operator key, no consent variable — and is still never shown INTIMATE
-    content (ADR-0016 Decision 5, #1894). The flag is deliberately not on this
-    protocol, so a bench stub or a test double need not declare it; the
-    provider registry's own type requires it of every real backend.
+    It is **not** the tier gate, and it is **not** the destination. Every
+    registered implementation declares two companion flags, neither of which
+    is on this protocol — so a bench stub or a test double need not declare
+    them, while the provider registry's own type requires them of every real
+    backend:
+
+    * ``intimate_eligible``, read by
+      :func:`~creek.classify.llm.providers.provider_intimate_eligible` and
+      enforced once at the :class:`~creek.classify.llm.router.ModelRouter`
+      chokepoint. The shared inference pool is not cloud — no operator key, no
+      consent variable — and is still never shown INTIMATE content (ADR-0016
+      Decision 5, #1894).
+    * ``egresses``, read by
+      :func:`~creek.classify.llm.providers.provider_egresses`: whether a
+      prompt sent here leaves the device at all. The pool and the attested
+      enclave both answer ``False`` to ``is_cloud`` and ``True`` to this one,
+      which is why the published ``inference_source`` asks this flag rather
+      than that one (#1894).
     """
 
     @property

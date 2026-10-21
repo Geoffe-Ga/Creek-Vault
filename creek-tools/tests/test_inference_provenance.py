@@ -16,14 +16,17 @@ can show is only that a label *survives* the job record.
 
 from __future__ import annotations
 
+import json
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 import yaml
 from starlette.requests import Request
+from starlette.testclient import TestClient
 
 from creek.classify.classify_engine import _PreparedFragment
+from creek.classify.llm import providers as providers_module
 from creek.classify.llm.pool_boundary import (
     POOL_URL_ENV,
     POOL_VENDOR_ENV,
@@ -48,6 +51,7 @@ from creek_mcp.provenance import (
     stage_inference_source,
 )
 from creek_mcp.tools import classify as classify_module
+from tests.v1_api_support import REFLECTIONS_PATH, build_app, headers, seed_vault
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -55,6 +59,24 @@ if TYPE_CHECKING:
 _CONFIG_SUBPATH: Final[tuple[str, ...]] = ("00-Creek-Meta", "creek_config.yaml")
 _VENDOR: Final[str] = "tinfoil"
 _KEY: Final[str] = "sk-ant-api03-PROVENANCEtestKEY-never-logged"
+_ENCLAVE_URL: Final[str] = "https://enclave.internal:8443"
+_ENTRY: Final[str] = "I keep saying yes to things I do not want, and I feel it later."
+_QUOTE: Final[str] = "saying yes to things I do not want"
+_TURN: Final[str] = json.dumps(
+    {"notes": [{"quote": _QUOTE, "kind": "pattern", "note": "It costs you."}]}
+)
+"""One well-formed reflection turn, as the enclave would return it."""
+
+_HTTP_OK: Final[int] = 200
+
+
+def _attested(*_args: object, **_kwargs: object) -> None:
+    """Stand in for a verified attestation; the real gate has its own suite."""
+
+
+def _answer(*_args: object, **_kwargs: object) -> str:
+    """Return one reflection turn in place of the enclave's own answer."""
+    return _TURN
 
 
 class TestStageLabelling:
@@ -87,14 +109,18 @@ class TestStageLabelling:
         """
         assert stage_inference_source("pool", {POOL_VENDOR_ENV: offered}) is None
 
-    @pytest.mark.parametrize(
-        "provider",
-        [pytest.param("ollama", id="ollama"), pytest.param("enclave", id="enclave")],
-    )
-    def test_a_provider_inside_the_vaults_boundary_is_local(
+    @pytest.mark.parametrize("provider", [pytest.param("ollama", id="ollama")])
+    def test_a_provider_whose_dial_never_leaves_the_device_is_local(
         self, provider: str
     ) -> None:
-        """``local`` is about custody, not about the process the model runs in."""
+        """``local`` means what the constant says: no socket leaves the device.
+
+        The predicate is :func:`provider_egresses`, not ``is_cloud``.
+        ``is_cloud`` asks whether an *operator cloud key* and its consent gate
+        are involved, which is a question about billing and consent rather
+        than about destination — and two registered providers answer ``False``
+        to it while dialling a remote host.
+        """
         assert stage_inference_source(provider, {}) == INFERENCE_SOURCE_LOCAL
 
     @pytest.mark.parametrize(
@@ -103,15 +129,28 @@ class TestStageLabelling:
             pytest.param("anthropic", id="anthropic"),
             pytest.param("openai", id="openai"),
             pytest.param("gemini", id="gemini"),
+            pytest.param("enclave", id="enclave"),
         ],
     )
-    def test_an_operator_cloud_key_is_left_unlabelled(self, provider: str) -> None:
+    def test_a_route_that_egresses_without_a_name_is_left_unlabelled(
+        self, provider: str
+    ) -> None:
         """None of the four values names it, so the field is omitted.
+
+        Two shapes, one absence. An operator's own cloud key on a self-hosted
+        vault is the first. The **enclave** is the second, and it is the one a
+        reader is most likely to think is misfiled: it declares
+        ``is_cloud=False``, because attest-then-mount means no operator cloud
+        key and no readable vendor — and it still sends the prompt to a remote
+        confidential-compute endpoint over ``https``. ``local`` would be
+        actively false there, and it is the one answer a socket spy could
+        contradict, so the field is omitted instead.
 
         **Do not "fix" this into a label.** The consumer's whole use for
         ``inference_source`` is to notice a route it did not expect, so a
-        value the server cannot stand behind is worse than an absence. If this
-        route needs a name, it needs a contract minor that publishes one.
+        value the server cannot stand behind is worse than an absence. If a
+        route needs a name, it needs a contract minor that publishes one — not
+        a fifth value smuggled in behind an existing one.
         """
         assert stage_inference_source(provider, {}) is None
 
@@ -129,6 +168,65 @@ class TestRequestKeyLabelling:
         """Fail closed here too; the provider string reaches this from a header."""
         key = RequestKey("Not A Vendor", _KEY)
         assert request_key_inference_source(key) is None
+
+
+class TestEnclaveRouteOmitsTheField:
+    """The blocking half of the enclave decision, from the route (#1894).
+
+    The stage test above pins the decision; this pins the **wire**. A vault
+    that sets ``llm.generation.provider: enclave`` — a registered provider
+    the generation resolver admits on ``provider.available`` outside
+    model-package mode — answers a PERSONAL reflection with no
+    ``inference_source`` key at all, rather than with ``local``.
+
+    That the enclave dial really does leave the device is proved separately,
+    with a socket spy, by
+    ``tests/test_enclave_provider.py::test_the_enclave_prompt_dial_leaves_the_device``:
+    the attestation and the generate call are stubbed here precisely so this
+    test is about the published field rather than about the transport.
+    """
+
+    @staticmethod
+    def _vault(tmp_path: Path) -> Path:
+        """Scaffold a vault whose ``generation`` stage is the enclave."""
+        vault = seed_vault(tmp_path / "vault")
+        data: dict[str, Any] = CreekConfig().model_dump(mode="json")
+        data["vault_path"] = str(vault)
+        data["llm"]["generation"] = {
+            **data["llm"]["default"],
+            "provider": "enclave",
+            "enclave_url": _ENCLAVE_URL,
+        }
+        path = vault.joinpath(*_CONFIG_SUBPATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.dump(data, sort_keys=False), encoding="utf-8")
+        return vault
+
+    def test_an_enclave_reflection_publishes_no_inference_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """200, a real reflection, and the field absent rather than ``local``.
+
+        The failure this closes: the writer's PERSONAL entry egresses to the
+        enclave operator, and a consumer rendering ``inference_source`` would
+        have told them it was answered on their own device — so the
+        stale-route condition ADR-0016 asks consumers to raise could never
+        fire.
+        """
+        monkeypatch.setattr(providers_module, "verify_enclave_attestation", _attested)
+        monkeypatch.setattr(providers_module, "call_enclave", _answer)
+
+        with TestClient(build_app(vault_path=self._vault(tmp_path))) as http:
+            response = http.post(
+                REFLECTIONS_PATH,
+                json={"content": _ENTRY},
+                headers=headers(ceiling="personal"),
+            )
+
+        assert response.status_code == _HTTP_OK, response.text
+        body = response.json()
+        assert body["notes"], body
+        assert "inference_source" not in body, body
 
 
 class TestRecorder:
@@ -176,6 +274,7 @@ class TestClassificationPassLabelling:
             pytest.param("pool", INFERENCE_SOURCE_POOL_CREEK, id="pool"),
             pytest.param("ollama", INFERENCE_SOURCE_LOCAL, id="ollama"),
             pytest.param("anthropic", None, id="operator-cloud"),
+            pytest.param("enclave", None, id="enclave"),
         ],
     )
     def test_an_llm_pass_is_labelled_by_its_configured_stage(

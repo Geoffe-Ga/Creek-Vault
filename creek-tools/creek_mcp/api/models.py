@@ -436,7 +436,15 @@ describes. It is a literal for the reason :data:`_UPLOAD_MINOR` is.
 """
 
 INFERENCE_SOURCE_LOCAL: Final[str] = "local"
-"""The answer came from a model inside the vault process (ADR-0016 D1.11)."""
+"""The answer came from a model whose dial never left the device (D1.11).
+
+Published only for a provider that declares
+:func:`~creek.classify.llm.providers.provider_egresses` ``False``, which today
+is the on-device Ollama path. It is deliberately **not** published for a
+backend that merely declines to be a readable cloud vendor: the attested
+enclave is unreadable and still remote, so an enclave-routed answer carries no
+``inference_source`` at all rather than this value (#1894).
+"""
 
 INFERENCE_SOURCE_POOL_CREEK: Final[str] = "pool:creek"
 """The answer came from a Creek-run shared inference pool (ADR-0016 O3)."""
@@ -1492,7 +1500,8 @@ class LetterResponse(_WireModel):
             (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted
             for a caller declaring an earlier minor. Also omitted — rather
             than guessed — on an answer this vocabulary does not label, which
-            today is an operator's own cloud key on a self-hosted vault. The
+            today is an operator's own cloud key on a self-hosted vault or an
+            attested enclave (unreadable, and still off-device). The
             consumer's use for the field is to notice a route it did not
             expect, so a label the server cannot stand behind would be worse
             than none.
@@ -2077,8 +2086,9 @@ class ClassificationResponse(_WireModel):
             (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted
             for a caller declaring an earlier minor. Also omitted — rather
             than guessed — on an answer this vocabulary does not label, which
-            today is an operator's own cloud key on a self-hosted vault, and on
-            a pass that called no model at all, such as ``method=rules``. The
+            today is an operator's own cloud key on a self-hosted vault or an
+            attested enclave (unreadable, and still off-device), and on a pass
+            that called no model at all, such as ``method=rules``. The
             consumer's use for the field is to notice a route it did not
             expect, so a label the server cannot stand behind would be worse
             than none.
@@ -2389,7 +2399,8 @@ class ReflectionResponse(_WireModel):
             (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted
             for a caller declaring an earlier minor. Also omitted — rather
             than guessed — on an answer this vocabulary does not label, which
-            today is an operator's own cloud key on a self-hosted vault. The
+            today is an operator's own cloud key on a self-hosted vault or an
+            attested enclave (unreadable, and still off-device). The
             consumer's use for the field is to notice a route it did not
             expect, so a label the server cannot stand behind would be worse
             than none.

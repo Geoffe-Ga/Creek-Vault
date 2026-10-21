@@ -35,11 +35,12 @@ inside ``JobStatusResponse.result``): the route that answered, one of
 and it is what lets adepthood treat an answer whose route differs from the one
 it disclosed as its existing ``409`` stale-route refusal. The field is
 **absent** rather than guessed on an answer this vocabulary does not label —
-an operator's own cloud key on a self-hosted vault is neither the pool, the
-writer's key, nor local — and absent on a pass that called no model at all,
-such as ``method=rules`` classification. A label the server cannot stand behind
-would be worse than no label, because the consumer's whole use for the field is
-to detect a route it did not expect.
+neither an operator's own cloud key on a self-hosted vault nor an attested
+enclave is the pool, the writer's key or local, the enclave because it is
+unreadable without being on-device — and absent on a pass that called no model
+at all, such as ``method=rules`` classification. A label the server cannot
+stand behind would be worse than no label, because the consumer's whole use for
+the field is to detect a route it did not expect.
 
 ``GET /v1/capabilities`` gains ``inference_pool``: whether this vault answers
 model calls from the shared pool, so a consumer can detect the route before

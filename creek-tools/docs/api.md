@@ -401,12 +401,23 @@ the classification response (which you read inside `JobStatusResponse.result`).
 Its value is the route that answered: `pool:creek`, `pool:attested:<vendor>`,
 `request_key:<vendor>` or `local`. Treat an answer whose route differs from the
 one you disclosed to the writer as a stale-route condition rather than a
-success. The field is **absent** rather than guessed in three cases, and they
+success. The field is **absent** rather than guessed in four cases, and they
 are one absence on the wire on purpose: your declared minor predates it; the
-route is one this contract has no name for (an operator's own cloud key on a
-self-hosted vault); or no model was called at all, which covers a
-`method=rules` classification and a repeat letter returned as stored. A label
-the server cannot stand behind would defeat the only thing the field is for.
+route is an operator's own cloud key on a self-hosted vault, which this
+contract has no name for; the route is the attested GPU-confidential-compute
+enclave, which it also has no name for; or no model was called at all, which
+covers a `method=rules` classification and a repeat letter returned as stored.
+A label the server cannot stand behind would defeat the only thing the field
+is for.
+
+The enclave is called out separately because it is the absence most likely to
+read as a bug. An enclave is *unreadable* — attestation is verified before any
+prompt leaves — but it is not *on-device*: the prompt is sent to a remote
+endpoint over `https`. `local` would therefore be the one value a socket spy
+could contradict, so a vault configured with `llm.generation.provider:
+enclave` publishes no `inference_source` instead. Read the absence the way you
+read the operator-cloud-key case: the server is telling you it will not name
+this route, not that the answer stayed on the device.
 
 `GET /v1/capabilities` gains `inference_pool`, so you can detect the route
 *before* dialling rather than inferring it from the first answer.
