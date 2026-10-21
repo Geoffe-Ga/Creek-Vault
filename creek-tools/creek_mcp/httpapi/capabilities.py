@@ -46,10 +46,12 @@ from __future__ import annotations
 from functools import partial
 from typing import TYPE_CHECKING
 
+from creek.classify.llm.consent import is_managed_vault
 from creek.classify.llm.pool_boundary import pool_url_configured
 from creek_mcp.api.models import (
     CAPABILITY_SINCE_MINOR,
     CONTRACT_MINOR,
+    KEYLESS_INFERENCE_SINCE_MINOR,
     PROVENANCE_SINCE_MINOR,
     REQUEST_KEYS_SINCE_MINOR,
     SUPPORTED_CONTRACT_MINORS,
@@ -80,6 +82,7 @@ from creek_mcp.policy import Transport
 from creek_mcp.tools.handshake import handshake_tool, vault_available
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from starlette.requests import Request
@@ -179,6 +182,46 @@ def advertised_inference_pool(declared_minor: str | None) -> bool | None:
     ):
         return None
     return pool_url_configured()
+
+
+def keyless_inference_available(environ: Mapping[str, str] | None = None) -> bool:
+    """Return whether a model call carrying no writer key may be attempted here.
+
+    ``False`` only where the refusal is certain before any dial: a managed
+    vault ships no inference runtime and refuses its operator's cloud key, so
+    without a shared pool pinned in the Machine environment there is nothing a
+    keyless call could reach. Everywhere else the vault's own routing decides
+    per request, exactly as before, so ``True`` promises an attempt and not
+    an answer. Like :func:`advertised_inference_pool` it reads the platform
+    environment only, never the vault config, so it costs nothing on the loop.
+
+    Args:
+        environ: Environment to read; ``os.environ`` when omitted.
+
+    Returns:
+        ``False`` for a managed vault with no pool; ``True`` otherwise.
+    """
+    return not is_managed_vault(environ) or pool_url_configured(environ)
+
+
+def advertised_keyless_inference(declared_minor: str | None) -> bool | None:
+    """Return whether to tell this caller a keyless call may run, or ``None``.
+
+    The field-level twin of :func:`advertised_inference_pool`, gated on
+    :data:`~creek_mcp.api.models.KEYLESS_INFERENCE_SINCE_MINOR`.
+
+    Args:
+        declared_minor: The caller's ``X-Creek-Contract-Version``, or ``None``.
+
+    Returns:
+        ``None`` to omit the field; otherwise
+        :func:`keyless_inference_available`.
+    """
+    if declared_minor is not None and not minor_at_least(
+        declared_minor, KEYLESS_INFERENCE_SINCE_MINOR
+    ):
+        return None
+    return keyless_inference_available()
 
 
 def _negotiate(vault: Path, context: RequestContext, advertised: list[str]) -> bool:
@@ -350,6 +393,7 @@ def _render(
     available: bool,
     request_keys: list[RequestKeyProvider] | None = None,
     inference_pool: bool | None = None,
+    keyless_inference: bool | None = None,
 ) -> Response:
     """Return the handshake body for *status*.
 
@@ -365,6 +409,8 @@ def _render(
             the field for a caller whose minor predates it.
         inference_pool: Whether the shared pool answers here, or ``None`` to
             omit the field for a caller whose minor predates it.
+        keyless_inference: Whether a keyless model call may run here, or
+            ``None`` to omit the field for a caller whose minor predates it.
 
     Returns:
         A ``200`` carrying the published response model and nothing else.
@@ -380,12 +426,15 @@ def _render(
         capabilities=(advertised if status is CapabilitiesStatus.OK else []),
         request_key_providers=request_keys,
         inference_pool=inference_pool,
+        keyless_inference=keyless_inference,
     )
     body = payload.model_dump(mode="json")
     if request_keys is None:
         body.pop("request_key_providers")
     if inference_pool is None:
         body.pop("inference_pool")
+    if keyless_inference is None:
+        body.pop("keyless_inference")
     return json_response(body, HTTP_OK)
 
 
@@ -481,4 +530,5 @@ async def handle_capabilities(request: Request) -> Response:
         available=available,
         request_keys=advertised_request_key_providers(declared),
         inference_pool=advertised_inference_pool(declared),
+        keyless_inference=advertised_keyless_inference(declared),
     )

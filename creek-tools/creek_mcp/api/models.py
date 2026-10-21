@@ -83,6 +83,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.19",
     "0.18",
     "0.17",
     "0.16",
@@ -433,6 +434,15 @@ because they are one contract change and a consumer that can name any of them
 can name all of them. Splitting it into three would let a future edit withhold
 the field while serving the code, which is a combination no vendored schema
 describes. It is a literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
+KEYLESS_INFERENCE_SINCE_MINOR: Final[str] = "0.20"
+"""First contract minor whose handshake carries ``keyless_inference`` (#1938).
+
+Its own constant rather than :data:`PROVENANCE_SINCE_MINOR`, because it is its
+own contract change: a ``0.19`` consumer vendored a closed
+:class:`CapabilitiesResponse` without it. It is a literal for the reason
+:data:`_UPLOAD_MINOR` is.
 """
 
 INFERENCE_SOURCE_LOCAL: Final[str] = "local"
@@ -1169,6 +1179,13 @@ class CapabilitiesResponse(_WireModel):
             the route *before* dialling rather than inferring it from the
             first answer's ``inference_source``. Since contract 0.19, and
             omitted for a caller declaring an earlier minor.
+        keyless_inference: ``False`` when a model call carrying no writer key
+            is certain to be refused here before any model is dialled: a
+            managed vault with no shared pool pinned. ``True`` when such a
+            call may be attempted. A consumer reading ``False`` should ask
+            the writer for their key instead of charging for a pass that
+            cannot run. Since contract 0.20, and omitted for a caller
+            declaring an earlier minor.
     """
 
     status: CapabilitiesStatus = Field(description="Overall server readiness.")
@@ -1198,6 +1215,14 @@ class CapabilitiesResponse(_WireModel):
         description=(
             "Whether model calls are answered from the shared inference pool. "
             "Since contract 0.19."
+        ),
+    )
+    keyless_inference: bool | None = Field(
+        default=None,
+        description=(
+            "False when a model call without a writer's request key is "
+            "refused before any model is dialled; true when one may be "
+            "attempted. Since contract 0.20."
         ),
     )
 
