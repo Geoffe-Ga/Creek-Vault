@@ -6,7 +6,11 @@ Two subcommands:
   ``--mode fake`` (the default) is hermetic; ``--mode live`` drives an
   operator-supplied Ollama and requires ``--model``, ``--digest`` and
   ``--git-sha`` (``scripts/bench.sh`` supplies the last from the checkout).
-- ``cost`` models USD per account-month from an operator price sheet.
+- ``cost`` models cost from an operator price sheet: a Fly Machine-month per
+  account by default, or — with ``--metered-model`` and ``--token-report`` —
+  ADR-0016's metered per-token pool, priced from the *measured* token block in
+  a benchmark report. A report whose basis is not ``provider_reported`` is
+  refused: a fake run's byte bound and an absent measurement are not prices.
 
 Exit codes: ``0`` success; ``2`` refusal — a fixed message naming the flag or
 field at fault, never the value; ``1`` any other failure, named by exception
@@ -30,43 +34,74 @@ from pydantic import ValidationError
 
 from creek_mcp.bench import HARNESS_VERSION
 from creek_mcp.bench.cost import (
+    DEFAULT_MONTHLY_REFLECTION_CAP,
     Allocation,
     AllowanceUse,
     DutyBand,
     cost_bands,
     load_price_sheet,
+    metered_estimate,
 )
-from creek_mcp.bench.fake import fake_factory
-from creek_mcp.bench.local_only import LocalOnlyFactory, require_local_target
+from creek_mcp.bench.fake import FakePool, fake_factory
+from creek_mcp.bench.local_only import (
+    LocalOnlyFactory,
+    refuse_cloud_tag,
+    require_local_target,
+)
 from creek_mcp.bench.metadata import RunMetadata
 from creek_mcp.bench.ollama_client import BenchOllamaClient
-from creek_mcp.bench.report import write_report
+from creek_mcp.bench.pool_client import BenchPoolClient
+from creek_mcp.bench.report import load_report, write_report
 from creek_mcp.bench.runner import Backend, BenchPlan, Workload, run_bench
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from creek_mcp.bench.cost import PriceSheet
 
 EXIT_OK: Final[int] = 0
 EXIT_FAILED: Final[int] = 1
 EXIT_REFUSED: Final[int] = 2
 
 _DEFAULT_OLLAMA_URL: Final[str] = "http://127.0.0.1:11434"
+_DEFAULT_POOL_URL: Final[str] = "http://127.0.0.1:8080"
 _DEFAULT_NUM_CTX: Final[int] = 4096
 _DEFAULT_NUM_PREDICT: Final[int] = 128
 _DEFAULT_DUTY_LOW: Final[str] = "0.05"
 _DEFAULT_DUTY_HIGH: Final[str] = "1"
 _FAKE_MODEL_TAG: Final[str] = "fake"
+_FAKE_POOL_VENDOR: Final[str] = "fake"
+_POOL_URL_FLAG: Final[str] = "--pool-url"
 _CORPUS_DIR: Final[str] = "corpus"
 _LIVE_REQUIRES: Final[tuple[tuple[str, str], ...]] = (
     ("model", "--model"),
     ("digest", "--digest"),
     ("git_sha", "--git-sha"),
 )
+_POOL_REQUIRES: Final[tuple[tuple[str, str], ...]] = (
+    ("pool_identity", "--pool-identity"),
+)
+_POOL_LIVE_REQUIRES: Final[tuple[tuple[str, str], ...]] = (
+    ("pool_vendor", "--pool-vendor"),
+)
 _ALLOWANCE_FLAGS: Final[tuple[str, ...]] = (
     "--allowance",
     "--seconds-per-reflection",
     "--linger-seconds",
 )
+_METERED_FLAGS: Final[tuple[str, ...]] = ("--metered-model", "--token-report")
+_METERED_ONLY_FLAGS: Final[tuple[tuple[str, str, object], ...]] = (
+    ("metered_currency", "--metered-currency", "USD"),
+    ("monthly_cap", "--monthly-cap", DEFAULT_MONTHLY_REFLECTION_CAP),
+    ("tokens_spent_input", "--tokens-spent-input", 0),
+    ("tokens_spent_output", "--tokens-spent-output", 0),
+)
+"""Flags that mean nothing to the Machine-month shape, with their defaults.
+
+Given without the metered pair they would be silently ignored, and a cost flag
+that looks applied but is not is exactly the shape of a wrong number someone
+budgets against. Refused instead.
+"""
 _FAILURES: Final[tuple[type[BaseException], ...]] = (
     OSError,
     RuntimeError,
@@ -113,12 +148,27 @@ def _add_reflect(
     """Register the ``reflect`` subcommand."""
     parser = subparsers.add_parser("reflect", help="run the capacity sweeps")
     parser.add_argument("--mode", choices=("fake", "live"), default="fake")
+    parser.add_argument(
+        "--provider",
+        choices=("ollama", "pool"),
+        default="ollama",
+        help="which runtime to measure; 'pool' drives the shared inference pool",
+    )
     parser.add_argument("--grounding", choices=("none", "default"), default=None)
     parser.add_argument("--ollama-url", default=_DEFAULT_OLLAMA_URL)
+    parser.add_argument("--pool-url", default=_DEFAULT_POOL_URL)
+    parser.add_argument(
+        "--pool-identity",
+        default=None,
+        help="the identity every pool request names and every answer must echo",
+    )
+    parser.add_argument(
+        "--pool-vendor", default=None, help="short label for whose pool was measured"
+    )
     parser.add_argument(
         "--allow-remote-host",
         action="store_true",
-        help="measure an --ollama-url that is not loopback or private (recorded)",
+        help="measure an endpoint that is not loopback or private (recorded)",
     )
     parser.add_argument("--model", default=None)
     parser.add_argument("--digest", default=None)
@@ -153,6 +203,23 @@ def _add_cost(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -
     parser.add_argument("--allowance", type=int, default=None)
     parser.add_argument("--seconds-per-reflection", type=Decimal, default=None)
     parser.add_argument("--linger-seconds", type=Decimal, default=None)
+    parser.add_argument(
+        "--metered-model",
+        default=None,
+        help="price ADR-0016's per-token pool for this model id",
+    )
+    parser.add_argument(
+        "--token-report",
+        type=Path,
+        default=None,
+        help="benchmark report whose measured token block prices the pool",
+    )
+    parser.add_argument("--metered-currency", choices=("USD", "EUR"), default="USD")
+    parser.add_argument(
+        "--monthly-cap", type=int, default=DEFAULT_MONTHLY_REFLECTION_CAP
+    )
+    parser.add_argument("--tokens-spent-input", type=int, default=0)
+    parser.add_argument("--tokens-spent-output", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)
 
 
@@ -167,29 +234,79 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _metadata(args: argparse.Namespace) -> RunMetadata:
-    """Build run metadata, refusing a live run missing a pinning flag."""
-    live = args.mode == "live"
-    if live:
-        for attribute, flag in _LIVE_REQUIRES:
-            if getattr(args, attribute) is None:
-                msg = f"{flag} is required for --mode live"
-                raise _RefusalError(msg)
-    grounding = args.grounding or ("default" if live else "none")
-    scope = (
-        require_local_target(
-            args.ollama_url, args.model, allow_remote=args.allow_remote_host
+def _require_flags(
+    args: argparse.Namespace, required: tuple[tuple[str, str], ...], reason: str
+) -> None:
+    """Refuse when any flag *reason* makes mandatory was not supplied.
+
+    Raises:
+        _RefusalError: Naming the first absent flag, never its value.
+    """
+    for attribute, flag in required:
+        if getattr(args, attribute) is None:
+            msg = f"{flag} is required for {reason}"
+            raise _RefusalError(msg)
+
+
+def _provider(args: argparse.Namespace) -> str:
+    """Return which provider actually serves the trials.
+
+    ``--provider`` names the runtime to measure; the hermetic mode substitutes
+    the local fake for Ollama, but *not* for the pool, whose refusal and
+    identity paths are exactly what the fake pool exists to exercise.
+    """
+    if args.provider == "pool":
+        return "pool"
+    return "ollama" if args.mode == "live" else "fake"
+
+
+def _model_tag(args: argparse.Namespace) -> str:
+    """Return the model tag the run drove, defaulting to the fake's."""
+    return args.model or _FAKE_MODEL_TAG
+
+
+def _endpoint_scope(args: argparse.Namespace, provider: str) -> str:
+    """Classify where a live run's requests go; a fake run sends none.
+
+    A pool endpoint is deliberately remote (ADR-0016 Decision 6), so the same
+    check runs against ``--pool-url`` and the operator opts in with
+    ``--allow-remote-host``; the report then records ``remote``.
+    """
+    if args.mode != "live":
+        return "fake"
+    if provider == "pool":
+        return require_local_target(
+            args.pool_url,
+            _model_tag(args),
+            allow_remote=args.allow_remote_host,
+            flag=_POOL_URL_FLAG,
         )
-        if live
-        else "fake"
+    return require_local_target(
+        args.ollama_url, args.model, allow_remote=args.allow_remote_host
     )
+
+
+def _metadata(args: argparse.Namespace) -> RunMetadata:
+    """Build run metadata, refusing a run missing a pinning flag."""
+    live = args.mode == "live"
+    provider = _provider(args)
+    if live:
+        _require_flags(args, _LIVE_REQUIRES, "--mode live")
+    if provider == "pool":
+        _require_flags(args, _POOL_REQUIRES, "--provider pool")
+        if live:
+            _require_flags(args, _POOL_LIVE_REQUIRES, "--provider pool --mode live")
+        refuse_cloud_tag(_model_tag(args))
+    pooled = provider == "pool"
     return RunMetadata.model_validate(
         {
             "mode": args.mode,
-            "provider": "ollama" if live else "fake",
-            "endpoint_scope": scope,
-            "grounding": grounding,
-            "model_tag": args.model if live else _FAKE_MODEL_TAG,
+            "provider": provider,
+            "endpoint_scope": _endpoint_scope(args, provider),
+            "grounding": args.grounding or ("default" if live else "none"),
+            "model_tag": _model_tag(args) if live or pooled else _FAKE_MODEL_TAG,
+            "pool_vendor": (args.pool_vendor or _FAKE_POOL_VENDOR) if pooled else None,
+            "pool_identity": args.pool_identity if pooled else None,
             "digest": args.digest,
             "num_ctx": args.num_ctx,
             "num_predict": args.num_predict,
@@ -199,8 +316,48 @@ def _metadata(args: argparse.Namespace) -> RunMetadata:
     )
 
 
+def _pool_backend(args: argparse.Namespace) -> Backend:
+    """Build the pool backend; hermetic unless the mode is live.
+
+    In the hermetic mode the client dials an in-process :class:`FakePool`, so
+    every sweep and every refusal path runs with no vendor contacted and
+    nothing billed (ADR-0016 Decision 4). The live path is the same client
+    with no transport injected.
+
+    :func:`_run_reflect` builds the metadata first, so ``--pool-identity`` is
+    already known to be present by the time this runs; that ordering is what
+    makes the pin non-optional, so do not reorder it.
+    """
+    fake = (
+        None
+        if args.mode == "live"
+        else FakePool(
+            identity=args.pool_identity,
+            model_tag=_model_tag(args),
+            measurement_digest=args.digest,
+        )
+    )
+    client = BenchPoolClient(
+        args.pool_url,
+        _model_tag(args),
+        identity=args.pool_identity,
+        num_ctx=args.num_ctx,
+        num_predict=args.num_predict,
+        measurement_digest=args.digest,
+        transport=None if fake is None else fake.transport(),
+    )
+    return Backend(
+        factory=LocalOnlyFactory(client.factory(), provider_name="pool"),
+        evict=client.evict,
+        resident_bytes=client.resident_bytes,
+        pin=client.verify_pinned,
+    )
+
+
 def _backend(args: argparse.Namespace) -> Backend:
-    """Build the fake or live backend; performs no I/O."""
+    """Build the fake, Ollama or pool backend; performs no I/O."""
+    if _provider(args) == "pool":
+        return _pool_backend(args)
     if args.mode == "fake":
         return Backend(
             factory=LocalOnlyFactory(fake_factory, provider_name="fake"),
@@ -243,8 +400,9 @@ def _run_reflect(args: argparse.Namespace) -> str:
     if store is not None and not store.is_dir():
         msg = "--model-store-path must be an existing directory"
         raise _RefusalError(msg)
+    metadata = _metadata(args)
     plan = BenchPlan(
-        metadata=_metadata(args), workload=_workload(args), backend=_backend(args)
+        metadata=metadata, workload=_workload(args), backend=_backend(args)
     )
     with tempfile.TemporaryDirectory(prefix="creek-bench-") as scratch:
         report = run_bench(
@@ -288,8 +446,11 @@ def _allocation(args: argparse.Namespace) -> Allocation:
 
 def _run_cost(args: argparse.Namespace) -> str:
     """Model the cost and write the estimate; return the summary line."""
-    allowance = _allowance(args)
+    metered = _metered_requested(args)
+    allowance = None if metered else _allowance(args)
     sheet = load_price_sheet(args.price_file, today=args.today or date.today())
+    if metered:
+        return _write_metered(args, sheet)
     estimate = cost_bands(
         sheet,
         _allocation(args),
@@ -300,6 +461,55 @@ def _run_cost(args: argparse.Namespace) -> str:
     return (
         f"kind={estimate.kind} low_usd={estimate.low_usd} "
         f"high_usd={estimate.high_usd} report={args.out}"
+    )
+
+
+def _metered_requested(args: argparse.Namespace) -> bool:
+    """Return whether the metered estimate was asked for, all flags or none.
+
+    Raises:
+        _RefusalError: When only one of the metered pair was given, or a
+            metered-only flag was given without the pair.
+    """
+    values = (args.metered_model, args.token_report)
+    if not any(value is None for value in values):
+        return True
+    for attribute, flag, default in _METERED_ONLY_FLAGS:
+        if getattr(args, attribute) != default:
+            msg = f"{flag} applies only with {', '.join(_METERED_FLAGS)}"
+            raise _RefusalError(msg)
+    if all(value is None for value in values):
+        return False
+    msg = f"{', '.join(_METERED_FLAGS)} must be given together"
+    raise _RefusalError(msg)
+
+
+def _write_metered(args: argparse.Namespace, sheet: PriceSheet) -> str:
+    """Price the metered pool from the report's measured block and write it.
+
+    The report is read for one field — its token block — and nothing else: a
+    cost figure must cite a measurement rather than restate an assumption.
+    """
+    estimate = metered_estimate(
+        sheet,
+        model_id=args.metered_model,
+        currency=args.metered_currency,
+        tokens=load_report(args.token_report).tokens_per_reflection,
+        monthly_reflection_cap=args.monthly_cap,
+        input_tokens_spent=args.tokens_spent_input,
+        output_tokens_spent=args.tokens_spent_output,
+    )
+    args.out.write_text(estimate.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    per_1000 = ", ".join(
+        f"{one.reflections_per_month}/mo={one.cost_per_1000_reflections}"
+        for one in estimate.per_volume
+    )
+    return (
+        f"kind={estimate.kind} shape={estimate.shape} "
+        f"basis={estimate.token_basis.value} currency={estimate.currency} "
+        f"per_1000[{per_1000}] "
+        f"per_account_month={estimate.cost_per_account_month} "
+        f"report={args.out}"
     )
 
 

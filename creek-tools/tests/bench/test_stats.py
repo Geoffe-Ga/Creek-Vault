@@ -152,6 +152,8 @@ def test_outcome_counts_zero_filled() -> None:
         Outcome.DISK_FULL: 0,
         Outcome.PROVIDER_UNAVAILABLE: 0,
         Outcome.CONTEXT_OVERFLOW: 0,
+        Outcome.RATE_LIMITED: 0,
+        Outcome.INSUFFICIENT_QUOTA: 0,
         Outcome.ERROR: 0,
     }
 

@@ -84,8 +84,9 @@ _CAP_SAFETY_FACTOR: Final[int] = 2
 """Decision 3.4 sizes a cap at spent + allowance x measured tokens x this."""
 
 _UNMEASURED: Final[str] = (
-    "pool caps must be sized from provider-reported measured tokens"
+    "cost and cap figures must be sized from provider-reported measured tokens"
 )
+"""One refusal for both callers: #1914's caps and #1897's cost line."""
 
 
 @unique
@@ -229,6 +230,81 @@ class PoolSpendCap:
             raise ValueError("pool key expiry must be timezone-aware")
 
 
+def measured_reflection_tokens(tokens: TokensPerReflection) -> tuple[int, int]:
+    """Return the worst-case citable ``(prompt, output)`` tokens per reflection.
+
+    The one basis rule for every figure sized on a measurement, in one place:
+    only :attr:`~creek_mcp.bench.usage.TokenBasis.PROVIDER_REPORTED` counts
+    may price a cap or a cost line.  A ``byte_upper_bound`` is a bound on
+    *bytes*, and ``unreported`` and ``not_measured`` are absences; quoting any
+    of them would read as a measured figure to anyone who budgeted against it.
+    The worst surface is taken per direction, so a letter's larger output
+    ceiling cannot overrun a figure sized on a reflection.
+
+    Args:
+        tokens: The measured per-surface token block (#1909).
+
+    Returns:
+        The worst measured prompt and output counts.
+
+    Raises:
+        ValueError: When *tokens* was not provider-reported, or reported no
+            prompt or no output count at all.
+    """
+    if tokens.basis is not TokenBasis.PROVIDER_REPORTED:
+        raise ValueError(_UNMEASURED)
+    prompt = max(
+        (surface.prompt_tokens or 0 for surface in tokens.per_surface.values()),
+        default=0,
+    )
+    output = max(
+        (surface.output_tokens or 0 for surface in tokens.per_surface.values()),
+        default=0,
+    )
+    if not prompt or not output:
+        raise ValueError(_UNMEASURED)
+    return prompt, output
+
+
+def pool_cap_tokens(
+    *,
+    tokens: TokensPerReflection,
+    monthly_reflection_cap: int,
+    input_tokens_spent: int,
+    output_tokens_spent: int,
+) -> tuple[int, int]:
+    """Return Decision 3.4's input and output token caps, the one formula.
+
+    ``tokens spent so far + monthly cap x measured tokens per reflection x 2``,
+    independently per direction.  Extracted so the cost model (#1897) and the
+    control plane quote this arithmetic rather than each re-deriving it.
+
+    Args:
+        tokens: The measured per-surface token block (#1909).
+        monthly_reflection_cap: The monthly reflection allowance this vault is
+            entitled to, injected rather than assumed here.
+        input_tokens_spent: Input tokens this key has already spent.
+        output_tokens_spent: Output tokens it has already spent.
+
+    Returns:
+        ``(input_tokens, output_tokens)``.
+
+    Raises:
+        ValueError: When *tokens* is not citable, or the allowance or spent
+            counts are out of range.
+    """
+    prompt, output = measured_reflection_tokens(tokens)
+    if monthly_reflection_cap <= 0:
+        raise ValueError("monthly reflection allowance must be positive")
+    if input_tokens_spent < 0 or output_tokens_spent < 0:
+        raise ValueError("spent token counts must not be negative")
+    allowance = monthly_reflection_cap * _CAP_SAFETY_FACTOR
+    return (
+        input_tokens_spent + allowance * prompt,
+        output_tokens_spent + allowance * output,
+    )
+
+
 def size_pool_caps(
     *,
     tokens: TokensPerReflection,
@@ -247,7 +323,8 @@ def size_pool_caps(
     assumption, and a ``byte_upper_bound`` basis is an upper bound rather than
     a measurement, so neither may price a cap.  The worst-case surface is
     taken, so a letter's larger ceiling cannot overrun a cap sized on a
-    reflection.
+    reflection.  The arithmetic itself lives in :func:`pool_cap_tokens`, so
+    the cost model (#1897) reports the same numbers this sets.
 
     Args:
         tokens: The measured per-surface token block.
@@ -267,27 +344,16 @@ def size_pool_caps(
         ValueError: When *tokens* was not provider-reported, or the allowance
             or spent counts are negative.
     """
-    if tokens.basis is not TokenBasis.PROVIDER_REPORTED:
-        raise ValueError(_UNMEASURED)
-    if monthly_reflection_cap <= 0:
-        raise ValueError("monthly reflection allowance must be positive")
-    if input_tokens_spent < 0 or output_tokens_spent < 0:
-        raise ValueError("spent token counts must not be negative")
-    prompt = max(
-        (surface.prompt_tokens or 0 for surface in tokens.per_surface.values()),
-        default=0,
+    input_tokens, output_tokens = pool_cap_tokens(
+        tokens=tokens,
+        monthly_reflection_cap=monthly_reflection_cap,
+        input_tokens_spent=input_tokens_spent,
+        output_tokens_spent=output_tokens_spent,
     )
-    output = max(
-        (surface.output_tokens or 0 for surface in tokens.per_surface.values()),
-        default=0,
-    )
-    if not prompt or not output:
-        raise ValueError(_UNMEASURED)
-    allowance = monthly_reflection_cap * _CAP_SAFETY_FACTOR
     return PoolSpendCap(
         lifetime_usd=lifetime_usd,
-        input_tokens=input_tokens_spent + allowance * prompt,
-        output_tokens=output_tokens_spent + allowance * output,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         expires_at=expires_at,
     )
 
