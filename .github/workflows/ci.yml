@@ -59,11 +59,13 @@ env:
   # Pin uv so a uv release cannot change resolution or CLI behaviour out from
   # under CI. uv is installed into the runner Python and is therefore audited
   # by the pip-audit step, so this pin must stay on a release with no open
-  # advisories (0.11.16 clears GHSA-w476-p2h3-79g9 / CVE-2025-13327 /
-  # GHSA-pjjw-68hj-v9mw); bump it deliberately when pip-audit flags a newer
-  # one. Hoisted to workflow scope in #1141 so the five jobs that install it
+  # advisories (0.11.16 cleared GHSA-w476-p2h3-79g9 / CVE-2025-13327 /
+  # GHSA-pjjw-68hj-v9mw, and 0.13.4 clears PYSEC-2026-4321 /
+  # GHSA-hq85-5cpj-mr62, the bundled emSign CA root whose intermediate
+  # keys are compromised); bump it deliberately when pip-audit flags a
+  # newer one. Hoisted to workflow scope in #1141 so the five jobs that install it
   # cannot drift apart on a security-relevant version.
-  UV_PINNED_VERSION: '0.11.16'
+  UV_PINNED_VERSION: '0.13.4'
   COVERAGE_THRESHOLD: 90
   DOCSTRING_COVERAGE_THRESHOLD: 95
   PYLINT_FAIL_UNDER: '9.0'
