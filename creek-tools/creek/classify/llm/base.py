@@ -30,6 +30,16 @@ class LLMProvider(Protocol):
     Drives the cloud-egress warning and consent gate. Declared as a plain
     class attribute on each implementation so the factory can read it without
     instantiating (which, for cloud backends, would require credentials).
+
+    It is **not** the tier gate. Every registered implementation also declares
+    a companion ``intimate_eligible`` flag, read by
+    :func:`~creek.classify.llm.providers.provider_intimate_eligible` and
+    enforced once at the :class:`~creek.classify.llm.router.ModelRouter`
+    chokepoint. The two differ: the shared inference pool is not cloud — no
+    operator key, no consent variable — and is still never shown INTIMATE
+    content (ADR-0016 Decision 5, #1894). The flag is deliberately not on this
+    protocol, so a bench stub or a test double need not declare it; the
+    provider registry's own type requires it of every real backend.
     """
 
     @property

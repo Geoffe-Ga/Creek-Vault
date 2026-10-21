@@ -22,6 +22,16 @@ bypass needs either half rebuilt somewhere else, so this module checks the
 4. **The boundary's own clients ignore the proxy environment**:
    ``trust_env=False``, no ``**kwargs``, and no ``proxy`` / ``mounts``.
 
+The same rules run a second time for the **pool** boundary
+(:mod:`creek.classify.llm.pool_boundary`, #1894), the one pinned destination
+beyond loopback: outside it, a module that names a pool path or
+``CREEK_POOL_URL`` may build no HTTP client and may not import the private
+destination reader. The pool boundary's own rule 4 is stricter than the local
+one, because a proxy-free *general-purpose* client is not good enough for a
+single pinned host: it must dial with :mod:`http.client`, which reads no proxy
+variable at all and follows no redirect, and it must name no proxy environment
+variable.
+
 Each rule is proved non-vacuous against planted violations below, one per
 bypass shape.
 """
@@ -39,6 +49,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parent.parent
 _SCANNED = (_ROOT / "creek", _ROOT / "creek_mcp")
 _BOUNDARY = _ROOT / "creek" / "classify" / "llm" / "local_boundary.py"
+_POOL_BOUNDARY = _ROOT / "creek" / "classify" / "llm" / "pool_boundary.py"
 
 _OLLAMA_PATH: Final = re.compile(
     r"/api/(?:generate|tags|show|chat|pull|push|embed|embeddings|ps|version"
@@ -46,6 +57,28 @@ _OLLAMA_PATH: Final = re.compile(
 )
 _URL_FIELD: Final = "ollama_url"
 _URL_BUILDER: Final = "ollama_endpoint"
+
+_POOL_PATH: Final = re.compile(r"/v1/(?:models|generate|completions|embeddings)\b")
+_POOL_URL_ENV: Final = "CREEK_POOL_URL"
+_POOL_URL_BUILDER: Final = "pool_destination"
+_URL_BUILDERS: Final = frozenset({_URL_BUILDER, _POOL_URL_BUILDER})
+
+_PROXY_ENV: Final = frozenset(
+    {
+        "ALL_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
+"""Environment keys that could carry a pinned dial to a third host."""
+
+_STDLIB_DIAL: Final = "http.client"
+"""The one HTTP module the pool boundary may use: no proxies, no redirects."""
 
 _DIALS: Final[dict[str, frozenset[str]]] = {
     "httpx": frozenset(
@@ -131,13 +164,57 @@ _NON_OLLAMA_DIALS: Final[dict[tuple[str, str], str]] = {
 _FORBIDDEN_CLIENT_KEYWORDS: Final = frozenset({"proxy", "proxies", "mounts"})
 
 
+@dataclass(frozen=True)
+class _Boundary:
+    """One dial boundary: the module that owns it and how to spot its data.
+
+    Attributes:
+        module: The only file allowed to turn this destination into a request.
+        paths: Pattern matching an API path on this destination.
+        url_field: A config attribute naming the destination, or ``None``
+            when there is none (the pool's destination is not in config).
+        url_env: An environment key naming the destination, or ``None``.
+        url_builder: The private URL/destination reader nothing else imports.
+        non_dialling: Functions in marker-bearing modules whose dial is to
+            something else entirely, mapped to the reason.
+    """
+
+    module: Path
+    paths: re.Pattern[str]
+    url_field: str | None
+    url_env: str | None
+    url_builder: str
+    non_dialling: dict[tuple[str, str], str]
+
+
+_OLLAMA = _Boundary(
+    module=_BOUNDARY,
+    paths=_OLLAMA_PATH,
+    url_field=_URL_FIELD,
+    url_env=None,
+    url_builder=_URL_BUILDER,
+    non_dialling=_NON_OLLAMA_DIALS,
+)
+"""The loopback Ollama runtime."""
+
+_POOL = _Boundary(
+    module=_POOL_BOUNDARY,
+    paths=_POOL_PATH,
+    url_field=None,
+    url_env=_POOL_URL_ENV,
+    url_builder=_POOL_URL_BUILDER,
+    non_dialling={},
+)
+"""The shared confidential inference pool (#1894)."""
+
+
 @dataclass
 class _Imports:
     """How a module spells the HTTP modules and the boundary's URL builder."""
 
     modules: dict[str, str] = field(default_factory=dict)
     names: dict[str, tuple[str, str]] = field(default_factory=dict)
-    url_builder_imports: list[int] = field(default_factory=list)
+    url_builder_imports: list[tuple[int, str]] = field(default_factory=list)
 
 
 def _collect_imports(tree: ast.Module) -> _Imports:
@@ -159,8 +236,8 @@ def _collect_imports(tree: ast.Module) -> _Imports:
                     found.modules[bound] = submodule
                 else:
                     found.names[bound] = (node.module, alias.name)
-                if alias.name == _URL_BUILDER:
-                    found.url_builder_imports.append(node.lineno)
+                if alias.name in _URL_BUILDERS:
+                    found.url_builder_imports.append((node.lineno, alias.name))
     return found
 
 
@@ -215,18 +292,28 @@ def _docstrings(tree: ast.Module) -> set[int]:
     }
 
 
-def _ollama_markers(root: ast.AST, docstrings: set[int]) -> list[int]:
-    """Return line numbers where *root* names an Ollama path or URL field."""
+def _markers(root: ast.AST, docstrings: set[int], boundary: _Boundary) -> list[int]:
+    """Return line numbers where *root* names *boundary*'s destination."""
     lines = []
     for node in ast.walk(root):
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and id(node) not in docstrings
-            and _OLLAMA_PATH.search(node.value)
-        ) or (isinstance(node, ast.Attribute) and node.attr == _URL_FIELD):
+        if _names_destination(node, docstrings, boundary):
             lines.append(node.lineno)
     return lines
+
+
+def _names_destination(
+    node: ast.AST, docstrings: set[int], boundary: _Boundary
+) -> bool:
+    """Return whether *node* names *boundary*'s path, config field or env key."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if id(node) in docstrings:
+            return False
+        return bool(boundary.paths.search(node.value) or node.value == boundary.url_env)
+    return (
+        isinstance(node, ast.Attribute)
+        and boundary.url_field is not None
+        and node.attr == boundary.url_field
+    )
 
 
 def _parents(tree: ast.AST) -> dict[int, ast.AST]:
@@ -254,11 +341,13 @@ def _call_name(call: ast.Call) -> str | None:
     return None if dotted is None else dotted.rsplit(".", 1)[-1]
 
 
-def _url_field_misuse(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str]:
-    """Rule 2: an ``ollama_url`` reaching anything but a validating sink."""
+def _url_field_misuse(
+    tree: ast.Module, parents: dict[int, ast.AST], url_field: str
+) -> list[str]:
+    """Rule 2: a destination config field reaching anything but a safe sink."""
     found = []
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Attribute) and node.attr == _URL_FIELD):
+        if not (isinstance(node, ast.Attribute) and node.attr == url_field):
             continue
         if not isinstance(node.ctx, ast.Load):
             continue
@@ -268,36 +357,40 @@ def _url_field_misuse(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str
         if isinstance(parent, ast.Call) and _call_name(parent) in _URL_SINKS:
             continue
         if isinstance(parent, ast.Call | ast.BinOp | ast.FormattedValue):
-            found.append(f"{node.lineno}: ollama_url fed to a URL or call")
+            found.append(f"{node.lineno}: {url_field} fed to a URL or call")
     return found
 
 
-def _module_violations(source: str, relative: str) -> list[str]:
-    """Return rule 1-3 violations for a module outside the boundary."""
+def _module_violations(
+    source: str, relative: str, boundary: _Boundary = _OLLAMA
+) -> list[str]:
+    """Return rule 1-3 violations for a module outside *boundary*."""
     tree = ast.parse(source)
     imports = _collect_imports(tree)
     parents = _parents(tree)
     docstrings = _docstrings(tree)
     found = [
         f"{line}: imports the boundary's URL builder"
-        for line in imports.url_builder_imports
+        for line, name in imports.url_builder_imports
+        if name == boundary.url_builder
     ]
-    found += _url_field_misuse(tree, parents)
-    if not _ollama_markers(tree, docstrings):
+    if boundary.url_field is not None:
+        found += _url_field_misuse(tree, parents, boundary.url_field)
+    if not _markers(tree, docstrings, boundary):
         return found
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and _is_dial(node, imports)):
             continue
         function = _enclosing_function(node, parents)
-        if (relative, function or "") not in _NON_OLLAMA_DIALS:
-            found.append(f"{node.lineno}: HTTP client dial in an Ollama module")
+        if (relative, function or "") not in boundary.non_dialling:
+            found.append(f"{node.lineno}: HTTP client dial in a destination module")
     for function in ast.walk(tree):
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
-        if (relative, function.name) in _NON_OLLAMA_DIALS and _ollama_markers(
-            function, docstrings
+        if (relative, function.name) in boundary.non_dialling and _markers(
+            function, docstrings, boundary
         ):
-            found.append(f"{function.lineno}: allowlisted dial touches Ollama")
+            found.append(f"{function.lineno}: allowlisted dial touches the boundary")
     return found
 
 
@@ -325,6 +418,63 @@ def _boundary_violations(source: str) -> list[str]:
     return found
 
 
+def _pool_boundary_violations(source: str) -> list[str]:
+    """Rule 4, pool flavour: the one pinned dial cannot be redirected.
+
+    Stricter than the local boundary's rule. A ``trust_env=False``
+    general-purpose client is enough for loopback, but the pool's destination
+    is a single pinned host: the dial must be :mod:`http.client`, which reads
+    no proxy variable and follows no redirect, and the module must name no
+    proxy environment key.
+    """
+    tree = ast.parse(source)
+    imports = _collect_imports(tree)
+    docstrings = _docstrings(tree)
+    dials = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _is_dial(node, imports)
+    ]
+    stdlib = [call for call in dials if _dial_module(call, imports) == _STDLIB_DIAL]
+    found = [] if stdlib else ["the pool boundary opens no http.client connection"]
+    found += [
+        f"{call.lineno}: a general-purpose HTTP client honours a proxy or redirect"
+        for call in dials
+        if _dial_module(call, imports) != _STDLIB_DIAL
+    ]
+    found += [
+        f"{node.lineno}: names a proxy environment variable"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+        and node.value in _PROXY_ENV
+    ]
+    return found
+
+
+def _dial_module(call: ast.Call, imports: _Imports) -> str:
+    """Return the HTTP module *call* dials through, or ``""``."""
+    target = _resolved_target(call, imports)
+    return "" if target is None else target[0]
+
+
+def _path_violations(path: Path, relative: str, source: str) -> list[str]:
+    """Return every boundary's violations for one module.
+
+    Each file is judged against both boundaries: its own rule 4 for the
+    boundary it *is*, and rules 1-3 for the boundary it is not.
+    """
+    found = (
+        _boundary_violations(source)
+        if path == _OLLAMA.module
+        else _module_violations(source, relative, _OLLAMA)
+    )
+    if path == _POOL.module:
+        return found + _pool_boundary_violations(source)
+    return found + _module_violations(source, relative, _POOL)
+
+
 def _tree_violations() -> list[str]:
     """Run every rule over the real ``creek/`` and ``creek_mcp/`` trees."""
     found = []
@@ -332,12 +482,10 @@ def _tree_violations() -> list[str]:
         for path in sorted(package.rglob("*.py")):
             relative = str(path.relative_to(_ROOT))
             source = path.read_text(encoding="utf-8")
-            violations = (
-                _boundary_violations(source)
-                if path == _BOUNDARY
-                else _module_violations(source, relative)
-            )
-            found += [f"{relative}:{violation}" for violation in violations]
+            found += [
+                f"{relative}:{violation}"
+                for violation in _path_violations(path, relative, source)
+            ]
     return found
 
 
@@ -362,11 +510,20 @@ def test_the_rules_see_the_real_dial_sites() -> None:
     )
     for relative, function in _NON_OLLAMA_DIALS:
         tree = ast.parse((_ROOT / relative).read_text(encoding="utf-8"))
-        assert _ollama_markers(tree, _docstrings(tree)), relative
+        assert _markers(tree, _docstrings(tree), _OLLAMA), relative
         assert any(
             isinstance(node, ast.FunctionDef) and node.name == function
             for node in ast.walk(tree)
         ), f"{relative}:{function} no longer exists; drop its allowlist entry"
+
+
+def test_the_pool_rule_sees_the_real_pool_boundary() -> None:
+    """Guard the guard: the pool boundary carries the data the rule looks for."""
+    source = _POOL_BOUNDARY.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    assert _markers(tree, _docstrings(tree), _POOL)
+    assert _pool_boundary_violations(source) == []
 
 
 _MARKER = 'TAGS = "/api/tags"\n'
@@ -490,3 +647,84 @@ def test_a_proxy_free_boundary_client_passes() -> None:
     source = "import httpx\nhttpx.Client(timeout=1, trust_env=False, verify=True)\n"
 
     assert _boundary_violations(source) == []
+
+
+_POOL_MARKER = 'MODELS = "/v1/models"\n'
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("import httpx\n" + _POOL_MARKER + "httpx.get(URL)\n", id="httpx"),
+        pytest.param(
+            "import httpx as hx\n" + _POOL_MARKER + "hx.Client()\n", id="alias"
+        ),
+        pytest.param(
+            "from httpx import Client\n" + _POOL_MARKER + "Client()\n", id="from"
+        ),
+        pytest.param(
+            "import http.client\n" + _POOL_MARKER + "http.client.HTTPConnection(H)\n",
+            id="http-client",
+        ),
+        pytest.param(
+            'import httpx\nENV = "CREEK_POOL_URL"\nhttpx.post(ENV)\n', id="env-key"
+        ),
+        pytest.param(
+            "from creek.classify.llm.pool_boundary import pool_destination as pd\n",
+            id="builder-alias",
+        ),
+    ],
+)
+def test_planted_pool_bypasses_are_caught(source: str) -> None:
+    """Each bypass shape outside the pool boundary is flagged."""
+    assert _module_violations(source, "creek/planted.py", _POOL)
+
+
+def test_a_pool_free_module_is_not_flagged_by_the_pool_rule() -> None:
+    """Control: an Ollama dial is not a pool bypass, and vice versa."""
+    ollama_only = (
+        "from creek.classify.llm.local_boundary import ollama_get\n"
+        "def f(cfg):\n"
+        "    return ollama_get(cfg, '/api/tags', timeout=1.0)\n"
+    )
+    pool_sink = (
+        "from creek.classify.llm.pool_boundary import pool_generate\n"
+        "def f(payload):\n"
+        "    return pool_generate(payload, budget=1.0)\n"
+    )
+
+    assert _module_violations(ollama_only, "creek/planted.py", _POOL) == []
+    assert _module_violations(pool_sink, "creek/planted.py", _POOL) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("import httpx\nhttpx.Client(trust_env=False)\n", id="httpx"),
+        pytest.param(
+            "import http.client\nimport os\n"
+            'http.client.HTTPConnection(os.environ["HTTP_PROXY"])\n',
+            id="proxy-env",
+        ),
+        pytest.param("x = 1\n", id="no-connection"),
+        pytest.param(
+            "import http.client\nimport requests\n"
+            "http.client.HTTPSConnection(H)\nrequests.get(U)\n",
+            id="second-stack",
+        ),
+    ],
+)
+def test_planted_pool_boundary_dials_are_caught(source: str) -> None:
+    """The pool boundary's own dial must be stdlib and proxy-blind."""
+    assert _pool_boundary_violations(source)
+
+
+def test_a_stdlib_pool_boundary_dial_passes() -> None:
+    """Control: an ``http.client`` connection with no proxy key is accepted."""
+    source = (
+        "import http.client\n"
+        "def f(host):\n"
+        "    return http.client.HTTPSConnection(host, timeout=1.0)\n"
+    )
+
+    assert _pool_boundary_violations(source) == []

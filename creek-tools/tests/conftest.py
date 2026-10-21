@@ -136,7 +136,9 @@ def _isolate_local_model_boundary_env(monkeypatch: pytest.MonkeyPatch) -> None:
     operator's ambient model-package pin is hidden for the same reason: it
     would make reflection tests depend on the shell they run in. An ambient
     managed-vault marker (#1863) is hidden too, because it would silently turn
-    off cloud consent in every consent test.
+    off cloud consent in every consent test, and an ambient pool destination
+    (#1894) because it is the one host a vault dials beyond loopback: a shell
+    that happens to export it must never let a test reach it.
 
     ``setenv`` before ``delenv`` makes monkeypatch record the variable's
     original state even when it was absent, so whatever a test writes is
@@ -147,9 +149,15 @@ def _isolate_local_model_boundary_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     from creek.classify.llm.consent import MANAGED_VAULT_ENV
     from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+    from creek.classify.llm.pool_boundary import POOL_URL_ENV
     from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV
 
-    for name in (LOOPBACK_ONLY_ENV, MODEL_PACKAGE_FILE_ENV, MANAGED_VAULT_ENV):
+    for name in (
+        LOOPBACK_ONLY_ENV,
+        MODEL_PACKAGE_FILE_ENV,
+        MANAGED_VAULT_ENV,
+        POOL_URL_ENV,
+    ):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 
