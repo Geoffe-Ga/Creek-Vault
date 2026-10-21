@@ -102,8 +102,10 @@ privacy decision the adapter did not make.
 waiting and an outage may not, and because the OpenAPI document carries one
 response object per status, so a code sharing ``503`` could not be documented at
 all. It is the same code, status, message and advisory ``Retry-After``
-``POST /v1/reflections`` has served since contract 0.19 — one per-account cap,
-reported identically wherever a caller meets it (#1903 step 6). A caller below
+``POST /v1/reflections`` has served since contract 0.19 — one budget, reported
+identically wherever a caller meets it (#1903 step 6). The concurrency sheds in
+:mod:`creek_mcp.httpapi.middleware.limits` are a different thing and stay
+``temporarily_unavailable`` on this route as on every other. A caller below
 :data:`~creek_mcp.api.models.LETTER_RATE_LIMITED_SINCE_MINOR` is served the
 ``temporarily_unavailable`` this route answered at ``0.20``, by
 :func:`~creek_mcp.httpapi.generation.served_error_code`.

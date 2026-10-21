@@ -447,7 +447,8 @@ serves `rate_limited` on `POST /v1/letters/{external_id}` as well as on
 The cap itself does not move and never was per route: both routes resolve the
 same `generation` stage through the same provider chokepoint, so the refusal is
 the shared pool's admission decision or your own request key's 429, and a
-single budget was already answering both. What `0.19` left split was the
+single budget was already answering both. See the `rate_limited` entry in the
+error table for what the code does and does not claim. What `0.19` left split was the
 reporting — a cap arriving mid-letter was collapsed into the
 `temporarily_unavailable` every other provider failure earns — and a caller
 rate limited on one route while being told an outage story on the other is
@@ -692,16 +693,13 @@ function of `code`. There is no `retryable` field on the wire, ever.
 
 **`rate_limited` is your own allowance, not an outage.** Added at contract
 `0.19.0` (#1894, [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md)),
-it means a rate limit rather than an outage: this vault is over its model-call
-admission cap (too many in flight, or too many this hour), or the vendor your
-own request key is spending on returned a 429. It is reachable on
+it means a rate limit rather than an outage. It is reachable on
 `POST /v1/reflections` since `0.19.0` and on `POST /v1/letters/{external_id}`
-since `0.21.0` (#1903 step 6), and documented on both in the OpenAPI document.
-**It is one budget, not two**: both routes dial the same `generation`
-chokepoint, so a cap met on one is the same cap on the other, which is exactly
-why they report it identically. `POST /v1/classifications` keeps its existing
-refusal shapes — its model work is accepted as a `202` job, so it cannot refuse
-admission in the response that admits it. It is a separate code from
+since `0.21.0` (#1903 step 6), and documented on both in the OpenAPI document,
+including its `Retry-After` header. `POST /v1/classifications` keeps its
+existing refusal shapes — its model work is accepted as a `202` job, so it
+cannot refuse admission in the response that admits it. It is a separate code
+from
 `temporarily_unavailable` because the two want different client behaviour: a
 cap clears by waiting, and the writer should be shown a wait rather than an
 outage. It carries an advisory `Retry-After` header, which is deliberately
@@ -716,6 +714,33 @@ declaring the minor its route began serving it at — `0.19` for reflections,
 pre-`0.19` caller that is the only spelling its vendored vocabulary has; for a
 `0.20` caller asking for a letter it is the version window holding, because the
 document that minor published records no 429 on that route.
+
+**What `rate_limited` actually is, stated precisely, because two plausible
+readings of it are wrong.**
+
+*The vault owns no limiter.* There is no hourly counter and no in-flight
+counter anywhere in Creek: a `429` is relayed, not minted. It is the shared
+inference pool's own HTTP `429`, or a `429` from whichever vendor the call
+reached — the key you sent on this request, or, on a self-hosted vault, the
+operator's own cloud key. So read the code as "the thing that would have
+answered this call refused to admit it, and waiting may clear that", and do
+**not** read it as a quota this vault is keeping for you.
+
+*It is one budget across both routes, and that part is provable here.* Both
+model-backed routes resolve the one `generation` stage through the same
+provider chokepoint, and the request Creek sends the pool carries `model`,
+`prompt`, `tier` and `deadline_ms` and **no route, verb or capability** — so
+the pool cannot be holding a per-route budget even in principle. A cap met on a
+reflection is the same cap on a letter, which is exactly why the two report it
+identically. Whether that budget is scoped per vault or per account is a
+pool-side fact this contract does not publish, so do not build on either.
+
+*Not every refusal to serve a request is this code.* The two concurrency limits
+in front of every route — the global one and the per-consumer one — still shed
+as `503 temporarily_unavailable`, on these two routes as on all the others.
+They are about how many requests this process is carrying right now, not about
+an allowance, and nothing about them changed here. Handle `503` on the
+model-backed routes as you always have; `429` is the narrower, newer story.
 
 **`unsupported_source` is about the caller's own filename, never the vault.**
 It was the only code added between contract `0.2.0` and `0.19.0` (it arrived

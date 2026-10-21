@@ -25,16 +25,22 @@ CONTRACT_VERSION: Final[str] = "0.21.0"
 
 0.21.0 (#1903 step 6, ADR-0016): **one cap, one surface.**
 ``rate_limited`` is served on ``POST /v1/letters/{external_id}`` as well as on
-``POST /v1/reflections``, so a caller held at its per-account admission cap is
-told the same thing by both model-backed routes it can reach it from — the same
+``POST /v1/reflections``, so a caller refused admission for a model call is
+told the same thing by both model-backed routes it can meet that refusal on —
+the same
 ``429``, the same closed code, the same envelope and the same advisory
 ``Retry-After``, through the one
 :func:`creek_mcp.httpapi.generation.served_error_code`.
 
 The cap itself does not move and never was per route: both routes resolve the
 one ``generation`` stage through ``_bounded_generation_factory``, so the refusal
-is the shared pool's admission decision or the writer's own key's ``429``, and a
-single budget was already answering both. What 0.19 left split was the
+is the shared pool's admission decision or the ``429`` of whichever vendor the
+call reached, and a single budget was already answering both. This server mints
+no cap of its own — it keeps no counter — and the pool request shape carries no
+route, so a per-route budget could not exist even in principle; whether the
+pool's budget is per vault or per account is not visible from here.
+
+What 0.19 left split was the
 *reporting* — a cap arriving mid-letter was collapsed into the
 ``temporarily_unavailable`` that every other provider failure earns, because
 ``ProviderRateLimitError`` subclasses ``RuntimeError`` and the letter tool
