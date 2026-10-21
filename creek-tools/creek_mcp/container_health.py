@@ -3,8 +3,20 @@
 ``ready`` is storage readiness: the process, the mounted vault and
 authenticated ``/v1``. ``model`` is a separate, fail-closed question — can the
 pinned local model generate? — answered without reading the vault or its
-config. The image healthcheck keeps probing ``ready``, so a missing model never
-marks the vault API unhealthy, and storage-ready never implies model-ready.
+config. ``pool`` is the same question for the shared confidential inference
+pool a managed vault uses instead (ADR-0016, #1894): is the pinned destination
+reachable, and does it report the manifest's runtime and model?
+
+``pool`` makes **no generation**. The local canary is a free loopback call; a
+pool canary would be a billed vendor call on every healthcheck, which the
+owner's "no spend yet" decision rules out, so pool readiness stops at the
+identity listing (ADR-0016 Decision 1 item 9). Attestation of the pinned
+measurement set is the attesting client's own cached verification and lands
+with that provider; this probe reports the identity half.
+
+The image healthcheck keeps probing ``ready``, so neither a missing model nor
+an unreachable pool ever marks the vault API unhealthy: storage-ready implies
+neither model-ready nor pool-ready, and ``ready`` never consults the pool.
 """
 
 from __future__ import annotations
@@ -21,10 +33,18 @@ from typing import Final
 import httpx
 
 from creek.classify.llm.local_boundary import ollama_get
+from creek.classify.llm.pool_boundary import (
+    PoolBoundaryError,
+    pool_list_models,
+    pool_response_ok,
+    pool_url_configured,
+)
 from creek.classify.llm.providers import (
     call_ollama,
     ollama_digest_matches,
     ollama_model_digest,
+    pool_identity_matches,
+    reported_pool_identity,
 )
 from creek.config import LLMConfig
 from creek_mcp.container_runtime import (
@@ -58,6 +78,7 @@ class ProbeTarget(StrEnum):
     VOLUME = "volume"
     READY = "ready"
     MODEL = "model"
+    POOL = "pool"
 
 
 class ProbeStatus(StrEnum):
@@ -74,6 +95,11 @@ class ProbeStatus(StrEnum):
     MODEL_MISSING = "model-missing"
     MODEL_DIGEST_MISMATCH = "model-digest-mismatch"
     GENERATION_FAILED = "generation-failed"
+    POOL_READY = "pool-ready"
+    POOL_UNCONFIGURED = "pool-unconfigured"
+    POOL_UNREACHABLE = "pool-unreachable"
+    POOL_MODEL_MISSING = "pool-model-missing"
+    POOL_IDENTITY_MISMATCH = "pool-identity-mismatch"
 
 
 _EXIT_CODES: Final[dict[ProbeStatus, int]] = {
@@ -88,6 +114,11 @@ _EXIT_CODES: Final[dict[ProbeStatus, int]] = {
     ProbeStatus.MODEL_MISSING: 24,
     ProbeStatus.MODEL_DIGEST_MISMATCH: 25,
     ProbeStatus.GENERATION_FAILED: 26,
+    ProbeStatus.POOL_READY: 0,
+    ProbeStatus.POOL_UNCONFIGURED: 30,
+    ProbeStatus.POOL_UNREACHABLE: 31,
+    ProbeStatus.POOL_MODEL_MISSING: 32,
+    ProbeStatus.POOL_IDENTITY_MISMATCH: 33,
 }
 
 _UNAVAILABLE: Final[dict[ProbeTarget, ProbeStatus]] = {
@@ -95,6 +126,7 @@ _UNAVAILABLE: Final[dict[ProbeTarget, ProbeStatus]] = {
     ProbeTarget.VOLUME: ProbeStatus.V1_UNREADY,
     ProbeTarget.READY: ProbeStatus.V1_UNREADY,
     ProbeTarget.MODEL: ProbeStatus.MODEL_MISSING,
+    ProbeTarget.POOL: ProbeStatus.POOL_UNCONFIGURED,
 }
 """Each target's status when the container environment itself is invalid."""
 
@@ -217,8 +249,53 @@ def _model_status() -> ProbeStatus:
     return ProbeStatus.GENERATION_FAILED
 
 
+def _pool_identity_status(manifest: ModelPackageManifest) -> ProbeStatus:
+    """Read the pinned pool's identity listing and grade it; no generation.
+
+    Args:
+        manifest: The operator's loaded manifest.
+
+    Returns:
+        ``POOL_READY`` when the pool reports the pinned runtime and model at
+        the pinned digest; otherwise the precise failure. Nothing is logged
+        and no prompt exists to leak.
+    """
+    try:
+        response = pool_list_models(budget=_PROBE_TIMEOUT)
+    except PoolBoundaryError:
+        return ProbeStatus.POOL_UNREACHABLE
+    if not pool_response_ok(response):
+        return ProbeStatus.POOL_UNREACHABLE
+    if reported_pool_identity(response.payload, manifest.model_name) is None:
+        return ProbeStatus.POOL_MODEL_MISSING
+    if not pool_identity_matches(
+        response.payload,
+        model_name=manifest.model_name,
+        inventory_digest=manifest.runtime_inventory_digest,
+    ):
+        return ProbeStatus.POOL_IDENTITY_MISMATCH
+    return ProbeStatus.POOL_READY
+
+
+def _pool_status() -> ProbeStatus:
+    """Return the shared inference pool's closed readiness state.
+
+    No manifest, one that fails to load, or no pinned destination in the
+    Machine environment is ``pool-unconfigured`` without any network call.
+    """
+    try:
+        manifest = configured_manifest()
+    except ModelPackageError:
+        return ProbeStatus.POOL_UNCONFIGURED
+    if manifest is None or not pool_url_configured():
+        return ProbeStatus.POOL_UNCONFIGURED
+    return _pool_identity_status(manifest)
+
+
 def probe(settings: ContainerSettings, target: ProbeTarget) -> ProbeResult:
     """Probe *target*, preserving which dependency made readiness fail."""
+    if target is ProbeTarget.POOL:
+        return ProbeResult(_pool_status())
     if target is ProbeTarget.MODEL:
         return ProbeResult(_model_status())
     if target is ProbeTarget.PROCESS:

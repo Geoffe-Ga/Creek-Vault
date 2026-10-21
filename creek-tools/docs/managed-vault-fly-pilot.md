@@ -105,12 +105,35 @@ separate Fly secret-backed files and are not part of that snapshot.
   before accepting a vault. On a fresh ext4 mount, bootstrap removes `lost+found`
   only when it is the sole entry and an empty, non-symlink directory. Recovered
   data and existing vault contents are never removed or overwritten.
-- Managed vaults are local-only for the operator, with one exception for the
-  writer ([ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md),
+- Managed vaults are local-only for the operator, with two exceptions
+  (amended by [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md)).
+
+  The first is for the **writer**
+  ([ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md),
   amended 2026-10-16). A request that carries the writer's own Anthropic or
   OpenAI key in `X-Creek-Provider` and `X-Creek-Provider-Key` is answered by
   that vendor for OPEN and PERSONAL content, for that request only; INTIMATE
   is still forced local or refused, and the key is never stored or logged.
+
+  The second is the **shared confidential warm-inference pool**. A managed
+  vault ships no inference runtime and a 1 GB Machine cannot hold a model, so
+  OPEN and PERSONAL inference without a writer's key routes to one pool
+  instead of to a local runtime that does not exist. The vault's half of that
+  contract (#1894) is a `pool` provider behind
+  `creek/classify/llm/pool_boundary.py` and exactly one destination beyond
+  loopback, `CREEK_POOL_URL`, read from the Machine environment and settable
+  from no vault config. The pool is not cloud — no operator key is involved
+  and no consent variable is read — and it is not intimate-eligible either:
+  INTIMATE never leaves the vault process under either implementation, forced
+  local or refused at the one `ModelRouter` chokepoint before any dial. The
+  pool is pinned to the same `00-Creek-Meta`-external manifest the local model
+  uses, by `model_name` and `runtime_inventory_digest`, and a pool reporting
+  any other identity is refused before a prompt is sent. `creek-container-health
+  --check pool` reports that identity, and makes no generation, because a
+  canary on the pool would be a billed vendor call. There are no retries and
+  no second destination: pool down, identity mismatch or an admission refusal
+  is a refusal, never a substituted model.
+
   Everything below governs the operator's key and is unchanged. The
   provisioner sets `CREEK_MANAGED_VAULT=1`
   on every vault Machine, on both the replay bootstrap and the default image

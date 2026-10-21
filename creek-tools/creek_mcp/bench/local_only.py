@@ -4,8 +4,13 @@ The harness exists to size a *local* model envelope, so a cloud provider
 answering a trial would both corrupt the measurement and egress synthetic
 prompts. :class:`LocalOnlyFactory` therefore refuses twice:
 
-- at construction, a provider name registered as cloud
-  (:func:`creek.classify.llm.providers.provider_is_cloud`);
+- at construction, a registered provider name that is not positively local
+  (:func:`creek.classify.llm.providers.provider_intimate_eligible`). That
+  covers every cloud vendor and, since #1894, the shared inference pool:
+  the pool is not cloud, yet it egresses, so sizing a *local* envelope with
+  it would both corrupt the measurement and send synthetic prompts off the
+  machine. An *unregistered* name (the harness's own ``fake``) is still
+  admitted and judged by the callable's own flag below;
 - on every build, a callable that does not positively declare
   ``is_cloud = False``. A missing attribute counts as cloud — fail closed.
 
@@ -29,7 +34,7 @@ import socket
 from typing import TYPE_CHECKING, Final, Literal
 from urllib.parse import urlsplit
 
-from creek.classify.llm.providers import provider_is_cloud
+from creek.classify.llm.providers import known_providers, provider_intimate_eligible
 from creek.models import PrivacyTier
 
 if TYPE_CHECKING:
@@ -119,6 +124,23 @@ def require_local_target(
     return scope
 
 
+def _offloads(provider_name: str) -> bool:
+    """Return whether *provider_name* is a registered, non-local backend.
+
+    Args:
+        provider_name: The provider's registry name.
+
+    Returns:
+        ``True`` for a registered provider that is not positively local — a
+        cloud vendor or the shared inference pool. ``False`` for ``ollama``,
+        the attested enclave, and any name the registry does not know (the
+        harness's own ``fake``), whose callable is judged on its own flag.
+    """
+    return provider_name in known_providers() and not provider_intimate_eligible(
+        provider_name
+    )
+
+
 class CloudProviderRefusedError(ValueError):
     """A cloud (or undeclared) provider was offered to the harness."""
 
@@ -127,16 +149,18 @@ class LocalOnlyFactory:
     """Wraps a model factory and refuses anything not positively local."""
 
     def __init__(self, inner: LLMFactory, *, provider_name: str) -> None:
-        """Refuse a cloud *provider_name* before anything is built.
+        """Refuse a non-local *provider_name* before anything is built.
 
         Args:
             inner: The factory producing completion callables.
             provider_name: The provider's registry name (``ollama``, ``fake``).
 
         Raises:
-            CloudProviderRefusedError: When *provider_name* is a cloud provider.
+            CloudProviderRefusedError: When *provider_name* is a registered
+                provider that is not positively local — a cloud vendor, or the
+                shared inference pool (see :func:`_offloads`).
         """
-        if provider_is_cloud(provider_name):
+        if _offloads(provider_name):
             raise CloudProviderRefusedError(_CLOUD_REFUSED)
         self._inner = inner
 
