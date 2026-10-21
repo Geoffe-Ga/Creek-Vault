@@ -19,6 +19,7 @@ from creek.classify.llm.providers import OllamaProvider
 from creek.models import PrivacyTier
 from creek_mcp.bench.ollama_client import BenchOllamaClient, DigestMismatchError
 from creek_mcp.bench.outcome import ContextOverflowError, ProviderUnavailableError
+from creek_mcp.bench.usage import TokenBasis, TokenUsage, UsageReporting
 
 _HEX = "b" * 64
 _LICENSE_CANARY = "CANARY-license-text-7d1e"
@@ -275,7 +276,55 @@ def test_live_bench_dials_bypass_environment_proxies(
     for stub in serve_ollama(OllamaStub(tags={"models": []}, generation="ok")):
         client = BenchOllamaClient(stub.url, "mistral:7b", num_ctx=2048, num_predict=8)
 
-        assert client.generate("synthetic prompt", num_predict=8) == "ok"
+        assert client.generate("synthetic prompt", num_predict=8).text == "ok"
         assert [(method, path) for method, path, _ in stub.requests] == [
             ("POST", "/api/generate")
         ]
+
+
+def test_usage_comes_from_the_runtimes_own_counters() -> None:
+    """``prompt_eval_count`` / ``eval_count`` are read back, not derived."""
+    recorder = _Recorder(
+        {
+            "/api/generate": {
+                "response": "x",
+                "prompt_eval_count": 1811,
+                "eval_count": 97,
+            }
+        }
+    )
+    llm = _client(recorder).factory()(PrivacyTier.OPEN, max_tokens=96)
+    assert isinstance(llm, UsageReporting)
+    assert llm.token_usage() is None
+    llm("p")
+    assert llm.token_usage() == TokenUsage(
+        prompt_tokens=1811, output_tokens=97, basis=TokenBasis.PROVIDER_REPORTED
+    )
+
+
+@pytest.mark.parametrize("counters", [{}, {"eval_count": True}, {"eval_count": -1}])
+def test_a_body_without_usable_counters_reports_none(
+    counters: dict[str, object],
+) -> None:
+    """Absent, boolean and negative counters all mean "unreported".
+
+    ``bool`` is an ``int`` in Python, so a body answering ``true`` would read
+    as one token unless it is excluded; a count a cost line could quote must
+    never come from a type confusion.
+    """
+    recorder = _Recorder({"/api/generate": {"response": "x", **counters}})
+    llm = _client(recorder).factory()(PrivacyTier.OPEN, max_tokens=96)
+    llm("p")
+    assert llm.token_usage() == TokenUsage(
+        prompt_tokens=None, output_tokens=None, basis=TokenBasis.UNREPORTED
+    )
+
+
+def test_a_malformed_body_reports_no_usage() -> None:
+    """A body that is not an object measured nothing and says so."""
+    recorder = _Recorder({"/api/generate": ["not", "a", "dict"]})
+    llm = _client(recorder).factory()(PrivacyTier.OPEN, max_tokens=8)
+    llm("p")
+    assert llm.token_usage() == TokenUsage(
+        prompt_tokens=None, output_tokens=None, basis=TokenBasis.UNREPORTED
+    )

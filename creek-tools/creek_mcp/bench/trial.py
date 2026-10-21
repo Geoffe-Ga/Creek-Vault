@@ -55,6 +55,16 @@ class Trial(BaseModel):
         outcome: How it ended.
         model_resident_bytes: The model's resident size reported by the
             runtime after the trial, or ``None`` when unknown.
+        prompt_tokens: Tokens the provider reported evaluating for the prompt,
+            or ``None`` when it reported none. Replaces ADR-0016's planning
+            assumption with a measurement (#1893); ``None`` says the count is
+            unknown, which is not the same claim as zero.
+        output_tokens: Tokens the provider reported generating, or ``None``.
+        max_output_tokens: The output ceiling ``reflect_tool`` asked the
+            factory for on this trial, captured at the seam, or ``None`` when
+            the factory was never reached. ``output_tokens`` above it means the
+            model overran its budget; the report counts that rather than
+            clipping it.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -67,3 +77,6 @@ class Trial(BaseModel):
     generation_s: NonNegativeFloat | None
     outcome: Outcome
     model_resident_bytes: NonNegativeInt | None
+    prompt_tokens: NonNegativeInt | None
+    output_tokens: NonNegativeInt | None
+    max_output_tokens: NonNegativeInt | None

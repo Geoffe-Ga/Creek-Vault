@@ -18,13 +18,22 @@ from creek_mcp.bench.stats import (
     P50,
     P95,
     LatencySummary,
+    TokenSummary,
+    TokenUsageSummary,
     error_rate,
     percentile_nearest_rank,
 )
 from creek_mcp.bench.trial import Phase, Sweep, Trial
 
 
-def _trial(latency_s: float, outcome: Outcome = Outcome.OK) -> Trial:
+def _trial(
+    latency_s: float,
+    outcome: Outcome = Outcome.OK,
+    *,
+    prompt_tokens: int | None = None,
+    output_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+) -> Trial:
     """Build one warm, serial trial with *latency_s* and *outcome*."""
     return Trial(
         sweep=Sweep.COLD_WARM,
@@ -35,6 +44,9 @@ def _trial(latency_s: float, outcome: Outcome = Outcome.OK) -> Trial:
         generation_s=None,
         outcome=outcome,
         model_resident_bytes=None,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -142,3 +154,80 @@ def test_outcome_counts_zero_filled() -> None:
         Outcome.CONTEXT_OVERFLOW: 0,
         Outcome.ERROR: 0,
     }
+
+
+def test_token_summary_over_no_samples_is_empty_not_zero() -> None:
+    """No measurement is ``None``, which is not the same claim as zero."""
+    summary = TokenSummary.from_counts([])
+    assert summary.count == 0
+    assert summary.p50 is None
+    assert summary.p95 is None
+    assert summary.mean is None
+    assert summary.max is None
+
+
+def test_token_summary_uses_the_same_nearest_rank_percentiles() -> None:
+    """p50 and p95 are observed samples, exactly as for latency."""
+    summary = TokenSummary.from_counts([10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+    assert summary.count == 10
+    assert summary.p50 == percentile_nearest_rank(
+        [10, 20, 30, 40, 50, 60, 70, 80, 90, 100], P50
+    )
+    assert summary.p95 == percentile_nearest_rank(
+        [10, 20, 30, 40, 50, 60, 70, 80, 90, 100], P95
+    )
+    assert summary.mean == 55.0
+    assert summary.max == 100
+
+
+def test_token_usage_summary_counts_only_successful_reported_trials() -> None:
+    """A failure cannot pull a token percentile, and an unreported trial is
+    counted as unreported rather than as a zero."""
+    trials = [
+        _trial(1.0, prompt_tokens=100, output_tokens=10, max_output_tokens=128),
+        _trial(1.0, prompt_tokens=300, output_tokens=30, max_output_tokens=128),
+        _trial(1.0),
+        _trial(1.0, Outcome.TIMEOUT, prompt_tokens=1, output_tokens=1),
+    ]
+    summary = TokenUsageSummary.from_trials(trials)
+    assert summary.reported_count == 2
+    assert summary.unreported_count == 1
+    assert summary.prompt.count == 2
+    assert summary.prompt.max == 300
+    assert summary.output.max == 30
+    assert summary.output_cap_exceeded_count == 0
+
+
+def test_token_usage_summary_counts_a_cap_overrun() -> None:
+    """A completion past the budget reflect asked for is reported, not clipped."""
+    trials = [
+        _trial(1.0, prompt_tokens=100, output_tokens=900, max_output_tokens=128),
+        _trial(1.0, prompt_tokens=100, output_tokens=128, max_output_tokens=128),
+    ]
+    summary = TokenUsageSummary.from_trials(trials)
+    assert summary.output_cap_exceeded_count == 1
+
+
+def test_token_usage_summary_over_no_trials_is_empty() -> None:
+    """An empty group summarises to nothing measured, and does not raise."""
+    summary = TokenUsageSummary.from_trials([])
+    assert summary.reported_count == 0
+    assert summary.unreported_count == 0
+    assert summary.prompt.p50 is None
+
+
+def test_a_trial_reporting_only_one_counter_still_counts_as_reported() -> None:
+    """A runtime may send one counter and omit the other.
+
+    It feeds one of the summaries either way, so counting it as *unreported*
+    would let ``output.count`` exceed ``reported_count`` — the opposite of what
+    ``unreported_count`` is documented to mean.
+    """
+    summary = TokenUsageSummary.from_trials(
+        [_trial(1.0, output_tokens=42, max_output_tokens=128)]
+    )
+    assert summary.reported_count == 1
+    assert summary.unreported_count == 0
+    assert summary.prompt.count == 0
+    assert summary.output.count == 1
+    assert summary.output.count <= summary.reported_count

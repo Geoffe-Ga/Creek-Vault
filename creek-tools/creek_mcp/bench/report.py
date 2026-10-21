@@ -25,7 +25,8 @@ from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 from creek_mcp.bench.deadline import Verdict, deadline_budget_seconds, deadline_verdict
 from creek_mcp.bench.eval.rubric import QualityScore
 from creek_mcp.bench.metadata import HostMetadata, RunMetadata
-from creek_mcp.bench.stats import LatencySummary
+from creek_mcp.bench.stats import LatencySummary, TokenUsageSummary
+from creek_mcp.bench.tokens import TokensPerReflection
 from creek_mcp.bench.trial import Phase, Sweep, Trial
 from creek_mcp.httpapi.middleware import limits
 
@@ -44,11 +45,21 @@ changing, and that has its own version —
 
 
 class PhaseSummary(BaseModel):
-    """One residency phase's aggregates within a sweep, and its verdict."""
+    """One residency phase's aggregates within a sweep, and its verdict.
+
+    Attributes:
+        latency: Latency aggregates over the phase's trials.
+        tokens: Measured prompt and output tokens over the same trials, at the
+            grain a cold start is judged on — a cold prompt is the same size as
+            a warm one, so a difference here is the backend's, not the
+            workload's.
+        verdict: The phase's deadline verdict.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     latency: LatencySummary
+    tokens: TokenUsageSummary
     verdict: Verdict
 
 
@@ -57,6 +68,9 @@ class SweepSummary(BaseModel):
 
     Attributes:
         latency: Aggregates over every trial in the sweep, for reference.
+        tokens: Measured prompt and output tokens over every trial in the
+            sweep. The context sweep's block is the one that shows how token
+            cost grows with input size.
         per_phase: Aggregates and a verdict per residency phase. Cold and warm
             trials are judged apart: pooled, a few slow cold starts fall
             outside the p95 rank of many warm trials and would go unseen.
@@ -67,6 +81,7 @@ class SweepSummary(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     latency: LatencySummary
+    tokens: TokenUsageSummary
     per_phase: dict[Phase, PhaseSummary]
     verdict: Verdict
     trials: tuple[Trial, ...]
@@ -108,6 +123,10 @@ class BenchReport(BaseModel):
         verdict: ``exceeds`` if any sweep exceeds; else ``insufficient_data``
             if any sweep lacked a success; else ``fits``.
         capacity: The concurrency sweep's basis for the admission caps.
+        tokens_per_reflection: The measured per-surface token block (#1893).
+            Every ADR-0016 cost figure cites this in place of the 2,500 + 128
+            planning assumption; a figure quoting the assumption is an
+            unmeasured placeholder.
         quality_score: The voice-fidelity eval's per-dimension scores and
             rubric version (#1898), or ``None`` for a capacity-only run. It is
             closed by construction like everything else here — enums, numbers
@@ -127,6 +146,7 @@ class BenchReport(BaseModel):
     per_sweep: dict[Sweep, SweepSummary]
     verdict: Verdict
     capacity: CapacityBasis
+    tokens_per_reflection: TokensPerReflection
     quality_score: QualityScore | None = None
 
 
@@ -184,10 +204,13 @@ def _sweep_summary(group: tuple[Trial, ...], budget: float) -> SweepSummary:
         if trials:
             latency = LatencySummary.from_trials(trials)
             per_phase[phase] = PhaseSummary(
-                latency=latency, verdict=deadline_verdict(latency, budget)
+                latency=latency,
+                tokens=TokenUsageSummary.from_trials(trials),
+                verdict=deadline_verdict(latency, budget),
             )
     return SweepSummary(
         latency=LatencySummary.from_trials(group),
+        tokens=TokenUsageSummary.from_trials(group),
         per_phase=per_phase,
         verdict=overall_verdict([summary.verdict for summary in per_phase.values()]),
         trials=group,
@@ -198,6 +221,7 @@ def build_report(
     run: RunMetadata,
     host: HostMetadata,
     trials: Sequence[Trial],
+    tokens: TokensPerReflection,
     *,
     quality: QualityScore | None = None,
 ) -> BenchReport:
@@ -207,9 +231,12 @@ def build_report(
     the same number the report records.
 
     Args:
-        run: The run's pinned metadata.
+        run: Pinned run metadata.
         host: Capacity-only host metadata.
         trials: Every trial the sweeps produced.
+        tokens: The per-surface measured token block, or
+            :func:`~creek_mcp.bench.tokens.unmeasured_tokens` when the pass
+            did not run.
         quality: The voice-fidelity eval's score (#1898), when one was run.
             ``None`` — the default — is a capacity-only report, which is what
             every existing caller produces.
@@ -232,6 +259,7 @@ def build_report(
         per_sweep=per_sweep,
         verdict=overall_verdict([summary.verdict for summary in per_sweep.values()]),
         capacity=capacity_basis(concurrency, budget),
+        tokens_per_reflection=tokens,
         quality_score=quality,
     )
 

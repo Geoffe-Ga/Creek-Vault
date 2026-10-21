@@ -12,6 +12,11 @@ runtime cache can serve one trial's text for another's.
 :func:`tempfile.gettempdir`, and be either absent or an empty directory. Both
 are checked before anything is written, so an existing vault — or any
 populated directory — is refused untouched.
+
+It also owns the two hermetic grounders the harness injects into
+``reflect_tool``, because both are statements about *this* corpus: the empty
+one, and the one that replays the production grounder's output shape from the
+corpus's own title format without loading an embedding model.
 """
 
 from __future__ import annotations
@@ -22,9 +27,13 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from creek._containment import escaping_child
+from creek.config import AuthorConfig
+
+if TYPE_CHECKING:
+    from creek.classify.privacy_filter import PrivacyTierOverride
 
 VOCABULARY: Final[tuple[str, ...]] = (
     "garden",
@@ -99,6 +108,12 @@ FRAGMENTS_DIR: Final[Path] = Path("01-Fragments") / "Notes"
 
 META_DIR: Final[str] = "00-Creek-Meta"
 """The vault meta directory ``reflect_tool`` writes its audit log under."""
+
+CONSUMER: Final[str] = "capacity-bench"
+"""Consumer id on the synthetic corpus's audit rows.
+
+Lives beside the corpus that carries the audit log, so every path that writes
+one — the sweeps and the per-surface token pass — names the same consumer."""
 
 _INDEX_BYTES: Final[int] = 4
 """Digest bytes read per word choice; ample for a 64-word vocabulary."""
@@ -242,3 +257,30 @@ def build_corpus(
             _note(seed, index, words_per_entry), encoding="utf-8"
         )
     return Corpus(root=resolved, entry_count=entries)
+
+
+def no_grounding(query: str, vault: Path, override: PrivacyTierOverride) -> list[str]:
+    """Return no grounding lines, so no embedding model is loaded.
+
+    The hermetic grounder: what ``--grounding none`` injects in place of
+    :func:`creek_mcp.tools.reflect._default_retrieve`, whose retrieval
+    specialist would load a sentence-transformer.
+    """
+    del query, vault, override
+    return []
+
+
+def filled_grounding(
+    query: str, vault: Path, override: PrivacyTierOverride
+) -> list[str]:
+    """Return as many synthetic corpus titles as the grounder would supply.
+
+    The production grounder returns the *titles* of the top
+    ``AuthorConfig().retrieval_top_k`` nearest fragments. Replaying that shape
+    from this corpus's own title format measures the grounded prompt — every
+    slot filled, which is the case the prompt-overhead allowance must cover —
+    without the embedding model a hermetic run cannot load.
+    """
+    del query, vault, override
+    top_k = AuthorConfig().retrieval_top_k
+    return [f"bench note {index:04d}" for index in range(top_k)]

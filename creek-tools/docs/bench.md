@@ -39,9 +39,13 @@ The run is made of four sweeps:
 | Sweep | Flags | What it answers |
 |---|---|---|
 | cold/warm | `--cold-trials`, `--warm-trials` | Each cold trial evicts the model (`keep_alive: 0`) and starts a fresh grounding session first. Warm trials share one session. |
-| context | `--context-sizes 512,2048` | Latency at each entry size, in words. Sizes are refused unless size + a 1,536-token prompt-overhead allowance + `--num-predict` fits in `--num-ctx`. Words can tokenize to several tokens, so a size that passes can still overflow; a live run reports that trial as `context_overflow` (from Ollama's `prompt_eval_count`), never `ok`. |
+| context | `--context-sizes 512,2048` | Latency and token cost at each entry size, in words. Sizes are refused unless size + a 1,536-token prompt-overhead allowance + `--num-predict` fits in `--num-ctx` (`tokens_per_reflection.prompt_overhead_tokens` reports whether that allowance is still a ceiling). Words can tokenize to several tokens, so a size that passes can still overflow; a live run reports that trial as `context_overflow` (from Ollama's `prompt_eval_count`), never `ok`. |
 | concurrency | `--concurrency 1,2,4` | Runs `N` reflections in flight together on `N` threads, the way `/v1` serves reads. |
 | idle | `--idle-cycles`, `--idle-seconds` | Evict, wait, then resume. |
+
+After the sweeps, one **untimed** turn per model-calling surface measures what a
+reflection *costs* rather than how long it takes. See
+[Measured tokens per reflection](#measured-tokens-per-reflection).
 
 ## Modes
 
@@ -100,7 +104,54 @@ JSON schema.
 | `capacity` | The largest concurrency level that fits, together with every level below it. It is compared against `/v1`'s admission caps (`DEFAULT_MAX_CONCURRENCY`, `DEFAULT_MAX_PER_CONSUMER`). It reports and changes nothing. |
 | `trials[].outcome` | One of `ok`, `timeout`, `oom`, `disk_full`, `provider_unavailable`, `context_overflow` or `error`. |
 | `trials[].model_resident_bytes` | The model's size from `/api/ps`. This is the runtime's figure, not the harness process's RSS. |
+| `trials[].prompt_tokens` / `output_tokens` | What the provider reported for that trial, or `null` when it reported nothing. Never derived. |
+| `trials[].max_output_tokens` | The output ceiling `reflect_tool` asked the factory for, captured at the model seam. |
+| `per_sweep.<sweep>.tokens`, `…per_phase.<phase>.tokens` | Measured prompt and output tokens over the **ok** trials of that group: p50, p95, mean, max, plus `reported_count`, `unreported_count` and `output_cap_exceeded_count`. |
+| `tokens_per_reflection` | The run-level measured token block. See below. |
 | `quality_score` | The voice-fidelity eval's per-dimension scores, rubric version, seed and verdict ([#1898](https://github.com/Geoffe-Ga/Creek-Vault/issues/1898)), or `null` for a capacity-only run. See below. |
+
+## Measured tokens per reflection
+
+ADR-0016 sized every cost figure from one unmeasured planning assumption:
+**2,500 prompt tokens and 128 output tokens per reflection**. The pilot's
+monthly ceiling, the per-1,000-reflections cost and the per-activation
+vendor-key cap all derive from it.
+
+**A cost figure must cite measured counts from `tokens_per_reflection`. Any
+figure quoting 2,500 + 128 is an unmeasured placeholder, and must say so.**
+The two assumed numbers are carried in the block itself
+(`assumed_prompt_tokens`, `assumed_output_tokens`) so a cost line can show
+which of the two it used.
+
+Three surfaces are measured separately, because the cap formula and the cost
+figures are per-surface and grounding changes the prompt materially:
+
+| Surface | Path | Output ceiling |
+|---|---|---|
+| `reflection_ungrounded` | `reflect_tool` with no grounding lines | `max_notes`-scaled, capped at 128 |
+| `reflection_grounded` | `reflect_tool` with every grounding slot filled, as a vault with a built index pays | the same |
+| `letter` | `write_letter` | 1,500 |
+
+Each measurement is one turn through the shipped path over the synthetic
+corpus. Nothing in the pass changes a prompt or a cap — it measures what ships.
+A CLI run always measures it; a programmatic caller can skip the pass with
+`measure_tokens=False` on its `Workload` for a latency-only run, and the block
+then reads `basis: "not_measured"` with an empty `per_surface`.
+
+| Field | Meaning |
+|---|---|
+| `basis` | `provider_reported` — the runtime's own counters (Ollama's `prompt_eval_count` / `eval_count`); **citable**. `byte_upper_bound` — one token per UTF-8 byte, self-reported by `--mode fake`, which has no tokenizer; an upper bound, **not** a cost. `unreported` — the pass ran and the backend reported no counts. `not_measured` — the pass did not run. |
+| `per_surface.<surface>.prompt_tokens` / `output_tokens` | The measured counts, or `null` when unreported. A `null` says the count is unknown; it is never replaced with a zero or an estimate. |
+| `per_surface.<surface>.output_cap_exceeded` | Whether the measured output ran past the ceiling that surface asked for. Reported, never clipped. |
+| `prompt_overhead_tokens` | Measured prompt tokens for the grounded template around a one-word entry — the allowance the context sweep subtracts from `num_ctx`, now a measurement rather than an assertion over the template's byte length. |
+| `prompt_overhead_within_bound` | Whether that measurement is at or below the 1,536-token allowance. `false` means the allowance has become the binding constraint rather than a ceiling, and the context sweep's sizes are no longer safe. |
+
+A fake run's counts are honest about themselves and useless as prices: they
+measure the real shape of the shipped prompt, at a byte-level bound that no
+tokenizer can exceed and every tokenizer beats. The counts a budget line may
+quote come from a pinned local runtime, or from the live pool run — which is
+gated on an owner budget note, because ADR-0016 Decision 4 authorizes no spend
+yet.
 
 ## Cost model
 
