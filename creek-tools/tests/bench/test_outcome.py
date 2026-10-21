@@ -21,6 +21,8 @@ from creek.models import PrivacyTier
 from creek_mcp.bench.outcome import (
     ContextOverflowError,
     Outcome,
+    PoolQuotaExhaustedError,
+    PoolRateLimitedError,
     ProviderUnavailableError,
     TrialProbe,
     classify_outcome,
@@ -54,6 +56,8 @@ def _status_error(status: int, body: str) -> httpx.HTTPStatusError:
         (httpx.ConnectError("refused", request=_REQUEST), Outcome.PROVIDER_UNAVAILABLE),
         (ProviderUnavailableError("down"), Outcome.PROVIDER_UNAVAILABLE),
         (ContextOverflowError("full"), Outcome.CONTEXT_OVERFLOW),
+        (PoolRateLimitedError("admission"), Outcome.RATE_LIMITED),
+        (PoolQuotaExhaustedError("cap spent"), Outcome.INSUFFICIENT_QUOTA),
         (
             _status_error(500, '{"error":"model requires more system memory"}'),
             Outcome.OOM,
@@ -70,7 +74,7 @@ def test_outcomes_classified(exc: BaseException | None, expected: Outcome) -> No
 
 
 def test_enum_is_closed() -> None:
-    """The vocabulary is exactly the six outcomes the report may carry."""
+    """The vocabulary is exactly the outcomes the report may carry."""
     assert {member.value for member in Outcome} == {
         "ok",
         "timeout",
@@ -78,8 +82,19 @@ def test_enum_is_closed() -> None:
         "disk_full",
         "provider_unavailable",
         "context_overflow",
+        "rate_limited",
+        "insufficient_quota",
         "error",
     }
+
+
+def test_pool_refusals_are_distinct_errors() -> None:
+    """A spent cap is not retryable pressure, so they classify apart."""
+    assert classify_outcome(PoolRateLimitedError("x")) is not classify_outcome(
+        PoolQuotaExhaustedError("y")
+    )
+    assert classify_outcome(PoolRateLimitedError("x")) is not Outcome.OK
+    assert classify_outcome(PoolQuotaExhaustedError("y")) is not Outcome.OK
 
 
 class _Clock:

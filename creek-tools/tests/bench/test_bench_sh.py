@@ -7,6 +7,7 @@ cannot produce an unreproducible live report by forgetting a flag.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -85,3 +86,37 @@ def test_bench_sh_fake_ok(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert out.is_file()
     assert result.stdout.startswith("verdict=fits ")
+
+
+def test_bench_sh_fake_pool_ok(tmp_path: Path) -> None:
+    """A hermetic pool run succeeds through the wrapper and writes a report."""
+    out = tmp_path / "pool.json"
+    result = _run(
+        "reflect",
+        "--provider",
+        "pool",
+        "--model",
+        "gpt-oss-120b",
+        "--pool-identity",
+        "vendor/gpt-oss-120b@v3",
+        "--out",
+        str(out),
+        "--entries",
+        "1",
+        "--cold-trials",
+        "0",
+        "--warm-trials",
+        "1",
+        "--concurrency",
+        "1",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("verdict=fits ")
+    assert json.loads(out.read_text(encoding="utf-8"))["run"]["provider"] == "pool"
+
+
+def test_bench_sh_pool_without_identity_is_refused(tmp_path: Path) -> None:
+    """A pool run with nothing pinned exits 2 through the wrapper."""
+    result = _run("reflect", "--provider", "pool", "--out", str(tmp_path / "pool.json"))
+    assert result.returncode == 2, result.stderr
+    assert "--pool-identity" in result.stderr

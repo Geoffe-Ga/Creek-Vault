@@ -77,6 +77,62 @@ def test_endpoint_scope_must_agree_with_mode() -> None:
     assert _run(endpoint_scope="remote").endpoint_scope == "remote"
 
 
+def _pool(**overrides: object) -> RunMetadata:
+    """Build live pool-provider metadata, overridden by *overrides*."""
+    fields: dict[str, object] = {
+        "provider": "pool",
+        "endpoint_scope": "remote",
+        "model_tag": "gpt-oss-120b",
+        "pool_vendor": "tinfoil",
+        "pool_identity": "tinfoil/gpt-oss-120b@v3",
+    }
+    fields.update(overrides)
+    return _run(**fields)
+
+
+def test_pool_provider_records_vendor_and_identity() -> None:
+    """A pool run names the vendor and the identity it pinned (ADR-0016 D7)."""
+    run = _pool()
+    assert run.provider == "pool"
+    assert run.pool_vendor == "tinfoil"
+    assert run.pool_identity == "tinfoil/gpt-oss-120b@v3"
+    assert run.endpoint_scope == "remote"
+
+
+@pytest.mark.parametrize("missing", ["pool_vendor", "pool_identity"])
+def test_pool_provider_requires_both_pool_fields(missing: str) -> None:
+    """A pool run that cannot be attributed to a pinned pool is refused."""
+    with pytest.raises(ValidationError, match="pool"):
+        _pool(**{missing: None})
+
+
+@pytest.mark.parametrize("field", ["pool_vendor", "pool_identity"])
+def test_pool_fields_are_refused_for_other_providers(field: str) -> None:
+    """Only a pool run carries pool fields, so the report cannot mislead."""
+    with pytest.raises(ValidationError, match="pool"):
+        _run(**{field: "tinfoil"})
+
+
+@pytest.mark.parametrize("vendor", ["Tinfoil Inc", "pool.vendor.example", ""])
+def test_pool_vendor_pattern_admits_no_hostname_or_free_text(vendor: str) -> None:
+    """The vendor id is a short label: never a hostname, never a sentence."""
+    with pytest.raises(ValidationError, match="pool_vendor"):
+        _pool(pool_vendor=vendor)
+
+
+def test_pool_identity_rejects_free_text() -> None:
+    """An identity with spaces could carry content; the pattern refuses it."""
+    with pytest.raises(ValidationError, match="pool_identity"):
+        _pool(pool_identity="the quick brown fox jumps over the lazy dog")
+
+
+def test_fake_pool_run_is_pinned_without_a_digest() -> None:
+    """``--provider pool --mode fake`` records the identity it drove."""
+    run = _pool(mode="fake", endpoint_scope="fake", digest=None, git_sha=None)
+    assert run.provider == "pool"
+    assert run.pool_identity == "tinfoil/gpt-oss-120b@v3"
+
+
 @pytest.mark.parametrize("digest", ["mistral", "sha256:" + "a" * 63, "A" * 64])
 def test_digest_pattern_rejects_bare_tag(digest: str) -> None:
     """Only a full ``sha256:<64 hex>`` digest pins weights."""
