@@ -1,6 +1,7 @@
 {
   "essay": null,
   "essay_grounded": false,
+  "inference_source": "pool:creek",
   "notes": [],
   "routed_tier": "personal",
   "status": "empty",

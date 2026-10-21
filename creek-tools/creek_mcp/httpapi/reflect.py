@@ -53,12 +53,21 @@ from creek_mcp.api.models import (
     ReflectionStatus,
     WireTierCeiling,
 )
-from creek_mcp.api.routes import CONTRACT_VERSION_HEADER
 from creek_mcp.httpapi.context import context_of
-from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
+from creek_mcp.httpapi.generation import (
+    declared_minor_at_least,
+    generate_off_loop,
+    served_error_code,
+    serves_provenance,
+)
 from creek_mcp.httpapi.vault import configured_vault, request_key_of
-from creek_mcp.tools.reflect import reflect_tool
+from creek_mcp.provenance import InferenceProvenance
+from creek_mcp.tools.reflect import (
+    PROMPT_TOO_LONG_REASON,
+    RATE_LIMITED_REASON,
+    reflect_tool,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -119,6 +128,15 @@ def reflect_refusal_code(reason: str) -> ErrorCode:
     one code and one message: see the module docstring for why splitting them
     would rebuild a corpus-enumeration oracle.
 
+    ``prompt_too_long`` is ``invalid_request`` rather than a refusal the
+    caller cannot act on: the entry was too large for one reflection, and
+    sending less is something the caller can actually do. ``rate_limited``
+    is its own code rather than ``temporarily_unavailable`` because a cap
+    clears by waiting and an outage may not — and a caller below contract
+    0.19 is served the latter by
+    :func:`~creek_mcp.httpapi.generation.served_error_code`, since its
+    vendored vocabulary cannot name the former.
+
     Args:
         reason: The ``reason`` field of a structured tool refusal.
 
@@ -130,8 +148,10 @@ def reflect_refusal_code(reason: str) -> ErrorCode:
     """
     if reason in {_NOT_FOUND_REASON, _ABOVE_CEILING_REASON}:
         return ErrorCode.PRIVACY_REFUSED
-    if reason == _NO_CONTENT_REASON:
+    if reason in {_NO_CONTENT_REASON, PROMPT_TOO_LONG_REASON}:
         return ErrorCode.INVALID_REQUEST
+    if reason == RATE_LIMITED_REASON:
+        return ErrorCode.RATE_LIMITED
     if reason.startswith(_UNAVAILABLE_PREFIX):
         return ErrorCode.TEMPORARILY_UNAVAILABLE
     return ErrorCode.INTERNAL_ERROR
@@ -156,7 +176,9 @@ async def _parsed_body(request: Request) -> ReflectionRequest | None:
 
 
 def _default_llm_factory(
-    vault: Path, request_key: RequestKey | None = None
+    vault: Path,
+    request_key: RequestKey | None = None,
+    provenance: InferenceProvenance | None = None,
 ) -> _LLMFactory:
     """Return the production tier-keyed LLM factory for *vault*.
 
@@ -177,13 +199,15 @@ def _default_llm_factory(
         vault: The vault being reflected against.
         request_key: The writer's request-scoped key (ADR-0015), or ``None``.
             Handed to the same builder, which decides whether it is used.
+        provenance: The request's provenance recorder, written by the one
+            frame that resolves the stage (ADR-0016 D1.11).
 
     Returns:
         The tier-keyed factory, bound to *vault*'s routing.
     """
     from creek_mcp.server import _build_reflect_llm_factory
 
-    return _build_reflect_llm_factory(vault, request_key)
+    return _build_reflect_llm_factory(vault, request_key, provenance)
 
 
 def _reflect(
@@ -193,6 +217,7 @@ def _reflect(
     build_factory: Callable[[], _LLMFactory] | None,
     session: GroundingSession | None,
     request_key: RequestKey | None,
+    provenance: InferenceProvenance,
 ) -> dict[str, Any] | None:
     """Resolve the vault and run the reflect tool, both off the event loop.
 
@@ -222,6 +247,10 @@ def _reflect(
             and forbids keywords by design.
         request_key: The writer's request-scoped key, or ``None``. Bound into
             the production builder only; an injected factory never sees it.
+        provenance: The request's provenance recorder. Bound into the
+            production builder only, for the same reason: an injected factory
+            resolves no stage, so it has no route to record, and the field is
+            then omitted rather than guessed.
 
     Returns:
         The tool's return dict, a synthetic refusal when the factory itself
@@ -233,7 +262,10 @@ def _reflect(
     if vault is None:
         return None
     try:
-        factory = (build_factory or partial(_default_llm_factory, vault, request_key))()
+        factory = (
+            build_factory
+            or partial(_default_llm_factory, vault, request_key, provenance)
+        )()
     except (RuntimeError, OSError, ValueError) as exc:
         return {
             "status": "refused",
@@ -289,12 +321,18 @@ def _render_notes(
     context: RequestContext,
     *,
     serve_related: bool,
+    inference_source: str | None,
 ) -> Response:
     """Return the note-bearing response for an ``ok`` or ``empty`` result.
 
     Args:
         result: The tool's return dict.
         context: The request's context.
+        serve_related: Whether the caller's declared minor can describe the
+            two #873 fields.
+        inference_source: The route that answered, or ``None`` when it is one
+            this contract does not label or the caller's minor predates the
+            field.
 
     Returns:
         A ``200`` carrying :class:`~creek_mcp.api.models.ReflectionResponse`, or
@@ -319,6 +357,7 @@ def _render_notes(
             # inside ``reflect_tool``; this adapter inherits it and adds none.
             related_praxis=result.get("related_praxis"),
             related_eddies=result.get("related_eddies"),
+            inference_source=inference_source,
         )
     except (ValidationError, ValueError, KeyError, TypeError):
         return error_response(ErrorCode.INTERNAL_ERROR, context)
@@ -346,6 +385,12 @@ def _dumped(payload: ReflectionResponse, *, serve_related: bool) -> dict[str, An
     so only on the reflections that found a compiled neighbour, which is the
     worst distribution a break could have.
 
+    ``inference_source`` is dropped on the same rule and needs no third
+    argument: :func:`_render_notes` is handed ``None`` for it whenever the
+    caller's minor predates :data:`~creek_mcp.api.models.PROVENANCE_SINCE_MINOR`,
+    so "withheld from this caller" and "no route this contract labels" arrive
+    here as the same absence.
+
     Args:
         payload: The validated response.
         serve_related: Whether the caller's declared minor is at least
@@ -358,20 +403,13 @@ def _dumped(payload: ReflectionResponse, *, serve_related: bool) -> dict[str, An
     for key in ("related_praxis", "related_eddies"):
         if not serve_related or data.get(key) is None:
             data.pop(key, None)
+    if data.get("inference_source") is None:
+        data.pop("inference_source", None)
     return data
 
 
 def _serves_related(request: Request) -> bool:
     """Whether this caller's declared minor can describe the two 0.9 fields.
-
-    The field-level twin of ``_predates_the_capability``'s route-level rule,
-    and needed for the same reason: every published response schema sets
-    ``additionalProperties: false``, so a consumer validating against the minor
-    it vendored rejects an unknown key rather than ignoring it.
-
-    A caller that declared no minor, or one this server does not serve, is
-    already refused upstream by the version gate; answering ``False`` here as
-    well keeps the decision fail-closed rather than relying on that ordering.
 
     Args:
         request: The request in flight.
@@ -380,15 +418,7 @@ def _serves_related(request: Request) -> bool:
         ``True`` only when the declared minor is at or past
         :data:`~creek_mcp.api.models.RELATED_FIELDS_SINCE_MINOR`.
     """
-    declared = request.headers.get(CONTRACT_VERSION_HEADER)
-    if declared is None:
-        return False
-    try:
-        return tuple(int(part) for part in declared.split(".")) >= tuple(
-            int(part) for part in RELATED_FIELDS_SINCE_MINOR.split(".")
-        )
-    except ValueError:
-        return False
+    return declared_minor_at_least(request, RELATED_FIELDS_SINCE_MINOR)
 
 
 def _render(
@@ -396,6 +426,8 @@ def _render(
     context: RequestContext,
     *,
     serve_related: bool,
+    provenance: InferenceProvenance,
+    serve_provenance: bool,
 ) -> Response:
     """Project the tool's result onto the published response, or a refusal.
 
@@ -404,6 +436,9 @@ def _render(
         context: The request's context.
         serve_related: Whether the caller declared a minor that can describe
             the two #873 fields.
+        provenance: The request's recorder, holding the route that answered.
+        serve_provenance: Whether the caller declared a minor that can
+            describe ``inference_source`` and name ``rate_limited``.
 
     Returns:
         The published response.
@@ -412,8 +447,16 @@ def _render(
     if escalation is not None:
         return escalation
     if result.get("status") in _NOTE_STATUSES:
-        return _render_notes(result, context, serve_related=serve_related)
-    return error_response(reflect_refusal_code(str(result.get("reason", ""))), context)
+        return _render_notes(
+            result,
+            context,
+            serve_related=serve_related,
+            inference_source=provenance.source if serve_provenance else None,
+        )
+    code = reflect_refusal_code(str(result.get("reason", "")))
+    return error_response(
+        served_error_code(code, serve_rate_limited=serve_provenance), context
+    )
 
 
 async def handle_reflection(request: Request) -> Response:
@@ -446,7 +489,9 @@ async def handle_reflection(request: Request) -> Response:
         request_key = request_key_of(request)
     except InvalidRequestKeyError:
         return error_response(ErrorCode.INVALID_REQUEST, context)
-    result = await read_off_loop(
+    provenance = InferenceProvenance()
+    result = await generate_off_loop(
+        context,
         _reflect,
         request,
         parsed,
@@ -454,7 +499,14 @@ async def handle_reflection(request: Request) -> Response:
         request.app.state.reflect_llm_factory,
         request.app.state.reflect_grounding_session,
         request_key,
+        provenance,
     )
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    return _render(result, context, serve_related=_serves_related(request))
+    return _render(
+        result,
+        context,
+        serve_related=_serves_related(request),
+        provenance=provenance,
+        serve_provenance=serves_provenance(request),
+    )

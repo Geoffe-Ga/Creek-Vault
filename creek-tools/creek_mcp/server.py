@@ -26,6 +26,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 
 from creek.care.guardrail import acute_distress_guard
+from creek.classify.llm.pool_boundary import declared_pool_request
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.model_pin import (
@@ -40,6 +41,11 @@ from creek_mcp.policy import (
     Transport,
     admitted_ceiling,
     effective_consumer,
+)
+from creek_mcp.provenance import (
+    InferenceProvenance,
+    request_key_inference_source,
+    stage_inference_source,
 )
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
@@ -282,7 +288,12 @@ def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
     """
     router = load_vault_config(vault).model_router
     provider = _generation_provider(router, tier, "draft")
-    return lambda prompt: provider.complete(prompt).text
+
+    def _draft(prompt: str) -> str:
+        with declared_pool_request(tier):
+            return provider.complete(prompt).text
+
+    return _draft
 
 
 def _build_compile_llm(vault: Path, tier: PrivacyTier) -> CompileLLM:
@@ -327,11 +338,18 @@ def _build_compile_llm(vault: Path, tier: PrivacyTier) -> CompileLLM:
     """
     router = load_vault_config(vault).model_router
     provider = _generation_provider(router, tier, "compile")
-    return lambda prompt: provider.complete(prompt).text
+
+    def _compile(prompt: str) -> str:
+        with declared_pool_request(tier):
+            return provider.complete(prompt).text
+
+    return _compile
 
 
 def _build_reflect_llm_factory(
-    vault: Path, request_key: RequestKey | None = None
+    vault: Path,
+    request_key: RequestKey | None = None,
+    provenance: InferenceProvenance | None = None,
 ) -> _LLMFactory:
     """Return a tier-keyed LLM factory for ``creek.reflect``.
 
@@ -347,15 +365,20 @@ def _build_reflect_llm_factory(
             Bound once here; the tier arrives per call.
         request_key: The writer's request-scoped key (ADR-0015), or ``None``.
             See :func:`_generation_provider` for when it is used.
+        provenance: The request's :class:`~creek_mcp.provenance.InferenceProvenance`
+            recorder, or ``None`` outside a ``/v1`` request. The route reads it
+            back to publish ``inference_source`` (ADR-0016 D1.11).
 
     Returns:
         A tier → LLM-callable factory bound to *vault*'s router.
     """
-    return _bounded_generation_factory(vault, "reflection", request_key)
+    return _bounded_generation_factory(vault, "reflection", request_key, provenance)
 
 
 def _build_letter_llm_factory(
-    vault: Path, request_key: RequestKey | None = None
+    vault: Path,
+    request_key: RequestKey | None = None,
+    provenance: InferenceProvenance | None = None,
 ) -> _LLMFactory:
     """Return the tier-keyed LLM factory ``POST /v1/letters`` dials (#1862).
 
@@ -368,15 +391,19 @@ def _build_letter_llm_factory(
     Args:
         vault: The served vault, whose own config owns the routing.
         request_key: The writer's request-scoped key (ADR-0015), or ``None``.
+        provenance: The request's provenance recorder, or ``None``.
 
     Returns:
         A tier → LLM-callable factory bound to *vault*'s router.
     """
-    return _bounded_generation_factory(vault, "letter", request_key)
+    return _bounded_generation_factory(vault, "letter", request_key, provenance)
 
 
 def _bounded_generation_factory(
-    vault: Path, verb: str, request_key: RequestKey | None = None
+    vault: Path,
+    verb: str,
+    request_key: RequestKey | None = None,
+    provenance: InferenceProvenance | None = None,
 ) -> _LLMFactory:
     """Return a tier-keyed, output-bounded ``generation`` factory for *verb*.
 
@@ -385,6 +412,7 @@ def _bounded_generation_factory(
         verb: The operation named in an unavailable-provider refusal.
         request_key: The writer's request-scoped key, or ``None``. Held only by
             this closure, which lives for the one request that built it.
+        provenance: The request's provenance recorder, or ``None``.
 
     Returns:
         ``factory(tier, *, max_tokens)``, resolving the provider per call
@@ -393,10 +421,11 @@ def _bounded_generation_factory(
     router = load_vault_config(vault).model_router
 
     def _factory(tier: PrivacyTier, *, max_tokens: int) -> _LLM:
-        provider = _generation_provider(router, tier, verb, request_key)
+        provider = _generation_provider(router, tier, verb, request_key, provenance)
         return partial(
-            _complete_reflection,
+            _complete_generation,
             provider,
+            tier,
             max_tokens=max_tokens,
         )
 
@@ -408,6 +437,7 @@ def _generation_provider(
     tier: PrivacyTier,
     verb: str,
     request_key: RequestKey | None = None,
+    provenance: InferenceProvenance | None = None,
 ) -> LLMProvider:
     """Return the ``generation`` provider for *tier*, or refuse (#1849).
 
@@ -440,6 +470,11 @@ def _generation_provider(
             ``reflection``). The refusal text is otherwise fixed and never
             carries the configured URL.
         request_key: The writer's request-scoped key, or ``None``.
+        provenance: The request's provenance recorder, or ``None``. It is
+            written **here**, at the one point where the destination is
+            decided, which is what makes ``inference_source`` a statement
+            about the route rather than a guess made later by a renderer that
+            cannot see it (ADR-0016 Decision 1 item 11).
 
     Returns:
         A provider that may serve this request.
@@ -456,13 +491,29 @@ def _generation_provider(
     )
     cfg = _resolve_generation_stage(router, tier, request_key)
     if request_key is not None and request_key_admitted(cfg, request_key):
+        _record_source(provenance, request_key_inference_source(request_key))
         return build_request_scoped_provider(request_key)
     if pin_refuses_stage(cfg):
         raise RuntimeError(msg)
     provider = build_provider(cfg)
     if not provider_may_serve(provider):
         raise RuntimeError(msg)
+    _record_source(provenance, stage_inference_source(cfg.provider))
     return provider
+
+
+def _record_source(provenance: InferenceProvenance | None, source: str | None) -> None:
+    """Record *source* on *provenance*, when this request has a recorder.
+
+    Args:
+        provenance: The request's recorder, or ``None`` outside a ``/v1``
+            request — the MCP transport publishes no provenance field, and a
+            CLI pass has nobody to publish it to.
+        source: The published provenance value, or ``None`` for a route this
+            contract does not label.
+    """
+    if provenance is not None:
+        provenance.record(source)
 
 
 def _resolve_generation_stage(
@@ -504,6 +555,38 @@ def _resolve_generation_stage(
         )
     )
     return keyed.resolve("generation", tier)
+
+
+def _complete_generation(
+    provider: LLMProvider,
+    tier: PrivacyTier,
+    prompt: str,
+    *,
+    max_tokens: int,
+) -> str:
+    """Declare this request's tier to the pool contract, then complete the turn.
+
+    The declaration happens here because this is the one frame that knows both
+    the routing tier and that a model call is about to happen. The shared
+    inference pool's closed request shape carries the declared tier (ADR-0016
+    Decision 1 item 4), and only a tier the pool admits — ``open`` or
+    ``personal`` — can be spelled: an INTIMATE turn leaves the scope
+    undeclared, so a pool dial would refuse rather than carry content the
+    :class:`~creek.classify.llm.router.ModelRouter` chokepoint has already
+    ruled out. Declaring costs a local provider nothing but a context
+    variable.
+
+    Args:
+        provider: The tier-routed provider selected for this request.
+        tier: The routing tier the stage was resolved for.
+        prompt: The fully formatted reflection or letter prompt.
+        max_tokens: Trusted output ceiling derived by the calling tool.
+
+    Returns:
+        The complete generated turn.
+    """
+    with declared_pool_request(tier):
+        return _complete_reflection(provider, prompt, max_tokens=max_tokens)
 
 
 def _complete_reflection(

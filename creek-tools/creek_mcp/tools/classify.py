@@ -30,6 +30,10 @@ from creek_mcp.model_pin import (
     pinned_model_serves,
     request_key_admitted,
 )
+from creek_mcp.provenance import (
+    request_key_inference_source,
+    stage_inference_source,
+)
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
 if TYPE_CHECKING:
@@ -147,6 +151,41 @@ def _intimate_route_serves(config: CreekConfig) -> bool:
     except (RuntimeError, ValueError):
         return False
     return pinned_model_serves(provider)
+
+
+def _pass_inference_source(
+    config: CreekConfig,
+    method: str,
+    request_scoped: RequestScopedClassifier | None,
+    request_key: RequestKey | None,
+) -> str | None:
+    """Return the provenance value for one classification pass, or ``None``.
+
+    One pass, one configured stage, so one label: the route is decided before
+    the walk starts and does not change per fragment. A tier *redirection* can
+    still send an INTIMATE fragment to the local ``default`` mid-pass, which is
+    why the label is a statement about the route the pass was **admitted on**
+    rather than a count of what each fragment did — and it never contradicts a
+    socket spy, because the only destination such a pass dials is the one named
+    here.
+
+    Args:
+        config: The classified vault's own configuration.
+        method: The classifier that ran.
+        request_scoped: The writer's provider for this pass, or ``None``.
+        request_key: The writer's request-scoped key, or ``None``.
+
+    Returns:
+        A published provenance value, or ``None`` for a pass that called no
+        model (``method=rules``) or a route this contract does not label.
+    """
+    if method != LLM_METHOD:
+        return None
+    if request_scoped is not None and request_key is not None:
+        return request_key_inference_source(request_key)
+    return stage_inference_source(
+        config.model_router.resolve("classification").provider
+    )
 
 
 def classify_tool(
@@ -305,4 +344,10 @@ def classify_tool(
         # such a fragment as done.
         "healed_unearned_llm": summary.healed_unearned_llm,
         "errors": list(summary.errors),
+        # ADR-0016 Decision 1 item 11: the route this pass was admitted on,
+        # or ``None`` for a pass that called no model at all. Absent from the
+        # wire rather than guessed — see :func:`_pass_inference_source`.
+        "inference_source": _pass_inference_source(
+            config, method, request_scoped, request_key
+        ),
     }

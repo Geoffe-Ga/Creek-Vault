@@ -437,7 +437,8 @@ def test_405_is_not_in_the_published_status_set() -> None:
     """The contract's closed set has no ``405`` in it, by derivation.
 
     ``415`` joined the set at contract 0.8 with ``unsupported_source``
-    (#1524); it is the only member added since 0.2.
+    (#1524), and ``429`` at 0.19 with ``rate_limited`` (#1894, ADR-0016).
+    Those two are the only members added since 0.2.
 
     The literal below is deliberate, and is the one restatement of the set in
     the suite: everywhere else derives it, so without a spelled-out copy a
@@ -448,7 +449,7 @@ def test_405_is_not_in_the_published_status_set() -> None:
     should have to be typed out on purpose.
     """
     assert _METHOD_NOT_ALLOWED not in ALLOWED_HTTP_STATUSES
-    expected = {200, 202, 401, 403, 404, 409, 415, 422, 500, 501, 503}
+    expected = {200, 202, 401, 403, 404, 409, 415, 422, 429, 500, 501, 503}
     assert expected == ALLOWED_HTTP_STATUSES
 
 

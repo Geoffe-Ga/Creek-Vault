@@ -14,6 +14,7 @@ Decision 4, no spend yet).
 
 from __future__ import annotations
 
+import contextvars
 import datetime
 import inspect
 import ssl
@@ -31,21 +32,30 @@ from creek.classify.llm import pool_boundary
 from creek.classify.llm.pool_boundary import (
     POOL_CONNECT_TIMEOUT,
     POOL_GENERATE_PATH,
+    POOL_MAX_DEADLINE_MS,
     POOL_MAX_REQUEST_BYTES,
     POOL_MODELS_PATH,
     POOL_REQUEST_TIMEOUT,
     POOL_URL_ENV,
+    PoolBoundaryError,
     PoolDestinationError,
     PoolDial,
     PoolDialCancelledError,
+    PoolRequestScope,
     PoolRequestTooLargeError,
+    PoolTierUndeclaredError,
     PoolUnreachableError,
     admit_pool_url,
+    current_pool_scope,
+    declared_pool_request,
     open_pool_dial,
     pool_destination,
     pool_generate,
     pool_list_models,
+    pool_request_scope,
     pool_url_configured,
+    pool_wire_tier,
+    require_pool_request,
 )
 from tests.pool_support import FakePool, SocketSpy
 
@@ -399,3 +409,166 @@ class TestTlsTrust:
 
         assert context.verify_mode is ssl.CERT_REQUIRED
         assert context.check_hostname is True
+
+
+class TestRefusalHierarchy:
+    """The review finding that a pool refusal escaped every generation catch.
+
+    ``PoolBoundaryError`` subclassed :class:`OSError` on the claim that "a
+    call site that already degrades on a transport failure degrades the same
+    way here". No generation call site catches ``OSError``:
+    ``creek_mcp/tools/reflect.py`` catches ``RuntimeError`` only. So a pool
+    that accepted the connection and then died mid-request escaped as an
+    unhandled exception instead of ADR-0016 Decision 1 item 10's refusal
+    shape.
+    """
+
+    def test_every_pool_refusal_is_a_runtime_error(self) -> None:
+        """The hierarchy is the one every generation call site already catches."""
+        assert issubclass(PoolBoundaryError, RuntimeError)
+        for subclass in (
+            PoolDestinationError,
+            PoolRequestTooLargeError,
+            PoolDialCancelledError,
+            PoolUnreachableError,
+            PoolTierUndeclaredError,
+        ):
+            assert issubclass(subclass, PoolBoundaryError)
+
+    def test_a_pool_that_accepts_then_dies_mid_request_is_a_refusal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The probe-succeeds-then-generate-dies path, which had no test at all.
+
+        This is the uncovered ``_failure()`` branch: the connection is
+        established and the request is sent, and only then does the pool go
+        away. It must be a ``PoolUnreachableError`` — and, because that is now
+        a ``RuntimeError``, a refusal every generation call site degrades on.
+        """
+        pool = FakePool(reset=True)
+        _pin(monkeypatch, pool.url)
+        try:
+            with pytest.raises(PoolUnreachableError) as caught:
+                pool_generate({"prompt": "x"})
+        finally:
+            pool.close()
+
+        assert pool.accepted == 1
+        assert isinstance(caught.value, RuntimeError)
+
+
+class TestRequestScope:
+    """ADR-0016 Decision 1 item 7: the cancel handle, with a real owner."""
+
+    def test_a_scope_cancels_a_dial_opened_in_the_context_it_copied(
+        self, monkeypatch: pytest.MonkeyPatch, hanging_pool: FakePool
+    ) -> None:
+        """The loop's scope closes a socket the worker thread opened.
+
+        This is the production shape: the route mints the scope and sets it as
+        the active one, the worker thread inherits the *same object* through
+        the copied context, and the route cancels it when the deadline fires.
+        """
+        _pin(monkeypatch, hanging_pool.url)
+        scope = PoolRequestScope(budget_seconds=600.0)
+        outcome: list[str] = []
+
+        def worker() -> None:
+            try:
+                pool_generate({"prompt": "x"})
+            except BaseException as exc:
+                outcome.append(type(exc).__name__)
+
+        with pool_request_scope(scope):
+            thread = threading.Thread(
+                target=contextvars.copy_context().run, args=(worker,), daemon=True
+            )
+            thread.start()
+            while hanging_pool.accepted == 0:
+                time.sleep(0.01)
+            scope.cancel()
+
+        thread.join(_CANCEL_DEADLINE)
+
+        assert not thread.is_alive()
+        assert outcome == [PoolDialCancelledError.__name__]
+
+    def test_a_dial_opened_after_the_cancel_is_cancelled_at_once(
+        self, monkeypatch: pytest.MonkeyPatch, fake_pool: FakePool
+    ) -> None:
+        """The race between the loop's deadline and the worker's first dial."""
+        _pin(monkeypatch, fake_pool.url)
+        scope = PoolRequestScope()
+        scope.cancel()
+
+        with pool_request_scope(scope):
+            dial = open_pool_dial()
+            with pytest.raises(PoolDialCancelledError):
+                dial.request(POOL_GENERATE_PATH, payload={"prompt": "x"})
+
+        assert fake_pool.accepted == 0
+
+    def test_a_scope_budget_caps_the_dial_without_an_explicit_one(
+        self, monkeypatch: pytest.MonkeyPatch, fake_pool: FakePool
+    ) -> None:
+        """The remaining-budget cap is no longer inert on the generation path."""
+        _pin(monkeypatch, fake_pool.url)
+
+        with pool_request_scope(PoolRequestScope(budget_seconds=0.4)):
+            dial = open_pool_dial()
+
+        assert dial.request_timeout <= 0.4
+        assert dial.connect_timeout <= 0.4
+
+    def test_a_spent_scope_budget_refuses_before_opening_a_socket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A vault request with no budget left never dials the pool."""
+        _pin(monkeypatch, "https://pool.vendor.test")
+        spy = SocketSpy(monkeypatch)
+
+        with (
+            pool_request_scope(PoolRequestScope(budget_seconds=-1.0)),
+            pytest.raises(PoolDialCancelledError),
+        ):
+            open_pool_dial()
+
+        assert spy.destinations == []
+
+    def test_the_declared_deadline_is_the_contract_ceiling_when_unbounded(
+        self,
+    ) -> None:
+        """An unbounded scope declares the contract's own 12 s ceiling."""
+        assert PoolRequestScope().deadline_ms() == POOL_MAX_DEADLINE_MS
+        assert PoolRequestScope().remaining() is None
+
+    def test_a_declaration_nests_onto_the_active_scope(self) -> None:
+        """The factory declares the tier onto the scope the route minted."""
+        scope = PoolRequestScope()
+        with pool_request_scope(scope), declared_pool_request("personal") as inner:
+            assert inner is scope
+            assert require_pool_request().require_tier() == "personal"
+        assert current_pool_scope() is None
+
+    def test_a_declaration_outside_a_route_mints_a_transient_scope(self) -> None:
+        """A non-route caller still declares a tier, and it does not leak."""
+        with declared_pool_request("open") as scope:
+            assert scope.tier == "open"
+            assert current_pool_scope() is scope
+        assert current_pool_scope() is None
+
+    @pytest.mark.parametrize(
+        ("offered", "expected"),
+        [
+            pytest.param("open", "open", id="open"),
+            pytest.param("personal", "personal", id="personal"),
+            pytest.param("intimate", None, id="intimate"),
+            pytest.param("", None, id="blank"),
+            pytest.param(7, None, id="not-a-string"),
+        ],
+    )
+    def test_only_the_two_admitted_tiers_have_a_wire_spelling(
+        self, offered: object, expected: str | None
+    ) -> None:
+        """``intimate`` has no spelling here, which is the whole point."""
+        assert pool_wire_tier(offered) == expected

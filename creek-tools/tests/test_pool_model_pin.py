@@ -16,7 +16,6 @@ pool ever being dialled (ADR-0016 T10).
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -24,8 +23,7 @@ import pytest
 from creek.classify.llm.pool_boundary import POOL_URL_ENV
 from creek.classify.llm.providers import PoolProvider
 from creek.config import LLMConfig
-from creek_mcp import model_package
-from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV, ModelPackageManifest
+from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV
 from creek_mcp.model_pin import (
     PINNED_PROVIDERS,
     pin_refuses_stage,
@@ -35,49 +33,16 @@ from creek_mcp.model_pin import (
 )
 from tests.pool_support import (
     PINNED_MODEL,
-    PINNED_RUNTIME_NAME,
-    PINNED_RUNTIME_VERSION,
     FakePool,
     SocketSpy,
     identity_listing,
-    pinned_identity_digest,
+)
+from tests.pool_support import (
+    pin_pool_manifest as _pin_manifest,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-
-def _pin_manifest(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    inventory_digest: str | None = None,
-    model_name: str = PINNED_MODEL,
-) -> ModelPackageManifest:
-    """Configure an approved manifest pinning the pool's identity."""
-    fields = {
-        "schema_version": 1,
-        "runtime_name": PINNED_RUNTIME_NAME,
-        "runtime_version": PINNED_RUNTIME_VERSION,
-        "runtime_digest": "c" * 64,
-        "model_name": model_name,
-        "model_blob_sha256": "b" * 64,
-        "runtime_inventory_digest": inventory_digest
-        or pinned_identity_digest(model_name),
-        "quantization": "Q4_K_M",
-        "parameter_count": 1_000_000,
-        "size_bytes": 4096,
-        "license_spdx": "Apache-2.0",
-        "license_url": "https://example.test/LICENSE",
-    }
-    path = tmp_path / "model-package" / "manifest.json"
-    path.parent.mkdir()
-    path.write_text(json.dumps(fields), encoding="utf-8")
-    monkeypatch.setattr(
-        model_package, "APPROVED_MODEL_LICENSES", frozenset({"Apache-2.0"})
-    )
-    monkeypatch.setenv(MODEL_PACKAGE_FILE_ENV, str(path))
-    return ModelPackageManifest.model_validate(fields)
 
 
 def _pool_stage() -> LLMConfig:

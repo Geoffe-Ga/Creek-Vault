@@ -4,6 +4,7 @@
   "invalid_request": "terminal",
   "not_found": "terminal",
   "privacy_refused": "terminal",
+  "rate_limited": "retry_with_backoff",
   "temporarily_unavailable": "retry_with_backoff",
   "unauthenticated": "terminal",
   "unavailable": "retry_after_operator_action",

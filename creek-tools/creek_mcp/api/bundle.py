@@ -66,6 +66,7 @@ from creek_mcp.api.models import (
     CONTRACT_MINOR,
     CONTRACT_MODELS,
     ERROR_MESSAGES,
+    INFERENCE_SOURCE_POOL_CREEK,
     OK_STATUS,
     RETRY_POLICY,
     SUPPORTED_CONTRACT_MINORS,
@@ -220,9 +221,11 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "tier_model": _TIER_MODEL_PAYLOAD,
     "capabilities": list(CAPABILITIES),
     "request_key_providers": [provider.value for provider in RequestKeyProvider],
+    "inference_pool": True,
 }
-"""A ready managed server: vault present, all ten capabilities served, and a
-writer's own Anthropic or OpenAI key accepted per request (#1873)."""
+"""A ready managed server: vault present, all ten capabilities served, a
+writer's own Anthropic or OpenAI key accepted per request (#1873), and model
+calls answered from the shared confidential inference pool (#1894)."""
 
 _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     **_CAPABILITIES_SUCCESS,
@@ -325,14 +328,25 @@ _LETTER_SUCCESS: Final[dict[str, Any]] = {
     "title": "Voice draft",
     "letter": _EXAMPLE_LETTER_TEXT,
     "attribution": _VOICE_DRAFT_ATTRIBUTION,
+    "inference_source": INFERENCE_SOURCE_POOL_CREEK,
 }
-"""A first letter, stored as the Voice Draft at the caller's id."""
+"""A first letter, stored as the Voice Draft at the caller's id.
+
+``inference_source`` names the route that wrote it (contract 0.19, #1894).
+Shown *present* here because a consumer needs the populated shape; the field
+is absent whenever there is no route to name.
+"""
 
 _LETTER_EMPTY: Final[dict[str, Any]] = {
-    **_LETTER_SUCCESS,
-    "action": JournalAction.UNCHANGED.value,
-}
-"""A repeat: the first letter returned as stored, with no model call."""
+    key: value for key, value in _LETTER_SUCCESS.items() if key != "inference_source"
+} | {"action": JournalAction.UNCHANGED.value}
+"""A repeat: the first letter returned as stored, with no model call.
+
+``inference_source`` is **absent**, and that is the whole point of this cell
+rather than an omission: no model was called, so there is no route to name,
+and a consumer must not read the stored letter's provenance off a response
+that only re-read it.
+"""
 
 _EXAMPLE_UPLOAD_EXTERNAL_ID: Final[str] = "adepthood:doc:2026-08-18T09:30:00Z"
 """A synthetic consumer-side document id, in the shape Adepthood mints."""
@@ -448,6 +462,10 @@ _CLASSIFICATION_SUCCESS: Final[dict[str, Any]] = {
 }
 """A worked classification pass over a network-seeded vault.
 
+``inference_source`` is **absent**: ``method=rules`` calls no model, so there
+is no route to name. An ``llm`` pass carries it, inside
+``JobStatusResponse.result``.
+
 ``privacy_tiers_assigned`` is **zero on purpose**, and it is the cell a
 consumer is most likely to misread as a failure. ``POST /v1/uploads`` requires
 an explicit tier (#1497), so every fragment a network-seeded corpus holds
@@ -528,8 +546,12 @@ _REFLECTIONS_SUCCESS: Final[dict[str, Any]] = {
     "essay_grounded": False,
     "related_praxis": [_EXAMPLE_PRAXIS],
     "related_eddies": [_EXAMPLE_EDDY],
+    "inference_source": INFERENCE_SOURCE_POOL_CREEK,
 }
 """A reflection that found something.
+
+``inference_source`` names the route that answered (contract 0.19, #1894), and
+is shown present for the reason the two ``related_*`` fields are.
 
 ``routed_tier`` equals ``tier_ceiling`` here, and always will: it is a constant
 function of the declared ceiling, which is why publishing it discloses nothing.

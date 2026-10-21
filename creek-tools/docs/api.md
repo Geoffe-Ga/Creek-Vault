@@ -392,6 +392,40 @@ byte-identical. The same bump brings `415` into the published status set, with
 the `unsupported_source` code; a client pinned below `0.8` cannot meet it,
 because the only route that emits it is the one it cannot reach.
 
+`0.19.0` (#1894, [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md))
+publishes **where each answer came from**, and the shared inference pool's
+admission refusal.
+
+`inference_source` is added to the reflection response, the letter response and
+the classification response (which you read inside `JobStatusResponse.result`).
+Its value is the route that answered: `pool:creek`, `pool:attested:<vendor>`,
+`request_key:<vendor>` or `local`. Treat an answer whose route differs from the
+one you disclosed to the writer as a stale-route condition rather than a
+success. The field is **absent** rather than guessed in four cases, and they
+are one absence on the wire on purpose: your declared minor predates it; the
+route is an operator's own cloud key on a self-hosted vault, which this
+contract has no name for; the route is the attested GPU-confidential-compute
+enclave, which it also has no name for; or no model was called at all, which
+covers a `method=rules` classification and a repeat letter returned as stored.
+A label the server cannot stand behind would defeat the only thing the field
+is for.
+
+The enclave is called out separately because it is the absence most likely to
+read as a bug. An enclave is *unreadable* — attestation is verified before any
+prompt leaves — but it is not *on-device*: the prompt is sent to a remote
+endpoint over `https`. `local` would therefore be the one value a socket spy
+could contradict, so a vault configured with `llm.generation.provider:
+enclave` publishes no `inference_source` instead. Read the absence the way you
+read the operator-cloud-key case: the server is telling you it will not name
+this route, not that the answer stayed on the device.
+
+`GET /v1/capabilities` gains `inference_pool`, so you can detect the route
+*before* dialling rather than inferring it from the first answer.
+
+`rate_limited` joins the error table above. All three additions are withheld
+from a caller below `0.19`, so every `0.18` response is byte-identical and
+`0.18` stays in the window.
+
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE
 /v1/connectors/drive` and `POST /v1/connectors/drive/syncs`. It is additive in
@@ -612,14 +646,35 @@ existence-and-rank oracle. Clients must branch on `code`, never parse prose.
 | `unsupported_source` | 415 | terminal |
 | `unavailable` | 503 | retry after operator action |
 | `temporarily_unavailable` | 503 | retry with backoff |
+| `rate_limited` | 429 | retry with backoff |
 | `internal_error` | 500 | retry with backoff |
 
 Retry policy is the static published table (`retry-policy.json`), a pure
 function of `code`. There is no `retryable` field on the wire, ever.
 
+**`rate_limited` is your own allowance, not an outage.** Added at contract
+`0.19.0` (#1894, [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md)),
+it means a rate limit rather than an outage: this vault is over its model-call
+admission cap (too many in flight, or too many this hour), or the vendor your
+own request key is spending on returned a 429. It is reachable on
+`POST /v1/reflections` and documented there in the OpenAPI document; the two
+write routes that also call a model keep their existing refusal shapes. It is
+a separate code from
+`temporarily_unavailable` because the two want different client behaviour: a
+cap clears by waiting, and the writer should be shown a wait rather than an
+outage. It carries an advisory `Retry-After` header, which is deliberately
+**outside** `retry-policy.json`: that table says *whether* to retry and is a
+contract fact; the header says *when* and is a hint. The message says nothing
+about how much of your allowance is spent, and the header is a constant — a
+number derived from this vault's own recent model use would answer "how busy
+is this vault?" to anyone willing to probe. It is served **only** to a caller
+declaring `0.19` or later; an older minor receives the
+`503 temporarily_unavailable` it has always received for a shed request, which
+is the only spelling its vendored vocabulary has.
+
 **`unsupported_source` is about the caller's own filename, never the vault.**
-It is the only code added since contract `0.2.0` (it arrived at `0.8.0`,
-#1524) and the only one that can be emitted by exactly one route,
+It was the only code added between contract `0.2.0` and `0.19.0` (it arrived
+at `0.8.0`, #1524) and is the only one that can be emitted by exactly one route,
 `POST /v1/uploads`. It means the extension names a structured format Creek
 must not flatten into one document — a conversation export, an archive, a
 legacy binary Office file — and its message is the one place on this surface
