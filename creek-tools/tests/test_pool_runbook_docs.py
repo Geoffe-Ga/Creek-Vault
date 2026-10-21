@@ -17,6 +17,11 @@ rather than trusted:
 * the constants the page quotes still match the code that defines them;
 * ``pool_min_below_one`` is described exactly as registered or not, whichever
   :class:`~creek_mcp.provisioning.budget.AlertKind` currently says;
+* every T19 clause row carries a status from a closed vocabulary and reads
+  ``Not met`` while its gate is open, so the page cannot quietly claim T19;
+* every ``per_sweep`` JSON path the evidence procedure quotes resolves against
+  the real report models, and the page does not call the harness
+  pool-incapable once the bench's provider vocabulary admits ``pool``;
 * no vendor is named, because naming one would mean the status banner above it
   went stale;
 * the forbidden custody claims appear only under a negation.
@@ -38,8 +43,12 @@ from creek.classify.llm.pool_boundary import (
     POOL_URL_ENV,
 )
 from creek.classify.llm.providers import POOL_IDENTITY_SCHEME
+from creek_mcp.bench.metadata import RunMetadata
+from creek_mcp.bench.report import BenchReport, PhaseSummary, SweepSummary
+from creek_mcp.bench.stats import LatencySummary
+from creek_mcp.bench.trial import Phase, Sweep
 from creek_mcp.container_health import ProbeResult, ProbeStatus
-from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV
+from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV, ModelPackageManifest
 from creek_mcp.provisioning.budget import AlertKind
 from creek_mcp.provisioning.pool_bundle import (
     POOL_MANIFEST_GUEST_PATH,
@@ -101,6 +110,25 @@ _POOL_EXIT_CODES: Final = {
 _DORMANT_HEADING: Final = "## 7. The O3 engine-host runbook, dormant"
 _DORMANT_TESTS: Final = ("T4", "T17", "T22", "T25")
 
+# The four T19 clauses, keyed by the opening words of each row's Clause cell.
+# ADR-0016's T19 has four, not three: the scaling minimum, the load/download
+# event, the p95 equivalence, and the fleet alert.
+_T19_CLAUSES: Final = (
+    "the scaling policy refuses a minimum of zero",
+    "the first reflection after idle shows no load or download event",
+    "its p95 equals the warm p95 within measurement noise",
+    "the fleet report raises",
+)
+
+# A T19 status cell may only say met or not met. Longest first, so "not met"
+# is matched before the "met" it contains.
+_T19_STATUSES: Final = ("not met", "met")
+
+# Any dotted path the page roots at ``per_sweep``. The whole tail is captured
+# so a path that drops a level (``per_sweep.warm.latency.p95``) is caught too,
+# not just one whose leaf field is wrong.
+_JSON_PATH: Final = re.compile(r"per_sweep\.([A-Za-z0-9_][A-Za-z0-9_.]*)")
+
 
 @pytest.fixture(scope="module")
 def runbook() -> str:
@@ -141,14 +169,38 @@ def test_status_records_every_open_gate(runbook: str) -> None:
         assert gate in lowered, f"status banner does not record: {gate}"
 
 
+def _cell(row: str, index: int) -> str:
+    """Return one cell of a Markdown table row, lowercased and stripped.
+
+    Scanning a whole row lets a verdict word in the *gate* column stand in for
+    a missing verdict, which is how a row like ``| (g) ... | satisfied | none;
+    not applicable |`` used to pass. Cells are addressed instead.
+
+    Args:
+        row: The table row, leading and trailing pipe included.
+        index: The 1-based cell position.
+
+    Returns:
+        The cell's text, lowercased, or ``""`` when the row is too short.
+    """
+    cells = row.split("|")[1:-1]
+    return cells[index - 1].strip().lower() if len(cells) >= index else ""
+
+
 @pytest.mark.parametrize("letter", _CONDITIONS)
 def test_every_condition_carries_a_verdict(runbook: str, letter: str) -> None:
-    """Each Decision 3.3 condition (a)-(h) has a row with a closed verdict."""
+    """Each Decision 3.3 condition (a)-(h) has a closed verdict in its own cell.
+
+    The verdict must be in the verdict column. A page that leaves the verdict
+    cell vague and happens to say "not applicable" in the gate column fails.
+    """
     rows = [line for line in runbook.splitlines() if line.startswith(f"| ({letter})")]
     assert rows, f"condition ({letter}) has no verdict row"
-    row = rows[0].lower()
-    assert any(verdict in row for verdict in _VERDICTS), (
-        f"condition ({letter}) carries no verdict from {_VERDICTS}"
+    verdict_cell = _cell(rows[0], 2)
+    assert verdict_cell, f"condition ({letter}) has no verdict cell"
+    assert any(verdict in verdict_cell for verdict in _VERDICTS), (
+        f"condition ({letter}) verdict cell {verdict_cell!r} "
+        f"carries no verdict from {_VERDICTS}"
     )
 
 
@@ -191,9 +243,99 @@ def test_dormant_section_names_every_o3_only_test(runbook: str) -> None:
 
 
 def test_warm_minimum_section_states_t19_honestly(runbook: str) -> None:
-    """T19's three clauses are each recorded with what they still need."""
+    """T19's four clauses are each present and named in the section."""
     assert "T19" in runbook
     assert _WARM_MINIMUM_ALERT in runbook
+    lowered = runbook.lower()
+    for clause in _T19_CLAUSES:
+        assert clause in lowered, f"T19 clause not recorded: {clause}"
+
+
+@pytest.mark.parametrize("clause", _T19_CLAUSES)
+def test_every_t19_clause_is_recorded_not_met(runbook: str, clause: str) -> None:
+    """Each T19 clause carries a closed status, and that status is "not met".
+
+    This is the page's most load-bearing table: it is the only place the
+    runbook says whether the warm-minimum acceptance test is satisfied. Every
+    clause's gate is open (the vendor choice, a budget line, the unregistered
+    alert kind), so every status must read "not met". A page rewritten to claim
+    T19 met fails here rather than passing on a substring.
+    """
+    rows = [
+        line
+        for line in runbook.splitlines()
+        if line.startswith("| ") and _cell(line, 1).startswith(clause)
+    ]
+    assert rows, f"T19 clause has no row: {clause}"
+    status = _cell(rows[0], 3)
+    assert status, f"T19 clause {clause!r} has no status cell"
+    stated = next(
+        (word for word in _T19_STATUSES if status.lstrip("*").startswith(word)),
+        None,
+    )
+    assert stated is not None, (
+        f"T19 clause {clause!r} status {status!r} is not one of {_T19_STATUSES}"
+    )
+    assert stated == "not met", (
+        f"T19 clause {clause!r} claims {stated!r}; every T19 gate is still open"
+    )
+
+
+def test_quoted_report_paths_resolve_against_the_models(runbook: str) -> None:
+    """Every ``per_sweep`` path the page quotes exists in the report models.
+
+    The evidence procedure tells an operator which JSON fields to read. A path
+    naming a sweep, phase or field the models do not define sends them looking
+    for something that is never emitted, so each segment is resolved against
+    :class:`~creek_mcp.bench.report.BenchReport` rather than trusted.
+    """
+    sweeps = {sweep.value for sweep in Sweep}
+    phases = {phase.value for phase in Phase}
+    assert "per_sweep" in BenchReport.model_fields
+    assert "per_phase" in SweepSummary.model_fields
+    assert "latency" in PhaseSummary.model_fields
+    found = _JSON_PATH.findall(runbook)
+    assert found, "the page quotes no per_sweep path"
+    # What each level under ``per_sweep`` may hold. A path may stop early (the
+    # page names ``per_sweep.idle.per_phase`` as a container), but every
+    # segment it does give must be the one the models define at that level.
+    levels: tuple[tuple[str, set[str]], ...] = (
+        ("sweep", sweeps),
+        ("key", {"per_phase"}),
+        ("phase", phases),
+        ("key", {"latency"}),
+        ("latency field", set(LatencySummary.model_fields)),
+    )
+    for tail in found:
+        segments = tail.rstrip(".").split(".")
+        assert len(segments) <= len(levels), (
+            f"per_sweep.{tail} is deeper than sweep.per_phase.phase.latency.field"
+        )
+        for segment, (label, allowed) in zip(segments, levels, strict=False):
+            assert segment in allowed, (
+                f"in per_sweep.{tail}: {segment!r} is not a valid {label}; "
+                f"known: {sorted(allowed)}"
+            )
+
+
+def test_page_does_not_call_the_harness_pool_incapable(runbook: str) -> None:
+    """Once the bench admits a ``pool`` provider, the page may not deny it.
+
+    #1913 gave the capacity harness a pool mode. The page went stale inside
+    its own review, telling an operator the harness could not reach a pool, so
+    the claim is tied to the bench's own provider vocabulary.
+    """
+    provider = RunMetadata.model_fields["provider"].annotation
+    assert "pool" in getattr(provider, "__args__", ()), (
+        "the bench no longer admits a pool provider; revisit this page's T19 row"
+    )
+    lowered = runbook.lower()
+    assert "ollama-specific today" not in lowered, (
+        "the harness has a pool mode; the page must not call it Ollama-specific"
+    )
+    assert "pool mode has landed" in lowered, (
+        "the page must record that pool mode landed (#1892)"
+    )
 
 
 def test_alert_kind_status_matches_the_enum(runbook: str) -> None:
@@ -262,6 +404,65 @@ def test_forbidden_claims_only_appear_negated(runbook: str, claim: str) -> None:
             assert _NEGATION.search(sentence), (
                 f"unnegated {claim!r} claim: {sentence.strip()!r}"
             )
+
+
+def test_every_required_manifest_field_is_documented(runbook: str) -> None:
+    """The manifest table documents all of the schema's required fields.
+
+    :class:`~creek_mcp.model_package.ModelPackageManifest` is ``extra="forbid"`` with
+    no defaults, so a manifest built from a partial table does not load at
+    all. The table is therefore checked against the model, not eyeballed.
+    """
+    documented = {
+        match
+        for line in runbook.splitlines()
+        if line.startswith("| `")
+        for match in re.findall(r"^\| `([a-z0-9_]+)`", line)
+    }
+    required = set(ModelPackageManifest.model_fields)
+    missing = sorted(required - documented)
+    assert not missing, f"manifest table does not document: {missing}"
+
+
+def test_runtime_version_row_does_not_say_minimum(runbook: str) -> None:
+    """The ``runtime_version`` row pins the exact reported version.
+
+    ``pool_identity`` hashes ``runtime_version`` verbatim into the digest that
+    ``pool_identity_matches`` compares, and ``_pinned_version`` refuses a
+    floating tag, so an operator who writes the *minimum admitted* version
+    gets a mismatch and exit 33. The row must not call it a minimum.
+    """
+    rows = [
+        line for line in runbook.splitlines() if line.startswith("| `runtime_version`")
+    ]
+    assert rows, "the manifest table has no runtime_version row"
+    assert "exact" in _cell(rows[0], 2), (
+        "the runtime_version row must say the exact reported version"
+    )
+    assert "pinned minimum version" not in _cell(rows[0], 2), (
+        "runtime_version is not the minimum admitted version"
+    )
+
+
+def test_page_invokes_only_registered_console_scripts(runbook: str) -> None:
+    """A command the page tells an operator to run must actually exist.
+
+    ``creek-container-health`` is argparse's ``prog``, not an entry point, so
+    the procedure quotes the ``python -m`` form instead. Any ``creek-*``
+    command the page puts in backticks is checked against the real
+    ``[project.scripts]`` table.
+    """
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    registered = set(re.findall(r"^(creek[a-z-]*) = \"", pyproject, re.MULTILINE))
+    assert "creek-tools-mcp" in registered, "the entry-point table was not parsed"
+    invoked = set(re.findall(r"`(creek-[a-z-]+) --", runbook))
+    unregistered = sorted(invoked - registered)
+    assert not unregistered, (
+        f"the page invokes commands that are not console scripts: {unregistered}; "
+        "use the python -m form"
+    )
 
 
 def test_relative_links_resolve(runbook: str) -> None:
