@@ -97,6 +97,8 @@ _INJECTED_FIELDS: Final[dict[str, str]] = {
     "running_seconds_injected": "running_seconds",
     "snapshot_bytes": "snapshot_bytes",
     "egress_bytes": "egress_bytes",
+    "pool_input_tokens": "pool_input_tokens",
+    "pool_output_tokens": "pool_output_tokens",
 }
 """Telemetry field -> ``InjectedUsage`` attribute it is copied from."""
 
@@ -508,6 +510,8 @@ class FleetReconciler:
             running_seconds_injected=_injected(usage, "running_seconds"),
             snapshot_bytes=_injected(usage, "snapshot_bytes"),
             egress_bytes=_injected(usage, "egress_bytes"),
+            pool_input_tokens=_injected(usage, "pool_input_tokens"),
+            pool_output_tokens=_injected(usage, "pool_output_tokens"),
             duplicate_allocation_attempts=self._store.duplicate_allocation_attempts(),
             orphan_resources=_count_kind(divergences, DivergenceKind.ORPHAN_RESOURCE),
             unconfirmed_deletions=len(pending_deletes),

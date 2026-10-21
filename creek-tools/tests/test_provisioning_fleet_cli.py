@@ -204,7 +204,12 @@ def test_report_prints_json_exits_three_on_alerts_and_never_repairs(
     assert document["telemetry"]["snapshot_bytes"] is None
     assert document["telemetry"]["machines_without_rootfs_size"] == 1
     assert document["telemetry"]["duplicate_allocation_attempts"] == 1
-    assert document["estimate"]["unpriced"] == ["egress", "snapshot", "stopped_rootfs"]
+    assert document["estimate"]["unpriced"] == [
+        "egress",
+        "pool",
+        "snapshot",
+        "stopped_rootfs",
+    ]
     assert document["inventory_mode"] == "derived"
     assert still_failed is not None
     assert still_failed.state is JobState.FAILED
