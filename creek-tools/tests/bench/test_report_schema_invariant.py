@@ -15,7 +15,7 @@ from typing import Annotated, Any
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
-from creek_mcp.bench.cost import CostEstimate, PriceSheet
+from creek_mcp.bench.cost import CostEstimate, MeteredEstimate, PriceSheet
 from creek_mcp.bench.report import BenchReport
 
 _CLOSED_FORMATS = {"date", "date-time"}
@@ -75,6 +75,17 @@ def test_cost_estimate_strings_are_closed() -> None:
     assert _open_strings(CostEstimate) == []
 
 
+def test_metered_estimate_strings_are_closed() -> None:
+    """The metered cost line (#1897) is shared the same way, so it is too.
+
+    Its ``model_id`` and ``source`` are operator-supplied, which is exactly
+    why they must be pattern-closed rather than free text.
+    """
+    leaves = _string_leaves(MeteredEstimate.model_json_schema())
+    assert leaves, "the walker found no string fields at all"
+    assert _open_strings(MeteredEstimate) == []
+
+
 def _models(model: type[BaseModel]) -> set[type[BaseModel]]:
     """Return *model* and every model nested in its fields."""
     seen: set[type[BaseModel]] = set()
@@ -100,8 +111,13 @@ def _nested(annotation: Any) -> list[type[BaseModel]]:
 
 def test_extra_forbidden_and_frozen_everywhere() -> None:
     """Every model in the report and cost trees is closed and immutable."""
-    models = _models(BenchReport) | _models(CostEstimate) | _models(PriceSheet)
-    assert len(models) >= 6
+    models = (
+        _models(BenchReport)
+        | _models(CostEstimate)
+        | _models(MeteredEstimate)
+        | _models(PriceSheet)
+    )
+    assert len(models) >= 8
     for model in models:
         assert model.model_config.get("extra") == "forbid", model.__name__
         assert model.model_config.get("frozen") is True, model.__name__
