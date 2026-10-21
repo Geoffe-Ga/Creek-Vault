@@ -18,12 +18,14 @@ from creek_mcp.bench.stats import (
     P50,
     P95,
     LatencySummary,
+    ThroughputSummary,
     TokenSummary,
     TokenUsageSummary,
     error_rate,
     percentile_nearest_rank,
 )
 from creek_mcp.bench.trial import Phase, Sweep, Trial
+from creek_mcp.bench.usage import TokenBasis
 
 
 def _trial(
@@ -33,6 +35,9 @@ def _trial(
     prompt_tokens: int | None = None,
     output_tokens: int | None = None,
     max_output_tokens: int | None = None,
+    generation_s: float | None = None,
+    ttft_s: float | None = None,
+    token_basis: TokenBasis | None = None,
 ) -> Trial:
     """Build one warm, serial trial with *latency_s* and *outcome*."""
     return Trial(
@@ -41,13 +46,117 @@ def _trial(
         concurrency=1,
         input_words=8,
         latency_s=latency_s,
-        generation_s=None,
+        generation_s=generation_s,
+        ttft_s=ttft_s,
         outcome=outcome,
         model_resident_bytes=None,
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
         max_output_tokens=max_output_tokens,
+        token_basis=token_basis,
     )
+
+
+def _rated(output_tokens: int, generation_s: float, basis: TokenBasis) -> Trial:
+    """A successful trial whose counts carry *basis*."""
+    return _trial(
+        1.0,
+        output_tokens=output_tokens,
+        generation_s=generation_s,
+        token_basis=basis,
+    )
+
+
+def test_ttft_p95_uses_only_the_trials_that_reported_one() -> None:
+    """A non-streaming trial contributes no sample and no zero."""
+    trials = [
+        _trial(1.0, ttft_s=None),
+        _trial(1.0, ttft_s=0.5),
+        _trial(1.0, ttft_s=1.5),
+    ]
+    assert LatencySummary.from_trials(trials).ttft_p95_s == 1.5
+
+
+def test_ttft_p95_is_none_when_nothing_streamed() -> None:
+    """``None`` says unknown; a zero would claim an instant first token."""
+    assert LatencySummary.from_trials([_trial(1.0)]).ttft_p95_s is None
+
+
+def test_ttft_ignores_a_failed_trials_first_token() -> None:
+    """A trial that failed is not a reflection anyone received."""
+    trials = [_trial(1.0, Outcome.TIMEOUT, ttft_s=0.01), _trial(1.0, ttft_s=2.0)]
+    assert LatencySummary.from_trials(trials).ttft_p95_s == 2.0
+
+
+def test_throughput_is_measured_only_from_provider_reported_counts() -> None:
+    """tokens/s = output tokens over the model call that produced them."""
+    trials = [
+        _rated(100, 2.0, TokenBasis.PROVIDER_REPORTED),
+        _rated(300, 2.0, TokenBasis.PROVIDER_REPORTED),
+    ]
+    summary = ThroughputSummary.from_trials(trials)
+    assert summary.basis is TokenBasis.PROVIDER_REPORTED
+    assert summary.count == 2
+    assert summary.excluded_count == 0
+    assert summary.tokens_per_second_p50 == 50.0
+    assert summary.tokens_per_second_p95 == 150.0
+
+
+def test_a_byte_upper_bound_yields_no_throughput_figure() -> None:
+    """A rate over bounded bytes would flatter the backend: refuse it."""
+    summary = ThroughputSummary.from_trials(
+        [_rated(100, 2.0, TokenBasis.BYTE_UPPER_BOUND)]
+    )
+    assert summary.basis is TokenBasis.BYTE_UPPER_BOUND
+    assert summary.count == 0
+    assert summary.excluded_count == 1
+    assert summary.tokens_per_second_p50 is None
+    assert summary.tokens_per_second_p95 is None
+
+
+def test_a_bounded_sample_never_dilutes_a_citable_one() -> None:
+    """Only the provider-reported trials feed the figure that is reported."""
+    summary = ThroughputSummary.from_trials(
+        [
+            _rated(100, 2.0, TokenBasis.PROVIDER_REPORTED),
+            _rated(999_999, 0.001, TokenBasis.BYTE_UPPER_BOUND),
+        ]
+    )
+    assert summary.basis is TokenBasis.PROVIDER_REPORTED
+    assert summary.count == 1
+    assert summary.excluded_count == 1
+    assert summary.tokens_per_second_p95 == 50.0
+
+
+def test_a_backend_that_reported_no_counts_is_unreported_not_bounded() -> None:
+    """An unlabelled trial is a gap in the counters, not an upper bound."""
+    summary = ThroughputSummary.from_trials([_trial(1.0, generation_s=2.0)])
+    assert summary.basis is TokenBasis.UNREPORTED
+    assert summary.tokens_per_second_p95 is None
+
+
+def test_throughput_needs_a_positive_generation_time() -> None:
+    """A zero-second model call cannot state a rate; division is refused."""
+    summary = ThroughputSummary.from_trials(
+        [_rated(100, 0.0, TokenBasis.PROVIDER_REPORTED)]
+    )
+    assert summary.count == 0
+    assert summary.excluded_count == 0
+    assert summary.tokens_per_second_p50 is None
+
+
+def test_throughput_ignores_failed_trials() -> None:
+    """A failure generated nothing measurable, however fast it failed."""
+    failed = _trial(
+        0.01,
+        Outcome.OOM,
+        output_tokens=10,
+        generation_s=0.001,
+        token_basis=TokenBasis.PROVIDER_REPORTED,
+    )
+    summary = ThroughputSummary.from_trials([failed])
+    assert summary.count == 0
+    assert summary.tokens_per_second_p95 is None
 
 
 def test_p50_p95_nearest_rank_exact() -> None:

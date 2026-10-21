@@ -188,6 +188,20 @@ class _Harness:
         return entry_text(seed=self.plan.workload.seed, index=index, words=words)
 
 
+def _reported_ttft(ttft_s: float | None) -> float | None:
+    """Return a first-token time only when the backend reported a usable one.
+
+    A negative figure is a skewed clock, not a measurement. Clamping it to
+    ``0.0`` would publish "the first token arrived instantly", which is the
+    one thing :attr:`Trial.ttft_s` promises ``None`` never means. ``None`` is
+    the honest clamp: the backend reported something, and it is unusable, so
+    the time to first token is unknown.
+    """
+    if ttft_s is None or ttft_s < 0.0:
+        return None
+    return ttft_s
+
+
 def run_trial(
     harness: _Harness, spec: _TrialSpec, session: GroundingSession | None
 ) -> Trial:
@@ -234,11 +248,13 @@ def run_trial(
         input_words=len(spec.content.split()),
         latency_s=max(latency, 0.0),
         generation_s=probe.generation_s,
+        ttft_s=_reported_ttft(probe.ttft_s),
         outcome=outcome,
         model_resident_bytes=_resident_bytes(plan),
         prompt_tokens=usage.prompt_tokens if usage is not None else None,
         output_tokens=usage.output_tokens if usage is not None else None,
         max_output_tokens=probe.max_output_tokens,
+        token_basis=usage.basis if usage is not None else None,
     )
 
 
@@ -281,11 +297,13 @@ def _evict_then_run(
             input_words=len(spec.content.split()),
             latency_s=0.0,
             generation_s=None,
+            ttft_s=None,
             outcome=classify_outcome(exc),
             model_resident_bytes=None,
             prompt_tokens=None,
             output_tokens=None,
             max_output_tokens=None,
+            token_basis=None,
         )
     if pause_s is not None:
         harness.plan.sleeper(pause_s)

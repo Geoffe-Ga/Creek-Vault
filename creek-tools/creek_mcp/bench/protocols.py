@@ -9,7 +9,7 @@ they use is a real import.
 """
 
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.models import PrivacyTier
@@ -20,6 +20,29 @@ class LLMCallable(Protocol):
 
     def __call__(self, prompt: str) -> str:
         """Return the completion for *prompt*."""
+
+
+@runtime_checkable
+class FirstTokenReporting(Protocol):
+    """A completion callable that can report its own time to first token.
+
+    An optional sibling of :class:`LLMCallable`, probed structurally exactly
+    as :class:`~creek_mcp.bench.usage.UsageReporting` is: a backend that does
+    not stream is asked nothing, and its trials report ``ttft_s = None``.
+
+    The figure is the *backend's own*, because only the backend sees the
+    stream: :meth:`time_to_first_token` returns seconds from the start of the
+    completion call to its first token. ADR-0016 R2 budgets time-to-first-token
+    with "attestation round trip included", and for a pool client the dial,
+    identity verification and attestation all happen inside that same call, so
+    measuring from its start is what R2 asks for.
+
+    Like ``token_usage``, it reads a figure already recorded, so it must not
+    raise and must not perform I/O — the trial is decided before it is called.
+    """
+
+    def time_to_first_token(self) -> float | None:
+        """Return the last completion's TTFT in seconds, or ``None``."""
 
 
 class LLMFactory(Protocol):
