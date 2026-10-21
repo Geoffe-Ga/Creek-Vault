@@ -337,6 +337,10 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
         # ``0.30`` is to the served ``0.3`` what ``0.20`` was to ``0.2`` until
         # #1938 made ``0.20`` a real minor: equal as a float, not as a string.
         ("0.30", _INCOMPATIBLE_STATUS),
+        # And one that can never be minted, so this row never expires: ``0.200``
+        # is float-equal to both ``0.2`` and ``0.20`` and prefix-matches both,
+        # while no bump will ever reach it.
+        ("0.200", _INCOMPATIBLE_STATUS),
         (" 0.2", _INCOMPATIBLE_STATUS),
         ("v0.2", _INCOMPATIBLE_STATUS),
         ("", _INCOMPATIBLE_STATUS),
@@ -349,6 +353,7 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
         "patch",
         "other-patch",
         "wrong-minor",
+        "unmintable-prefix-collider",
         "padded",
         "prefixed",
         "empty",
@@ -380,6 +385,26 @@ def test_the_version_header_is_matched_strictly(
     refused: the header's published grammar is ``major.minor``, and a server
     that accepted both spellings would let two clients disagree about which one
     is canonical while both appearing to work.
+
+    The last two rows are the prefix-collision tripwire, and their values have
+    to be chosen rather than picked: each must be a minor this server does
+    **not** serve whose decimal spelling *starts with* one it does, so a gate
+    comparing by ``startswith``, or by float, rather than by component tuple
+    goes red. ``0.30`` is to the served ``0.3`` what ``0.20`` was to ``0.2``
+    until #1938 minted ``0.20``.
+
+    ``0.200`` is there because that history is the point: a probe whose value
+    can be minted expires, and the two that have expired so far both expired on
+    the bump that needed them most. ``0.200`` is float-equal to ``0.2`` and
+    ``0.20`` and prefix-matches both, and no bump will ever reach it, so it
+    holds the property permanently. Keeping ``0.30`` alongside it costs one
+    line and covers a second decade.
+
+    Neither is the next free minor above the current one, deliberately: that
+    value is served by the very next bump, and the row then asserts that the
+    current minor is refused — red for the right reason and legible as the
+    wrong one. #1903 step 6 walked into exactly that and is why this paragraph
+    exists.
 
     Args:
         vault: A seeded vault.

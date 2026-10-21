@@ -25,7 +25,6 @@ from creek.classify.llm.consent import MANAGED_VAULT_ENV
 from creek.classify.llm.pool_boundary import POOL_URL_ENV
 from creek.config import CreekConfig
 from creek_mcp.api.models import (
-    CONTRACT_MINOR,
     KEYLESS_INFERENCE_SINCE_MINOR,
     SUPPORTED_CONTRACT_MINORS,
 )
@@ -184,8 +183,25 @@ def test_false_is_a_promise_the_reflect_route_keeps(
 
 
 def test_the_field_arrived_at_its_own_minor() -> None:
-    """0.20 widened the window: 0.19 is still served, and the gate is literal."""
-    assert CONTRACT_MINOR == "0.20"
+    """0.20 widened the window rather than shifting it, and the gate is literal.
+
+    Every assertion here is about **this field's** minor, which is what the
+    test is named for. It used to open with ``CONTRACT_MINOR == "0.20"`` as
+    well, and that line has been dropped: "0.20 is the current minor" is a
+    claim about the *next* bump rather than about ``keyless_inference``, so it
+    went red the first time an unrelated minor shipped (#1903 step 6, which
+    moved the current minor to 0.21 without touching this field or this
+    handshake). The claim it was making is not lost — the current minor is
+    pinned, once, by ``test_the_previous_minor_is_still_served`` in
+    ``tests/test_adepthood_contract_models.py``, which is the test whose job
+    that is and which already has to be edited at every bump.
+
+    ``"0.20" in SUPPORTED_CONTRACT_MINORS`` replaces it and is the assertion
+    actually worth having here: it says the minor this field shipped at is
+    *still served*, which is the property a consumer pinned to it depends on
+    and which a later bump could silently break.
+    """
     assert KEYLESS_INFERENCE_SINCE_MINOR == "0.20"
+    assert "0.20" in SUPPORTED_CONTRACT_MINORS
     assert "0.19" in SUPPORTED_CONTRACT_MINORS
     assert "0.18" in SUPPORTED_CONTRACT_MINORS

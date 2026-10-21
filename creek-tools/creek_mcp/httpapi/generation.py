@@ -14,7 +14,10 @@ comparison, once, and :func:`withheld_provenance_dropped` is what it decides.
 than for a field: a caller below :data:`~creek_mcp.api.models.PROVENANCE_SINCE_MINOR`
 vendored an ``ErrorCode`` enum with no ``rate_limited`` member, so
 :func:`served_error_code` serves it the ``temporarily_unavailable`` it has
-always received for a shed request.
+always received for a shed request. Both synchronous model-backed routes call
+it since contract 0.21 (#1903 step 6), each passing the since-minor *it* began
+serving the code at, so one per-account cap is reported one way wherever a
+caller meets it.
 
 **The pool request scope.** ADR-0016 Decision 1 item 7: when the vault sheds a
 request at its deadline, the route catches the cancellation at the
@@ -26,8 +29,8 @@ answered. :func:`generate_off_loop` is that shed path, and it is also what
 binds the pool's declared ``deadline_ms`` to the vault request's own remaining
 budget instead of the contract's flat ceiling.
 
-Only the **read** route takes it. ``POST /v1/letters/{external_id}`` and
-``POST /v1/classifications`` dispatch through
+Only the **read** route takes the shed path. ``POST /v1/letters/{external_id}``
+and ``POST /v1/classifications`` dispatch through
 :func:`~creek_mcp.httpapi.deadline.write_off_loop`, which does not abandon its
 worker on purpose (see that module): there is nothing to shed, because the
 caller is going to wait for the true answer either way.
@@ -126,10 +129,21 @@ def served_error_code(code: ErrorCode, *, serve_rate_limited: bool) -> ErrorCode
     received for a shed request, and what ``limits.py`` still serves when
     admission sheds one today.
 
+    Called by both model-backed synchronous routes since contract 0.21, and
+    *this* function is why that is not a second dialect: each route decides for
+    itself which since-minor admits the code — 0.19 for reflections, 0.21 for
+    letters, where the route began reaching it — and then the downgrade, its
+    target, the envelope and the ``Retry-After`` are one implementation they
+    share (#1903 step 6).
+
     Args:
         code: The code the route decided on.
         serve_rate_limited: Whether the caller's declared minor is at or past
-            :data:`~creek_mcp.api.models.PROVENANCE_SINCE_MINOR`.
+            the one its route began serving the code at —
+            :data:`~creek_mcp.api.models.PROVENANCE_SINCE_MINOR` for
+            ``POST /v1/reflections``,
+            :data:`~creek_mcp.api.models.LETTER_RATE_LIMITED_SINCE_MINOR` for
+            ``POST /v1/letters/{external_id}``.
 
     Returns:
         The code to actually serve.

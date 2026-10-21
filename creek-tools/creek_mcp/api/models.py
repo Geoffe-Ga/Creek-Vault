@@ -83,6 +83,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.20",
     "0.19",
     "0.18",
     "0.17",
@@ -212,6 +213,20 @@ Contract 0.19 (#1894) adds ``inference_source`` to three published responses,
 refusal is served to such a caller as ``temporarily_unavailable``, the code it
 has always received for a shed request. So a ``0.18`` consumer validating its
 vendored closed schemas is answered byte-identically and stays in the window.
+
+Contract 0.20 (#1938) adds ``keyless_inference`` to the handshake, withheld
+from callers below :data:`KEYLESS_INFERENCE_SINCE_MINOR`, so every response a
+``0.19`` consumer can reach is byte-identical and ``0.19`` stays in the window.
+
+Contract 0.21 (#1903 step 6) serves ``rate_limited`` on
+``POST /v1/letters/{external_id}`` as well, so one per-account cap is reported
+by one surface. No model, field or status is added — ``429`` was already in the
+published set — and the only thing that moves is which route documents and
+reaches it, withheld from callers below
+:data:`LETTER_RATE_LIMITED_SINCE_MINOR`, which keeps every ``0.20`` letter
+response exactly as that minor published it. It is 0.21 and not 0.20 precisely
+because 0.20 had already shipped: see that constant for why reusing a published
+minor would have been the break this window exists to prevent.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -443,6 +458,35 @@ Its own constant rather than :data:`PROVENANCE_SINCE_MINOR`, because it is its
 own contract change: a ``0.19`` consumer vendored a closed
 :class:`CapabilitiesResponse` without it. It is a literal for the reason
 :data:`_UPLOAD_MINOR` is.
+"""
+
+LETTER_RATE_LIMITED_SINCE_MINOR: Final[str] = "0.21"
+"""First contract minor that may meet ``rate_limited`` on the letter route.
+
+A *second* since-minor for one code, and the distinction it carries is which
+question is being asked. ``rate_limited`` and its ``429`` are 0.19's, so
+:data:`PROVENANCE_SINCE_MINOR` already answers "can this caller name the
+code?" — and a 0.19 caller can. What this constant answers is "does *this
+route* reach it?", because until 0.21 ``POST /v1/letters/{external_id}`` did
+not: the published document documented no ``429`` on it, and a cap arriving
+mid-letter was collapsed into the ``temporarily_unavailable`` every other
+provider failure earns. Serving the cap there is a response that *moves* on a
+route an already-published minor describes, and the only mechanism this
+contract has for that is a minor.
+
+**Which is why it is 0.21 rather than 0.20**, even though 0.20 is the minor
+this work was specified against. 0.20 shipped first, for ``keyless_inference``
+(#1938, the constant above), so by the time this landed 0.20 was itself an
+already-published minor describing this path — and a consumer that negotiated
+it for that field never agreed to a ``429`` on a letter. Reusing 0.20 would
+have been exactly the move the paragraph above forbids, committed by the
+change that wrote the paragraph.
+
+It is **not** a second dialect. The downgrade runs through the same
+:func:`~creek_mcp.httpapi.generation.served_error_code`, to the same code,
+with the same envelope and the same advisory ``Retry-After`` the reflection
+route has served since 0.19 — the datum that differs is when the route began
+reaching the code, which is exactly what a since-minor is.
 """
 
 INFERENCE_SOURCE_LOCAL: Final[str] = "local"
@@ -749,15 +793,29 @@ class ErrorCode(StrEnum):
             reachable only on ``POST /v1/uploads``.
         UNAVAILABLE: The vault is absent or unreadable; a human must act.
         TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.
-        RATE_LIMITED: This vault's own admission cap refused the request —
-            too many model calls in flight, or too many this hour (ADR-0016
-            Decision 1 items 4 and 8). A cap, **not** an outage: the writer
-            should be shown a wait, which is the whole reason it is not
+        RATE_LIMITED: The destination this call would have reached refused to
+            admit it (ADR-0016 Decision 1 items 4 and 8). **Relayed, never
+            minted**: this server keeps no hourly or in-flight counter, so the
+            refusal is the shared pool's own ``429`` or one from whichever
+            vendor the call reached — the writer's request key, or an
+            operator's cloud key on a self-hosted vault. A cap, **not** an
+            outage: it clears by waiting, which is the whole reason it is not
+            ``temporarily_unavailable``. The two concurrency limits in front of
+            every route are a different thing and still shed as
             ``temporarily_unavailable``. Added at contract 0.19 (#1894) and
             served only to callers declaring :data:`PROVENANCE_SINCE_MINOR` or
             later; an older caller receives ``temporarily_unavailable``, which
             is what it has always received for a shed request and the only
-            spelling its vendored vocabulary has.
+            spelling its vendored vocabulary has. Reachable on
+            ``POST /v1/reflections`` from 0.19 and on
+            ``POST /v1/letters/{external_id}`` from
+            :data:`LETTER_RATE_LIMITED_SINCE_MINOR` (0.21) — **one** budget
+            either way, and that much is provable here: both routes dial the
+            single ``generation`` chokepoint, and the request this server sends
+            the pool carries no route, verb or capability, so a per-route
+            budget cannot exist even in principle. Whether the budget is scoped
+            per vault or per account is a pool-side fact this contract does not
+            publish.
         INTERNAL_ERROR: An unexpected server fault.
     """
 

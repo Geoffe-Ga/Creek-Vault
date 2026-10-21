@@ -242,10 +242,19 @@ def _reflect(
 
 
 def _key_headers(**kwargs: Any) -> dict[str, str]:
-    """Return the two request-key headers for an admitted writer's key."""
+    """Return the two request-key headers for an admitted writer's key.
+
+    The value deliberately does **not** imitate a vendor key.
+    :func:`~creek.classify.llm.request_key._is_key_shaped` admits any non-empty
+    value up to 512 characters over ``[A-Za-z0-9._-]`` and checks no prefix, so
+    a key-shaped canary bought nothing and cost a ``detect-secrets``
+    suppression — a high-entropy ``sk-ant-`` string is exactly what that hook
+    exists to stop, and a test is a bad place to teach it exceptions. This
+    value is still distinctive enough for a leak sweep to find.
+    """
     return {
         PROVIDER_HEADER: "anthropic",
-        PROVIDER_KEY_HEADER: "sk-ant-api03-ROUTEtestKEY1894zzPP-never-logged",
+        PROVIDER_KEY_HEADER: "route-test-header-1894-never-logged",
         **kwargs,
     }
 
@@ -798,18 +807,45 @@ def _await_terminal(
     pytest.fail("the pipeline job did not reach a terminal state")
 
 
+def _letter_body() -> dict[str, Any]:
+    """Return a letter request whose note anchors a verbatim span."""
+    return {
+        "content": ENTRY,
+        "tier": "open",
+        "title": "Voice draft",
+        "note": {"anchor_text": QUOTE, "kind": "pattern", "note": "Look here."},
+    }
+
+
+def _letter(
+    vault: Path, *, external_id: str = "letter-1903", minor: str | None = None
+) -> httpx.Response:
+    """POST one letter over *vault* and return the response.
+
+    The sibling of :func:`_reflect`, and the reason step 6 of #1903 could be
+    asserted at all: the two routes are now driven through one shape, so
+    "they answer the same way" is a comparison rather than two transcriptions.
+    """
+    sent = (
+        headers(ceiling="personal")
+        if minor is None
+        else headers(ceiling="personal", minor=minor)
+    )
+    with _client(vault) as http:
+        return http.post(
+            LETTERS_TEMPLATE.format(external_id=external_id),
+            json=_letter_body(),
+            headers=sent,
+        )
+
+
 class TestLetterProvenance:
     """``POST /v1/letters/{external_id}`` names the route that wrote it."""
 
     @staticmethod
     def _body() -> dict[str, Any]:
         """Return a letter request whose note anchors a verbatim span."""
-        return {
-            "content": ENTRY,
-            "tier": "open",
-            "title": "Voice draft",
-            "note": {"anchor_text": QUOTE, "kind": "pattern", "note": "Look here."},
-        }
+        return _letter_body()
 
     @pytest.mark.usefixtures("isolated")
     def test_a_pool_written_letter_names_the_pool(
@@ -850,6 +886,78 @@ class TestLetterProvenance:
         assert again.json()["action"] == "unchanged"
         assert "inference_source" not in again.json()
         assert answering_pool.accepted == _ONE_GENERATION_DIAL
+
+
+class TestOneCapOneSurface:
+    """ADR-0016 D1 item 4 on **both** model-backed routes (#1903 step 6).
+
+    The owner's ratification, 2026-10-21: *"if the cap is per-account, the
+    surface should be per-account too."* The cap already was per-account, and
+    not by accident — ``_build_reflect_llm_factory`` and
+    ``_build_letter_llm_factory`` are both ``_bounded_generation_factory`` over
+    the one ``generation`` stage, so the single pool admission refusal driven
+    here is *one* budget answering two routes and there is no per-route counter
+    anywhere to disagree with it. What was asymmetric was only the reporting,
+    and that is what this class pins shut.
+    """
+
+    @pytest.mark.usefixtures("isolated")
+    def test_both_model_backed_routes_report_one_cap_identically(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same status, same code, same message, same advisory wait.
+
+        Compared field by field rather than body to body: the envelope carries
+        a per-request correlation id, which is the one thing that must *not*
+        match.
+        """
+        _probe_passes(monkeypatch)
+        pool = FakePool(status=HTTP_TOO_MANY_REQUESTS)
+        pool.pin(monkeypatch)
+        vault = _pool_vault(tmp_path)
+        try:
+            reflection = _reflect(vault)
+            letter = _letter(vault)
+        finally:
+            pool.close()
+
+        assert reflection.status_code == HTTP_TOO_MANY_REQUESTS, reflection.text
+        assert letter.status_code == reflection.status_code, letter.text
+        assert letter.json()["code"] == reflection.json()["code"] == "rate_limited"
+        assert letter.json()["message"] == reflection.json()["message"]
+        assert (
+            letter.headers[RETRY_AFTER_HEADER]
+            == reflection.headers[RETRY_AFTER_HEADER]
+            == RETRY_AFTER_SECONDS
+        )
+
+    @pytest.mark.usefixtures("isolated")
+    def test_both_routes_downgrade_together_for_a_caller_below_the_bump(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller that cannot be told sees one story on both routes too.
+
+        Symmetry has to hold on the withheld side as well, or the version gate
+        would reintroduce exactly the split it was asked to close — one route
+        answering 429 and its neighbour 503 to the same caller in the same
+        second. ``0.18`` predates the code entirely and so is the one minor
+        for which both routes are *expected* to downgrade.
+        """
+        _probe_passes(monkeypatch)
+        pool = FakePool(status=HTTP_TOO_MANY_REQUESTS)
+        pool.pin(monkeypatch)
+        vault = _pool_vault(tmp_path)
+        try:
+            reflection = _reflect(vault, minor=_PRIOR_MINOR)
+            letter = _letter(vault, minor=_PRIOR_MINOR)
+        finally:
+            pool.close()
+
+        assert reflection.status_code == HTTP_SERVICE_UNAVAILABLE, reflection.text
+        assert letter.status_code == reflection.status_code, letter.text
+        code = "temporarily_unavailable"
+        assert letter.json()["code"] == reflection.json()["code"] == code
+        assert RETRY_AFTER_HEADER not in letter.headers
 
 
 def _classified_by(source: str | None) -> dict[str, Any]:

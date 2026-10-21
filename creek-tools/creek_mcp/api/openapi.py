@@ -51,6 +51,7 @@ from creek_mcp.api.routes import (
     RouteSpec,
 )
 from creek_mcp.contract import CONTRACT_VERSION
+from creek_mcp.httpapi.errors import RETRY_AFTER_HEADER, RETRY_AFTER_SECONDS
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -139,6 +140,7 @@ actually produce.
 _CAPABILITY_ERROR_CODES: Final[dict[Capability, tuple[ErrorCode, ...]]] = {
     Capability.UPLOAD: (ErrorCode.UNSUPPORTED_SOURCE,),
     Capability.REFLECTIONS: (ErrorCode.RATE_LIMITED,),
+    Capability.LETTERS: (ErrorCode.RATE_LIMITED,),
 }
 """Refusals only one capability can produce, keyed by that capability.
 
@@ -155,11 +157,16 @@ return — and omitting it from the one that can leaves a generated client with
 no branch for the refusal it will meet the first time somebody uploads a
 ``conversations.json``.
 :attr:`~creek_mcp.api.models.ErrorCode.RATE_LIMITED` is the same shape at
-contract 0.19 (#1894): only ``POST /v1/reflections`` reaches it, through
-:func:`creek_mcp.httpapi.reflect.reflect_refusal_code`, because it is the one
-route whose model call is admitted against a per-vault cap. The two write
-routes that also call a model keep their existing refusal shapes, which is
-what ADR-0016 Decision 1 item 10 asks of them.
+contract 0.19 (#1894), and at 0.21 (#1903 step 6) it is the reason the table
+earns its keep a second time: ``POST /v1/letters/{external_id}`` joins
+``POST /v1/reflections`` in one line rather than a second branch. Both routes'
+model calls are admitted against the **same** per-account cap — they resolve
+the one ``generation`` stage through the same
+``creek_mcp.server._bounded_generation_factory`` — so documenting it on one and
+not the other published two different stories about one budget. It stays off
+the remaining capabilities because they reach no model, and off
+``POST /v1/classifications``, whose own model work is accepted as a ``202`` job
+and so cannot refuse admission in the response that admits it.
 """
 
 SECURITY_SCHEME_NAME: Final[str] = "bearerAuth"
@@ -445,6 +452,36 @@ def _success_response(spec: RouteSpec, model: type[BaseModel] | None) -> dict[st
     return {"description": spec.summary, "content": _json_content(schema)}
 
 
+_RESPONSE_HEADERS: Final[dict[ErrorCode, dict[str, Any]]] = {
+    ErrorCode.RATE_LIMITED: {
+        RETRY_AFTER_HEADER: {
+            "description": (
+                "Advisory wait before retrying, as integer delta-seconds "
+                f"(RFC 9110 §10.2.3). Always the constant {RETRY_AFTER_SECONDS}: "
+                "a value derived from this vault's own recent model calls would "
+                "answer 'how much of your allowance is spent?' to anyone willing "
+                "to probe. Deliberately outside retry-policy.json, which says "
+                "whether to retry and is contract; this says when and is a hint."
+            ),
+            "schema": {"type": "integer", "format": "int32", "example": 60},
+        }
+    },
+}
+"""Response headers a refusal carries, keyed by the code that carries them.
+
+A table for the same reason :data:`_CAPABILITY_ERROR_CODES` is one: "which
+headers does this refusal send" is data about the refusal. One entry today, and
+it earns the table — a consumer cannot write a backoff against a header the
+document does not declare, and a cross-repo consumer is exactly who reads this
+document instead of the source. The value is interpolated from
+:data:`~creek_mcp.httpapi.errors.RETRY_AFTER_SECONDS` rather than restated, so
+the published number cannot drift from the one the server sends.
+
+``401``'s ``WWW-Authenticate`` is deliberately absent: it is obligatory for that
+status and carries no server-specific value a client reads.
+"""
+
+
 def _error_response(code: ErrorCode) -> dict[str, Any]:
     """Return the response object for one wire error code.
 
@@ -452,14 +489,19 @@ def _error_response(code: ErrorCode) -> dict[str, Any]:
         code: The error code being documented.
 
     Returns:
-        The published constant message, and a reference to the single error
-        envelope. Never an inline schema — a second error shape is where a
-        field that echoes request or vault material eventually appears.
+        The published constant message, a reference to the single error
+        envelope, and any headers this refusal sends. Never an inline schema —
+        a second error shape is where a field that echoes request or vault
+        material eventually appears.
     """
-    return {
+    response: dict[str, Any] = {
         "description": ERROR_MESSAGES[code],
         "content": _json_content(_component_ref(_ERROR_ENVELOPE_NAME)),
     }
+    headers = _RESPONSE_HEADERS.get(code)
+    if headers is not None:
+        response["headers"] = headers
+    return response
 
 
 def _responses(spec: RouteSpec) -> dict[str, Any]:
