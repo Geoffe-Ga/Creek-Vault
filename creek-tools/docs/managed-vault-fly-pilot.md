@@ -89,15 +89,17 @@ separate Fly secret-backed files and are not part of that snapshot.
   the control Machine.
 - Build the control image from `Dockerfile.control-plane`. Its root bootstrap
   validates that `/data` is the exact mounted volume, narrows ownership and
-  modes only for `/data`, `/data/runtime-secrets`, and the eight declared
-  secret-backed files (the eighth is the organization pool admin key of
-  [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md)
-  Decision 3.4; see [the pool runbook](pool-measurement-pin.md) section 4),
+  modes only for `/data`, `/data/runtime-secrets`, and the seven declared
+  secret-backed files, plus the organization pool admin key when — and only
+  when — the Machine declares `CREEK_POOL_ADMIN_KEY_IN_USE = "1"`
+  ([ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md)
+  Decision 3.4; see [the pool runbook](pool-measurement-pin.md) section 4). It
   then irreversibly drops groups, gid, and uid to `10001`
   before importing the long-running runtime. Secret values in environment
   variables, symlinked files, empty files, extra links, and oversized files
-  are startup failures. After the mounts, startup verifies the pool admin
-  key's custody and refuses with its own content-free code when it is missing,
+  are startup failures; the admin key's environment form is refused in both
+  regimes. After the mounts, startup verifies the pool admin key's custody and
+  refuses with its own content-free code when a key declared in use is
   malformed, undated or expired.
 - A replay vault Machine explicitly starts as root only through
   `creek_mcp.provisioning.fly_vault_bootstrap`. That bootstrap validates the
@@ -177,10 +179,15 @@ placeholder drift, and delimiter-bearing coordinates and pins `app`, one
 `[[http_service.checks]]`, one volume mount, `force_https`, restart policy, and
 one `[[files]]` entry per base64 Fly app secret. It also pins a rolling deploy
 with one unavailable Machine, `SIGTERM`, a 300-second Fly kill timeout, and
-`on-failure` with three retries. `--pool-admin-key-expires-at` is required and
-must be a timezone-aware instant: it is rendered into the Machine's non-secret
-`CREEK_POOL_ADMIN_KEY_EXPIRES_AT`, which startup reads to decide whether the
-pool admin key is near expiry, and an undeclared expiry refuses. The operator
+`on-failure` with three retries. `--pool-admin-key-expires-at` is **optional**
+and omitting it is the default: the rendered config then declares
+`CREEK_POOL_ADMIN_KEY_IN_USE = "0"`, carries no `CREEK_POOL_ADMIN_KEY_B64`
+entry, and requires no admin-key secret — which is the regime a pilot rendered
+today is in, since no vendor is chosen and no admin key exists. Passing a
+timezone-aware instant switches the config into the in-use regime: it appends
+the `CREEK_POOL_ADMIN_KEY_B64` `[[files]]` entry, so that Fly app secret must
+then be set out of band like the other seven, and it makes every admin-key
+custody refusal binding. The operator
 must first create
 the named app and volume and set each declared base64 secret out of band. The
 live `deploy` mode requires the SHA-256 of a private, short-lived authorization

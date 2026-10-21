@@ -10,10 +10,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from creek_mcp.container_runtime import ContainerConfigurationError, is_mounted_volume
-from creek_mcp.provisioning.pool_admin_key import verify_pool_admin_key
-from creek_mcp.provisioning.pool_bundle import (
+
+# ``pool_admin_key`` imports nothing first-party at module scope, so reaching
+# it here does not widen this bootstrap's root import surface (#1930).
+from creek_mcp.provisioning.pool_admin_key import (
     POOL_ADMIN_KEY_GUEST_PATH,
     POOL_ADMIN_KEY_SECRET_NAME,
+    pool_admin_secret_files,
+    verify_pool_admin_key,
 )
 
 if TYPE_CHECKING:
@@ -32,8 +36,14 @@ _SECRET_FILES: Final[tuple[Path, ...]] = (
     Path("/run/secrets/creek_tls_ca_private_key"),
     Path("/run/secrets/creek_handoff_token"),
     Path("/run/secrets/creek_fleet_policy"),
-    Path(POOL_ADMIN_KEY_GUEST_PATH),
 )
+"""The files every control plane carries, whatever admin-key regime it is in.
+
+The pool admin key is deliberately *not* here: it is appended by
+:func:`~creek_mcp.provisioning.pool_admin_key.pool_admin_secret_files` only
+while the Machine declares it in use, so declaring the custody path cannot
+make a pilot that has no key yet unbootable (#1930).
+"""
 _FLY_SECRET_NAMES: Final[tuple[str, ...]] = (
     "CREEK_CONTROL_TOKENS_B64",
     "CREEK_FLY_TOKEN_B64",
@@ -124,19 +134,39 @@ def _run_pilot(argv: list[str]) -> None:
 
 
 def _require_custodied_pool_admin_key() -> None:
-    """Refuse startup unless the organization admin key is usable.
+    """Refuse startup unless the organization admin key may be presented.
 
     ADR-0016 Decision 3.4's per-activation key lifecycle cannot reset a cap,
     extend an expiry or revoke a key without this credential, so a control
-    plane that came up without it would discover that only when a vault's key
-    expired.  The verdict is a closed-vocabulary code on stderr and nothing
-    else: never the value, its length or a digest of it (#1930).
+    plane that came up without a usable one would discover that only when a
+    vault's key expired.  The verdict is a closed-vocabulary code on stderr
+    and nothing else: never the value, its length or a digest of it (#1930).
 
-    This runs after ``prepare_runtime_paths`` has narrowed the file to mode
-    0400 and before any privilege drop, so a refusal lands before the
-    long-running composition is imported.  The value is format-checked inside
+    Which verdicts are reachable *here* is narrower than the vocabulary, and
+    deliberately so:
+
+    * ``NOT_IN_USE`` whenever the Machine declares no admin key, which is the
+      default and today's only regime;
+    * ``MALFORMED``, ``UNDECLARED``, ``EXPIRED`` and ``NEAR_EXPIRY`` once a
+      key is declared in use;
+    * ``MISSING`` only when the declaration says in use and the file is gone
+      *after* ``prepare_runtime_paths`` listed it — an absent declared file is
+      normally caught first by ``_normalize_secret``'s generic exit 2, which
+      is a refusal either way;
+    * ``REJECTED`` **never** here: it is a runtime verdict from a vendor
+      response, and startup makes no vendor call.
+
+    The check runs after ``prepare_runtime_paths`` has narrowed the file to
+    mode 0400 — before that it would read a Fly-injected file as
+    ``MALFORMED`` — and before any privilege drop, so a refusal lands before
+    the long-running composition is imported.  The value is format-checked
+    inside
     :func:`~creek_mcp.provisioning.pool_admin_key.verify_pool_admin_key`'s own
     frame and is never returned here.
+
+    Nothing delivers this verdict to an operator yet: emission waits on
+    #1896's fleet-report pass and on adepthood's receiver admitting the kinds
+    (see the ``pool_admin_key`` module docstring).
 
     Raises:
         SystemExit: With the verdict's own exit code when the key is unusable.
@@ -156,7 +186,9 @@ def main() -> None:
     if any(os.environ.get(name) for name in _FLY_SECRET_NAMES):
         raise SystemExit("creek-fly-pilot: secret values must be injected as files")
     try:
-        prepare_runtime_paths()
+        prepare_runtime_paths(
+            secret_files=_SECRET_FILES + pool_admin_secret_files(os.environ)
+        )
         _require_custodied_pool_admin_key()
         drop_privileges_and_run(sys.argv[1:])
     except ContainerConfigurationError as exc:

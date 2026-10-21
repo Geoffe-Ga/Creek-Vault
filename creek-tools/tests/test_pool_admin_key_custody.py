@@ -3,17 +3,26 @@
 The admin key is the one credential that can create, re-cap and delete *every*
 activation's vendor key, so its custody is tested rather than trusted:
 
-* it is a **declared secret** alongside the control plane's others — one
-  ``[[files]]`` entry, one Fly secret name, one bootstrap-normalized path;
+* it is a **declared secret** whose registration is checked for *exact*
+  equality across all four places it must appear — the rendered ``[[files]]``
+  entry, the renderer's closed secret-name set, the bootstrap's normalized
+  file list and its environment-form refusal — because a secret registered in
+  three of four places is a latent production failure and drift protection is
+  the whole point of this surface;
 * every refusal carries a **content-free closed-vocabulary code** whose exit
   code is its own, distinct from ``--check pool``'s ``pool-unconfigured`` (30);
-* an unconfigured or malformed key **refuses**, never falls through to an
+* while the key is declared in use, a missing, malformed, undated or
+  **expired** key **refuses** — including through ``load_pool_admin_key``,
+  which is the only path to the value — and never falls through to an
   unauthenticated or default path;
+* while it is declared *not* in use, which is the default and today's only
+  regime, nothing is required and nothing refuses: declaring the custody path
+  must not make a pilot that has no key yet unbootable, because the only way
+  to boot it then would be to invent the placeholder credential this module
+  exists to refuse;
 * the key value reaches no log record, error body, alert row or file under the
-  test root — on success **and** on a simulated vendor 401 whose response body
-  echoes the credential back;
-* each failure mode raises its own alert kind, distinguishable from
-  ``pool_credential_orphan``.
+  test root. That sweep carries a **positive control**, so a sweep that could
+  no longer detect a leak fails instead of passing vacuously.
 
 Every value here is a synthetic canary. Nothing dials a vendor, nothing is
 provisioned and nothing bills (ADR-0016 Decision 4, "no spend").
@@ -35,26 +44,34 @@ import pytest
 
 from creek_mcp.container_health import _EXIT_CODES as _PROBE_EXIT_CODES
 from creek_mcp.container_health import ProbeStatus
+from creek_mcp.container_runtime import ContainerConfigurationError
 from creek_mcp.provisioning import pilot_bootstrap, pool_admin_key
 from creek_mcp.provisioning.budget import AlertKind
-from creek_mcp.provisioning.fly_pilot_config import render_fly_toml
+from creek_mcp.provisioning.fly_pilot_config import _SECRET_NAMES, render_fly_toml
 from creek_mcp.provisioning.pilot_alerts import HttpFleetAlertSink
 from creek_mcp.provisioning.pool_admin_key import (
+    POOL_ADMIN_KEY_EXPIRES_AT_ENV,
+    POOL_ADMIN_KEY_GUEST_PATH,
+    POOL_ADMIN_KEY_IN_USE,
+    POOL_ADMIN_KEY_IN_USE_ENV,
+    POOL_ADMIN_KEY_NOT_IN_USE,
+    POOL_ADMIN_KEY_RENEW_WITHIN,
+    POOL_ADMIN_KEY_SECRET_NAME,
+    PoolAdminKeyCheck,
     PoolAdminKeyError,
     PoolAdminKeyStatus,
     classify_admin_response,
     load_pool_admin_key,
+    pool_admin_key_in_use,
+    pool_admin_secret_files,
     verify_pool_admin_key,
-)
-from creek_mcp.provisioning.pool_bundle import (
-    POOL_ADMIN_KEY_EXPIRES_AT_ENV,
-    POOL_ADMIN_KEY_GUEST_PATH,
-    POOL_ADMIN_KEY_SECRET_NAME,
 )
 from tests.test_fly_pilot_deploy import _TEMPLATE, _coordinates
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
+
+    from creek_mcp.provisioning.fly_pilot_config import FlyPilotCoordinates
 
 # An obvious placeholder. It is well-formed on purpose: a canary that the
 # format check rejected would never reach the paths this module sweeps.
@@ -64,12 +81,12 @@ _NOW: Final[datetime] = datetime(2026, 10, 21, 12, tzinfo=UTC)
 _DISTANT: Final[str] = (_NOW + timedelta(days=90)).isoformat()
 _ALERT_URL: Final[str] = "https://adepthood.example/internal/vault-provisioning/alerts"
 
-_REFUSALS: Final[tuple[PoolAdminKeyStatus, ...]] = (
-    PoolAdminKeyStatus.MISSING,
-    PoolAdminKeyStatus.MALFORMED,
-    PoolAdminKeyStatus.REJECTED,
-    PoolAdminKeyStatus.EXPIRY_UNDECLARED,
-    PoolAdminKeyStatus.EXPIRED,
+_REFUSALS: Final[tuple[PoolAdminKeyStatus, ...]] = tuple(
+    status for status in PoolAdminKeyStatus if status.refused
+)
+_USABLE: Final[tuple[PoolAdminKeyStatus, ...]] = (
+    PoolAdminKeyStatus.READY,
+    PoolAdminKeyStatus.NEAR_EXPIRY,
 )
 
 
@@ -89,16 +106,24 @@ def _admin_key_file(tmp_path: Path, value: str = _CANARY) -> Path:
     return path
 
 
-def _environ(expires_at: str = _DISTANT) -> dict[str, str]:
+def _environ(
+    expires_at: str = _DISTANT,
+    *,
+    in_use: str | None = POOL_ADMIN_KEY_IN_USE,
+) -> dict[str, str]:
     """Return the declared, non-secret admin-key environment.
 
     Args:
         expires_at: The declared expiry, as the Machine env carries it.
+        in_use: The declared regime, or ``None`` to omit the declaration.
 
     Returns:
         The environment mapping.
     """
-    return {POOL_ADMIN_KEY_EXPIRES_AT_ENV: expires_at}
+    environ = {POOL_ADMIN_KEY_EXPIRES_AT_ENV: expires_at}
+    if in_use is not None:
+        environ[POOL_ADMIN_KEY_IN_USE_ENV] = in_use
+    return environ
 
 
 def _bearer(tmp_path: Path) -> Path:
@@ -116,39 +141,192 @@ def _bearer(tmp_path: Path) -> Path:
     return path
 
 
+def _sink(tmp_path: Path, requests: list[httpx.Request]) -> HttpFleetAlertSink:
+    """Return the real closed alert sink over a recording mock transport.
+
+    Args:
+        tmp_path: The test root, for the mounted bearer.
+        requests: The list each delivered request is appended to.
+
+    Returns:
+        The sink.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    return HttpFleetAlertSink(
+        _ALERT_URL,
+        _bearer(tmp_path),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _in_use_coordinates() -> FlyPilotCoordinates:
+    """Return coordinates in the admin-key-in-use regime.
+
+    Returns:
+        The coordinates, with a declared timezone-aware expiry.
+    """
+    return dataclasses.replace(
+        _coordinates(), pool_admin_key_expires_at="2026-12-28T12:00:00+00:00"
+    )
+
+
 # --------------------------------------------------------------------------
-# The storage half: a declared secret alongside the control plane's others.
+# Storage: exact-equality registration across all four places.
 # --------------------------------------------------------------------------
 
 
-def test_the_admin_key_is_declared_everywhere_the_other_secrets_are() -> None:
-    """One Fly secret name, one guest path, one bootstrap-normalized file."""
-    from creek_mcp.provisioning.fly_pilot_config import _SECRET_NAMES
+def test_the_environment_form_is_refused_in_every_regime() -> None:
+    """A secret value in an env var is always a startup refusal, in use or not.
 
-    assert POOL_ADMIN_KEY_SECRET_NAME in _SECRET_NAMES
-    assert POOL_ADMIN_KEY_SECRET_NAME in pilot_bootstrap._FLY_SECRET_NAMES
-    assert Path(POOL_ADMIN_KEY_GUEST_PATH) in pilot_bootstrap._SECRET_FILES
+    Exact equality, not membership: the env-refusal list must be the closed
+    secret-name set plus the admin key and nothing else, so a secret added to
+    one list and forgotten in the other fails here.
+    """
+    assert set(pilot_bootstrap._FLY_SECRET_NAMES) == (
+        set(_SECRET_NAMES) | {POOL_ADMIN_KEY_SECRET_NAME}
+    )
+    assert len(pilot_bootstrap._FLY_SECRET_NAMES) == len(
+        set(pilot_bootstrap._FLY_SECRET_NAMES)
+    )
 
 
-def test_the_rendered_config_mounts_the_admin_key_and_declares_its_expiry() -> None:
-    """The renderer gives the credential a declared home, not an ad hoc one."""
-    document = tomllib.loads(render_fly_toml(_TEMPLATE, _coordinates()))
+def test_the_always_present_files_exactly_match_the_closed_secret_names() -> None:
+    """The bootstrap's unconditional list is the seven, and only the seven."""
+    assert POOL_ADMIN_KEY_SECRET_NAME not in _SECRET_NAMES
+    assert Path(POOL_ADMIN_KEY_GUEST_PATH) not in pilot_bootstrap._SECRET_FILES
+    assert len(pilot_bootstrap._SECRET_FILES) == len(_SECRET_NAMES)
 
-    files = {item["guest_path"]: item["secret_name"] for item in document["files"]}
-    assert files[POOL_ADMIN_KEY_GUEST_PATH] == POOL_ADMIN_KEY_SECRET_NAME
-    assert document["env"][POOL_ADMIN_KEY_EXPIRES_AT_ENV]
-    assert _CANARY not in render_fly_toml(_TEMPLATE, _coordinates())
+
+@pytest.mark.parametrize("declared", [None, POOL_ADMIN_KEY_NOT_IN_USE, "", "   "])
+def test_nothing_is_required_while_no_admin_key_is_declared_in_use(
+    declared: str | None,
+) -> None:
+    """The default regime: no file to normalize, and no refusal."""
+    environ = {} if declared is None else {POOL_ADMIN_KEY_IN_USE_ENV: declared}
+
+    assert pool_admin_key_in_use(environ) is False
+    assert pool_admin_secret_files(environ) == ()
+
+
+def test_the_admin_key_file_is_normalized_only_while_it_is_in_use() -> None:
+    """In use, the bootstrap normalizes exactly one extra declared file."""
+    assert pool_admin_secret_files(_environ()) == (Path(POOL_ADMIN_KEY_GUEST_PATH),)
+
+
+@pytest.mark.parametrize(
+    ("coordinates", "expected_names"),
+    [
+        (_coordinates(), set(_SECRET_NAMES)),
+        (_in_use_coordinates(), set(_SECRET_NAMES) | {POOL_ADMIN_KEY_SECRET_NAME}),
+    ],
+    ids=["not-in-use", "in-use"],
+)
+def test_the_rendered_files_exactly_match_the_regime(
+    coordinates: FlyPilotCoordinates,
+    expected_names: set[str],
+) -> None:
+    """Exact set equality in both regimes, plus guest-path agreement.
+
+    This is the drift gate that matters: the rendered ``[[files]]`` entries,
+    the renderer's expected secret-name set and the bootstrap's normalized
+    path list must all name the same files, so a secret declared in one and
+    forgotten in another cannot ship.
+    """
+    document = tomllib.loads(render_fly_toml(_TEMPLATE, coordinates))
+
+    rendered = {item["secret_name"] for item in document["files"]}
+    assert rendered == expected_names
+    assert len(document["files"]) == len(expected_names)
+    assert all(set(item) == {"guest_path", "secret_name"} for item in document["files"])
+
+    environ = (
+        _environ()
+        if coordinates.pool_admin_key_expires_at is not None
+        else {POOL_ADMIN_KEY_IN_USE_ENV: POOL_ADMIN_KEY_NOT_IN_USE}
+    )
+    expected_paths = set(pilot_bootstrap._SECRET_FILES) | set(
+        pool_admin_secret_files(environ)
+    )
+    assert {Path(item["guest_path"]) for item in document["files"]} == expected_paths
+
+
+def test_the_rendered_config_declares_the_regime_in_its_environment() -> None:
+    """The Machine's own config says which regime it is in; nothing is inferred."""
+    absent = tomllib.loads(render_fly_toml(_TEMPLATE, _coordinates()))["env"]
+    present = tomllib.loads(render_fly_toml(_TEMPLATE, _in_use_coordinates()))["env"]
+
+    assert absent[POOL_ADMIN_KEY_IN_USE_ENV] == POOL_ADMIN_KEY_NOT_IN_USE
+    assert absent[POOL_ADMIN_KEY_EXPIRES_AT_ENV] == ""
+    assert present[POOL_ADMIN_KEY_IN_USE_ENV] == POOL_ADMIN_KEY_IN_USE
+    assert present[POOL_ADMIN_KEY_EXPIRES_AT_ENV] == (
+        _in_use_coordinates().pool_admin_key_expires_at
+    )
+
+
+def test_no_key_material_is_rendered_in_either_regime() -> None:
+    """The config names secrets; it never carries one."""
+    for coordinates in (_coordinates(), _in_use_coordinates()):
+        rendered = render_fly_toml(_TEMPLATE, coordinates)
+        assert _CANARY not in rendered
+        assert "B64=" not in rendered
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda text: text.replace("CREEK_FLEET_POLICY_B64", "CREEK_INVENTED_B64"),
+            id="renamed-secret",
+        ),
+        pytest.param(
+            lambda text: (
+                text
+                + '\n[[files]]\n  guest_path = "/run/secrets/creek_extra"\n'
+                + '  {{FILE_REFERENCE_KEY}} = "CREEK_EXTRA_B64"\n'
+            ),
+            id="extra-secret",
+        ),
+        pytest.param(
+            lambda text: (
+                text
+                + '\n[[files]]\n  guest_path = "/run/secrets/creek_pool_admin_key"\n'
+                + '  {{FILE_REFERENCE_KEY}} = "CREEK_POOL_ADMIN_KEY_B64"\n'
+            ),
+            id="admin-key-while-not-in-use",
+        ),
+    ],
+)
+def test_the_renderer_refuses_a_drifted_secret_contract(
+    tmp_path: Path,
+    mutate: Callable[[str], str],
+) -> None:
+    """The set-equality check is enforced, not decorative.
+
+    Nothing else in the suite mutates the template, so without this the
+    renderer's one real drift defence is never exercised — including the case
+    that matters most here: the admin key declared while the config says no
+    admin key is in use.
+    """
+    drifted = tmp_path / "fly.toml.template"
+    drifted.write_text(mutate(_TEMPLATE.read_text(encoding="utf-8")), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="drifted from reviewed policy"):
+        render_fly_toml(drifted, _coordinates())
 
 
 # --------------------------------------------------------------------------
-# The verification half: fail closed with a content-free code.
+# Verification: fail closed with a content-free code.
 # --------------------------------------------------------------------------
 
 
 def test_a_well_formed_key_with_a_distant_expiry_verifies_ready(
     tmp_path: Path,
 ) -> None:
-    """The one passing shape: present, owner-only, well-formed, in date."""
+    """The one passing shape: in use, present, owner-only, well-formed, in date."""
     check = verify_pool_admin_key(
         _admin_key_file(tmp_path), environ=_environ(), now=_NOW
     )
@@ -159,10 +337,44 @@ def test_a_well_formed_key_with_a_distant_expiry_verifies_ready(
     assert check.alert() is None
 
 
+def test_a_key_declared_not_in_use_verifies_without_touching_the_file(
+    tmp_path: Path,
+) -> None:
+    """Today's regime: nothing to custody, so nothing refuses and nothing alerts."""
+    check = verify_pool_admin_key(
+        tmp_path / "absent",
+        environ={POOL_ADMIN_KEY_IN_USE_ENV: POOL_ADMIN_KEY_NOT_IN_USE},
+        now=_NOW,
+    )
+
+    assert check.status is PoolAdminKeyStatus.NOT_IN_USE
+    assert check.exit_code == 0
+    assert check.refused is False
+    assert check.alert() is None
+
+
+@pytest.mark.parametrize("declared", ["2", "true", "yes", "01", "0x1", "no"])
+def test_a_garbled_in_use_declaration_refuses(
+    tmp_path: Path,
+    declared: str,
+) -> None:
+    """The regime flag is a closed two-value vocabulary, not a truthiness test."""
+    assert pool_admin_key_in_use({POOL_ADMIN_KEY_IN_USE_ENV: declared}) is None
+
+    check = verify_pool_admin_key(
+        _admin_key_file(tmp_path),
+        environ=_environ(in_use=declared),
+        now=_NOW,
+    )
+
+    assert check.status is PoolAdminKeyStatus.UNDECLARED
+    assert check.refused is True
+
+
 def test_a_missing_key_refuses_with_a_code_that_is_not_pool_unconfigured(
     tmp_path: Path,
 ) -> None:
-    """An absent credential refuses; it never reads as "no pool configured"."""
+    """An absent in-use credential refuses; it never reads as "no pool"."""
     check = verify_pool_admin_key(tmp_path / "absent", environ=_environ(), now=_NOW)
 
     assert check.status is PoolAdminKeyStatus.MISSING
@@ -221,92 +433,182 @@ def test_an_undeclared_or_naive_expiry_refuses(
         _admin_key_file(tmp_path), environ=_environ(declared), now=_NOW
     )
 
-    assert check.status is PoolAdminKeyStatus.EXPIRY_UNDECLARED
+    assert check.status is PoolAdminKeyStatus.UNDECLARED
     assert check.refused is True
 
 
-def test_an_absent_expiry_declaration_refuses(tmp_path: Path) -> None:
+def test_an_absent_expiry_declaration_refuses_while_in_use(tmp_path: Path) -> None:
     """No declaration at all is the same refusal as an unusable one."""
-    check = verify_pool_admin_key(_admin_key_file(tmp_path), environ={}, now=_NOW)
-
-    assert check.status is PoolAdminKeyStatus.EXPIRY_UNDECLARED
-
-
-def test_an_expired_declaration_refuses(tmp_path: Path) -> None:
-    """An expired admin key cannot reset a cap; refusing is the fail-closed act."""
-    expired = (_NOW - timedelta(seconds=1)).isoformat()
-
     check = verify_pool_admin_key(
-        _admin_key_file(tmp_path), environ=_environ(expired), now=_NOW
+        _admin_key_file(tmp_path),
+        environ={POOL_ADMIN_KEY_IN_USE_ENV: POOL_ADMIN_KEY_IN_USE},
+        now=_NOW,
     )
 
-    assert check.status is PoolAdminKeyStatus.EXPIRED
-    assert check.refused is True
+    assert check.status is PoolAdminKeyStatus.UNDECLARED
 
 
-def test_a_key_inside_the_renewal_window_alerts_without_refusing(
+@pytest.mark.parametrize(
+    ("offset", "status", "remaining"),
+    [
+        pytest.param(timedelta(0), PoolAdminKeyStatus.EXPIRED, None, id="exactly-now"),
+        pytest.param(
+            timedelta(seconds=-1), PoolAdminKeyStatus.EXPIRED, None, id="one-second-ago"
+        ),
+        pytest.param(
+            timedelta(seconds=1),
+            PoolAdminKeyStatus.NEAR_EXPIRY,
+            1,
+            id="one-second-left",
+        ),
+        pytest.param(
+            POOL_ADMIN_KEY_RENEW_WITHIN,
+            PoolAdminKeyStatus.NEAR_EXPIRY,
+            int(POOL_ADMIN_KEY_RENEW_WITHIN.total_seconds()),
+            id="exactly-the-window",
+        ),
+        pytest.param(
+            POOL_ADMIN_KEY_RENEW_WITHIN + timedelta(seconds=1),
+            PoolAdminKeyStatus.READY,
+            None,
+            id="one-second-outside-the-window",
+        ),
+    ],
+)
+def test_the_expiry_window_is_inclusive_at_both_of_its_edges(
     tmp_path: Path,
+    offset: timedelta,
+    status: PoolAdminKeyStatus,
+    remaining: int | None,
 ) -> None:
-    """Near expiry the key still works, so it alerts rather than refusing."""
+    """The boundaries, not just the middle: ``<= 0`` expired, ``<= window`` near."""
+    check = verify_pool_admin_key(
+        _admin_key_file(tmp_path),
+        environ=_environ((_NOW + offset).isoformat()),
+        now=_NOW,
+    )
+
+    assert check.status is status
+    assert check.remaining_seconds == remaining
+
+
+def test_a_near_expiry_alert_carries_only_counts(tmp_path: Path) -> None:
+    """The measured and threshold cells are second counts, not key material."""
     soon = (_NOW + timedelta(days=3)).isoformat()
 
     check = verify_pool_admin_key(
         _admin_key_file(tmp_path), environ=_environ(soon), now=_NOW
     )
+    alert = check.alert()
 
     assert check.status is PoolAdminKeyStatus.NEAR_EXPIRY
     assert check.refused is False
-    alert = check.alert()
     assert alert is not None
     assert alert.kind is AlertKind.POOL_ADMIN_KEY_NEAR_EXPIRY
+    assert alert.subject == "fleet"
+    assert alert.age_seconds is None
+    assert alert.measured == str(int(timedelta(days=3).total_seconds()))
+    assert alert.threshold == str(int(POOL_ADMIN_KEY_RENEW_WITHIN.total_seconds()))
 
 
-def test_every_status_carries_its_own_exit_code_and_none_collides_with_a_probe(
-    tmp_path: Path,
-) -> None:
+def test_the_documented_renewal_window_is_the_constant_the_code_uses() -> None:
+    """The 15 days the runbook quotes is this constant, not a second copy."""
+    assert timedelta(days=15) == POOL_ADMIN_KEY_RENEW_WITHIN
+
+
+def test_every_refusal_has_its_own_code_and_none_collides_with_a_probe() -> None:
     """Codes are a closed vocabulary the operator can act on unambiguously."""
-    del tmp_path
-    codes = {status: status.exit_code for status in PoolAdminKeyStatus}
+    refusing = {status: status.exit_code for status in _REFUSALS}
+    proceeding = {
+        status.exit_code for status in PoolAdminKeyStatus if not status.refused
+    }
 
-    assert len(set(codes.values())) == len(codes)
-    assert codes[PoolAdminKeyStatus.READY] == 0
-    assert set(codes.values()) & set(_PROBE_EXIT_CODES.values()) == {0}
+    assert len(set(refusing.values())) == len(refusing)
+    assert proceeding == {0}
+    assert 0 not in set(refusing.values())
+    assert set(refusing.values()) & set(_PROBE_EXIT_CODES.values()) == set()
 
 
 # --------------------------------------------------------------------------
-# The loader fails closed; it never returns a default.
+# The loader fails closed; it never returns a default, and never an expired key.
 # --------------------------------------------------------------------------
 
 
-def test_the_loader_returns_the_value_only_for_a_custodied_file(
+def test_the_loader_returns_the_value_only_for_a_custodied_in_date_key(
     tmp_path: Path,
 ) -> None:
-    """The one way to the value, and the only shape it accepts."""
-    assert load_pool_admin_key(_admin_key_file(tmp_path)) == _CANARY
+    """The one way to the value, and the only shapes it accepts."""
+    path = _admin_key_file(tmp_path)
+
+    assert load_pool_admin_key(path, environ=_environ(), now=_NOW) == _CANARY
+    # Near expiry the key still works, so the loader must still hand it over:
+    # refusing here would brick the control plane 15 days early.
+    soon = (_NOW + timedelta(days=3)).isoformat()
+    assert load_pool_admin_key(path, environ=_environ(soon), now=_NOW) == _CANARY
 
 
 @pytest.mark.parametrize(
-    ("factory", "status"),
+    ("factory", "environ", "status"),
     [
-        (lambda root: root / "absent", PoolAdminKeyStatus.MISSING),
-        (lambda root: _admin_key_file(root, "short"), PoolAdminKeyStatus.MALFORMED),
+        pytest.param(
+            lambda root: root / "absent",
+            _environ(),
+            PoolAdminKeyStatus.MISSING,
+            id="missing",
+        ),
+        pytest.param(
+            lambda root: _admin_key_file(root, "short"),
+            _environ(),
+            PoolAdminKeyStatus.MALFORMED,
+            id="malformed",
+        ),
+        pytest.param(
+            _admin_key_file,
+            _environ((_NOW - timedelta(days=1)).isoformat()),
+            PoolAdminKeyStatus.EXPIRED,
+            id="expired",
+        ),
+        pytest.param(
+            _admin_key_file,
+            _environ("not-a-date"),
+            PoolAdminKeyStatus.UNDECLARED,
+            id="undeclared-expiry",
+        ),
+        pytest.param(
+            _admin_key_file,
+            {POOL_ADMIN_KEY_IN_USE_ENV: POOL_ADMIN_KEY_NOT_IN_USE},
+            PoolAdminKeyStatus.NOT_IN_USE,
+            id="not-in-use",
+        ),
     ],
 )
 def test_the_loader_refuses_rather_than_falling_through_to_a_default(
     tmp_path: Path,
-    factory: object,
+    factory: Callable[[Path], Path],
+    environ: Mapping[str, str],
     status: PoolAdminKeyStatus,
 ) -> None:
-    """No unconfigured path yields an empty, placeholder or ambient credential."""
-    assert callable(factory)
-    path = factory(tmp_path)
+    """No path yields an empty, placeholder, ambient or **expired** credential.
 
+    The expired and undeclared rows are the point: a loader that enforced only
+    presence and format would hand a #1896 caller a credential the vendor has
+    already stopped honouring, which is a fail-open wearing a check's clothes.
+    """
     with pytest.raises(PoolAdminKeyError) as caught:
-        load_pool_admin_key(path)
+        load_pool_admin_key(factory(tmp_path), environ=environ, now=_NOW)
 
     assert caught.value.status is status
     assert str(caught.value) == status.value
     assert caught.value.exit_code == status.exit_code
+
+
+def test_the_loader_accepts_exactly_the_statuses_that_may_be_presented() -> None:
+    """Enumerated, so a new status cannot default into being presentable."""
+    assert set(pool_admin_key._USABLE) == set(_USABLE)
+    assert set(_USABLE) & set(_REFUSALS) == set()
+    assert set(_USABLE) | set(_REFUSALS) | {PoolAdminKeyStatus.NOT_IN_USE} == set(
+        PoolAdminKeyStatus
+    )
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +617,14 @@ def test_the_loader_refuses_rather_than_falling_through_to_a_default(
 
 
 def test_a_vendor_401_classifies_from_the_status_code_alone() -> None:
-    """``_pool_status_error``'s "no body is read" discipline, for the admin key."""
+    """Signature-enforced, not swept: there is no parameter a body fits in.
+
+    This is a structural claim, deliberately not a leak sweep. A sweep over a
+    response object this function was never given would hold trivially; what
+    actually excludes the body is that ``classify_admin_response`` accepts one
+    ``int`` and nothing else, which is asserted here against the resolved
+    annotations rather than the source text.
+    """
     signature = inspect.signature(classify_admin_response)
 
     assert list(signature.parameters) == ["status_code"]
@@ -328,57 +637,82 @@ def test_a_vendor_401_classifies_from_the_status_code_alone() -> None:
     assert classify_admin_response(403) is not None
     assert classify_admin_response(200) is None
     assert classify_admin_response(500) is None
+    assert classify_admin_response(429) is None
 
 
 # --------------------------------------------------------------------------
-# The canary sweep: success and the hostile 401.
+# The canary sweep, with a positive control.
 # --------------------------------------------------------------------------
 
 
-def _sweep_files(root: Path, *, secret_file: Path) -> list[str]:
-    """Return every file under *root* except the custodied secret itself.
+def _sweep_files(root: Path, *, allowed: Path | None) -> list[str]:
+    """Return the contents of every file under *root* except *allowed*.
 
     Args:
         root: The test root to sweep.
-        secret_file: The one file allowed to hold the canary.
+        allowed: The one file permitted to hold the canary, or ``None`` to
+            sweep every file including the custodied secret.
 
     Returns:
-        The decoded contents of every other file.
+        The decoded contents of each swept file.
     """
     return [
         path.read_bytes().decode("utf-8", "replace")
         for path in root.rglob("*")
-        if path.is_file() and path != secret_file
+        if path.is_file() and path != allowed
     ]
+
+
+def test_the_sweep_can_detect_a_leak_at_all(tmp_path: Path) -> None:
+    """Positive control for the sweep below.
+
+    Without this, a sweep that silently stopped looking at anything would pass
+    forever. Pointed at the custodied secret itself, the same helper must find
+    the canary.
+    """
+    secret_file = _admin_key_file(tmp_path)
+
+    assert any(_CANARY in text for text in _sweep_files(tmp_path, allowed=None))
+    assert all(
+        _CANARY not in text for text in _sweep_files(tmp_path, allowed=secret_file)
+    )
 
 
 def test_the_canary_reaches_no_log_error_alert_row_or_file(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC1: on success and on a vendor 401 that echoes the key back."""
+    """AC1, over every path that actually handles the value.
+
+    The sweep covers the functions that touch the credential —
+    ``verify_pool_admin_key``, which reads and format-checks it;
+    ``load_pool_admin_key``, which *returns* it; the refusal path's error; and
+    the whole startup sequence through ``pilot_bootstrap.main`` with the real
+    verification against a real canary file — rather than objects built after
+    the value was already dropped.
+    """
     caplog.set_level(logging.DEBUG)
     secret_file = _admin_key_file(tmp_path)
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(204)
-
-    sink = HttpFleetAlertSink(
-        _ALERT_URL,
-        _bearer(tmp_path),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    monkeypatch.setenv(POOL_ADMIN_KEY_IN_USE_ENV, POOL_ADMIN_KEY_IN_USE)
+    monkeypatch.setenv(POOL_ADMIN_KEY_EXPIRES_AT_ENV, _DISTANT)
+    monkeypatch.setattr(pilot_bootstrap, "POOL_ADMIN_KEY_GUEST_PATH", str(secret_file))
+    monkeypatch.setattr(pilot_bootstrap.sys, "argv", ["pilot"])
+    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", lambda **_kw: None)
+    monkeypatch.setattr(pilot_bootstrap, "drop_privileges_and_run", lambda _argv: None)
 
     ready = verify_pool_admin_key(secret_file, environ=_environ(), now=_NOW)
-    # A hostile vendor echoing the credential into its own 401 body. The
-    # classifier is handed the status line only, so the body has nowhere to go.
-    hostile = httpx.Response(401, text=f'{{"error":"invalid key {_CANARY}"}}')
-    rejected = classify_admin_response(hostile.status_code)
-    assert rejected is not None
-    alert = rejected.alert()
+    loaded = load_pool_admin_key(secret_file, environ=_environ(), now=_NOW)
+    expired_environ = _environ((_NOW - timedelta(days=1)).isoformat())
+    with pytest.raises(PoolAdminKeyError) as refusal:
+        load_pool_admin_key(secret_file, environ=expired_environ, now=_NOW)
+    # The real startup sequence, with the real verification, over the real file.
+    pilot_bootstrap.main()
+
+    requests: list[httpx.Request] = []
+    sink = _sink(tmp_path, requests)
+    alert = PoolAdminKeyCheck(PoolAdminKeyStatus.REJECTED).alert()
     assert alert is not None
     sink.deliver([alert.kind.value])
     sink.close()
@@ -390,61 +724,39 @@ def test_the_canary_reaches_no_log_error_alert_row_or_file(
         captured.err,
         repr(ready),
         str(ready),
-        repr(rejected),
+        repr(refusal.value),
+        str(refusal.value),
         repr(alert),
         json.dumps(dataclasses.asdict(alert), sort_keys=True, default=str),
         *(request.content.decode() for request in requests),
-        *_sweep_files(tmp_path, secret_file=secret_file),
+        *_sweep_files(tmp_path, allowed=secret_file),
     ]
     for haystack in haystacks:
         assert _CANARY not in haystack
 
-    assert requests
-    assert json.loads(requests[-1].content) == {
-        "schema": "creek_fleet_alert_v1",
-        "counts": {AlertKind.POOL_ADMIN_KEY_REJECTED.value: 1},
-    }
-
-
-def test_a_refusal_error_carries_only_its_closed_vocabulary_code(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A malformed key's traceback must not become the leak the file was not."""
-    caplog.set_level(logging.DEBUG)
-    bad = _CANARY + "\nsecond-line-pool-admin-key-canary"
-    path = _admin_key_file(tmp_path, bad)
-
-    with pytest.raises(PoolAdminKeyError) as caught:
-        load_pool_admin_key(path)
-
-    for haystack in (str(caught.value), repr(caught.value), caplog.text):
-        assert _CANARY not in haystack
+    # The sweep is only meaningful because the value really was in play.
+    assert loaded == _CANARY
+    assert ready.status is PoolAdminKeyStatus.READY
+    assert captured.err == (
+        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.READY.value}\n"
+    )
+    assert json.loads(requests[-1].content)["counts"] == {alert.kind.value: 1}
 
 
 # --------------------------------------------------------------------------
-# The alert half: one kind per failure mode, all distinct from the orphan.
+# The alert half: registered, mapped, and not yet emitted.
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("status", _REFUSALS)
-def test_every_refusal_fires_its_own_closed_alert_kind(
+def test_every_refusal_maps_to_a_closed_alert_kind_the_sink_accepts(
     tmp_path: Path,
     status: PoolAdminKeyStatus,
 ) -> None:
     """AC5: hermetic, no vendor call, one delivered count per failure mode."""
     requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(204)
-
-    sink = HttpFleetAlertSink(
-        _ALERT_URL,
-        _bearer(tmp_path),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-    alert = pool_admin_key.PoolAdminKeyCheck(status).alert()
+    sink = _sink(tmp_path, requests)
+    alert = PoolAdminKeyCheck(status).alert()
     assert alert is not None
 
     sink.deliver([alert.kind.value])
@@ -467,14 +779,32 @@ def test_the_admin_key_kinds_are_distinct_from_the_pool_credential_orphan() -> N
 
 
 def test_every_status_maps_into_the_closed_alert_vocabulary() -> None:
-    """No failure mode is silently unalerted, and READY raises nothing."""
+    """No failure mode is silently unalerted, and the usable ones raise nothing."""
     for status in PoolAdminKeyStatus:
-        alert = pool_admin_key.PoolAdminKeyCheck(status).alert()
-        if status is PoolAdminKeyStatus.READY:
+        alert = PoolAdminKeyCheck(status).alert()
+        if status in {PoolAdminKeyStatus.READY, PoolAdminKeyStatus.NOT_IN_USE}:
             assert alert is None
         else:
             assert alert is not None
             assert alert.kind in set(AlertKind)
+
+
+def test_no_production_path_emits_an_admin_key_alert_yet() -> None:
+    """Pin the honest state of the alerting half, so the docs cannot drift.
+
+    The kinds are registered because the custody vocabulary needs them, but
+    emission belongs to #1896's fleet-report pass and additionally needs
+    adepthood's receiver to admit them. The startup path deliberately prints a
+    code and builds no ``Alert``; if that changes, this fails and the "recorded,
+    not delivered" wording in the runbook and the module docstring must change
+    with it.
+    """
+    source = Path(pilot_bootstrap.__file__).read_text(encoding="utf-8")
+
+    assert ".alert()" not in source
+    assert "HttpFleetAlertSink" not in source
+    assert "recorded" in (pool_admin_key.__doc__ or "")
+    assert "not yet emitted" in (pool_admin_key.__doc__ or "")
 
 
 # --------------------------------------------------------------------------
@@ -492,8 +822,160 @@ def test_the_module_docstring_states_why_a_hash_or_handle_cannot_serve() -> None
 
 
 # --------------------------------------------------------------------------
-# Startup: the control plane refuses to come up without a custodied key.
+# Startup: ordering, and the real file.
 # --------------------------------------------------------------------------
+
+
+def test_startup_normalizes_the_files_before_it_verifies_custody(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The order is load-bearing, so it is recorded rather than assumed.
+
+    ``read_owner_only_file`` refuses anything not already mode 0400, so
+    verifying before ``prepare_runtime_paths`` would read every Fly-injected
+    file as ``MALFORMED``. Without this test, swapping the two calls passes.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(pilot_bootstrap.sys, "argv", ["pilot"])
+    monkeypatch.setattr(
+        pilot_bootstrap,
+        "prepare_runtime_paths",
+        lambda **_kw: calls.append("prepare"),
+    )
+    monkeypatch.setattr(
+        pilot_bootstrap,
+        "verify_pool_admin_key",
+        lambda *_a, **_kw: (
+            calls.append("verify") or PoolAdminKeyCheck(PoolAdminKeyStatus.NOT_IN_USE)
+        ),
+    )
+    monkeypatch.setattr(
+        pilot_bootstrap, "drop_privileges_and_run", lambda _argv: calls.append("drop")
+    )
+
+    pilot_bootstrap.main()
+
+    assert calls == ["prepare", "verify", "drop"]
+
+
+def test_startup_lists_the_admin_key_for_normalization_only_when_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The conditional file list reaches ``prepare_runtime_paths`` as declared."""
+    listed: list[tuple[Path, ...]] = []
+    monkeypatch.setattr(pilot_bootstrap.sys, "argv", ["pilot"])
+    monkeypatch.setattr(
+        pilot_bootstrap,
+        "prepare_runtime_paths",
+        lambda *, secret_files: listed.append(secret_files),
+    )
+    monkeypatch.setattr(
+        pilot_bootstrap,
+        "verify_pool_admin_key",
+        lambda *_a, **_kw: PoolAdminKeyCheck(PoolAdminKeyStatus.NOT_IN_USE),
+    )
+    monkeypatch.setattr(pilot_bootstrap, "drop_privileges_and_run", lambda _argv: None)
+
+    monkeypatch.delenv(POOL_ADMIN_KEY_IN_USE_ENV, raising=False)
+    pilot_bootstrap.main()
+    monkeypatch.setenv(POOL_ADMIN_KEY_IN_USE_ENV, POOL_ADMIN_KEY_IN_USE)
+    pilot_bootstrap.main()
+
+    assert listed[0] == pilot_bootstrap._SECRET_FILES
+    assert listed[1] == (
+        *pilot_bootstrap._SECRET_FILES,
+        Path(POOL_ADMIN_KEY_GUEST_PATH),
+    )
+
+
+def test_an_absent_declared_admin_key_is_refused_by_the_real_normalizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reachable startup refusal for an absent in-use key is exit 2.
+
+    ``prepare_runtime_paths`` runs first and ``_normalize_secret`` raises on
+    any listed file it cannot open, so an absent *declared* admin key is
+    refused there with the generic content-free code rather than reaching
+    ``MISSING`` (40). Both are refusals; the runbook says which is which.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        f"41 32 0:35 / {state} rw,nosuid - ext4 /dev/vault rw\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(pilot_bootstrap.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(pilot_bootstrap.os, "chown", lambda *_a, **_kw: None)
+
+    with pytest.raises(ContainerConfigurationError, match="unavailable"):
+        pilot_bootstrap.prepare_runtime_paths(
+            state_root=state,
+            mountinfo=mountinfo,
+            secret_files=(tmp_path / "absent-admin-key",),
+            uid=10001,
+            gid=10001,
+        )
+
+
+def test_startup_refuses_a_real_malformed_admin_key_with_its_own_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``main()`` against a real file, with the real verification, not a stub.
+
+    Only ``prepare_runtime_paths`` is stubbed — it needs root and the real
+    ``/data`` mount — so the verdict here is produced by the production
+    classifier reading the production path.
+    """
+    malformed = _admin_key_file(tmp_path, "short")
+    monkeypatch.setenv(POOL_ADMIN_KEY_IN_USE_ENV, POOL_ADMIN_KEY_IN_USE)
+    monkeypatch.setenv(POOL_ADMIN_KEY_EXPIRES_AT_ENV, _DISTANT)
+    monkeypatch.setattr(pilot_bootstrap, "POOL_ADMIN_KEY_GUEST_PATH", str(malformed))
+    monkeypatch.setattr(pilot_bootstrap.sys, "argv", ["pilot"])
+    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", lambda **_kw: None)
+    started: list[object] = []
+    monkeypatch.setattr(
+        pilot_bootstrap, "drop_privileges_and_run", lambda argv: started.append(argv)
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        pilot_bootstrap.main()
+
+    assert caught.value.code == PoolAdminKeyStatus.MALFORMED.exit_code
+    assert started == []
+    assert capsys.readouterr().err == (
+        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.MALFORMED.value}\n"
+    )
+
+
+def test_startup_refuses_a_real_missing_admin_key_with_its_own_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``MISSING`` (40) is reachable through ``main()`` when the file vanishes.
+
+    This is the window ``_normalize_secret`` does not cover: the declaration
+    says in use and the file is gone by the time custody is verified.
+    """
+    monkeypatch.setenv(POOL_ADMIN_KEY_IN_USE_ENV, POOL_ADMIN_KEY_IN_USE)
+    monkeypatch.setenv(POOL_ADMIN_KEY_EXPIRES_AT_ENV, _DISTANT)
+    monkeypatch.setattr(
+        pilot_bootstrap, "POOL_ADMIN_KEY_GUEST_PATH", str(tmp_path / "vanished")
+    )
+    monkeypatch.setattr(pilot_bootstrap.sys, "argv", ["pilot"])
+    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", lambda **_kw: None)
+    monkeypatch.setattr(pilot_bootstrap, "drop_privileges_and_run", lambda _argv: None)
+
+    with pytest.raises(SystemExit) as caught:
+        pilot_bootstrap.main()
+
+    assert caught.value.code == PoolAdminKeyStatus.MISSING.exit_code
+    assert capsys.readouterr().err == (
+        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.MISSING.value}\n"
+    )
 
 
 def test_bootstrap_refuses_the_admin_key_as_an_environment_value(
@@ -501,70 +983,10 @@ def test_bootstrap_refuses_the_admin_key_as_an_environment_value(
 ) -> None:
     """The admin key is a file, exactly like the control plane's other secrets."""
     monkeypatch.setenv(POOL_ADMIN_KEY_SECRET_NAME, "synthetic-secret")
-    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", lambda: None)
+    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", lambda **_kw: None)
 
     with pytest.raises(SystemExit, match="secret values"):
         pilot_bootstrap.main()
-
-
-def test_bootstrap_refuses_startup_with_a_content_free_code(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """An unusable admin key stops the control plane before it serves."""
-    started: list[object] = []
-    monkeypatch.setattr(pilot_bootstrap.sys, "argv", ["pilot"])
-    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", lambda: None)
-    monkeypatch.setattr(
-        pilot_bootstrap,
-        "drop_privileges_and_run",
-        lambda argv: started.append(argv),
-    )
-    monkeypatch.setattr(
-        pilot_bootstrap,
-        "verify_pool_admin_key",
-        lambda *_args, **_kwargs: pool_admin_key.PoolAdminKeyCheck(
-            PoolAdminKeyStatus.MISSING
-        ),
-    )
-
-    with pytest.raises(SystemExit) as caught:
-        pilot_bootstrap.main()
-
-    assert caught.value.code == PoolAdminKeyStatus.MISSING.exit_code
-    assert started == []
-    assert capsys.readouterr().err == (
-        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.MISSING.value}\n"
-    )
-
-
-def test_bootstrap_starts_and_reports_the_ready_code(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The outcome is legible either way: one closed code on stderr."""
-    started: list[object] = []
-    monkeypatch.setattr(pilot_bootstrap.sys, "argv", ["pilot", "--flag"])
-    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", lambda: None)
-    monkeypatch.setattr(
-        pilot_bootstrap,
-        "drop_privileges_and_run",
-        lambda argv: started.append(argv),
-    )
-    monkeypatch.setattr(
-        pilot_bootstrap,
-        "verify_pool_admin_key",
-        lambda *_args, **_kwargs: pool_admin_key.PoolAdminKeyCheck(
-            PoolAdminKeyStatus.READY
-        ),
-    )
-
-    pilot_bootstrap.main()
-
-    assert started == [["--flag"]]
-    assert capsys.readouterr().err == (
-        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.READY.value}\n"
-    )
 
 
 def test_the_verification_environment_is_injected_not_ambient(

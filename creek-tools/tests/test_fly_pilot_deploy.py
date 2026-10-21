@@ -40,7 +40,8 @@ def _coordinates() -> FlyPilotCoordinates:
         handoff_url="https://adepthood.example/control/v1/handoff",
         alert_url="https://adepthood.example/internal/vault-provisioning/alerts",
         volume="creek_control_state",
-        pool_admin_key_expires_at="2026-12-28T12:00:00+00:00",
+        # Left at its default: no admin key is in use yet (#1930), which is
+        # the regime a pilot rendered today is actually in.
     )
 
 
@@ -399,7 +400,7 @@ def test_rendered_config_has_one_machine_volume_and_secret_contract() -> None:
     ]
     assert document["restart"] == [{"policy": "on-failure", "retries": 3}]
     assert "processes" not in document
-    assert len(document["files"]) == 8
+    assert len(document["files"]) == 7
     assert all(set(item) == {"guest_path", "secret_name"} for item in document["files"])
     assert "{{" not in rendered
     assert "provider-token" not in rendered
@@ -435,7 +436,6 @@ def test_renderer_refuses_mutable_or_injectable_coordinates(
         "handoff_url": "https://adepthood.example/callback",
         "alert_url": "https://adepthood.example/internal/vault-provisioning/alerts",
         "volume": "creek_control_state",
-        "pool_admin_key_expires_at": "2026-12-28T12:00:00+00:00",
     }
     values[field] = value
 
@@ -1228,8 +1228,6 @@ def test_cli_render_is_offline_and_deploy_requires_all_private_inputs(
         _coordinates().alert_url,
         "--volume",
         _coordinates().volume,
-        "--pool-admin-key-expires-at",
-        _coordinates().pool_admin_key_expires_at,
     ]
 
     fly_pilot_deploy.main(["render", *common, "--output", str(output)])

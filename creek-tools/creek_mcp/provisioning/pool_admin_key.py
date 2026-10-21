@@ -24,23 +24,54 @@ vault depends on.  Its blast radius is the whole organization, so:
 * it travels as a mode-0400 file, never an environment value
   (:mod:`creek_mcp.provisioning.pilot_bootstrap` refuses the env form);
 * nothing here logs, echoes, hashes or measures the value.  Every record this
-  module produces is a closed-vocabulary code, a count or a latency: a hash
-  would be a verifier for an offline guess, and a length would narrow one, so
-  neither is emitted even in a refusal.
+  module produces is a closed-vocabulary code or a count: a hash would be a
+  verifier for an offline guess, and a length would narrow one, so neither is
+  emitted even in a refusal.
+
+**In use, or not yet.** No vendor is chosen and no key exists, so the custody
+path is **declared now and enforced on use**.  The control plane declares
+:data:`POOL_ADMIN_KEY_IN_USE_ENV` from a closed two-value vocabulary, and it
+defaults to not-in-use: a pilot deployed before the first key exists neither
+carries the secret nor refuses to boot.  The alternative — refusing to boot
+without a key nothing yet consumes — would force an operator to invent a
+placeholder credential, which is the one thing this module exists to refuse,
+and would make ``READY`` meaningless.  Once the key *is* declared in use every
+refusal below is binding.
 
 **Fail closed.** :func:`verify_pool_admin_key` answers one content-free
 :class:`PoolAdminKeyStatus` and never the value.  :func:`load_pool_admin_key`
-is the one way to the value and *raises* rather than returning a default,
-placeholder or ambient credential, so an unconfigured or malformed key can
-never fall through to an unauthenticated path.  Each status has its own exit
-code, disjoint from :mod:`creek_mcp.container_health`'s probe codes — in
-particular from ``pool-unconfigured`` (30), which means "no pool at all" and
-must stay distinguishable from "a pool, with no usable admin key".
+is the one way to the value and *raises* for every status but
+:attr:`PoolAdminKeyStatus.READY` and :attr:`PoolAdminKeyStatus.NEAR_EXPIRY`,
+so an unconfigured, malformed, undated or **expired** key can never be
+presented, and no caller receives a default, placeholder or ambient
+credential.  Each refusing status has its own exit code, disjoint from
+:mod:`creek_mcp.container_health`'s probe codes — in particular from
+``pool-unconfigured`` (30), which means "no pool at all" and must stay
+distinguishable from "a pool, with no usable admin key".
+
+**Alerting is registered, not yet emitted (#1896).** :meth:`
+PoolAdminKeyCheck.alert` maps each status onto the closed
+:class:`~creek_mcp.provisioning.budget.AlertKind` vocabulary, but **no
+production path calls it yet**, so a ``NEAR_EXPIRY`` verdict today is
+*recorded on stderr at startup, not delivered to anyone*.  Two things have to
+land before it can be: the fleet-report emission belongs to the attesting
+provider (#1896), which owns the only periodic pass that could re-check a
+long-running control plane, and adepthood's alert receiver enforces **its own**
+closed kind list, which today admits six kinds and not even
+``pool_credential_orphan``.  Emitting an unknown kind would be answered 400,
+which Creek's sink escalates to ``AlertDeliveryError``, which fails the
+scheduler component and takes the Machine unhealthy — so wiring an emitter
+before that list is widened would turn a warning into an outage.  Nothing here
+pretends otherwise: near-expiry is not an early warning until #1896 wires it.
 
 No spend is authorized (Decision 4): nothing here dials a vendor.
 :func:`classify_admin_response` classifies a vendor admin response that
 somebody else made, from its **status code alone** — the body is never read,
 because a 401 body is exactly where a vendor echoes the credential back.
+
+This module deliberately imports nothing first-party at module scope: it is
+reached from the root bootstrap before the privilege drop, and that bootstrap
+is documented as minimal.
 """
 
 from __future__ import annotations
@@ -50,23 +81,57 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum, unique
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
-
-from creek_mcp.provisioning.budget import FLEET_SUBJECT, Alert, AlertKind
-from creek_mcp.provisioning.pool_bundle import POOL_ADMIN_KEY_EXPIRES_AT_ENV
-from creek_mcp.provisioning.production_secrets import read_owner_only_file
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
+
+    from creek_mcp.provisioning.budget import Alert
+
+POOL_ADMIN_KEY_GUEST_PATH: Final[str] = "/run/secrets/creek_pool_admin_key"
+"""The organization admin key's one declared home.
+
+It is a *control-plane* file, never a vault one: no activation's Machine
+carries it, because a vault that held it could re-cap or delete every other
+vault's key.
+"""
+
+POOL_ADMIN_KEY_SECRET_NAME: Final[str] = "CREEK_POOL_ADMIN_KEY_B64"
+"""The Fly app secret that injects :data:`POOL_ADMIN_KEY_GUEST_PATH`."""
+
+POOL_ADMIN_KEY_IN_USE_ENV: Final[str] = "CREEK_POOL_ADMIN_KEY_IN_USE"
+"""Whether this control plane consumes an admin key: ``"1"`` or ``"0"``.
+
+A closed two-value vocabulary, absent meaning ``"0"``.  Declared rather than
+inferred so the pilot's own config says which regime it is in, and defaulting
+to not-in-use so declaring custody cannot brick a pilot that has no key yet.
+Any other value is a garbled declaration and refuses
+(:attr:`PoolAdminKeyStatus.UNDECLARED`).
+"""
+
+POOL_ADMIN_KEY_EXPIRES_AT_ENV: Final[str] = "CREEK_POOL_ADMIN_KEY_EXPIRES_AT"
+"""The admin key's declared expiry: a non-secret ISO-8601 instant.
+
+The vendor holds the real expiry and no vendor call is authorized (Decision
+4), so the operator declares it beside the secret the way the Fly org token's
+own expiry is declared.  While the key is in use an undeclared expiry is a
+refusal rather than an assumption: a key nobody dated expires unnoticed and
+takes the per-activation key lifecycle with it.
+"""
+
+POOL_ADMIN_KEY_IN_USE: Final[str] = "1"
+"""The in-use declaration's only affirmative value."""
+
+POOL_ADMIN_KEY_NOT_IN_USE: Final[str] = "0"
+"""The in-use declaration's only negative value, and its default."""
 
 POOL_ADMIN_KEY_RENEW_WITHIN: Final[timedelta] = timedelta(days=15)
-"""Alert this far ahead of the declared expiry.
+"""Record a near-expiry verdict this far ahead of the declared expiry.
 
 Decision 3.4 extends a *per-activation* key in place every 15 days for 30, so
 one missed cycle is survivable.  The admin key is re-issued by hand, which
-takes an owner action, so it gets the same notice period: a window long enough
-that one ignored alert is not yet an outage.
+takes an owner action, so it gets the same notice period.
 """
 
 _MAX_ADMIN_KEY_BYTES: Final[int] = 4096
@@ -89,67 +154,92 @@ class PoolAdminKeyStatus(StrEnum):
 
     Attributes:
         READY: Present, owner-only, well-formed, and in date.
+        NOT_IN_USE: This control plane declares that it consumes no admin
+            key, so there is nothing to custody yet.  Not a refusal.
+        NEAR_EXPIRY: Usable, but inside :data:`POOL_ADMIN_KEY_RENEW_WITHIN`
+            of its declared expiry.  Not a refusal — the key still works —
+            and today only *recorded*, never delivered (see the module
+            docstring).
         MISSING: No declared secret file exists at all.
         MALFORMED: The file exists but is not a usable bearer credential, or
             its mode is not owner-only.
         REJECTED: The vendor refused it (401/403): present and well-formed,
-            but no longer valid.
-        NEAR_EXPIRY: Usable, but inside :data:`POOL_ADMIN_KEY_RENEW_WITHIN` of
-            its declared expiry.  The only non-refusing non-ready status.
-        EXPIRY_UNDECLARED: No parseable, timezone-aware expiry was declared,
-            so near-expiry could never be detected.
+            but no longer valid.  A **runtime** verdict only; no vendor call
+            happens at startup.
+        UNDECLARED: The custody declaration is absent or not from the closed
+            vocabulary — either the in-use flag or, while in use, a
+            parseable timezone-aware expiry.
         EXPIRED: The declared expiry has passed.
     """
 
     READY = "pool-admin-key-ready"
+    NOT_IN_USE = "pool-admin-key-not-in-use"
+    NEAR_EXPIRY = "pool-admin-key-near-expiry"
     MISSING = "pool-admin-key-missing"
     MALFORMED = "pool-admin-key-malformed"
     REJECTED = "pool-admin-key-rejected"
-    NEAR_EXPIRY = "pool-admin-key-near-expiry"
-    EXPIRY_UNDECLARED = "pool-admin-key-expiry-undeclared"
+    UNDECLARED = "pool-admin-key-undeclared"
     EXPIRED = "pool-admin-key-expired"
 
     @property
     def exit_code(self) -> int:
-        """Return this status's stable supervisor exit code.
+        """Return this status's stable process exit code.
 
         Returns:
-            The code, disjoint from every ``--check`` probe code but ``0``.
+            ``0`` for every status that lets startup proceed, and otherwise a
+            code unique to the refusal and disjoint from every probe code.
         """
         return _EXIT_CODES[self]
+
+    @property
+    def refused(self) -> bool:
+        """Return whether this status must stop the operation.
+
+        Returns:
+            ``True`` for the five refusals.  ``READY``, ``NOT_IN_USE`` and
+            ``NEAR_EXPIRY`` each let the control plane run.
+        """
+        return self in _REFUSING
 
 
 _EXIT_CODES: Final[dict[PoolAdminKeyStatus, int]] = {
     PoolAdminKeyStatus.READY: 0,
+    PoolAdminKeyStatus.NOT_IN_USE: 0,
+    PoolAdminKeyStatus.NEAR_EXPIRY: 0,
     PoolAdminKeyStatus.MISSING: 40,
     PoolAdminKeyStatus.MALFORMED: 41,
     PoolAdminKeyStatus.REJECTED: 42,
-    PoolAdminKeyStatus.NEAR_EXPIRY: 43,
-    PoolAdminKeyStatus.EXPIRY_UNDECLARED: 44,
-    PoolAdminKeyStatus.EXPIRED: 45,
+    PoolAdminKeyStatus.UNDECLARED: 43,
+    PoolAdminKeyStatus.EXPIRED: 44,
 }
-"""Codes start at 40 so no probe code (20-26, 30-33) is ever reused."""
+"""Codes start at 40 so no probe code (20-26, 30-33) is ever reused.
 
-_ALERT_KINDS: Final[dict[PoolAdminKeyStatus, AlertKind]] = {
-    PoolAdminKeyStatus.MISSING: AlertKind.POOL_ADMIN_KEY_UNUSABLE,
-    PoolAdminKeyStatus.MALFORMED: AlertKind.POOL_ADMIN_KEY_UNUSABLE,
-    PoolAdminKeyStatus.EXPIRY_UNDECLARED: AlertKind.POOL_ADMIN_KEY_UNUSABLE,
-    PoolAdminKeyStatus.EXPIRED: AlertKind.POOL_ADMIN_KEY_UNUSABLE,
-    PoolAdminKeyStatus.REJECTED: AlertKind.POOL_ADMIN_KEY_REJECTED,
-    PoolAdminKeyStatus.NEAR_EXPIRY: AlertKind.POOL_ADMIN_KEY_NEAR_EXPIRY,
-}
-"""Three kinds, not seven: the operator's action differs, not the code."""
+Every non-refusing status is ``0``: a working key must never stop the control
+plane, so the distinguishing signal for those is the printed status string,
+not the exit code.
+"""
 
 _REFUSING: Final[frozenset[PoolAdminKeyStatus]] = frozenset(
     {
         PoolAdminKeyStatus.MISSING,
         PoolAdminKeyStatus.MALFORMED,
         PoolAdminKeyStatus.REJECTED,
-        PoolAdminKeyStatus.EXPIRY_UNDECLARED,
+        PoolAdminKeyStatus.UNDECLARED,
         PoolAdminKeyStatus.EXPIRED,
     }
 )
-"""Every status that must stop the operation. ``NEAR_EXPIRY`` still works."""
+"""Every status that must stop the operation."""
+
+_USABLE: Final[frozenset[PoolAdminKeyStatus]] = frozenset(
+    {PoolAdminKeyStatus.READY, PoolAdminKeyStatus.NEAR_EXPIRY}
+)
+"""The only two statuses for which :func:`load_pool_admin_key` returns a value.
+
+``NOT_IN_USE`` is deliberately absent: it is not a refusal for *startup*, but
+a caller that asks for the value of a key its own config says it does not use
+has a bug, and handing one back would be the fail-open this module exists to
+prevent.
+"""
 
 _UNAUTHORIZED: Final[frozenset[int]] = frozenset({401, 403})
 """The only vendor responses that say anything about the admin key itself."""
@@ -183,18 +273,36 @@ class PoolAdminKeyCheck:
         """Return whether the admin-key operation must not proceed.
 
         Returns:
-            ``True`` for every status but ``READY`` and ``NEAR_EXPIRY``.
+            ``True`` for the five refusing statuses.
         """
-        return self.status in _REFUSING
+        return self.status.refused
 
     def alert(self) -> Alert | None:
         """Return this verdict's closed operator alert, or ``None``.
 
+        **No production path calls this yet** — see the module docstring for
+        the two gates (#1896's fleet-report pass, and adepthood's own closed
+        kind list) that have to clear before an alert can be delivered.
+
         Returns:
-            The alert, or ``None`` when the key is ready.  The subject is the
-            fleet, because the admin key belongs to no single activation.
+            The alert, or ``None`` when there is nothing to report.  The
+            subject is the fleet, because the admin key belongs to no single
+            activation.
         """
-        kind = _ALERT_KINDS.get(self.status)
+        # Imported here, not at module scope: the root bootstrap reaches this
+        # module before the privilege drop, and ``budget`` pulls the bench
+        # cost model with it.
+        from creek_mcp.provisioning.budget import FLEET_SUBJECT, Alert, AlertKind
+
+        kinds = {
+            PoolAdminKeyStatus.MISSING: AlertKind.POOL_ADMIN_KEY_UNUSABLE,
+            PoolAdminKeyStatus.MALFORMED: AlertKind.POOL_ADMIN_KEY_UNUSABLE,
+            PoolAdminKeyStatus.UNDECLARED: AlertKind.POOL_ADMIN_KEY_UNUSABLE,
+            PoolAdminKeyStatus.EXPIRED: AlertKind.POOL_ADMIN_KEY_UNUSABLE,
+            PoolAdminKeyStatus.REJECTED: AlertKind.POOL_ADMIN_KEY_REJECTED,
+            PoolAdminKeyStatus.NEAR_EXPIRY: AlertKind.POOL_ADMIN_KEY_NEAR_EXPIRY,
+        }
+        kind = kinds.get(self.status)
         if kind is None:
             return None
         measured = (
@@ -209,7 +317,7 @@ class PoolAdminKeyCheck:
 
 
 class PoolAdminKeyError(RuntimeError):
-    """The admin key is unusable, so the operation refuses.
+    """The admin key may not be presented, so the operation refuses.
 
     The message is the status code and nothing else, so a traceback that
     escapes into a log or an error body carries no key material and no
@@ -220,14 +328,14 @@ class PoolAdminKeyError(RuntimeError):
         """Carry only the closed-vocabulary status.
 
         Args:
-            status: The refusing status.
+            status: The status that forbade the value.
         """
         super().__init__(status.value)
         self.status = status
 
     @property
     def exit_code(self) -> int:
-        """Return the refusing status's exit code.
+        """Return the status's exit code.
 
         Returns:
             The code.
@@ -235,30 +343,48 @@ class PoolAdminKeyError(RuntimeError):
         return self.status.exit_code
 
 
-def load_pool_admin_key(path: Path) -> str:
-    """Return the full admin key value, or refuse.
-
-    The one way to the value.  There is no default, no placeholder and no
-    environment fallback: a caller that cannot get the key here cannot make an
-    admin call at all, which is what keeps an unconfigured control plane from
-    silently proceeding unauthenticated.
+def pool_admin_key_in_use(environ: Mapping[str, str]) -> bool | None:
+    """Return the declared in-use regime, or ``None`` when it is garbled.
 
     Args:
-        path: The declared secret file, normally
-            :data:`~creek_mcp.provisioning.pool_bundle.POOL_ADMIN_KEY_GUEST_PATH`.
+        environ: The environment carrying :data:`POOL_ADMIN_KEY_IN_USE_ENV`.
 
     Returns:
-        The full key value, exactly as the vendor's ``update`` and ``delete``
-        calls require it.
-
-    Raises:
-        PoolAdminKeyError: When the file is absent, not owner-only, or not a
-            well-formed bearer credential.  The error names only its status.
+        ``True`` while the control plane declares it consumes an admin key,
+        ``False`` when it declares it does not or declares nothing at all, and
+        ``None`` when the declaration is outside the closed vocabulary.
     """
-    status, value = _stored_status(path)
-    if value is None:
-        raise PoolAdminKeyError(status)
-    return value
+    declared = environ.get(POOL_ADMIN_KEY_IN_USE_ENV, "").strip()
+    if not declared or declared == POOL_ADMIN_KEY_NOT_IN_USE:
+        return False
+    if declared == POOL_ADMIN_KEY_IN_USE:
+        return True
+    return None
+
+
+def pool_admin_secret_files(environ: Mapping[str, str]) -> tuple[Path, ...]:
+    """Return the admin-key files the root bootstrap must normalize.
+
+    Mirrors :func:`~creek_mcp.provisioning.pool_bundle.pool_secret_files`: the
+    bootstrap *validates listed files* and never enumerates ``/run/secrets``
+    (Decision 6), and the list is derived from the Machine's own closed
+    declaration.  A control plane with no admin key in use normalizes nothing,
+    so declaring the custody path cannot make an existing pilot unbootable.
+
+    Args:
+        environ: The Machine's environment.
+
+    Returns:
+        The one admin-key path while it is in use, and otherwise empty.  A
+        garbled declaration also returns empty, so the refusal comes from
+        :func:`verify_pool_admin_key`'s content-free code rather than from the
+        bootstrap's generic exit 2.
+    """
+    return (
+        (Path(POOL_ADMIN_KEY_GUEST_PATH),)
+        if pool_admin_key_in_use(environ) is True
+        else ()
+    )
 
 
 def verify_pool_admin_key(
@@ -269,34 +395,57 @@ def verify_pool_admin_key(
 ) -> PoolAdminKeyCheck:
     """Verify the declared secret's custody without exposing its value.
 
-    Storage first, then the declared expiry.  The value is read into a local
-    frame to be format-checked and is never returned, logged or measured from
-    here.
+    The declaration first, then storage, then the declared expiry.  The value
+    is read into a local frame to be format-checked and is never returned,
+    logged or measured from here.
 
     Args:
         path: The declared secret file.
-        environ: The process environment to read the declared expiry from,
-            injected rather than taken ambiently so a caller can verify a
-            Machine's environment without being that Machine.
+        environ: The process environment to read the custody declaration
+            from, injected rather than taken ambiently so a caller can verify
+            a Machine's environment without being that Machine.
         now: The instant to judge the expiry against.
 
     Returns:
         The content-free verdict.
     """
-    stored, _value = _stored_status(path)
-    if stored is not PoolAdminKeyStatus.READY:
-        return PoolAdminKeyCheck(stored)
-    expires_at = _declared_expiry(environ)
-    if expires_at is None:
-        return PoolAdminKeyCheck(PoolAdminKeyStatus.EXPIRY_UNDECLARED)
-    remaining = expires_at - now
-    if remaining <= timedelta(0):
-        return PoolAdminKeyCheck(PoolAdminKeyStatus.EXPIRED)
-    if remaining <= POOL_ADMIN_KEY_RENEW_WITHIN:
-        return PoolAdminKeyCheck(
-            PoolAdminKeyStatus.NEAR_EXPIRY, int(remaining.total_seconds())
-        )
-    return PoolAdminKeyCheck(PoolAdminKeyStatus.READY)
+    check, _value = _classify(path, environ=environ, now=now)
+    return check
+
+
+def load_pool_admin_key(
+    path: Path,
+    *,
+    environ: Mapping[str, str],
+    now: datetime,
+) -> str:
+    """Return the full admin key value, or refuse.
+
+    The one way to the value.  There is no default, no placeholder and no
+    environment fallback, and the expiry is enforced here rather than only in
+    :func:`verify_pool_admin_key`: a loader that handed back an expired key
+    would let a caller present a credential the vendor has already stopped
+    honouring, which is a fail-open dressed as a check.
+
+    Args:
+        path: The declared secret file, normally
+            :data:`POOL_ADMIN_KEY_GUEST_PATH`.
+        environ: The environment carrying the custody declaration.
+        now: The instant to judge the expiry against.
+
+    Returns:
+        The full key value, exactly as the vendor's ``update`` and ``delete``
+        calls require it.
+
+    Raises:
+        PoolAdminKeyError: For every status but ``READY`` and
+            ``NEAR_EXPIRY``, including ``NOT_IN_USE``.  The error names only
+            its status.
+    """
+    check, value = _classify(path, environ=environ, now=now)
+    if check.status not in _USABLE or value is None:
+        raise PoolAdminKeyError(check.status)
+    return value
 
 
 def classify_admin_response(status_code: int) -> PoolAdminKeyCheck | None:
@@ -320,6 +469,46 @@ def classify_admin_response(status_code: int) -> PoolAdminKeyCheck | None:
     return None
 
 
+def _classify(
+    path: Path,
+    *,
+    environ: Mapping[str, str],
+    now: datetime,
+) -> tuple[PoolAdminKeyCheck, str | None]:
+    """Produce the one verdict both public entry points share.
+
+    Args:
+        path: The declared secret file.
+        environ: The environment carrying the custody declaration.
+        now: The instant to judge the expiry against.
+
+    Returns:
+        The verdict, paired with the value only when it may be presented.
+    """
+    in_use = pool_admin_key_in_use(environ)
+    if in_use is None:
+        return (PoolAdminKeyCheck(PoolAdminKeyStatus.UNDECLARED), None)
+    if not in_use:
+        return (PoolAdminKeyCheck(PoolAdminKeyStatus.NOT_IN_USE), None)
+    stored, value = _stored_status(path)
+    if stored is not PoolAdminKeyStatus.READY or value is None:
+        return (PoolAdminKeyCheck(stored), None)
+    expires_at = _declared_expiry(environ)
+    if expires_at is None:
+        return (PoolAdminKeyCheck(PoolAdminKeyStatus.UNDECLARED), None)
+    remaining = expires_at - now
+    if remaining <= timedelta(0):
+        return (PoolAdminKeyCheck(PoolAdminKeyStatus.EXPIRED), None)
+    if remaining <= POOL_ADMIN_KEY_RENEW_WITHIN:
+        return (
+            PoolAdminKeyCheck(
+                PoolAdminKeyStatus.NEAR_EXPIRY, int(remaining.total_seconds())
+            ),
+            value,
+        )
+    return (PoolAdminKeyCheck(PoolAdminKeyStatus.READY), value)
+
+
 def _stored_status(path: Path) -> tuple[PoolAdminKeyStatus, str | None]:
     """Read and format-check the stored credential.
 
@@ -331,6 +520,11 @@ def _stored_status(path: Path) -> tuple[PoolAdminKeyStatus, str | None]:
         ``(MISSING | MALFORMED, None)`` otherwise.  No branch here reports the
         value's length, prefix or digest.
     """
+    # Imported here, not at module scope: this module is reached from the root
+    # bootstrap before the privilege drop, and ``production_secrets`` pulls the
+    # whole x509/AEAD surface with it.
+    from creek_mcp.provisioning.production_secrets import read_owner_only_file
+
     if not os.path.lexists(path):
         return (PoolAdminKeyStatus.MISSING, None)
     try:
@@ -347,8 +541,7 @@ def _declared_expiry(environ: Mapping[str, str]) -> datetime | None:
     """Return the declared, timezone-aware expiry, or ``None``.
 
     Args:
-        environ: The environment carrying
-            :data:`~creek_mcp.provisioning.pool_bundle.POOL_ADMIN_KEY_EXPIRES_AT_ENV`.
+        environ: The environment carrying :data:`POOL_ADMIN_KEY_EXPIRES_AT_ENV`.
 
     Returns:
         The instant, or ``None`` when it is absent, unparseable or naive — all

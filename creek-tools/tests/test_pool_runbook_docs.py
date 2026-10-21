@@ -51,13 +51,15 @@ from creek_mcp.container_health import ProbeResult, ProbeStatus
 from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV, ModelPackageManifest
 from creek_mcp.provisioning.budget import AlertKind
 from creek_mcp.provisioning.fly_pilot_config import _SECRET_NAMES
-from creek_mcp.provisioning.pilot_bootstrap import (
-    _SECRET_FILES as _BOOTSTRAP_SECRET_FILES,
-)
-from creek_mcp.provisioning.pool_admin_key import PoolAdminKeyStatus
-from creek_mcp.provisioning.pool_bundle import (
+from creek_mcp.provisioning.pool_admin_key import (
     POOL_ADMIN_KEY_GUEST_PATH,
+    POOL_ADMIN_KEY_IN_USE_ENV,
+    POOL_ADMIN_KEY_RENEW_WITHIN,
     POOL_ADMIN_KEY_SECRET_NAME,
+    PoolAdminKeyStatus,
+    pool_admin_secret_files,
+)
+from creek_mcp.provisioning.pool_bundle import (
     POOL_MANIFEST_GUEST_PATH,
     POOL_VENDOR_KEY_GUEST_PATH,
 )
@@ -372,16 +374,60 @@ def test_admin_key_custody_claim_matches_the_code(runbook: str) -> None:
     """The page may claim admin-key custody only while the code provides it.
 
     #1930 was filed because this page attributed the declared-secret entry to
-    a merged issue that never shipped it. The claim is therefore tied to the
-    three artifacts that make it true: the Fly secret name in the rendered
-    config's closed set, the bootstrap-normalized guest path, and the alert
-    kinds. If any is removed, the page must go back to saying so.
+    a merged issue that never shipped it, so each claim is tied to the artifact
+    that makes it true rather than to a phrase that a rewording defeats: the
+    Fly secret name, the guest path the bootstrap normalizes while the key is
+    in use, and the env var that declares the regime must all be quoted.
     """
-    assert POOL_ADMIN_KEY_SECRET_NAME in _SECRET_NAMES
-    assert Path(POOL_ADMIN_KEY_GUEST_PATH) in _BOOTSTRAP_SECRET_FILES
+    assert Path(POOL_ADMIN_KEY_GUEST_PATH) in pool_admin_secret_files(
+        {POOL_ADMIN_KEY_IN_USE_ENV: "1"}
+    )
     assert POOL_ADMIN_KEY_SECRET_NAME in runbook
     assert POOL_ADMIN_KEY_GUEST_PATH in runbook
-    assert "there is no declared-secret entry" not in runbook
+    assert POOL_ADMIN_KEY_IN_USE_ENV in runbook
+
+
+def test_the_page_does_not_claim_the_admin_key_is_unconditionally_declared(
+    runbook: str,
+) -> None:
+    """The regime is conditional, and the page must say which regime is default.
+
+    The secret is declared in the rendered config only while the key is in
+    use, so a page that said the control plane always carries eight secrets
+    would be as wrong as the one that said it carried none.
+    """
+    assert POOL_ADMIN_KEY_SECRET_NAME not in _SECRET_NAMES
+    lowered = runbook.lower()
+    assert "not in use" in lowered
+    assert "eight declared" not in lowered
+
+
+def test_the_page_does_not_call_near_expiry_an_early_warning(runbook: str) -> None:
+    """No production path emits an admin-key alert yet, so the page may not imply one.
+
+    ``PoolAdminKeyCheck.alert`` has no non-test caller: emission belongs to
+    #1896's fleet-report pass, and adepthood's receiver enforces its own closed
+    kind list. Until both land, near-expiry is recorded, not delivered, and the
+    page has to say so.
+    """
+    lowered = runbook.lower()
+    assert "recorded" in lowered
+    assert "not delivered" in lowered
+    # Negated mentions are the point of the section, so the claim is checked
+    # per sentence against the page's own negation vocabulary, exactly as
+    # ``test_forbidden_claims_only_appear_negated`` does for custody claims.
+    for overclaim in ("early warning", "warns the operator", "alerts the operator"):
+        for sentence in _SENTENCE.findall(runbook):
+            if overclaim in sentence.lower():
+                assert _NEGATION.search(sentence), (
+                    f"page overclaims alerting: {sentence.strip()!r}"
+                )
+
+
+def test_the_runbook_quotes_the_renewal_window_constant(runbook: str) -> None:
+    """The notice period the page quotes is the constant the code applies."""
+    days = int(POOL_ADMIN_KEY_RENEW_WITHIN.total_seconds() // 86400)
+    assert f"{days} days" in runbook, f"runbook does not quote {days} days"
 
 
 @pytest.mark.parametrize("kind", sorted(_ADMIN_KEY_ALERT_KINDS))

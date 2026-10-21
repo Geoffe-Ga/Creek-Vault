@@ -10,8 +10,12 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
-from creek_mcp.provisioning.pool_bundle import (
+from creek_mcp.provisioning.pool_admin_key import (
     POOL_ADMIN_KEY_EXPIRES_AT_ENV,
+    POOL_ADMIN_KEY_GUEST_PATH,
+    POOL_ADMIN_KEY_IN_USE,
+    POOL_ADMIN_KEY_IN_USE_ENV,
+    POOL_ADMIN_KEY_NOT_IN_USE,
     POOL_ADMIN_KEY_SECRET_NAME,
 )
 
@@ -33,6 +37,7 @@ _TOKENS: Final[tuple[str, ...]] = (
     "HANDOFF_URL",
     "ALERT_URL",
     "VOLUME",
+    "POOL_ADMIN_KEY_IN_USE",
     "POOL_ADMIN_KEY_EXPIRES_AT",
     "FILE_REFERENCE_KEY",
 )
@@ -45,13 +50,32 @@ _SECRET_NAMES: Final[frozenset[str]] = frozenset(
         "CREEK_TLS_CA_PRIVATE_KEY_B64",
         "CREEK_HANDOFF_TOKEN_B64",
         "CREEK_FLEET_POLICY_B64",
-        # ADR-0016 Decision 3.4, #1930: the organization pool admin key gets a
-        # declared home here rather than being stored ad hoc the first time a
-        # vendor key exists.  Its custody rules live in
-        # creek_mcp.provisioning.pool_admin_key.
-        POOL_ADMIN_KEY_SECRET_NAME,
     }
 )
+"""The secrets every control plane carries, whatever regime it is in."""
+
+_ADMIN_KEY_FILE_BLOCK: Final[str] = "\n".join(
+    (
+        "",
+        "[[files]]",
+        f'  guest_path = "{POOL_ADMIN_KEY_GUEST_PATH}"',
+        f'  {"_".join(("secret", "name"))} = "{POOL_ADMIN_KEY_SECRET_NAME}"',
+        "",
+    )
+)
+"""ADR-0016 Decision 3.4, #1930: the organization pool admin key's declared
+``[[files]]`` entry, appended only while the key is in use.
+
+It is appended rather than carried in the template because a ``[[files]]``
+entry makes its Fly secret mandatory at deploy time, and no key exists yet: a
+pilot deployed before the first one would otherwise need a placeholder
+credential, which is exactly what
+:mod:`creek_mcp.provisioning.pool_admin_key` refuses.  Appending is safe
+because :func:`_validate_document` re-parses the whole rendered document and
+checks the resulting ``files`` set for exact equality against
+:func:`_expected_secret_names`, so nothing appended escapes the same contract
+the template is held to.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +91,16 @@ class FlyPilotCoordinates:
     handoff_url: str
     alert_url: str
     volume: str
-    pool_admin_key_expires_at: str
+    pool_admin_key_expires_at: str | None = None
+    """The pool admin key's declared expiry, or ``None`` while no key is in use.
+
+    ``None`` is the default on purpose (#1930): the vendor is unchosen and no
+    admin key exists, so a pilot rendered today declares the custody path's
+    *absence* rather than inventing a placeholder expiry for a placeholder
+    credential.  Supplying a timezone-aware instant switches the rendered
+    config into the in-use regime, which declares the secret and makes every
+    custody refusal in :mod:`creek_mcp.provisioning.pool_admin_key` binding.
+    """
 
     def __post_init__(self) -> None:
         """Reject placeholders, mutable images, and TOML/shell injection."""
@@ -85,9 +118,10 @@ class FlyPilotCoordinates:
         ):
             raise ValueError("Fly pilot images must use immutable sha256 digests")
         _require_aware_instant(self.token_expires_at, field="token expiry")
-        _require_aware_instant(
-            self.pool_admin_key_expires_at, field="pool admin key expiry"
-        )
+        if self.pool_admin_key_expires_at is not None:
+            _require_aware_instant(
+                self.pool_admin_key_expires_at, field="pool admin key expiry"
+            )
         try:
             handoff = httpx.URL(self.handoff_url)
             alert = httpx.URL(self.alert_url)
@@ -147,7 +181,12 @@ def render_fly_toml(template: Path, coordinates: FlyPilotCoordinates) -> str:
         "HANDOFF_URL": coordinates.handoff_url,
         "ALERT_URL": coordinates.alert_url,
         "VOLUME": coordinates.volume,
-        "POOL_ADMIN_KEY_EXPIRES_AT": coordinates.pool_admin_key_expires_at,
+        "POOL_ADMIN_KEY_IN_USE": (
+            POOL_ADMIN_KEY_NOT_IN_USE
+            if coordinates.pool_admin_key_expires_at is None
+            else POOL_ADMIN_KEY_IN_USE
+        ),
+        "POOL_ADMIN_KEY_EXPIRES_AT": coordinates.pool_admin_key_expires_at or "",
         "FILE_REFERENCE_KEY": "_".join(("secret", "name")),
     }
     for token in _TOKENS:
@@ -157,12 +196,29 @@ def render_fly_toml(template: Path, coordinates: FlyPilotCoordinates) -> str:
         rendered = rendered.replace(marker, values[token])
     if "{{" in rendered or "}}" in rendered:
         raise ValueError("Fly pilot template contains an unknown placeholder")
+    if coordinates.pool_admin_key_expires_at is not None:
+        rendered = rendered.rstrip("\n") + "\n" + _ADMIN_KEY_FILE_BLOCK
     try:
         document = tomllib.loads(rendered)
     except tomllib.TOMLDecodeError as exc:
         raise ValueError("rendered Fly pilot config is invalid") from exc
     _validate_document(document, coordinates)
     return rendered
+
+
+def _expected_secret_names(coordinates: FlyPilotCoordinates) -> frozenset[str]:
+    """Return the exact Fly secret names this config must declare.
+
+    Args:
+        coordinates: The reviewed coordinates.
+
+    Returns:
+        The seven always-present names, plus the pool admin key while it is in
+        use.
+    """
+    if coordinates.pool_admin_key_expires_at is None:
+        return _SECRET_NAMES
+    return _SECRET_NAMES | {POOL_ADMIN_KEY_SECRET_NAME}
 
 
 def _validate_document(
@@ -195,7 +251,14 @@ def _validate_document(
             "CREEK_PILOT_ALERT_URL": coordinates.alert_url,
             "CREEK_PILOT_RECONCILE_INTERVAL_SECONDS": "3600",
             "CREEK_PILOT_RECONCILE_WINDOW_SECONDS": "120",
-            POOL_ADMIN_KEY_EXPIRES_AT_ENV: coordinates.pool_admin_key_expires_at,
+            POOL_ADMIN_KEY_IN_USE_ENV: (
+                POOL_ADMIN_KEY_NOT_IN_USE
+                if coordinates.pool_admin_key_expires_at is None
+                else POOL_ADMIN_KEY_IN_USE
+            ),
+            POOL_ADMIN_KEY_EXPIRES_AT_ENV: (
+                coordinates.pool_admin_key_expires_at or ""
+            ),
         }
         or not isinstance(service, dict)
         or service.get("internal_port") != 8080
@@ -227,9 +290,9 @@ def _validate_document(
         ]
         or restart != [{"policy": "on-failure", "retries": 3}]
         or not isinstance(files, list)
-        or len(files) != len(_SECRET_NAMES)
+        or len(files) != len(_expected_secret_names(coordinates))
         or {item.get("secret_name") for item in files if isinstance(item, dict)}
-        != _SECRET_NAMES
+        != _expected_secret_names(coordinates)
         or any(
             set(item) != {"guest_path", "secret_name"}
             for item in files

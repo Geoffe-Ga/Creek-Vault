@@ -146,7 +146,9 @@ def test_bootstrap_refuses_secret_values_in_environment(
         nonlocal prepared
         prepared = True
 
-    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", prepare)
+    monkeypatch.setattr(
+        pilot_bootstrap, "prepare_runtime_paths", lambda **_kwargs: prepare()
+    )
 
     with pytest.raises(SystemExit, match="secret values"):
         pilot_bootstrap.main()
@@ -259,7 +261,7 @@ def test_bootstrap_main_runs_exact_sequence_and_sanitizes_startup_failure(
     monkeypatch.setattr(
         pilot_bootstrap,
         "prepare_runtime_paths",
-        lambda: calls.append("prepare"),
+        lambda **_kwargs: calls.append("prepare"),
     )
     monkeypatch.setattr(
         pilot_bootstrap,
@@ -271,17 +273,17 @@ def test_bootstrap_main_runs_exact_sequence_and_sanitizes_startup_failure(
     monkeypatch.setattr(
         pilot_bootstrap,
         "verify_pool_admin_key",
-        lambda *_args, **_kwargs: PoolAdminKeyCheck(PoolAdminKeyStatus.READY),
+        lambda *_args, **_kwargs: PoolAdminKeyCheck(PoolAdminKeyStatus.NOT_IN_USE),
     )
 
     pilot_bootstrap.main()
 
     assert calls == ["prepare", ["--flag"]]
     assert capsys.readouterr().err == (
-        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.READY.value}\n"
+        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.NOT_IN_USE.value}\n"
     )
 
-    def refuse() -> None:
+    def refuse(**_kwargs: object) -> None:
         raise ContainerConfigurationError("content-free-refusal")
 
     monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", refuse)
