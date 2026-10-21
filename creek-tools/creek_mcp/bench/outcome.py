@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import httpx
 
+from creek_mcp.bench.protocols import FirstTokenReporting
 from creek_mcp.bench.usage import TokenUsage, UsageReporting
 
 if TYPE_CHECKING:
@@ -154,6 +155,11 @@ class TrialProbe:
         usage: The provider's own token report for the first completion, or
             ``None`` when the backend reported none (or raised before it
             could). Never derived — see :mod:`creek_mcp.bench.usage`.
+        ttft_s: Seconds from the start of the first completion call to its
+            first token, as the backend reported them, or ``None`` when it
+            does not stream (or streamed nothing). Never derived: a
+            non-streaming backend's TTFT is unknown, which is not the same
+            claim as "as slow as the whole call".
         max_output_tokens: The output ceiling the factory was asked to build
             with, or ``None`` when the factory was never reached.
     """
@@ -162,6 +168,7 @@ class TrialProbe:
     outcome: Outcome | None = None
     generation_s: float | None = None
     usage: TokenUsage | None = None
+    ttft_s: float | None = None
     max_output_tokens: int | None = None
 
     def record(self, exc: BaseException) -> None:
@@ -177,6 +184,16 @@ class TrialProbe:
         """
         if self.usage is None and isinstance(llm, UsageReporting):
             self.usage = llm.token_usage()
+
+    def record_ttft(self, llm: object) -> None:
+        """Keep the first time-to-first-token *llm* offers, if it offers one.
+
+        First-report-wins for the same reason :meth:`record_usage` is: one
+        trial is one reflection, and a later turn's figure would silently
+        replace the measured one.
+        """
+        if self.ttft_s is None and isinstance(llm, FirstTokenReporting):
+            self.ttft_s = llm.time_to_first_token()
 
 
 def probe_factory(factory: LLMFactory, probe: TrialProbe) -> LLMFactory:
@@ -208,6 +225,7 @@ def probe_factory(factory: LLMFactory, probe: TrialProbe) -> LLMFactory:
                 raise
             else:
                 probe.record_usage(llm)
+                probe.record_ttft(llm)
                 return completion
             finally:
                 probe.generation_s = probe.clock() - start

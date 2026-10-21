@@ -22,10 +22,17 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 
-from creek_mcp.bench.deadline import Verdict, deadline_budget_seconds, deadline_verdict
+from creek_mcp.bench.deadline import (
+    BudgetTable,
+    Verdict,
+    budget_table,
+    deadline_budget_seconds,
+    deadline_verdict,
+    overall_verdict,
+)
 from creek_mcp.bench.eval.rubric import QualityScore
 from creek_mcp.bench.metadata import HostMetadata, RunMetadata
-from creek_mcp.bench.stats import LatencySummary, TokenUsageSummary
+from creek_mcp.bench.stats import LatencySummary, ThroughputSummary, TokenUsageSummary
 from creek_mcp.bench.tokens import TokensPerReflection
 from creek_mcp.bench.trial import Phase, Sweep, Trial
 from creek_mcp.httpapi.middleware import limits
@@ -41,6 +48,19 @@ the field means: a reader that handled ``null`` still reads every report this
 version produces. What *would* be a bump is the rubric's own arithmetic
 changing, and that has its own version —
 :data:`creek_mcp.bench.eval.RUBRIC_VERSION`, recorded inside the score.
+
+Not bumped for R2's budget table either (#1895). ``budgets``, ``throughput``,
+``latency.ttft_p95_s`` and the trials' ``ttft_s`` / ``token_basis`` are all
+*new* fields, and no field already in the schema changed meaning or was
+removed: ``budget_seconds`` is still the deadline this process enforces and
+``verdict`` is still the per-sweep verdict against it, with R2 answered beside
+them in ``budgets.verdict`` rather than folded into either. A reader of this
+version still parses every field it already knew, so the additive rule above
+applies and :data:`creek_mcp.bench.HARNESS_VERSION` carries the change (1.2.0)
+— which is the version a reader needing latency budgets or TTFT must require.
+The three earlier changes #1915 records as having landed under version ``1``
+are a different question — one of them, ``run.digest``, genuinely did change
+meaning — and this note does not settle them.
 """
 
 
@@ -53,6 +73,8 @@ class PhaseSummary(BaseModel):
             grain a cold start is judged on — a cold prompt is the same size as
             a warm one, so a difference here is the backend's, not the
             workload's.
+        throughput: Output tokens per second over the same trials, reported
+            only from provider-reported counts.
         verdict: The phase's deadline verdict.
     """
 
@@ -60,6 +82,7 @@ class PhaseSummary(BaseModel):
 
     latency: LatencySummary
     tokens: TokenUsageSummary
+    throughput: ThroughputSummary
     verdict: Verdict
 
 
@@ -74,6 +97,10 @@ class SweepSummary(BaseModel):
         per_phase: Aggregates and a verdict per residency phase. Cold and warm
             trials are judged apart: pooled, a few slow cold starts fall
             outside the p95 rank of many warm trials and would go unseen.
+        throughput: Output tokens per second over every trial in the sweep,
+            reported only from provider-reported counts. ``None`` figures with
+            a ``byte_upper_bound`` basis are a fake run refusing to state a
+            rate over bounded bytes, not a backend that generated nothing.
         verdict: The worse of the per-phase verdicts.
         trials: The sweep's trials.
     """
@@ -82,6 +109,7 @@ class SweepSummary(BaseModel):
 
     latency: LatencySummary
     tokens: TokenUsageSummary
+    throughput: ThroughputSummary
     per_phase: dict[Phase, PhaseSummary]
     verdict: Verdict
     trials: tuple[Trial, ...]
@@ -118,10 +146,21 @@ class BenchReport(BaseModel):
         kind: Always ``benchmark`` — measured, unlike a cost ``model``.
         run: Pinned run metadata.
         host: Capacity-only host metadata.
-        budget_seconds: The deadline the verdicts were judged against.
+        budget_seconds: The deadline the per-sweep verdicts were judged
+            against — the one deadline *this* process enforces. ADR-0016 R2's
+            four budgets are in ``budgets``, judged separately.
         per_sweep: Each sweep that ran.
         verdict: ``exceeds`` if any sweep exceeds; else ``insufficient_data``
-            if any sweep lacked a success; else ``fits``.
+            if any sweep lacked a success; else ``fits``. **This is the sweep
+            verdict against ``budget_seconds`` and nothing more.** R2 is
+            answered by ``budgets.verdict``, which is reported separately
+            because a run can sit comfortably inside the shed deadline while
+            measuring nothing R2 asks about.
+        budgets: ADR-0016 R2's named budget table (#1895): one row per budget
+            with its limit, the value judged against it, its own verdict, and
+            whether production enforces it today. ``measures_production_path``
+            on it is false for every hermetic run, and then no figure in it is
+            a production guarantee.
         capacity: The concurrency sweep's basis for the admission caps.
         tokens_per_reflection: The measured per-surface token block (#1893).
             Every ADR-0016 cost figure cites this in place of the 2,500 + 128
@@ -145,18 +184,10 @@ class BenchReport(BaseModel):
     budget_seconds: PositiveFloat
     per_sweep: dict[Sweep, SweepSummary]
     verdict: Verdict
+    budgets: BudgetTable
     capacity: CapacityBasis
     tokens_per_reflection: TokensPerReflection
     quality_score: QualityScore | None = None
-
-
-def overall_verdict(verdicts: Sequence[Verdict]) -> Verdict:
-    """Combine per-sweep verdicts; any failure dominates, then any gap."""
-    if Verdict.EXCEEDS in verdicts:
-        return Verdict.EXCEEDS
-    if not verdicts or Verdict.INSUFFICIENT_DATA in verdicts:
-        return Verdict.INSUFFICIENT_DATA
-    return Verdict.FITS
 
 
 def _max_fitting_level(trials: Sequence[Trial], budget: float) -> int | None:
@@ -206,11 +237,13 @@ def _sweep_summary(group: tuple[Trial, ...], budget: float) -> SweepSummary:
             per_phase[phase] = PhaseSummary(
                 latency=latency,
                 tokens=TokenUsageSummary.from_trials(trials),
+                throughput=ThroughputSummary.from_trials(trials),
                 verdict=deadline_verdict(latency, budget),
             )
     return SweepSummary(
         latency=LatencySummary.from_trials(group),
         tokens=TokenUsageSummary.from_trials(group),
+        throughput=ThroughputSummary.from_trials(group),
         per_phase=per_phase,
         verdict=overall_verdict([summary.verdict for summary in per_phase.values()]),
         trials=group,
@@ -258,6 +291,7 @@ def build_report(
         budget_seconds=budget,
         per_sweep=per_sweep,
         verdict=overall_verdict([summary.verdict for summary in per_sweep.values()]),
+        budgets=budget_table(trials, endpoint_scope=run.endpoint_scope),
         capacity=capacity_basis(concurrency, budget),
         tokens_per_reflection=tokens,
         quality_score=quality,

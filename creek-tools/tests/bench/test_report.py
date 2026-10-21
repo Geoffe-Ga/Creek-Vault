@@ -40,11 +40,13 @@ def _trial(
         input_words=4,
         latency_s=latency_s,
         generation_s=None,
+        ttft_s=None,
         outcome=outcome,
         model_resident_bytes=None,
         prompt_tokens=None,
         output_tokens=None,
         max_output_tokens=None,
+        token_basis=None,
     )
 
 

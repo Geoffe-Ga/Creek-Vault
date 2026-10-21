@@ -234,11 +234,13 @@ def run_trial(
         input_words=len(spec.content.split()),
         latency_s=max(latency, 0.0),
         generation_s=probe.generation_s,
+        ttft_s=None if probe.ttft_s is None else max(probe.ttft_s, 0.0),
         outcome=outcome,
         model_resident_bytes=_resident_bytes(plan),
         prompt_tokens=usage.prompt_tokens if usage is not None else None,
         output_tokens=usage.output_tokens if usage is not None else None,
         max_output_tokens=probe.max_output_tokens,
+        token_basis=usage.basis if usage is not None else None,
     )
 
 
@@ -281,11 +283,13 @@ def _evict_then_run(
             input_words=len(spec.content.split()),
             latency_s=0.0,
             generation_s=None,
+            ttft_s=None,
             outcome=classify_outcome(exc),
             model_resident_bytes=None,
             prompt_tokens=None,
             output_tokens=None,
             max_output_tokens=None,
+            token_basis=None,
         )
     if pause_s is not None:
         harness.plan.sleeper(pause_s)

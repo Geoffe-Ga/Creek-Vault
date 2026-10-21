@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from creek_mcp.bench.outcome import Outcome
+from creek_mcp.bench.usage import TokenBasis
 
 
 class Sweep(StrEnum):
@@ -52,6 +53,12 @@ class Trial(BaseModel):
         generation_s: Seconds inside the model call alone, or ``None`` when
             the model was never reached. ``latency_s - generation_s`` is the
             grounding-and-overhead share of the shared deadline.
+        ttft_s: Seconds from the start of the model call to its first token,
+            as a streaming backend reported them, or ``None`` when the backend
+            does not stream. ADR-0016 R2 budgets this at p95 ≤ 2 s with the
+            attestation round trip included, which for a pool client is inside
+            the same call. ``None`` is "unknown", never "instant" and never
+            "as slow as the whole call".
         outcome: How it ended.
         model_resident_bytes: The model's resident size reported by the
             runtime after the trial, or ``None`` when unknown.
@@ -65,6 +72,13 @@ class Trial(BaseModel):
             the factory was never reached. ``output_tokens`` above it means the
             model overran its budget; the report counts that rather than
             clipping it.
+        token_basis: Where this trial's counts came from, travelling with the
+            counts rather than being inferred from the run. ``None`` when the
+            provider reported none. Only
+            :attr:`~creek_mcp.bench.usage.TokenBasis.PROVIDER_REPORTED` may
+            feed a tokens-per-second figure: a rate over a byte upper bound
+            divides a bound by a measurement and flatters the backend, so
+            :class:`~creek_mcp.bench.stats.ThroughputSummary` refuses it.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -75,8 +89,10 @@ class Trial(BaseModel):
     input_words: NonNegativeInt
     latency_s: NonNegativeFloat
     generation_s: NonNegativeFloat | None
+    ttft_s: NonNegativeFloat | None
     outcome: Outcome
     model_resident_bytes: NonNegativeInt | None
     prompt_tokens: NonNegativeInt | None
     output_tokens: NonNegativeInt | None
     max_output_tokens: NonNegativeInt | None
+    token_basis: TokenBasis | None

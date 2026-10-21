@@ -13,8 +13,10 @@ import logging
 from typing import TYPE_CHECKING
 
 from creek_mcp.bench.corpus import entry_text
+from creek_mcp.bench.deadline import R2_POOL_CONCURRENCY, BudgetName
 from creek_mcp.bench.report import load_report, write_report
 from creek_mcp.bench.runner import run_bench
+from creek_mcp.bench.usage import TokenBasis
 from tests.bench.conftest import CANARY, FakeModel, make_plan
 
 if TYPE_CHECKING:
@@ -102,3 +104,42 @@ def test_measured_tokens_are_counts_and_never_content(tmp_path: Path) -> None:
         assert measured.output_cap_exceeded
     sweep_tokens = next(iter(report.per_sweep.values())).tokens
     assert sweep_tokens.output_cap_exceeded_count > 0
+
+
+def test_the_budget_and_throughput_fields_are_filled_not_merely_declared(
+    tmp_path: Path,
+) -> None:
+    """The content-free guard above must not pass vacuously on new fields.
+
+    ``test_report_never_contains_corpus_or_output`` proves nothing about a
+    field a run leaves unset, so this asserts the latency-budget block and the
+    throughput block of #1895 are genuinely populated by a run — and that what
+    populates them is numbers and closed enums, with the canary nowhere in the
+    serialized form.
+    """
+    model = FakeModel(echo_canary=True)
+    plan = make_plan(
+        model,
+        seed=19,
+        concurrency_levels=(1, R2_POOL_CONCURRENCY),
+        idle_cycles=1,
+        measure_tokens=True,
+    )
+    report = run_bench(plan, tmp_path / "corpus")
+    rendered = report.model_dump_json()
+
+    assert {row.name for row in report.budgets.rows} == set(BudgetName)
+    judged = [row for row in report.budgets.rows if row.measured_seconds is not None]
+    assert judged, "no budget row was judged, so the block proves nothing"
+    assert all(row.limit_seconds > 0 for row in report.budgets.rows)
+    assert report.budgets.pool_level_measured is True
+
+    throughputs = [summary.throughput for summary in report.per_sweep.values()]
+    assert throughputs
+    assert all(block.excluded_count > 0 for block in throughputs)
+    assert all(block.basis is TokenBasis.BYTE_UPPER_BOUND for block in throughputs)
+
+    assert CANARY not in rendered
+    for prompt in model.prompts:
+        for window in _windows(prompt.rsplit("ENTRY:", 1)[-1]):
+            assert window not in rendered

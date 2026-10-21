@@ -96,19 +96,119 @@ JSON schema.
 | Field | Meaning |
 |---|---|
 | `host` | Capacity facts (CPUs, RAM, kernel, free disk) of the machine the **harness** ran on (`scope: harness`). `describes_model_host` is true only when the model ran there too: fake mode or a loopback endpoint. Free disk is from `--model-store-path` when given (`disk_scope: model_store`), otherwise from the harness's temp directory (`harness_temp`). |
-| `budget_seconds` | `min(limits.DEFAULT_TIMEOUT_SECONDS, OllamaProvider.REQUEST_TIMEOUT)`. Grounding and generation share this one budget. |
-| `per_sweep.<sweep>.latency` | p50 and p95 over **ok** trials; the error rate over all trials; `generation_p95_s`, the model call's share. |
+| `budget_seconds` | `min(limits.DEFAULT_TIMEOUT_SECONDS, OllamaProvider.REQUEST_TIMEOUT)`. Grounding and generation share this one budget. It is the deadline **this process** enforces; ADR-0016 R2's four budgets are in `budgets`. |
+| `per_sweep.<sweep>.latency` | p50 and p95 over **ok** trials; the error rate over all trials; `generation_p95_s`, the model call's share; `ttft_p95_s`, the p95 time to first token over the trials whose backend reported one (`null` when none did). |
+| `per_sweep.<sweep>.throughput`, `…per_phase.<phase>.throughput` | Output tokens per second — `basis`, `count`, `excluded_count`, `tokens_per_second_p50`, `tokens_per_second_p95`. See the budget section below for why a fake run's figures are `null`. |
+| `budgets` | ADR-0016 R2's named budget table. See below. |
 | `per_sweep.<sweep>.per_phase` | The same aggregates and a verdict per residency phase (`cold`, `warm`, `resume`), so a slow cold start is not hidden inside many warm trials. |
 | `per_sweep.<sweep>.verdict` | The worse of its phases. A phase `fits` only when p95 ≤ budget **and** no trial failed; trials that all failed are `exceeds`, not missing data. |
-| `verdict` | Any `exceeds` dominates. `insufficient_data` means nothing was measured. |
+| `verdict` | Any `exceeds` dominates. `insufficient_data` means nothing was measured. **This is the per-sweep verdict against `budget_seconds` only** — R2 is answered by `budgets.verdict`, separately, because a run can sit well inside the shed deadline while measuring nothing R2 asks about. |
 | `capacity` | The largest concurrency level that fits, together with every level below it. It is compared against `/v1`'s admission caps (`DEFAULT_MAX_CONCURRENCY`, `DEFAULT_MAX_PER_CONSUMER`). It reports and changes nothing. |
 | `trials[].outcome` | One of `ok`, `timeout`, `oom`, `disk_full`, `provider_unavailable`, `context_overflow` or `error`. |
 | `trials[].model_resident_bytes` | The model's size from `/api/ps`. This is the runtime's figure, not the harness process's RSS. |
+| `trials[].ttft_s` | Seconds from the start of the model call to its first token, as a streaming backend reported them, or `null` when the backend does not stream. `null` is "unknown" — never "instant", never "as slow as the whole call". |
 | `trials[].prompt_tokens` / `output_tokens` | What the provider reported for that trial, or `null` when it reported nothing. Never derived. |
+| `trials[].token_basis` | Where that trial's counts came from, travelling with the counts. Only `provider_reported` may feed a tokens/s figure. |
 | `trials[].max_output_tokens` | The output ceiling `reflect_tool` asked the factory for, captured at the model seam. |
 | `per_sweep.<sweep>.tokens`, `…per_phase.<phase>.tokens` | Measured prompt and output tokens over the **ok** trials of that group: p50, p95, mean, max, plus `reported_count`, `unreported_count` and `output_cap_exceeded_count`. |
 | `tokens_per_reflection` | The run-level measured token block. See below. |
 | `quality_score` | The voice-fidelity eval's per-dimension scores, rubric version, seed and verdict ([#1898](https://github.com/Geoffe-Ga/Creek-Vault/issues/1898)), or `null` for a capacity-only run. See below. |
+
+## Latency budgets: ADR-0016 R2's named table
+
+R2 states four budgets, not one. The harness reports each as its own row in
+`budgets.rows`, with its limit, the value judged against it, and its own
+verdict — never collapsed into a single pass.
+
+| Row | Limit | Source | Judged against |
+|---|---|---|---|
+| `server_shed_deadline` | `min(DEFAULT_TIMEOUT_SECONDS, OllamaProvider.REQUEST_TIMEOUT)` | `code` | Representative reflection p95 |
+| `vault_first_byte_window` | 10 s | `documented_constant` | Representative reflection p95 |
+| `vault_reflection_p95` | 25 s | `adr_0016_r2` | Representative reflection p95 |
+| `machine_wake_within_client_deadline` | 10 s × 3 attempts | `documented_constant` | p95 of the **cold and resumed** trials, which are the wake-bearing ones |
+| `pool_generate_p95` | 10 s | `adr_0016_r2` | `generation_p95_s` of the concurrency sweep's **level-4** trials |
+| `pool_ttft_p95` | 2 s | `adr_0016_r2` | `ttft_p95_s` over the run's `ok` trials |
+
+"Representative reflection p95" means **every sweep except the context
+sweep**. All the others reflect an entry of the workload's `query_words` size,
+which is the reflection R2 budgets "cold and warm". The context sweep
+deliberately walks input size up towards `num_ctx` to find where the window
+breaks, so its trials time entries production never sends; naming that p95
+`vault_reflection_p95` would publish a stress result as the production figure.
+Those trials are still judged — against the deadline this process enforces, in
+their own `per_sweep.context` verdict.
+
+**Which budget is code-derived and which is ADR-derived.** `source: code`
+means the limit is read through its module or class at call time, so patching
+`limits.DEFAULT_TIMEOUT_SECONDS` moves both the limit and the verdict.
+`documented_constant` means the number is stated by code in *another*
+repository — adepthood's `creek_vault_client.py` — which this process cannot
+import, so it is recorded here as a constant, composed the way its source
+composes it. `adr_0016_r2` means the ADR states it and no code anywhere does.
+
+**The 10 s first-byte window is what binds today.** R2 names its own
+prerequisite: adepthood must widen `_post_reflection`'s phase budgets to its
+30 s deadline with `_widened_phase_budgets`, as the cold embedding call
+already is. It has not happened —
+[#1903](https://github.com/Geoffe-Ga/Creek-Vault/issues/1903) sequences it,
+and it is adepthood's own issue. Until then `_post_reflection` runs on the
+pooled client whose `httpx.Timeout` `read` phase is
+`_VAULT_TIMEOUT_SECONDS = 10.0`, `/v1/reflections` is not streamed, and
+Machine wake is **inside** that window rather than beside it.
+
+So the harness reports the 25 s budget and judges against the 10 s one:
+
+- `budgets.binding_budget` names the budget production enforces
+  (`vault_first_byte_window` today, `vault_reflection_p95` once widened);
+- `budgets.phase_budgets_widened` records which world the run was judged in;
+- `in_force` is `false` on the 25 s row, and `budgets.verdict` is the worst
+  verdict **among the rows in force only**.
+
+**A green `vault_reflection_p95` row is therefore not a pass.** It says the
+measurement would fit a budget production does not yet allow. The row that
+decides anything today is `vault_first_byte_window`.
+
+**No row is a production guarantee unless `measures_production_path` is true.**
+That field is `false` for every `fake` and `loopback` run, because such a run
+times this process on this machine: there is no Fly Machine to wake, no pool
+to dial and no attestation round trip to include. The figures are a floor on
+the harness's own overhead and nothing more. Only a `private` or `remote`
+endpoint earns the field, and ADR-0016 Decision 4 authorizes **no spend** for
+such a run yet — that is the capstone child,
+[#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899).
+
+**A failure outranks a fast p95.** Each row applies `MAX_FIT_ERROR_RATE = 0.0`
+before it compares anything: a group containing one timed-out, OOM, disk-full
+or model-unavailable trial is `exceeds` even when its p95 is inside every
+budget. That trial is a reflection the user did not get, however fast it
+failed. With no failures, a `null` measured value is a genuine gap —
+`insufficient_data`, never a pass. That is what a run reports when nothing
+streamed (`pool_ttft_p95`), when concurrency 4 was never requested
+(`pool_generate_p95`, and `pool_level_measured` is then `false`), or when no
+cold or resumed trial ran (`machine_wake_within_client_deadline`).
+
+### tokens/s, and when it is refused
+
+`throughput` carries output tokens per second, and it is computed **only from
+`provider_reported` counts**. A `byte_upper_bound` count bounds *bytes*, so
+dividing it by a measured generation time yields an upper bound on throughput
+wearing a measurement's clothes — and an upper bound flatters the backend,
+which is the one direction a capacity figure must never err in. Such samples
+land in `excluded_count`, the figures stay `null`, and `basis` says which bound
+was refused. This is the same rule
+`creek_mcp/provisioning/pool_bundle.py`'s `size_pool_caps` applies to the cost
+side.
+
+So **a `--mode fake` run reports `tokens_per_second_p50` and
+`tokens_per_second_p95` as `null`** with `basis: "byte_upper_bound"` and a
+non-zero `excluded_count`. That is the correct result, not a gap in the
+harness: the fake has no tokenizer, so it can state a rate over bytes or
+nothing, and nothing is the honest option. A citable rate needs a pinned local
+runtime or the live pool run.
+
+Note also that `tokens_per_second_p95` is the **favourable** tail — the run's
+fastest generation, not its worst. A latency budget is judged on
+`latency.p95_s`; throughput p95 is never the figure to promise against.
 
 ## Measured tokens per reflection
 
