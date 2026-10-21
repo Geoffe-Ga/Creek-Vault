@@ -20,8 +20,20 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.19.0"
+CONTRACT_VERSION: Final[str] = "0.20.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.20.0 (#1938): ``GET /v1/capabilities`` gains ``keyless_inference``. It is
+``false`` when this vault is certain that a model call carrying no writer key
+will be refused before any model is dialled. Today that means a managed vault
+with no shared pool pinned: it ships no inference runtime and refuses its
+operator's cloud key. ``inference_pool: false`` could not say this, because a
+self-connected vault running its own model reports the same. Without the field
+a consumer could only learn it by charging a writer, dialling, and refunding a
+``temporarily_unavailable`` that retrying never clears. ``true`` means a
+keyless call may be attempted, which is all a self-connected vault has ever
+promised. The field is withheld from callers below 0.20, so every response a
+``0.19`` consumer can reach is byte-identical, and ``0.19`` stays in the window.
 
 0.19.0 (#1894, ADR-0016): **provenance, and the admission refusal the shared
 inference pool needs.** Three additions, all gated on this minor.

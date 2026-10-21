@@ -334,7 +334,9 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
         ("0.2", _OK_STATUS),
         ("0.2.0", _INCOMPATIBLE_STATUS),
         ("0.2.1", _INCOMPATIBLE_STATUS),
-        ("0.20", _INCOMPATIBLE_STATUS),
+        # ``0.30`` is to the served ``0.3`` what ``0.20`` was to ``0.2`` until
+        # #1938 made ``0.20`` a real minor: equal as a float, not as a string.
+        ("0.30", _INCOMPATIBLE_STATUS),
         (" 0.2", _INCOMPATIBLE_STATUS),
         ("v0.2", _INCOMPATIBLE_STATUS),
         ("", _INCOMPATIBLE_STATUS),
