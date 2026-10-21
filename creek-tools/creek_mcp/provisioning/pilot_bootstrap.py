@@ -5,10 +5,16 @@ from __future__ import annotations
 import os
 import stat
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from creek_mcp.container_runtime import ContainerConfigurationError, is_mounted_volume
+from creek_mcp.provisioning.pool_admin_key import verify_pool_admin_key
+from creek_mcp.provisioning.pool_bundle import (
+    POOL_ADMIN_KEY_GUEST_PATH,
+    POOL_ADMIN_KEY_SECRET_NAME,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,6 +32,7 @@ _SECRET_FILES: Final[tuple[Path, ...]] = (
     Path("/run/secrets/creek_tls_ca_private_key"),
     Path("/run/secrets/creek_handoff_token"),
     Path("/run/secrets/creek_fleet_policy"),
+    Path(POOL_ADMIN_KEY_GUEST_PATH),
 )
 _FLY_SECRET_NAMES: Final[tuple[str, ...]] = (
     "CREEK_CONTROL_TOKENS_B64",
@@ -35,6 +42,7 @@ _FLY_SECRET_NAMES: Final[tuple[str, ...]] = (
     "CREEK_TLS_CA_PRIVATE_KEY_B64",
     "CREEK_HANDOFF_TOKEN_B64",
     "CREEK_FLEET_POLICY_B64",
+    POOL_ADMIN_KEY_SECRET_NAME,
 )
 
 
@@ -115,12 +123,41 @@ def _run_pilot(argv: list[str]) -> None:
     pilot_cli.main(argv)
 
 
+def _require_custodied_pool_admin_key() -> None:
+    """Refuse startup unless the organization admin key is usable.
+
+    ADR-0016 Decision 3.4's per-activation key lifecycle cannot reset a cap,
+    extend an expiry or revoke a key without this credential, so a control
+    plane that came up without it would discover that only when a vault's key
+    expired.  The verdict is a closed-vocabulary code on stderr and nothing
+    else: never the value, its length or a digest of it (#1930).
+
+    This runs after ``prepare_runtime_paths`` has narrowed the file to mode
+    0400 and before any privilege drop, so a refusal lands before the
+    long-running composition is imported.  The value is format-checked inside
+    :func:`~creek_mcp.provisioning.pool_admin_key.verify_pool_admin_key`'s own
+    frame and is never returned here.
+
+    Raises:
+        SystemExit: With the verdict's own exit code when the key is unusable.
+    """
+    check = verify_pool_admin_key(
+        Path(POOL_ADMIN_KEY_GUEST_PATH),
+        environ=os.environ,
+        now=datetime.now(tz=UTC),
+    )
+    print(f"creek-fly-pilot: pool admin key: {check.status.value}", file=sys.stderr)
+    if check.refused:
+        raise SystemExit(check.exit_code)
+
+
 def main() -> None:
     """Reject env-carried secrets, prepare exact mounts, and exec unprivileged."""
     if any(os.environ.get(name) for name in _FLY_SECRET_NAMES):
         raise SystemExit("creek-fly-pilot: secret values must be injected as files")
     try:
         prepare_runtime_paths()
+        _require_custodied_pool_admin_key()
         drop_privileges_and_run(sys.argv[1:])
     except ContainerConfigurationError as exc:
         print(f"creek-fly-pilot: startup refused: {exc}", file=sys.stderr)

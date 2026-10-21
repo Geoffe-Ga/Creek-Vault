@@ -9,6 +9,17 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Give the organization pool admin key a declared custody path before any such
+  key exists (#1930). The rendered Fly pilot config declares
+  `CREEK_POOL_ADMIN_KEY_B64` at `/run/secrets/creek_pool_admin_key`, the root
+  bootstrap normalizes it and refuses the environment form, and
+  `creek_mcp.provisioning.pool_admin_key` fails closed with its own
+  content-free verdict codes (40-45, never reusing `--check pool`'s 30) plus
+  three `AlertKind` members distinct from `pool_credential_orphan`. The value
+  is never logged, echoed, measured or hashed, including on a vendor 401,
+  whose response body is never read. The vendor calls themselves remain
+  #1896's.
+
 - Managed vaults are now local-only by construction (#1863). Every
   Adepthood-provisioned vault Machine carries `CREEK_MANAGED_VAULT=1`, and a
   managed vault refuses to start while `CREEK_CLOUD_CONSENT` or the legacy

@@ -232,14 +232,53 @@ job record, a commit or this page.
 
 **The organization admin key** creates, updates and deletes per-activation
 vendor keys. It is held by the control plane as a declared secret file with its
-own alert kind, and re-issued **only on compromise** (create-then-delete, a
-per-activation Machine update). *Not built:* there is no declared-secret entry
-for it — the rendered Fly pilot config's `_SECRET_NAMES` names seven secrets and
-none is a pool admin key — and no alert kind of its own. The control-plane issue
-([#1900](https://github.com/Geoffe-Ga/Creek-Vault/issues/1900)) has since
-merged, and it carried the per-activation identity, URL and credential **without**
-either piece, so both are still unbuilt and no open issue currently owns them.
-The only pool alert kind registered today is `pool_credential_orphan`.
+own alert kinds, and re-issued **only on compromise** (create-then-delete, a
+per-activation Machine update). *Built* ([#1930](https://github.com/Geoffe-Ga/Creek-Vault/issues/1930)):
+the rendered Fly pilot config declares `CREEK_POOL_ADMIN_KEY_B64` at
+`/run/secrets/creek_pool_admin_key`, the root bootstrap normalizes it to
+mode 0400 and refuses the environment-variable form, and
+`creek_mcp.provisioning.pool_admin_key` owns its custody — `load_pool_admin_key`
+is the one way to the value and raises rather than returning a default, so an
+unconfigured or malformed key refuses instead of falling through to an
+unauthenticated path. Three alert kinds are registered, each distinct from
+`pool_credential_orphan` (which is about a per-activation key, not this one):
+`pool_admin_key_unusable`, `pool_admin_key_rejected` and
+`pool_admin_key_near_expiry`.
+
+**Why the control plane keeps the value in full, not a hash or a handle:** the
+vendor's Admin API identifies a key *by its own value*, so the `update` that
+resets a cap, the `update` that extends an expiry and the `delete` that revokes
+on deletion each present the full key value. A digest cannot be presented, and
+the API offers no key id or prefix a caller may substitute. That is also why
+this credential is more dangerous than a per-activation one: it carries no cap
+and no activation binding, so it can re-cap, mint or delete every vault's key.
+
+**Startup verdicts** (`pool_admin_key.PoolAdminKeyStatus`, content-free codes
+only — never the value, its length or a digest):
+
+| Verdict | Exit code | Means |
+|---|---|---|
+| `pool-admin-key-ready` | 0 | Present, owner-only, well-formed, in date |
+| `pool-admin-key-missing` | 40 | No declared secret file at all |
+| `pool-admin-key-malformed` | 41 | Not a bearer credential, or not owner-only |
+| `pool-admin-key-rejected` | 42 | The vendor answered 401/403; the body is never read |
+| `pool-admin-key-near-expiry` | 43 | Usable, inside 15 days of the declared expiry |
+| `pool-admin-key-expiry-undeclared` | 44 | No timezone-aware `CREEK_POOL_ADMIN_KEY_EXPIRES_AT` |
+| `pool-admin-key-expired` | 45 | The declared expiry has passed |
+
+Codes start at 40 so none can be confused with `--check pool`'s `30`
+(`pool-unconfigured`), which means "no pool at all" rather than "a pool with no
+usable admin key". The expiry is **declared** by the operator, not discovered:
+no vendor call is authorized, so the key's own expiry is recorded in the
+Machine's non-secret `[env]` beside the secret. An undeclared expiry refuses,
+because a key nobody dated expires unnoticed.
+
+*Still not built here:* the vendor calls themselves — the `update` that resets
+a cap, the in-place expiry extension and the create-then-delete re-issue — which
+are the attesting provider's
+([#1896](https://github.com/Geoffe-Ga/Creek-Vault/issues/1896)) and cannot be
+written before the vendor adapter exists. This page records custody, not
+lifecycle.
 
 **One vendor key per activation**, kept in full in the encrypted bundle because
 the vendor's update and delete calls require the value
@@ -302,7 +341,7 @@ Status, clause by clause, at this commit:
 | The scaling policy refuses a minimum of zero | There is no Creek-run engine host to scale. Residency is the vendor's property, asserted in its documentation and bounded by the contract's "a vendor outage is a refusal, never a fallback". The O3 policy that refuses a minimum of zero is dormant (section 7) | **Not met, and not implementable vault-side.** Owner gate: the vendor choice. What replaces it is the documented-residency row below plus the measured equivalence |
 | The first reflection after idle shows no load or download event | The attested channel gives the vault no engine-level telemetry, and no catalogue in ADR-0016's sources documents a load or download event, so unless the chosen vendor publishes one this clause has no observable signal under O5. The substitute is weaker and is recorded as such: latency equivalence below, plus the vendor's written residency terms | **Not met.** Owner gates: the vendor choice and a budget line (Decision 4) |
 | Its p95 equals the warm p95 within measurement noise | The harness's `idle` sweep (`--idle-cycles`, `--idle-seconds`) reports a `resume` phase in `per_sweep.idle.per_phase` — only `resume`, since `_idle` runs no warm trial — and the warm p95 comes from the `cold_warm` sweep, at `per_sweep.cold_warm.per_phase.warm.latency.p95_s`; the two are compared | **Not met, but no longer blocked on the harness.** Pool mode has landed ([#1892](https://github.com/Geoffe-Ga/Creek-Vault/issues/1892), closed): `--pool-url`, `--pool-identity` and `--pool-vendor` drive the real pool client through the same sweeps, hermetic against an in-process fake unless the run is live. What remains is the live run itself, which needs the owner's budget note ([#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899)) and the vendor choice |
-| The fleet report raises `pool_min_below_one` | Hermetic: the alert kind is in the closed `AlertKind` vocabulary and the report raises it when a warm minimum reads below one | **Not met:** `pool_min_below_one` is **not registered** in `AlertKind`, whose seven members end at `pool_credential_orphan`. [#1900](https://github.com/Geoffe-Ga/Creek-Vault/issues/1900) was expected to register it and merged without doing so, so no open issue owns it today. `tests/test_pool_runbook_docs.py` fails this page the moment it lands, so this row cannot go stale |
+| The fleet report raises `pool_min_below_one` | Hermetic: the alert kind is in the closed `AlertKind` vocabulary and the report raises it when a warm minimum reads below one | **Not met:** `pool_min_below_one` is **not registered** in `AlertKind`, which registers the pool credential orphan and the admin-key kinds of [#1930](https://github.com/Geoffe-Ga/Creek-Vault/issues/1930) but no warm-minimum kind. [#1900](https://github.com/Geoffe-Ga/Creek-Vault/issues/1900) was expected to register it and merged without doing so, so no open issue owns it today. `tests/test_pool_runbook_docs.py` fails this page the moment it lands, so this row cannot go stale |
 
 ### The procedure, for when those gates clear
 

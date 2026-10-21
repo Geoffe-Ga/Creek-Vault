@@ -9,6 +9,10 @@ import pytest
 
 from creek_mcp.container_runtime import ContainerConfigurationError
 from creek_mcp.provisioning import pilot_bootstrap
+from creek_mcp.provisioning.pool_admin_key import (
+    PoolAdminKeyCheck,
+    PoolAdminKeyStatus,
+)
 
 _CONTROL_DOCKERFILE = Path(__file__).resolve().parents[2] / "Dockerfile.control-plane"
 
@@ -262,10 +266,20 @@ def test_bootstrap_main_runs_exact_sequence_and_sanitizes_startup_failure(
         "drop_privileges_and_run",
         lambda argv: calls.append(argv),
     )
+    # The admin-key custody verdict has its own dedicated coverage in
+    # tests/test_pool_admin_key_custody.py; here it must only not interfere.
+    monkeypatch.setattr(
+        pilot_bootstrap,
+        "verify_pool_admin_key",
+        lambda *_args, **_kwargs: PoolAdminKeyCheck(PoolAdminKeyStatus.READY),
+    )
 
     pilot_bootstrap.main()
 
     assert calls == ["prepare", ["--flag"]]
+    assert capsys.readouterr().err == (
+        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.READY.value}\n"
+    )
 
     def refuse() -> None:
         raise ContainerConfigurationError("content-free-refusal")

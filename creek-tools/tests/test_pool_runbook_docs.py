@@ -50,7 +50,14 @@ from creek_mcp.bench.trial import Phase, Sweep
 from creek_mcp.container_health import ProbeResult, ProbeStatus
 from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV, ModelPackageManifest
 from creek_mcp.provisioning.budget import AlertKind
+from creek_mcp.provisioning.fly_pilot_config import _SECRET_NAMES
+from creek_mcp.provisioning.pilot_bootstrap import (
+    _SECRET_FILES as _BOOTSTRAP_SECRET_FILES,
+)
+from creek_mcp.provisioning.pool_admin_key import PoolAdminKeyStatus
 from creek_mcp.provisioning.pool_bundle import (
+    POOL_ADMIN_KEY_GUEST_PATH,
+    POOL_ADMIN_KEY_SECRET_NAME,
     POOL_MANIFEST_GUEST_PATH,
     POOL_VENDOR_KEY_GUEST_PATH,
 )
@@ -106,6 +113,15 @@ _POOL_EXIT_CODES: Final = {
     ProbeStatus.POOL_MODEL_MISSING: 32,
     ProbeStatus.POOL_IDENTITY_MISMATCH: 33,
 }
+
+# The admin-key custody surface of #1930: three alert kinds and the closed
+# verdict vocabulary whose exit codes the page tabulates.
+_ADMIN_KEY_ALERT_KINDS: Final = (
+    AlertKind.POOL_ADMIN_KEY_UNUSABLE.value,
+    AlertKind.POOL_ADMIN_KEY_REJECTED.value,
+    AlertKind.POOL_ADMIN_KEY_NEAR_EXPIRY.value,
+)
+_STATUSES: Final = tuple(PoolAdminKeyStatus)
 
 _DORMANT_HEADING: Final = "## 7. The O3 engine-host runbook, dormant"
 _DORMANT_TESTS: Final = ("T4", "T17", "T22", "T25")
@@ -349,6 +365,53 @@ def test_alert_kind_status_matches_the_enum(runbook: str) -> None:
     assert says_missing is not registered, (
         f"{_WARM_MINIMUM_ALERT} registered={registered}; "
         f"runbook says {_NOT_REGISTERED!r}={says_missing}"
+    )
+
+
+def test_admin_key_custody_claim_matches_the_code(runbook: str) -> None:
+    """The page may claim admin-key custody only while the code provides it.
+
+    #1930 was filed because this page attributed the declared-secret entry to
+    a merged issue that never shipped it. The claim is therefore tied to the
+    three artifacts that make it true: the Fly secret name in the rendered
+    config's closed set, the bootstrap-normalized guest path, and the alert
+    kinds. If any is removed, the page must go back to saying so.
+    """
+    assert POOL_ADMIN_KEY_SECRET_NAME in _SECRET_NAMES
+    assert Path(POOL_ADMIN_KEY_GUEST_PATH) in _BOOTSTRAP_SECRET_FILES
+    assert POOL_ADMIN_KEY_SECRET_NAME in runbook
+    assert POOL_ADMIN_KEY_GUEST_PATH in runbook
+    assert "there is no declared-secret entry" not in runbook
+
+
+@pytest.mark.parametrize("kind", sorted(_ADMIN_KEY_ALERT_KINDS))
+def test_every_admin_key_alert_kind_is_registered_and_documented(
+    runbook: str,
+    kind: str,
+) -> None:
+    """Each admin-key kind is in the closed vocabulary and named on the page."""
+    assert kind in {member.value for member in AlertKind}
+    assert kind in runbook
+
+
+@pytest.mark.parametrize(
+    ("status", "code"), sorted((status.value, status.exit_code) for status in _STATUSES)
+)
+def test_runbook_quotes_admin_key_exit_codes(
+    runbook: str,
+    status: str,
+    code: int,
+) -> None:
+    """Each custody verdict is documented with the code the code emits.
+
+    The codes an operator reads off a refused startup must be the ones the
+    module defines, and none may collide with ``--check pool``'s ``30``.
+    """
+    assert code not in set(_POOL_EXIT_CODES.values()) - {0}
+    rows = [line for line in runbook.splitlines() if status in line]
+    assert rows, f"{status} is not documented"
+    assert any(re.search(rf"\b{code}\b", row) for row in rows), (
+        f"{status} is not documented with exit code {code}"
     )
 
 

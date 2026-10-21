@@ -80,7 +80,8 @@ _USAGE_KEYS: Final[tuple[str, ...]] = (
     "pool_input_tokens",
     "pool_output_tokens",
 )
-_FLEET_SUBJECT: Final[str] = "fleet"
+FLEET_SUBJECT: Final[str] = "fleet"
+"""The subject an alert carries when it is about the fleet, not a resource."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +481,14 @@ class AlertKind(StrEnum):
     INCOMPLETE_CREATE = "incomplete_create"
     MONTHLY_BUDGET_DEPARTURE = "monthly_budget_departure"
     POOL_CREDENTIAL_ORPHAN = "pool_credential_orphan"
+    # The organization admin key (ADR-0016 Decision 3.4, #1930).  Its failure
+    # modes are *not* ``POOL_CREDENTIAL_ORPHAN``: that one names a leftover
+    # per-activation key, which costs money until it is revoked, while these
+    # name the one credential that can re-cap or delete every activation's
+    # key, whose loss stops the whole lifecycle rather than spending on it.
+    POOL_ADMIN_KEY_UNUSABLE = "pool_admin_key_unusable"
+    POOL_ADMIN_KEY_REJECTED = "pool_admin_key_rejected"
+    POOL_ADMIN_KEY_NEAR_EXPIRY = "pool_admin_key_near_expiry"
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,14 +540,14 @@ def _alert_for(divergence: Divergence, policy: FleetPolicy) -> Alert | None:
         return None
     resource_kind = _PER_RESOURCE_ALERTS.get(divergence.kind)
     if resource_kind is not None:
-        subject = divergence.provider_allocation_id or _FLEET_SUBJECT
+        subject = divergence.provider_allocation_id or FLEET_SUBJECT
         return Alert(_narrowed(resource_kind, divergence), subject, None, None, None)
     if divergence.kind is DivergenceKind.STUCK_DELETION:
-        kind, subject = AlertKind.STUCK_DELETION, divergence.job_id or _FLEET_SUBJECT
+        kind, subject = AlertKind.STUCK_DELETION, divergence.job_id or FLEET_SUBJECT
         threshold = policy.stuck_deletion_after
     elif divergence.kind is DivergenceKind.CONTINUOUS_RUNNING:
         kind = AlertKind.CONTINUOUS_RUNNING
-        subject = divergence.provider_allocation_id or _FLEET_SUBJECT
+        subject = divergence.provider_allocation_id or FLEET_SUBJECT
         threshold = policy.max_continuous_running
     else:
         return None
@@ -567,7 +576,7 @@ def evaluate_alerts(
         alerts.append(
             Alert(
                 AlertKind.MONTHLY_BUDGET_DEPARTURE,
-                _FLEET_SUBJECT,
+                FLEET_SUBJECT,
                 None,
                 str(estimate.estimated_month),
                 str(policy.monthly_budget),

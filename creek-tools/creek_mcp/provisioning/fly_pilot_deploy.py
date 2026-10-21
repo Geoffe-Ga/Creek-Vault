@@ -617,6 +617,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--handoff-url", required=True)
     parser.add_argument("--alert-url", required=True)
     parser.add_argument("--volume", required=True)
+    parser.add_argument("--pool-admin-key-expires-at", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--authorization-file", type=Path)
     parser.add_argument("--authorization-sha256")
@@ -638,6 +639,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.handoff_url,
         args.alert_url,
         args.volume,
+        args.pool_admin_key_expires_at,
     )
     if args.command == "render":
         if args.output is None:

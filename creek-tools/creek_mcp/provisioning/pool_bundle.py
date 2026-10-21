@@ -80,6 +80,28 @@ POOL_CLIENT_CERT_GUEST_PATH: Final[str] = "/run/secrets/creek_pool.crt"
 POOL_CLIENT_KEY_GUEST_PATH: Final[str] = "/run/secrets/creek_pool.key"
 """O3 successor: that certificate's private key."""
 
+POOL_ADMIN_KEY_GUEST_PATH: Final[str] = "/run/secrets/creek_pool_admin_key"
+"""The organization admin key's one declared home (#1930, Decision 3.4).
+
+It is a *control-plane* file, never a vault one: no activation's Machine
+carries it, because a vault that held it could re-cap or delete every other
+vault's key.  The custody rules live in
+:mod:`creek_mcp.provisioning.pool_admin_key`.
+"""
+
+POOL_ADMIN_KEY_SECRET_NAME: Final[str] = "CREEK_POOL_ADMIN_KEY_B64"
+"""The Fly app secret that injects :data:`POOL_ADMIN_KEY_GUEST_PATH`."""
+
+POOL_ADMIN_KEY_EXPIRES_AT_ENV: Final[str] = "CREEK_POOL_ADMIN_KEY_EXPIRES_AT"
+"""The admin key's declared expiry: a non-secret ISO-8601 instant.
+
+The vendor holds the real expiry and no vendor call is authorized (Decision
+4), so the operator declares it beside the secret the way the Fly org token's
+own expiry is declared.  An undeclared expiry is a refusal rather than an
+assumption: a key nobody dated expires unnoticed and takes the per-activation
+key lifecycle with it.
+"""
+
 _CAP_SAFETY_FACTOR: Final[int] = 2
 """Decision 3.4 sizes a cap at spent + allowance x measured tokens x this."""
 

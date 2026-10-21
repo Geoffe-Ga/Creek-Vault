@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
+from creek_mcp.provisioning.pool_bundle import (
+    POOL_ADMIN_KEY_EXPIRES_AT_ENV,
+    POOL_ADMIN_KEY_SECRET_NAME,
+)
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -28,6 +33,7 @@ _TOKENS: Final[tuple[str, ...]] = (
     "HANDOFF_URL",
     "ALERT_URL",
     "VOLUME",
+    "POOL_ADMIN_KEY_EXPIRES_AT",
     "FILE_REFERENCE_KEY",
 )
 _SECRET_NAMES: Final[frozenset[str]] = frozenset(
@@ -39,6 +45,11 @@ _SECRET_NAMES: Final[frozenset[str]] = frozenset(
         "CREEK_TLS_CA_PRIVATE_KEY_B64",
         "CREEK_HANDOFF_TOKEN_B64",
         "CREEK_FLEET_POLICY_B64",
+        # ADR-0016 Decision 3.4, #1930: the organization pool admin key gets a
+        # declared home here rather than being stored ad hoc the first time a
+        # vendor key exists.  Its custody rules live in
+        # creek_mcp.provisioning.pool_admin_key.
+        POOL_ADMIN_KEY_SECRET_NAME,
     }
 )
 
@@ -56,6 +67,7 @@ class FlyPilotCoordinates:
     handoff_url: str
     alert_url: str
     volume: str
+    pool_admin_key_expires_at: str
 
     def __post_init__(self) -> None:
         """Reject placeholders, mutable images, and TOML/shell injection."""
@@ -72,12 +84,10 @@ class FlyPilotCoordinates:
             or _IMAGE_RE.fullmatch(self.control_image) is None
         ):
             raise ValueError("Fly pilot images must use immutable sha256 digests")
-        try:
-            expiry = datetime.fromisoformat(self.token_expires_at)
-        except ValueError as exc:
-            raise ValueError("Fly pilot token expiry is invalid") from exc
-        if expiry.tzinfo is None:
-            raise ValueError("Fly pilot token expiry must include a timezone")
+        _require_aware_instant(self.token_expires_at, field="token expiry")
+        _require_aware_instant(
+            self.pool_admin_key_expires_at, field="pool admin key expiry"
+        )
         try:
             handoff = httpx.URL(self.handoff_url)
             alert = httpx.URL(self.alert_url)
@@ -99,6 +109,28 @@ class FlyPilotCoordinates:
             raise ValueError("Fly pilot callback URLs are invalid")
 
 
+def _require_aware_instant(value: str, *, field: str) -> None:
+    """Refuse an unparseable or timezone-naive declared instant.
+
+    Both declared expiries the pilot carries — the Fly org token's and the
+    pool admin key's — are judged against an absolute instant, so a naive one
+    would be read in whatever zone the reader happened to be in.
+
+    Args:
+        value: The declared ISO-8601 instant.
+        field: What to name in the refusal.
+
+    Raises:
+        ValueError: When *value* is unparseable or carries no offset.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"Fly pilot {field} is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"Fly pilot {field} must include a timezone")
+
+
 def render_fly_toml(template: Path, coordinates: FlyPilotCoordinates) -> str:
     """Render and structurally revalidate one secret-free Fly config."""
     try:
@@ -115,6 +147,7 @@ def render_fly_toml(template: Path, coordinates: FlyPilotCoordinates) -> str:
         "HANDOFF_URL": coordinates.handoff_url,
         "ALERT_URL": coordinates.alert_url,
         "VOLUME": coordinates.volume,
+        "POOL_ADMIN_KEY_EXPIRES_AT": coordinates.pool_admin_key_expires_at,
         "FILE_REFERENCE_KEY": "_".join(("secret", "name")),
     }
     for token in _TOKENS:
@@ -162,6 +195,7 @@ def _validate_document(
             "CREEK_PILOT_ALERT_URL": coordinates.alert_url,
             "CREEK_PILOT_RECONCILE_INTERVAL_SECONDS": "3600",
             "CREEK_PILOT_RECONCILE_WINDOW_SECONDS": "120",
+            POOL_ADMIN_KEY_EXPIRES_AT_ENV: coordinates.pool_admin_key_expires_at,
         }
         or not isinstance(service, dict)
         or service.get("internal_port") != 8080
