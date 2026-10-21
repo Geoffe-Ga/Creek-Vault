@@ -81,3 +81,8 @@
 # regenerated). Published as a rolling GitHub Release ("knowledge-graph")
 # by .github/workflows/graph-update.yml; the adepthood hub fetches it there.
 graphify-out/
+
+# Ralph fleet local worktrees — one checkout + .venv per in-flight issue,
+# created by scripts/ralph/fleet.sh. Machine-local scratch, never committed
+# (the sibling .claude/worktrees/ entry above covers the Agent tool's).
+.ralph/
