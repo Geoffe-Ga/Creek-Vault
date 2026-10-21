@@ -4,9 +4,29 @@ The FEAT-040.9 guard runs synchronously during ``creek draft`` and stamps
 each saved draft's frontmatter with ``voice_distance`` / ``voice_findings``.
 This lint check is the audit pass that asks the operator to revisit any
 draft whose distance exceeds the configured
-:attr:`creek.config.AIStyleConfig.voice_distance_upper`. Drafts that lack the
-stamp (written before the guard, or hand-authored) are re-scanned against the
-voice fingerprint so the check still has a measurement.
+:attr:`creek.config.AIStyleConfig.voice_distance_upper`.
+
+**Every draft is measured from its body, stamp or no stamp (#1936).** The
+check used to trust a stamped ``voice_distance`` and re-scan only the
+unstamped ones, which meant the same content could get two different
+verdicts: a stamp is a snapshot of what some earlier run measured, against
+the fingerprint, config and aggregation of *that* moment. After #1936 that
+divergence was no longer hypothetical — every draft stamped under the old
+diluting mean carries a number too small to flag — so the audit pass now
+re-measures the prose in front of it. Scanning is pure regex over the body;
+the stamp remains in frontmatter as the guard's attestation, which
+:mod:`creek.generate.voice_authenticity` still reads.
+
+**What this check does and does not catch.** ``voice_distance`` aggregates
+the per-tell-family divergences from the user's measured rates, and the
+shipped ceiling of 0.35 is cleared by one family diverging by more than
+about one occurrence per 371 words — so a short draft carrying a single
+AI-register tell is surfaced, while a divergence milder than each tell's own
+margin is treated as ordinary variation and never surfaced at all. The
+instrument measures *register*, by tell families someone enumerated; prose
+that is off-voice in a way no tell measures scores 0.0. See
+:mod:`creek.generate.ai_style.distance` for the aggregation and its
+measurements.
 
 **Epistemics — read this before acting on a finding.** Voice distance is a
 *probabilistic, vault-relative* signal: it measures how far a draft sits from
@@ -59,37 +79,28 @@ def _resolve_ai_style_config(vault_path: Path) -> AIStyleConfig:
         return AIStyleConfig()
 
 
-def _stamped_divergences(raw: object) -> str:
-    """Format the top stamped ``voice_findings`` entries as ``dir-use feature``."""
-    if not isinstance(raw, list):
-        return ""
-    parts: list[str] = []
-    for entry in raw[:_MAX_DIVERGENCES]:
-        if isinstance(entry, dict):
-            direction = entry.get("direction", "?")
-            feature = entry.get("feature_key", "?")
-            parts.append(f"{direction}-use {feature}")
-    return ", ".join(parts)
-
-
 def _measure_draft(
     post: frontmatter.Post,
     fingerprint: VoiceFingerprint,
     config: AIStyleConfig,
 ) -> tuple[float, str]:
-    """Return ``(voice_distance, divergences)`` for one draft.
+    """Return ``(voice_distance, divergences)`` measured from the draft's body.
 
-    Reads the stamped ``voice_distance`` / ``voice_findings`` when present;
-    otherwise re-scans the body against the fingerprint so unstamped drafts
-    are still measured.
+    The stamped ``voice_distance`` is deliberately not consulted (#1936): a
+    stamp records an earlier run's measurement, so trusting it would let the
+    same content reach two verdicts. The named divergences are the worst
+    families by evidence, so the operator reads the strongest signal first
+    rather than whichever tell happens to be registered earliest.
     """
-    stamped = post.metadata.get("voice_distance")
-    if isinstance(stamped, (int, float)):
-        return float(stamped), _stamped_divergences(post.metadata.get("voice_findings"))
     report = scan(post.content, fingerprint=fingerprint, config=config)
+    worst = sorted(
+        {finding.feature_key: finding for finding in report.findings}.values(),
+        key=lambda finding: report.family_evidence.get(finding.feature_key, 0.0),
+        reverse=True,
+    )
     divergences = ", ".join(
         f"{finding.direction}-use {finding.feature_key}"
-        for finding in report.findings[:_MAX_DIVERGENCES]
+        for finding in worst[:_MAX_DIVERGENCES]
     )
     return report.voice_distance, divergences
 

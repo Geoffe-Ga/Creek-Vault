@@ -18,17 +18,20 @@ is judged:
   :func:`creek.lint.checks.voice_fidelity.run` over the candidate written as a
   draft. It was removed for two measured reasons, not for tidiness.
 
-  First, it could not discriminate. Against this corpus's fingerprint the
-  on-voice fixture measures ``voice_distance=0.0000`` and the deliberately
-  off-voice fixture ``0.1012``, both far under the shipped
-  :attr:`creek.config.AIStyleConfig.voice_distance_upper` of ``0.35``. A
-  heavier slop text tripping six of the sixteen active tell families still
-  only reaches ``0.2568``; the ceiling is first cleared by a saturation
-  specimen that trips all sixteen at once (``0.6863``) — prose no candidate
-  model emits. At candidate length the component therefore read ``True`` for
-  *both* fixtures, contributing a constant point to every obedience score.
+  First, it could not discriminate — the defect #1936 has since fixed in the
+  scorer it delegated to. When #1911 measured it, the on-voice fixture scored
+  ``voice_distance=0.0000`` against this corpus's fingerprint and the
+  deliberately off-voice fixture ``0.1012``, both far under the shipped
+  :attr:`creek.config.AIStyleConfig.voice_distance_upper` of ``0.35``: the
+  score was a weighted mean over all seventeen article tells, so two tripped
+  families were diluted by the fifteen clean ones and nothing under nine
+  simultaneous families reached the ceiling. The component therefore read
+  ``True`` for *both* fixtures, contributing a constant point to every
+  obedience score. #1936 replaced that mean with a union of per-family
+  evidence and the same off-voice fixture now measures ``0.9778``, so this
+  reason has expired; the second has not, and it is sufficient on its own.
 
-  Second, even a recalibrated ceiling could not be allowed to stand as a
+  Second, even a discriminating voice check could not be allowed to stand as a
   fourth component: with four equally-weighted components a candidate that
   violates exactly one scores ``3/4 = 0.75``, which clears
   :data:`~creek_mcp.bench.eval.PASS_THRESHOLD`. The dimension could not fail

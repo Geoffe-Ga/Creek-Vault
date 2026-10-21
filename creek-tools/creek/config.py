@@ -1832,8 +1832,26 @@ class AIStyleConfig(BaseModel):
     voice_distance_upper: float = Field(default=0.35, ge=0.0, le=1.0)
     """Distance above which a draft is considered to diverge from the
     user's voice enough to warrant a rewrite pass / lint finding. Capped at
-    1.0 because ``voice_distance`` is always ``< 1.0``; a higher threshold
-    would silently disable the check."""
+    1.0 because ``voice_distance`` never exceeds 1.0; a threshold *at* the
+    attainable maximum would silently disable the check.
+
+    **What 0.35 means, measured (#1936).** The number is unchanged, but the
+    aggregation beneath it is no longer a mean over every tell, so the
+    ceiling finally falls somewhere a draft can reach. ``voice_distance`` is
+    now the union of per-family evidence, each family's evidence being
+    ``rate / (rate + 5.0)`` once it clears its own margin, so **one
+    weight-1.0 family clears 0.35 when it diverges by more than 2.69
+    occurrences per 1000 words — about one per 371 words**, and milder
+    divergences must accumulate across families to flag. Measured against
+    the eval harness's synthetic corpus, with these defaults: the corpus's
+    own entries and an on-voice candidate score 0.0000; a candidate written
+    deliberately off-voice (two families) 0.9778; a synthetic specimen
+    tripping one family at 53 words 0.8830. Under the old weighted mean
+    those were 0.0000, 0.1012 and 0.0535 — nothing short of nine
+    simultaneous families (0.3698) reached this ceiling, which is why the
+    check never fired on a real draft. Full table and derivation:
+    :mod:`creek.generate.ai_style.distance`; pinned by
+    ``tests/generate/ai_style/test_voice_distance_discrimination.py``."""
 
     citation_network_checks: bool = False
     """Opt-in toggle for live external-link checking by the ``citation`` tells.

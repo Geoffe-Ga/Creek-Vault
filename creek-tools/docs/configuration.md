@@ -543,6 +543,8 @@ ai_style:
   min_fingerprint_fragments: 5 # below this the fingerprint is "thin"
 ```
 
+`voice_distance` is the union of the per-tell-family divergences that clear their own margins, so one family diverging by more than about one occurrence per 371 words clears the default `voice_distance_upper` of 0.35, and prose in your own measured voice scores exactly `0.0000`. (Before #1936 it was a weighted mean over every family, including the ones that matched you, so a draft needed roughly nine simultaneously tripped families to clear the same ceiling and the check effectively never fired.)
+
 `voice_distance_target` is the value the post-composition de-slop rewrite loop drives toward; it is distinct from `voice_distance_upper` (the accepted ceiling) and is **clamped** to the ceiling if configured above it. The guard always stamps a `voice_guard_status` on the draft (`rewritten`, `measured_only:*`, or `skipped:*`) — it never silently passes a mannered draft through. See [generation](./generation.md#voice-fidelity-feat-040).
 
 ## `author` — the Writing Desk

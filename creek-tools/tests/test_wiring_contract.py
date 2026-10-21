@@ -1321,7 +1321,21 @@ CLI_CONTRACT: Final[Mapping[str, Surface]] = {
         derived_from=("creek.generate.voice_authenticity:VOICE_DISTANCE_KEY",),
         argv=("{essay}", "--vault", "{vault}"),
         prepare=(("report", "--vault", "{vault}", "--type", "fingerprint"),),
-        effect=Effect(prints=("voice_distance",), absent=("Skipping the check",)),
+        # Exit 1 is the measured verdict, not a tolerated regression (#1936).
+        # Every fragment in the seeded corpus is a short standalone line, so
+        # the profiler measures a one-line-fragment rate of 36.47 per 1k words
+        # and the ``one_line_fragment`` *signature* tell becomes live for this
+        # voice; the essay is one dense block, strips that rhythm entirely, and
+        # is flagged for under-use — which is the tell's stated purpose. This
+        # surface read exit 0 until #1936 only because the weighted mean
+        # divided that one divergence by 16.5 and called 0.8794 a 0.0533. The
+        # observable the surface exists to prove is unchanged and stronger: the
+        # command measures this file and does not skip.
+        effect=Effect(
+            prints=("voice_distance", "diverges from voice"),
+            absent=("Skipping the check",),
+            exit_code=1,
+        ),
         contrast=Contrast(
             why=(
                 "with no corpus behind it there is no fingerprint to measure "

@@ -118,17 +118,28 @@ Semantic (run when `--since` or an explicit `--check` is passed):
 
 ### Voice fidelity (FEAT-040)
 
-The `voice-fidelity` check walks `07-Voice/Drafts/`, reads the
-`voice_distance` / `voice_findings` frontmatter stamped by the
-generation-time guard (and re-scans any draft that lacks the stamp against
-your voice fingerprint), and surfaces one finding per draft whose
-`voice_distance` exceeds `ai_style.voice_distance_upper` (default `0.35`).
-Each finding names the top over- and under-used features and a remediation
+The `voice-fidelity` check walks `07-Voice/Drafts/`, measures each draft's
+body against your voice fingerprint, and surfaces one finding per draft
+whose `voice_distance` exceeds `ai_style.voice_distance_upper` (default
+`0.35`). Each finding names the most divergent features and a remediation
 hint — re-run `creek draft` or revise toward your voice. It runs by default,
 or on demand with `creek lint --check voice-fidelity`. If no fingerprint
 exists yet it emits a single informational finding (run the profiler first)
 rather than failing. Like every lint check it only **reads** — it never
 rewrites or deletes a draft.
+
+Every draft is re-measured, stamp or no stamp (#1936). The generation-time
+guard still stamps `voice_distance` / `voice_findings` into frontmatter as
+its attestation, but the audit pass does not read them to decide: a stamp
+records what an earlier run measured, against the fingerprint, config and
+scoring of that moment, so trusting it would let the same prose reach two
+verdicts. What the ceiling means in practice: `voice_distance` is the union
+of the per-tell-family divergences that clear their own margins, so **one
+family diverging by more than about one occurrence per 371 words is enough
+to surface a draft**, and milder divergences have to accumulate across
+families. A divergence smaller than a family's own margin is treated as
+ordinary variation and never surfaces — which is why prose in your own
+measured voice scores exactly `0.0000`.
 
 > **This is not an AI detector.** Voice distance is a *probabilistic,
 > vault-relative* signal: it measures how far a draft sits from **your own

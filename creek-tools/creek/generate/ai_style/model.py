@@ -157,13 +157,21 @@ class ScanReport:
         findings: Every divergence that exceeded its margin.
         deltas: Per-``feature_key`` signed ``draft_rate - user_rate`` (the
             user side falling back to the generic prior when unmeasured).
-        voice_distance: The aggregate weighted divergence. ``0.0`` means the
-            draft's measured profile matches the user's.
+        family_evidence: Per-``feature_key`` evidence in ``[0, 1)`` that this
+            tell family really diverges — ``0.0`` for every family inside its
+            margin, the saturated magnitude above it (#1936). One entry per
+            measured family, so this is the per-component view behind the
+            scalar: a caller ranking several candidates can read *which*
+            families diverge and how hard, rather than only the aggregate.
+        voice_distance: The aggregate divergence — the union of
+            ``family_evidence``. ``0.0`` means no family cleared its margin,
+            which is exactly when ``findings`` is empty.
         thin_fingerprint: ``True`` when the fingerprint was below the
             configured ``min_fingerprint_fragments`` and flagging was softened.
     """
 
     findings: list[Finding] = field(default_factory=list)
     deltas: dict[str, float] = field(default_factory=dict)
+    family_evidence: dict[str, float] = field(default_factory=dict)
     voice_distance: float = 0.0
     thin_fingerprint: bool = False
