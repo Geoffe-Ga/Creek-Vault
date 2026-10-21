@@ -50,6 +50,15 @@ from creek_mcp.bench.trial import Phase, Sweep
 from creek_mcp.container_health import ProbeResult, ProbeStatus
 from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV, ModelPackageManifest
 from creek_mcp.provisioning.budget import AlertKind
+from creek_mcp.provisioning.fly_pilot_config import _SECRET_NAMES
+from creek_mcp.provisioning.pool_admin_key import (
+    POOL_ADMIN_KEY_GUEST_PATH,
+    POOL_ADMIN_KEY_IN_USE_ENV,
+    POOL_ADMIN_KEY_RENEW_WITHIN,
+    POOL_ADMIN_KEY_SECRET_NAME,
+    PoolAdminKeyStatus,
+    pool_admin_secret_files,
+)
 from creek_mcp.provisioning.pool_bundle import (
     POOL_MANIFEST_GUEST_PATH,
     POOL_VENDOR_KEY_GUEST_PATH,
@@ -106,6 +115,15 @@ _POOL_EXIT_CODES: Final = {
     ProbeStatus.POOL_MODEL_MISSING: 32,
     ProbeStatus.POOL_IDENTITY_MISMATCH: 33,
 }
+
+# The admin-key custody surface of #1930: three alert kinds and the closed
+# verdict vocabulary whose exit codes the page tabulates.
+_ADMIN_KEY_ALERT_KINDS: Final = (
+    AlertKind.POOL_ADMIN_KEY_UNUSABLE.value,
+    AlertKind.POOL_ADMIN_KEY_REJECTED.value,
+    AlertKind.POOL_ADMIN_KEY_NEAR_EXPIRY.value,
+)
+_STATUSES: Final = tuple(PoolAdminKeyStatus)
 
 _DORMANT_HEADING: Final = "## 7. The O3 engine-host runbook, dormant"
 _DORMANT_TESTS: Final = ("T4", "T17", "T22", "T25")
@@ -349,6 +367,97 @@ def test_alert_kind_status_matches_the_enum(runbook: str) -> None:
     assert says_missing is not registered, (
         f"{_WARM_MINIMUM_ALERT} registered={registered}; "
         f"runbook says {_NOT_REGISTERED!r}={says_missing}"
+    )
+
+
+def test_admin_key_custody_claim_matches_the_code(runbook: str) -> None:
+    """The page may claim admin-key custody only while the code provides it.
+
+    #1930 was filed because this page attributed the declared-secret entry to
+    a merged issue that never shipped it, so each claim is tied to the artifact
+    that makes it true rather than to a phrase that a rewording defeats: the
+    Fly secret name, the guest path the bootstrap normalizes while the key is
+    in use, and the env var that declares the regime must all be quoted.
+    """
+    assert Path(POOL_ADMIN_KEY_GUEST_PATH) in pool_admin_secret_files(
+        {POOL_ADMIN_KEY_IN_USE_ENV: "1"}
+    )
+    assert POOL_ADMIN_KEY_SECRET_NAME in runbook
+    assert POOL_ADMIN_KEY_GUEST_PATH in runbook
+    assert POOL_ADMIN_KEY_IN_USE_ENV in runbook
+
+
+def test_the_page_does_not_claim_the_admin_key_is_unconditionally_declared(
+    runbook: str,
+) -> None:
+    """The regime is conditional, and the page must say which regime is default.
+
+    The secret is declared in the rendered config only while the key is in
+    use, so a page that said the control plane always carries eight secrets
+    would be as wrong as the one that said it carried none.
+    """
+    assert POOL_ADMIN_KEY_SECRET_NAME not in _SECRET_NAMES
+    lowered = runbook.lower()
+    assert "not in use" in lowered
+    assert "eight declared" not in lowered
+
+
+def test_the_page_does_not_call_near_expiry_an_early_warning(runbook: str) -> None:
+    """No production path emits an admin-key alert yet, so the page may not imply one.
+
+    ``PoolAdminKeyCheck.alert`` has no non-test caller: emission belongs to
+    #1896's fleet-report pass, and adepthood's receiver enforces its own closed
+    kind list. Until both land, near-expiry is recorded, not delivered, and the
+    page has to say so.
+    """
+    lowered = runbook.lower()
+    assert "recorded" in lowered
+    assert "not delivered" in lowered
+    # Negated mentions are the point of the section, so the claim is checked
+    # per sentence against the page's own negation vocabulary, exactly as
+    # ``test_forbidden_claims_only_appear_negated`` does for custody claims.
+    for overclaim in ("early warning", "warns the operator", "alerts the operator"):
+        for sentence in _SENTENCE.findall(runbook):
+            if overclaim in sentence.lower():
+                assert _NEGATION.search(sentence), (
+                    f"page overclaims alerting: {sentence.strip()!r}"
+                )
+
+
+def test_the_runbook_quotes_the_renewal_window_constant(runbook: str) -> None:
+    """The notice period the page quotes is the constant the code applies."""
+    days = int(POOL_ADMIN_KEY_RENEW_WITHIN.total_seconds() // 86400)
+    assert f"{days} days" in runbook, f"runbook does not quote {days} days"
+
+
+@pytest.mark.parametrize("kind", sorted(_ADMIN_KEY_ALERT_KINDS))
+def test_every_admin_key_alert_kind_is_registered_and_documented(
+    runbook: str,
+    kind: str,
+) -> None:
+    """Each admin-key kind is in the closed vocabulary and named on the page."""
+    assert kind in {member.value for member in AlertKind}
+    assert kind in runbook
+
+
+@pytest.mark.parametrize(
+    ("status", "code"), sorted((status.value, status.exit_code) for status in _STATUSES)
+)
+def test_runbook_quotes_admin_key_exit_codes(
+    runbook: str,
+    status: str,
+    code: int,
+) -> None:
+    """Each custody verdict is documented with the code the code emits.
+
+    The codes an operator reads off a refused startup must be the ones the
+    module defines, and none may collide with ``--check pool``'s ``30``.
+    """
+    assert code not in set(_POOL_EXIT_CODES.values()) - {0}
+    rows = [line for line in runbook.splitlines() if status in line]
+    assert rows, f"{status} is not documented"
+    assert any(re.search(rf"\b{code}\b", row) for row in rows), (
+        f"{status} is not documented with exit code {code}"
     )
 
 

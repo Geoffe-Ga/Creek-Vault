@@ -617,6 +617,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--handoff-url", required=True)
     parser.add_argument("--alert-url", required=True)
     parser.add_argument("--volume", required=True)
+    # Optional, and absent means "no admin key in use" (#1930).  Supplying a
+    # timezone-aware instant switches the rendered config into the in-use
+    # regime: it declares CREEK_POOL_ADMIN_KEY_B64 and makes every custody
+    # refusal binding.  Required would mean inventing an expiry for a key that
+    # does not exist yet.
+    parser.add_argument("--pool-admin-key-expires-at")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--authorization-file", type=Path)
     parser.add_argument("--authorization-sha256")
@@ -638,6 +644,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.handoff_url,
         args.alert_url,
         args.volume,
+        args.pool_admin_key_expires_at,
     )
     if args.command == "render":
         if args.output is None:

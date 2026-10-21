@@ -232,14 +232,88 @@ job record, a commit or this page.
 
 **The organization admin key** creates, updates and deletes per-activation
 vendor keys. It is held by the control plane as a declared secret file with its
-own alert kind, and re-issued **only on compromise** (create-then-delete, a
-per-activation Machine update). *Not built:* there is no declared-secret entry
-for it — the rendered Fly pilot config's `_SECRET_NAMES` names seven secrets and
-none is a pool admin key — and no alert kind of its own. The control-plane issue
-([#1900](https://github.com/Geoffe-Ga/Creek-Vault/issues/1900)) has since
-merged, and it carried the per-activation identity, URL and credential **without**
-either piece, so both are still unbuilt and no open issue currently owns them.
-The only pool alert kind registered today is `pool_credential_orphan`.
+own alert kinds, and re-issued **only on compromise** (create-then-delete, a
+per-activation Machine update). *Built* ([#1930](https://github.com/Geoffe-Ga/Creek-Vault/issues/1930)):
+`creek_mcp.provisioning.pool_admin_key` owns its custody. `load_pool_admin_key`
+is the one way to the value and raises rather than returning a default, so a
+missing, malformed, undated or expired key refuses instead of falling through
+to an unauthenticated path. Three alert kinds are registered, each distinct
+from `pool_credential_orphan` (which is about a per-activation key, not this
+one): `pool_admin_key_unusable`, `pool_admin_key_rejected` and
+`pool_admin_key_near_expiry`.
+
+**Declared now, enforced on use.** No vendor is chosen and no admin key
+exists, so the rendered Fly pilot config declares which regime it is in and
+defaults to **not in use**: `CREEK_POOL_ADMIN_KEY_IN_USE = "0"`, no
+`CREEK_POOL_ADMIN_KEY_B64` secret, nothing for the bootstrap to normalize and
+nothing that can refuse. Rendering with `--pool-admin-key-expires-at <instant>`
+switches the config into the in-use regime, which appends the
+`CREEK_POOL_ADMIN_KEY_B64` `[[files]]` entry at
+`/run/secrets/creek_pool_admin_key` — the root bootstrap then normalizes it to
+mode 0400 — and makes every refusal below binding. The environment-variable
+form of the secret is refused in **both** regimes.
+
+The default matters. A `[[files]]` entry makes its Fly secret mandatory at
+deploy time, so declaring the admin key unconditionally would mean an operator
+had to invent a placeholder credential to boot a pilot that consumes no admin
+key — and a placeholder that satisfied the format check would make
+`pool-admin-key-ready` meaningless. The custody path is therefore in place
+*before* the first key exists, which is what was asked for, without making
+today's pilot undeployable.
+
+**Why the control plane keeps the value in full, not a hash or a handle:** the
+vendor's Admin API identifies a key *by its own value*, so the `update` that
+resets a cap, the `update` that extends an expiry and the `delete` that revokes
+on deletion each present the full key value. A digest cannot be presented, and
+the API offers no key id or prefix a caller may substitute. That is also why
+this credential is more dangerous than a per-activation one: it carries no cap
+and no activation binding, so it can re-cap, mint or delete every vault's key.
+
+**Custody verdicts** (`pool_admin_key.PoolAdminKeyStatus`, content-free codes
+only — never the value, its length or a digest). The "Raised by" column is not
+decoration: only some of these are reachable at startup, and a table that
+implied otherwise would be the same kind of false claim #1930 was filed over.
+
+| Verdict | Exit code | Raised by | Means |
+|---|---|---|---|
+| `pool-admin-key-ready` | 0 | Startup, `load_pool_admin_key` | In use, present, owner-only, well-formed, in date |
+| `pool-admin-key-not-in-use` | 0 | Startup, `load_pool_admin_key` | The config declares no admin key, or declares nothing at all. Today's default. Not a refusal at startup; the loader still refuses to hand over a value |
+| `pool-admin-key-near-expiry` | 0 | Startup, `load_pool_admin_key` | Usable, inside 15 days of the declared expiry. Not a refusal: the key still works |
+| `pool-admin-key-missing` | 40 | Startup (narrow), `load_pool_admin_key` | In use and no secret file. At startup `prepare_runtime_paths` normally refuses first with the generic exit `2`, because it lists the file before custody is verified; this code is what remains when the file goes missing after that |
+| `pool-admin-key-malformed` | 41 | Startup, `load_pool_admin_key` | Not a bearer credential, or not owner-only |
+| `pool-admin-key-rejected` | 42 | **Runtime only** | The vendor answered 401/403; the body is never read. Never raised at startup, which makes no vendor call |
+| `pool-admin-key-undeclared` | 43 | Startup, `load_pool_admin_key` | A **garbled** `CREEK_POOL_ADMIN_KEY_IN_USE` (anything but `0` or `1`), or a missing, unparseable or timezone-naive `CREEK_POOL_ADMIN_KEY_EXPIRES_AT` while in use. An **absent** in-use flag is *not* this — it reads as `not-in-use` and proceeds |
+| `pool-admin-key-expired` | 44 | Startup, `load_pool_admin_key` | The declared expiry has passed |
+
+Codes start at 40 so none can be confused with `--check pool`'s `30`
+(`pool-unconfigured`), which means "no pool at all" rather than "a pool with no
+usable admin key". Every verdict that lets the control plane run is `0`: a
+working key must never stop it, so the signal for those is the printed status
+string, not the exit code. The expiry is **declared** by the operator, not
+discovered: no vendor call is authorized, so the key's own expiry is recorded
+in the Machine's non-secret `[env]` beside the secret. An undeclared expiry
+refuses, because a key nobody dated expires unnoticed.
+
+**Alerting is registered, not yet emitted.** The three alert kinds exist in the
+closed `AlertKind` vocabulary, and each verdict maps onto one, but **no
+production path emits them**: a near-expiry verdict today is *recorded* on
+stderr at startup and **not delivered** to anyone. Two gates stand in the way,
+and neither is this page's to clear. The periodic re-check belongs to the
+attesting provider's fleet-report pass
+([#1896](https://github.com/Geoffe-Ga/Creek-Vault/issues/1896)) — a control
+plane boots once and runs for months, so a startup-only check cannot warn
+about an expiry that arrives later. And adepthood's alert receiver enforces its
+*own* closed kind list, which today admits six kinds and not even
+`pool_credential_orphan`; an unknown kind is answered `400`, which
+`HttpFleetAlertSink` escalates to `AlertDeliveryError`, which fails the
+scheduler component and takes the Machine unhealthy. Wiring an emitter before
+that list is widened would convert a warning into an outage, so near-expiry is
+**not** an early warning yet, and this page does not pretend it is.
+
+*Also not built here:* the vendor calls themselves — the `update` that resets
+a cap, the in-place expiry extension and the create-then-delete re-issue — which
+are #1896's and cannot be written before the vendor adapter exists. This page
+records custody, not lifecycle.
 
 **One vendor key per activation**, kept in full in the encrypted bundle because
 the vendor's update and delete calls require the value
@@ -302,7 +376,7 @@ Status, clause by clause, at this commit:
 | The scaling policy refuses a minimum of zero | There is no Creek-run engine host to scale. Residency is the vendor's property, asserted in its documentation and bounded by the contract's "a vendor outage is a refusal, never a fallback". The O3 policy that refuses a minimum of zero is dormant (section 7) | **Not met, and not implementable vault-side.** Owner gate: the vendor choice. What replaces it is the documented-residency row below plus the measured equivalence |
 | The first reflection after idle shows no load or download event | The attested channel gives the vault no engine-level telemetry, and no catalogue in ADR-0016's sources documents a load or download event, so unless the chosen vendor publishes one this clause has no observable signal under O5. The substitute is weaker and is recorded as such: latency equivalence below, plus the vendor's written residency terms | **Not met.** Owner gates: the vendor choice and a budget line (Decision 4) |
 | Its p95 equals the warm p95 within measurement noise | The harness's `idle` sweep (`--idle-cycles`, `--idle-seconds`) reports a `resume` phase in `per_sweep.idle.per_phase` — only `resume`, since `_idle` runs no warm trial — and the warm p95 comes from the `cold_warm` sweep, at `per_sweep.cold_warm.per_phase.warm.latency.p95_s`; the two are compared | **Not met, but no longer blocked on the harness.** Pool mode has landed ([#1892](https://github.com/Geoffe-Ga/Creek-Vault/issues/1892), closed): `--pool-url`, `--pool-identity` and `--pool-vendor` drive the real pool client through the same sweeps, hermetic against an in-process fake unless the run is live. What remains is the live run itself, which needs the owner's budget note ([#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899)) and the vendor choice |
-| The fleet report raises `pool_min_below_one` | Hermetic: the alert kind is in the closed `AlertKind` vocabulary and the report raises it when a warm minimum reads below one | **Not met:** `pool_min_below_one` is **not registered** in `AlertKind`, whose seven members end at `pool_credential_orphan`. [#1900](https://github.com/Geoffe-Ga/Creek-Vault/issues/1900) was expected to register it and merged without doing so, so no open issue owns it today. `tests/test_pool_runbook_docs.py` fails this page the moment it lands, so this row cannot go stale |
+| The fleet report raises `pool_min_below_one` | Hermetic: the alert kind is in the closed `AlertKind` vocabulary and the report raises it when a warm minimum reads below one | **Not met:** `pool_min_below_one` is **not registered** in `AlertKind`, which registers the pool credential orphan and the admin-key kinds of [#1930](https://github.com/Geoffe-Ga/Creek-Vault/issues/1930) but no warm-minimum kind. [#1900](https://github.com/Geoffe-Ga/Creek-Vault/issues/1900) was expected to register it and merged without doing so, so no open issue owns it today. `tests/test_pool_runbook_docs.py` fails this page the moment it lands, so this row cannot go stale |
 
 ### The procedure, for when those gates clear
 
