@@ -86,3 +86,8 @@ graphify-out/
 # created by scripts/ralph/fleet.sh. Machine-local scratch, never committed
 # (the sibling .claude/worktrees/ entry above covers the Agent tool's).
 .ralph/
+
+# Agent lane scratch — check-all logs and intermediate output written by a
+# worker inside its worktree. Ephemeral and per-lane; a `git add .` would
+# otherwise sweep it into that lane's PR.
+scratchpad/
