@@ -277,12 +277,12 @@ implied otherwise would be the same kind of false claim #1930 was filed over.
 | Verdict | Exit code | Raised by | Means |
 |---|---|---|---|
 | `pool-admin-key-ready` | 0 | Startup, `load_pool_admin_key` | In use, present, owner-only, well-formed, in date |
-| `pool-admin-key-not-in-use` | 0 | Startup | The config declares no admin key. Today's default; not a refusal |
+| `pool-admin-key-not-in-use` | 0 | Startup, `load_pool_admin_key` | The config declares no admin key, or declares nothing at all. Today's default. Not a refusal at startup; the loader still refuses to hand over a value |
 | `pool-admin-key-near-expiry` | 0 | Startup, `load_pool_admin_key` | Usable, inside 15 days of the declared expiry. Not a refusal: the key still works |
 | `pool-admin-key-missing` | 40 | Startup (narrow), `load_pool_admin_key` | In use and no secret file. At startup `prepare_runtime_paths` normally refuses first with the generic exit `2`, because it lists the file before custody is verified; this code is what remains when the file goes missing after that |
 | `pool-admin-key-malformed` | 41 | Startup, `load_pool_admin_key` | Not a bearer credential, or not owner-only |
 | `pool-admin-key-rejected` | 42 | **Runtime only** | The vendor answered 401/403; the body is never read. Never raised at startup, which makes no vendor call |
-| `pool-admin-key-undeclared` | 43 | Startup, `load_pool_admin_key` | The custody declaration is absent or outside its closed vocabulary — either `CREEK_POOL_ADMIN_KEY_IN_USE`, or a timezone-aware `CREEK_POOL_ADMIN_KEY_EXPIRES_AT` while in use |
+| `pool-admin-key-undeclared` | 43 | Startup, `load_pool_admin_key` | A **garbled** `CREEK_POOL_ADMIN_KEY_IN_USE` (anything but `0` or `1`), or a missing, unparseable or timezone-naive `CREEK_POOL_ADMIN_KEY_EXPIRES_AT` while in use. An **absent** in-use flag is *not* this — it reads as `not-in-use` and proceeds |
 | `pool-admin-key-expired` | 44 | Startup, `load_pool_admin_key` | The declared expiry has passed |
 
 Codes start at 40 so none can be confused with `--check pool`'s `30`

@@ -69,9 +69,20 @@ No spend is authorized (Decision 4): nothing here dials a vendor.
 somebody else made, from its **status code alone** — the body is never read,
 because a 401 body is exactly where a vendor echoes the credential back.
 
-This module deliberately imports nothing first-party at module scope: it is
-reached from the root bootstrap before the privilege drop, and that bootstrap
-is documented as minimal.
+**Import surface, honestly bounded.** This module imports nothing first-party
+at module scope, because it is reached from the root bootstrap before the
+privilege drop.  That buys a bounded surface **in the not-in-use regime
+only**: once a key is declared in use, :func:`_stored_status` runs and pulls
+``production_secrets`` — and with it ``cryptography``'s x509/AEAD surface and
+the ``provisioning`` modules that module imports — still as root.  Measured
+on this tree, on top of what ``pilot_bootstrap`` already loads at module
+scope: **2** modules in the not-in-use regime, **47** in the in-use one.  That
+is a real cost, not a cancelled one, and both figures' shape is pinned by
+``test_pool_admin_key_custody.py`` so neither claim can drift.  It is not inlined
+away here: ``pilot_bootstrap`` already imports ``container_runtime`` at module
+scope, so the "minimal bootstrap" premise is weak before this module is
+reached, and duplicating an ``O_NOFOLLOW``/mode-checking reader to dodge one
+import would trade a real DRY guarantee for a notional one.
 """
 
 from __future__ import annotations
@@ -107,7 +118,9 @@ A closed two-value vocabulary, absent meaning ``"0"``.  Declared rather than
 inferred so the pilot's own config says which regime it is in, and defaulting
 to not-in-use so declaring custody cannot brick a pilot that has no key yet.
 Any other value is a garbled declaration and refuses
-(:attr:`PoolAdminKeyStatus.UNDECLARED`).
+(:attr:`PoolAdminKeyStatus.UNDECLARED`).  An absent flag is **not** garbled:
+it takes the permissive path, which is what makes declaring custody safe
+before a key exists, and is also the one case no refusal catches.
 """
 
 POOL_ADMIN_KEY_EXPIRES_AT_ENV: Final[str] = "CREEK_POOL_ADMIN_KEY_EXPIRES_AT"
@@ -166,9 +179,13 @@ class PoolAdminKeyStatus(StrEnum):
         REJECTED: The vendor refused it (401/403): present and well-formed,
             but no longer valid.  A **runtime** verdict only; no vendor call
             happens at startup.
-        UNDECLARED: The custody declaration is absent or not from the closed
-            vocabulary — either the in-use flag or, while in use, a
-            parseable timezone-aware expiry.
+        UNDECLARED: A **garbled** in-use flag — one outside
+            :data:`POOL_ADMIN_KEY_IN_USE` / :data:`POOL_ADMIN_KEY_NOT_IN_USE`
+            — or, while in use, a missing, unparseable or timezone-naive
+            expiry.  An *absent* or empty in-use flag is **not** this: it is
+            ``NOT_IN_USE``, which proceeds.  The distinction matters to an
+            operator, so it is spelled out rather than summarised as "the
+            declaration is absent or invalid".
         EXPIRED: The declared expiry has passed.
     """
 
@@ -520,9 +537,12 @@ def _stored_status(path: Path) -> tuple[PoolAdminKeyStatus, str | None]:
         ``(MISSING | MALFORMED, None)`` otherwise.  No branch here reports the
         value's length, prefix or digest.
     """
-    # Imported here, not at module scope: this module is reached from the root
-    # bootstrap before the privilege drop, and ``production_secrets`` pulls the
-    # whole x509/AEAD surface with it.
+    # Imported here, not at module scope, so a control plane in the
+    # not-in-use regime never pays for it: this module is reached from the
+    # root bootstrap before the privilege drop. Note what that does and does
+    # not buy — reaching THIS function means a key is declared in use, so the
+    # x509/AEAD surface ``production_secrets`` carries is loaded as root after
+    # all. The deferral bounds the default regime, not every regime.
     from creek_mcp.provisioning.production_secrets import read_owner_only_file
 
     if not os.path.lexists(path):

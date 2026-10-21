@@ -34,6 +34,9 @@ import dataclasses
 import inspect
 import json
 import logging
+import os
+import subprocess
+import sys
 import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1003,3 +1006,228 @@ def test_the_verification_environment_is_injected_not_ambient(
         ).status
         is PoolAdminKeyStatus.READY
     )
+
+
+# --------------------------------------------------------------------------
+# The root import surface, pinned per regime (#1930 review).
+# --------------------------------------------------------------------------
+
+_IMPORT_PROBE: Final[str] = """
+import json, os, sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+import creek_mcp.container_runtime  # noqa: F401  the bootstrap's own baseline
+
+before = set(sys.modules)
+from creek_mcp.provisioning import pilot_bootstrap
+
+pilot_bootstrap.verify_pool_admin_key(
+    Path(os.environ["PROBE_KEY_PATH"]), environ=os.environ, now=datetime.now(tz=UTC)
+)
+print(json.dumps(sorted(set(sys.modules) - before)))
+"""
+"""Measure what reaching the custody check adds *on top of* the bootstrap's
+own module-scope baseline, in a fresh interpreter.
+
+A subprocess, because ``sys.modules`` in this one is already saturated by the
+test suite's own imports, which would make any in-process measurement read
+zero and the gate vacuous.
+"""
+
+
+def _import_delta(
+    tmp_path: Path,
+    *,
+    in_use: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> set[str]:
+    """Return the modules the custody check adds in one regime.
+
+    Args:
+        tmp_path: The test root, for the probe's key path.
+        in_use: The regime declaration to run under.
+        monkeypatch: Used only to build the child environment.
+
+    Returns:
+        The module names imported after ``container_runtime``.
+    """
+    del monkeypatch
+    probe = tmp_path / "import_probe.py"
+    probe.write_text(_IMPORT_PROBE, encoding="utf-8")
+    environment = {
+        **os.environ,
+        POOL_ADMIN_KEY_IN_USE_ENV: in_use,
+        POOL_ADMIN_KEY_EXPIRES_AT_ENV: _DISTANT,
+        "PROBE_KEY_PATH": str(tmp_path / "absent-admin-key"),
+    }
+    completed = subprocess.run(
+        [sys.executable, str(probe)],
+        capture_output=True,
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        text=True,
+    )
+    return set(json.loads(completed.stdout))
+
+
+def test_the_not_in_use_regime_adds_nothing_to_the_root_import_surface(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default regime pays for the two new modules and nothing else.
+
+    ``pool_admin_key`` imports nothing first-party at module scope precisely
+    so that a control plane with no admin key does not drag the x509/AEAD
+    surface in as root. This is that claim, measured.
+    """
+    added = _import_delta(
+        tmp_path, in_use=POOL_ADMIN_KEY_NOT_IN_USE, monkeypatch=monkeypatch
+    )
+
+    assert added == {
+        "creek_mcp.provisioning.pilot_bootstrap",
+        "creek_mcp.provisioning.pool_admin_key",
+    }
+
+
+def test_the_in_use_regime_does_pay_for_the_secret_reader_as_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The honest other half: in use, the deferral does not cancel the cost.
+
+    ``_stored_status`` imports ``production_secrets`` lazily, but it runs
+    before the privilege drop, so with a key declared in use the bootstrap
+    loads the x509/AEAD surface as root after all. The module docstring and
+    the PR say exactly this; pinning it stops the claim drifting back into
+    "adds nothing", and stops the cost growing unnoticed.
+    """
+    added = _import_delta(
+        tmp_path, in_use=POOL_ADMIN_KEY_IN_USE, monkeypatch=monkeypatch
+    )
+
+    assert "creek_mcp.provisioning.production_secrets" in added
+    assert any(name.startswith("cryptography.x509") for name in added)
+    assert "creek_mcp.provisioning.pool_admin_key" in added
+    # The claim is "bounded in the default regime only", so the docstring has
+    # to keep saying so.
+    assert "not-in-use regime" in (pool_admin_key.__doc__ or "")
+
+
+def test_the_unrendered_template_is_not_a_deployable_config() -> None:
+    """Why ``secret_name`` is assembled rather than written literally.
+
+    With ``{{FILE_REFERENCE_KEY}}`` as a bare key the template is not valid
+    TOML, so it cannot be mistaken for a config or consumed un-rendered. The
+    appended admin-key block keeps the same idiom, and this pins the property
+    that makes the idiom worth keeping.
+    """
+    with pytest.raises(tomllib.TOMLDecodeError):
+        tomllib.loads(_TEMPLATE.read_text(encoding="utf-8"))
+
+
+# --------------------------------------------------------------------------
+# Startup, end to end, for the paths that had no main()-level coverage.
+# --------------------------------------------------------------------------
+
+
+def _stub_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    key_path: Path,
+) -> list[object]:
+    """Stub only what needs root, and return the privilege-drop recorder.
+
+    Args:
+        monkeypatch: The patcher.
+        key_path: The admin-key path startup should verify.
+
+    Returns:
+        The list the privilege drop appends to, so a refusal can be shown to
+        have happened before it.
+    """
+    started: list[object] = []
+    monkeypatch.setattr(pilot_bootstrap, "POOL_ADMIN_KEY_GUEST_PATH", str(key_path))
+    monkeypatch.setattr(pilot_bootstrap.sys, "argv", ["pilot"])
+    monkeypatch.setattr(pilot_bootstrap, "prepare_runtime_paths", lambda **_kw: None)
+    monkeypatch.setattr(
+        pilot_bootstrap, "drop_privileges_and_run", lambda argv: started.append(argv)
+    )
+    return started
+
+
+def test_startup_refuses_a_garbled_regime_declaration_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The garbled flag refuses through ``main()``, and normalizes no file.
+
+    The one refusal that had no end-to-end cover. It also must not be mistaken
+    for the in-use regime by the file list: a garbled declaration normalizes
+    nothing, so the refusal comes from the custody code's own code rather than
+    from ``_normalize_secret``'s generic exit 2.
+    """
+    started = _stub_startup(monkeypatch, key_path=_admin_key_file(tmp_path))
+    monkeypatch.setenv(POOL_ADMIN_KEY_IN_USE_ENV, "yes")
+    monkeypatch.setenv(POOL_ADMIN_KEY_EXPIRES_AT_ENV, _DISTANT)
+
+    assert pool_admin_secret_files({POOL_ADMIN_KEY_IN_USE_ENV: "yes"}) == ()
+
+    with pytest.raises(SystemExit) as caught:
+        pilot_bootstrap.main()
+
+    assert caught.value.code == PoolAdminKeyStatus.UNDECLARED.exit_code
+    assert started == []
+    assert capsys.readouterr().err == (
+        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.UNDECLARED.value}\n"
+    )
+
+
+def test_startup_refuses_an_expired_admin_key_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An expired declared key stops the control plane before it serves."""
+    started = _stub_startup(monkeypatch, key_path=_admin_key_file(tmp_path))
+    monkeypatch.setenv(POOL_ADMIN_KEY_IN_USE_ENV, POOL_ADMIN_KEY_IN_USE)
+    monkeypatch.setenv(
+        POOL_ADMIN_KEY_EXPIRES_AT_ENV, (datetime.now(tz=UTC) - timedelta(1)).isoformat()
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        pilot_bootstrap.main()
+
+    assert caught.value.code == PoolAdminKeyStatus.EXPIRED.exit_code
+    assert started == []
+    assert capsys.readouterr().err == (
+        f"creek-fly-pilot: pool admin key: {PoolAdminKeyStatus.EXPIRED.value}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "in_use", [POOL_ADMIN_KEY_NOT_IN_USE, POOL_ADMIN_KEY_IN_USE], ids=["off", "on"]
+)
+def test_the_environment_form_is_refused_behaviourally_in_both_regimes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_use: str,
+) -> None:
+    """Not just a name-list comparison: ``main()`` really refuses, either way.
+
+    The env-form check sits ahead of every regime decision, so a key smuggled
+    in as an environment value must be refused whether or not the config says
+    an admin key is in use.
+    """
+    started = _stub_startup(monkeypatch, key_path=_admin_key_file(tmp_path))
+    monkeypatch.setenv(POOL_ADMIN_KEY_IN_USE_ENV, in_use)
+    monkeypatch.setenv(POOL_ADMIN_KEY_EXPIRES_AT_ENV, _DISTANT)
+    monkeypatch.setenv(POOL_ADMIN_KEY_SECRET_NAME, "synthetic-secret")
+
+    with pytest.raises(SystemExit, match="secret values"):
+        pilot_bootstrap.main()
+
+    assert started == []

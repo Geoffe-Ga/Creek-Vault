@@ -59,6 +59,13 @@ _ADMIN_KEY_FILE_BLOCK: Final[str] = "\n".join(
         "",
         "[[files]]",
         f'  guest_path = "{POOL_ADMIN_KEY_GUEST_PATH}"',
+        # ``secret_name`` is assembled rather than written literally, matching
+        # the ``FILE_REFERENCE_KEY`` placeholder the template uses for the same
+        # key. The effect is verifiable: with ``{{FILE_REFERENCE_KEY}}`` as a
+        # bare key the *unrendered* template is not valid TOML, so it can never
+        # be mistaken for a deployable config or consumed by ``fly deploy``
+        # un-rendered. The appended block keeps the idiom so the rendered and
+        # templated entries are spelled one way, not two.
         f'  {"_".join(("secret", "name"))} = "{POOL_ADMIN_KEY_SECRET_NAME}"',
         "",
     )
