@@ -1,6 +1,6 @@
 """The harness can only ever measure a local model.
 
-``LocalOnlyFactory`` refuses a provider registered as cloud at construction,
+``LocalOnlyFactory`` refuses a registered non-local provider at construction,
 and refuses any built callable that does not positively declare
 ``is_cloud = False`` — a missing attribute fails *closed*.
 """
@@ -42,9 +42,14 @@ def _bare(prompt: str) -> str:
     return prompt
 
 
-@pytest.mark.parametrize("name", ["anthropic", "openai", "gemini"])
-def test_cloud_name_refused_at_construction(name: str) -> None:
-    """A cloud provider name is refused before anything is built."""
+@pytest.mark.parametrize("name", ["anthropic", "openai", "gemini", "pool"])
+def test_offloading_name_refused_at_construction(name: str) -> None:
+    """A registered non-local provider is refused before anything is built.
+
+    ``pool`` is in the list although it is not cloud (#1894): the shared
+    inference pool egresses, so sizing a *local* envelope with it would both
+    corrupt the measurement and send synthetic prompts off the machine.
+    """
     built: list[int] = []
 
     def _factory(tier: PrivacyTier, *, max_tokens: int) -> LLMCallable:

@@ -218,6 +218,28 @@ error body. A self-connected container ignores the headers.
 
 ### Loopback-only Ollama in container mode
 
+> **Amended by [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md)
+> (#1894).** Loopback-only remains the rule for Ollama, and a single-container
+> self-hosted vault is unchanged. A *managed* vault, though, ships no inference
+> runtime at all — a 1 GB Machine cannot hold a model — so it has one
+> destination beyond loopback: the shared confidential warm-inference pool,
+> reached through the `pool` provider and
+> `creek/classify/llm/pool_boundary.py`. Its address is `CREEK_POOL_URL`, read
+> from the Machine environment and settable from no vault config, and it is
+> the *only* such destination: any other host, IP literal or config-supplied
+> URL is refused with a fixed, URL-free message, and nothing outside that
+> boundary module may build an HTTP client for it
+> (`tests/test_ollama_endpoint_invariant.py` enforces both halves). The pool
+> dials with `http.client`, which reads no proxy variable and follows no
+> redirect; it has a 1 s connect and 12 s request timeout, never beyond the
+> vault request's remaining budget, **no retries**, and a cancel handle that
+> closes the socket so a cancelled dial does not outlive the answer. The pool
+> is pinned to the same manifest the local model uses, by `model_name` and
+> `runtime_inventory_digest`, and `creek-container-health --check pool`
+> reports that identity without ever asking the pool to generate. INTIMATE
+> never routes there: the pool is `intimate_eligible = False`, so the one
+> `ModelRouter` chokepoint forces it local or refuses before any dial.
+
 In a container, every LLM stage's `ollama_url` must be a literal loopback
 address (`localhost`, `127.0.0.0/8` or `[::1]`), whatever the stage's
 provider. The Ollama provider is labelled local, so its endpoint must actually
@@ -234,8 +256,9 @@ be local. Two layers enforce this:
   compile, draft, the Writing Desk's voice client and `--method llm`
   classification (`POST /v1/classifications`). Each one refuses unless a model
   package is configured and its stage resolves to an Ollama provider on a
-  loopback URL, with the pinned model tag, listed at the pinned digest. A
-  cloud stage (Anthropic, OpenAI, Gemini or enclave) is refused before any
+  loopback URL, or to the shared inference pool on its one pinned
+  destination, with the pinned model tag at the pinned digest. Any other
+  stage (Anthropic, OpenAI, Gemini or enclave) is refused before any
   dial, whether or not a key and consent are present. Without a manifest,
   these paths are unavailable in a container rather than served by an unpinned
   or cloud model. Refusals keep each path's existing shape: reflection,
