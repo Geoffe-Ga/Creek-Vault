@@ -57,7 +57,7 @@ runtime as follows.
 | `runtime_digest` | The SHA-256 over the pinned measurement bundle (Decision 3.2) | **Nothing in the vault today.** The field's shape is validated; no code reads it. Its verification is the attesting client's, which is not built (#1896) |
 | `model_name` | The vendor's catalogue model id | The identity listing must offer it |
 | `runtime_inventory_digest` | The pool identity digest, defined below | `pool_identity_matches`, before every prompt |
-| `model_blob_sha256` | Not applicable: the vault holds no weights for a pool runtime, and `verify_weights` is an O3-side check | — |
+| `model_blob_sha256` | Required by the schema, which ADR-0016 leaves unchanged, so the operator still fills it. No vault-side check consumes it for a pool runtime: `verify_weights` runs where the weights are, which under O5 is inside the vendor's enclave and not ours to run | — |
 
 ### The pool identity digest
 
@@ -148,7 +148,8 @@ vendor's own reference for it instead.
 
 D05 was written for a runtime we control. Decision 3.3 maps its five
 conditions onto a vendor and adds three. **Every row below is the record's
-verdict, not evidence.** Three of the eight are open owner escalations.
+verdict, not evidence.** Five of the eight carry an open owner gate: two
+waivers, (f)'s evidence, and the two that wait on the vendor choice.
 
 | Condition | Verdict | Owner gate, if open |
 |---|---|---|
@@ -230,9 +231,11 @@ until its cap is spent, which is why the cap — not the network — is the brak
 | Revoke | At deletion, confirmed **before** the content-free receipt is issued; the issuer raises rather than returns on an unconfirmed revocation | `PoolBundleIssuer.revoke` |
 | Reconcile | A surviving credential is an orphan in the fleet report (`pool_credential_orphan`) | `AlertKind` |
 
-An exhausted cap answers `insufficient_quota` (429, non-transient), which the
-vault maps to `temporarily_unavailable`: retrying cannot clear it, so the vault
-refuses rather than spending on. A control plane that is down when a key
+An exhausted cap answers `insufficient_quota` (429, non-transient). The
+contract maps it to `temporarily_unavailable` so the vault refuses rather than
+spending on, because retrying cannot clear it — *designed, not built:* the
+mapping lives in the attesting provider (#1896), and no code in this
+repository reads that vendor status today. A control plane that is down when a key
 expires leaves that vault `temporarily_unavailable` until it returns — fail
 closed, accepted.
 
@@ -262,7 +265,7 @@ Status, clause by clause, at this commit:
 | Clause | Under O5 it means | Status |
 |---|---|---|
 | The scaling policy refuses a minimum of zero | There is no Creek-run engine host to scale. Residency is the vendor's property, asserted in its documentation and bounded by the contract's "a vendor outage is a refusal, never a fallback". The O3 policy that refuses a minimum of zero is dormant (section 7) | **Not met, and not implementable vault-side.** Owner gate: the vendor choice. What replaces it is the documented-residency row below plus the measured equivalence |
-| The first reflection after idle shows no load or download event | A vendor exposes no load or download event, so this has no observable signal under O5. The substitute is weaker and is recorded as such: latency equivalence below, plus the vendor's written residency terms | **Not met.** Owner gates: the vendor choice and a budget line (Decision 4) |
+| The first reflection after idle shows no load or download event | The attested channel gives the vault no engine-level telemetry, and no catalogue in ADR-0016's sources documents a load or download event, so unless the chosen vendor publishes one this clause has no observable signal under O5. The substitute is weaker and is recorded as such: latency equivalence below, plus the vendor's written residency terms | **Not met.** Owner gates: the vendor choice and a budget line (Decision 4) |
 | Its p95 equals the warm p95 within measurement noise | The harness's `idle` sweep (`--idle-cycles`, `--idle-seconds`) reports a `resume` phase beside `warm` in `per_sweep.idle.per_phase`; the two p95s are compared | **Not met.** The harness is Ollama-specific today (`--ollama-url`, `/api/tags`); pool mode is [#1892](https://github.com/Geoffe-Ga/Creek-Vault/issues/1892), and the live run needs the owner's budget note ([#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899)) |
 | The fleet report raises `pool_min_below_one` | Hermetic: the alert kind is in the closed `AlertKind` vocabulary and the report raises it when a warm minimum reads below one | **Not met:** `pool_min_below_one` is **not registered** in `AlertKind` — it belongs to [#1900](https://github.com/Geoffe-Ga/Creek-Vault/issues/1900). `tests/test_pool_runbook_docs.py` fails this page when that lands, so this row cannot go stale |
 

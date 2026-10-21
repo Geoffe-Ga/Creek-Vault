@@ -49,6 +49,7 @@ from creek_mcp.provisioning.pool_bundle import (
 _DOCS: Final = Path(__file__).resolve().parents[1] / "docs"
 _RUNBOOK_NAME: Final = "pool-measurement-pin.md"
 _RUNBOOK: Final = _DOCS / _RUNBOOK_NAME
+_ADR_NAME: Final = "0016-shared-confidential-warm-inference-pool.md"
 
 _WARM_MINIMUM_ALERT: Final = "pool_min_below_one"
 _NOT_REGISTERED: Final = "not registered"
@@ -149,6 +150,19 @@ def test_every_condition_carries_a_verdict(runbook: str, letter: str) -> None:
     assert any(verdict in row for verdict in _VERDICTS), (
         f"condition ({letter}) carries no verdict from {_VERDICTS}"
     )
+
+
+def test_adr_options_cell_reads_vendor_asserted() -> None:
+    """The record's own Options cell says vendor-asserted while (f) is open.
+
+    Decision 3.3: "without (f) the Options table's cell reads
+    'vendor-asserted'". The runbook and the record must not disagree about
+    who is excluded from reading a prompt.
+    """
+    adr = (_DOCS / "architecture" / "ADR" / _ADR_NAME).read_text(encoding="utf-8")
+    rows = [line for line in adr.splitlines() if line.startswith("| **O5**")]
+    assert rows, "the Options table has no O5 row"
+    assert "vendor-asserted" in rows[0].lower()
 
 
 def test_condition_f_reads_vendor_asserted(runbook: str) -> None:
