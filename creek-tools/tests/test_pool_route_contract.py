@@ -118,15 +118,13 @@ HTTP_ACCEPTED: Final[int] = 202
 # --------------------------------------------------------------------------- #
 
 
-def _pool_vault(
-    tmp_path: Path, provider: str = "pool", stage: str = "generation"
-) -> Path:
-    """Scaffold a vault whose *stage* is routed to *provider*."""
+def _pool_vault(tmp_path: Path, provider: str = "pool") -> Path:
+    """Scaffold a vault whose ``generation`` stage is routed to *provider*."""
     vault = seed_vault(tmp_path / "vault")
     data: dict[str, Any] = CreekConfig().model_dump(mode="json")
     data["vault_path"] = str(vault)
     data["llm"]["default"].update(model=PINNED_MODEL)
-    data["llm"][stage] = {
+    data["llm"]["generation"] = {
         **data["llm"]["default"],
         "provider": provider,
         "model": PINNED_MODEL,
