@@ -513,9 +513,24 @@ Reported separately, never averaged into one figure.
 | Dimension | Basis | What it measures |
 |---|---|---|
 | `voice_match` | judge | How close the candidate sits to the synthetic corpus's own voice. |
-| `instruction_obedience` | deterministic | Length band, required headings, banned phrases, plus the shipped `creek.lint.checks.voice_fidelity` guard over the candidate written as a draft. |
+| `instruction_obedience` | deterministic | The three instructions the Writing Desk surface states: a length band, required headings, banned phrases. One violated instruction scores `2/3` and fails the dimension. |
 | `grounding_accuracy` | deterministic | The share of cited fragment ids the corpus actually contains. An invented citation scores zero; an uncited output scores zero too. |
 | `refusal_behaviour` | deterministic | Three probes that must each be refused — the care guard's acute-distress path, an above-ceiling prompt, and an INTIMATE fragment. The expectations are computed from `acute_distress_guard` and `tier_allowed`, not written down. |
+
+A fourth obedience component delegated to the shipped
+`creek.lint.checks.voice_fidelity` guard until
+[#1911](https://github.com/Geoffe-Ga/Creek-Vault/issues/1911). It was removed
+because it could not fail. Measured against this corpus's fingerprint, the
+on-voice fixture scores `voice_distance=0.0000` and the deliberately off-voice
+fixture `0.1012`, both far under the shipped `voice_distance_upper` of `0.35`;
+a heavier slop text tripping six of the sixteen active tell families reaches
+only `0.2568`, and the ceiling is first cleared by a saturation specimen that
+trips all sixteen at once (`0.6863`). A constant component is not merely
+useless — at four equally-weighted components a candidate violating exactly
+one scores `3/4 = 0.75` and clears `PASS_THRESHOLD`, so the dimension could
+not fail on a single violated instruction. Voice is dimension (a)'s subject,
+not an instruction. The measurement is pinned by
+`tests/bench/eval/test_dimensions.py::test_the_shipped_voice_check_cannot_separate_the_fixtures`.
 
 `voice_match` can report a third basis, `unsupported`, and does so by default.
 [#1880](https://github.com/Geoffe-Ga/Creek-Vault/issues/1880) records that the

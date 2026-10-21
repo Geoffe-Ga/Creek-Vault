@@ -168,7 +168,7 @@ def run_eval(plan: EvalPlan, corpus_root: Path) -> EvalResult:
                 evidence_present=plan.voice_evidence_present,
                 requests=requests,
             ),
-            score_instruction_obedience(corpus, blinded, plan.instructions),
+            score_instruction_obedience(blinded, plan.instructions),
             score_grounding_accuracy(corpus, blinded),
             score_refusal_behaviour(blinded),
         )

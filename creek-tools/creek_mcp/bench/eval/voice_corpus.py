@@ -10,10 +10,13 @@ only reason a crude judge can rank anything at all.
 
 The corpus is a real vault as far as the shared voice code paths are concerned:
 model-valid ``open`` fragments under ``01-Fragments/Notes``, the
-``00-Creek-Meta`` directory, an empty ``07-Voice/Drafts`` for the candidates
-the obedience dimension writes, and a persisted voice fingerprint built from
-the entries themselves — without which
-:mod:`creek.lint.checks.voice_fidelity` has nothing to measure against.
+``00-Creek-Meta`` directory, an empty ``07-Voice/Drafts``, and a persisted
+voice fingerprint built from the entries themselves — without which
+:mod:`creek.lint.checks.voice_fidelity` has nothing to measure against. No
+scorer writes drafts any more: #1911 retired the obedience dimension's
+voice-fidelity component as a component that could not fail, and the drafts
+directory now exists because a vault has one, and because the measurement
+behind that decision is re-verified from it on every run.
 
 **Confinement.** The root goes through
 :func:`creek_mcp.bench.corpus.confined_root`, the same gate the capacity

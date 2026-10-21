@@ -1,21 +1,28 @@
 """The four dimensions, scored separately and against real code paths.
 
-Two properties matter beyond the arithmetic. The deterministic obedience
-checks are the *existing* ``voice_fidelity`` / ``voice_authenticity`` modules,
-called rather than re-implemented — asserted by patching the shared functions
-and watching the eval follow them. And the voice-match dimension is explicit
-about its dependency on voice evidence in the prompt (#1880): without it the
-dimension reports ``unsupported`` rather than inventing a pass or a failure.
+Three properties matter beyond the arithmetic. Corpus health is the *existing*
+``voice_authenticity`` module, called rather than re-implemented — asserted by
+patching the shared function and watching the eval follow it. The voice-match
+dimension is explicit about its dependency on voice evidence in the prompt
+(#1880): without it the dimension reports ``unsupported`` rather than inventing
+a pass or a failure. And every obedience component is exercised in *both*
+directions, because #1911 was a component that could not fail: a free point
+that lifted every obedience score toward the pass threshold. The measurement
+that retired it is pinned here too, so the decision is auditable from the suite
+and not only from a PR body.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
+from creek.config import AIStyleConfig
 from creek.generate import voice_authenticity
+from creek.generate.ai_style.fingerprint import load_fingerprint
+from creek.generate.ai_style.scanner import scan
 from creek.generate.voice_authenticity import (
     AICorpusLeak,
     AudienceMix,
@@ -31,15 +38,29 @@ from creek_mcp.bench.eval.dimensions import (
     ObedienceCheck,
     corpus_health,
     expected_refusals,
+    obedience_checks,
     score_grounding_accuracy,
     score_instruction_obedience,
     score_refusal_behaviour,
     score_voice_match,
 )
 from creek_mcp.bench.eval.judge import HermeticJudge, JudgeRequest
-from creek_mcp.bench.eval.rubric import Basis, Dimension, RefusalProbe
-from creek_mcp.bench.eval.voice_corpus import VoiceCorpus, build_voice_corpus
+from creek_mcp.bench.eval.rubric import (
+    Basis,
+    Dimension,
+    RefusalProbe,
+    RubricVerdict,
+    next_candidate,
+    rubric_verdict,
+)
+from creek_mcp.bench.eval.voice_corpus import (
+    DRAFTS_DIR,
+    VoiceCorpus,
+    build_voice_corpus,
+)
 from tests.bench.eval.conftest import (
+    IN_VOICE_TEXT,
+    SLOP_TEXT,
     RecordingJudge,
     in_voice_candidate,
     slop_candidate,
@@ -155,64 +176,225 @@ def test_voice_match_averages_over_candidates(corpus: VoiceCorpus) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_obedience_calls_the_shared_voice_fidelity_check(
-    corpus: VoiceCorpus, monkeypatch: pytest.MonkeyPatch
+_PERMISSIVE: Final[DeskInstructions] = DeskInstructions(
+    min_words=1,
+    max_words=10_000,
+    required_headings=(),
+    banned_phrases=(),
+)
+"""An instruction surface no candidate can disobey, for isolating a component."""
+
+_STRUCTURED: Final[DeskInstructions] = DeskInstructions(
+    min_words=1,
+    max_words=10_000,
+    required_headings=("## Afterward",),
+    banned_phrases=(),
+)
+"""Only the structure component is active, so a failure can only be structural."""
+
+_FULL_SURFACE: Final[DeskInstructions] = DeskInstructions(
+    min_words=DEFAULT_INSTRUCTIONS.min_words,
+    max_words=DEFAULT_INSTRUCTIONS.max_words,
+    required_headings=("## Afterward",),
+    banned_phrases=DEFAULT_INSTRUCTIONS.banned_phrases,
+)
+"""All three components active at once, so one surface can separate two fixtures."""
+
+_HEADED_TEXT: Final[str] = "## Afterward\n\nI shut the door. I slept."
+"""Short, headed, and clean: satisfies structure and nothing else is asked."""
+
+_TOO_SHORT_TEXT: Final[str] = "I slept."
+"""Under the default floor of 40 words, and nothing else."""
+
+_COMPLIANT_TEXT: Final[str] = f"## Afterward\n\n{IN_VOICE_TEXT}"
+"""Obeys all three instructions of :data:`_FULL_SURFACE` at once."""
+
+_DISOBEDIENT_TEXT: Final[str] = (
+    "In today's fast-paced world one must delve into the tapestry."
+)
+"""Disobeys all three at once: too short, unheaded, and three banned phrases."""
+
+_COMPONENT_DIRECTIONS: Final[
+    tuple[tuple[ObedienceCheck, DeskInstructions, str, bool], ...]
+] = (
+    (ObedienceCheck.LENGTH, DEFAULT_INSTRUCTIONS, _TOO_SHORT_TEXT, False),
+    (ObedienceCheck.LENGTH, DEFAULT_INSTRUCTIONS, IN_VOICE_TEXT, True),
+    (ObedienceCheck.STRUCTURE, _STRUCTURED, IN_VOICE_TEXT, False),
+    (ObedienceCheck.STRUCTURE, _STRUCTURED, _HEADED_TEXT, True),
+    (ObedienceCheck.BANNED_PHRASES, DEFAULT_INSTRUCTIONS, SLOP_TEXT, False),
+    (ObedienceCheck.BANNED_PHRASES, DEFAULT_INSTRUCTIONS, IN_VOICE_TEXT, True),
+)
+"""Every component, in both directions — the #1911 guard, stated as data."""
+
+_ON_VOICE_DISTANCE: Final[float] = 0.0
+"""Measured ``voice_distance`` of the on-voice fixture against this corpus."""
+
+_OFF_VOICE_DISTANCE: Final[float] = 0.1012
+"""Measured ``voice_distance`` of the off-voice fixture against this corpus."""
+
+_DISTANCE_TOLERANCE: Final[float] = 5e-4
+"""Slack on the pinned measurements; a real drift should red this, not round away."""
+
+_LADDER: Final[tuple[str, ...]] = ("cheap-model", "middle-model", "frontier-model")
+"""A three-rung cost ladder, cheapest first, for the escalation assertion."""
+
+
+def test_the_component_table_covers_every_check_in_both_directions() -> None:
+    """A new component cannot be added without a fixture that fails it (#1911).
+
+    This is the structural half of the #1911 fix: the parametrised table below
+    is only a guard if it is complete, so completeness is asserted rather than
+    maintained by hand.
+    """
+    covered = {
+        (check, expected) for check, _desk, _text, expected in _COMPONENT_DIRECTIONS
+    }
+    assert covered == {
+        (check, expected) for check in ObedienceCheck for expected in (True, False)
+    }
+
+
+@pytest.mark.parametrize(
+    ("check", "instructions", "text", "expected"),
+    _COMPONENT_DIRECTIONS,
+    ids=[
+        f"{check.value}-{'passes' if expected else 'fails'}"
+        for check, _desk, _text, expected in _COMPONENT_DIRECTIONS
+    ],
+)
+def test_every_obedience_component_is_exercised_in_both_directions(
+    check: ObedienceCheck,
+    instructions: DeskInstructions,
+    text: str,
+    expected: bool,
 ) -> None:
-    """The eval exercises ``creek.lint.checks.voice_fidelity.run`` itself."""
-    seen: list[Path] = []
-    original = voice_fidelity.run
-
-    def _spy(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
-        seen.append(vault_path)
-        return original(vault_path, since=since)
-
-    monkeypatch.setattr(voice_fidelity, "run", _spy)
-    score_instruction_obedience(
-        corpus, blind((in_voice_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
-    )
-    assert seen == [corpus.root]
+    """Each component reads ``True`` for one candidate and ``False`` for another."""
+    blinded = blind((replace(in_voice_candidate(), text=text),), seed=1)
+    checks = obedience_checks(blinded, instructions)
+    assert checks[blinded[0].candidate_id][check] is expected
 
 
-def test_obedience_fails_loudly_if_the_shared_check_is_removed(
-    corpus: VoiceCorpus, monkeypatch: pytest.MonkeyPatch
+def test_no_obedience_component_is_constant_across_the_two_fixtures() -> None:
+    """One surface separates a compliant candidate from a disobedient one.
+
+    Every component flips between the two, which is what #1911's free point
+    could not do: it read ``True`` for the off-voice fixture as well as the
+    on-voice one.
+    """
+    compliant = replace(in_voice_candidate(), text=_COMPLIANT_TEXT)
+    disobedient = replace(slop_candidate(), text=_DISOBEDIENT_TEXT)
+    blinded = blind((compliant, disobedient), seed=1)
+    checks = obedience_checks(blinded, _FULL_SURFACE)
+    by_text = {candidate.text: checks[candidate.candidate_id] for candidate in blinded}
+    assert by_text[_COMPLIANT_TEXT] == dict.fromkeys(ObedienceCheck, True)
+    assert by_text[_DISOBEDIENT_TEXT] == dict.fromkeys(ObedienceCheck, False)
+
+
+def test_one_violated_component_scores_below_the_pass_threshold() -> None:
+    """Three honest components: one violated instruction fails the dimension.
+
+    The arithmetic is the reason #1911's component had to go rather than be
+    recalibrated. With four equally-weighted components a single violation
+    scores ``0.75``, which clears ``PASS_THRESHOLD``; with three it scores
+    ``2/3`` and does not.
+    """
+    candidate = replace(in_voice_candidate(), text=IN_VOICE_TEXT)
+    score = score_instruction_obedience(blind((candidate,), seed=1), _FULL_SURFACE)
+    assert score.score == pytest.approx(2 / 3)
+    assert score.score < PASS_THRESHOLD
+
+
+def test_the_ladder_does_not_stop_on_one_violated_component() -> None:
+    """A single violated instruction must still buy the next rung up."""
+    candidate = replace(in_voice_candidate(), text=IN_VOICE_TEXT)
+    score = score_instruction_obedience(blind((candidate,), seed=1), _FULL_SURFACE)
+    verdict = rubric_verdict((score,))
+    assert verdict is RubricVerdict.FAILS
+    assert next_candidate(_LADDER, _LADDER[0], verdict) == _LADDER[1]
+
+
+def test_obedience_does_not_call_the_voice_fidelity_check(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Duplicated logic would survive this; a real call site does not."""
+    """#1911: the dimension must not run a check whose result cannot move a score.
 
-    def _broken(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
+    Scoring through a ``voice_fidelity.run`` that explodes is the only way to
+    pin the *absence* of a call site; a reinstated delegation reds this test.
+    """
+
+    def _explode(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
         del vault_path, since
-        raise AssertionError("shared check reached")
+        raise AssertionError("voice-fidelity check reached")
 
-    monkeypatch.setattr(voice_fidelity, "run", _broken)
-    with pytest.raises(AssertionError, match="shared check reached"):
-        score_instruction_obedience(
-            corpus, blind((in_voice_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
-        )
+    monkeypatch.setattr(voice_fidelity, "run", _explode)
+    score = score_instruction_obedience(
+        blind((in_voice_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
+    )
+    assert score.probes == len(ObedienceCheck)
 
 
-def test_obedience_scores_an_in_voice_candidate_above_the_threshold(
+def test_the_shipped_voice_check_cannot_separate_the_fixtures(
     corpus: VoiceCorpus,
 ) -> None:
+    """The measurement that retired #1911's component, pinned in the suite.
+
+    ``creek.lint.checks.voice_fidelity.run`` flags a draft only once its
+    ``voice_distance`` clears ``voice_distance_upper``. At candidate length the
+    off-voice fixture does not get close, so the check returned no findings for
+    *either* fixture and the component was a constant. If a scanner or ceiling
+    change ever makes it discriminate here, this test reds and the decision in
+    ``dimensions.py``'s module docstring is up for review again.
+    """
+    drafts = corpus.root / DRAFTS_DIR
+    for name, text in (("on-voice", IN_VOICE_TEXT), ("off-voice", SLOP_TEXT)):
+        (drafts / f"{name}.md").write_text(text, encoding="utf-8")
+    result = voice_fidelity.run(corpus.root)
+    assert result.findings == []
+    config = AIStyleConfig()
+    fingerprint = load_fingerprint(corpus.root, config)
+    on_voice = scan(IN_VOICE_TEXT, fingerprint=fingerprint, config=config)
+    off_voice = scan(SLOP_TEXT, fingerprint=fingerprint, config=config)
+    assert on_voice.voice_distance == pytest.approx(
+        _ON_VOICE_DISTANCE, abs=_DISTANCE_TOLERANCE
+    )
+    assert off_voice.voice_distance == pytest.approx(
+        _OFF_VOICE_DISTANCE, abs=_DISTANCE_TOLERANCE
+    )
+    # The signal exists; it is simply far too small for the shipped ceiling.
+    assert on_voice.voice_distance < off_voice.voice_distance
+    assert off_voice.voice_distance < config.voice_distance_upper
+
+
+def test_obedience_scores_an_in_voice_candidate_above_the_threshold() -> None:
     """A compliant draft passes every deterministic component."""
     score = score_instruction_obedience(
-        corpus, blind((in_voice_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
+        blind((in_voice_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
     )
     assert score.basis is Basis.DETERMINISTIC
     assert score.score >= PASS_THRESHOLD
     assert score.probes == len(ObedienceCheck)
 
 
-def test_obedience_penalises_banned_phrases(corpus: VoiceCorpus) -> None:
+def test_obedience_probes_count_candidates_times_components() -> None:
+    """``probes`` is the real unit count, so a dropped component shows up in it."""
+    score = score_instruction_obedience(
+        blind((in_voice_candidate(), slop_candidate()), seed=3), DEFAULT_INSTRUCTIONS
+    )
+    assert score.probes == 2 * len(ObedienceCheck)
+
+
+def test_obedience_penalises_banned_phrases() -> None:
     """The slop candidate uses several banned phrases and loses that component."""
     good = score_instruction_obedience(
-        corpus, blind((in_voice_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
+        blind((in_voice_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
     )
     bad = score_instruction_obedience(
-        corpus, blind((slop_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
+        blind((slop_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
     )
     assert bad.score < good.score
 
 
-def test_obedience_penalises_a_length_violation(corpus: VoiceCorpus) -> None:
+def test_obedience_penalises_a_length_violation() -> None:
     """Length is part of the Writing Desk instruction surface."""
     strict = DeskInstructions(
         min_words=10_000,
@@ -220,51 +402,53 @@ def test_obedience_penalises_a_length_violation(corpus: VoiceCorpus) -> None:
         required_headings=(),
         banned_phrases=(),
     )
-    score = score_instruction_obedience(
-        corpus, blind((in_voice_candidate(),), seed=1), strict
-    )
+    score = score_instruction_obedience(blind((in_voice_candidate(),), seed=1), strict)
     assert score.score < 1.0
 
 
-def test_obedience_penalises_a_missing_heading(corpus: VoiceCorpus) -> None:
+def test_obedience_penalises_a_missing_heading() -> None:
     """Structure is checked against the instructions, not guessed."""
-    structured = DeskInstructions(
-        min_words=1,
-        max_words=10_000,
-        required_headings=("## Afterward",),
-        banned_phrases=(),
-    )
     score = score_instruction_obedience(
-        corpus, blind((in_voice_candidate(),), seed=1), structured
+        blind((in_voice_candidate(),), seed=1), _STRUCTURED
     )
     assert score.score < 1.0
 
 
-def test_obedience_credits_a_candidate_that_meets_the_structure(
+def test_obedience_credits_a_candidate_that_meets_every_component() -> None:
+    """Control for the tests above: each component can be satisfied at once.
+
+    Asserted per component rather than as ``score == 1.0``: a mean of ``1.0``
+    cannot tell three honest passes from two passes plus a component that is
+    incapable of failing, which is what #1911 hid.
+    """
+    candidate = replace(in_voice_candidate(), text=_HEADED_TEXT)
+    blinded = blind((candidate,), seed=1)
+    assert obedience_checks(blinded, _STRUCTURED) == {
+        blinded[0].candidate_id: dict.fromkeys(ObedienceCheck, True)
+    }
+    assert score_instruction_obedience(blinded, _STRUCTURED).score == 1.0
+
+
+def test_obedience_leaves_the_corpus_drafts_directory_alone(
     corpus: VoiceCorpus,
 ) -> None:
-    """Control for the test above: the heading check can be satisfied."""
-    candidate = replace(
-        in_voice_candidate(), text="## Afterward\n\nI shut the door. I slept."
+    """Scoring instructions is a pure read; it writes nothing into the vault."""
+    score_instruction_obedience(
+        blind((in_voice_candidate(),), seed=1), DEFAULT_INSTRUCTIONS
     )
-    structured = DeskInstructions(
-        min_words=1,
-        max_words=10_000,
-        required_headings=("## Afterward",),
-        banned_phrases=(),
-    )
-    score = score_instruction_obedience(corpus, blind((candidate,), seed=1), structured)
+    assert list((corpus.root / DRAFTS_DIR).glob("*.md")) == []
+
+
+def test_obedience_credits_the_off_voice_fixture_when_nothing_is_disobeyed() -> None:
+    """Obedience is about instructions, not voice — and now says so honestly.
+
+    This was #1911's RED: under a surface the off-voice fixture cannot disobey,
+    the dimension already scored ``1.0``, which looked like three honest passes
+    and was in fact two passes plus a component incapable of failing. The score
+    is unchanged and now means what it says. Voice is dimension (a)'s subject.
+    """
+    score = score_instruction_obedience(blind((slop_candidate(),), seed=1), _PERMISSIVE)
     assert score.score == 1.0
-
-
-def test_obedience_writes_drafts_only_inside_the_corpus(
-    corpus: VoiceCorpus,
-) -> None:
-    """Drafts are written inside the temp corpus, under its opaque id."""
-    blinded = blind((in_voice_candidate(),), seed=1)
-    score_instruction_obedience(corpus, blinded, DEFAULT_INSTRUCTIONS)
-    drafts = sorted(corpus.root.glob("07-Voice/Drafts/*.md"))
-    assert [path.stem for path in drafts] == [blinded[0].candidate_id]
 
 
 # --------------------------------------------------------------------------

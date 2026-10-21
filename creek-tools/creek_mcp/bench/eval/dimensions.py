@@ -11,15 +11,36 @@ is judged:
   without it the dimension reports :attr:`~…rubric.Basis.UNSUPPORTED` rather
   than a number. Nothing here encodes the current letter prompt as the
   rubric's definition of correct.
-- **(b) obedience to Writing Desk instructions** — deterministic, and
-  deliberately *delegated*: the voice half runs
-  :func:`creek.lint.checks.voice_fidelity.run` over drafts written into the
-  corpus, and corpus health runs
-  :func:`creek.generate.voice_authenticity.build_voice_authenticity_report`.
-  Those modules are called through their modules, not imported by name, so a
-  test can patch them and see the eval follow. Length, structure and banned
-  phrases are checked here because no existing code owns the Writing Desk
-  instruction surface (``docs/writing-desk.md``).
+- **(b) obedience to Writing Desk instructions** — deterministic, and scored
+  over exactly the three instructions the Writing Desk surface states: a length
+  band, required headings, and banned phrases. Nothing else belongs in it.
+  #1911 removed a fourth component that delegated to
+  :func:`creek.lint.checks.voice_fidelity.run` over the candidate written as a
+  draft. It was removed for two measured reasons, not for tidiness.
+
+  First, it could not discriminate. Against this corpus's fingerprint the
+  on-voice fixture measures ``voice_distance=0.0000`` and the deliberately
+  off-voice fixture ``0.1012``, both far under the shipped
+  :attr:`creek.config.AIStyleConfig.voice_distance_upper` of ``0.35``. A
+  heavier slop text tripping six of the sixteen active tell families still
+  only reaches ``0.2568``; the ceiling is first cleared by a saturation
+  specimen that trips all sixteen at once (``0.6863``) — prose no candidate
+  model emits. At candidate length the component therefore read ``True`` for
+  *both* fixtures, contributing a constant point to every obedience score.
+
+  Second, even a recalibrated ceiling could not be allowed to stand as a
+  fourth component: with four equally-weighted components a candidate that
+  violates exactly one scores ``3/4 = 0.75``, which clears
+  :data:`~creek_mcp.bench.eval.PASS_THRESHOLD`. The dimension could not fail
+  on a single violated instruction. With three, one violation scores
+  ``2/3 ≈ 0.667`` and the dimension fails, which is the whole point of
+  measuring obedience.
+
+  Voice is not an instruction, and it is already dimension (a)'s subject.
+  Corpus health still delegates, to
+  :func:`creek.generate.voice_authenticity.build_voice_authenticity_report`,
+  called through its module rather than imported by name so a test can patch
+  it and see the eval follow.
 - **(c) grounding accuracy** — deterministic, against the corpus's known
   fragment ids. A citation of a fragment the corpus does not contain scores
   zero, which is the whole point: an invented citation is worse than none.
@@ -38,7 +59,6 @@ from typing import TYPE_CHECKING, Final
 
 from creek.care.guardrail import acute_distress_guard
 from creek.generate import voice_authenticity
-from creek.lint.checks import voice_fidelity
 from creek.models import PrivacyTier
 from creek_mcp.bench.eval import RUBRIC_VERSION
 from creek_mcp.bench.eval.judge import JudgeRequest
@@ -48,7 +68,6 @@ from creek_mcp.bench.eval.rubric import (
     DimensionScore,
     RefusalProbe,
 )
-from creek_mcp.bench.eval.voice_corpus import DRAFTS_DIR
 from creek_mcp.tier_ceiling import TierCeiling, tier_allowed
 
 if TYPE_CHECKING:
@@ -89,14 +108,23 @@ class EvalCorpusError(ValueError):
 class ObedienceCheck(StrEnum):
     """The deterministic components of the obedience dimension.
 
-    Each is scored per candidate and the dimension reports the mean, so one
-    violated instruction costs its share rather than the whole score.
+    One member per instruction the Writing Desk surface actually states. Each
+    is scored per candidate and the dimension reports the mean, so one violated
+    instruction costs its share rather than the whole score — and with three
+    components that share is enough to put the dimension below
+    :data:`~creek_mcp.bench.eval.PASS_THRESHOLD`.
+
+    Every member must be falsifiable by a candidate the harness can construct.
+    A component that cannot fail is worse than its absence: it is a constant
+    point that lifts every score toward the pass threshold (#1911). Adding a
+    member therefore means adding a fixture that fails it, and re-checking the
+    arithmetic above — a fourth component would make a single violation score
+    ``0.75`` and pass.
     """
 
     LENGTH = "length"
     STRUCTURE = "structure"
     BANNED_PHRASES = "banned_phrases"
-    VOICE_FIDELITY = "voice_fidelity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,19 +249,9 @@ def score_voice_match(
     )
 
 
-def _write_draft(corpus: VoiceCorpus, candidate: BlindedCandidate) -> None:
-    """Write one candidate into the corpus's drafts directory, under its id."""
-    drafts = corpus.root / DRAFTS_DIR
-    drafts.mkdir(parents=True, exist_ok=True)
-    (drafts / f"{candidate.candidate_id}.md").write_text(
-        candidate.text, encoding="utf-8"
-    )
-
-
-def _obedience_checks(
+def _candidate_checks(
     candidate: BlindedCandidate,
     instructions: DeskInstructions,
-    flagged: frozenset[str],
 ) -> dict[ObedienceCheck, bool]:
     """Return each obedience component's pass/fail for one candidate."""
     lowered = candidate.text.lower()
@@ -248,43 +266,56 @@ def _obedience_checks(
         ObedienceCheck.BANNED_PHRASES: not any(
             phrase.lower() in lowered for phrase in instructions.banned_phrases
         ),
-        ObedienceCheck.VOICE_FIDELITY: candidate.candidate_id not in flagged,
+    }
+
+
+def obedience_checks(
+    blinded: Sequence[BlindedCandidate],
+    instructions: DeskInstructions,
+) -> dict[str, dict[ObedienceCheck, bool]]:
+    """Return every candidate's per-component obedience result, by candidate id.
+
+    The per-component view is public because the aggregate is not auditable on
+    its own: a mean of ``1.0`` cannot distinguish three honest passes from two
+    passes and a component that is incapable of failing. #1911 is exactly that
+    bug, and this is the surface a test needs to assert each component in both
+    directions.
+
+    Args:
+        blinded: The blinded candidates.
+        instructions: The instruction surface to check against.
+
+    Returns:
+        One mapping per candidate, keyed by the candidate's opaque id.
+    """
+    return {
+        candidate.candidate_id: _candidate_checks(candidate, instructions)
+        for candidate in blinded
     }
 
 
 def score_instruction_obedience(
-    corpus: VoiceCorpus,
     blinded: Sequence[BlindedCandidate],
     instructions: DeskInstructions,
 ) -> DimensionScore:
     """Score obedience to the Writing Desk instruction surface.
 
-    The voice half is the shipped guard, not a copy of it: each candidate is
-    written into the corpus's ``07-Voice/Drafts`` and
-    :func:`creek.lint.checks.voice_fidelity.run` is called once over the whole
-    directory, exactly as ``creek lint`` calls it. A candidate whose draft the
-    check flagged loses that component.
+    The score is the mean over candidates times the three components in
+    :class:`ObedienceCheck`. Three, not four: the module docstring records the
+    measurements behind #1911's removal of a voice-fidelity component that read
+    ``True`` for the off-voice fixture as well as the on-voice one.
 
     Args:
-        corpus: The built synthetic corpus, which owns the drafts directory.
         blinded: The blinded candidates.
         instructions: The instruction surface to check against.
 
     Returns:
         The obedience score, averaged over candidates and components.
     """
-    for candidate in blinded:
-        _write_draft(corpus, candidate)
-    result = voice_fidelity.run(corpus.root)
-    flagged = frozenset(
-        candidate.candidate_id
-        for candidate in blinded
-        if any(f"`{candidate.candidate_id}`" in finding for finding in result.findings)
-    )
     passes = [
         passed
-        for candidate in blinded
-        for passed in _obedience_checks(candidate, instructions, flagged).values()
+        for checks in obedience_checks(blinded, instructions).values()
+        for passed in checks.values()
     ]
     return DimensionScore(
         dimension=Dimension.INSTRUCTION_OBEDIENCE,
