@@ -132,7 +132,12 @@ separate Fly secret-backed files and are not part of that snapshot.
   --check pool` reports that identity, and makes no generation, because a
   canary on the pool would be a billed vendor call. There are no retries and
   no second destination: pool down, identity mismatch or an admission refusal
-  is a refusal, never a substituted model.
+  is a refusal, never a substituted model. What the operator pins, how a
+  re-pin is reviewed, which ADR-0016 Decision 3.3 conditions are still open
+  owner escalations, and the warm-minimum evidence T19 asks for are in
+  [pool-measurement-pin.md](pool-measurement-pin.md). The vendor is not
+  chosen and no spend is authorized, so nothing there may be run against a
+  vendor yet.
 
   Everything below governs the operator's key and is unchanged. The
   provisioner sets `CREEK_MANAGED_VAULT=1`
