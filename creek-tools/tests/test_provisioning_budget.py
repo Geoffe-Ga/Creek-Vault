@@ -354,6 +354,12 @@ def test_alert_vocabulary_is_exactly_seven_kinds_and_each_condition_maps_to_one(
         # ADR-0016 D1.12: a leftover pool credential is still spendable up to
         # its cap, unlike an orphaned volume, so it has its own kind (#1900).
         "pool_credential_orphan",
+        # ADR-0016 Decision 3.4: the organization admin key's own failure
+        # modes, which stop the key lifecycle rather than spending on it
+        # (#1930).  Deliberately distinct from pool_credential_orphan.
+        "pool_admin_key_unusable",
+        "pool_admin_key_rejected",
+        "pool_admin_key_near_expiry",
     }
     assert alerts == (
         Alert(AlertKind.CONTINUOUS_RUNNING, "fly-hot", 7200, "7200", "7200"),

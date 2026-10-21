@@ -40,6 +40,8 @@ def _coordinates() -> FlyPilotCoordinates:
         handoff_url="https://adepthood.example/control/v1/handoff",
         alert_url="https://adepthood.example/internal/vault-provisioning/alerts",
         volume="creek_control_state",
+        # Left at its default: no admin key is in use yet (#1930), which is
+        # the regime a pilot rendered today is actually in.
     )
 
 
@@ -414,6 +416,9 @@ def test_rendered_config_has_one_machine_volume_and_secret_contract() -> None:
         ("vault_image", "registry.fly.io/vault:latest"),
         ("control_image", "registry.fly.io/control:latest"),
         ("handoff_url", "http://adepthood.example/callback"),
+        ("token_expires_at", "2026-09-28T12:00:00"),
+        ("pool_admin_key_expires_at", "2026-12-28T12:00:00"),
+        ("pool_admin_key_expires_at", "not-a-date"),
     ],
 )
 def test_renderer_refuses_mutable_or_injectable_coordinates(

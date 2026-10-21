@@ -9,6 +9,37 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Give the organization pool admin key a declared custody path before any such
+  key exists (#1930). `creek_mcp.provisioning.pool_admin_key` fails closed with
+  its own content-free verdict codes (40-44, never reusing `--check pool`'s 30):
+  `load_pool_admin_key` is the one path to the value and refuses a missing,
+  malformed, undated or **expired** key rather than returning a default. The
+  value is never logged, echoed, measured or hashed, including on a vendor 401,
+  whose response body is never read — `classify_admin_response` takes a status
+  code and nothing else.
+
+  The custody path is **declared now and enforced on use**: a rendered pilot
+  config defaults to `CREEK_POOL_ADMIN_KEY_IN_USE = "0"`, carries no
+  `CREEK_POOL_ADMIN_KEY_B64` entry and requires no admin-key secret, so
+  declaring custody cannot make today's keyless pilot undeployable (which would
+  have forced an operator to invent the placeholder credential this module
+  exists to refuse). Rendering with `--pool-admin-key-expires-at <instant>`
+  (optional, new) switches to the in-use regime, which declares the secret and
+  makes every refusal binding. The environment-variable form of the secret is
+  refused in both regimes.
+
+  **Rollout prerequisite, in-use regime only:** set the `CREEK_POOL_ADMIN_KEY_B64`
+  Fly app secret out of band, like the other seven, before deploying a config
+  rendered with `--pool-admin-key-expires-at`.
+
+  Three `AlertKind` members are registered, each distinct from
+  `pool_credential_orphan`, but **nothing emits them yet**: a near-expiry
+  verdict is recorded on stderr at startup and not delivered. Periodic
+  re-checking belongs to #1896's fleet-report pass, and adepthood's alert
+  receiver enforces its own closed kind list (six kinds today, not including
+  `pool_credential_orphan`) that would answer an unknown kind `400` and take
+  the Machine unhealthy. The vendor calls themselves also remain #1896's.
+
 - Managed vaults are now local-only by construction (#1863). Every
   Adepthood-provisioned vault Machine carries `CREEK_MANAGED_VAULT=1`, and a
   managed vault refuses to start while `CREEK_CLOUD_CONSENT` or the legacy
