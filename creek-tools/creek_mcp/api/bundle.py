@@ -222,6 +222,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "capabilities": list(CAPABILITIES),
     "request_key_providers": [provider.value for provider in RequestKeyProvider],
     "inference_pool": True,
+    "keyless_inference": True,
 }
 """A ready managed server: vault present, all ten capabilities served, a
 writer's own Anthropic or OpenAI key accepted per request (#1873), and model
