@@ -18,12 +18,23 @@ Every dial lands on a loopback listener this suite opened (see
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 from creek.classify.llm.pool_boundary import (
+    POOL_MAX_DEADLINE_MS,
+    POOL_PROMPT_CHARS_PER_TOKEN,
+    POOL_PROMPT_TOKEN_CAP,
+    POOL_REQUEST_ID_HEADER,
     POOL_URL_ENV,
     PoolBoundaryError,
     PoolDestinationError,
+    PoolPromptTooLongError,
+    PoolRequestScope,
+    PoolTierUndeclaredError,
+    declared_pool_request,
+    pool_request_scope,
 )
 from creek.classify.llm.providers import (
     DEFAULT_MODELS,
@@ -49,6 +60,9 @@ from tests.pool_support import (
     identity_listing,
     pinned_identity_digest,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 def _config(**overrides: object) -> LLMConfig:
@@ -243,6 +257,18 @@ class TestAvailability:
 class TestCompletion:
     """Generation: one dial, one model, and no silent substitution."""
 
+    @pytest.fixture(autouse=True)
+    def _declared(self) -> Iterator[None]:
+        """Declare a ``personal`` pool request around every test in this class.
+
+        ADR-0016 Decision 1 item 4 makes the declared tier part of the closed
+        request shape, and :func:`creek.classify.llm.pool_boundary.require_pool_request`
+        refuses a context that has not declared one — so every generation test
+        here now runs inside the declaration a route makes for it.
+        """
+        with declared_pool_request("personal"):
+            yield
+
     def test_a_pinned_pool_answers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The happy path returns the pool's own text."""
         pool = FakePool.serving(generation(text="the answer"))
@@ -381,3 +407,140 @@ class TestCompletion:
             assert provider.complete("prompt").text
         finally:
             pool.close()
+
+
+class TestClosedRequestShape:
+    """ADR-0016 Decision 1 item 4: the request shape, on the wire.
+
+    The review of #1905 found the shipped shape was ``{"model", "prompt",
+    "stream", max_tokens?, system?}`` — missing the declared tier,
+    ``deadline_ms`` and the request id, and carrying ``stream``, an unknown
+    field against a closed shape. The consequence that mattered: **the pool's
+    own INTIMATE refusal could not exist, because the tier was never
+    transmitted.** These tests read the bytes the fake pool actually received.
+    """
+
+    def test_the_declared_tier_and_deadline_reach_the_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The closed shape is exactly the item 4 fields, and ``stream`` is gone."""
+        pool = FakePool.serving(generation())
+        pool.pin(monkeypatch)
+        try:
+            with declared_pool_request("open"):
+                PoolProvider(_config()).complete("prompt", max_tokens=16, system="s")
+        finally:
+            pool.close()
+
+        assert pool.bodies[0] == {
+            "model": PINNED_MODEL,
+            "prompt": "prompt",
+            "tier": "open",
+            "deadline_ms": POOL_MAX_DEADLINE_MS,
+            "max_tokens": 16,
+            "system": "s",
+        }
+
+    def test_the_request_id_rides_in_a_header_and_not_the_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A correlation key is not an inference argument (item 4)."""
+        pool = FakePool.serving(generation())
+        pool.pin(monkeypatch)
+        try:
+            with declared_pool_request("personal") as scope:
+                PoolProvider(_config()).complete("prompt")
+                declared = scope.request_id
+        finally:
+            pool.close()
+
+        assert pool.headers[0][POOL_REQUEST_ID_HEADER.lower()] == declared
+        assert "request_id" not in pool.bodies[0]
+
+    def test_an_intimate_tier_is_never_spelled_on_the_wire(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Declaring ``intimate`` leaves the scope undeclared, so nothing dials.
+
+        The :class:`~creek.classify.llm.router.ModelRouter` chokepoint has
+        already refused or redirected such a request (Decision 5); this is the
+        defence-in-depth layer, and it fails closed rather than inventing a
+        tier the pool contract cannot name.
+        """
+        monkeypatch.setenv(POOL_URL_ENV, "https://pool.vendor.test")
+        spy = SocketSpy(monkeypatch)
+
+        with declared_pool_request("intimate"), pytest.raises(PoolTierUndeclaredError):
+            PoolProvider(_config()).complete("prompt")
+
+        assert spy.destinations == []
+
+    def test_an_undeclared_context_refuses_before_any_dial(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No scope at all is a refusal, not a dial with a guessed tier."""
+        monkeypatch.setenv(POOL_URL_ENV, "https://pool.vendor.test")
+        spy = SocketSpy(monkeypatch)
+
+        with pytest.raises(PoolTierUndeclaredError):
+            PoolProvider(_config()).complete("prompt")
+
+        assert spy.destinations == []
+
+    def test_the_declared_deadline_is_capped_by_the_remaining_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``deadline_ms`` never outlives the vault request that wanted it."""
+        pool = FakePool.serving(generation())
+        pool.pin(monkeypatch)
+        scope = PoolRequestScope(budget_seconds=2.0)
+        try:
+            with pool_request_scope(scope), declared_pool_request("personal"):
+                PoolProvider(_config()).complete("prompt")
+        finally:
+            pool.close()
+
+        declared = pool.bodies[0]["deadline_ms"]
+        assert isinstance(declared, int)
+        assert 0 < declared <= 2000
+
+
+class TestPromptCapAtTheBoundary:
+    """The last line of the vault-side prompt cap (ADR-0016 D1.4).
+
+    A route that builds its own prompt drops grounding and refuses with its
+    own published shape. This guard catches every *other* pool caller, so no
+    path can dial over the cap merely because its route forgot — and it is
+    never a truncation on either path.
+    """
+
+    def test_an_over_cap_prompt_refuses_before_any_dial(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Measured against the contract's own cap, with zero dials."""
+        monkeypatch.setenv(POOL_URL_ENV, "https://pool.vendor.test")
+        spy = SocketSpy(monkeypatch)
+        prompt = "x" * (POOL_PROMPT_TOKEN_CAP * POOL_PROMPT_CHARS_PER_TOKEN + 1)
+
+        with (
+            declared_pool_request("personal"),
+            pytest.raises(PoolPromptTooLongError),
+        ):
+            PoolProvider(_config()).complete(prompt)
+
+        assert spy.destinations == []
+
+    def test_a_prompt_at_the_cap_is_admitted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The boundary is inclusive, so the cap is a ceiling and not a fence."""
+        pool = FakePool.serving(generation(text="fits"))
+        pool.pin(monkeypatch)
+        prompt = "x" * (POOL_PROMPT_TOKEN_CAP * POOL_PROMPT_CHARS_PER_TOKEN)
+        try:
+            with declared_pool_request("open"):
+                completion = PoolProvider(_config()).complete(prompt)
+        finally:
+            pool.close()
+
+        assert completion.text == "fits"

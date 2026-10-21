@@ -138,6 +138,7 @@ actually produce.
 
 _CAPABILITY_ERROR_CODES: Final[dict[Capability, tuple[ErrorCode, ...]]] = {
     Capability.UPLOAD: (ErrorCode.UNSUPPORTED_SOURCE,),
+    Capability.REFLECTIONS: (ErrorCode.RATE_LIMITED,),
 }
 """Refusals only one capability can produce, keyed by that capability.
 
@@ -146,13 +147,19 @@ A table rather than an ``if spec.capability is Capability.UPLOAD`` in
 document" is data about the route, and the *next* capability-specific code
 should be one line here rather than a second branch.
 
-Only ``upload`` has an entry today.
-:attr:`~creek_mcp.api.models.ErrorCode.UNSUPPORTED_SOURCE` is emitted by
-:func:`creek_mcp.httpapi.upload.upload_refusal_code` and nowhere else, so
+Two entries today, and the second one is the reason the table was worth
+having. :attr:`~creek_mcp.api.models.ErrorCode.UNSUPPORTED_SOURCE` is emitted
+by :func:`creek_mcp.httpapi.upload.upload_refusal_code` and nowhere else, so
 documenting it on every route would advertise a ``415`` five endpoints cannot
 return — and omitting it from the one that can leaves a generated client with
 no branch for the refusal it will meet the first time somebody uploads a
 ``conversations.json``.
+:attr:`~creek_mcp.api.models.ErrorCode.RATE_LIMITED` is the same shape at
+contract 0.19 (#1894): only ``POST /v1/reflections`` reaches it, through
+:func:`creek_mcp.httpapi.reflect.reflect_refusal_code`, because it is the one
+route whose model call is admitted against a per-vault cap. The two write
+routes that also call a model keep their existing refusal shapes, which is
+what ADR-0016 Decision 1 item 10 asks of them.
 """
 
 SECURITY_SCHEME_NAME: Final[str] = "bearerAuth"

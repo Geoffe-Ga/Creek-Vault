@@ -80,6 +80,7 @@ from creek.classify.llm.providers import (
     OllamaProvider,
     OpenAIProvider,
     build_provider,
+    provider_egresses,
     provider_is_cloud,
 )
 
@@ -99,6 +100,7 @@ __all__ = [
     "build_provider",
     "cloud_warning",
     "has_cloud_consent",
+    "provider_egresses",
     "provider_is_cloud",
     "require_cloud_consent",
 ]

@@ -30,6 +30,7 @@ from creek.classify.llm.providers import (
     OpenAIProvider,
     build_provider,
     known_providers,
+    provider_egresses,
     provider_is_cloud,
 )
 from creek.config import LLMConfig
@@ -138,6 +139,64 @@ def test_provider_is_cloud_does_not_instantiate() -> None:
 def test_anthropic_provider_is_cloud(anthropic_env: None) -> None:
     """``AnthropicProvider`` advertises cloud egress via ``is_cloud``."""
     assert AnthropicProvider(LLMConfig(provider="anthropic")).is_cloud is True
+
+
+class TestProviderEgresses:
+    """``egresses`` answers the destination question ``is_cloud`` does not.
+
+    ``is_cloud`` means "an operator cloud key, behind a consent gate". Two
+    registered backends answer ``False`` to it and still open a socket to a
+    remote host — the attested enclave and the shared pool — so anything that
+    needs to know whether the prompt *leaves the device* must ask this instead
+    (#1894; the ``inference_source`` provenance label is the caller that
+    found it out the hard way).
+    """
+
+    @pytest.mark.parametrize(
+        ("provider", "expected"),
+        [
+            pytest.param("ollama", False, id="ollama"),
+            pytest.param("anthropic", True, id="anthropic"),
+            pytest.param("openai", True, id="openai"),
+            pytest.param("gemini", True, id="gemini"),
+            pytest.param("enclave", True, id="enclave"),
+            pytest.param("pool", True, id="pool"),
+        ],
+    )
+    def test_every_registered_provider_answers(
+        self, provider: str, expected: bool
+    ) -> None:
+        """Every name in the registry, so a new backend cannot slip in unasked.
+
+        ``known_providers`` is asserted against this table below, which is
+        what makes the row list exhaustive rather than merely long.
+        """
+        assert provider_egresses(provider) is expected
+
+    def test_the_table_above_covers_the_whole_registry(self) -> None:
+        """The parametrize list is the registry, not a sample of it."""
+        covered = {"ollama", "anthropic", "openai", "gemini", "enclave", "pool"}
+        assert set(known_providers()) == covered
+
+    def test_an_unregistered_provider_is_assumed_to_egress(self) -> None:
+        """Fail closed, unlike ``is_cloud``.
+
+        ``provider_is_cloud`` answers ``False`` for an unknown name so the
+        classifier does not print a spurious consent warning. The opposite
+        default is right here: a name this process cannot resolve is not
+        evidence that nothing leaves the device, and the consequence of
+        guessing wrong is a published ``local`` on an answer that egressed.
+        """
+        assert provider_egresses("frobnicate") is True
+
+    def test_it_does_not_instantiate_the_provider(self) -> None:
+        """Read off the class, exactly as ``provider_is_cloud`` is.
+
+        No ``anthropic_env`` fixture: constructing ``AnthropicProvider``
+        without a key raises, so a passing assertion here proves the flag was
+        read from the class.
+        """
+        assert provider_egresses("anthropic") is True
 
 
 class TestOllamaProvider:

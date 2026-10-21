@@ -142,7 +142,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier \u2014 the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field \u2014 do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.",
+  "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier \u2014 the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field \u2014 do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted \u2014 rather\n        than guessed \u2014 on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.",
   "properties": {
     "essay": {
       "anyOf": [
@@ -162,6 +162,20 @@
       "description": "Required; only False is admissible at contract 0.2.",
       "title": "Essay Grounded",
       "type": "boolean"
+    },
+    "inference_source": {
+      "anyOf": [
+        {
+          "pattern": "^(?:local|pool:creek|pool:attested:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|request_key:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Route that answered: pool:creek, pool:attested:<vendor>, request_key:<vendor> or local. Since contract 0.19.",
+      "title": "Inference Source"
     },
     "notes": {
       "description": "Margin notes; may be empty.",

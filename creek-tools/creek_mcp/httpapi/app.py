@@ -43,7 +43,8 @@ why :func:`_outermost_fault` handles that case rather than assuming a fresh
 context. Every other fault is enveloped one layer down and never gets here.
 
 **A method miss renders as a routing miss.** ``405`` is not in the contract's
-published status set ``{200, 401, 403, 404, 409, 422, 500, 501, 503}``, and a
+published status set
+``{200, 202, 401, 403, 404, 409, 415, 422, 429, 500, 501, 503}``, and a
 conforming client maps an out-of-set status to "unreachable" — losing the vault
 entirely over a wrong verb. It would also publish which verbs a path serves,
 which is a small enumeration primitive. So the dispatch to :func:`_routing_miss`
@@ -177,7 +178,8 @@ METHOD_NOT_ALLOWED: Final[int] = 405
 
 Spelled as a literal precisely because the contract has **no**
 :class:`~creek_mcp.api.models.ErrorCode` for it. ``405`` is outside the
-published status set ``{200, 401, 403, 404, 409, 422, 500, 501, 503}`` *on
+published status set
+``{200, 202, 401, 403, 404, 409, 415, 422, 429, 500, 501, 503}`` *on
 purpose* — see the module docstring for why a method miss must be
 indistinguishable from a path miss — so there is no table to derive it from,
 and inventing a code to derive it from would put it back in the set.

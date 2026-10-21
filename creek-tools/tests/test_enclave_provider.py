@@ -42,15 +42,25 @@ from creek.classify.llm.providers import (
     build_provider,
     known_providers,
     provider_display_name,
+    provider_egresses,
     provider_is_cloud,
 )
 from creek.classify.llm.router import ModelRouter
 from creek.config import LLMConfig, LLMRoutingConfig
 from creek.models import PrivacyTier
+from tests.pool_support import SocketSpy
 
 _ENCLAVE_URL = "https://enclave.internal:8443"
 _MEASUREMENT = "sha384:attested-measurement-abc123"  # test literal, not real
 _PATCH_TARGET = "creek.classify.llm.providers.httpx.Client"
+_VERIFY_TARGET = "creek.classify.llm.providers.verify_enclave_attestation"
+_PROXY_ENV: Final[tuple[str, ...]] = (
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+"""Proxy variables ``httpx`` reads, cleared so a dial records its true host."""
 
 _UNSET: Final[object] = object()
 """Sentinel: serve the builder's well-formed default JSON body."""
@@ -154,6 +164,44 @@ def test_enclave_provider_is_not_cloud() -> None:
     """The enclave is ``is_cloud=False`` — attestation makes it operator-unreadable."""
     assert EnclaveProvider.is_cloud is False
     assert provider_is_cloud("enclave") is False
+
+
+def test_enclave_egresses_although_it_is_not_cloud() -> None:
+    """``is_cloud=False`` is not ``stays on the device`` (#1894).
+
+    Unreadable and local are different claims, and the enclave makes only the
+    first. Everything that needs the second — above all the published
+    ``inference_source``, which must never say ``local`` about an answer a
+    socket spy saw leave — reads ``egresses`` instead.
+    """
+    assert EnclaveProvider.egresses is True
+    assert provider_egresses("enclave") is True
+
+
+def test_the_enclave_prompt_dial_leaves_the_device() -> None:
+    """The reason ``egresses`` is ``True``, observed rather than asserted.
+
+    Attestation is stubbed out here on purpose: it is the gate that makes the
+    destination *unreadable*, and this test is about the destination existing
+    at all. With a socket spy in place of the real connector, the generate
+    call records a dial to the configured enclave host — not loopback — and
+    then fails, which is what a refused socket does.
+    """
+    with (
+        patch(_VERIFY_TARGET, return_value=None),
+        pytest.MonkeyPatch.context() as patcher,
+    ):
+        # ``call_enclave`` builds a plain ``httpx.Client``, which honours the
+        # ambient proxy variables; a developer machine behind one would record
+        # the proxy's address instead of the enclave's.
+        for variable in _PROXY_ENV:
+            patcher.delenv(variable, raising=False)
+        spy = SocketSpy(patcher)
+        with pytest.raises(httpx.HTTPError):
+            build_provider(_config()).complete("a prompt that must not go far")
+
+    assert spy.destinations == [("enclave.internal", 8443)]
+    assert spy.hosts != ["127.0.0.1"]
 
 
 def test_cloud_providers_remain_cloud() -> None:

@@ -227,6 +227,7 @@ from creek.classify.constants import (
     RULES_METHOD,
 )
 from creek.classify.llm import LLMClassifier
+from creek.classify.llm.pool_boundary import declared_pool_request, pool_wire_tier
 from creek.classify.llm.router import IntimateRoutingError
 from creek.classify.praxis_pass import apply_praxis
 from creek.classify.privacy import PrivacyClassifier
@@ -1117,6 +1118,15 @@ class _PreparedFragment:
             own verdict against this to answer the only question that
             licenses touching a settled tier: did *this run* make the
             heuristic stricter? (#1105)
+        pool_tier: The tier this fragment may be declared as on the shared
+            inference pool's wire, or ``None`` when the pool contract has no
+            spelling for it — which is every INTIMATE and unclassified
+            fragment (ADR-0016 Decision 1 item 4). Carried per fragment
+            rather than per classifier because the fragment's own tier is
+            what the pool must be told, and this is the frame that knows it:
+            one classifier serves every non-INTIMATE tier, so a tier declared
+            on the classifier would have had to be the stricter of them
+            instead of the true one.
     """
 
     fragment: Fragment
@@ -1124,6 +1134,7 @@ class _PreparedFragment:
     raw: dict[str, object]
     llm: LLMClassifier | None
     tier_baseline: PrivacyTier
+    pool_tier: str | None = None
 
 
 def _should_retier(
@@ -1309,6 +1320,14 @@ def _prepare_fragment(
         raw=raw,
         llm=llm,
         tier_baseline=tier_baseline,
+        # ADR-0016 Decision 1 item 4: the shared pool's closed request shape
+        # carries the declared tier, and ``pool_wire_tier`` has no spelling
+        # for ``intimate`` or ``unclassified`` — so a fragment routed to the
+        # local INTIMATE classifier leaves the declaration empty and a pool
+        # dial from it would refuse rather than carry a guessed tier. The
+        # ``ModelRouter`` chokepoint has already refused or redirected such a
+        # fragment; this is the defence-in-depth layer.
+        pool_tier=pool_wire_tier(tier_of(fragment)),
     )
 
 
@@ -1400,7 +1419,7 @@ def _process_file(
     # classifiers are pre-warmed (their availability was checked before the loop)
     # and read-only during the run, and each fragment is an independent input, so
     # concurrent calls are safe.
-    with _classify_permit(throttle, llm):
+    with _classify_permit(throttle, llm), declared_pool_request(prepared.pool_tier):
         new_fragment, outcome, reasoning = _classify_one(
             fragment=prepared.fragment,
             body=body,

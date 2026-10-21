@@ -78,6 +78,7 @@ from pydantic import BaseModel, ValidationError
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek_mcp.api.models import (
     OK_STATUS,
+    PROVENANCE_SINCE_MINOR,
     ClassificationMethod,
     ClassificationRequest,
     ClassificationResponse,
@@ -93,6 +94,10 @@ from creek_mcp.api.models import (
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
+from creek_mcp.httpapi.generation import (
+    declared_minor_at_least,
+    withheld_provenance_dropped,
+)
 from creek_mcp.httpapi.jobs import (
     StoredJob,
     claim_job,
@@ -264,6 +269,8 @@ def _rendered(
     result: dict[str, Any] | None,
     context: RequestContext,
     build: Callable[[dict[str, Any]], _Response],
+    *,
+    serve_provenance: bool = True,
 ) -> Response:
     """Project one tool's return onto its published response.
 
@@ -278,6 +285,9 @@ def _rendered(
             response body is assembled, and both models it can build forbid
             extra fields — which is what makes "no fragment can be in this
             body" a property of the types rather than of this function's care.
+        serve_provenance: Whether the caller's declared minor can describe
+            ``inference_source``. ``LinkResponse`` has no such field, so its
+            caller leaves this at the default.
 
     Returns:
         The ``200``, or the published refusal.
@@ -295,7 +305,12 @@ def _rendered(
         # not set, or a `tier_ceiling` the wire enum cannot name. Nothing a
         # caller can act on, so it is a server fault.
         return error_response(ErrorCode.INTERNAL_ERROR, context)
-    return json_response(payload.model_dump(mode="json"), HTTP_OK)
+    return json_response(
+        withheld_provenance_dropped(
+            payload.model_dump(mode="json"), serve=serve_provenance
+        ),
+        HTTP_OK,
+    )
 
 
 def _classification_model(
@@ -336,6 +351,10 @@ def _classification_model(
         praxis_marked=int(result["praxis_marked"]),
         tags_extracted=int(result["tags_extracted"]),
         complete=not result["errors"] and int(result["llm_call_failed"]) == 0,
+        # ``.get`` rather than ``[]``, unlike every count above: a job record
+        # written before contract 0.19 carries no such key, and reclaiming one
+        # must not become a server fault.
+        inference_source=result.get("inference_source"),
     )
 
 
@@ -571,7 +590,10 @@ async def handle_classification(request: Request) -> Response:
         )
     result = await write_off_loop(_classify, request, parsed, context)
     return _rendered(
-        result, context, partial(_classification_model, method=parsed.method)
+        result,
+        context,
+        partial(_classification_model, method=parsed.method),
+        serve_provenance=declared_minor_at_least(request, PROVENANCE_SINCE_MINOR),
     )
 
 
@@ -609,4 +631,10 @@ async def handle_job_status(request: Request) -> Response:
     status = await write_off_loop(_job_status, request, context, active_job_ids)
     if status is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    return json_response(status.model_dump(mode="json"), HTTP_OK)
+    return json_response(
+        withheld_provenance_dropped(
+            status.model_dump(mode="json"),
+            serve=declared_minor_at_least(request, PROVENANCE_SINCE_MINOR),
+        ),
+        HTTP_OK,
+    )

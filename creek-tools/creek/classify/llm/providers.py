@@ -38,12 +38,16 @@ from creek.classify.llm.local_boundary import (
     ollama_post,
 )
 from creek.classify.llm.pool_boundary import (
+    POOL_REQUEST_ID_HEADER,
     POOL_REQUEST_TIMEOUT,
     PoolBoundaryError,
+    PoolPromptTooLongError,
     admit_pool_url,
     pool_generate,
     pool_list_models,
+    pool_prompt_within_cap,
     pool_response_ok,
+    require_pool_request,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +91,7 @@ __all__ = [
     "pool_identity_digest",
     "pool_identity_matches",
     "provider_display_name",
+    "provider_egresses",
     "provider_intimate_eligible",
     "provider_is_cloud",
     "reported_pool_identity",
@@ -415,6 +420,9 @@ class AnthropicProvider:
 
     intimate_eligible: bool = False
     """A readable cloud vendor may never be shown INTIMATE content."""
+
+    egresses: bool = True
+    """The prompt is sent to Anthropic's API; it leaves the device."""
 
     PROVIDER_NAME: str = "Anthropic"
     """Display name woven into consent and cloud-egress messages."""
@@ -969,6 +977,17 @@ class OllamaProvider:
     intimate_eligible: bool = True
     """On-device inference: the one place INTIMATE content may be read."""
 
+    egresses: bool = False
+    """The dial stays on the device: loopback, and loopback-only when pinned.
+
+    The one registered backend that may publish ``local`` provenance. A
+    self-hosted operator can still point ``ollama_url`` at a LAN host, which
+    this class-level flag cannot see; a managed vault cannot, because the
+    container sets
+    :data:`~creek.classify.llm.local_boundary.LOOPBACK_ONLY_ENV` and every
+    non-loopback endpoint is refused before the dial.
+    """
+
     PROVIDER_NAME: str = "Ollama"
     """Display name (local; never appears in a cloud-egress message)."""
 
@@ -1297,6 +1316,17 @@ class EnclaveProvider:
     intimate_eligible: bool = True
     """Attest-then-mount makes the enclave unreadable, so INTIMATE may route here."""
 
+    egresses: bool = True
+    """The prompt is sent to a remote confidential-compute endpoint.
+
+    Unreadable and on-device are different claims, and the enclave makes
+    only the first. :attr:`is_cloud` is ``False`` above because no operator
+    cloud key and no consent variable are involved; the socket still goes to
+    the enclave operator's host over ``https``. That is why the published
+    ``inference_source`` may not call an enclave answer ``local`` (#1894,
+    ADR-0016 T15) — a socket spy would contradict it.
+    """
+
     PROVIDER_NAME: str = "Enclave (GPU-CC)"
     """Display name for the confidential-compute endpoint."""
 
@@ -1404,6 +1434,9 @@ class OpenAIProvider:
 
     intimate_eligible: bool = False
     """A readable cloud vendor may never be shown INTIMATE content."""
+
+    egresses: bool = True
+    """The prompt is sent to the OpenAI API; it leaves the device."""
 
     PROVIDER_NAME: str = "OpenAI"
     """Display name woven into consent and cloud-egress messages."""
@@ -1690,6 +1723,9 @@ class GeminiProvider:
     intimate_eligible: bool = False
     """A readable cloud vendor may never be shown INTIMATE content."""
 
+    egresses: bool = True
+    """The prompt is sent to the Gemini API; it leaves the device."""
+
     PROVIDER_NAME: str = "Gemini"
     """Display name woven into consent and cloud-egress messages."""
 
@@ -1949,6 +1985,10 @@ _POOL_MALFORMED: Final[str] = "the shared inference pool answered unusably"
 _POOL_REFUSED: Final[str] = "the shared inference pool refused the request"
 _POOL_RATE_LIMITED: Final[str] = "the shared inference pool is rate limiting"
 
+_POOL_PROMPT_TOO_LONG: Final[str] = (
+    "the prompt exceeds the shared inference pool's token cap"
+)
+
 _POOL_IDENTITY_TIMEOUT: Final[float] = 2.0
 """Seconds allowed for the identity listing; it precedes every prompt."""
 
@@ -2165,6 +2205,24 @@ def call_pool(
     Exactly one dial, to one destination, with no retry and no fallback to
     another model or another host (ADR-0016 R9, Decision 1 item 10).
 
+    **The request shape is closed** and is exactly Decision 1 item 4's: the
+    pinned identity, the prompt, the **declared tier**, ``deadline_ms`` capped
+    at :data:`~creek.classify.llm.pool_boundary.POOL_MAX_DEADLINE_MS`, and the
+    optional ``max_tokens`` and ``system``. The random request id rides in
+    :data:`~creek.classify.llm.pool_boundary.POOL_REQUEST_ID_HEADER`, a header
+    and not a body field, because it is a correlation key rather than an
+    inference argument. ``stream`` is **not** sent: this boundary reads one
+    whole answer, and an unknown field against a closed shape is a refusal the
+    vault would have earned for nothing.
+
+    Transmitting the tier is what lets the pool refuse ``intimate`` at all. It
+    is defence in depth and never the first line — the
+    :class:`~creek.classify.llm.router.ModelRouter` chokepoint has already
+    refused or redirected an INTIMATE request before any dial, because by the
+    time a pool could refuse, the plaintext would have left the vault. A
+    context that declared no admitted tier is refused here rather than dialled
+    with the field guessed.
+
     Args:
         config: The stage's configuration, read only for the model name.
         prompt: The fully-formatted prompt.
@@ -2179,16 +2237,29 @@ def call_pool(
         PoolIdentityError: When the answer names a different model.
         ProviderRateLimitError: On a 429 from the pool.
         RuntimeError: On any other refusal.
-        PoolBoundaryError: On a transport failure or a cancelled dial.
+        PoolBoundaryError: On a transport failure, a cancelled dial, or a
+            context that declared no admitted tier.
     """
     _admit_configured_destination(config)
+    if not pool_prompt_within_cap(prompt):
+        raise PoolPromptTooLongError(_POOL_PROMPT_TOO_LONG)
+    scope = require_pool_request()
     model = _resolve_configured_model(config.model, DEFAULT_MODELS["pool"])
-    payload: dict[str, object] = {"model": model, "prompt": prompt, "stream": False}
+    payload: dict[str, object] = {
+        "model": model,
+        "prompt": prompt,
+        "tier": scope.require_tier(),
+        "deadline_ms": scope.deadline_ms(timeout),
+    }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     if system:
         payload["system"] = system
-    response = pool_generate(payload, budget=timeout)
+    response = pool_generate(
+        payload,
+        budget=timeout,
+        headers={POOL_REQUEST_ID_HEADER: scope.request_id},
+    )
     if not pool_response_ok(response):
         raise _pool_status_error(response.status)
     return _pool_completion(response.payload, model)
@@ -2221,6 +2292,13 @@ class PoolProvider:
 
     intimate_eligible: bool = False
     """INTIMATE never leaves the vault process, attested pool or not."""
+
+    egresses: bool = True
+    """One destination beyond loopback, pinned in the Machine environment.
+
+    Not cloud and not on-device either. The pool's provenance is named by
+    its own two values rather than by ``local``.
+    """
 
     PROVIDER_NAME: str = "Shared Pool"
     """Display name for the shared confidential inference pool."""
@@ -2301,10 +2379,10 @@ class PoolProvider:
 
 #: Registry mapping the ``LLMConfig.provider`` string to its provider class.
 #: The value is the concrete class (not the ``LLMProvider`` protocol) so it is
-#: both constructible and exposes the class-level ``is_cloud`` and
-#: ``intimate_eligible`` flags; widen the union as new providers land. mypy
-#: rejects a member that declares neither, so a new backend cannot be
-#: registered without answering both questions.
+#: both constructible and exposes the class-level ``is_cloud``,
+#: ``intimate_eligible`` and ``egresses`` flags; widen the union as new
+#: providers land. mypy rejects a member that is missing any of the three, so
+#: a new backend cannot be registered without answering all three questions.
 _PROVIDER_REGISTRY: dict[
     str,
     type[
@@ -2369,6 +2447,43 @@ def provider_is_cloud(provider: str) -> bool:
     """
     provider_cls = _PROVIDER_REGISTRY.get(provider)
     return bool(provider_cls is not None and provider_cls.is_cloud)
+
+
+def provider_egresses(provider: str) -> bool:
+    """Report whether a prompt sent to *provider* leaves the device (#1894).
+
+    The honest destination question, and deliberately **not**
+    :func:`provider_is_cloud`. That flag means "an operator cloud key, behind
+    the cloud-egress consent gate", which is a question about billing and
+    consent; two registered backends answer ``False`` to it and still open a
+    socket to a remote host — the attested enclave (unreadable, not local) and
+    the shared pool (one pinned destination beyond loopback). Anything that
+    needs to know whether the content left the machine must read this instead,
+    above all the published ``inference_source``: ADR-0016 T15 requires that
+    label to match a socket spy's observed destination on every route, and
+    ``local`` about an enclave answer is the one value it could contradict.
+
+    Read from the class-level ``egresses`` flag without instantiating, exactly
+    as :func:`provider_is_cloud` reads ``is_cloud``. The provider registry's
+    own type is what forces every registered backend to declare it, so a new
+    backend cannot be added without answering the question.
+
+    An unregistered provider is assumed to egress. This is the opposite
+    default to :func:`provider_is_cloud`, which answers ``False`` for an
+    unknown name so the classifier prints no spurious consent warning. Here
+    the fail-closed direction is the other way: a name this process cannot
+    resolve is no evidence that nothing left the device, and the cost of
+    guessing wrong is a published ``local`` on an answer that egressed.
+
+    Args:
+        provider: The ``LLMConfig.provider`` string.
+
+    Returns:
+        ``True`` when the named provider sends content off-device, or when it
+        names no registered backend at all.
+    """
+    provider_cls = _PROVIDER_REGISTRY.get(provider)
+    return provider_cls is None or provider_cls.egresses
 
 
 def provider_intimate_eligible(provider: str) -> bool:

@@ -546,6 +546,7 @@ EXPECTED_ERROR_CODES: frozenset[str] = frozenset(
         "unsupported_source",
         "unavailable",
         "temporarily_unavailable",
+        "rate_limited",
         "internal_error",
     }
 )
@@ -560,11 +561,12 @@ EXPECTED_ERROR_STATUS: tuple[tuple[str, int], ...] = (
     ("unsupported_source", 415),
     ("unavailable", 503),
     ("temporarily_unavailable", 503),
+    ("rate_limited", 429),
     ("internal_error", 500),
 )
 
 ALLOWED_HTTP_STATUSES: frozenset[int] = frozenset(
-    {401, 403, 404, 409, 415, 422, 500, 501, 503}
+    {401, 403, 404, 409, 415, 422, 429, 500, 501, 503}
 )
 
 EXPECTED_RETRY_POLICY: tuple[tuple[str, str], ...] = (
@@ -577,6 +579,7 @@ EXPECTED_RETRY_POLICY: tuple[tuple[str, str], ...] = (
     ("unsupported_source", "terminal"),
     ("unavailable", "retry_after_operator_action"),
     ("temporarily_unavailable", "retry_with_backoff"),
+    ("rate_limited", "retry_with_backoff"),
     ("internal_error", "retry_with_backoff"),
 )
 
@@ -816,13 +819,14 @@ def test_contract_model_rejects_an_unknown_key(model_name: str) -> None:
 
 
 def test_error_code_membership_is_frozen() -> None:
-    """``ErrorCode`` carries exactly the ten agreed wire codes.
+    """``ErrorCode`` carries exactly the eleven agreed wire codes.
 
     Nine since contract 0.2; ``unsupported_source`` joined at 0.8 (#1524),
-    which is also what brought ``415`` into the published status set.
+    which is also what brought ``415`` into the published status set, and
+    ``rate_limited`` joined at 0.19 (#1894, ADR-0016), which brought ``429``.
     """
     assert {code.value for code in ErrorCode} == EXPECTED_ERROR_CODES
-    assert len(ErrorCode) == 10
+    assert len(ErrorCode) == 11
 
 
 def test_error_code_has_no_care_escalation_member() -> None:
@@ -1866,12 +1870,15 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.18 widened the compatibility window rather than shifting it.
+    """0.19 widened the compatibility window rather than shifting it.
 
-    A ``0.17`` client has no request-key headers or ``request_key_providers``
-    in its vendored contract, and every response it can receive keeps its
-    byte-identical shape under #1873. Earlier minors are checked alongside it
-    because the window only ever widens.
+    A ``0.18`` client has neither ``inference_source``, ``inference_pool`` nor
+    ``rate_limited`` in its vendored contract, and every response it can
+    receive keeps its byte-identical shape under #1894: both fields are
+    omitted and an admission refusal reaches it as the
+    ``temporarily_unavailable`` it has always received for a shed request.
+    Earlier minors are checked alongside it because the window only ever
+    widens.
 
     The head entry of :data:`SUPPORTED_CONTRACT_MINORS` is *derived* from
     :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the version
@@ -1879,6 +1886,7 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.18" in SUPPORTED_CONTRACT_MINORS
     assert "0.17" in SUPPORTED_CONTRACT_MINORS
     assert "0.16" in SUPPORTED_CONTRACT_MINORS
     assert "0.15" in SUPPORTED_CONTRACT_MINORS
@@ -1889,7 +1897,7 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.18"
+    assert CONTRACT_MINOR == "0.19"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:
