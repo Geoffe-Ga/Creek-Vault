@@ -23,16 +23,15 @@ import pytest
 import yaml
 from starlette.requests import Request
 
-from creek.classify.llm import LLMClassifier
-from creek.classify.llm.completion import Completion
+from creek.classify.classify_engine import _PreparedFragment
 from creek.classify.llm.pool_boundary import (
-    POOL_PERSONAL_TIER,
     POOL_URL_ENV,
     POOL_VENDOR_ENV,
-    current_pool_scope,
+    pool_wire_tier,
 )
 from creek.classify.llm.request_key import RequestKey
-from creek.config import CreekConfig, LLMConfig, load_vault_config
+from creek.config import CreekConfig, load_vault_config
+from creek.models import PrivacyTier
 from creek_mcp.api.models import (
     INFERENCE_SOURCE_LOCAL,
     INFERENCE_SOURCE_POOL_CREEK,
@@ -269,82 +268,43 @@ class TestRequestBudget:
         assert remaining <= 0
 
 
-class TestClassifierTierDeclaration:
-    """A pool-routed classification pass declares a tier, or does not dial.
+class TestFragmentTierDeclaration:
+    """A classification pass declares each fragment's own tier, or none.
 
-    Without this the closed request shape would make a pool-routed
-    classification stage refuse at the dial rather than carry the tier — a
-    fail-closed outcome, but a useless one.
+    The pool contract's request shape carries the declared tier, so a
+    pool-routed classification stage would otherwise refuse at the dial.
+    :class:`creek.classify.classify_engine._PreparedFragment` carries
+    ``pool_wire_tier(tier_of(fragment))`` and the classify call runs inside
+    that declaration — per fragment, so the tier declared is the fragment's
+    true one rather than the stricter of the two a shared classifier serves.
     """
 
-    def test_the_non_intimate_classifier_declares_the_stricter_tier(self) -> None:
-        """``personal``: one classifier serves both admitted tiers."""
-        recorded: list[str | None] = []
-        classifier = LLMClassifier(
-            LLMConfig(provider="pool"),
-            provider=_RecordingProvider(recorded),
-            available=True,
-            declared_tier=POOL_PERSONAL_TIER,
-        )
+    @pytest.mark.parametrize(
+        "tier",
+        list(PrivacyTier),
+        ids=[tier.value for tier in PrivacyTier],
+    )
+    def test_every_privacy_tier_either_has_one_wire_spelling_or_none(
+        self, tier: PrivacyTier
+    ) -> None:
+        """``intimate`` and ``unclassified`` have none, and that is the point.
 
-        assert classifier.invoke_prompt("classify this") == "{}"
-        assert recorded == [POOL_PERSONAL_TIER]
-
-    def test_the_intimate_classifier_declares_nothing(self) -> None:
-        """So a pool dial from the INTIMATE route refuses rather than carrying it."""
-        recorded: list[str | None] = []
-        classifier = LLMClassifier(
-            LLMConfig(provider="ollama"),
-            provider=_RecordingProvider(recorded),
-            available=True,
-        )
-
-        assert classifier.invoke_prompt("classify this") == "{}"
-        assert recorded == [None]
-
-
-class _RecordingProvider:
-    """A provider that records the tier the active pool scope declared."""
-
-    is_cloud: bool = False
-    intimate_eligible: bool = True
-
-    def __init__(self, recorded: list[str | None]) -> None:
-        """Store the list each completion appends the declared tier to.
-
-        Args:
-            recorded: The list to append to.
+        A fragment the pool contract cannot name leaves the declaration empty,
+        so a dial from its classifier refuses rather than carrying a guess.
+        The chokepoint has already routed such a fragment locally; this is the
+        defence-in-depth layer.
         """
-        self._recorded = recorded
+        spelled = pool_wire_tier(tier)
+        if tier in {PrivacyTier.OPEN, PrivacyTier.PERSONAL}:
+            assert spelled == tier.value
+        else:
+            assert spelled is None
 
-    @property
-    def model(self) -> str:
-        """The model name; never used by these tests."""
-        return "recording-model"
+    def test_a_prepared_fragment_declares_nothing_by_default(self) -> None:
+        """The default is the fail-closed one, not ``open``.
 
-    @property
-    def available(self) -> bool:
-        """Always available; nothing is dialled."""
-        return True
-
-    def complete(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int | None = None,
-        system: str | None = None,
-    ) -> Completion:
-        """Record the declared tier and return an empty JSON object.
-
-        Args:
-            prompt: Ignored.
-            max_tokens: Ignored.
-            system: Ignored.
-
-        Returns:
-            A completion carrying ``{}``.
+        A rules pass builds no classifier and declares no tier, and a future
+        caller that forgets the keyword inherits "declare nothing" rather than
+        "declare the most permissive tier".
         """
-        del prompt, max_tokens, system
-        scope = current_pool_scope()
-        self._recorded.append(None if scope is None else scope.tier)
-        return Completion(text="{}")
+        assert _PreparedFragment.__dataclass_fields__["pool_tier"].default is None
