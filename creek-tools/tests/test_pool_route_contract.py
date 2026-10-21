@@ -35,6 +35,9 @@ from creek.classify.llm.pool_boundary import (
     POOL_PROMPT_TOKEN_CAP,
     POOL_URL_ENV,
     POOL_VENDOR_ENV,
+    PoolBoundaryError,
+    PoolDial,
+    PoolDialCancelledError,
     pool_prompt_tokens,
     pool_prompt_within_cap,
 )
@@ -70,6 +73,8 @@ if TYPE_CHECKING:
     import httpx
     from starlette.testclient import TestClient
 
+    from creek.classify.llm.pool_boundary import PoolResponse
+
 ENTRY: Final[str] = "I keep saying yes to things I do not want, and I feel it later."
 """A benign entry the care guard does not escalate."""
 
@@ -100,6 +105,9 @@ _BOUNDED_TIMEOUT: Final[float] = 2.0
 
 _CANCEL_DEADLINE: Final[float] = 1.0
 """ADR-0016 T23: the socket must close within one second of the cancel."""
+
+_SETTLE_POLL: Final[float] = 0.01
+"""Poll interval while the abandoned worker records its dial's refusal."""
 
 _JOB_DEADLINE: Final[float] = 5.0
 """Bounded wait for a durable pipeline job to reach a terminal state."""
@@ -534,6 +542,67 @@ class TestRequestKeyPrecedence:
 # --------------------------------------------------------------------------- #
 
 
+def _recorded_dial_endings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[type[BaseException]]:
+    """Record which refusal ended each real pool dial, in order.
+
+    **Why a closing socket is not proof of a cancel.** ``open_pool_dial`` caps
+    the boundary's own ``request_timeout`` at the scope's remaining budget,
+    and that budget is derived from the very deadline the route sheds on — so
+    the worker's blocked read times out at the same instant the loop cancels,
+    and :meth:`PoolDial.request`'s ``finally: self.close()`` then closes the
+    socket anyway. The pool sees end-of-stream either way, within milliseconds
+    of the same moment. A timing assertion therefore cannot tell the two
+    apart, which is exactly how the first version of the test below passed
+    with ``PoolRequestScope.cancel`` monkeypatched to a no-op.
+
+    What *does* distinguish them is the production refusal the dial raises,
+    because :meth:`PoolDial._failure` reads its own ``_cancelled`` flag: a
+    cancelled dial raises :class:`PoolDialCancelledError`, and one that merely
+    ran out its read timeout raises :class:`PoolUnreachableError`. Recording
+    it here is the route-level proof that the *route* cut the socket.
+
+    Args:
+        monkeypatch: Restores the real method when the test finishes.
+
+    Returns:
+        The live list the wrapper appends to; the worker thread is abandoned
+        at the deadline, so it fills shortly *after* the response returns.
+    """
+    endings: list[type[BaseException]] = []
+    original = PoolDial.request
+
+    def recording(dial: PoolDial, path: str, **kwargs: Any) -> PoolResponse:
+        """Delegate, noting the refusal on the way out."""
+        try:
+            return original(dial, path, **kwargs)
+        except PoolBoundaryError as exc:
+            endings.append(type(exc))
+            raise
+
+    monkeypatch.setattr(PoolDial, "request", recording)
+    return endings
+
+
+def _settled(endings: list[type[BaseException]], timeout: float) -> bool:
+    """Wait, bounded, for the abandoned worker to record its dial's ending.
+
+    Args:
+        endings: The list :func:`_recorded_dial_endings` returned.
+        timeout: Seconds to wait.
+
+    Returns:
+        ``True`` once something has been recorded; ``False`` on expiry.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if endings:
+            return True
+        time.sleep(_SETTLE_POLL)
+    return bool(endings)
+
+
 class TestShedPath:
     """ADR-0016 T23 / Decision 1 item 7, from the route rather than a unit test.
 
@@ -541,19 +610,28 @@ class TestShedPath:
     ``pool_generate`` owned its dial inside a ``with``, and nothing on the
     event loop held a reference to cancel. So the shed path was unrealized and
     the "remaining budget" cap was inert on the only generation path.
+
+    An independent review of #1920 then found that the first route-level test
+    written for it proved less than it claimed: it asserted only that the
+    pool's socket closed, which the boundary's own capped read timeout does at
+    the same instant, so the test still passed with
+    ``PoolRequestScope.cancel`` replaced by a no-op. It now asserts the
+    refusal the dial raised instead — see :func:`_recorded_dial_endings` —
+    which only the cancel can produce, and that patch now reds it.
     """
 
     @pytest.mark.usefixtures("isolated")
-    def test_a_shed_reflection_closes_the_pool_socket(
+    def test_a_shed_reflection_has_its_pool_dial_cancelled(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The deadline fires, the caller is answered, and the dial is cut.
+        """The deadline fires, the caller is answered, and the route cuts the dial.
 
         Without the wiring the worker thread would stay blocked for the
         boundary's full 12 s request timeout with the pool's connection open —
         a vendor call still running after the vault had already answered.
         """
         _probe_passes(monkeypatch)
+        endings = _recorded_dial_endings(monkeypatch)
         hanging = FakePool(hang=True)
         hanging.pin(monkeypatch)
         vault = _pool_vault(tmp_path)
@@ -565,12 +643,17 @@ class TestShedPath:
                     headers=headers(ceiling="personal"),
                 )
             closed = hanging.held_reached_eof(_CANCEL_DEADLINE)
+            settled = _settled(endings, _CANCEL_DEADLINE)
         finally:
             hanging.close()
 
         assert response.status_code == HTTP_SERVICE_UNAVAILABLE, response.text
         assert response.json()["code"] == "temporarily_unavailable"
         assert closed, "the shed request left the pool dial open"
+        assert settled, "the pool dial never ended"
+        # The load-bearing assertion: ``PoolUnreachableError`` here would mean
+        # the dial timed itself out and the route's cancel did nothing.
+        assert endings == [PoolDialCancelledError], endings
         # One dial and no retry: the shed is a refusal, not a second attempt.
         assert hanging.accepted == 1
 
