@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -35,9 +36,8 @@ from creek.classify.llm.pool_boundary import (
     POOL_PROMPT_TOKEN_CAP,
     POOL_URL_ENV,
     POOL_VENDOR_ENV,
-    PoolBoundaryError,
     PoolDial,
-    PoolDialCancelledError,
+    PoolRequestScope,
     pool_prompt_tokens,
     pool_prompt_within_cap,
 )
@@ -73,8 +73,6 @@ if TYPE_CHECKING:
     import httpx
     from starlette.testclient import TestClient
 
-    from creek.classify.llm.pool_boundary import PoolResponse
-
 ENTRY: Final[str] = "I keep saying yes to things I do not want, and I feel it later."
 """A benign entry the care guard does not escalate."""
 
@@ -105,9 +103,6 @@ _BOUNDED_TIMEOUT: Final[float] = 2.0
 
 _CANCEL_DEADLINE: Final[float] = 1.0
 """ADR-0016 T23: the socket must close within one second of the cancel."""
-
-_SETTLE_POLL: Final[float] = 0.01
-"""Poll interval while the abandoned worker records its dial's refusal."""
 
 _JOB_DEADLINE: Final[float] = 5.0
 """Bounded wait for a durable pipeline job to reach a terminal state."""
@@ -542,65 +537,71 @@ class TestRequestKeyPrecedence:
 # --------------------------------------------------------------------------- #
 
 
-def _recorded_dial_endings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> list[type[BaseException]]:
-    """Record which refusal ended each real pool dial, in order.
+@dataclass
+class _DialSpy:
+    """What the route's scope registered, and which dials it then cancelled.
+
+    Attributes:
+        registered: Every dial handed to :meth:`PoolRequestScope.register`,
+            in order. Empty means the loop was holding nothing to cancel,
+            which is the #1905 defect itself.
+        cancelled: Every dial :meth:`PoolDial.cancel` was called on.
+    """
+
+    registered: list[PoolDial]
+    cancelled: list[PoolDial]
+
+
+def _spy_on_dials(monkeypatch: pytest.MonkeyPatch) -> _DialSpy:
+    """Record the route's custody of its pool dial, delegating to the real code.
 
     **Why a closing socket is not proof of a cancel.** ``open_pool_dial`` caps
-    the boundary's own ``request_timeout`` at the scope's remaining budget,
-    and that budget is derived from the very deadline the route sheds on — so
-    the worker's blocked read times out at the same instant the loop cancels,
-    and :meth:`PoolDial.request`'s ``finally: self.close()`` then closes the
-    socket anyway. The pool sees end-of-stream either way, within milliseconds
-    of the same moment. A timing assertion therefore cannot tell the two
-    apart, which is exactly how the first version of the test below passed
-    with ``PoolRequestScope.cancel`` monkeypatched to a no-op.
+    the boundary's own ``request_timeout`` at the scope's remaining budget, and
+    that budget is read off the very deadline the route sheds on — so the
+    worker's blocked read expires at the same instant the loop cancels, and
+    :meth:`PoolDial.request`'s ``finally: self.close()`` closes the socket
+    anyway. The pool reaches end-of-stream either way, so "the socket closed"
+    is satisfied by a route that cancels nothing at all. That is exactly how
+    the first version of the test below passed with
+    ``PoolRequestScope.cancel`` monkeypatched to a no-op, which an independent
+    review of #1920 demonstrated.
 
-    What *does* distinguish them is the production refusal the dial raises,
-    because :meth:`PoolDial._failure` reads its own ``_cancelled`` flag: a
-    cancelled dial raises :class:`PoolDialCancelledError`, and one that merely
-    ran out its read timeout raises :class:`PoolUnreachableError`. Recording
-    it here is the route-level proof that the *route* cut the socket.
+    Nor can the two co-timed closers be told apart by timing or by the
+    refusal the dial raises: both are decided by which of two deadlines a
+    loaded machine serves first, so an assertion either way is a race, not a
+    contract.
 
-    Args:
-        monkeypatch: Restores the real method when the test finishes.
-
-    Returns:
-        The live list the wrapper appends to; the worker thread is abandoned
-        at the deadline, so it fills shortly *after* the response returns.
-    """
-    endings: list[type[BaseException]] = []
-    original = PoolDial.request
-
-    def recording(dial: PoolDial, path: str, **kwargs: Any) -> PoolResponse:
-        """Delegate, noting the refusal on the way out."""
-        try:
-            return original(dial, path, **kwargs)
-        except PoolBoundaryError as exc:
-            endings.append(type(exc))
-            raise
-
-    monkeypatch.setattr(PoolDial, "request", recording)
-    return endings
-
-
-def _settled(endings: list[type[BaseException]], timeout: float) -> bool:
-    """Wait, bounded, for the abandoned worker to record its dial's ending.
+    What *is* a contract, and what #1905's review actually found missing, is
+    custody: the event loop must still hold a reference to the in-flight dial
+    and must cancel it. That is what this records, and a no-op
+    ``PoolRequestScope.cancel`` empties :attr:`_DialSpy.cancelled` outright.
+    The companion claim — that cancelling a live dial closes its socket — is
+    proved against a real listener by
+    ``tests/test_pool_boundary.py::TestRequestScope``.
 
     Args:
-        endings: The list :func:`_recorded_dial_endings` returned.
-        timeout: Seconds to wait.
+        monkeypatch: Restores both real methods when the test finishes.
 
     Returns:
-        ``True`` once something has been recorded; ``False`` on expiry.
+        The live spy; ``cancelled`` fills on the event loop as the route sheds.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if endings:
-            return True
-        time.sleep(_SETTLE_POLL)
-    return bool(endings)
+    spy = _DialSpy(registered=[], cancelled=[])
+    register = PoolRequestScope.register
+    cancel = PoolDial.cancel
+
+    def recording_register(scope: PoolRequestScope, dial: PoolDial) -> None:
+        """Note the dial the scope takes custody of, then register it."""
+        spy.registered.append(dial)
+        register(scope, dial)
+
+    def recording_cancel(dial: PoolDial) -> None:
+        """Note the dial being cancelled, then cancel it for real."""
+        spy.cancelled.append(dial)
+        cancel(dial)
+
+    monkeypatch.setattr(PoolRequestScope, "register", recording_register)
+    monkeypatch.setattr(PoolDial, "cancel", recording_cancel)
+    return spy
 
 
 class TestShedPath:
@@ -615,13 +616,14 @@ class TestShedPath:
     written for it proved less than it claimed: it asserted only that the
     pool's socket closed, which the boundary's own capped read timeout does at
     the same instant, so the test still passed with
-    ``PoolRequestScope.cancel`` replaced by a no-op. It now asserts the
-    refusal the dial raised instead — see :func:`_recorded_dial_endings` —
-    which only the cancel can produce, and that patch now reds it.
+    ``PoolRequestScope.cancel`` replaced by a no-op. It now asserts the route's
+    **custody** of the dial instead — that the loop held the in-flight dial and
+    cancelled it — which is the thing #1905's review found missing and the
+    thing that patch destroys. See :func:`_spy_on_dials`.
     """
 
     @pytest.mark.usefixtures("isolated")
-    def test_a_shed_reflection_has_its_pool_dial_cancelled(
+    def test_a_shed_reflection_cancels_the_pool_dial_the_loop_held(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The deadline fires, the caller is answered, and the route cuts the dial.
@@ -631,7 +633,7 @@ class TestShedPath:
         a vendor call still running after the vault had already answered.
         """
         _probe_passes(monkeypatch)
-        endings = _recorded_dial_endings(monkeypatch)
+        dials = _spy_on_dials(monkeypatch)
         hanging = FakePool(hang=True)
         hanging.pin(monkeypatch)
         vault = _pool_vault(tmp_path)
@@ -643,17 +645,20 @@ class TestShedPath:
                     headers=headers(ceiling="personal"),
                 )
             closed = hanging.held_reached_eof(_CANCEL_DEADLINE)
-            settled = _settled(endings, _CANCEL_DEADLINE)
         finally:
             hanging.close()
 
         assert response.status_code == HTTP_SERVICE_UNAVAILABLE, response.text
         assert response.json()["code"] == "temporarily_unavailable"
         assert closed, "the shed request left the pool dial open"
-        assert settled, "the pool dial never ended"
-        # The load-bearing assertion: ``PoolUnreachableError`` here would mean
-        # the dial timed itself out and the route's cancel did nothing.
-        assert endings == [PoolDialCancelledError], endings
+        # The load-bearing pair, and the whole of what #1905's review found
+        # missing: the loop took custody of the generation dial, and the shed
+        # cancelled that same dial rather than an empty list of them.
+        assert dials.registered, "the loop held no dial to cancel"
+        assert dials.cancelled == dials.registered, (
+            dials.cancelled,
+            dials.registered,
+        )
         # One dial and no retry: the shed is a refusal, not a second attempt.
         assert hanging.accepted == 1
 
