@@ -26,9 +26,10 @@ from creek_mcp.bench.outcome import (
     classify_outcome,
     probe_factory,
 )
+from creek_mcp.bench.usage import TokenBasis, TokenUsage
 
 if TYPE_CHECKING:
-    from creek_mcp.bench.protocols import LLMCallable
+    from creek_mcp.bench.protocols import LLMCallable, LLMFactory
 
 _REQUEST = httpx.Request("POST", "http://127.0.0.1:11434/api/generate")
 
@@ -147,3 +148,92 @@ def test_probe_records_a_factory_failure() -> None:
         probe_factory(_factory, probe)(PrivacyTier.OPEN, max_tokens=8)
     assert probe.outcome is Outcome.PROVIDER_UNAVAILABLE
     assert probe.generation_s is None
+
+
+class _ReportingLLM:
+    """A completion callable that reports its own token usage."""
+
+    def __init__(self, usage: TokenUsage | None) -> None:
+        """Bind the usage this callable will report."""
+        self._usage = usage
+
+    def __call__(self, prompt: str) -> str:
+        """Echo *prompt* back."""
+        return prompt
+
+    def token_usage(self) -> TokenUsage | None:
+        """Return the bound usage."""
+        return self._usage
+
+
+def _usage_factory(usage: TokenUsage | None) -> LLMFactory:
+    """Return a factory building a :class:`_ReportingLLM` reporting *usage*."""
+
+    def _factory(tier: PrivacyTier, *, max_tokens: int) -> LLMCallable:
+        del tier, max_tokens
+        return _ReportingLLM(usage)
+
+    return _factory
+
+
+def test_probe_captures_the_providers_usage_and_the_requested_budget() -> None:
+    """The probe is where the harness can see what reflect_tool hides."""
+    probe = TrialProbe(clock=_Clock())
+    usage = TokenUsage(
+        prompt_tokens=1234, output_tokens=56, basis=TokenBasis.PROVIDER_REPORTED
+    )
+    llm = probe_factory(_usage_factory(usage), probe)(PrivacyTier.OPEN, max_tokens=128)
+    assert llm("prompt") == "prompt"
+    assert probe.usage == usage
+    assert probe.max_output_tokens == 128
+
+
+def test_probe_leaves_usage_unset_when_the_backend_reports_none() -> None:
+    """Nothing is estimated for a provider that reports no counts."""
+    probe = TrialProbe(clock=_Clock())
+    llm = probe_factory(_usage_factory(None), probe)(PrivacyTier.OPEN, max_tokens=64)
+    llm("prompt")
+    assert probe.usage is None
+    assert probe.max_output_tokens == 64
+
+
+def test_probe_leaves_usage_unset_for_a_callable_that_cannot_report() -> None:
+    """A plain callable is not interrogated for an attribute it lacks."""
+    probe = TrialProbe(clock=_Clock())
+
+    def _factory(tier: PrivacyTier, *, max_tokens: int) -> LLMCallable:
+        del tier, max_tokens
+
+        def _llm(prompt: str) -> str:
+            return prompt
+
+        return _llm
+
+    probe_factory(_factory, probe)(PrivacyTier.OPEN, max_tokens=8)("x")
+    assert probe.usage is None
+
+
+def test_probe_records_the_budget_even_when_the_call_fails() -> None:
+    """A failed trial still says which ceiling reflect asked for."""
+    probe = TrialProbe(clock=_Clock())
+    usage = TokenUsage(
+        prompt_tokens=9, output_tokens=9, basis=TokenBasis.PROVIDER_REPORTED
+    )
+
+    class _FailingReporter(_ReportingLLM):
+        """Reports usage, but never completes a turn to report it for."""
+
+        def __call__(self, prompt: str) -> str:
+            """Fail the way an out-of-memory runtime does."""
+            del prompt
+            raise MemoryError
+
+    def _factory(tier: PrivacyTier, *, max_tokens: int) -> LLMCallable:
+        del tier, max_tokens
+        return _FailingReporter(usage)
+
+    llm = probe_factory(_factory, probe)(PrivacyTier.OPEN, max_tokens=32)
+    with pytest.raises(MemoryError):
+        llm("prompt")
+    assert probe.max_output_tokens == 32
+    assert probe.usage is None
