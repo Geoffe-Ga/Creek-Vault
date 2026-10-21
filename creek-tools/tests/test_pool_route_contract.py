@@ -95,14 +95,47 @@ HTTP_TOO_MANY_REQUESTS: Final[int] = 429
 HTTP_SERVICE_UNAVAILABLE: Final[int] = 503
 HTTP_BAD_GATEWAY: Final[int] = 502
 
-_SHED_TIMEOUT: Final[float] = 0.3
-"""A deadline short enough to fire while the fake pool is still holding on."""
+_SHED_TIMEOUT: Final[float] = 5.0
+"""A deadline the route reaches its dial inside of, and sheds after.
+
+Both halves matter and the lower bound is the one that bites. At 0.3 s this
+test was load-flaky for a reason worth recording: on a busy machine the
+reflection route had not finished the care guard, the journal write and the
+prompt build — let alone opened a pool dial — before the deadline fired, so
+the pool recorded ``accepted=0`` and the shed under test never happened. The
+test still read as a failure of the cancel wiring. Five seconds is generous
+against that floor while remaining far under the pool contract's own 12 s
+request timeout, so a hanging pool is still holding the connection when the
+deadline arrives.
+"""
 
 _BOUNDED_TIMEOUT: Final[float] = 2.0
 """A deadline comfortably under the pool contract's own 12 s ceiling."""
 
 _CANCEL_DEADLINE: Final[float] = 1.0
 """ADR-0016 T23: the socket must close within one second of the cancel."""
+
+_UNCAPPED_BUDGET: Final[float] = 60.0
+"""A scope budget large enough that the boundary's own timeout cannot bind.
+
+The one deliberate intervention in the shed test, and the thing that makes it
+decisive rather than a coin toss. In production ``open_pool_dial`` caps the
+boundary's ``request_timeout`` at :meth:`PoolRequestScope.remaining`, which is
+read off the very deadline the route sheds on — so the worker's blocked read
+and the loop's cancel are the *same instant* by construction, the socket
+closes either way, and no observation at route level can attribute it. That
+overlap is why the first version of this test passed with
+``PoolRequestScope.cancel`` monkeypatched to a no-op, and why asserting the
+refusal the dial raised merely traded a vacuous assertion for a flaky one.
+
+Reporting a minute of remaining budget separates the two: the dial arms a
+12 s read (the pool contract's own ceiling, :data:`POOL_REQUEST_TIMEOUT`,
+which now binds instead), the route still sheds on its real
+:data:`_SHED_TIMEOUT` deadline, and nothing but the cancel can close that
+socket inside :data:`_CANCEL_DEADLINE`. The cap this sets aside has its own
+test next door — ``test_the_declared_deadline_is_bounded_by_the_requests_own``
+— which patches nothing.
+"""
 
 _JOB_DEADLINE: Final[float] = 5.0
 """Bounded wait for a durable pipeline job to reach a terminal state."""
@@ -568,16 +601,19 @@ def _spy_on_dials(monkeypatch: pytest.MonkeyPatch) -> _DialSpy:
 
     Nor can the two co-timed closers be told apart by timing or by the
     refusal the dial raises: both are decided by which of two deadlines a
-    loaded machine serves first, so an assertion either way is a race, not a
-    contract.
+    loaded machine serves first, so an assertion either way is a race rather
+    than a contract — and the dial's own timeout wins often enough that the
+    reflection tool turns its ``PoolUnreachableError`` into a refusal the
+    route never sheds on at all.
 
-    What *is* a contract, and what #1905's review actually found missing, is
-    custody: the event loop must still hold a reference to the in-flight dial
-    and must cancel it. That is what this records, and a no-op
-    ``PoolRequestScope.cancel`` empties :attr:`_DialSpy.cancelled` outright.
-    The companion claim — that cancelling a live dial closes its socket — is
-    proved against a real listener by
-    ``tests/test_pool_boundary.py::TestRequestScope``.
+    The test that uses this therefore does two things. It sets the cap aside
+    with :data:`_UNCAPPED_BUDGET`, so the dial's own read is twelve seconds
+    away and only the cancel can close the socket inside
+    :data:`_CANCEL_DEADLINE`; and it records custody here — the event loop
+    must still hold a reference to the in-flight dial and must cancel it,
+    which is precisely what #1905's review found missing. A no-op
+    ``PoolRequestScope.cancel`` empties :attr:`_DialSpy.cancelled` and leaves
+    the socket open, so it reds both halves.
 
     Args:
         monkeypatch: Restores both real methods when the test finishes.
@@ -630,9 +666,17 @@ class TestShedPath:
 
         Without the wiring the worker thread would stay blocked for the
         boundary's full 12 s request timeout with the pool's connection open —
-        a vendor call still running after the vault had already answered.
+        a vendor call still running after the vault had already answered. That
+        counterfactual is what :data:`_UNCAPPED_BUDGET` restores: with the
+        remaining-budget cap set aside the dial really does hold a 12 s read,
+        so an unclosed socket stays open for seconds past the answer and the
+        one-second ``closed`` assertion below can only pass by way of the
+        cancel.
         """
         _probe_passes(monkeypatch)
+        monkeypatch.setattr(
+            PoolRequestScope, "remaining", lambda _self: _UNCAPPED_BUDGET
+        )
         dials = _spy_on_dials(monkeypatch)
         hanging = FakePool(hang=True)
         hanging.pin(monkeypatch)
@@ -650,10 +694,16 @@ class TestShedPath:
 
         assert response.status_code == HTTP_SERVICE_UNAVAILABLE, response.text
         assert response.json()["code"] == "temporarily_unavailable"
-        assert closed, "the shed request left the pool dial open"
+        assert closed, (
+            "the shed request left the pool dial open: "
+            f"accepted={hanging.accepted} registered={len(dials.registered)} "
+            f"cancelled={len(dials.cancelled)}"
+        )
         # The load-bearing pair, and the whole of what #1905's review found
         # missing: the loop took custody of the generation dial, and the shed
-        # cancelled that same dial rather than an empty list of them.
+        # cancelled that same dial rather than an empty list of them. With the
+        # budget cap set aside, ``closed`` above says the same thing from the
+        # pool's side of the wire.
         assert dials.registered, "the loop held no dial to cancel"
         assert dials.cancelled == dials.registered, (
             dials.cancelled,
