@@ -67,7 +67,18 @@ never carries silently-unchanged prose without a recorded reason. Values:
 ``skipped:disabled`` / ``skipped:no_fingerprint`` / ``skipped:thin_fingerprint``
 (the draft-path skip reasons), ``measured_only:no_llm`` /
 ``measured_only:no_rewriter`` / ``measured_only:below_target`` /
-``measured_only:above_target`` (ran but did not rewrite), and ``rewritten``."""
+``measured_only:above_target`` / :data:`VOICE_GUARD_REWRITE_FAILED` (ran but
+did not rewrite), and ``rewritten``."""
+
+VOICE_GUARD_REWRITE_FAILED = "measured_only:rewrite_failed"
+"""Status for a draft whose rewrite hop raised and was recovered from (#1936).
+
+The draft-path caller catches a failing rewrite LLM, re-measures
+deterministically, and stamps this — so a provider timeout costs the polish
+pass and nothing else. Distinct from ``measured_only:above_target``, which
+means the pass was never attempted or was attempted and *declined* on the
+merits; this one means it broke.
+"""
 
 _STATUS_IN_WORDS: dict[str, str] = {
     "rewritten": "rewritten toward your voice",
@@ -75,8 +86,13 @@ _STATUS_IN_WORDS: dict[str, str] = {
     "measured_only:no_rewriter": "measured but not rewritten (no rewrite step set up)",
     "measured_only:below_target": "measured and already close enough to leave alone",
     "measured_only:above_target": (
-        "measured and further from your voice than the target, but rewrite passes "
-        "are set to 0 in your config, so it was left as is"
+        "measured and further from your voice than the target, but not rewritten "
+        "— either your config allows no rewrite passes, or a pass ran and was "
+        "discarded for not improving the draft, so it was left as is"
+    ),
+    VOICE_GUARD_REWRITE_FAILED: (
+        "measured, but the rewrite step failed and was skipped — your draft was "
+        "saved unchanged apart from the deterministic clean-up"
     ),
     "skipped:disabled": "skipped — turned off in config",
     "skipped:no_fingerprint": (
@@ -138,12 +154,16 @@ class VoiceFidelityReport:
         body: The final body — sanitized, and rewritten toward voice when a
             rewrite lowered the distance. This is what ``save_draft`` writes.
         voice_distance: The final aggregate distance from the user's voice
-            in ``[0, 1)``. ``0.0`` means the draft matches the user's profile.
+            in ``[0, 1]``. ``0.0`` means no tell family diverged past its own
+            margin — which is exactly when ``findings`` is empty (#1936).
         findings: The residual directional divergences after the final pass.
         thin_fingerprint: ``True`` when the fingerprint was below the
             configured minimum and the distance was softened accordingly.
         passes: How many rewrite passes were actually attempted (``0`` when
             the draft was already within bounds, ``no_llm``, or disabled).
+            Attempts, not adoptions: a pass that was generated and discarded
+            counts here (it cost an LLM call) but does not make :attr:`status`
+            ``rewritten`` (#1936).
         status: The machine-readable guard outcome stamped on the draft
             (see :data:`VOICE_GUARD_STATUS_KEY`) — never silently empty.
     """
@@ -290,20 +310,29 @@ def _revise_toward_voice(
     style_preamble: str,
     grounding_check: GroundingCheck | None,
     context: str,
-) -> tuple[_Candidate, int]:
-    """Run the bounded rewrite loop, returning the best candidate and pass count.
+) -> tuple[_Candidate, int, int]:
+    """Run the bounded rewrite loop, returning the best candidate and its counts.
 
     A pass is kept only when it strictly lowers distance and (when a check is
     supplied) preserves grounding; otherwise the loop stops with the current
     best. The deterministic rewrite means a non-improving pass would repeat,
     so stopping on the first non-improvement is both correct and cheap.
+
+    Returns:
+        ``(best, attempted, kept)``. The two counts differ exactly when a
+        pass was generated and then discarded, and they are reported
+        separately because ``attempted`` is the cost (one LLM call each) while
+        ``kept`` is the only thing that licenses the ``rewritten`` status —
+        conflating them stamped a false attestation on a body nothing had
+        changed (#1936).
     """
-    passes = 0
+    attempted = 0
+    kept = 0
     while (
         best.report.voice_distance > config.voice_distance_target
-        and passes < config.max_revision_passes
+        and attempted < config.max_revision_passes
     ):
-        passes += 1
+        attempted += 1
         prompt = build_voice_rewrite_prompt(
             best.body, best.report, style_preamble=style_preamble
         )
@@ -316,12 +345,13 @@ def _revise_toward_voice(
         if grounding_check is not None and not grounding_check(candidate_body):
             break
         best = _Candidate(candidate_body, candidate_report)
-    return best, passes
+        kept += 1
+    return best, attempted, kept
 
 
 def _guard_status(
     *,
-    passes: int,
+    kept: int,
     no_llm: bool,
     has_llm: bool,
     distance: float,
@@ -330,17 +360,23 @@ def _guard_status(
     """Return the machine-readable guard outcome for a draft that was scanned.
 
     Args:
-        passes: Rewrite passes actually applied.
+        kept: Rewrite passes whose output was actually adopted — *not* the
+            number attempted. A pass that was generated and then discarded for
+            raising distance or dropping grounding leaves the body exactly as
+            it was, so it cannot license ``rewritten``: that draft is
+            ``measured_only:above_target``, which is the literal truth, since
+            the loop only runs while distance exceeds the target and a
+            discarded pass does not move it (#1936).
         no_llm: Whether the rewrite hop was suppressed (``--no-llm``).
         has_llm: Whether a rewrite LLM was supplied.
         distance: The final measured voice distance.
         target: The de-slop target the rewrite loop drives toward.
 
     Returns:
-        ``rewritten`` when a pass was applied, otherwise a ``measured_only:*``
-        reason explaining why no rewrite occurred.
+        ``rewritten`` when a pass was adopted, otherwise a ``measured_only:*``
+        reason explaining why the body was not changed.
     """
-    if passes > 0:
+    if kept > 0:
         return "rewritten"
     if no_llm:
         return "measured_only:no_llm"
@@ -392,8 +428,9 @@ def run_voice_fidelity_guard(
     report = scan(sanitized, fingerprint=fingerprint, config=config, context=context)
     best = _Candidate(sanitized, report)
     passes = 0
+    kept = 0
     if llm is not None and not no_llm:
-        best, passes = _revise_toward_voice(
+        best, passes, kept = _revise_toward_voice(
             best,
             fingerprint=fingerprint,
             config=config,
@@ -409,7 +446,7 @@ def run_voice_fidelity_guard(
         thin_fingerprint=best.report.thin_fingerprint,
         passes=passes,
         status=_guard_status(
-            passes=passes,
+            kept=kept,
             no_llm=no_llm,
             has_llm=llm is not None,
             distance=best.report.voice_distance,

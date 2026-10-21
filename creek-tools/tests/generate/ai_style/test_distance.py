@@ -1,4 +1,13 @@
-"""Tests for the voice-distance scoring model (FEAT-040.1)."""
+"""Tests for the voice-distance scoring model (FEAT-040.1).
+
+The aggregation these exercise is the union of per-family evidence that
+#1936 put in place of a weighted mean; the properties of that union — no
+dilution by clean families, a floor set by the worst family, agreement with
+the findings, and the measured flag boundary — live in
+``test_voice_distance_discrimination.py``. What is pinned here is the
+scalar's framework-level behaviour: direction, boundedness, softening, and
+the fact that weight still orders the families.
+"""
 
 from __future__ import annotations
 
@@ -52,44 +61,51 @@ class TestVoiceDistance:
     def test_zero_magnitudes_score_zero(self) -> None:
         """Matching the user on every feature yields distance 0."""
         items = [
-            FeatureContribution("a", weight=1.0, magnitude=0.0),
-            FeatureContribution("b", weight=2.0, magnitude=0.0),
+            FeatureContribution("a", weight=1.0, magnitude=0.0, margin=0.0),
+            FeatureContribution("b", weight=2.0, magnitude=0.0, margin=0.0),
         ]
         assert voice_distance(items) == 0.0
 
     def test_distance_rises_with_divergence(self) -> None:
         """Larger divergence ⇒ larger distance."""
-        small = voice_distance([FeatureContribution("a", 1.0, 1.0)])
-        large = voice_distance([FeatureContribution("a", 1.0, 50.0)])
+        small = voice_distance([FeatureContribution("a", 1.0, 1.0, 0.0)])
+        large = voice_distance([FeatureContribution("a", 1.0, 50.0, 0.0)])
         assert 0.0 < small < large < 1.0
 
     def test_distance_is_bounded_below_one(self) -> None:
         """Even an enormous divergence saturates below 1.0."""
-        assert voice_distance([FeatureContribution("a", 1.0, 1e6)]) < 1.0
+        assert voice_distance([FeatureContribution("a", 1.0, 1e6, 0.0)]) < 1.0
 
     def test_zero_total_weight_scores_zero(self) -> None:
         """A zero-weight feature cannot produce a non-zero distance."""
-        assert voice_distance([FeatureContribution("a", 0.0, 99.0)]) == 0.0
+        assert voice_distance([FeatureContribution("a", 0.0, 99.0, 0.0)]) == 0.0
 
     def test_softening_scales_the_score_down(self) -> None:
         """Thin-fingerprint softening reduces the distance proportionally."""
-        items = [FeatureContribution("a", 1.0, 10.0)]
+        items = [FeatureContribution("a", 1.0, 10.0, 0.0)]
         full = voice_distance(items)
         softened = voice_distance(items, softening=0.25)
         assert softened == pytest.approx(full * 0.25)
 
-    def test_weight_biases_the_mean(self) -> None:
-        """A heavier feature pulls the weighted mean toward its magnitude."""
+    def test_weight_scales_a_feature_against_the_heaviest(self) -> None:
+        """Each feature counts in proportion to the heaviest one in play.
+
+        Making the severe feature nine times heavier does not raise the
+        score — it *demotes* the mild one to a ninth of its evidence, so the
+        union falls. Under the pre-#1936 mean a clean feature's weight
+        mattered too, because it sat in the denominator; now only the
+        weights of features that actually diverge move anything.
+        """
         balanced = voice_distance(
             [
-                FeatureContribution("a", 1.0, 0.0),
-                FeatureContribution("b", 1.0, 50.0),
+                FeatureContribution("a", 1.0, 50.0, 0.0),
+                FeatureContribution("b", 1.0, 2.0, 0.0),
             ],
         )
-        b_heavy = voice_distance(
+        a_heavy = voice_distance(
             [
-                FeatureContribution("a", 1.0, 0.0),
-                FeatureContribution("b", 9.0, 50.0),
+                FeatureContribution("a", 9.0, 50.0, 0.0),
+                FeatureContribution("b", 1.0, 2.0, 0.0),
             ],
         )
-        assert b_heavy > balanced
+        assert balanced > a_heavy

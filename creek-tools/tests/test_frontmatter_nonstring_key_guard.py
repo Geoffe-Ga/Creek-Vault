@@ -793,14 +793,34 @@ def _post_loaders() -> list[tuple[str, _PostLoader]]:
     ]
 
 
-def _scan_voice_fidelity_draft(module: object, path: Path) -> object:
-    """Call ``voice_fidelity._scan_draft`` with a throwaway fingerprint/config."""
-    from creek.config import AIStyleConfig
-    from creek.generate.ai_style.model import VoiceFingerprint
+_OFF_VOICE_BODY: Final[str] = (
+    "I had to delve into the tapestry of it. The hour plays a vital role.\n"
+)
+"""An obviously synthetic body that trips two tell families, so it is flagged.
 
+``voice_fidelity._scan_draft`` measures the body since #1936 — a stamped
+``voice_distance`` no longer decides, because a stamp is one earlier run's
+measurement — so a positive control for it has to be off-voice *prose*.
+"""
+
+
+def _scan_voice_fidelity_draft(module: object, path: Path) -> object:
+    """Call ``voice_fidelity._scan_draft`` with a throwaway fingerprint/config.
+
+    The fingerprint is deliberately non-thin: a thin one multiplies the whole
+    distance by ``thin_fingerprint_softening`` (0.25), which caps it under the
+    0.35 ceiling and would make every positive control vacuous.
+    """
+    from creek.config import AIStyleConfig
+    from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
+
+    fingerprint = VoiceFingerprint(
+        features={"em_dash_density": FeatureStat(rate=0.0, support=12)},
+        fragment_count=12,
+    )
     return module._scan_draft(  # type: ignore[attr-defined]
         path,
-        VoiceFingerprint(),
+        fingerprint,
         AIStyleConfig(),
     )
 
@@ -891,8 +911,13 @@ def test_post_loaders_positive_control(tmp_path: Path) -> None:
     assert compile_engine._load_existing_provenance(page) != []
 
     # ``voice_fidelity._scan_draft`` returns ``None`` for "unreadable" *and*
-    # for "on voice", so its control needs a draft that must be reported.
-    off_voice = _write_note(tmp_path / "draft.md", "voice_distance: 99.0\n")
+    # for "on voice", so its control needs a draft that must be reported —
+    # off-voice in its *body* since #1936, not by a stamped distance.
+    off_voice = _write_note(
+        tmp_path / "draft.md",
+        "type: draft\n",
+        body=_OFF_VOICE_BODY,
+    )
     assert _scan_voice_fidelity_draft(voice_fidelity, off_voice) is not None
 
 
@@ -992,7 +1017,8 @@ def test_lint_run_survives_a_nonstring_key_note(tmp_path: Path) -> None:
     _scatter_bad_notes(vault / "07-Voice" / "Drafts", prefix="draft-bad")
     _write_note(
         vault / "07-Voice" / "Drafts" / "off-voice.md",
-        "voice_distance: 99.0\n",
+        "type: draft\n",
+        body=_OFF_VOICE_BODY,
     )
 
     report = LintRunner(vault_path=vault).run()
