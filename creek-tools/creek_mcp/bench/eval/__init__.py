@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from typing import Final
 
-RUBRIC_VERSION: Final[str] = "1.0.0"
+RUBRIC_VERSION: Final[str] = "1.1.0"
 """Version of the rubric and its artifact schema, recorded in every run.
 
 Bumped whenever a dimension changes meaning, a threshold moves, or a scorer's
