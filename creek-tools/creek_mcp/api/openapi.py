@@ -156,7 +156,7 @@ return — and omitting it from the one that can leaves a generated client with
 no branch for the refusal it will meet the first time somebody uploads a
 ``conversations.json``.
 :attr:`~creek_mcp.api.models.ErrorCode.RATE_LIMITED` is the same shape at
-contract 0.19 (#1894), and at 0.20 (#1903 step 6) it is the reason the table
+contract 0.19 (#1894), and at 0.21 (#1903 step 6) it is the reason the table
 earns its keep a second time: ``POST /v1/letters/{external_id}`` joins
 ``POST /v1/reflections`` in one line rather than a second branch. Both routes'
 model calls are admitted against the **same** per-account cap — they resolve

@@ -244,18 +244,17 @@ def _reflect(
 def _key_headers(**kwargs: Any) -> dict[str, str]:
     """Return the two request-key headers for an admitted writer's key.
 
-    The value is a fabricated string shaped like an Anthropic key so the
-    header validator admits it; no such key exists and nothing here dials a
-    vendor. Marked for ``detect-secrets`` inline rather than baselined,
-    following :mod:`tests.test_redact_pattern_overlap_notes`: a baseline entry
-    records a line number, so it goes stale the first time anything above it
-    moves, which is exactly how this line became a blocking finding without
-    its bytes changing.
+    The value deliberately does **not** imitate a vendor key.
+    :func:`~creek.classify.llm.request_key._is_key_shaped` admits any non-empty
+    value up to 512 characters over ``[A-Za-z0-9._-]`` and checks no prefix, so
+    a key-shaped canary bought nothing and cost a ``detect-secrets``
+    suppression — a high-entropy ``sk-ant-`` string is exactly what that hook
+    exists to stop, and a test is a bad place to teach it exceptions. This
+    value is still distinctive enough for a leak sweep to find.
     """
     return {
         PROVIDER_HEADER: "anthropic",
-        # pragma: allowlist nextline secret
-        PROVIDER_KEY_HEADER: "sk-ant-api03-ROUTEtestKEY1894zzPP-never-logged",
+        PROVIDER_KEY_HEADER: "route-test-header-1894-never-logged",
         **kwargs,
     }
 

@@ -3,6 +3,7 @@
   "contract_minor": "0.20",
   "contract_version": "0.20.0",
   "inference_pool": true,
+  "keyless_inference": true,
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "request_key_providers": [
     "anthropic",

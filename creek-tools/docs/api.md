@@ -392,6 +392,20 @@ byte-identical. The same bump brings `415` into the published status set, with
 the `unsupported_source` code; a client pinned below `0.8` cannot meet it,
 because the only route that emits it is the one it cannot reach.
 
+`0.20.0` (#1938) tells you, before you dial, when a model call **without the
+writer's key** cannot run here. `GET /v1/capabilities` gains
+`keyless_inference`. It is `false` on a managed vault with no shared pool
+pinned: such a vault ships no inference runtime and refuses its operator's
+cloud key, so a reflection, letter or `method=llm` classification that carries
+no `X-Creek-Provider-Key` is refused as `temporarily_unavailable` every time,
+and retrying never clears it. When you read `false`, ask the writer for their
+own key (or don't offer the call) instead of charging for a pass that cannot
+run. `true` means a keyless call may be attempted, not that it will succeed.
+`inference_pool: false` cannot tell you this, because a self-connected vault
+running its own model reports the same. The field is withheld from a caller
+below `0.20`, so every `0.19` response is byte-identical and `0.19` stays in
+the window.
+
 `0.19.0` (#1894, [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md))
 publishes **where each answer came from**, and the shared inference pool's
 admission refusal.
@@ -426,7 +440,7 @@ this route, not that the answer stayed on the device.
 from a caller below `0.19`, so every `0.18` response is byte-identical and
 `0.18` stays in the window.
 
-`0.20.0` (#1903 step 6, [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md))
+`0.21.0` (#1903 step 6, [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md))
 serves `rate_limited` on `POST /v1/letters/{external_id}` as well as on
 `POST /v1/reflections`, so **one cap is reported by one surface.**
 
@@ -443,9 +457,12 @@ The 429 is identical on both: same code, same message, same envelope, same
 advisory `Retry-After`. Nothing is stored on that path, so a capped letter
 leaves your caller-owned id unwritten and a retry still answers `created`. No
 model, field, status or route is added — `429` was already in the published set
-— and the refusal is withheld from a caller below `0.20`, which keeps every
-`0.19` letter response exactly as `0.19` published it, so `0.19` stays in the
-window.
+— and the refusal is withheld from a caller below `0.21`, which keeps every
+`0.20` letter response exactly as `0.20` published it, so `0.20` stays in the
+window. It is `0.21` and not `0.20` because `0.20` had already shipped for
+`keyless_inference` (#1938): if you negotiated `0.20` for that field you never
+agreed to a `429` on a letter, and this contract does not move a published
+minor's responses under it.
 
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE
@@ -679,7 +696,7 @@ it means a rate limit rather than an outage: this vault is over its model-call
 admission cap (too many in flight, or too many this hour), or the vendor your
 own request key is spending on returned a 429. It is reachable on
 `POST /v1/reflections` since `0.19.0` and on `POST /v1/letters/{external_id}`
-since `0.20.0` (#1903 step 6), and documented on both in the OpenAPI document.
+since `0.21.0` (#1903 step 6), and documented on both in the OpenAPI document.
 **It is one budget, not two**: both routes dial the same `generation`
 chokepoint, so a cap met on one is the same cap on the other, which is exactly
 why they report it identically. `POST /v1/classifications` keeps its existing
@@ -694,10 +711,10 @@ about how much of your allowance is spent, and the header is a constant — a
 number derived from this vault's own recent model use would answer "how busy
 is this vault?" to anyone willing to probe. It is served **only** to a caller
 declaring the minor its route began serving it at — `0.19` for reflections,
-`0.20` for letters — and an older minor receives the
+`0.21` for letters — and an older minor receives the
 `503 temporarily_unavailable` it has always received for a shed request. For a
 pre-`0.19` caller that is the only spelling its vendored vocabulary has; for a
-`0.19` caller asking for a letter it is the version window holding, because the
+`0.20` caller asking for a letter it is the version window holding, because the
 document that minor published records no 429 on that route.
 
 **`unsupported_source` is about the caller's own filename, never the vault.**

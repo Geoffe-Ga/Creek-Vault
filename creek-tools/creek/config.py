@@ -1657,6 +1657,54 @@ def _default_category_weights() -> dict[AIStyleCategory, float]:
     return weights
 
 
+ONE_LINE_FRAGMENT_WEIGHT: float = 0.25
+"""Default weight for the ``one_line_fragment_density`` family (#1936).
+
+The one tell whose *measured user rate* is dominated by an artifact rather
+than by a habit, which the union aggregation made load-bearing. Two facts
+combine:
+
+* ``features.one_line_fragment_density`` counts any blank-line-delimited
+  block that is a single line of at most 20 words — a markdown heading
+  counts, and a whole short fragment counts as one.
+* ``fingerprint.build_fingerprint`` averages **per-fragment rates**, not
+  pooled words. So a 41-word fragment that is one short block measures
+  1000/41 ≈ 24 per 1000 words on its own, and a corpus where even 6-10% of
+  fragments are short notes averages past the 3.0
+  :attr:`AIStyleConfig.signature_polarity_threshold` and makes the family a
+  live *signature* for that voice.
+
+Under-use is then the concern, and a long-form draft with no standalone
+short paragraph under-uses it by the user's whole rate: measured against a
+corpus of five short entries, one essay — *itself one of those five
+fragments* — scored 0.8794 on this family alone and was flagged, which
+contradicts the invariant stated on
+:attr:`AIStyleConfig.voice_distance_upper` that the user's own writing must
+not flag. Creek's users are journalers; short entries are the normal corpus
+shape, so at full weight ``creek voice-check`` would fail on essentially
+every long-form draft they ever write.
+
+At 0.25 this family's lone evidence caps at ``0.25 x 36.47/41.47 = 0.2199``
+for the measured worst case — under the 0.35 ceiling, so it can no longer
+flag a draft by itself, while it still accumulates in a union beside real
+divergences and still reports its own evidence in
+``ScanReport.family_evidence``. This is a weight, not a repair: the artifact
+in the measure and the fingerprint aggregation is the actual bug and is
+tracked by #1945.
+"""
+
+
+def _default_feature_weights() -> dict[str, float]:
+    """Return the default per-feature weight overrides.
+
+    Replaced wholesale when a vault configures ``feature_weights`` — like
+    every weight map here, this is a default value and not a merge base — so
+    a vault that sets any entry re-states the one it wants to keep. See
+    :data:`ONE_LINE_FRAGMENT_WEIGHT` for why the default is not empty.
+    """
+    return {"one_line_fragment_density": ONE_LINE_FRAGMENT_WEIGHT}
+
+
 def _default_authorship_weights() -> dict[str, float]:
     """Return default per-platform weights for fingerprint aggregation.
 
@@ -1821,9 +1869,11 @@ class AIStyleConfig(BaseModel):
     generic baseline. A "tell" fires for a feature only when the draft's
     measured rate differs from the user's stored rate by more than
     :attr:`default_margin` (or a per-feature override). The scalar
-    ``voice_distance`` aggregates those divergences, weighted by
-    category. Everything here is intentionally conservative: the headline
-    correctness property is that the user's *own* writing must not flag.
+    ``voice_distance`` combines the families that diverged as independent
+    evidence, each weighted relative to the heaviest family in play, and a
+    family inside its margin contributes nothing at all (#1936). Everything
+    here is intentionally conservative: the headline correctness property is
+    that the user's *own* writing must not flag.
     """
 
     enabled: bool = True
@@ -1832,8 +1882,26 @@ class AIStyleConfig(BaseModel):
     voice_distance_upper: float = Field(default=0.35, ge=0.0, le=1.0)
     """Distance above which a draft is considered to diverge from the
     user's voice enough to warrant a rewrite pass / lint finding. Capped at
-    1.0 because ``voice_distance`` is always ``< 1.0``; a higher threshold
-    would silently disable the check."""
+    1.0 because ``voice_distance`` never exceeds 1.0; a threshold *at* the
+    attainable maximum would silently disable the check.
+
+    **What 0.35 means, measured (#1936).** The number is unchanged, but the
+    aggregation beneath it is no longer a mean over every tell, so the
+    ceiling finally falls somewhere a draft can reach. ``voice_distance`` is
+    now the union of per-family evidence, each family's evidence being
+    ``rate / (rate + 5.0)`` once it clears its own margin, so **one
+    weight-1.0 family clears 0.35 when it diverges by more than 2.69
+    occurrences per 1000 words — about one per 371 words**, and milder
+    divergences must accumulate across families to flag. Measured against
+    the eval harness's synthetic corpus, with these defaults: the corpus's
+    own entries and an on-voice candidate score 0.0000; a candidate written
+    deliberately off-voice (two families) 0.9778; a synthetic specimen
+    tripping one family at 53 words 0.8830. Under the old weighted mean
+    those were 0.0000, 0.1012 and 0.0535 — nothing short of nine
+    simultaneous families (0.3698) reached this ceiling, which is why the
+    check never fired on a real draft. Full table and derivation:
+    :mod:`creek.generate.ai_style.distance`; pinned by
+    ``tests/generate/ai_style/test_voice_distance_discrimination.py``."""
 
     citation_network_checks: bool = False
     """Opt-in toggle for live external-link checking by the ``citation`` tells.
@@ -1875,10 +1943,19 @@ class AIStyleConfig(BaseModel):
     flagging aggressively."""
 
     thin_fingerprint_softening: float = Field(default=0.25, ge=0.0, le=1.0)
-    """Multiplier applied to distance contributions when the fingerprint
-    is thin (see :attr:`min_fingerprint_fragments`). ``0.25`` keeps a
-    quarter of the signal so obvious tells still surface while the
-    measurement is unreliable."""
+    """Multiplier applied to the whole ``voice_distance`` when the
+    fingerprint is thin (see :attr:`min_fingerprint_fragments`). ``0.25``
+    keeps a quarter of the signal while the measurement is unreliable.
+
+    Note what that means at the shipped numbers, which is stronger than the
+    "obvious tells still surface" this used to claim: ``0.25`` is below
+    :attr:`voice_distance_upper` of ``0.35``, so while the fingerprint is
+    thin **no draft can be flagged by the scalar at all** — the ceiling is
+    unreachable by construction. The per-tell *findings* still fire and are
+    still reported (they are not softened), and the draft guard skips its
+    rewrite hop on a thin fingerprint anyway. So a new vault gets findings to
+    read and no verdicts, which is the intended caution; raising the ceiling
+    is not how to change that, lowering the thinness bar is."""
 
     calibration_fp_floor: float = Field(default=0.05, ge=0.0, le=1.0)
     """Maximum acceptable false-positive rate on the user's own writing
@@ -1896,13 +1973,26 @@ class AIStyleConfig(BaseModel):
         default_factory=_default_category_weights,
     )
     """Per-category weight applied to each feature's divergence when
-    summing ``voice_distance``. Mechanical tells are down-weighted because
-    they are auto-repaired and should not dominate the human-vs-voice
-    score."""
+    ``voice_distance`` combines the diverging families. Mechanical tells are
+    down-weighted because they are auto-repaired and should not dominate the
+    human-vs-voice score. Only *ratios* matter: each family is weighted
+    against the heaviest family in play, so scaling every entry changes
+    nothing (#1936)."""
 
-    feature_weights: dict[str, float] = Field(default_factory=dict)
-    """Optional per-``feature_key`` weight overrides. A key present here
-    wins over its category weight."""
+    feature_weights: dict[str, float] = Field(
+        default_factory=_default_feature_weights,
+    )
+    """Per-``feature_key`` weight overrides. A key present here wins over its
+    category weight. Not empty by default: see
+    :data:`ONE_LINE_FRAGMENT_WEIGHT` for the one family that ships
+    down-weighted and the measurements behind it.
+
+    **Raising one entry lowers every other family**, because weights are
+    taken relative to the heaviest in play: setting
+    ``{"ai_vocab_density": 3.0}`` leaves AI vocabulary exactly where it was
+    and divides every other family's evidence by three, so a family that
+    measured 0.88 contributes 0.29 and stops being able to flag on its own.
+    To emphasise a family, lower the others."""
 
     authorship_weights: dict[str, float] = Field(
         default_factory=_default_authorship_weights,

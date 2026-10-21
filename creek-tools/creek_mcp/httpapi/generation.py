@@ -15,7 +15,7 @@ than for a field: a caller below :data:`~creek_mcp.api.models.PROVENANCE_SINCE_M
 vendored an ``ErrorCode`` enum with no ``rate_limited`` member, so
 :func:`served_error_code` serves it the ``temporarily_unavailable`` it has
 always received for a shed request. Both synchronous model-backed routes call
-it since contract 0.20 (#1903 step 6), each passing the since-minor *it* began
+it since contract 0.21 (#1903 step 6), each passing the since-minor *it* began
 serving the code at, so one per-account cap is reported one way wherever a
 caller meets it.
 
@@ -128,6 +128,13 @@ def served_error_code(code: ErrorCode, *, serve_rate_limited: bool) -> ErrorCode
     is not a softening of the truth but exactly what such a caller has always
     received for a shed request, and what ``limits.py`` still serves when
     admission sheds one today.
+
+    Called by both model-backed synchronous routes since contract 0.21, and
+    *this* function is why that is not a second dialect: each route decides for
+    itself which since-minor admits the code — 0.19 for reflections, 0.21 for
+    letters, where the route began reaching it — and then the downgrade, its
+    target, the envelope and the ``Retry-After`` are one implementation they
+    share (#1903 step 6).
 
     Args:
         code: The code the route decided on.

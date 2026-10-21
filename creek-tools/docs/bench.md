@@ -520,17 +520,20 @@ Reported separately, never averaged into one figure.
 A fourth obedience component delegated to the shipped
 `creek.lint.checks.voice_fidelity` guard until
 [#1911](https://github.com/Geoffe-Ga/Creek-Vault/issues/1911). It was removed
-because it could not fail. Measured against this corpus's fingerprint, the
-on-voice fixture scores `voice_distance=0.0000` and the deliberately off-voice
-fixture `0.1012`, both far under the shipped `voice_distance_upper` of `0.35`;
-a heavier slop text tripping six of the sixteen active tell families reaches
-only `0.2568`, and the ceiling is first cleared by a saturation specimen that
-trips all sixteen at once (`0.6863`). A constant component is not merely
-useless — at four equally-weighted components a candidate violating exactly
-one scores `3/4 = 0.75` and clears `PASS_THRESHOLD`, so the dimension could
-not fail on a single violated instruction. Voice is dimension (a)'s subject,
-not an instruction. The measurement is pinned by
-`tests/bench/eval/test_dimensions.py::test_the_shipped_voice_check_cannot_separate_the_fixtures`.
+because it could not fail. Measured against this corpus's fingerprint at the
+time, the on-voice fixture scored `voice_distance=0.0000` and the deliberately
+off-voice fixture `0.1012`, both far under the shipped `voice_distance_upper`
+of `0.35`: the score was a weighted mean over all seventeen article tell
+families, so two tripped families were diluted by the fifteen clean ones and
+nothing under nine simultaneously tripped families reached the ceiling.
+[#1936](https://github.com/Geoffe-Ga/Creek-Vault/issues/1936) fixed that
+scorer — the same off-voice fixture now measures `0.9778` — so the
+discrimination half of the argument has expired. The other half stands on its
+own: at four equally-weighted components a candidate violating exactly one
+scores `3/4 = 0.75` and clears `PASS_THRESHOLD`, so the dimension could not
+fail on a single violated instruction. Voice is dimension (a)'s subject, not
+an instruction. Both measurements are pinned by
+`tests/bench/eval/test_dimensions.py::test_the_shipped_voice_check_now_separates_the_fixtures`.
 
 `voice_match` can report a third basis, `unsupported`, and does so by default.
 [#1880](https://github.com/Geoffe-Ga/Creek-Vault/issues/1880) records that the

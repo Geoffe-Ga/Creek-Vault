@@ -1201,16 +1201,6 @@
               }
             }
           },
-          "429": {
-            "description": "this vault is over its model-call allowance",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
           "500": {
             "description": "the server failed to complete this request",
             "content": {
@@ -2470,7 +2460,7 @@
         "type": "string"
       },
       "ErrorCode": {
-        "description": "The eleven wire error codes: nine from 0.2, one at 0.8, one at 0.19.\n\nThere is deliberately **no** ``care_escalation`` member: an escalation is a\nsuccessful, 200-shaped :class:`CareEscalationResponse`, because a person in\nacute distress must not have their response swallowed by a client's error\npath.\n\nAttributes:\n    UNAUTHENTICATED: No valid consumer credential accompanied the request.\n    INVALID_REQUEST: The body does not satisfy the published schema.\n    INCOMPATIBLE_VERSION: The requested contract minor is not served here.\n    PRIVACY_REFUSED: The single answer for every vault-object non-answer.\n        Above the ceiling, purged, orphaned, schema-invalid and deleted out\n        of band all collapse to this one code with this one message.\n    NOT_FOUND: A **routing** code only — no such endpoint or path on this\n        server. Never emitted for a vault object. Emitting it for a\n        fragment would reintroduce the existence oracle that #846 / #970 /\n        #972 / #1090 collapsed: the difference between \"no such id\" and\n        \"not for you\" is a corpus enumeration primitive.\n    UNSUPPORTED_CAPABILITY: A published capability this server does not\n        implement.\n    UNSUPPORTED_SOURCE: The uploaded file's **extension** names a format\n        Creek must not ingest as one document — a conversation export, an\n        archive, a legacy binary Office file (#1526). A statement about\n        the caller's own filename and nothing else, so it discloses\n        nothing about the vault. Added at contract 0.8 (#1524), and\n        reachable only on ``POST /v1/uploads``.\n    UNAVAILABLE: The vault is absent or unreadable; a human must act.\n    TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.\n    RATE_LIMITED: This vault's own admission cap refused the request —\n        too many model calls in flight, or too many this hour (ADR-0016\n        Decision 1 items 4 and 8). A cap, **not** an outage: the writer\n        should be shown a wait, which is the whole reason it is not\n        ``temporarily_unavailable``. Added at contract 0.19 (#1894) and\n        served only to callers declaring :data:`PROVENANCE_SINCE_MINOR` or\n        later; an older caller receives ``temporarily_unavailable``, which\n        is what it has always received for a shed request and the only\n        spelling its vendored vocabulary has. Reachable on\n        ``POST /v1/reflections`` from 0.19 and on\n        ``POST /v1/letters/{external_id}`` from\n        :data:`LETTER_RATE_LIMITED_SINCE_MINOR` — **one** budget either\n        way, since both routes dial the single ``generation`` chokepoint\n        and the cap is the pool's admission refusal or the writer's own\n        key's, never a counter this server keeps per route.\n    INTERNAL_ERROR: An unexpected server fault.",
+        "description": "The eleven wire error codes: nine from 0.2, one at 0.8, one at 0.19.\n\nThere is deliberately **no** ``care_escalation`` member: an escalation is a\nsuccessful, 200-shaped :class:`CareEscalationResponse`, because a person in\nacute distress must not have their response swallowed by a client's error\npath.\n\nAttributes:\n    UNAUTHENTICATED: No valid consumer credential accompanied the request.\n    INVALID_REQUEST: The body does not satisfy the published schema.\n    INCOMPATIBLE_VERSION: The requested contract minor is not served here.\n    PRIVACY_REFUSED: The single answer for every vault-object non-answer.\n        Above the ceiling, purged, orphaned, schema-invalid and deleted out\n        of band all collapse to this one code with this one message.\n    NOT_FOUND: A **routing** code only — no such endpoint or path on this\n        server. Never emitted for a vault object. Emitting it for a\n        fragment would reintroduce the existence oracle that #846 / #970 /\n        #972 / #1090 collapsed: the difference between \"no such id\" and\n        \"not for you\" is a corpus enumeration primitive.\n    UNSUPPORTED_CAPABILITY: A published capability this server does not\n        implement.\n    UNSUPPORTED_SOURCE: The uploaded file's **extension** names a format\n        Creek must not ingest as one document — a conversation export, an\n        archive, a legacy binary Office file (#1526). A statement about\n        the caller's own filename and nothing else, so it discloses\n        nothing about the vault. Added at contract 0.8 (#1524), and\n        reachable only on ``POST /v1/uploads``.\n    UNAVAILABLE: The vault is absent or unreadable; a human must act.\n    TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.\n    RATE_LIMITED: This vault's own admission cap refused the request —\n        too many model calls in flight, or too many this hour (ADR-0016\n        Decision 1 items 4 and 8). A cap, **not** an outage: the writer\n        should be shown a wait, which is the whole reason it is not\n        ``temporarily_unavailable``. Added at contract 0.19 (#1894) and\n        served only to callers declaring :data:`PROVENANCE_SINCE_MINOR` or\n        later; an older caller receives ``temporarily_unavailable``, which\n        is what it has always received for a shed request and the only\n        spelling its vendored vocabulary has.\n    INTERNAL_ERROR: An unexpected server fault.",
         "enum": [
           "unauthenticated",
           "invalid_request",
@@ -2957,7 +2947,7 @@
       },
       "CapabilitiesResponse": {
         "additionalProperties": false,
-        "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n— which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` — the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.\n    request_key_providers: The vendors whose writer-supplied key this vault\n        will spend on OPEN and PERSONAL model calls, sent per request in\n        ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a\n        self-connected vault, which ignores request keys. Since contract\n        0.18, and omitted for a caller declaring an earlier minor.\n    inference_pool: Whether this vault answers its model calls from the\n        shared confidential inference pool (ADR-0016). ``False`` on a\n        vault that runs its own model. Published so a consumer can detect\n        the route *before* dialling rather than inferring it from the\n        first answer's ``inference_source``. Since contract 0.19, and\n        omitted for a caller declaring an earlier minor.",
+        "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n— which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` — the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.\n    request_key_providers: The vendors whose writer-supplied key this vault\n        will spend on OPEN and PERSONAL model calls, sent per request in\n        ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a\n        self-connected vault, which ignores request keys. Since contract\n        0.18, and omitted for a caller declaring an earlier minor.\n    inference_pool: Whether this vault answers its model calls from the\n        shared confidential inference pool (ADR-0016). ``False`` on a\n        vault that runs its own model. Published so a consumer can detect\n        the route *before* dialling rather than inferring it from the\n        first answer's ``inference_source``. Since contract 0.19, and\n        omitted for a caller declaring an earlier minor.\n    keyless_inference: ``False`` when a model call carrying no writer key\n        is certain to be refused here before any model is dialled: a\n        managed vault with no shared pool pinned. ``True`` when such a\n        call may be attempted. A consumer reading ``False`` should ask\n        the writer for their key instead of charging for a pass that\n        cannot run. Since contract 0.20, and omitted for a caller\n        declaring an earlier minor.",
         "properties": {
           "status": {
             "$ref": "#/components/schemas/CapabilitiesStatus",
@@ -3030,6 +3020,19 @@
             "default": null,
             "description": "Whether model calls are answered from the shared inference pool. Since contract 0.19.",
             "title": "Inference Pool"
+          },
+          "keyless_inference": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "False when a model call without a writer's request key is refused before any model is dialled; true when one may be attempted. Since contract 0.20.",
+            "title": "Keyless Inference"
           }
         },
         "required": [

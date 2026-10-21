@@ -5684,6 +5684,30 @@ def _build_and_persist_fingerprint(vault: Path) -> None:
     save_fingerprint(fingerprint, vault, config)
 
 
+_MILD_DIVERGENCE_PADDING = 20
+"""Copies of one in-voice exemplar that dilute a single tell to ~0.18 (#1936)."""
+
+
+def _write_mildly_divergent_draft(target: Path) -> None:
+    """Write a draft that trips exactly one tell family, mildly.
+
+    The threshold-precedence tests need a file whose distance sits *between*
+    two candidate ceilings, which under the #1936 union aggregation means one
+    diverging family at low density rather than a slop fixture (those now
+    score ~1.0). One section-summary formula in ~900 words of the exemplar
+    voice measures 0.18: it fires the family, and the rate — about 1.1 per
+    1000 words — is well under the 2.69 per 1000 words that clears 0.35.
+
+    Args:
+        target: File to write.
+    """
+    padding = (_voice_fixture_dir("in_voice") / "01_morning.md").read_text(
+        encoding="utf-8",
+    )
+    body = " ".join([padding.strip()] * _MILD_DIVERGENCE_PADDING)
+    target.write_text(f"In conclusion, the morning went by. {body}", encoding="utf-8")
+
+
 def test_voice_check_help_advertises_options() -> None:
     """``creek voice-check --help`` documents its flags, ANSI/width-robust."""
     # Render wide and strip ANSI so the rich help table cannot wrap or
@@ -5908,7 +5932,7 @@ def test_voice_check_default_threshold_honors_vault_override(
     """Without ``--max-distance``, the vault's ``voice_distance_upper`` wins.
 
     A vault config pins ``voice_distance_upper`` to 0.10 — far below the 0.35
-    default. A file whose distance sits between the two (~0.29) passes under
+    default. A file whose distance sits between the two (~0.18) passes under
     the default but must DIVERGE under the vault override. This pins that the
     effective threshold is resolved from the loaded vault config at call time,
     not frozen from the default config at module import.
@@ -5919,14 +5943,9 @@ def test_voice_check_default_threshold_honors_vault_override(
     config_path = _write_voice_distance_config(vault, 0.10)
     monkeypatch.setenv("CREEK_CONFIG", str(config_path))
 
-    # ~0.29 distance: comfortably above the 0.10 override, below the 0.35 default.
+    # ~0.18 distance: comfortably above the 0.10 override, below the 0.35 default.
     target = tmp_path / "padded.md"
-    target.write_text(
-        (_voice_fixture_dir("slop") / "03_wiki_padding.md").read_text(
-            encoding="utf-8",
-        ),
-        encoding="utf-8",
-    )
+    _write_mildly_divergent_draft(target)
 
     result = runner.invoke(
         app,
@@ -5947,7 +5966,7 @@ def test_voice_check_explicit_max_distance_overrides_vault_config(
     """An explicit ``--max-distance`` beats the vault's configured ceiling.
 
     The vault pins ``voice_distance_upper`` to 0.10, but passing
-    ``--max-distance 0.5`` must take precedence so the ~0.29 file passes.
+    ``--max-distance 0.5`` must take precedence so the ~0.18 file passes.
     """
     vault = tmp_path / "vault"
     _scaffold_voice_vault(vault)
@@ -5956,12 +5975,7 @@ def test_voice_check_explicit_max_distance_overrides_vault_config(
     monkeypatch.setenv("CREEK_CONFIG", str(config_path))
 
     target = tmp_path / "padded.md"
-    target.write_text(
-        (_voice_fixture_dir("slop") / "03_wiki_padding.md").read_text(
-            encoding="utf-8",
-        ),
-        encoding="utf-8",
-    )
+    _write_mildly_divergent_draft(target)
 
     result = runner.invoke(
         app,

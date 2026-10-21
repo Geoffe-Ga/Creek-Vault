@@ -17,7 +17,7 @@ abandoning a thread that may still store the letter while telling the caller
 ``503`` would invite a retry that races the write it reported as failed.
 
 **The admission cap is reported here as it is on the reflection route** (#1903
-step 6, contract 0.20). The cap was never per route — both routes resolve the
+step 6, contract 0.21). The cap was never per route — both routes resolve the
 one ``generation`` stage through the same factory builder — so a writer held at
 it was already held at it on both, and the only thing that differed was that
 this route told them an outage story. ``429 rate_limited`` with its advisory
@@ -105,7 +105,7 @@ all. It is the same code, status, message and advisory ``Retry-After``
 ``POST /v1/reflections`` has served since contract 0.19 — one per-account cap,
 reported identically wherever a caller meets it (#1903 step 6). A caller below
 :data:`~creek_mcp.api.models.LETTER_RATE_LIMITED_SINCE_MINOR` is served the
-``temporarily_unavailable`` this route answered at ``0.19``, by
+``temporarily_unavailable`` this route answered at ``0.20``, by
 :func:`~creek_mcp.httpapi.generation.served_error_code`.
 """
 
@@ -254,7 +254,7 @@ def _render(
 
     *serve_rate_limited* is kept separate from *inference_source*'s own gate
     even though both are read off the declared minor: the field arrived at
-    0.19 and the cap reaches this route at 0.20, and collapsing them into one
+    0.19 and the cap reaches this route at 0.21, and collapsing them into one
     flag would make a caller's provenance eligibility decide which refusal it
     is told about.
     """

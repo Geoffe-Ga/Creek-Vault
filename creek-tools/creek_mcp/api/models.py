@@ -83,6 +83,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.20",
     "0.19",
     "0.18",
     "0.17",
@@ -213,13 +214,19 @@ refusal is served to such a caller as ``temporarily_unavailable``, the code it
 has always received for a shed request. So a ``0.18`` consumer validating its
 vendored closed schemas is answered byte-identically and stays in the window.
 
-Contract 0.20 (#1903 step 6) serves ``rate_limited`` on
+Contract 0.20 (#1938) adds ``keyless_inference`` to the handshake, withheld
+from callers below :data:`KEYLESS_INFERENCE_SINCE_MINOR`, so every response a
+``0.19`` consumer can reach is byte-identical and ``0.19`` stays in the window.
+
+Contract 0.21 (#1903 step 6) serves ``rate_limited`` on
 ``POST /v1/letters/{external_id}`` as well, so one per-account cap is reported
 by one surface. No model, field or status is added — ``429`` was already in the
 published set — and the only thing that moves is which route documents and
 reaches it, withheld from callers below
-:data:`LETTER_RATE_LIMITED_SINCE_MINOR`, which keeps every ``0.19`` letter
-response exactly as that minor published it.
+:data:`LETTER_RATE_LIMITED_SINCE_MINOR`, which keeps every ``0.20`` letter
+response exactly as that minor published it. It is 0.21 and not 0.20 precisely
+because 0.20 had already shipped: see that constant for why reusing a published
+minor would have been the break this window exists to prevent.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -444,19 +451,36 @@ the field while serving the code, which is a combination no vendored schema
 describes. It is a literal for the reason :data:`_UPLOAD_MINOR` is.
 """
 
-LETTER_RATE_LIMITED_SINCE_MINOR: Final[str] = "0.20"
+KEYLESS_INFERENCE_SINCE_MINOR: Final[str] = "0.20"
+"""First contract minor whose handshake carries ``keyless_inference`` (#1938).
+
+Its own constant rather than :data:`PROVENANCE_SINCE_MINOR`, because it is its
+own contract change: a ``0.19`` consumer vendored a closed
+:class:`CapabilitiesResponse` without it. It is a literal for the reason
+:data:`_UPLOAD_MINOR` is.
+"""
+
+LETTER_RATE_LIMITED_SINCE_MINOR: Final[str] = "0.21"
 """First contract minor that may meet ``rate_limited`` on the letter route.
 
 A *second* since-minor for one code, and the distinction it carries is which
 question is being asked. ``rate_limited`` and its ``429`` are 0.19's, so
 :data:`PROVENANCE_SINCE_MINOR` already answers "can this caller name the
-code?" — and a 0.19 caller can. What 0.20 answers is "does *this route* reach
-it?", because at 0.19 ``POST /v1/letters/{external_id}`` did not: the
-published document documented no ``429`` on it, and a cap arriving mid-letter
-was collapsed into the ``temporarily_unavailable`` every other provider
-failure earns. Serving the cap there is therefore a response that *moves* on
-a route a published minor already describes, and the only mechanism this
+code?" — and a 0.19 caller can. What this constant answers is "does *this
+route* reach it?", because until 0.21 ``POST /v1/letters/{external_id}`` did
+not: the published document documented no ``429`` on it, and a cap arriving
+mid-letter was collapsed into the ``temporarily_unavailable`` every other
+provider failure earns. Serving the cap there is a response that *moves* on a
+route an already-published minor describes, and the only mechanism this
 contract has for that is a minor.
+
+**Which is why it is 0.21 rather than 0.20**, even though 0.20 is the minor
+this work was specified against. 0.20 shipped first, for ``keyless_inference``
+(#1938, the constant above), so by the time this landed 0.20 was itself an
+already-published minor describing this path — and a consumer that negotiated
+it for that field never agreed to a ``429`` on a letter. Reusing 0.20 would
+have been exactly the move the paragraph above forbids, committed by the
+change that wrote the paragraph.
 
 It is **not** a second dialect. The downgrade runs through the same
 :func:`~creek_mcp.httpapi.generation.served_error_code`, to the same code,
@@ -780,7 +804,7 @@ class ErrorCode(StrEnum):
             spelling its vendored vocabulary has. Reachable on
             ``POST /v1/reflections`` from 0.19 and on
             ``POST /v1/letters/{external_id}`` from
-            :data:`LETTER_RATE_LIMITED_SINCE_MINOR` — **one** budget either
+            :data:`LETTER_RATE_LIMITED_SINCE_MINOR` (0.21) — **one** budget either
             way, since both routes dial the single ``generation`` chokepoint
             and the cap is the pool's admission refusal or the writer's own
             key's, never a counter this server keeps per route.
@@ -1205,6 +1229,13 @@ class CapabilitiesResponse(_WireModel):
             the route *before* dialling rather than inferring it from the
             first answer's ``inference_source``. Since contract 0.19, and
             omitted for a caller declaring an earlier minor.
+        keyless_inference: ``False`` when a model call carrying no writer key
+            is certain to be refused here before any model is dialled: a
+            managed vault with no shared pool pinned. ``True`` when such a
+            call may be attempted. A consumer reading ``False`` should ask
+            the writer for their key instead of charging for a pass that
+            cannot run. Since contract 0.20, and omitted for a caller
+            declaring an earlier minor.
     """
 
     status: CapabilitiesStatus = Field(description="Overall server readiness.")
@@ -1234,6 +1265,14 @@ class CapabilitiesResponse(_WireModel):
         description=(
             "Whether model calls are answered from the shared inference pool. "
             "Since contract 0.19."
+        ),
+    )
+    keyless_inference: bool | None = Field(
+        default=None,
+        description=(
+            "False when a model call without a writer's request key is "
+            "refused before any model is dialled; true when one may be "
+            "attempted. Since contract 0.20."
         ),
     )
 

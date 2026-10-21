@@ -117,7 +117,8 @@ SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "s
 OPENAPI_GOLDEN: Final[Path] = (
     Path(__file__).resolve().parent / "fixtures" / "openapi-0.20.0.json"
 )
-"""The published document at contract 0.20.0 (#1903 step 6).
+"""The published document at contract 0.21.0: `keyless_inference` (#1938) and
+the letter route's admission refusal (#1903 step 6).
 
 Regenerate it **only** with a deliberate contract change, and say in that
 change's ADR row what moved:

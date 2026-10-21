@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "a7bf50b5b82839dae607b65b8acc5b4f90c9c99445f39e2d99dabf57d5151a00",
+      "sha256": "d53ef16d562a4f04014917b42a6b16a0cda575c39844731bc32e185c28ffe691",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "9165fd88c34e389c6142ee5e02e8f7de21cad3ef7596013ec5ac19e5e2359f1c",
+      "sha256": "c72ce07f5a4514e0accd48bfb7ad519473ef8999c08c7887a8a8430bb4f28a8c",
       "state": "success"
     },
     {
@@ -503,7 +503,7 @@
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "26a3421bc9bdd4b97f98a90d1ccfedd447bd6b228ae0f155baccde18272b6ad2",
+      "sha256": "b8161715c2fb7588c44c17988fb603ef4d6013053ec07e57c8022dfb16ffd58c",
       "state": null
     },
     {
@@ -587,7 +587,7 @@
       "capability": null,
       "model": "ErrorEnvelope",
       "path": "schemas/ErrorEnvelope.schema.json",
-      "sha256": "21be9b2ab0dcfff0c179b617cfe8567e73989415a4afa9e90b1792e25e64500f",
+      "sha256": "dbe92ea9de79fb0ebb3cda5fa3338f5acb24c14e3d61253e3521e983f4c2c691",
       "state": null
     },
     {

@@ -20,7 +20,7 @@ import yaml
 from starlette.testclient import TestClient
 
 from creek._fslock import VaultLockTimeoutError
-from creek.care.guardrail import CARE_SIGNAL
+from creek.care.guardrail import CARE_SIGNAL, acute_distress_guard
 from creek.classify.llm.consent import CLOUD_CONSENT_ENV
 from creek.classify.llm.providers import ProviderRateLimitError
 from creek.classify.llm.router import IntimateRoutingError
@@ -31,6 +31,7 @@ from creek.voice_drafts import (
     VoiceDraftAction,
     VoiceDraftDocument,
     VoiceDraftStorageError,
+    VoiceDraftWriteResult,
     create_voice_draft_if_absent,
 )
 from creek_mcp.api.models import (
@@ -45,11 +46,16 @@ from creek_mcp.api.models import (
 )
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.httpapi.errors import RETRY_AFTER_HEADER, RETRY_AFTER_SECONDS
+from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.letter import (
     LETTER_MAX_OUTPUT_TOKENS,
     MAX_LETTER_CHARS,
+    LetterCall,
+    LetterOutcome,
+    LetterRefusal,
     LetterSource,
     build_letter_prompt,
+    write_letter,
 )
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
@@ -73,7 +79,7 @@ _INTERNAL_ERROR: Final[int] = 500
 _UNAVAILABLE: Final[int] = 503
 _RATE_LIMITED: Final[int] = 429
 _OLD_MINOR: Final[str] = "0.16"
-_PRIOR_LETTER_CAP_MINOR: Final[str] = "0.19"
+_PRIOR_LETTER_CAP_MINOR: Final[str] = "0.20"
 """The minor immediately below the one that serves the cap on this route.
 
 Spelled rather than derived from
@@ -863,13 +869,14 @@ def test_a_rate_limited_letter_stores_no_voice_draft_readable_by_its_id(
 def test_a_minor_below_the_bump_still_receives_temporarily_unavailable(
     tmp_path: Path,
 ) -> None:
-    """A caller at 0.19 is answered exactly as it was before this change.
+    """A caller at 0.20 is answered exactly as it was before this change.
 
     ``rate_limited`` and its 429 are 0.19's own, so this is not a vocabulary
-    gate: a 0.19 consumer can name the code. What it cannot have is a *letter*
+    gate: a 0.20 consumer can name the code. What it cannot have is a *letter*
     response that moved after its minor was published — the published document
-    documents no 429 on this route at 0.19 — so the downgrade here is the
-    version window holding, not a softening of the truth.
+    documents no 429 on this route at 0.20, which shipped for
+    ``keyless_inference`` (#1938) and never mentioned a capped letter — so the
+    downgrade here is the version window holding, not a softening of the truth.
     """
     vault = seed_vault(tmp_path / "vault")
     spy = _FactorySpy(completion_error=ProviderRateLimitError("Anthropic: capped"))
@@ -880,21 +887,81 @@ def test_a_minor_below_the_bump_still_receives_temporarily_unavailable(
     assert RETRY_AFTER_HEADER not in response.headers
 
 
-def test_the_cap_is_charged_once_per_request_whatever_the_dial_count(
-    tmp_path: Path,
-) -> None:
-    """One letter request is one admission decision, read off the provider.
+def test_one_letter_request_makes_exactly_one_dial_today(tmp_path: Path) -> None:
+    """The unit the cap is spent in is a **dial**, and one request makes one.
 
-    The vault keeps **no counter of its own**: a cap is whatever the shared
-    ``generation`` chokepoint — pool admission or the writer's own key —
-    refuses, so the unit the cap is spent in is a *dial*, not a request. #1939
-    will generate up to three candidates per letter, and this pins which way
-    today's implementation behaves so that issue can choose deliberately:
-    every dial faces admission, and the first refusal ends the request.
+    Named for what it proves, which is narrower than it sounds and is the
+    point. The vault keeps **no counter of its own** — there is no hourly or
+    in-flight limiter anywhere in ``creek/`` or ``creek_mcp/`` — so a cap is
+    whatever the shared ``generation`` chokepoint refuses: the pool's HTTP
+    ``429``, or any provider's :class:`ProviderRateLimitError`. That makes the
+    spend-unit a dial. Today ``_generate`` dials once, so one request costs one
+    unit, which is all this test can honestly claim.
+
+    **The consequence #1939 must decide rather than inherit**, and the reason
+    this is pinned at all: under best-of-N, three candidates generated as three
+    dials face admission three times and therefore spend **three** units. That
+    is the default this code hands it, not a choice made here. The next test
+    makes that reachable claim concrete rather than leaving it to inference.
     """
     vault = seed_vault(tmp_path / "vault")
     spy = _FactorySpy(completion_error=ProviderRateLimitError("Anthropic: capped"))
     with _client(vault, spy) as test_client:
-        _post(test_client)
+        response = _post(test_client)
 
+    assert _code(response) == (_RATE_LIMITED, ErrorCode.RATE_LIMITED.value)
     assert len(spy.prompts) == 1
+
+
+def test_every_dial_faces_admission_so_n_candidates_would_cost_n(
+    tmp_path: Path,
+) -> None:
+    """A second dial is refused independently of the first having succeeded.
+
+    The claim above, made real instead of asserted by one-dial arithmetic. A
+    factory that answers the first completion and refuses the second shows that
+    admission is faced **per dial** with no per-request credit: nothing in the
+    vault remembers that this request already got through once. So an N-candidate
+    letter is N admission decisions, and the first refusal ends the request
+    whichever candidate it lands on.
+
+    Driven through the tool rather than the route because one ``POST`` makes one
+    dial today, which is exactly what the test above pins — the second dial has
+    no route-level caller until #1939 builds one, and inventing one here would
+    be testing a loop this contract does not have.
+    """
+    vault = seed_vault(tmp_path / "vault")
+    spy = _FactorySpy(completion_error=ProviderRateLimitError("Anthropic: capped"))
+    spy_first_ok = _FactorySpy()
+
+    first = _letter_outcome(vault, spy_first_ok, external_id="cap-candidate-1")
+    second = _letter_outcome(vault, spy, external_id="cap-candidate-2")
+
+    assert isinstance(first, VoiceDraftWriteResult)
+    assert second is LetterRefusal.RATE_LIMITED
+    assert len(spy_first_ok.prompts) == 1
+    assert len(spy.prompts) == 1
+
+
+def _letter_outcome(
+    vault: Path, spy: _FactorySpy, *, external_id: str
+) -> LetterOutcome:
+    """Run the letter tool once against *vault*, returning its raw outcome."""
+    return write_letter(
+        LetterCall(
+            vault_path=vault,
+            external_id=external_id,
+            ceiling=TierCeiling.PERSONAL,
+            consumer="tests",
+            build_factory=lambda: spy,
+            care_guard=acute_distress_guard,
+        ),
+        LetterSource(
+            content=_ENTRY,
+            note=_NOTE,
+            anchor_text=_ANCHOR,
+            kind="pattern",
+            tier=PrivacyTier.PERSONAL,
+            title=None,
+        ),
+    )
