@@ -13,9 +13,19 @@ verdicts: a stamp is a snapshot of what some earlier run measured, against
 the fingerprint, config and aggregation of *that* moment. After #1936 that
 divergence was no longer hypothetical — every draft stamped under the old
 diluting mean carries a number too small to flag — so the audit pass now
-re-measures the prose in front of it. Scanning is pure regex over the body;
-the stamp remains in frontmatter as the guard's attestation, which
-:mod:`creek.generate.voice_authenticity` still reads.
+re-measures the prose in front of it. The stamp remains in frontmatter as the
+guard's attestation, which :mod:`creek.generate.voice_authenticity` still
+reads.
+
+The cost is paid knowingly: a scan is pure regex over the body — no model
+call, no I/O beyond the read this check already did — but it is now paid for
+*every* draft on *every* run rather than skipped for stamped ones, so the
+check's cost grows with the number of drafts times the tell count instead of
+with the unstamped ones alone. At a few hundred drafts that is milliseconds;
+if ``creek lint`` latency ever becomes a complaint, this is the line to
+revisit, and the thing to restore is not stamp-trust (it gives identical
+content two verdicts) but a cache keyed on the body digest *and* the
+fingerprint, config and aggregation version that produced the number.
 
 **What this check does and does not catch.** ``voice_distance`` aggregates
 the per-tell-family divergences from the user's measured rates, and the

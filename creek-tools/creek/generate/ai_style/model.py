@@ -163,9 +163,28 @@ class ScanReport:
             measured family, so this is the per-component view behind the
             scalar: a caller ranking several candidates can read *which*
             families diverge and how hard, rather than only the aggregate.
-        voice_distance: The aggregate divergence — the union of
-            ``family_evidence``. ``0.0`` means no family cleared its margin,
-            which is exactly when ``findings`` is empty.
+            Note it is the **raw** per-family signal, taken before
+            ``thin_fingerprint_softening``, whereas :attr:`voice_distance` has
+            that factor baked in — softening is a global discount for an
+            unreliable *measurement*, not a property of any one family. That
+            asymmetry cannot affect a best-of-N ranking (#1939): softening
+            depends on how thin the vault's fingerprint is, which is a property
+            of the corpus and not of a candidate, so every candidate scored in
+            one request shares the same factor. It would only matter when
+            comparing scores taken against *different* vaults.
+        voice_distance: The aggregate divergence. ``0.0`` means no family
+            cleared its margin, which at any non-degenerate configuration is
+            exactly when ``findings`` is empty. It is **not** the plain union
+            of :attr:`family_evidence`: the aggregate additionally applies
+            each family's weight *relative to the heaviest family in play*
+            and the thin-fingerprint softening, neither of which is in that
+            map. So a consumer may use ``family_evidence`` to see and count
+            *which* families diverge, but must not try to re-derive this
+            number from it — the two disagree wherever a mechanical family
+            (weight 0.5) diverges or the fingerprint is thin. ``0.0`` with a
+            non-empty ``findings`` is reachable only by configuring the
+            diverging family's weight to zero or softening to zero, both of
+            which are legal and both of which mean "do not score this".
         thin_fingerprint: ``True`` when the fingerprint was below the
             configured ``min_fingerprint_fragments`` and flagging was softened.
     """

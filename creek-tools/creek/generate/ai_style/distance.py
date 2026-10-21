@@ -46,12 +46,23 @@ re-break as soon as a draft got longer or a tell family was added):
   findings now agree by construction: ``voice_distance == 0.0`` exactly when
   a scan produced no finding. Prose that fires nothing scores exactly zero,
   which is why a far stricter score costs no false positive on the user's
-  own writing.
+  own writing. The ``⇐`` direction of that equivalence holds always; the
+  ``⇒`` direction ("a finding implies a non-zero score") holds at every
+  configuration except the two that deliberately switch scoring off — a
+  diverging family whose weight is ``0``, and ``thin_fingerprint_softening``
+  at ``0.0``. Both are legal and both mean "do not score this".
 * **The families combine as independent evidence** (a noisy-OR / union),
   not as an average: ``1 - Π(1 - wᵢ · eᵢ)``. A clean family multiplies by
   exactly 1, so it cannot dilute; the worst family sets a floor the rest
   cannot average away; breadth still accumulates, since every additional
-  diverging family strictly raises the score.
+  diverging family strictly raises the score. One caveat on "a clean family
+  cannot dilute", since ``wᵢ`` is each weight *relative to the heaviest
+  family in play*: a clean family heavier than every diverging one does
+  lower the score, by raising the denominator every other family is measured
+  against. At the shipped weights the maximum is ``1.0`` and nothing can
+  exceed it, so the property holds as stated; a vault that configures a
+  weight above ``1.0`` buys the dilution back for every family below it (see
+  :attr:`creek.config.AIStyleConfig.feature_weights`).
 
 No new tuning knob was added: the per-tell margins, the category/feature
 weights and :data:`SATURATION_SCALE` are all pre-existing, and weights
@@ -172,9 +183,11 @@ def voice_distance(
     its weight *relative to the heaviest family in play* — so the result
     sits in ``[0, 1]``, is ``0.0`` exactly when no family cleared its
     margin, rises with both the severity of the worst family and the number
-    of diverging families, and is unchanged by families that match the
-    user. See the module docstring for why this replaced a weighted mean,
-    and for the measurements behind it (#1936).
+    of diverging families, and is unchanged by families that match the user
+    (as long as none of them is heavier than every diverging one — see the
+    module docstring's caveat, which cannot arise at the shipped weights).
+    See the module docstring for why this replaced a weighted mean, and for
+    the measurements behind it (#1936).
 
     Args:
         contributions: One entry per measured feature.

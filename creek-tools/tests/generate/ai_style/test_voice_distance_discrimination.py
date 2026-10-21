@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from creek.config import AIStyleConfig
+from creek.config import ONE_LINE_FRAGMENT_WEIGHT, AIStyleConfig
 from creek.generate.ai_style import build_fingerprint, scan
 from creek.generate.ai_style.distance import (
     SATURATION_SCALE,
@@ -110,15 +110,17 @@ without which the sweep below would be measuring something other than what
 it claims.
 """
 
-_INERT_FAMILY: Final[str] = "one_line_fragment_density"
-"""The one article tell that is *inert* against this fingerprint (#635).
+_SIGNATURE_FAMILY: Final[str] = "one_line_fragment_density"
+"""The one article tell that is *inert* against this module's fingerprint.
 
-``one_line_fragment`` is a ``signature`` tell: it scores only for a writer
-whose own one-line-paragraph rate clears
+``one_line_fragment`` is a ``signature`` tell (#635): it scores only for a
+writer whose own one-line-paragraph rate clears
 ``signature_polarity_threshold``. The fixture voice does not, so the family
 cannot be made to fire and is excluded from the injection table by
 construction — asserted, not assumed, by
 :meth:`TestInjectionTableCompleteness.test_the_uninjectable_family_is_inert`.
+:class:`TestOwnWritingDoesNotFlag` builds the other kind of voice, the one
+this family *is* live for, because that is where it was a false positive.
 """
 
 _SWEEP: Final[tuple[tuple[int, float], ...]] = (
@@ -221,6 +223,24 @@ class TestEvidencePerFamily:
         assert voice_distance([diverging]) == pytest.approx(
             voice_distance([diverging, *clean])
         )
+
+    def test_a_clean_family_heavier_than_the_rest_does_dilute(self) -> None:
+        """The one shape where a clean family still lowers the score.
+
+        Weights are taken relative to the heaviest family *in play*, clean
+        ones included, so a clean family weighted above every diverging one
+        raises the denominator and shrinks them all. It cannot happen at the
+        shipped weights, where the maximum is 1.0 — this pins the boundary of
+        the no-dilution claim rather than a behaviour anyone should rely on,
+        and it is the same arithmetic behind the ``feature_weights`` footgun
+        (raising one family demotes the others).
+        """
+        diverging = FeatureContribution("a", weight=1.0, magnitude=10.0, margin=0.5)
+        heavy_clean = FeatureContribution("b", weight=4.0, magnitude=0.0, margin=0.5)
+        alone = voice_distance([diverging])
+        with_heavy_clean = voice_distance([diverging, heavy_clean])
+        assert with_heavy_clean < alone
+        assert with_heavy_clean == pytest.approx(alone / 4.0)
 
     def test_the_worst_family_sets_a_floor(self) -> None:
         """One egregious family can no longer be averaged away by the rest."""
@@ -362,7 +382,7 @@ class TestInjectionTableCompleteness:
     ) -> None:
         """Injections plus the one inert family account for every article tell."""
         injected = {key for key, _sentence in _INJECTIONS}
-        assert injected | {_INERT_FAMILY} == _article_tell_keys(config)
+        assert injected | {_SIGNATURE_FAMILY} == _article_tell_keys(config)
 
     def test_the_saturation_specimen_fires_every_injected_family(
         self,
@@ -384,7 +404,7 @@ class TestInjectionTableCompleteness:
         (tell,) = [
             candidate
             for candidate in get_tells(config.enabled_categories)
-            if candidate.feature_key == _INERT_FAMILY
+            if candidate.feature_key == _SIGNATURE_FAMILY
         ]
         user_rate = fingerprint.rate_for(tell.feature_key) or 0.0
         polarity = effective_polarity(
@@ -404,8 +424,233 @@ class TestInjectionTableCompleteness:
             _specimen(len(_INJECTIONS)), fingerprint=fingerprint, config=config
         )
         assert set(report.family_evidence) == _article_tell_keys(config)
-        assert report.family_evidence[_INERT_FAMILY] == 0.0
+        assert report.family_evidence[_SIGNATURE_FAMILY] == 0.0
         assert all(report.family_evidence[key] > 0.0 for key, _sentence in _INJECTIONS)
+
+
+class TestFamilyEvidenceSurface:
+    """What ``ScanReport.family_evidence`` guarantees to a best-of-N selector.
+
+    #1939 ranks candidates on ``(count of families with evidence > 0,
+    voice_distance)`` read off this map rather than on the scalar alone, so
+    these are its load-bearing properties: the map is complete for *every*
+    scan including a clean one, its keys are the tell registry's closed
+    vocabulary and never draft text, and its non-zero count is exactly the
+    number of families that fired.
+    """
+
+    @pytest.mark.parametrize("injections", [0, 1, 2, 16])
+    def test_the_map_is_complete_even_when_nothing_diverges(
+        self,
+        injections: int,
+        fingerprint: VoiceFingerprint,
+        config: AIStyleConfig,
+    ) -> None:
+        """Clean families are reported as 0.0, not omitted.
+
+        A clean candidate must still carry one entry per measured family, so
+        a selector can count diverging families without having to tell "no
+        divergence" apart from "no measurement".
+        """
+        report = scan(_specimen(injections), fingerprint=fingerprint, config=config)
+        assert set(report.family_evidence) == _article_tell_keys(config)
+        assert all(evidence >= 0.0 for evidence in report.family_evidence.values())
+
+    @pytest.mark.parametrize("injections", [0, 1, 2, 16])
+    def test_the_non_zero_count_is_the_number_of_families_that_fired(
+        self,
+        injections: int,
+        fingerprint: VoiceFingerprint,
+        config: AIStyleConfig,
+    ) -> None:
+        """The quantity #1939 ranks on means what its name says."""
+        report = scan(_specimen(injections), fingerprint=fingerprint, config=config)
+        diverging = {
+            key for key, evidence in report.family_evidence.items() if evidence > 0.0
+        }
+        assert diverging == _families(report)
+        assert len(diverging) == injections
+
+    def test_the_keys_are_the_closed_tell_vocabulary_not_draft_text(
+        self,
+        fingerprint: VoiceFingerprint,
+        config: AIStyleConfig,
+    ) -> None:
+        """A content-free surface: ids and codes only, no prose from the draft.
+
+        The map is safe to log or persist because its keys come from the tell
+        registry and its values are floats. Asserted against the scanned text
+        itself so a future key built from an excerpt — the obvious way this
+        leaks — reds here.
+        """
+        text = _specimen(len(_INJECTIONS))
+        report = scan(text, fingerprint=fingerprint, config=config)
+        words = {word.strip(".,").lower() for word in text.split()}
+        for key in report.family_evidence:
+            assert key in _article_tell_keys(config)
+            assert key.lower() not in words
+            assert key not in text
+
+    def test_no_two_tells_share_a_feature_key(
+        self,
+        config: AIStyleConfig,
+    ) -> None:
+        """A shared ``feature_key`` would silently collapse an entry.
+
+        ``Tell`` documents that several tells *may* measure one
+        ``feature_key``. None do today, and the map is keyed by it — so a
+        collision would overwrite one tell's evidence with another's while
+        the union still multiplied both in, making the count #1939 ranks on
+        quietly wrong. Pinned so the collision cannot arrive unannounced.
+        """
+        article_tells = [
+            tell
+            for tell in get_tells(config.enabled_categories)
+            if tell.applies_in("article")
+        ]
+        keys = [tell.feature_key for tell in article_tells]
+        assert len(keys) == len(set(keys))
+
+    def test_a_disabled_subsystem_reports_no_families_at_all(
+        self,
+        fingerprint: VoiceFingerprint,
+    ) -> None:
+        """The one case where the map is empty, so it is not read as "clean".
+
+        With ``ai_style.enabled`` false the scanner returns an empty report —
+        no findings, no families, distance 0.0 — which a selector must treat
+        as "not measured" rather than "measured and perfect".
+        """
+        report = scan(
+            _specimen(len(_INJECTIONS)),
+            fingerprint=fingerprint,
+            config=AIStyleConfig(enabled=False),
+        )
+        assert report.family_evidence == {}
+        assert report.findings == []
+        assert report.voice_distance == 0.0
+
+
+class TestOwnWritingDoesNotFlag:
+    """The invariant on ``voice_distance_upper``, tested where it nearly broke.
+
+    ``one_line_fragment`` is the one tell whose measured *user* rate is an
+    artifact rather than a habit: it counts any single-line block of at most
+    20 words (a markdown heading included), and the fingerprint averages
+    per-fragment rates rather than pooling words, so a corpus of short
+    journal entries measures 50-200 per 1000 words by construction and the
+    family becomes a live *signature* for that voice. Under-use is then the
+    concern, and a long-form draft with no standalone short paragraph
+    under-uses it by the user's entire rate — which, before the family was
+    down-weighted, scored 0.8794 and flagged a draft that *was itself one of
+    the corpus fragments*. Creek's users are journalers, so that is the
+    median vault, and ``creek voice-check`` is documented as a gate that
+    exits non-zero on divergence.
+
+    The fixture voice in the rest of this module has the family inert
+    (its rate is under ``signature_polarity_threshold``), so nothing else
+    here covers the live case. These two tests do: one structural, one
+    end-to-end on the user's own prose.
+    """
+
+    _SHORT_ENTRIES: Final[tuple[str, ...]] = (
+        "Woke early. Rain on the skylight.",
+        "Bus late again. Walked instead.",
+        "Cooked for four, ate alone, no complaints.",
+        "Finished the book. Worth the last thirty pages.",
+        "Cleared the shed. Found the tools.",
+        "Swam before work. Eight lengths, badly.",
+    )
+    """Six one-line entries — the shape that makes the signature live."""
+
+    _LONG_FORM: Final[str] = (
+        "I cleared the shed this morning and found the box of my father's "
+        "tools under a tarpaulin, which I had not opened since we moved the "
+        "boxes in. I oiled the plane and put a new blade in the knife, and "
+        "then I swept the floor twice because the first pass only moved the "
+        "dust around. My hands smelled of iron all evening and I did not "
+        "wash them until bed, which is the kind of thing I notice and then "
+        "decide not to mind."
+    )
+    """One long-form paragraph in the same voice: no standalone short block."""
+
+    @pytest.fixture
+    def live_signature_fingerprint(
+        self,
+        tmp_path: Path,
+    ) -> VoiceFingerprint:
+        """Build a fingerprint whose ``one_line_fragment`` signature is live.
+
+        The long-form entry is part of the corpus, so the draft scored below
+        is the user's *own* writing measured against a profile it helped
+        build — the exact shape the invariant is about.
+        """
+        fragments = tmp_path / "01-Fragments"
+        fragments.mkdir(parents=True)
+        for index, body in enumerate((*self._SHORT_ENTRIES, self._LONG_FORM)):
+            (fragments / f"entry_{index:02d}.md").write_text(
+                "---\n"
+                "source:\n"
+                "  author: self\n"
+                "  platform: markdown\n"
+                "privacy_tier: open\n"
+                f"---\n{body}\n",
+                encoding="utf-8",
+            )
+        return build_fingerprint(tmp_path, AIStyleConfig())
+
+    def test_the_signature_family_cannot_flag_a_draft_by_itself(
+        self,
+        config: AIStyleConfig,
+    ) -> None:
+        """Structural, so it holds at any magnitude: its weight is the cap.
+
+        A family's evidence is strictly below 1, so its contribution is
+        strictly below its relative weight. At 0.25 against a heaviest weight
+        of 1.0, ``one_line_fragment`` tops out under the 0.35 ceiling however
+        extreme the under-use — it can add to a union beside real slop, but
+        it can never carry a verdict alone.
+        """
+        assert config.feature_weights["one_line_fragment_density"] == pytest.approx(
+            ONE_LINE_FRAGMENT_WEIGHT
+        )
+        assert max(config.category_weights.values()) == pytest.approx(1.0)
+        assert config.voice_distance_upper > ONE_LINE_FRAGMENT_WEIGHT
+        saturated = FeatureContribution(
+            "one_line_fragment_density",
+            weight=ONE_LINE_FRAGMENT_WEIGHT,
+            magnitude=1e6,
+            margin=0.5,
+        )
+        clean_heaviest = FeatureContribution(
+            "ai_vocab_density", weight=1.0, magnitude=0.0, margin=2.0
+        )
+        assert voice_distance([saturated, clean_heaviest]) < config.voice_distance_upper
+
+    def test_a_long_form_draft_in_the_users_own_voice_is_not_flagged(
+        self,
+        live_signature_fingerprint: VoiceFingerprint,
+        config: AIStyleConfig,
+    ) -> None:
+        """The user's own prose, measured against their own profile, stays clean.
+
+        The signature really is live here and the family really does diverge
+        — asserted, so the test cannot pass by the tell being inert — yet the
+        draft sits under the ceiling, which is what
+        ``voice_distance_upper``'s "the user's own writing must not flag"
+        promises. The divergence is still *reported*: down-weighting changed
+        what carries a verdict, not what gets surfaced for review.
+        """
+        rate = live_signature_fingerprint.rate_for(_SIGNATURE_FAMILY)
+        assert rate is not None
+        assert rate >= config.signature_polarity_threshold
+        report = scan(
+            self._LONG_FORM, fingerprint=live_signature_fingerprint, config=config
+        )
+        assert not live_signature_fingerprint.is_thin(config.min_fingerprint_fragments)
+        assert _families(report) == {_SIGNATURE_FAMILY}
+        assert report.family_evidence[_SIGNATURE_FAMILY] > 0.0
+        assert report.voice_distance < config.voice_distance_upper
 
 
 class TestFlagBoundary:
