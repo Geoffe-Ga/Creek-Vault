@@ -168,8 +168,24 @@ def entry_text(*, seed: int, index: int, words: int) -> str:
     )
 
 
-def _confined_root(root: Path) -> Path:
-    """Resolve *root* and refuse anything but a fresh directory under temp."""
+def confined_root(root: Path) -> Path:
+    """Resolve *root* and refuse anything but a fresh directory under temp.
+
+    Public because the voice-fidelity eval (#1898) writes its own synthetic
+    corpus under the same guarantee. One shared gate, so neither corpus
+    builder can drift into reading a real vault.
+
+    Args:
+        root: The requested corpus root.
+
+    Returns:
+        The resolved root.
+
+    Raises:
+        CorpusConfinementError: When *root* is not strictly under the system
+            temp directory, is not a directory, or is not empty. Nothing is
+            written in any of those cases.
+    """
     resolved = root.resolve(strict=False)
     temp = Path(tempfile.gettempdir()).resolve()
     if resolved == temp or not resolved.is_relative_to(temp):
@@ -229,7 +245,7 @@ def build_corpus(
         raise ValueError(_NEGATIVE_ENTRIES)
     if words_per_entry < 0:
         raise ValueError(_NEGATIVE_WORDS)
-    resolved = _confined_root(root)
+    resolved = confined_root(root)
     notes_dir = resolved / FRAGMENTS_DIR
     meta_dir = resolved / META_DIR
     for directory in (notes_dir, meta_dir):
