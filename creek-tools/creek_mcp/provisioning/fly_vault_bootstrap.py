@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from creek_mcp.container_runtime import ContainerConfigurationError, is_mounted_volume
+from creek_mcp.provisioning.pool_bundle import pool_secret_files
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -22,19 +23,45 @@ _SECRET_FILES: Final[tuple[Path, ...]] = (
     Path("/run/secrets/creek_consumer_tokens"),
     Path("/run/secrets/creek_replay_state"),
 )
+"""Every injected file this runtime expects, listed rather than enumerated.
+
+The pool's manifest and credential files join the list when the Machine's own
+environment declares a pool bundle (ADR-0016 Decision 6, T12), so they are
+normalized exactly like the entries above.  ``/run/secrets`` is never scanned:
+an unlisted file is not normalized and a listed one that is absent is a
+startup refusal."""
+
+
+def _expected_secret_files() -> tuple[Path, ...]:
+    """Return the listed secret files, including this activation's pool files.
+
+    Returns:
+        The paths to validate and normalize.
+
+    Raises:
+        ContainerConfigurationError: When a pool is configured under a
+            credential kind this runtime does not recognize.
+    """
+    try:
+        return (*_SECRET_FILES, *pool_secret_files(os.environ))
+    except ValueError as exc:
+        raise ContainerConfigurationError(
+            "Fly vault pool secret declaration is invalid"
+        ) from exc
 
 
 def prepare_runtime_paths(
     *,
     vault_root: Path = _VAULT_ROOT,
     mountinfo: Path = _MOUNTINFO,
-    secret_files: tuple[Path, ...] = _SECRET_FILES,
+    secret_files: tuple[Path, ...] | None = None,
     uid: int = _SERVICE_UID,
     gid: int = _SERVICE_GID,
 ) -> None:
     """Validate and narrowly normalize the encrypted mount and injected files."""
     if os.geteuid() != 0:
         raise ContainerConfigurationError("Fly vault bootstrap requires root")
+    expected = _expected_secret_files() if secret_files is None else secret_files
     try:
         metadata = vault_root.lstat()
     except OSError as exc:
@@ -47,7 +74,7 @@ def prepare_runtime_paths(
         raise ContainerConfigurationError("Fly vault path must be an exact volume")
     os.chown(vault_root, uid, gid, follow_symlinks=False)
     os.chmod(vault_root, 0o700, follow_symlinks=False)
-    for path in secret_files:
+    for path in expected:
         _normalize_secret(path, uid=uid, gid=gid)
     _remove_empty_recovery_directory(vault_root)
 

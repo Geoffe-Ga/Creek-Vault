@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -27,6 +28,12 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.fly import FlyRuntimeSecrets
 from creek_mcp.provisioning.models import FailureReason
+from creek_mcp.provisioning.pool_bundle import (
+    PoolBundleIssuer,
+    PoolCredential,
+    PoolCredentialKind,
+    PoolRuntimeBundle,
+)
 from creek_mcp.provisioning.replay_contract import REPLAY_STATE_BYTES, is_replay_state
 from creek_mcp.provisioning.routing import RoutingPrincipal
 
@@ -80,6 +87,7 @@ class _BundleDocument:
     consumer_registry: bytes = field(repr=False)
     tls_certificate: bytes = field(repr=False)
     tls_private_key: bytes = field(repr=False)
+    pool: PoolRuntimeBundle | None = field(default=None, repr=False)
 
     def encode(self) -> bytes:
         """Encode the in-memory bundle for authenticated encryption."""
@@ -92,6 +100,7 @@ class _BundleDocument:
             "consumer_registry": _b64(self.consumer_registry),
             "tls_certificate": _b64(self.tls_certificate),
             "tls_private_key": _b64(self.tls_private_key),
+            "pool": None if self.pool is None else _encode_pool(self.pool),
         }
         return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
@@ -134,6 +143,7 @@ class _BundleDocument:
                 _unb64(document["consumer_registry"]),
                 _unb64(document["tls_certificate"]),
                 _unb64(document["tls_private_key"]),
+                _decode_pool(document.get("pool")),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             raise ValueError("runtime secret state is invalid") from None
@@ -146,6 +156,7 @@ class _BundleDocument:
             self.consumer_registry,
             self.tls_certificate,
             self.tls_private_key,
+            self.pool,
         )
 
 
@@ -166,8 +177,15 @@ class EncryptedFileFlySecretManager:
         ca_private_key_file: Path,
         app_prefix: str,
         clock: Callable[[], datetime] | None = None,
+        pool_bundles: PoolBundleIssuer | None = None,
     ) -> None:
-        """Load mounted key material and validate the owner-only state root."""
+        """Load mounted key material and validate the owner-only state root.
+
+        *pool_bundles* mints and revokes the per-activation pool bundle of
+        ADR-0016 Decision 1 items 1 to 3.  Absent, activations are issued with
+        no pool, which is the pool-free path and the standing O3 fallback.
+        """
+        self._pool_bundles = pool_bundles
         self._state_directory = state_directory.resolve()
         self._clock = clock or _utc_now
         _require_owner_only_directory(self._state_directory)
@@ -270,13 +288,85 @@ class EncryptedFileFlySecretManager:
         return document.runtime()
 
     def revoke(self, activation_id: str) -> None:
-        """Persist a content-free tombstone, then remove any encrypted bundle."""
+        """Revoke at the pool, then tombstone and remove the encrypted bundle.
+
+        ``FlyProviderDriver.delete`` calls this before it destroys the Machine
+        and before the content-free deletion receipt is issued, so the pool
+        revocation is confirmed first: an unconfirmed one raises and no receipt
+        follows (ADR-0016 Decision 1 item 3, T11).  The local tombstone is
+        written only afterwards, so a retry re-attempts the vendor call rather
+        than losing the credential's value and leaving a spendable key behind.
+        """
         digest = _activation_digest(activation_id)
         bundle_path, revoked_path = self._paths(digest)
+        self._revoke_pool_credential(bundle_path, digest)
         with suppress(FileExistsError):
             _exclusive_write(revoked_path, b"revoked\n")
         with suppress(FileNotFoundError):
             bundle_path.unlink()
+
+    def _revoke_pool_credential(self, bundle_path: Path, digest: str) -> None:
+        """Revoke this activation's pool credential, confirming the refusal.
+
+        Args:
+            bundle_path: The activation's encrypted bundle.
+            digest: Its activation digest, the document's AAD.
+        """
+        if self._pool_bundles is None or not bundle_path.exists():
+            return
+        document = _load_document(self._cipher, bundle_path, digest)
+        if document.pool is not None:
+            self._pool_bundles.revoke(document.pool)
+
+    def roll_pool_bundle(self, activation_id: str) -> PoolRuntimeBundle:
+        """Write this activation's next pool bundle version, and return it.
+
+        This is the "write the new bundle version" half of the per-activation
+        roll of ADR-0016 Decision 1 item 1.  It is deliberately the only half
+        here: updating the Machine config — which restarts a running Machine
+        after a drain and leaves a stopped one untouched — and retiring the old
+        identity once inventory shows no activation on it belong to T26, which
+        the attesting-provider issue owns.  Until the Machine is updated,
+        ``_verify_machine`` compares it against the *new* stored version, which
+        is what makes the roll observable; every other activation keeps its own
+        version and is unaffected.  That window is a refusal, never a fallback
+        to another model or destination (Decision 1 item 10).
+
+        The previous credential is revoked only when the issuer actually
+        replaced it: a re-pin that changes the manifest alone keeps the vendor
+        key, and Decision 3.4 re-issues (create then delete) on compromise
+        only.
+
+        Args:
+            activation_id: The activation to roll.
+
+        Returns:
+            The newly stored bundle.
+
+        Raises:
+            ValueError: When no pool issuer is configured, the activation has
+                no stored bundle, or it has been revoked.
+        """
+        if self._pool_bundles is None:
+            raise ValueError("no pool bundle issuer is configured")
+        digest = _activation_digest(activation_id)
+        bundle_path, revoked_path = self._paths(digest)
+        self._refuse_revoked(bundle_path, revoked_path)
+        document = _load_document(self._cipher, bundle_path, digest)
+        previous = document.pool
+        if previous is None:
+            raise ValueError("activation carries no pool bundle to roll")
+        issued = self._pool_bundles.issue(f"fly-{digest}")
+        rolled = dataclasses.replace(
+            issued,
+            bundle_version=max(issued.bundle_version, previous.bundle_version + 1),
+        )
+        updated = dataclasses.replace(document, pool=rolled)
+        bundle_path.write_bytes(self._encrypt(updated.encode(), _aad(digest)))
+        self._refuse_revoked(bundle_path, revoked_path)
+        if rolled.credential != previous.credential:
+            self._pool_bundles.revoke(previous)
+        return rolled
 
     def _paths(self, digest: str) -> tuple[Path, Path]:
         return (
@@ -334,6 +424,11 @@ class EncryptedFileFlySecretManager:
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         )
+        pool = (
+            None
+            if self._pool_bundles is None
+            else self._pool_bundles.issue(f"fly-{digest}")
+        )
         return _BundleDocument(
             activation_id,
             requester_identity,
@@ -343,6 +438,7 @@ class EncryptedFileFlySecretManager:
             f"{consumer_identity}={credential}\n".encode(),
             certificate.public_bytes(serialization.Encoding.PEM),
             private_pem,
+            pool,
         )
 
     def _certificate(
@@ -434,6 +530,60 @@ class ReadOnlyFlySecretManager:
         """Refuse credential revocation outside the provisioning worker."""
         del activation_id
         raise ProviderError(FailureReason.PROVIDER_REJECTED, retryable=False)
+
+
+def _encode_pool(bundle: PoolRuntimeBundle) -> dict[str, object]:
+    """Serialize one activation's stored pool bundle for encryption at rest.
+
+    The credential travels in full, because the vendor's update and delete
+    calls require the value (ADR-0016 Decision 3.4), and it never leaves this
+    encrypted document except as a Machine file.
+
+    Args:
+        bundle: The activation's stored bundle.
+
+    Returns:
+        The JSON-ready document.
+    """
+    return {
+        "bundle_version": bundle.bundle_version,
+        "pool_url": bundle.pool_url,
+        "manifest_json": bundle.manifest_json,
+        "credential_kind": bundle.credential.kind.value,
+        "credential_files": [
+            [path, _b64(value)] for path, value in bundle.credential.files
+        ],
+    }
+
+
+def _decode_pool(value: object) -> PoolRuntimeBundle | None:
+    """Decode a previously authenticated pool bundle, or ``None`` when absent.
+
+    Args:
+        value: The ``pool`` member of a decoded bundle document.
+
+    Returns:
+        The bundle, or ``None`` for a pool-free activation.
+
+    Raises:
+        ValueError: When the stored bundle is not a usable pool bundle.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("stored pool bundle is invalid")
+    files = value["credential_files"]
+    if not isinstance(files, list):
+        raise ValueError("stored pool bundle is invalid")
+    return PoolRuntimeBundle(
+        bundle_version=int(value["bundle_version"]),
+        pool_url=str(value["pool_url"]),
+        manifest_json=str(value["manifest_json"]),
+        credential=PoolCredential(
+            PoolCredentialKind(str(value["credential_kind"])),
+            tuple((str(entry[0]), _unb64(entry[1])) for entry in files),
+        ),
+    )
 
 
 def _routing_cipher(master_key_file: Path) -> AESGCM:

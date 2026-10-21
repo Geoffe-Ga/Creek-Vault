@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Final
 
-from creek_mcp.provisioning.models import Disposition, DivergenceKind
+from creek_mcp.bench.cost import MAX_PRICE_AGE_DAYS
+from creek_mcp.provisioning.models import (
+    Disposition,
+    DivergenceKind,
+    ResourceClass,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -37,6 +42,22 @@ _MONEY_FIELDS: Final[tuple[str, ...]] = (
     "running_hour_rate",
     "snapshot_gb_month_rate",
     "egress_gb_rate",
+    "pool_input_mtoken_rate",
+    "pool_output_mtoken_rate",
+)
+_POOL_RATE_FIELDS: Final[tuple[str, ...]] = (
+    "pool_input_mtoken_rate",
+    "pool_output_mtoken_rate",
+)
+"""The pool's metered vendor rates, per million tokens (ADR-0016 D3.6)."""
+_TOKENS_PER_MTOKEN: Final[Decimal] = Decimal(1_000_000)
+_POOL_COMPONENT: Final[str] = "pool"
+_POOL_UNDATED: Final[str] = (
+    "pool_rate_observed_on is required when a pool rate is priced"
+)
+_POOL_STALE: Final[str] = "pool price sheet is stale: pool_rate_observed_on is too old"
+_POOL_FUTURE: Final[str] = (
+    "pool price sheet is from the future: pool_rate_observed_on is after today"
 )
 _DURATION_KEYS: Final[dict[str, str]] = {
     "max_continuous_running": "max_continuous_running_seconds",
@@ -56,6 +77,8 @@ _USAGE_KEYS: Final[tuple[str, ...]] = (
     "snapshot_bytes",
     "egress_bytes",
     "running_seconds",
+    "pool_input_tokens",
+    "pool_output_tokens",
 )
 _FLEET_SUBJECT: Final[str] = "fleet"
 
@@ -71,6 +94,9 @@ class FleetPolicy:
     running_hour_rate: Decimal
     snapshot_gb_month_rate: Decimal | None
     egress_gb_rate: Decimal | None
+    pool_input_mtoken_rate: Decimal | None
+    pool_output_mtoken_rate: Decimal | None
+    pool_rate_observed_on: date | None
     max_continuous_running: timedelta
     stuck_deletion_after: timedelta
     review_activated_vaults: int
@@ -106,6 +132,9 @@ class FleetPolicy:
             running_hour_rate=_money(mapping, "running_hour_rate"),
             snapshot_gb_month_rate=_optional_money(mapping, "snapshot_gb_month_rate"),
             egress_gb_rate=_optional_money(mapping, "egress_gb_rate"),
+            pool_input_mtoken_rate=_optional_money(mapping, "pool_input_mtoken_rate"),
+            pool_output_mtoken_rate=_optional_money(mapping, "pool_output_mtoken_rate"),
+            pool_rate_observed_on=_optional_date(mapping, "pool_rate_observed_on"),
             max_continuous_running=_duration(mapping, "max_continuous_running_seconds"),
             stuck_deletion_after=_duration(mapping, "stuck_deletion_seconds"),
             review_activated_vaults=_count(mapping, "review_activated_vaults"),
@@ -114,9 +143,18 @@ class FleetPolicy:
         )
 
     @classmethod
-    def from_toml(cls, path: Path) -> FleetPolicy:
-        """Load only the policy from an operator TOML file."""
-        return load_policy_file(path).policy
+    def from_toml(cls, path: Path, *, today: date | None = None) -> FleetPolicy:
+        """Load only the policy from an operator TOML file.
+
+        Args:
+            path: The operator policy file.
+            today: The date the load is dated against; today in UTC when
+                omitted.
+
+        Returns:
+            The policy.
+        """
+        return load_policy_file(path, today=today).policy
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +164,13 @@ class InjectedUsage:
     snapshot_bytes: int | None
     egress_bytes: int | None
     running_seconds: int | None
+    pool_input_tokens: int | None = None
+    pool_output_tokens: int | None = None
+    """Pool tokens read off the vendor's usage page (ADR-0016 Decision 4).
+
+    Optional like every other injected figure: absent leaves the pool cost
+    line unpriced and listed, never zero.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,12 +181,29 @@ class PolicyFile:
     usage: InjectedUsage
 
 
-def load_policy_file(path: Path) -> PolicyFile:
+def load_policy_file(path: Path, *, today: date | None = None) -> PolicyFile:
     """Parse ``[budget]``, ``[policy]``, ``[review]`` and optional ``[usage]``.
 
     Floats are parsed straight into ``Decimal`` so a rate written as ``0.1``
     is exactly ``Decimal("0.1")``.  Errors name the offending key and never
     echo file content.
+
+    A priced pool line is dated: ADR-0016 Decision 4 makes the pool a metered
+    vendor line, and R6 prices it from a dated sheet rather than arithmetic
+    alone, so a pool rate without ``pool_rate_observed_on``, or one older than
+    :data:`~creek_mcp.bench.cost.MAX_PRICE_AGE_DAYS` or dated after *today*,
+    is refused exactly as ``bench.sh cost`` refuses its own sheet (T16).
+
+    Args:
+        path: The operator policy file.
+        today: The date the sheet is dated against; today in UTC when omitted.
+
+    Returns:
+        The parsed policy and injected usage.
+
+    Raises:
+        ValueError: When the file is unreadable, is not valid TOML, names an
+            invalid key, or carries an undated, stale or future pool sheet.
     """
     try:
         document = tomllib.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
@@ -154,10 +216,36 @@ def load_policy_file(path: Path) -> PolicyFile:
         table = _table(document, section)
         flat.update({f"{prefix}{key}": value for key, value in table.items()})
     usage = _table(document, "usage")
+    policy = FleetPolicy.from_mapping(flat)
+    _require_fresh_pool_sheet(policy, today or datetime.now(tz=UTC).date())
     return PolicyFile(
-        policy=FleetPolicy.from_mapping(flat),
-        usage=InjectedUsage(*(_optional_count(usage, key) for key in _USAGE_KEYS)),
+        policy=policy,
+        usage=InjectedUsage(
+            **{key: _optional_count(usage, key) for key in _USAGE_KEYS}
+        ),
     )
+
+
+def _require_fresh_pool_sheet(policy: FleetPolicy, today: date) -> None:
+    """Refuse an undated, stale or future pool price sheet.
+
+    Args:
+        policy: The parsed policy.
+        today: The date to measure the sheet's age against.
+
+    Raises:
+        ValueError: When a pool rate is priced without a usable date.
+    """
+    if not any(getattr(policy, name) is not None for name in _POOL_RATE_FIELDS):
+        return
+    observed = policy.pool_rate_observed_on
+    if observed is None:
+        raise ValueError(_POOL_UNDATED)
+    age = (today - observed).days
+    if age < 0:
+        raise ValueError(_POOL_FUTURE)
+    if age > MAX_PRICE_AGE_DAYS:
+        raise ValueError(_POOL_STALE)
 
 
 def _table(document: Mapping[str, object], section: str) -> Mapping[str, object]:
@@ -222,6 +310,16 @@ def _optional_count(mapping: Mapping[str, object], key: str) -> int | None:
     value = _count(mapping, key)
     if value < 0:
         raise ValueError(f"{key} must not be negative")
+    return value
+
+
+def _optional_date(mapping: Mapping[str, object], key: str) -> date | None:
+    """Return one optional TOML date; absent or null means undated."""
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise ValueError(f"{key} must be a plain TOML date")
     return value
 
 
@@ -322,6 +420,11 @@ def estimate_monthly_cost(
             unpriced.append(name)
         else:
             components[name] = _gb(size_bytes) * rate
+    pool = _pool_component(telemetry, policy)
+    if pool is None:
+        unpriced.append(_POOL_COMPONENT)
+    else:
+        components[_POOL_COMPONENT] = pool
     total = sum(components.values(), Decimal(0))
     return CostEstimate(
         currency=policy.currency,
@@ -329,6 +432,40 @@ def estimate_monthly_cost(
         components={name: _cents(value) for name, value in components.items()},
         unpriced=tuple(sorted(unpriced)),
         running_basis=basis,
+    )
+
+
+def _pool_component(
+    telemetry: FleetTelemetry,
+    policy: FleetPolicy,
+) -> Decimal | None:
+    """Price the pool's metered vendor line, or report it unpriced.
+
+    ADR-0016 Decision 4 keeps the pool a separate line: it is never folded
+    into the pilot's storage-era monthly figure.  The free allowance is not
+    treated as a budget, so an allowance-covered month still prices at the
+    sheet's rates.  Any missing rate or token count leaves the line unpriced
+    and listed rather than silently zero.
+
+    Args:
+        telemetry: The pass's measurements, carrying the injected token totals.
+        policy: The dated operator policy.
+
+    Returns:
+        The month's pool cost, or ``None`` when an input is missing.
+    """
+    priced = (
+        (telemetry.pool_input_tokens, policy.pool_input_mtoken_rate),
+        (telemetry.pool_output_tokens, policy.pool_output_mtoken_rate),
+    )
+    if any(tokens is None or rate is None for tokens, rate in priced):
+        return None
+    return sum(
+        (
+            Decimal(tokens or 0) / _TOKENS_PER_MTOKEN * (rate or Decimal(0))
+            for tokens, rate in priced
+        ),
+        Decimal(0),
     )
 
 
@@ -342,6 +479,7 @@ class AlertKind(StrEnum):
     CONTINUOUS_RUNNING = "continuous_running"
     INCOMPLETE_CREATE = "incomplete_create"
     MONTHLY_BUDGET_DEPARTURE = "monthly_budget_departure"
+    POOL_CREDENTIAL_ORPHAN = "pool_credential_orphan"
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +500,28 @@ _PER_RESOURCE_ALERTS: Final[dict[DivergenceKind, AlertKind]] = {
 }
 
 
+def _narrowed(kind: AlertKind, divergence: Divergence) -> AlertKind:
+    """Name a surviving pool credential as its own kind (ADR-0016 D1.12).
+
+    A credential left behind by a deletion is operationally unlike an orphaned
+    volume: it is still spendable up to its cap until it is revoked, so it gets
+    its own alert kind rather than hiding inside ``orphan_resource`` (T11).
+
+    Args:
+        kind: The alert kind the divergence's own kind maps to.
+        divergence: The divergence being alerted on.
+
+    Returns:
+        The narrowed kind, or *kind* unchanged.
+    """
+    if (
+        kind is AlertKind.ORPHAN_RESOURCE
+        and divergence.resource_class is ResourceClass.CREDENTIAL
+    ):
+        return AlertKind.POOL_CREDENTIAL_ORPHAN
+    return kind
+
+
 def _alert_for(divergence: Divergence, policy: FleetPolicy) -> Alert | None:
     """Map one divergence to its alert, or None for report-only kinds."""
     if (
@@ -372,7 +532,7 @@ def _alert_for(divergence: Divergence, policy: FleetPolicy) -> Alert | None:
     resource_kind = _PER_RESOURCE_ALERTS.get(divergence.kind)
     if resource_kind is not None:
         subject = divergence.provider_allocation_id or _FLEET_SUBJECT
-        return Alert(resource_kind, subject, None, None, None)
+        return Alert(_narrowed(resource_kind, divergence), subject, None, None, None)
     if divergence.kind is DivergenceKind.STUCK_DELETION:
         kind, subject = AlertKind.STUCK_DELETION, divergence.job_id or _FLEET_SUBJECT
         threshold = policy.stuck_deletion_after
