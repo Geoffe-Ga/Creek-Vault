@@ -201,6 +201,14 @@ CREEK_EVAL_JUDGE_PROVIDER=anthropic CREEK_EVAL_JUDGE_MODEL=<model> \
   ./scripts/test.sh --live -k live_judge
 ```
 
+The routed judge's reply is parsed **strictly**: the prompt asks for "a single
+number between 0 and 1 and nothing else" under a 16-token ceiling, so the reply
+has to *be* a score — optionally behind a `score:` label, optionally followed by
+a full stop — or `JudgeUnavailableError` is raised. A chatty judge therefore
+refuses honestly instead of having a number mined out of its prose. (An earlier
+lenient scan read a perfect `1.0` out of the rubric version `1.0.0`, which the
+prompt used to interpolate; the version now rides only on the recorded score.)
+
 ### Starting cheap
 
 Per the ratification comment on #1849 the owner's quality bar is **explicitly
