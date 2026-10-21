@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, NonNegativeFloat, NonNegativeInt
 
 from creek_mcp.bench.outcome import Outcome
 from creek_mcp.bench.trial import Trial
+from creek_mcp.bench.usage import TokenBasis
 
 P50: Final[float] = 0.50
 """The median."""
@@ -86,6 +87,12 @@ class LatencySummary(BaseModel):
         p50_s: Median latency of ``ok`` trials, ``None`` when there were none.
         p95_s: p95 latency of ``ok`` trials, ``None`` when there were none.
         generation_p95_s: p95 of the model-call share of ``ok`` trials.
+        ttft_p95_s: p95 time to first token over the ``ok`` trials whose
+            backend reported one, ``None`` when none did. A non-streaming
+            backend therefore leaves this unset rather than contributing a
+            zero, which would claim an instant first token, or the whole
+            latency, which would claim a slow one. ADR-0016 R2 budgets it at
+            ≤ 2 s.
         outcome_counts: Trials per outcome, every outcome present.
     """
 
@@ -97,6 +104,7 @@ class LatencySummary(BaseModel):
     p50_s: NonNegativeFloat | None
     p95_s: NonNegativeFloat | None
     generation_p95_s: NonNegativeFloat | None
+    ttft_p95_s: NonNegativeFloat | None
     outcome_counts: dict[Outcome, NonNegativeInt]
 
     @classmethod
@@ -109,6 +117,7 @@ class LatencySummary(BaseModel):
         ok = [trial for trial in trials if trial.outcome is Outcome.OK]
         latencies = [trial.latency_s for trial in ok]
         generations = [t.generation_s for t in ok if t.generation_s is not None]
+        ttfts = [t.ttft_s for t in ok if t.ttft_s is not None]
         counts = dict.fromkeys(Outcome, 0)
         for trial in trials:
             counts[trial.outcome] += 1
@@ -119,6 +128,7 @@ class LatencySummary(BaseModel):
             p50_s=_optional_percentile(latencies, P50),
             p95_s=_optional_percentile(latencies, P95),
             generation_p95_s=_optional_percentile(generations, P95),
+            ttft_p95_s=_optional_percentile(ttfts, P95),
             outcome_counts=counts,
         )
 
@@ -218,3 +228,83 @@ def _overran_budget(trial: Trial) -> bool:
     if trial.output_tokens is None or trial.max_output_tokens is None:
         return False
     return trial.output_tokens > trial.max_output_tokens
+
+
+def _rate(trial: Trial) -> float | None:
+    """Return *trial*'s output tokens per second, or ``None`` if it has none.
+
+    A rate needs both a count and a positive model-call time. A zero-second
+    generation is not an infinite rate, it is an unmeasurable one.
+    """
+    if trial.output_tokens is None or trial.generation_s is None:
+        return None
+    if trial.generation_s <= 0:
+        return None
+    return trial.output_tokens / trial.generation_s
+
+
+def _throughput_basis(rated: Sequence[Trial], citable: Sequence[Trial]) -> TokenBasis:
+    """Return the basis the reported throughput rests on.
+
+    A citable sample makes the figure provider-reported. With none, the basis
+    says *why* there is no figure: a byte upper bound is a bound that was
+    refused, while an absent label is a backend that counted nothing.
+    """
+    if citable:
+        return TokenBasis.PROVIDER_REPORTED
+    bases = {t.token_basis for t in rated if t.token_basis is not None}
+    if TokenBasis.BYTE_UPPER_BOUND in bases:
+        return TokenBasis.BYTE_UPPER_BOUND
+    return TokenBasis.UNREPORTED
+
+
+class ThroughputSummary(BaseModel):
+    """Output tokens per second over one group of trials.
+
+    **Only a provider-reported count may state a rate.** A
+    :attr:`~creek_mcp.bench.usage.TokenBasis.BYTE_UPPER_BOUND` count bounds
+    *bytes*, so dividing it by a measured generation time produces an upper
+    bound on throughput dressed as a measurement — and an upper bound on
+    throughput flatters the backend, which is the direction a capacity figure
+    must never err in. Such samples are counted in ``excluded_count`` and the
+    figures stay ``None``, which :mod:`creek_mcp.provisioning.pool_bundle`'s
+    ``size_pool_caps`` refuses on the same grounds.
+
+    Only ``ok`` trials contribute, for :class:`LatencySummary`'s reason: a
+    trial that failed fast generated nothing.
+
+    Attributes:
+        basis: What the figures rest on, or why there are none.
+        count: Citable samples the figures were taken over.
+        excluded_count: ``ok`` trials that could have stated a rate but whose
+            counts were not citable. Non-zero with a ``None`` figure means the
+            run measured throughput it may not quote.
+        tokens_per_second_p50: Median rate, or ``None``.
+        tokens_per_second_p95: The rate at the p95 rank. **This is the
+            favourable tail**, not the worst case: a high value is the run's
+            fastest generation, so a latency budget is judged on
+            :attr:`LatencySummary.p95_s`, never on this.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    basis: TokenBasis
+    count: NonNegativeInt
+    excluded_count: NonNegativeInt
+    tokens_per_second_p50: NonNegativeFloat | None
+    tokens_per_second_p95: NonNegativeFloat | None
+
+    @classmethod
+    def from_trials(cls, trials: Sequence[Trial]) -> Self:
+        """Summarise the citable throughput of the ``ok`` trials in *trials*."""
+        ok = [t for t in trials if t.outcome is Outcome.OK]
+        rated = [t for t in ok if _rate(t) is not None]
+        citable = [t for t in rated if t.token_basis is TokenBasis.PROVIDER_REPORTED]
+        rates = [rate for t in citable if (rate := _rate(t)) is not None]
+        return cls(
+            basis=_throughput_basis(rated, citable),
+            count=len(citable),
+            excluded_count=len(rated) - len(citable),
+            tokens_per_second_p50=_optional_percentile(rates, P50),
+            tokens_per_second_p95=_optional_percentile(rates, P95),
+        )

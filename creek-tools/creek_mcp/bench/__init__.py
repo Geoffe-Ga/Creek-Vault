@@ -43,11 +43,17 @@ from __future__ import annotations
 
 from typing import Final
 
-HARNESS_VERSION: Final[str] = "1.1.0"
+HARNESS_VERSION: Final[str] = "1.2.0"
 """Version of the harness and its report schema, recorded in every run.
 
 1.1.0 added the measured per-reflection token block (#1893): ``prompt_tokens``,
 ``output_tokens`` and ``max_output_tokens`` on every trial, a token summary per
 sweep and phase, and the run-level ``tokens_per_reflection``. Additive, so
 ``report.schema_version`` is unchanged — a 1.0.0 consumer still parses a 1.1.0
-report, and a reader needing measured counts can require this version."""
+report, and a reader needing measured counts can require this version.
+
+1.2.0 added ADR-0016 R2's named budget table (#1895): ``budgets``, a
+``throughput`` block per sweep and phase, ``latency.ttft_p95_s``, and
+``ttft_s`` / ``token_basis`` on every trial. Additive on the same terms, so
+``report.schema_version`` is again unchanged; a reader needing the latency
+budgets, time-to-first-token or tokens/s must require this version."""

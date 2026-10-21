@@ -252,3 +252,70 @@ def test_probe_records_the_budget_even_when_the_call_fails() -> None:
         llm("prompt")
     assert probe.max_output_tokens == 32
     assert probe.usage is None
+
+
+class _StreamingLLM:
+    """A completion callable that reports when its first token arrived."""
+
+    def __init__(self, ttft_s: float | None) -> None:
+        """Bind the first-token time this callable will report."""
+        self._ttft_s = ttft_s
+
+    def __call__(self, prompt: str) -> str:
+        """Echo *prompt* back."""
+        return prompt
+
+    def time_to_first_token(self) -> float | None:
+        """Return the bound first-token time."""
+        return self._ttft_s
+
+
+def _streaming_factory(ttft_s: float | None) -> LLMFactory:
+    """Return a factory building a :class:`_StreamingLLM` reporting *ttft_s*."""
+
+    def _factory(tier: PrivacyTier, *, max_tokens: int) -> LLMCallable:
+        del tier, max_tokens
+        return _StreamingLLM(ttft_s)
+
+    return _factory
+
+
+def test_probe_captures_a_streaming_backends_first_token_time() -> None:
+    """R2's TTFT is the backend's own figure, read at the seam."""
+    probe = TrialProbe(clock=_Clock())
+    llm = probe_factory(_streaming_factory(0.75), probe)(PrivacyTier.OPEN, max_tokens=8)
+    llm("prompt")
+    assert probe.ttft_s == 0.75
+
+
+def test_probe_leaves_ttft_unset_for_a_non_streaming_backend() -> None:
+    """A callable with no first-token accessor is never interrogated."""
+    probe = TrialProbe(clock=_Clock())
+
+    def _factory(tier: PrivacyTier, *, max_tokens: int) -> LLMCallable:
+        del tier, max_tokens
+
+        def _llm(prompt: str) -> str:
+            return prompt
+
+        return _llm
+
+    probe_factory(_factory, probe)(PrivacyTier.OPEN, max_tokens=8)("x")
+    assert probe.ttft_s is None
+
+
+def test_probe_leaves_ttft_unset_when_the_backend_streamed_nothing() -> None:
+    """A streaming backend that reports no first token states nothing."""
+    probe = TrialProbe(clock=_Clock())
+    llm = probe_factory(_streaming_factory(None), probe)(PrivacyTier.OPEN, max_tokens=8)
+    llm("prompt")
+    assert probe.ttft_s is None
+
+
+def test_probe_keeps_the_first_turns_first_token_time() -> None:
+    """First-report-wins, like the usage report: one trial is one turn."""
+    probe = TrialProbe(clock=_Clock())
+    llm = probe_factory(_streaming_factory(0.25), probe)(PrivacyTier.OPEN, max_tokens=8)
+    llm("one")
+    probe.record_ttft(_StreamingLLM(9.0))
+    assert probe.ttft_s == 0.25
