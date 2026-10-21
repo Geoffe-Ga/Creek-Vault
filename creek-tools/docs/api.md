@@ -392,6 +392,20 @@ byte-identical. The same bump brings `415` into the published status set, with
 the `unsupported_source` code; a client pinned below `0.8` cannot meet it,
 because the only route that emits it is the one it cannot reach.
 
+`0.20.0` (#1938) tells you, before you dial, when a model call **without the
+writer's key** cannot run here. `GET /v1/capabilities` gains
+`keyless_inference`. It is `false` on a managed vault with no shared pool
+pinned: such a vault ships no inference runtime and refuses its operator's
+cloud key, so a reflection, letter or `method=llm` classification that carries
+no `X-Creek-Provider-Key` is refused as `temporarily_unavailable` every time,
+and retrying never clears it. When you read `false`, ask the writer for their
+own key (or don't offer the call) instead of charging for a pass that cannot
+run. `true` means a keyless call may be attempted, not that it will succeed.
+`inference_pool: false` cannot tell you this, because a self-connected vault
+running its own model reports the same. The field is withheld from a caller
+below `0.20`, so every `0.19` response is byte-identical and `0.19` stays in
+the window.
+
 `0.19.0` (#1894, [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md))
 publishes **where each answer came from**, and the shared inference pool's
 admission refusal.
