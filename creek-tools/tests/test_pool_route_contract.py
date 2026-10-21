@@ -242,9 +242,19 @@ def _reflect(
 
 
 def _key_headers(**kwargs: Any) -> dict[str, str]:
-    """Return the two request-key headers for an admitted writer's key."""
+    """Return the two request-key headers for an admitted writer's key.
+
+    The value is a fabricated string shaped like an Anthropic key so the
+    header validator admits it; no such key exists and nothing here dials a
+    vendor. Marked for ``detect-secrets`` inline rather than baselined,
+    following :mod:`tests.test_redact_pattern_overlap_notes`: a baseline entry
+    records a line number, so it goes stale the first time anything above it
+    moves, which is exactly how this line became a blocking finding without
+    its bytes changing.
+    """
     return {
         PROVIDER_HEADER: "anthropic",
+        # pragma: allowlist nextline secret
         PROVIDER_KEY_HEADER: "sk-ant-api03-ROUTEtestKEY1894zzPP-never-logged",
         **kwargs,
     }
