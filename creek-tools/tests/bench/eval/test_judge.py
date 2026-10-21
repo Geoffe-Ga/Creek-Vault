@@ -19,6 +19,7 @@ from creek.config import LLMConfig, LLMRoutingConfig
 from creek.models import PrivacyTier
 from creek_mcp.bench.eval import RUBRIC_VERSION
 from creek_mcp.bench.eval.judge import (
+    JUDGE_PROMPT,
     JUDGE_ROLE,
     HermeticJudge,
     JudgeRequest,
@@ -194,3 +195,67 @@ def test_routed_judge_refuses_an_unparsable_verdict(answer: str) -> None:
     )
     with pytest.raises(JudgeUnavailableError, match="score"):
         judge(_request(SLOP_TEXT))
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Rubric version 1.0.0, dimension voice. score: 0.35",
+        "Per rubric 1.0.0 the score is 0.1",
+        "1.0.0",
+        "The candidate scores 1.0 on voice but 0.2 on grounding.",
+    ],
+)
+def test_routed_judge_refuses_a_chatty_or_version_echoing_verdict(answer: str) -> None:
+    """A prose reply must refuse, never yield a number mined out of its text.
+
+    ``1.0.0`` is the rubric version, and a lenient scan read a perfect ``1.0``
+    out of it — a fabricated pass in the direction that looks like success.
+    """
+    judge = RoutedJudge(
+        _local_router(),
+        provider_factory=lambda _cfg: _StubProvider(text=answer),
+    )
+    with pytest.raises(JudgeUnavailableError, match="score"):
+        judge(_request(SLOP_TEXT))
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("0.35", 0.35),
+        ("0.35.", 0.35),
+        ("score: 0.35", 0.35),
+        ("score = 0.35", 0.35),
+        ("Score: 0.35", 0.35),
+        ("0", 0.0),
+        ("1", 1.0),
+        ("0.0", 0.0),
+        ("1.0", 1.0),
+        (".5", 0.5),
+    ],
+)
+def test_routed_judge_accepts_a_bare_score_reply(answer: str, expected: float) -> None:
+    """The replies the prompt actually asks for all still parse."""
+    judge = RoutedJudge(
+        _local_router(),
+        provider_factory=lambda _cfg: _StubProvider(text=answer),
+    )
+    assert judge(_request(SLOP_TEXT)) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("answer", ["1.5", "1.0001", "-0.2", "", "   ", "\n\t"])
+def test_routed_judge_refuses_an_out_of_range_or_empty_verdict(answer: str) -> None:
+    """Just over the boundary, negative, and blank are all refusals."""
+    judge = RoutedJudge(
+        _local_router(),
+        provider_factory=lambda _cfg: _StubProvider(text=answer),
+    )
+    with pytest.raises(JudgeUnavailableError, match="score"):
+        judge(_request(SLOP_TEXT))
+
+
+def test_the_judge_prompt_cannot_collide_with_a_score() -> None:
+    """The prompt hands the judge no version-shaped string to echo back."""
+    assert "{rubric_version}" not in JUDGE_PROMPT
+    assert RUBRIC_VERSION not in JUDGE_PROMPT

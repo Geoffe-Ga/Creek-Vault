@@ -49,7 +49,7 @@ JUDGE_MAX_TOKENS: Final[int] = 16
 
 JUDGE_PROMPT: Final[str] = (
     "You are scoring one candidate passage against a reference passage for a "
-    "voice-fidelity rubric (version {rubric_version}, dimension {dimension}).\n"
+    "voice-fidelity rubric (dimension {dimension}).\n"
     "You are not told which model wrote the candidate, and you must not guess.\n"
     "Score how closely the candidate matches the reference's VOICE — sentence "
     "rhythm, diction, person, and concreteness — not its subject matter and "
@@ -57,9 +57,25 @@ JUDGE_PROMPT: Final[str] = (
     "Answer with a single number between 0 and 1 and nothing else.\n\n"
     "REFERENCE:\n{reference}\n\nCANDIDATE ({candidate_id}):\n{candidate}\n"
 )
-"""The routed judge's prompt. Only ever filled with synthetic corpus text."""
+"""The routed judge's prompt. Only ever filled with synthetic corpus text.
 
-_SCORE_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+It deliberately does **not** name the rubric version. A version is a semver,
+and a judge that merely restated the one it was handed put ``1.0.0`` in the
+reply, out of which a lenient parse read a perfect ``1.0``. The version belongs
+on the recorded score, not in the judge's input: it tells the judge nothing it
+can act on, and :func:`_parse_score` now refuses such a reply anyway.
+"""
+
+_SCORE_REPLY: Final[re.Pattern[str]] = re.compile(
+    r"(?:score\s*[:=]\s*)?(?P<score>[0-9]+(?:\.[0-9]+)?|\.[0-9]+)\.?",
+    re.IGNORECASE,
+)
+"""The whole of a readable reply: an optional label, one number, a full stop.
+
+Matched with :meth:`re.Pattern.fullmatch` against the stripped reply, so a
+number has to *be* the answer rather than merely appear in it. That is what
+stops a semver — two dots — or a sentence from yielding a score.
+"""
 _FIRST_PERSON: Final[frozenset[str]] = frozenset(
     {"i", "me", "my", "mine", "myself", "i'm", "i'd", "i've", "i'll"}
 )
@@ -68,7 +84,7 @@ _SENTENCE_END: Final[re.Pattern[str]] = re.compile(r"[.!?]+")
 _WORD: Final[re.Pattern[str]] = re.compile(r"[A-Za-z']+")
 
 _UNAVAILABLE: Final[str] = "the routed judge's provider is not available"
-_UNPARSABLE: Final[str] = "the routed judge returned no score in [0, 1]"
+_UNPARSABLE: Final[str] = "the routed judge's reply is not a single score in [0, 1]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,14 +215,31 @@ class HermeticJudge:
 
 
 def _parse_score(text: str) -> float:
-    """Return the first number in *text* that lies in ``[0, 1]``.
+    """Return the score *text* consists of, in ``[0, 1]``.
+
+    The parse is strict because :data:`JUDGE_PROMPT` asks for "a single number
+    between 0 and 1 and nothing else" under a :data:`JUDGE_MAX_TOKENS` ceiling,
+    so anything else is a judge that did not follow the instruction — not a
+    reply to be mined.
+
+    Accepted, after stripping surrounding whitespace: a decimal number in the
+    unit interval (``0``, ``1``, ``0.35``, ``.5``), optionally behind a
+    ``score:`` or ``score =`` label and optionally followed by a single full
+    stop.
+
+    Refused: prose around the number ("the score is 0.1"), several numbers, a
+    dotted version such as ``1.0.0``, a value outside ``[0, 1]``, and an empty
+    or whitespace-only reply.
 
     Raises:
-        JudgeUnavailableError: When the reply contains no such number. A reply
-            the harness cannot read is a refusal, never a guessed zero.
+        JudgeUnavailableError: In every refused case. A reply the harness
+            cannot read is a refusal, never a guessed zero — and never, as a
+            lenient scan once made it, a fabricated ``1.0`` read out of the
+            rubric version.
     """
-    for match in _SCORE_PATTERN.finditer(text):
-        value = float(match.group())
+    match = _SCORE_REPLY.fullmatch(text.strip())
+    if match is not None:
+        value = float(match.group("score"))
         if 0.0 <= value <= 1.0:
             return value
     raise JudgeUnavailableError(_UNPARSABLE)
@@ -267,7 +300,6 @@ class RoutedJudge:
             raise JudgeUnavailableError(_UNAVAILABLE)
         completion = provider.complete(
             JUDGE_PROMPT.format(
-                rubric_version=request.rubric_version,
                 dimension=request.dimension.value,
                 reference=request.reference_text,
                 candidate=request.candidate_text,
