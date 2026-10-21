@@ -74,6 +74,8 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol
 
 from creek._containment import escaping_child
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
+from creek.classify.llm.pool_boundary import pool_prompt_within_cap
+from creek.classify.llm.providers import ProviderRateLimitError
 from creek.vault.reader import CORPUS_SUBDIRS, try_validate_fragment
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
@@ -98,6 +100,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "creek.reflect"
+
+PROMPT_TOO_LONG_REASON: Final[str] = "prompt_too_long"
+"""The refusal reason for an entry that cannot fit under the prompt cap.
+
+ADR-0016 Decision 1 item 4, vault side. Grounding snippets are dropped first;
+an entry that still exceeds the cap is **refused, never truncated**, so a
+reflection never silently reads part of an entry and reports margin notes as
+though it had read the whole thing. The reason is content-free — the name of
+the condition and nothing about the entry — and
+:func:`creek_mcp.httpapi.reflect.reflect_refusal_code` maps it to
+``invalid_request``, because the caller can act on it: send less, or send the
+entry in pieces they chose.
+
+Imported by the HTTP adapter rather than respelled there: a drifted copy would
+silently fall through that mapping to ``internal_error``.
+"""
+
+RATE_LIMITED_REASON: Final[str] = "reflection rate limited"
+"""The refusal reason for a rate limit, as opposed to an outage.
+
+Distinguished from the generic provider-failure refusal because the two want
+different client behaviour and, since contract 0.19, different wire codes: a
+cap means wait, an outage means retry or escalate (ADR-0016 Decision 1
+items 4, 8 and 10).
+
+It covers **two** sources, deliberately, because both are the same fact about
+the same request: the shared pool's own admission refusal, and a 429 from the
+vendor a writer's request key is spending on (ADR-0015). Both arrive as
+:class:`~creek.classify.llm.providers.ProviderRateLimitError`, and a writer
+whose own key is rate limited should be shown a wait for exactly the reason a
+pool-capped one should. The ``retry_after`` such an error may carry is **not**
+forwarded: the published ``Retry-After`` is a constant, because a wait derived
+from a vendor's own response would relay upstream detail this surface never
+relays.
+"""
 
 _DEFAULT_MAX_NOTES = 6
 _ALLOWED_KINDS = {"reframe", "fear", "longing", "value", "pattern", "tension", "gift"}
@@ -521,6 +558,48 @@ def _clean_notes(
         if len(cleaned) >= max_notes:
             break
     return cleaned
+
+
+def _capped_prompt(
+    entry: str,
+    grounding: list[str],
+    *,
+    max_notes: int,
+) -> str | None:
+    """Return a prompt under the pool's token cap, or ``None`` to refuse.
+
+    ADR-0016 Decision 1 item 4, vault side, in its exact order: **grounding
+    snippets are dropped first**, one at a time from the least relevant end,
+    and only an entry that still does not fit is refused. The entry itself is
+    never trimmed, so a reflection either reads the whole entry or reads none
+    of it.
+
+    Dropping from the tail rather than all at once is not politeness: the
+    grounding lines arrive in relevance order, so a single over-long snippet
+    costs the reflection one neighbour instead of all of them.
+
+    The cap is enforced here even on a local route. It is the pool's cap, but
+    a prompt whose size depends on which provider happens to be configured is
+    a prompt whose *answer* does, and a reflection that silently varies with
+    deployment is worse than one bound by one rule everywhere.
+
+    Args:
+        entry: The entry being reflected on.
+        grounding: The grounding snippets, most relevant first.
+        max_notes: The caller's requested note count.
+
+    Returns:
+        The prompt to send, or ``None`` when even the ungrounded prompt
+        exceeds the cap.
+    """
+    snippets = list(grounding)
+    while True:
+        prompt = _build_prompt(entry, snippets, max_notes=max_notes)
+        if pool_prompt_within_cap(prompt):
+            return prompt
+        if not snippets:
+            return None
+        snippets.pop()
 
 
 def _build_prompt(
@@ -1000,14 +1079,36 @@ def reflect_tool(
         corpus=corpus,
     )
 
+    # Before the factory, not after: building it probes the provider, and a
+    # probe is a dial. An over-cap entry must be refused with **zero** dials
+    # (ADR-0016 T20).
+    prompt = _capped_prompt(entry, grounding.lines, max_notes=max_notes)
+    if prompt is None:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=PROMPT_TOO_LONG_REASON,
+        )
     try:
         max_tokens = _reflection_output_token_budget(max_notes)
         llm = llm_factory(tier, max_tokens=max_tokens)
-        response_text = llm(_build_prompt(entry, grounding.lines, max_notes=max_notes))
+        response_text = llm(prompt)
+    except ProviderRateLimitError:
+        # A cap, not an outage. Separated from the refusal below because only
+        # one of the two is cleared by waiting, and contract 0.19 gives them
+        # different wire codes.
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=RATE_LIMITED_REASON,
+        )
     except RuntimeError as exc:
-        # Covers a missing/unavailable provider AND ``IntimateRoutingError``
-        # (a RuntimeError subclass) — the router raises the latter rather than
-        # egressing intimate content when no local backend exists.
+        # Covers a missing/unavailable provider, ``IntimateRoutingError`` and
+        # every ``PoolBoundaryError`` — the router raises the first rather
+        # than egressing intimate content when no local backend exists, and
+        # the pool boundary raises the last when its one destination refuses,
+        # is unreachable, or dies mid-request after accepting the connection
+        # (#1894: that last path used to escape as an unhandled ``OSError``).
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,

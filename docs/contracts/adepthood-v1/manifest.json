@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.18.0",
+  "contract_version": "0.19.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "f1eb3c4d059fc5162c909efa56da6cceec0f3336a510198294698cdc9294c14c",
+      "sha256": "00cd2f2475b138cb6f25fc0bfae174f06857b08ecf6d530190c2277fa25e0f1d",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "7a4c5bfcde9cc932ec58e62791d3223b83ad0528457d850b262ab42fbfb3dd80",
+      "sha256": "f25e78c49c40523236d6213a94c49b38565638650725ead2807dd53b69da8a94",
       "state": "success"
     },
     {
@@ -237,7 +237,7 @@
       "capability": "letters",
       "model": "LetterResponse",
       "path": "examples/letters/success.json",
-      "sha256": "2299b30efa08b967e497f7bc855dbf72672dff7fe6dc555c11669a81c14e2297",
+      "sha256": "4917a2581ce7f9ff4d45f7410b957fc92b5faadac24f033928dd38c9d0ca5470",
       "state": "success"
     },
     {
@@ -307,7 +307,7 @@
       "capability": "reflections",
       "model": "ReflectionResponse",
       "path": "examples/reflections/empty.json",
-      "sha256": "acbc52f5a0d4928138cc2e2a83e8d71676951ca5b639c143ab588e63b397845f",
+      "sha256": "04ca80bbbb2d7662ac2508ed505a852e8d558ea9cfdf238229430a2ee74b7023",
       "state": "empty"
     },
     {
@@ -335,7 +335,7 @@
       "capability": "reflections",
       "model": "ReflectionResponse",
       "path": "examples/reflections/success.json",
-      "sha256": "ecb5b753260dcba1a5612b502e0ef3a6580cb0e9bbd856b9fc777d88396daca9",
+      "sha256": "86d48e5c429bd811e55c9412ee3c0e55a22d18ff9dc903d6e3c8dd2f074b5794",
       "state": "success"
     },
     {
@@ -496,14 +496,14 @@
       "capability": null,
       "model": null,
       "path": "retry-policy.json",
-      "sha256": "8e6d5be69156f8934c5a7ab523e115e0053017107e53ef31a4be83147d0657fb",
+      "sha256": "9351047069af3f87a273fd8bcb677857cc83fcee9f45beb211a09e60c8fa633b",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "dbfff29d448def63c804e1c909dfe79a64a2886aba3129011be75e3bfab4a19a",
+      "sha256": "26a3421bc9bdd4b97f98a90d1ccfedd447bd6b228ae0f155baccde18272b6ad2",
       "state": null
     },
     {
@@ -538,7 +538,7 @@
       "capability": null,
       "model": "ClassificationResponse",
       "path": "schemas/ClassificationResponse.schema.json",
-      "sha256": "d4b79a946574fbf618e8ca66fe08083b9124b5c484e58bcf70b1f1463e9f5862",
+      "sha256": "1de8a93c3d0791278dc1bfbb23443ba398a5274974797c9dd9a232d4dec23d6d",
       "state": null
     },
     {
@@ -587,7 +587,7 @@
       "capability": null,
       "model": "ErrorEnvelope",
       "path": "schemas/ErrorEnvelope.schema.json",
-      "sha256": "6f9d0a3288cdf9f207cd28da3742f90ae686e12da6b21f28f82743895e0a634e",
+      "sha256": "dbe92ea9de79fb0ebb3cda5fa3338f5acb24c14e3d61253e3521e983f4c2c691",
       "state": null
     },
     {
@@ -601,7 +601,7 @@
       "capability": null,
       "model": "JobStatusResponse",
       "path": "schemas/JobStatusResponse.schema.json",
-      "sha256": "c3cceda670e58715bfea8085b32bf813df5cf412bc46258a7048ace6c2e54fd5",
+      "sha256": "9f4fb4353f7100e7880a7cec8ba1b9c4853d25ab701b1887a41f54dc9ba56a43",
       "state": null
     },
     {
@@ -643,7 +643,7 @@
       "capability": null,
       "model": "LetterResponse",
       "path": "schemas/LetterResponse.schema.json",
-      "sha256": "4461b9480c7179da2d8fb2de6f99a3b50b05b1ae13825e18ba777ed1c12fc9dc",
+      "sha256": "a157049675b9e2332da5fb04b2e928fd88c14efb2131ba649d1ab3ae2a147777",
       "state": null
     },
     {
@@ -685,7 +685,7 @@
       "capability": null,
       "model": "ReflectionResponse",
       "path": "schemas/ReflectionResponse.schema.json",
-      "sha256": "048a0db1587133ea96111d9293f0e08afcb15ac8cf29a9164dc063523a09ed9c",
+      "sha256": "f41f939e8fef1054f8b5da10ef031520bae9138387cad16513f4c2ad3f862e5f",
       "state": null
     },
     {

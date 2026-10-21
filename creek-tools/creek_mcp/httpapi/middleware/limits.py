@@ -65,6 +65,7 @@ than inventing new wire vocabulary for the caller to learn.
 
 from __future__ import annotations
 
+from time import monotonic
 from typing import TYPE_CHECKING, Final
 
 from anyio import Semaphore, WouldBlock, fail_after
@@ -411,6 +412,10 @@ class RequestTimeoutMiddleware:
             await pass_through(self.app, scope, receive, send)
             return
         context = context_of(scope)
+        # Recorded before the scope opens, so a handler bounding an
+        # out-of-process call reads the same instant this layer will enforce
+        # rather than a duration it has to guess the start of.
+        context.deadline = monotonic() + self._timeout_seconds
         try:
             with fail_after(self._timeout_seconds):
                 await self.app(scope, receive, send)

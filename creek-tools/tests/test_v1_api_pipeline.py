@@ -917,7 +917,11 @@ def test_an_intimate_fragment_in_an_http_llm_job_never_reaches_cloud(
     providers: list[str] = []
 
     class _RecordingClassifier:
-        def __init__(self, config: Any) -> None:
+        def __init__(self, config: Any, **_kwargs: Any) -> None:
+            # ``**_kwargs`` absorbs the engine's per-tier keywords — since
+            # #1894 it also passes ``declared_tier``, the privacy tier a pool
+            # dial may carry — so this double records the provider without
+            # also pinning the engine's call signature.
             self.config = config
             self._provider = str(config.provider)
 

@@ -55,9 +55,13 @@ such a condition is keyed on the stack's order rather than on anything the
 builder can see. The unconditional form cannot fail that way.
 
 **What the exposure actually is.** Intersect the published status set —
-``{200, 401, 403, 404, 409, 422, 500, 501, 503}`` — with the statuses RFC 9110
-§15.1 enumerates as heuristically cacheable — ``{200, 203, 204, 206, 300, 301,
-404, 405, 410, 414, 501}`` — and the whole of it is ``{200, 404, 501}``. Lead
+``{200, 202, 401, 403, 404, 409, 415, 422, 429, 500, 501, 503}`` — with the
+statuses RFC 9110 §15.1 enumerates as heuristically cacheable —
+``{200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501}`` — and the whole of
+it is ``{200, 404, 501}``. The set has grown three times since that was
+written (``202`` with the job surface at contract 0.14, ``415`` at 0.8,
+``429`` at 0.19) and the intersection has not: none of the three is
+heuristically cacheable. Lead
 with the ``404``: it is reachable today on every unrouted ``/v1`` path, it
 carries no explicit freshness information, and a *conforming* shared cache may
 therefore store it and reuse it on heuristic freshness alone. That is the one
@@ -240,6 +244,27 @@ considered and rejected rather than overlooked:
   directive besides. Sending it is cargo cult here: ``/v1``'s clients are
   contract-versioned JSON consumers, not the HTTP/1.0 browsers the habit was
   formed for, and an extra header nobody reads is one more thing to keep true.
+"""
+
+RETRY_AFTER_HEADER: Final[str] = "Retry-After"
+"""The advisory wait a ``429`` carries (ADR-0016 Decision 1 item 4).
+
+Deliberately **outside** :data:`~creek_mcp.api.models.RETRY_POLICY`. That
+table is keyed on the code alone and says *whether* to retry, which is a
+contract fact the published ``retry-policy.json`` pins; this header says
+*when*, which is a hint. Keeping them apart is what lets the hint change
+without a contract bump.
+"""
+
+RETRY_AFTER_SECONDS: Final[str] = "60"
+"""The one advisory wait, and the same one for every caller.
+
+A constant rather than a computed remainder on purpose. A per-vault number
+derived from that vault's own recent model calls would answer "how much has
+this vault used?" to anyone willing to probe — the usage oracle
+:data:`~creek_mcp.api.models.ERROR_MESSAGES`'s entry for this code is also
+written to avoid. Sixty seconds matches the default per-hour admission window
+closely enough to be useful and tells the caller nothing.
 """
 
 WWW_AUTHENTICATE_HEADER: Final[str] = "WWW-Authenticate"
@@ -438,12 +463,15 @@ def _challenge_for(code: ErrorCode) -> Mapping[str, str]:
         code: The wire error code being rendered.
 
     Returns:
-        The bearer challenge for an unauthenticated refusal, and nothing for
-        every other code — a challenge on a ``422`` would invite a client to
-        re-present credentials that were never the problem.
+        The bearer challenge for an unauthenticated refusal, the advisory
+        wait for an admission refusal, and nothing for every other code — a
+        challenge on a ``422`` would invite a client to re-present credentials
+        that were never the problem.
     """
     if code is ErrorCode.UNAUTHENTICATED:
         return {WWW_AUTHENTICATE_HEADER: BEARER_CHALLENGE}
+    if code is ErrorCode.RATE_LIMITED:
+        return {RETRY_AFTER_HEADER: RETRY_AFTER_SECONDS}
     return {}
 
 

@@ -38,12 +38,16 @@ from creek.classify.llm.local_boundary import (
     ollama_post,
 )
 from creek.classify.llm.pool_boundary import (
+    POOL_REQUEST_ID_HEADER,
     POOL_REQUEST_TIMEOUT,
     PoolBoundaryError,
+    PoolPromptTooLongError,
     admit_pool_url,
     pool_generate,
     pool_list_models,
+    pool_prompt_within_cap,
     pool_response_ok,
+    require_pool_request,
 )
 
 if TYPE_CHECKING:
@@ -1949,6 +1953,10 @@ _POOL_MALFORMED: Final[str] = "the shared inference pool answered unusably"
 _POOL_REFUSED: Final[str] = "the shared inference pool refused the request"
 _POOL_RATE_LIMITED: Final[str] = "the shared inference pool is rate limiting"
 
+_POOL_PROMPT_TOO_LONG: Final[str] = (
+    "the prompt exceeds the shared inference pool's token cap"
+)
+
 _POOL_IDENTITY_TIMEOUT: Final[float] = 2.0
 """Seconds allowed for the identity listing; it precedes every prompt."""
 
@@ -2165,6 +2173,24 @@ def call_pool(
     Exactly one dial, to one destination, with no retry and no fallback to
     another model or another host (ADR-0016 R9, Decision 1 item 10).
 
+    **The request shape is closed** and is exactly Decision 1 item 4's: the
+    pinned identity, the prompt, the **declared tier**, ``deadline_ms`` capped
+    at :data:`~creek.classify.llm.pool_boundary.POOL_MAX_DEADLINE_MS`, and the
+    optional ``max_tokens`` and ``system``. The random request id rides in
+    :data:`~creek.classify.llm.pool_boundary.POOL_REQUEST_ID_HEADER`, a header
+    and not a body field, because it is a correlation key rather than an
+    inference argument. ``stream`` is **not** sent: this boundary reads one
+    whole answer, and an unknown field against a closed shape is a refusal the
+    vault would have earned for nothing.
+
+    Transmitting the tier is what lets the pool refuse ``intimate`` at all. It
+    is defence in depth and never the first line — the
+    :class:`~creek.classify.llm.router.ModelRouter` chokepoint has already
+    refused or redirected an INTIMATE request before any dial, because by the
+    time a pool could refuse, the plaintext would have left the vault. A
+    context that declared no admitted tier is refused here rather than dialled
+    with the field guessed.
+
     Args:
         config: The stage's configuration, read only for the model name.
         prompt: The fully-formatted prompt.
@@ -2179,16 +2205,29 @@ def call_pool(
         PoolIdentityError: When the answer names a different model.
         ProviderRateLimitError: On a 429 from the pool.
         RuntimeError: On any other refusal.
-        PoolBoundaryError: On a transport failure or a cancelled dial.
+        PoolBoundaryError: On a transport failure, a cancelled dial, or a
+            context that declared no admitted tier.
     """
     _admit_configured_destination(config)
+    if not pool_prompt_within_cap(prompt):
+        raise PoolPromptTooLongError(_POOL_PROMPT_TOO_LONG)
+    scope = require_pool_request()
     model = _resolve_configured_model(config.model, DEFAULT_MODELS["pool"])
-    payload: dict[str, object] = {"model": model, "prompt": prompt, "stream": False}
+    payload: dict[str, object] = {
+        "model": model,
+        "prompt": prompt,
+        "tier": scope.require_tier(),
+        "deadline_ms": scope.deadline_ms(timeout),
+    }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     if system:
         payload["system"] = system
-    response = pool_generate(payload, budget=timeout)
+    response = pool_generate(
+        payload,
+        budget=timeout,
+        headers={POOL_REQUEST_ID_HEADER: scope.request_id},
+    )
     if not pool_response_ok(response):
         raise _pool_status_error(response.status)
     return _pool_completion(response.payload, model)

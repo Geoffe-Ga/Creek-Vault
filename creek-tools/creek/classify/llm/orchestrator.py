@@ -26,6 +26,7 @@ from creek.classify.llm.parsing import (
     _split_reasoning_and_yaml,
     validate_response,
 )
+from creek.classify.llm.pool_boundary import declared_pool_request
 from creek.classify.llm.prompts import build_classification_prompt
 from creek.classify.llm.providers import (
     Completion,
@@ -97,6 +98,7 @@ class LLMClassifier:
         *,
         provider: LLMProvider | None = None,
         available: bool | None = None,
+        declared_tier: str | None = None,
     ) -> None:
         """Initialize the LLM classifier.
 
@@ -117,9 +119,17 @@ class LLMClassifier:
                 ``False`` marks the classifier unavailable without building or
                 dialling anything, so every fragment routed to it is returned
                 unchanged.
+            declared_tier: The privacy tier this classifier's fragments may be
+                declared as on the shared inference pool's wire, or ``None``
+                to declare none — which refuses a pool dial rather than
+                guessing (ADR-0016 Decision 1 item 4). The INTIMATE
+                classifier is always built with ``None``: its route is the
+                router's local one, and a tier the pool contract cannot name
+                must not be invented for it.
         """
         self.config = config
         self._available: bool | None = available
+        self._declared_tier = declared_tier
         self._provider_instance: LLMProvider | None = provider
         if provider_is_cloud(config.provider):
             logger.warning(cloud_warning(provider_display_name(config.provider)))
@@ -189,7 +199,8 @@ class LLMClassifier:
         Returns:
             Raw response text from the provider.
         """
-        return self._provider().complete(prompt).text
+        with declared_pool_request(self._declared_tier):
+            return self._provider().complete(prompt).text
 
     def invoke_prompt(self, prompt: str) -> str:
         """Public dispatch helper for callers outside classification.
@@ -231,7 +242,8 @@ class LLMClassifier:
         Returns:
             A :class:`Completion` with the response text and the stop reason.
         """
-        return self._provider().complete(prompt, max_tokens=max_tokens)
+        with declared_pool_request(self._declared_tier):
+            return self._provider().complete(prompt, max_tokens=max_tokens)
 
     def _build_prompt(
         self,

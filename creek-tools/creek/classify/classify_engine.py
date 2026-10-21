@@ -227,6 +227,7 @@ from creek.classify.constants import (
     RULES_METHOD,
 )
 from creek.classify.llm import LLMClassifier
+from creek.classify.llm.pool_boundary import POOL_PERSONAL_TIER
 from creek.classify.llm.router import IntimateRoutingError
 from creek.classify.praxis_pass import apply_praxis
 from creek.classify.privacy import PrivacyClassifier
@@ -603,7 +604,13 @@ def build_tier_classifiers(
     if request_scoped is not None:
         return _request_scoped_tier_classifiers(config, request_scoped)
     router = config.model_router
-    non_intimate = LLMClassifier(config=router.resolve("classification"))
+    # ``personal`` and not ``open``: one classifier serves both admitted
+    # tiers, so the stricter claim is the only one that can never understate
+    # what the pool is being handed (ADR-0016 Decision 1 item 4). The INTIMATE
+    # classifier below declares nothing, so a pool dial from it refuses.
+    non_intimate = LLMClassifier(
+        config=router.resolve("classification"), declared_tier=POOL_PERSONAL_TIER
+    )
     try:
         intimate_cfg = router.resolve("classification", PrivacyTier.INTIMATE)
     except IntimateRoutingError as exc:
@@ -634,7 +641,9 @@ def _request_scoped_tier_classifiers(
         degrade rather than refuse when it cannot serve.
     """
     non_intimate = LLMClassifier(
-        config=request_scoped.config, provider=request_scoped.provider
+        config=request_scoped.config,
+        provider=request_scoped.provider,
+        declared_tier=POOL_PERSONAL_TIER,
     )
     try:
         intimate_cfg = config.model_router.resolve(

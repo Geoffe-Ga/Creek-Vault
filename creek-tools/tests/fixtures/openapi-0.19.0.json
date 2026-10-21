@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.18.0",
+    "version": "0.19.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -433,6 +433,16 @@
           },
           "422": {
             "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "this vault is over its model-call allowance",
             "content": {
               "application/json": {
                 "schema": {
@@ -2450,7 +2460,7 @@
         "type": "string"
       },
       "ErrorCode": {
-        "description": "The ten wire error codes: nine from contract 0.2, one added at 0.8.\n\nThere is deliberately **no** ``care_escalation`` member: an escalation is a\nsuccessful, 200-shaped :class:`CareEscalationResponse`, because a person in\nacute distress must not have their response swallowed by a client's error\npath.\n\nAttributes:\n    UNAUTHENTICATED: No valid consumer credential accompanied the request.\n    INVALID_REQUEST: The body does not satisfy the published schema.\n    INCOMPATIBLE_VERSION: The requested contract minor is not served here.\n    PRIVACY_REFUSED: The single answer for every vault-object non-answer.\n        Above the ceiling, purged, orphaned, schema-invalid and deleted out\n        of band all collapse to this one code with this one message.\n    NOT_FOUND: A **routing** code only — no such endpoint or path on this\n        server. Never emitted for a vault object. Emitting it for a\n        fragment would reintroduce the existence oracle that #846 / #970 /\n        #972 / #1090 collapsed: the difference between \"no such id\" and\n        \"not for you\" is a corpus enumeration primitive.\n    UNSUPPORTED_CAPABILITY: A published capability this server does not\n        implement.\n    UNSUPPORTED_SOURCE: The uploaded file's **extension** names a format\n        Creek must not ingest as one document — a conversation export, an\n        archive, a legacy binary Office file (#1526). A statement about\n        the caller's own filename and nothing else, so it discloses\n        nothing about the vault. Added at contract 0.8 (#1524), and\n        reachable only on ``POST /v1/uploads``.\n    UNAVAILABLE: The vault is absent or unreadable; a human must act.\n    TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.\n    INTERNAL_ERROR: An unexpected server fault.",
+        "description": "The eleven wire error codes: nine from 0.2, one at 0.8, one at 0.19.\n\nThere is deliberately **no** ``care_escalation`` member: an escalation is a\nsuccessful, 200-shaped :class:`CareEscalationResponse`, because a person in\nacute distress must not have their response swallowed by a client's error\npath.\n\nAttributes:\n    UNAUTHENTICATED: No valid consumer credential accompanied the request.\n    INVALID_REQUEST: The body does not satisfy the published schema.\n    INCOMPATIBLE_VERSION: The requested contract minor is not served here.\n    PRIVACY_REFUSED: The single answer for every vault-object non-answer.\n        Above the ceiling, purged, orphaned, schema-invalid and deleted out\n        of band all collapse to this one code with this one message.\n    NOT_FOUND: A **routing** code only — no such endpoint or path on this\n        server. Never emitted for a vault object. Emitting it for a\n        fragment would reintroduce the existence oracle that #846 / #970 /\n        #972 / #1090 collapsed: the difference between \"no such id\" and\n        \"not for you\" is a corpus enumeration primitive.\n    UNSUPPORTED_CAPABILITY: A published capability this server does not\n        implement.\n    UNSUPPORTED_SOURCE: The uploaded file's **extension** names a format\n        Creek must not ingest as one document — a conversation export, an\n        archive, a legacy binary Office file (#1526). A statement about\n        the caller's own filename and nothing else, so it discloses\n        nothing about the vault. Added at contract 0.8 (#1524), and\n        reachable only on ``POST /v1/uploads``.\n    UNAVAILABLE: The vault is absent or unreadable; a human must act.\n    TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.\n    RATE_LIMITED: This vault's own admission cap refused the request —\n        too many model calls in flight, or too many this hour (ADR-0016\n        Decision 1 items 4 and 8). A cap, **not** an outage: the writer\n        should be shown a wait, which is the whole reason it is not\n        ``temporarily_unavailable``. Added at contract 0.19 (#1894) and\n        served only to callers declaring :data:`PROVENANCE_SINCE_MINOR` or\n        later; an older caller receives ``temporarily_unavailable``, which\n        is what it has always received for a shed request and the only\n        spelling its vendored vocabulary has.\n    INTERNAL_ERROR: An unexpected server fault.",
         "enum": [
           "unauthenticated",
           "invalid_request",
@@ -2461,6 +2471,7 @@
           "unsupported_source",
           "unavailable",
           "temporarily_unavailable",
+          "rate_limited",
           "internal_error"
         ],
         "title": "ErrorCode",
@@ -2478,7 +2489,7 @@
       },
       "ClassificationResponse": {
         "additionalProperties": false,
-        "description": "What one classification pass did, in counts alone (#1570).\n\n**Nothing here names a fragment.** No id, no path, no title, no excerpt,\nnot even an error string — the engine's per-fragment errors interpolate\nfile paths, so they are collapsed into :attr:`complete`. That is what makes\nit safe for this route to run over the *whole* vault while serving a caller\ncapped at ``personal``: the pass reads material above the ceiling on the\nhost, and reports nothing whatsoever about it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The classifier that ran, echoed so a client that sent an empty\n        body learns which default it got.\n    total: Creek fragments visited.\n    classified: Fragments whose frontmatter this run rewrote.\n    preserved_manual: Fragments left alone because an operator had stamped\n        them by hand.\n    preserved_llm: Fragments left alone by the resume short-circuit.\n    privacy_tiers_assigned: Fragments whose privacy tier this run derived.\n        **Zero is the expected answer for a network-seeded corpus**, and it\n        is not a failure: ``POST /v1/uploads`` requires an explicit tier\n        (#1497), so an uploaded fragment already carries the caller's\n        declared one and the tier pass does not own it. Only ``retier``\n        re-opens that case.\n    retiered: Subset of the above where an already-recorded tier was\n        replaced by a stricter one. Non-zero only under ``retier``.\n    praxis_marked: Fragments raised to a stronger praxis potential.\n    tags_extracted: Fragments that gained a hashtag ``tags`` entry.\n    complete: Whether every visited fragment was processed without error.\n        ``False`` means some were skipped, and — because the pass is\n        resumable — that the honest next step is to call again rather than\n        to treat the corpus as done. The *reasons* stay in the server log:\n        each one names the file it failed on.",
+        "description": "What one classification pass did, in counts alone (#1570).\n\n**Nothing here names a fragment.** No id, no path, no title, no excerpt,\nnot even an error string — the engine's per-fragment errors interpolate\nfile paths, so they are collapsed into :attr:`complete`. That is what makes\nit safe for this route to run over the *whole* vault while serving a caller\ncapped at ``personal``: the pass reads material above the ceiling on the\nhost, and reports nothing whatsoever about it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The classifier that ran, echoed so a client that sent an empty\n        body learns which default it got.\n    total: Creek fragments visited.\n    classified: Fragments whose frontmatter this run rewrote.\n    preserved_manual: Fragments left alone because an operator had stamped\n        them by hand.\n    preserved_llm: Fragments left alone by the resume short-circuit.\n    privacy_tiers_assigned: Fragments whose privacy tier this run derived.\n        **Zero is the expected answer for a network-seeded corpus**, and it\n        is not a failure: ``POST /v1/uploads`` requires an explicit tier\n        (#1497), so an uploaded fragment already carries the caller's\n        declared one and the tier pass does not own it. Only ``retier``\n        re-opens that case.\n    retiered: Subset of the above where an already-recorded tier was\n        replaced by a stricter one. Non-zero only under ``retier``.\n    praxis_marked: Fragments raised to a stronger praxis potential.\n    tags_extracted: Fragments that gained a hashtag ``tags`` entry.\n    complete: Whether every visited fragment was processed without error.\n        ``False`` means some were skipped, and — because the pass is\n        resumable — that the honest next step is to call again rather than\n        to treat the corpus as done. The *reasons* stay in the server log:\n        each one names the file it failed on.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault, and on\n        a pass that called no model at all, such as ``method=rules``. The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.",
         "properties": {
           "status": {
             "const": "ok",
@@ -2546,6 +2557,20 @@
             "description": "Every visited fragment processed cleanly.",
             "title": "Complete",
             "type": "boolean"
+          },
+          "inference_source": {
+            "anyOf": [
+              {
+                "pattern": "^(?:local|pool:creek|pool:attested:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|request_key:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Route that answered: pool:creek, pool:attested:<vendor>, request_key:<vendor> or local. Since contract 0.19.",
+            "title": "Inference Source"
           }
         },
         "required": [
@@ -2922,7 +2947,7 @@
       },
       "CapabilitiesResponse": {
         "additionalProperties": false,
-        "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n— which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` — the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.\n    request_key_providers: The vendors whose writer-supplied key this vault\n        will spend on OPEN and PERSONAL model calls, sent per request in\n        ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a\n        self-connected vault, which ignores request keys. Since contract\n        0.18, and omitted for a caller declaring an earlier minor.",
+        "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n— which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` — the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.\n    request_key_providers: The vendors whose writer-supplied key this vault\n        will spend on OPEN and PERSONAL model calls, sent per request in\n        ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a\n        self-connected vault, which ignores request keys. Since contract\n        0.18, and omitted for a caller declaring an earlier minor.\n    inference_pool: Whether this vault answers its model calls from the\n        shared confidential inference pool (ADR-0016). ``False`` on a\n        vault that runs its own model. Published so a consumer can detect\n        the route *before* dialling rather than inferring it from the\n        first answer's ``inference_source``. Since contract 0.19, and\n        omitted for a caller declaring an earlier minor.",
         "properties": {
           "status": {
             "$ref": "#/components/schemas/CapabilitiesStatus",
@@ -2982,6 +3007,19 @@
             "default": null,
             "description": "Vendors whose writer-supplied request key this vault will use for open and personal model calls; empty when request keys are ignored. Since contract 0.18.",
             "title": "Request Key Providers"
+          },
+          "inference_pool": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Whether model calls are answered from the shared inference pool. Since contract 0.19.",
+            "title": "Inference Pool"
           }
         },
         "required": [
@@ -3540,7 +3578,7 @@
       },
       "LetterResponse": {
         "additionalProperties": false,
-        "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.",
+        "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault. The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.",
         "properties": {
           "status": {
             "const": "ok",
@@ -3588,6 +3626,20 @@
           "attribution": {
             "$ref": "#/components/schemas/VoiceDraftAttribution",
             "description": "Fixed AI attribution and zero voice weight."
+          },
+          "inference_source": {
+            "anyOf": [
+              {
+                "pattern": "^(?:local|pool:creek|pool:attested:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|request_key:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Route that answered: pool:creek, pool:attested:<vendor>, request_key:<vendor> or local. Since contract 0.19.",
+            "title": "Inference Source"
           }
         },
         "required": [
@@ -3686,7 +3738,7 @@
       },
       "ReflectionResponse": {
         "additionalProperties": false,
-        "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier — the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field — do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.",
+        "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier — the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field — do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault. The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.",
         "properties": {
           "status": {
             "description": "ok or empty; escalate is CareEscalationResponse instead.",
@@ -3765,6 +3817,20 @@
             "default": null,
             "description": "Eddies the entry belongs to; absent when none.",
             "title": "Related Eddies"
+          },
+          "inference_source": {
+            "anyOf": [
+              {
+                "pattern": "^(?:local|pool:creek|pool:attested:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|request_key:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Route that answered: pool:creek, pool:attested:<vendor>, request_key:<vendor> or local. Since contract 0.19.",
+            "title": "Inference Source"
           }
         },
         "required": [

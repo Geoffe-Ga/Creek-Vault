@@ -20,8 +20,42 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.18.0"
+CONTRACT_VERSION: Final[str] = "0.19.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.19.0 (#1894, ADR-0016): **provenance, and the admission refusal the shared
+inference pool needs.** Three additions, all gated on this minor.
+
+``inference_source`` is published on :class:`creek_mcp.api.models.ReflectionResponse`,
+:class:`~creek_mcp.api.models.LetterResponse` and
+:class:`~creek_mcp.api.models.ClassificationResponse` (which a consumer reads
+inside ``JobStatusResponse.result``): the route that answered, one of
+``pool:creek``, ``pool:attested:<vendor>``, ``request_key:<vendor>`` or
+``local``. It is ADR-0016 Decision 1 item 11's "every answer names its route",
+and it is what lets adepthood treat an answer whose route differs from the one
+it disclosed as its existing ``409`` stale-route refusal. The field is
+**absent** rather than guessed on an answer this vocabulary does not label —
+an operator's own cloud key on a self-hosted vault is neither the pool, the
+writer's key, nor local — and absent on a pass that called no model at all,
+such as ``method=rules`` classification. A label the server cannot stand behind
+would be worse than no label, because the consumer's whole use for the field is
+to detect a route it did not expect.
+
+``GET /v1/capabilities`` gains ``inference_pool``: whether this vault answers
+model calls from the shared pool, so a consumer can detect the route before
+dialling rather than inferring it from the first answer.
+
+``rate_limited`` joins the closed error vocabulary — HTTP **429**, disposition
+``retry_with_backoff`` in the published ``retry-policy.json``, with an advisory
+``Retry-After`` header that is deliberately outside that table. It is the pool's
+admission refusal (Decision 1 items 4 and 8): a per-vault cap, not an outage,
+and a writer should be shown a wait. It is served **only** to callers declaring
+0.19 or later; an older minor keeps receiving ``temporarily_unavailable``, which
+is what it has always received for a shed request and what its vendored closed
+vocabulary can name. ``429`` joins the published status set.
+
+``0.18`` stays in the window: every response a ``0.18`` consumer can reach is
+byte-identical, because all three additions are withheld from it.
 
 0.18.0 (#1873, ADR-0015): a writer's request-scoped provider key.
 ``POST /v1/reflections``, ``POST /v1/letters/{external_id}`` and

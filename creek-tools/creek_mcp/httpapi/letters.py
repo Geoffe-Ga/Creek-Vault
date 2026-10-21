@@ -30,6 +30,7 @@ from creek.models import PrivacyTier
 from creek.voice_drafts import VoiceDraftAction
 from creek_mcp.api.models import (
     OK_STATUS,
+    PROVENANCE_SINCE_MINOR,
     CareEscalationResponse,
     CareSignal,
     ErrorCode,
@@ -43,8 +44,10 @@ from creek_mcp.api.models import (
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
+from creek_mcp.httpapi.generation import declared_minor_at_least
 from creek_mcp.httpapi.journal import admissible_external_id
 from creek_mcp.httpapi.vault import configured_vault, request_key_of
+from creek_mcp.provenance import InferenceProvenance
 from creek_mcp.tools.handshake import vault_available
 from creek_mcp.tools.letter import (
     LetterCall,
@@ -96,18 +99,22 @@ a lookup miss is caught as an ``internal_error`` rather than coerced.
 
 
 def _default_factory(
-    vault: Path, request_key: RequestKey | None = None
+    vault: Path,
+    request_key: RequestKey | None = None,
+    provenance: InferenceProvenance | None = None,
 ) -> LetterLLMFactory:
     """Return the production tier-keyed letter factory bound to *vault*.
 
     Imported lazily, as :mod:`creek_mcp.httpapi.reflect` does, so the HTTP
     adapter stays startable without the MCP framework the server module
     imports. *request_key* is the writer's request-scoped key (ADR-0015), or
-    ``None``; the builder decides whether it is used.
+    ``None``; the builder decides whether it is used. *provenance* is the
+    request's recorder, written by the one frame that resolves the stage, so
+    the stored letter can name the route that wrote it (ADR-0016 D1.11).
     """
     from creek_mcp.server import _build_letter_llm_factory
 
-    return _build_letter_llm_factory(vault, request_key)
+    return _build_letter_llm_factory(vault, request_key, provenance)
 
 
 async def _parsed_body(request: Request) -> LetterRequest | None:
@@ -137,6 +144,7 @@ def _write(
     context: RequestContext,
     build_factory: Callable[[], LetterLLMFactory] | None,
     request_key: RequestKey | None,
+    provenance: InferenceProvenance,
 ) -> LetterOutcome | None:
     """Resolve the vault and run the letter tool, both off the event loop.
 
@@ -153,7 +161,8 @@ def _write(
         external_id=external_id,
         ceiling=context.ceiling,
         consumer=context.consumer,
-        build_factory=build_factory or partial(_default_factory, vault, request_key),
+        build_factory=build_factory
+        or partial(_default_factory, vault, request_key, provenance),
         care_guard=acute_distress_guard,
     )
     return write_letter(call, _source(parsed))
@@ -170,8 +179,16 @@ def _escalation(outcome: LetterEscalation, context: RequestContext) -> Response:
     return json_response(payload.model_dump(mode="json"), HTTP_OK)
 
 
-def _letter(outcome: LetterWrite, context: RequestContext) -> Response:
+def _letter(
+    outcome: LetterWrite, context: RequestContext, inference_source: str | None
+) -> Response:
     """Project a stored letter onto the closed response model.
+
+    *inference_source* is the route that wrote the letter, or ``None`` — which
+    covers three distinct cases that are all one absence on the wire: the
+    caller's declared minor predates the field, the route is one this contract
+    does not label, or the id already held a letter and it was returned
+    **without a model call at all**, so there is no route to name.
 
     Returns:
         The ``200``, or ``internal_error`` when the stored record cannot be
@@ -190,19 +207,25 @@ def _letter(outcome: LetterWrite, context: RequestContext) -> Response:
             title=record.title,
             letter=record.content,
             attribution=VoiceDraftAttribution(),
+            inference_source=inference_source,
         )
     except (ValidationError, ValueError, KeyError):
         return error_response(ErrorCode.INTERNAL_ERROR, context)
-    return json_response(payload.model_dump(mode="json"), HTTP_OK)
+    body = payload.model_dump(mode="json")
+    if inference_source is None:
+        body.pop("inference_source")
+    return json_response(body, HTTP_OK)
 
 
-def _render(outcome: LetterOutcome, context: RequestContext) -> Response:
+def _render(
+    outcome: LetterOutcome, context: RequestContext, inference_source: str | None
+) -> Response:
     """Map one tool outcome onto its wire response."""
     if isinstance(outcome, LetterRefusal):
         return error_response(REFUSAL_CODES[outcome], context)
     if isinstance(outcome, LetterEscalation):
         return _escalation(outcome, context)
-    return _letter(outcome, context)
+    return _letter(outcome, context, inference_source)
 
 
 async def handle_letter(request: Request) -> Response:
@@ -225,6 +248,7 @@ async def handle_letter(request: Request) -> Response:
         request_key = request_key_of(request)
     except InvalidRequestKeyError:
         return error_response(ErrorCode.INVALID_REQUEST, context)
+    provenance = InferenceProvenance()
     outcome = await write_off_loop(
         _write,
         request,
@@ -233,7 +257,9 @@ async def handle_letter(request: Request) -> Response:
         context,
         request.app.state.letter_llm_factory,
         request_key,
+        provenance,
     )
     if outcome is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    return _render(outcome, context)
+    serve = declared_minor_at_least(request, PROVENANCE_SINCE_MINOR)
+    return _render(outcome, context, provenance.source if serve else None)

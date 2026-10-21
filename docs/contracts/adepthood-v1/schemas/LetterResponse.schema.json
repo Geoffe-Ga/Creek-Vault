@@ -40,7 +40,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.",
+  "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted \u2014 rather\n        than guessed \u2014 on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault. The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.",
   "properties": {
     "action": {
       "description": "Created, or unchanged when the id already held a letter.",
@@ -64,6 +64,20 @@
       "description": "Stable vault-side fragment identity.",
       "title": "Fragment Id",
       "type": "string"
+    },
+    "inference_source": {
+      "anyOf": [
+        {
+          "pattern": "^(?:local|pool:creek|pool:attested:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|request_key:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Route that answered: pool:creek, pool:attested:<vendor>, request_key:<vendor> or local. Since contract 0.19.",
+      "title": "Inference Source"
     },
     "letter": {
       "description": "The letter text; free model prose.",
