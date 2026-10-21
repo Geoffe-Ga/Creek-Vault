@@ -334,7 +334,7 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
         ("0.2", _OK_STATUS),
         ("0.2.0", _INCOMPATIBLE_STATUS),
         ("0.2.1", _INCOMPATIBLE_STATUS),
-        ("0.20", _INCOMPATIBLE_STATUS),
+        ("0.21", _INCOMPATIBLE_STATUS),
         (" 0.2", _INCOMPATIBLE_STATUS),
         ("v0.2", _INCOMPATIBLE_STATUS),
         ("", _INCOMPATIBLE_STATUS),
@@ -378,6 +378,17 @@ def test_the_version_header_is_matched_strictly(
     refused: the header's published grammar is ``major.minor``, and a server
     that accepted both spellings would let two clients disagree about which one
     is canonical while both appearing to work.
+
+    The ``wrong-minor`` row is the prefix-collision tripwire, and its value has
+    to be chosen rather than picked: it must be a minor this server does **not**
+    serve whose decimal spelling *starts with* one it does, so a gate matching
+    by ``startswith`` rather than by equality goes red. It was ``0.20`` until
+    contract 0.20 shipped (#1903 step 6) and had to move to the next unserved
+    one, because a row asserting that the current minor is refused would have
+    been red for the right reason and read as the wrong one. It has to move
+    again at 0.21 — which is the row doing its job, not maintenance it does not
+    earn: a value that never needs revisiting is one that has stopped naming an
+    unserved minor at all.
 
     Args:
         vault: A seeded vault.
