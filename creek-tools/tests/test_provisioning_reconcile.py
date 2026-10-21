@@ -362,7 +362,12 @@ def test_orphan_resource_is_reported_idempotently_and_never_destroyed(
     assert one.telemetry.machines_without_rootfs_size == 1
     assert one.telemetry.duplicate_allocation_attempts == 1
     assert one.telemetry.orphan_resources == 2
-    assert one.estimate.unpriced == ("egress", "snapshot", "stopped_rootfs")
+    assert one.estimate.unpriced == (
+        "egress",
+        "pool",
+        "snapshot",
+        "stopped_rootfs",
+    )
     assert one.telemetry.unconfirmed_deletions == 0
     assert one.telemetry.snapshot_bytes is None
     assert one.telemetry.allocations_by_state == {"ready": 1}
@@ -834,7 +839,7 @@ def test_telemetry_marks_snapshot_and_egress_unknown_unless_injected(
     assert plain.telemetry.sources["snapshot_bytes"] == "unavailable"
     assert plain.telemetry.sources["egress_bytes"] == "unavailable"
     assert plain.telemetry.sources["running_seconds_injected"] == "unavailable"
-    assert plain.estimate.unpriced == ("egress", "snapshot")
+    assert plain.estimate.unpriced == ("egress", "pool", "snapshot")
     assert json.dumps(plain.to_dict())  # serialisable with nulls
     assert plain.to_dict()["telemetry"]["snapshot_bytes"] is None
     assert enriched.telemetry.snapshot_bytes == 3 * _GIB
@@ -848,7 +853,7 @@ def test_telemetry_marks_snapshot_and_egress_unknown_unless_injected(
     assert enriched.telemetry.sources["activated_allocations"] == "store"
     assert enriched.estimate.running_basis.value == "injected"
     assert enriched.estimate.components["snapshot"] == Decimal("0.15")
-    assert enriched.estimate.unpriced == ("egress",)
+    assert enriched.estimate.unpriced == ("egress", "pool")
     assert set(document) == {
         "observed_at",
         "telemetry",

@@ -174,10 +174,19 @@ def compose_fly(
     )
 
 
-def _load_policy(path: Path, parser: argparse.ArgumentParser) -> PolicyFile:
-    """Load the operator policy or exit 2 naming the offending key only."""
+def _load_policy(
+    path: Path,
+    parser: argparse.ArgumentParser,
+    *,
+    now: datetime,
+) -> PolicyFile:
+    """Load the operator policy or exit 2 naming the offending key only.
+
+    *now* dates the pool price sheet, so an undated or stale pool rate is
+    refused here rather than silently pricing the fleet report (T16).
+    """
     try:
-        policy_file = load_policy_file(path)
+        policy_file = load_policy_file(path, today=now.astimezone(UTC).date())
     except ValueError as exc:
         parser.error(f"--policy-file is invalid: {exc}")
     return policy_file
@@ -243,7 +252,7 @@ def main(
         finally:
             bundle.close()
     now = clock()
-    policy_file = _load_policy(args.policy_file, parser)
+    policy_file = _load_policy(args.policy_file, parser, now=now)
     app_names = _load_inventory_names(args.inventory_file, parser)
     month = _record_month_target(args, parser, now)
     bundle = compose(args, parser)
