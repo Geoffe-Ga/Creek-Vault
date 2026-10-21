@@ -1,12 +1,17 @@
 # ADR-0016: A shared, confidential, always-warm inference pool for managed vaults
 
-- **Status**: Proposed (drafted 2026-10-17 by Fable, claude-fable-5-1, for
-  #1874; awaiting the owner's answers to Q1 and Q2 in Decision 0). The
-  answers are recorded as a comment on #1849 and folded in by a follow-up
-  docs PR that sets `Accepted (owner decision YYYY-MM-DD)`, as ADR-0015 did.
-  Under a Yes to Q1, Accepted takes effect only once the adepthood ADR 0009
-  amendment merges; until then O3 is the fallback design. Nothing here is a
-  public claim; every claim waits for adepthood B24
+- **Status**: Accepted (owner decision 2026-10-20), drafted 2026-10-17 by
+  Fable, claude-fable-5-1, for #1874. The owner's answers to Decision 0 are
+  recorded as a comment on #1849: Q1 is **Yes**, selecting **O5**, the
+  vendor-attested confidential pool of Decision 3, and accepting the R7
+  deviation explicitly (ciphertext-only egress inside an attestation-bound
+  channel in place of no egress); Q2 is **option (i)**, so the pool serves
+  the embedding model too, under O5 only with an attested embedding model
+  inside the measurement set, falling back to (iii) otherwise. Accepted
+  takes effect only once the adepthood ADR 0009 amendment merges; that
+  amendment has not merged, so until then O3 is the fallback design and this
+  record is not yet in force. Nothing here is a public claim; every claim
+  waits for adepthood B24
   ([adepthood#3076](https://github.com/Geoffe-Ga/adepthood/issues/3076)).
 - **Date**: 2026-10-17
 - **Driving issue**: #1874; parent #1849 (B05); measurement #1850 (B09); model
