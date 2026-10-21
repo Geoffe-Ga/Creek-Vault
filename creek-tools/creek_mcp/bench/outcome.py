@@ -39,6 +39,8 @@ class Outcome(StrEnum):
     DISK_FULL = "disk_full"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     CONTEXT_OVERFLOW = "context_overflow"
+    RATE_LIMITED = "rate_limited"
+    INSUFFICIENT_QUOTA = "insufficient_quota"
     ERROR = "error"
 
 
@@ -56,6 +58,25 @@ class ContextOverflowError(RuntimeError):
 
     Ollama answers a truncated prompt instead of failing; a trial that timed a
     shorter prompt than it reports must not count as ``ok``.
+    """
+
+
+class PoolRateLimitedError(RuntimeError):
+    """The inference pool refused this trial for admission pressure (429).
+
+    A pool answers ``rate_limited`` when it is serving as much as it will
+    serve right now (ADR-0016 Decision 1 item 4). It is transient, and it is
+    emphatically not a success: a refusal returns in milliseconds and would
+    drag p95 *down* if it were counted as one.
+    """
+
+
+class PoolQuotaExhaustedError(RuntimeError):
+    """The pool's vendor key has spent its cap (429, non-transient).
+
+    Distinct from :class:`PoolRateLimitedError` because retrying cannot fix
+    it: under ADR-0016 Decision 3 item 4 an exhausted per-activation cap
+    answers ``insufficient_quota`` until the cap is raised or reset.
     """
 
 
@@ -112,6 +133,10 @@ def classify_outcome(exc: BaseException | None) -> Outcome:
         return Outcome.PROVIDER_UNAVAILABLE
     if isinstance(exc, ContextOverflowError):
         return Outcome.CONTEXT_OVERFLOW
+    if isinstance(exc, PoolRateLimitedError):
+        return Outcome.RATE_LIMITED
+    if isinstance(exc, PoolQuotaExhaustedError):
+        return Outcome.INSUFFICIENT_QUOTA
     return Outcome.ERROR
 
 

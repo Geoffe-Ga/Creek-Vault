@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # scripts/bench.sh - Run the model-capacity harness (python -m creek_mcp.bench).
-# Usage: ./scripts/bench.sh reflect [--mode fake|live] --out REPORT.json [...]
+# Usage: ./scripts/bench.sh reflect [--mode fake|live] [--provider ollama|pool]
+#            --out REPORT.json [...]
 #        ./scripts/bench.sh cost --price-file PRICES.json --out COST.json [...]
 #        ./scripts/bench.sh --help
 #
-# Hermetic by default (--mode fake). A live run drives an operator-supplied
-# Ollama and must be reproducible from its report, so this wrapper injects the
-# checkout's commit as --git-sha when a live `reflect` run did not pass one.
+# Hermetic by default (--mode fake), for both providers: --provider pool runs
+# the shared confidential inference pool's client against an in-process fake
+# pool, so no vendor is contacted and nothing is billed (ADR-0016 Decision 4,
+# issue #1892). A live run drives an operator-supplied Ollama or pool and must
+# be reproducible from its report, so this wrapper injects the checkout's
+# commit as --git-sha when a live `reflect` run did not pass one.
 # Exit codes are the harness's own: 0 ok, 2 refused, 1 failed (issue #1850).
 # See docs/bench.md.
 

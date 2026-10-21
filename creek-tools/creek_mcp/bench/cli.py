@@ -36,10 +36,15 @@ from creek_mcp.bench.cost import (
     cost_bands,
     load_price_sheet,
 )
-from creek_mcp.bench.fake import fake_factory
-from creek_mcp.bench.local_only import LocalOnlyFactory, require_local_target
+from creek_mcp.bench.fake import FakePool, fake_factory
+from creek_mcp.bench.local_only import (
+    LocalOnlyFactory,
+    refuse_cloud_tag,
+    require_local_target,
+)
 from creek_mcp.bench.metadata import RunMetadata
 from creek_mcp.bench.ollama_client import BenchOllamaClient
+from creek_mcp.bench.pool_client import BenchPoolClient
 from creek_mcp.bench.report import write_report
 from creek_mcp.bench.runner import Backend, BenchPlan, Workload, run_bench
 
@@ -51,16 +56,25 @@ EXIT_FAILED: Final[int] = 1
 EXIT_REFUSED: Final[int] = 2
 
 _DEFAULT_OLLAMA_URL: Final[str] = "http://127.0.0.1:11434"
+_DEFAULT_POOL_URL: Final[str] = "http://127.0.0.1:8080"
 _DEFAULT_NUM_CTX: Final[int] = 4096
 _DEFAULT_NUM_PREDICT: Final[int] = 128
 _DEFAULT_DUTY_LOW: Final[str] = "0.05"
 _DEFAULT_DUTY_HIGH: Final[str] = "1"
 _FAKE_MODEL_TAG: Final[str] = "fake"
+_FAKE_POOL_VENDOR: Final[str] = "fake"
+_POOL_URL_FLAG: Final[str] = "--pool-url"
 _CORPUS_DIR: Final[str] = "corpus"
 _LIVE_REQUIRES: Final[tuple[tuple[str, str], ...]] = (
     ("model", "--model"),
     ("digest", "--digest"),
     ("git_sha", "--git-sha"),
+)
+_POOL_REQUIRES: Final[tuple[tuple[str, str], ...]] = (
+    ("pool_identity", "--pool-identity"),
+)
+_POOL_LIVE_REQUIRES: Final[tuple[tuple[str, str], ...]] = (
+    ("pool_vendor", "--pool-vendor"),
 )
 _ALLOWANCE_FLAGS: Final[tuple[str, ...]] = (
     "--allowance",
@@ -113,12 +127,27 @@ def _add_reflect(
     """Register the ``reflect`` subcommand."""
     parser = subparsers.add_parser("reflect", help="run the capacity sweeps")
     parser.add_argument("--mode", choices=("fake", "live"), default="fake")
+    parser.add_argument(
+        "--provider",
+        choices=("ollama", "pool"),
+        default="ollama",
+        help="which runtime to measure; 'pool' drives the shared inference pool",
+    )
     parser.add_argument("--grounding", choices=("none", "default"), default=None)
     parser.add_argument("--ollama-url", default=_DEFAULT_OLLAMA_URL)
+    parser.add_argument("--pool-url", default=_DEFAULT_POOL_URL)
+    parser.add_argument(
+        "--pool-identity",
+        default=None,
+        help="the identity every pool request names and every answer must echo",
+    )
+    parser.add_argument(
+        "--pool-vendor", default=None, help="short label for whose pool was measured"
+    )
     parser.add_argument(
         "--allow-remote-host",
         action="store_true",
-        help="measure an --ollama-url that is not loopback or private (recorded)",
+        help="measure an endpoint that is not loopback or private (recorded)",
     )
     parser.add_argument("--model", default=None)
     parser.add_argument("--digest", default=None)
@@ -167,29 +196,79 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _metadata(args: argparse.Namespace) -> RunMetadata:
-    """Build run metadata, refusing a live run missing a pinning flag."""
-    live = args.mode == "live"
-    if live:
-        for attribute, flag in _LIVE_REQUIRES:
-            if getattr(args, attribute) is None:
-                msg = f"{flag} is required for --mode live"
-                raise _RefusalError(msg)
-    grounding = args.grounding or ("default" if live else "none")
-    scope = (
-        require_local_target(
-            args.ollama_url, args.model, allow_remote=args.allow_remote_host
+def _require_flags(
+    args: argparse.Namespace, required: tuple[tuple[str, str], ...], reason: str
+) -> None:
+    """Refuse when any flag *reason* makes mandatory was not supplied.
+
+    Raises:
+        _RefusalError: Naming the first absent flag, never its value.
+    """
+    for attribute, flag in required:
+        if getattr(args, attribute) is None:
+            msg = f"{flag} is required for {reason}"
+            raise _RefusalError(msg)
+
+
+def _provider(args: argparse.Namespace) -> str:
+    """Return which provider actually serves the trials.
+
+    ``--provider`` names the runtime to measure; the hermetic mode substitutes
+    the local fake for Ollama, but *not* for the pool, whose refusal and
+    identity paths are exactly what the fake pool exists to exercise.
+    """
+    if args.provider == "pool":
+        return "pool"
+    return "ollama" if args.mode == "live" else "fake"
+
+
+def _model_tag(args: argparse.Namespace) -> str:
+    """Return the model tag the run drove, defaulting to the fake's."""
+    return args.model or _FAKE_MODEL_TAG
+
+
+def _endpoint_scope(args: argparse.Namespace, provider: str) -> str:
+    """Classify where a live run's requests go; a fake run sends none.
+
+    A pool endpoint is deliberately remote (ADR-0016 Decision 6), so the same
+    check runs against ``--pool-url`` and the operator opts in with
+    ``--allow-remote-host``; the report then records ``remote``.
+    """
+    if args.mode != "live":
+        return "fake"
+    if provider == "pool":
+        return require_local_target(
+            args.pool_url,
+            _model_tag(args),
+            allow_remote=args.allow_remote_host,
+            flag=_POOL_URL_FLAG,
         )
-        if live
-        else "fake"
+    return require_local_target(
+        args.ollama_url, args.model, allow_remote=args.allow_remote_host
     )
+
+
+def _metadata(args: argparse.Namespace) -> RunMetadata:
+    """Build run metadata, refusing a run missing a pinning flag."""
+    live = args.mode == "live"
+    provider = _provider(args)
+    if live:
+        _require_flags(args, _LIVE_REQUIRES, "--mode live")
+    if provider == "pool":
+        _require_flags(args, _POOL_REQUIRES, "--provider pool")
+        if live:
+            _require_flags(args, _POOL_LIVE_REQUIRES, "--provider pool --mode live")
+        refuse_cloud_tag(_model_tag(args))
+    pooled = provider == "pool"
     return RunMetadata.model_validate(
         {
             "mode": args.mode,
-            "provider": "ollama" if live else "fake",
-            "endpoint_scope": scope,
-            "grounding": grounding,
-            "model_tag": args.model if live else _FAKE_MODEL_TAG,
+            "provider": provider,
+            "endpoint_scope": _endpoint_scope(args, provider),
+            "grounding": args.grounding or ("default" if live else "none"),
+            "model_tag": _model_tag(args) if live or pooled else _FAKE_MODEL_TAG,
+            "pool_vendor": (args.pool_vendor or _FAKE_POOL_VENDOR) if pooled else None,
+            "pool_identity": args.pool_identity if pooled else None,
             "digest": args.digest,
             "num_ctx": args.num_ctx,
             "num_predict": args.num_predict,
@@ -199,8 +278,48 @@ def _metadata(args: argparse.Namespace) -> RunMetadata:
     )
 
 
+def _pool_backend(args: argparse.Namespace) -> Backend:
+    """Build the pool backend; hermetic unless the mode is live.
+
+    In the hermetic mode the client dials an in-process :class:`FakePool`, so
+    every sweep and every refusal path runs with no vendor contacted and
+    nothing billed (ADR-0016 Decision 4). The live path is the same client
+    with no transport injected.
+
+    :func:`_run_reflect` builds the metadata first, so ``--pool-identity`` is
+    already known to be present by the time this runs; that ordering is what
+    makes the pin non-optional, so do not reorder it.
+    """
+    fake = (
+        None
+        if args.mode == "live"
+        else FakePool(
+            identity=args.pool_identity,
+            model_tag=_model_tag(args),
+            measurement_digest=args.digest,
+        )
+    )
+    client = BenchPoolClient(
+        args.pool_url,
+        _model_tag(args),
+        identity=args.pool_identity,
+        num_ctx=args.num_ctx,
+        num_predict=args.num_predict,
+        measurement_digest=args.digest,
+        transport=None if fake is None else fake.transport(),
+    )
+    return Backend(
+        factory=LocalOnlyFactory(client.factory(), provider_name="pool"),
+        evict=client.evict,
+        resident_bytes=client.resident_bytes,
+        pin=client.verify_pinned,
+    )
+
+
 def _backend(args: argparse.Namespace) -> Backend:
-    """Build the fake or live backend; performs no I/O."""
+    """Build the fake, Ollama or pool backend; performs no I/O."""
+    if _provider(args) == "pool":
+        return _pool_backend(args)
     if args.mode == "fake":
         return Backend(
             factory=LocalOnlyFactory(fake_factory, provider_name="fake"),
@@ -243,8 +362,9 @@ def _run_reflect(args: argparse.Namespace) -> str:
     if store is not None and not store.is_dir():
         msg = "--model-store-path must be an existing directory"
         raise _RefusalError(msg)
+    metadata = _metadata(args)
     plan = BenchPlan(
-        metadata=_metadata(args), workload=_workload(args), backend=_backend(args)
+        metadata=metadata, workload=_workload(args), backend=_backend(args)
     )
     with tempfile.TemporaryDirectory(prefix="creek-bench-") as scratch:
         report = run_bench(

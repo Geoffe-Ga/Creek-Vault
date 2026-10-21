@@ -16,6 +16,7 @@ from creek_mcp.bench.local_only import (
     CloudProviderRefusedError,
     LocalOnlyFactory,
     endpoint_scope,
+    refuse_cloud_tag,
     require_local_target,
 )
 
@@ -178,3 +179,29 @@ def test_url_without_a_host_refused() -> None:
     """A URL naming no host cannot be judged local."""
     with pytest.raises(CloudProviderRefusedError, match="host"):
         require_local_target("not a url", "mistral:7b", allow_remote=False)
+
+
+def test_refusal_names_the_flag_it_was_given() -> None:
+    """Pool mode is refused by its own flag name, not Ollama's (#1892)."""
+    with pytest.raises(CloudProviderRefusedError, match="--pool-url") as excinfo:
+        require_local_target(
+            "http://pool.example",
+            "gpt-oss-120b",
+            allow_remote=False,
+            resolve=lambda host: ["93.184.216.34"],
+            flag="--pool-url",
+        )
+    assert "--allow-remote-host" in str(excinfo.value)
+
+
+def test_no_host_refusal_names_the_flag_too() -> None:
+    """A hostless URL is refused by the flag that supplied it."""
+    with pytest.raises(CloudProviderRefusedError, match="--pool-url"):
+        endpoint_scope("not-a-url", flag="--pool-url")
+
+
+def test_cloud_tag_is_refused_on_its_own() -> None:
+    """The cloud-offload tag rule is reusable without resolving a URL."""
+    with pytest.raises(CloudProviderRefusedError, match="cloud"):
+        refuse_cloud_tag("gpt-oss:120b-cloud")
+    assert refuse_cloud_tag("gpt-oss-120b") is None

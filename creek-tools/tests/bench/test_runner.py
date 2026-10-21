@@ -589,3 +589,34 @@ def test_unanchored_quote_really_yields_empty(tmp_path: Path) -> None:
         retrieve=lambda query, vault, override: [],
     )
     assert result["status"] == "empty"
+
+
+@pytest.mark.parametrize(
+    ("provider", "scope", "describes"),
+    [
+        ("ollama", "loopback", True),
+        ("ollama", "remote", False),
+        ("pool", "loopback", False),
+        ("pool", "remote", False),
+    ],
+)
+def test_host_facts_never_claim_to_describe_a_pool(
+    provider: str, scope: str, describes: bool
+) -> None:
+    """A pool's weights are the vendor's, loopback sidecar or not (#1892).
+
+    ADR-0016 Decision 3 item 1 allows a vendor's attesting proxy to run as a
+    loopback sidecar in the vault image, so a loopback pool endpoint still
+    fronts someone else's hardware.
+    """
+    metadata = run_metadata(
+        mode="live",
+        provider=provider,
+        endpoint_scope=scope,
+        digest="sha256:" + "a" * 64,
+        git_sha="b" * 40,
+        grounding="default",
+        pool_vendor="tinfoil" if provider == "pool" else None,
+        pool_identity="tinfoil/gpt-oss-120b@v3" if provider == "pool" else None,
+    )
+    assert runner_module._describes_model_host(metadata) is describes
