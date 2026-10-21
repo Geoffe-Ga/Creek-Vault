@@ -43,12 +43,22 @@ into a single pass. Two properties keep the table honest:
   production actually enforces. A green 25 s row cannot be read as
   "production is fine".
 
-**What the table does not say.** Every figure in it describes the backend the
-run actually drove. A fake or loopback run measures the harness's own floor on
-the harness's own host — no Fly Machine wake, no pool dial, no attestation —
-so :attr:`BudgetTable.measures_production_path` is false and no row may be
-quoted as a production guarantee. Only a run against a real pool endpoint
-earns that, and ADR-0016 Decision 4 authorizes no spend for one yet (#1899).
+**No run this harness can execute today is a production run.** Every figure in
+the table describes the backend the run actually drove, and none of the
+backends it can drive is the production path. A fake or loopback run measures
+the harness's own floor on the harness's own host. A run against a private or
+remote Ollama measures somebody's dev box, which is why an endpoint scope
+cannot stand in for this: ``bench --mode live`` against a LAN address reaches a
+model off this host and still dials no pool, wakes no Fly Machine and includes
+no attestation round trip. The live pool run that would is #1899, and ADR-0016
+Decision 4 authorizes no spend for it.
+
+So **no row here may be quoted as a production guarantee, whatever the endpoint
+scope was.** :attr:`BudgetTable.model_off_harness_host` records only the narrow
+fact its name states — whether the measured model ran somewhere other than the
+host whose capacity the report describes — and licenses nothing beyond it. It
+is the exact complement of ``host.describes_model_host``, taken from that field
+rather than re-derived, so the two can never disagree.
 """
 
 from __future__ import annotations
@@ -61,6 +71,7 @@ from pydantic import BaseModel, ConfigDict, NonNegativeFloat, PositiveFloat, Pos
 from creek.classify.llm import providers
 from creek_mcp.bench.stats import LatencySummary
 from creek_mcp.bench.trial import Phase, Sweep, Trial
+from creek_mcp.bench.usage import TokenBasis
 from creek_mcp.httpapi.middleware import limits
 
 if TYPE_CHECKING:
@@ -148,23 +159,33 @@ until #1903 lands adepthood's widening**, which is why
 :data:`ADEPTHOOD_PHASE_BUDGETS_WIDENED` exists.
 """
 
-_ADEPTHOOD_VAULT_ATTEMPTS: Final[int] = 3
-"""Attempts adepthood makes at one vault call, each on the per-try timeout."""
+_ADEPTHOOD_VAULT_DEADLINE_PHASES: Final[int] = 3
+"""Timeout phases adepthood's total vault deadline is composed of.
+
+``_VAULT_DEADLINE_PHASE_BUDGETS = 3`` in ``creek_vault_client.py``: pool
+acquisition, connect and read, each allowed the per-phase window above.
+
+It is a **phase** count, not a retry count. R2 states no retries, and reading
+this 3 as attempts would assert that adepthood tries a reflection three times,
+which it does not do — a false fact about another repository's code, in the one
+:data:`BudgetSource.DOCUMENTED_CONSTANT` whose whole value is recording that
+code faithfully.
+"""
 
 ADEPTHOOD_TOTAL_DEADLINE_SECONDS: Final[float] = (
-    ADEPTHOOD_FIRST_BYTE_WINDOW_SECONDS * _ADEPTHOOD_VAULT_ATTEMPTS
+    ADEPTHOOD_FIRST_BYTE_WINDOW_SECONDS * _ADEPTHOOD_VAULT_DEADLINE_PHASES
 )
 """adepthood's total deadline for one vault call.
 
 ``_VAULT_TOTAL_DEADLINE_SECONDS = 10.0 x 3`` in ``creek_vault_client.py``,
 inside the ``run_resonance`` HTTP request. Composed here the way its source
-composes it — per-try timeout times attempts — rather than written as the
-product, so a change to the documented per-try window moves this with it. It
+composes it — per-phase window times phase count — rather than written as the
+product, so a change to the documented per-phase window moves this with it. It
 is also why this is not a restatement of ``DEFAULT_TIMEOUT_SECONDS``, which
 happens to hold the same number for an unrelated reason.
 
-R2 requires Machine wake to fit beside the vault's own budget inside this; the
-wake-bearing cold and resumed trials are what measure it.
+R2 requires Machine wake to fit *beside* the vault's own budget inside this,
+which is what :data:`R2_MACHINE_WAKE_ALLOWANCE_SECONDS` derives.
 """
 
 ADEPTHOOD_PHASE_BUDGETS_WIDENED: Final[bool] = False
@@ -187,6 +208,25 @@ R2_VAULT_P95_SECONDS: Final[float] = 25.0
 **not in force** until :data:`ADEPTHOOD_PHASE_BUDGETS_WIDENED` is true.
 """
 
+R2_MACHINE_WAKE_ALLOWANCE_SECONDS: Final[float] = (
+    ADEPTHOOD_TOTAL_DEADLINE_SECONDS - R2_VAULT_P95_SECONDS
+)
+"""What a wake-bearing reflection may take and still fit *beside* the vault.
+
+R2: Machine wake "must fit beside that 25 s inside adepthood's 30 s". *Beside*,
+not *inside* — so the allowance is the 30 s total deadline minus the 25 s the
+reflection itself may spend, derived from both rather than written as 5 s so a
+change to either moves it.
+
+Judging the wake row against the full 30 s instead would let a 14 s
+wake-bearing trial read "Machine wake fits inside adepthood's client deadline",
+which is false the moment the reflection it precedes spends its own budget. The
+measured value is the wake-bearing trial's *total* latency rather than an
+isolated wake — the harness cannot separate them — so this is a conservative
+proxy, and deliberately so: it cannot call a wake green that leaves the
+reflection no room.
+"""
+
 R2_POOL_GENERATE_P95_SECONDS: Final[float] = 10.0
 """R2: pool generate p95, for a 2,500-token prompt and 128 output tokens."""
 
@@ -200,14 +240,48 @@ A level the concurrency sweep must request for that row to be measurable;
 :attr:`BudgetTable.pool_level_measured` says whether it did.
 """
 
+R2_POOL_PROMPT_TOKENS: Final[int] = 2500
+"""R2: the prompt size the pool generate budget is stated at.
+
+R2 budgets pool generate p95 "for a 2,500-token prompt and 128 output tokens at
+concurrency 4" — two conditions, not one. The concurrency is something the
+sweep requests, so :attr:`BudgetTable.pool_level_measured` can report it. The
+prompt size is a property of the workload, and ``Workload.query_words``
+defaults to 64 words, which is an order of magnitude under R2's prompt. A row
+measured on that prompt is not the row R2 states, so the prompt size is
+disclosed the same way the level is, by
+:attr:`BudgetTable.pool_prompt_size_measured`.
+"""
+
+R2_POOL_PROMPT_TOKEN_TOLERANCE: Final[float] = 0.1
+"""The fraction a measured prompt may differ from R2's size and still count.
+
+R2 states a round 2,500 and no workload hits it exactly: entry text is whole
+words and a tokenizer is not a word counter. A +/-10% band keeps the row
+measurable for a workload genuinely aimed at R2's prompt while refusing one
+that is nowhere near it.
+"""
+
 _WAKE_PHASES: Final[frozenset[Phase]] = frozenset({Phase.COLD, Phase.RESUME})
 """Residency phases whose latency contains a Machine wake."""
 
-_PRODUCTION_SCOPES: Final[frozenset[str]] = frozenset({"private", "remote"})
-"""Endpoint scopes where the measured model is not on the harness's own host.
+_VAULT_SWEEPS: Final[frozenset[Sweep]] = frozenset({Sweep.COLD_WARM, Sweep.IDLE})
+"""Sweeps whose trials time the single reflection R2's vault budgets mean.
 
-A ``fake`` or ``loopback`` run measures this process and this machine. Neither
-dials a pool, so neither can time one.
+R2 budgets *one* reflection, cold or warm. Only these two sweeps issue one at
+a time: ``cold_warm`` reflects sequentially and ``idle`` evicts, waits and
+resumes once per cycle, so each trial's wall clock is that reflection's own.
+
+Both stress sweeps are excluded, for the same reason and symmetrically. The
+``context`` sweep walks input size up towards ``num_ctx`` to find where the
+window breaks, so it times entries production never sends. The
+``concurrency`` sweep runs ``level`` reflections simultaneously and every
+``latency_s`` is wall clock, so each one carries the queueing delay of the
+others — a figure that answers "how does the server behave under load", not
+"how long does a reflection take". Folding either into a row named
+``vault_reflection_p95`` would publish a stress result as the production
+figure. Both are still judged, in their own ``per_sweep`` verdicts and against
+the deadline this process enforces.
 """
 
 
@@ -222,9 +296,15 @@ class BudgetName(StrEnum):
         VAULT_REFLECTION_P95: R2's 25 s vault budget, reachable only once
             adepthood widens its phase budgets.
         MACHINE_WAKE_WITHIN_CLIENT_DEADLINE: R2's requirement that a
-            wake-bearing reflection fit inside adepthood's total deadline.
-        POOL_GENERATE_P95: R2's 10 s pool generate budget at concurrency 4.
-        POOL_TTFT_P95: R2's 2 s time-to-first-token budget.
+            wake-bearing reflection fit *beside* the vault budget inside
+            adepthood's total deadline, so it is judged against
+            :data:`R2_MACHINE_WAKE_ALLOWANCE_SECONDS`, not the whole 30 s.
+        POOL_GENERATE_P95: R2's 10 s pool generate budget, at concurrency 4
+            and R2's prompt size — both conditions, or the row is a gap.
+        POOL_TTFT_P95: R2's 2 s time-to-first-token budget, on the same
+            group as the generate row. **No backend this harness ships
+            reports a first-token time**, so this row is a gap in every
+            configuration available today; see :attr:`Trial.ttft_s`.
     """
 
     SERVER_SHED_DEADLINE = "server_shed_deadline"
@@ -293,10 +373,22 @@ class BudgetTable(BaseModel):
         pool_level_measured: Whether the concurrency sweep requested that
             level. ``False`` means the pool row measured nothing, which the
             row reports as ``insufficient_data`` rather than a pass.
-        measures_production_path: Whether the run reached a model off this
-            host. ``False`` for every fake or loopback run, and then **no row
-            here may be quoted as a production figure**: there was no Machine
-            wake to time, no pool to dial and no attestation to include.
+        pool_prompt_size_measured: Whether the trials feeding the pool rows
+            reported a prompt of :data:`R2_POOL_PROMPT_TOKENS`, within
+            :data:`R2_POOL_PROMPT_TOKEN_TOLERANCE`. R2 states its pool budget
+            for a 2,500-token prompt *and* concurrency 4; ``False`` means the
+            second condition went unmet, so the rows report
+            ``insufficient_data`` rather than a pass earned on a smaller
+            prompt.
+        model_off_harness_host: Whether the measured model ran somewhere other
+            than the host whose capacity this report describes — the exact
+            complement of ``host.describes_model_host``, taken from it rather
+            than re-derived. It is a narrow fact and **licenses nothing**: in
+            particular it is not a production signal, because a private or
+            remote endpoint is as likely to be a LAN dev box as anything
+            production uses. No run this harness can execute today dials an
+            attesting pool, so **no row here is ever a production
+            guarantee**; see the module docstring.
         verdict: The worst verdict among the rows **in force**. Rows out of
             force are excluded by construction, so a budget production does
             not enforce can neither pass nor fail the table.
@@ -309,22 +401,9 @@ class BudgetTable(BaseModel):
     phase_budgets_widened: bool
     pool_concurrency_level: PositiveInt
     pool_level_measured: bool
-    measures_production_path: bool
+    pool_prompt_size_measured: bool
+    model_off_harness_host: bool
     verdict: Verdict
-
-
-def measures_production_path(endpoint_scope: str) -> bool:
-    """Return whether a run at *endpoint_scope* timed a model off this host.
-
-    Args:
-        endpoint_scope: The run metadata's endpoint scope.
-
-    Returns:
-        ``True`` only for a private or remote endpoint. A fake provider and a
-        loopback runtime both run on the harness's own machine, so a figure
-        from either describes that machine and not a pool.
-    """
-    return endpoint_scope in _PRODUCTION_SCOPES
 
 
 def _summary(trials: Sequence[Trial]) -> LatencySummary | None:
@@ -381,39 +460,61 @@ def _pool_trials(trials: Sequence[Trial]) -> list[Trial]:
     ]
 
 
-def _vault_trials(trials: Sequence[Trial]) -> list[Trial]:
-    """Return the trials whose input size is the one R2's vault budget means.
+def _is_r2_prompt_size(trial: Trial) -> bool:
+    """Return whether *trial* reported a prompt of R2's stated size.
 
-    Every sweep but the context sweep reflects an entry of the workload's
-    ``query_words`` size, which is the representative reflection R2 budgets
-    "cold and warm". The context sweep deliberately sweeps input size up
-    towards ``num_ctx`` to find where the window breaks, so its trials time
-    entries production never sends; folding them into a row named
-    ``vault_reflection_p95`` would label a stress result as the production
-    figure. They are still judged — against the deadline this process
-    enforces, in their own ``per_sweep.context`` verdict.
+    Only a provider-reported count answers this. A byte upper bound is not a
+    token count, and an unreported or underived one is not a measurement, so
+    either leaves the condition unmet rather than guessed at.
     """
-    return [trial for trial in trials if trial.sweep is not Sweep.CONTEXT]
+    if trial.token_basis is not TokenBasis.PROVIDER_REPORTED:
+        return False
+    if trial.prompt_tokens is None:
+        return False
+    allowed = R2_POOL_PROMPT_TOKENS * R2_POOL_PROMPT_TOKEN_TOLERANCE
+    return abs(trial.prompt_tokens - R2_POOL_PROMPT_TOKENS) <= allowed
+
+
+def _vault_trials(trials: Sequence[Trial]) -> list[Trial]:
+    """Return the trials that time the reflection R2's vault budgets mean.
+
+    Scoped to :data:`_VAULT_SWEEPS`, whose docstring states why each stress
+    sweep is excluded.
+    """
+    return [trial for trial in trials if trial.sweep in _VAULT_SWEEPS]
 
 
 def _vault_rows(
-    overall: LatencySummary | None, vault_p95: float | None, *, widened: bool
+    overall: LatencySummary | None,
+    vault: LatencySummary | None,
+    *,
+    widened: bool,
 ) -> tuple[BudgetRow, ...]:
-    """Return the three rows judged on the representative reflection latency."""
+    """Return the shed-deadline row and R2's two vault rows.
+
+    The shed deadline is judged over **every** trial, because it is the
+    deadline this process actually sheds on: a context-sweep reflection is
+    shed by it exactly like any other, and a row sourced from this
+    repository's code reading ``fits`` beside a ``per_sweep.context`` verdict
+    of ``exceeds`` — for the same number — is a contradiction a reader would
+    quote. Scoping to the representative reflection is defensible for R2's two
+    vault rows, which name a production figure; it is not defensible here.
+    """
+    vault_p95 = vault.p95_s if vault else None
     return (
         _row(
             BudgetName.SERVER_SHED_DEADLINE,
             BudgetSource.CODE,
             deadline_budget_seconds(),
             overall,
-            vault_p95,
+            overall.p95_s if overall else None,
             in_force=True,
         ),
         _row(
             BudgetName.VAULT_FIRST_BYTE_WINDOW,
             BudgetSource.DOCUMENTED_CONSTANT,
             ADEPTHOOD_FIRST_BYTE_WINDOW_SECONDS,
-            overall,
+            vault,
             vault_p95,
             in_force=not widened,
         ),
@@ -421,20 +522,56 @@ def _vault_rows(
             BudgetName.VAULT_REFLECTION_P95,
             BudgetSource.ADR_0016_R2,
             R2_VAULT_P95_SECONDS,
-            overall,
+            vault,
             vault_p95,
             in_force=widened,
         ),
     )
 
 
-def budget_table(trials: Sequence[Trial], *, endpoint_scope: str) -> BudgetTable:
+def _pool_rows(pool: Sequence[Trial]) -> tuple[BudgetRow, ...]:
+    """Return R2's two pool rows, judged on the same group of trials.
+
+    Both rows describe one claim — how the pool behaves at R2's stated level
+    and prompt size — so both are judged on that group and no other. In
+    particular the TTFT row is **not** judged over every trial: feeding it the
+    context sweep let one deliberate out-of-memory there publish a row reading
+    "limit 2.0 s, measured 1.0 s, verdict exceeds", because the error-rate
+    clause fires on a group the row does not describe. Scoping the group
+    scopes that clause with it.
+    """
+    sized = [trial for trial in pool if _is_r2_prompt_size(trial)]
+    summary = _summary(sized)
+    return (
+        _row(
+            BudgetName.POOL_GENERATE_P95,
+            BudgetSource.ADR_0016_R2,
+            R2_POOL_GENERATE_P95_SECONDS,
+            summary,
+            summary.generation_p95_s if summary else None,
+            in_force=True,
+        ),
+        _row(
+            BudgetName.POOL_TTFT_P95,
+            BudgetSource.ADR_0016_R2,
+            R2_POOL_TTFT_P95_SECONDS,
+            summary,
+            summary.ttft_p95_s if summary else None,
+            in_force=True,
+        ),
+    )
+
+
+def budget_table(trials: Sequence[Trial], *, describes_model_host: bool) -> BudgetTable:
     """Judge *trials* against every budget in ADR-0016 R2, row by row.
 
     Args:
         trials: Every trial the sweeps produced.
-        endpoint_scope: The run's endpoint scope, which decides whether any
-            figure here describes a path production uses.
+        describes_model_host: ``host.describes_model_host`` for this run.
+            Recorded, complemented, as
+            :attr:`BudgetTable.model_off_harness_host` so the two fields can
+            never disagree. It is not a production signal; no run this harness
+            can execute today measures the production path.
 
     Returns:
         The table, whose verdict covers only the rows in force today.
@@ -444,33 +581,17 @@ def budget_table(trials: Sequence[Trial], *, endpoint_scope: str) -> BudgetTable
     vault = _summary(_vault_trials(trials))
     wake = _summary([t for t in trials if t.phase in _WAKE_PHASES])
     pool = _pool_trials(trials)
-    pool_summary = _summary(pool)
     rows = (
-        *_vault_rows(vault, vault.p95_s if vault else None, widened=widened),
+        *_vault_rows(overall, vault, widened=widened),
         _row(
             BudgetName.MACHINE_WAKE_WITHIN_CLIENT_DEADLINE,
             BudgetSource.DOCUMENTED_CONSTANT,
-            ADEPTHOOD_TOTAL_DEADLINE_SECONDS,
+            R2_MACHINE_WAKE_ALLOWANCE_SECONDS,
             wake,
             wake.p95_s if wake else None,
             in_force=True,
         ),
-        _row(
-            BudgetName.POOL_GENERATE_P95,
-            BudgetSource.ADR_0016_R2,
-            R2_POOL_GENERATE_P95_SECONDS,
-            pool_summary,
-            pool_summary.generation_p95_s if pool_summary else None,
-            in_force=True,
-        ),
-        _row(
-            BudgetName.POOL_TTFT_P95,
-            BudgetSource.ADR_0016_R2,
-            R2_POOL_TTFT_P95_SECONDS,
-            overall,
-            overall.ttft_p95_s if overall else None,
-            in_force=True,
-        ),
+        *_pool_rows(pool),
     )
     return BudgetTable(
         rows=rows,
@@ -482,6 +603,7 @@ def budget_table(trials: Sequence[Trial], *, endpoint_scope: str) -> BudgetTable
         phase_budgets_widened=widened,
         pool_concurrency_level=R2_POOL_CONCURRENCY,
         pool_level_measured=bool(pool),
-        measures_production_path=measures_production_path(endpoint_scope),
+        pool_prompt_size_measured=any(_is_r2_prompt_size(trial) for trial in pool),
+        model_off_harness_host=not describes_model_host,
         verdict=overall_verdict([row.verdict for row in rows if row.in_force]),
     )

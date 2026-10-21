@@ -158,9 +158,11 @@ class BenchReport(BaseModel):
             measuring nothing R2 asks about.
         budgets: ADR-0016 R2's named budget table (#1895): one row per budget
             with its limit, the value judged against it, its own verdict, and
-            whether production enforces it today. ``measures_production_path``
-            on it is false for every hermetic run, and then no figure in it is
-            a production guarantee.
+            whether production enforces it today. **No row in it is ever a
+            production guarantee**, whatever the endpoint scope was: no run
+            this harness can execute today dials an attesting pool, and the
+            live pool run that would is #1899. ``model_off_harness_host``
+            states only whether the model ran off this host.
         capacity: The concurrency sweep's basis for the admission caps.
         tokens_per_reflection: The measured per-surface token block (#1893).
             Every ADR-0016 cost figure cites this in place of the 2,500 + 128
@@ -291,7 +293,7 @@ def build_report(
         budget_seconds=budget,
         per_sweep=per_sweep,
         verdict=overall_verdict([summary.verdict for summary in per_sweep.values()]),
-        budgets=budget_table(trials, endpoint_scope=run.endpoint_scope),
+        budgets=budget_table(trials, describes_model_host=host.describes_model_host),
         capacity=capacity_basis(concurrency, budget),
         tokens_per_reflection=tokens,
         quality_score=quality,
