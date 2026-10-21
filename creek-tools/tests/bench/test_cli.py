@@ -7,7 +7,9 @@ refusal must happen before the harness touches the network.
 
 from __future__ import annotations
 
+import functools
 import json
+import socket
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -20,8 +22,10 @@ from creek.models import PrivacyTier
 from creek_mcp.bench import cli
 from creek_mcp.bench.corpus import entry_text
 from creek_mcp.bench.deadline import Verdict
-from creek_mcp.bench.fake import FakeLLM, fake_factory
+from creek_mcp.bench.fake import FakeLLM, FakePool, fake_factory
 from creek_mcp.bench.ollama_client import BenchOllamaClient
+from creek_mcp.bench.outcome import Outcome
+from creek_mcp.bench.pool_client import BenchPoolClient
 from creek_mcp.bench.report import load_report
 from creek_mcp.bench.trial import Sweep
 from tests.bench.conftest import quote_from
@@ -459,6 +463,294 @@ def test_model_store_path_is_recorded(tmp_path: Path) -> None:
     host = load_report(tmp_path / "report.json").host
     assert host.disk_scope == "model_store"
     assert str(store) not in (tmp_path / "report.json").read_text(encoding="utf-8")
+
+
+_POOL_IDENTITY = "tinfoil/gpt-oss-120b@v3"
+_POOL_MODEL = "gpt-oss-120b"
+_POOL_DIGEST = "sha256:" + "d" * 64
+
+
+def _pool_argv(tmp_path: Path, *extra: str) -> list[str]:
+    """Return argv for a small hermetic pool run."""
+    return _reflect(
+        tmp_path,
+        "--provider",
+        "pool",
+        "--model",
+        _POOL_MODEL,
+        "--pool-identity",
+        _POOL_IDENTITY,
+        *extra,
+    )
+
+
+def _knobbed_pool(**overrides: Any) -> Any:
+    """Return a ``FakePool`` replacement applying *overrides* to every build."""
+
+    def _build(**fields: Any) -> FakePool:
+        return FakePool(**(fields | overrides))
+
+    return _build
+
+
+@pytest.fixture
+def public_pool_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve a pool hostname to a public address without asking a resolver.
+
+    The run is otherwise hermetic, and a test must not depend on what DNS
+    says about a reserved ``.example`` name: a resolver that hijacks NXDOMAIN
+    to a private address would flip ``endpoint_scope`` from ``remote`` to
+    ``private`` and fail the assertion for a reason that is not the code's.
+
+    ``require_local_target``'s ``resolve`` default is bound when the function
+    is defined, so patching ``local_only._resolve`` would never reach this
+    call; the CLI's own imported symbol is the seam.
+    """
+    monkeypatch.setattr(
+        cli,
+        "require_local_target",
+        functools.partial(
+            cli.require_local_target, resolve=lambda host: ["93.184.216.34"]
+        ),
+    )
+
+
+@pytest.fixture
+def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if anything opens a real socket connection.
+
+    The fake pool answers over an in-process ``httpx`` transport, so the run
+    is hermetic even though it goes through a client; what must never happen
+    is a connection leaving the process.
+    """
+
+    def _refuse(self: socket.socket, address: object) -> None:
+        msg = f"the run opened a socket to {type(address).__name__}"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(socket.socket, "connect", _refuse)
+
+
+def test_fake_pool_runs_every_sweep_and_reports_provider_pool(
+    tmp_path: Path, no_sockets: None
+) -> None:
+    """AC1: the fake pool runs the sweeps and the report says ``pool``."""
+    assert cli.main(_pool_argv(tmp_path, "--idle-cycles", "1")) == 0
+    report = load_report(tmp_path / "report.json")
+    assert report.run.provider == "pool"
+    assert report.run.pool_identity == _POOL_IDENTITY
+    assert report.run.pool_vendor == "fake"
+    assert report.run.endpoint_scope == "fake"
+    assert report.verdict is Verdict.FITS
+    assert set(report.per_sweep) == {
+        Sweep.COLD_WARM,
+        Sweep.CONTEXT,
+        Sweep.CONCURRENCY,
+        Sweep.IDLE,
+    }
+
+
+def test_pool_advertising_another_identity_exits_2_with_no_generate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC2: a foreign identity is refused with zero generation calls."""
+    built: list[FakePool] = []
+
+    def _build(**fields: Any) -> FakePool:
+        pool = FakePool(**(fields | {"served_identity": "impostor/model@v1"}))
+        built.append(pool)
+        return pool
+
+    monkeypatch.setattr(cli, "FakePool", _build)
+    assert cli.main(_pool_argv(tmp_path)) == 2
+    assert "identity" in capsys.readouterr().err
+    assert built and built[-1].generate_calls == 0
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_pool_echoing_another_identity_is_never_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3: an answer under another identity is discarded, not counted ok."""
+    monkeypatch.setattr(cli, "FakePool", _knobbed_pool(echo_identity="impostor"))
+    assert cli.main(_pool_argv(tmp_path)) == 0
+    report = load_report(tmp_path / "report.json")
+    outcomes = {
+        trial.outcome for sweep in report.per_sweep.values() for trial in sweep.trials
+    }
+    assert Outcome.OK not in outcomes
+    assert report.verdict is Verdict.EXCEEDS
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("rate_limited", Outcome.RATE_LIMITED),
+        ("insufficient_quota", Outcome.INSUFFICIENT_QUOTA),
+    ],
+)
+def test_pool_admission_refusals_are_reported_as_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+    expected: Outcome,
+) -> None:
+    """AC6: both 429 codes reach the report as their own error outcome."""
+    monkeypatch.setattr(cli, "FakePool", _knobbed_pool(refusal_code=code))
+    assert cli.main(_pool_argv(tmp_path)) == 0
+    report = load_report(tmp_path / "report.json")
+    outcomes = {
+        trial.outcome for sweep in report.per_sweep.values() for trial in sweep.trials
+    }
+    assert outcomes == {expected}
+    assert report.verdict is Verdict.EXCEEDS
+
+
+def test_pool_mode_requires_the_pinned_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], no_http: list[str]
+) -> None:
+    """A pool run with nothing pinned is refused by flag name."""
+    argv = _reflect(tmp_path, "--provider", "pool", "--model", _POOL_MODEL)
+    assert cli.main(argv) == 2
+    assert "--pool-identity" in capsys.readouterr().err
+    assert no_http == []
+
+
+def test_live_pool_requires_the_vendor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], no_http: list[str]
+) -> None:
+    """A live pool run must say whose pool produced the measurement."""
+    argv = _pool_argv(
+        tmp_path,
+        "--mode",
+        "live",
+        "--pool-url",
+        "http://127.0.0.1:9",
+        "--digest",
+        _POOL_DIGEST,
+        "--git-sha",
+        _SHA,
+    )
+    assert cli.main(argv) == 2
+    assert "--pool-vendor" in capsys.readouterr().err
+    assert no_http == []
+
+
+def test_remote_pool_refused_by_default_exit_2_no_http(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], no_http: list[str]
+) -> None:
+    """AC4: a public --pool-url needs the operator's explicit opt-in."""
+    argv = _pool_argv(
+        tmp_path,
+        "--mode",
+        "live",
+        "--pool-url",
+        "http://8.8.4.4",
+        "--pool-vendor",
+        "tinfoil",
+        "--digest",
+        _POOL_DIGEST,
+        "--git-sha",
+        _SHA,
+    )
+    assert cli.main(argv) == 2
+    assert "--allow-remote-host" in capsys.readouterr().err
+    assert no_http == []
+
+
+def test_allowed_remote_pool_records_remote_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, public_pool_dns: None
+) -> None:
+    """AC4: with the opt-in, the run proceeds and records ``remote``."""
+    pool = FakePool(
+        identity=_POOL_IDENTITY,
+        model_tag=_POOL_MODEL,
+        measurement_digest=_POOL_DIGEST,
+    )
+    real_init = BenchPoolClient.__init__
+
+    def _init(self: BenchPoolClient, *args: Any, **kwargs: Any) -> None:
+        kwargs["transport"] = pool.transport()
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(BenchPoolClient, "__init__", _init)
+    argv = _pool_argv(
+        tmp_path,
+        "--mode",
+        "live",
+        "--pool-url",
+        "https://pool.vendor.example",
+        "--allow-remote-host",
+        "--pool-vendor",
+        "tinfoil",
+        "--digest",
+        _POOL_DIGEST,
+        "--git-sha",
+        _SHA,
+    )
+    assert cli.main(argv) == 0
+    report = load_report(tmp_path / "report.json")
+    assert report.run.endpoint_scope == "remote"
+    assert report.run.provider == "pool"
+    assert report.run.digest == _POOL_DIGEST
+    assert report.host.describes_model_host is False
+    assert pool.generate_calls > 0
+
+
+def test_cloud_offload_tag_refused_in_pool_mode(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], no_http: list[str]
+) -> None:
+    """AC5: a ``*-cloud`` tag is refused in pool mode too, hermetic or not."""
+    argv = _reflect(
+        tmp_path,
+        "--provider",
+        "pool",
+        "--model",
+        "gpt-oss:120b-cloud",
+        "--pool-identity",
+        _POOL_IDENTITY,
+    )
+    assert cli.main(argv) == 2
+    assert "cloud" in capsys.readouterr().err
+    assert no_http == []
+
+
+def test_pool_report_holds_no_url_or_hostname(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, public_pool_dns: None
+) -> None:
+    """AC7: the pool's URL and hostname appear nowhere in the report."""
+    host = "pool-canary-7f3e.vendor.example"
+    pool = FakePool(
+        identity=_POOL_IDENTITY,
+        model_tag=_POOL_MODEL,
+        measurement_digest=_POOL_DIGEST,
+    )
+    real_init = BenchPoolClient.__init__
+
+    def _init(self: BenchPoolClient, *args: Any, **kwargs: Any) -> None:
+        kwargs["transport"] = pool.transport()
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(BenchPoolClient, "__init__", _init)
+    argv = _pool_argv(
+        tmp_path,
+        "--mode",
+        "live",
+        "--pool-url",
+        f"https://{host}",
+        "--allow-remote-host",
+        "--pool-vendor",
+        "tinfoil",
+        "--digest",
+        _POOL_DIGEST,
+        "--git-sha",
+        _SHA,
+    )
+    assert cli.main(argv) == 0
+    written = (tmp_path / "report.json").read_text(encoding="utf-8")
+    assert host not in written
+    assert "pool-canary" not in written
+    assert "vendor.example" not in written
 
 
 # --------------------------------------------------------------------------

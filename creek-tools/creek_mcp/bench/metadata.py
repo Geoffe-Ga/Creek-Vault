@@ -25,6 +25,8 @@ GIT_SHA_PATTERN: Final[str] = r"^[0-9a-f]{40}$"
 """A full commit sha that pins the harness exactly."""
 
 _MODEL_TAG_PATTERN: Final[str] = r"^[A-Za-z0-9_.:/-]{1,128}$"
+_POOL_VENDOR_PATTERN: Final[str] = r"^[a-z0-9][a-z0-9-]{0,31}$"
+_POOL_IDENTITY_PATTERN: Final[str] = r"^[A-Za-z0-9_.:/@+-]{1,128}$"
 _QUANTIZATION_PATTERN: Final[str] = r"^[A-Za-z0-9_]{1,32}$"
 _PARAMETER_COUNT_PATTERN: Final[str] = r"^[0-9]+(\.[0-9]+)?[KMBT]?$"
 _LICENSE_ID_PATTERN: Final[str] = r"^[A-Za-z0-9.+-]{1,64}$"
@@ -41,6 +43,12 @@ CpuKind = Literal["shared", "performance", "unknown"]
 _LIVE_NEEDS_DIGEST: Final[str] = "digest is required for a live run"
 _LIVE_NEEDS_SHA: Final[str] = "git_sha is required for a live run"
 _SCOPE_MISMATCH: Final[str] = "endpoint_scope must be fake exactly when mode is fake"
+_POOL_NEEDS_PIN: Final[str] = (
+    "pool_vendor and pool_identity are required for the pool provider"
+)
+_POOL_ONLY_FIELDS: Final[str] = (
+    "pool_vendor and pool_identity belong to the pool provider only"
+)
 
 
 class RunMetadata(BaseModel):
@@ -56,7 +64,15 @@ class RunMetadata(BaseModel):
             injects an empty grounder (the hermetic fake mode, which must not
             load an embedding model).
         model_tag: The model name the provider was asked for.
-        digest: The weights' content digest; required live.
+        digest: The content digest that pins what served the run; required
+            live. For a runtime that is ``ollama`` these are the weights; for
+            the ``pool`` provider it is the attested measurement-set digest
+            (ADR-0016 Decision 3 item 2), since a vendor publishes no blob
+            digest for its weights.
+        pool_vendor: Who runs the pool — a short label, never a hostname;
+            ``None`` for every other provider.
+        pool_identity: The identity the run pinned and every request named
+            (ADR-0016 Decision 1 item 1); ``None`` for every other provider.
         quantization: Quantization level the runtime reported.
         parameter_count: Parameter size the runtime reported (``7.2B``).
         license_id: A short license identifier from a fixed table, never the
@@ -70,7 +86,7 @@ class RunMetadata(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     mode: Literal["fake", "live"]
-    provider: Literal["fake", "ollama"]
+    provider: Literal["fake", "ollama", "pool"]
     endpoint_scope: Literal["fake", "loopback", "private", "remote"] = "fake"
     grounding: Literal["none", "default"]
     model_tag: Annotated[str, Field(pattern=_MODEL_TAG_PATTERN)]
@@ -79,6 +95,8 @@ class RunMetadata(BaseModel):
     parameter_count: Annotated[str, Field(pattern=_PARAMETER_COUNT_PATTERN)] | None = (
         None
     )
+    pool_vendor: Annotated[str, Field(pattern=_POOL_VENDOR_PATTERN)] | None = None
+    pool_identity: Annotated[str, Field(pattern=_POOL_IDENTITY_PATTERN)] | None = None
     license_id: Annotated[str, Field(pattern=_LICENSE_ID_PATTERN)] = UNKNOWN
     num_ctx: PositiveInt
     num_predict: PositiveInt
@@ -94,6 +112,28 @@ class RunMetadata(BaseModel):
             raise ValueError(_LIVE_NEEDS_SHA)
         if (self.mode == "fake") != (self.endpoint_scope == "fake"):
             raise ValueError(_SCOPE_MISMATCH)
+        return self._pool_runs_name_their_pool()
+
+    def _pool_runs_name_their_pool(self) -> Self:
+        """Refuse a pool run that cannot be attributed, or a borrowed field.
+
+        A measurement only supports a cohort decision if the report says
+        which pool, at which identity, produced it (ADR-0016 Decision 7); and
+        a non-pool run carrying pool fields would claim a pool it never
+        drove.
+
+        Returns:
+            This metadata, unchanged.
+
+        Raises:
+            ValueError: When the pool fields do not match the provider.
+        """
+        named = (self.pool_vendor, self.pool_identity)
+        if self.provider == "pool":
+            if any(value is None for value in named):
+                raise ValueError(_POOL_NEEDS_PIN)
+        elif any(value is not None for value in named):
+            raise ValueError(_POOL_ONLY_FIELDS)
         return self
 
 

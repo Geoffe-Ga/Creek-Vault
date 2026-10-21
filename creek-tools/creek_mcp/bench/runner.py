@@ -410,6 +410,21 @@ _SAME_HOST_SCOPES: Final[frozenset[str]] = frozenset({"fake", "loopback"})
 """Endpoint scopes where the model runs on the harness's own host."""
 
 
+def _describes_model_host(metadata: RunMetadata) -> bool:
+    """Return whether the harness's host facts describe the model's host too.
+
+    A fake run answers in process, so they do. A real runtime at a loopback
+    endpoint runs on this host, so they do. A **pool** never does, even on
+    loopback: ADR-0016 Decision 3 item 1 puts a vendor's attesting proxy in
+    the vault image as a loopback sidecar, and the weights it fronts are the
+    vendor's. Claiming this machine's cores and memory described them would
+    be a false capacity fact.
+    """
+    if metadata.endpoint_scope == "fake":
+        return True
+    return metadata.provider != "pool" and metadata.endpoint_scope in _SAME_HOST_SCOPES
+
+
 def _measure_tokens(harness: _Harness) -> TokensPerReflection:
     """Run the per-surface token pass, or report that it was skipped.
 
@@ -480,6 +495,6 @@ def run_bench(
         model_store or corpus.root,
         cpu_kind=cpu_kind,
         model_store=model_store is not None,
-        describes_model_host=metadata.endpoint_scope in _SAME_HOST_SCOPES,
+        describes_model_host=_describes_model_host(metadata),
     )
     return build_report(metadata, host, trials, tokens)
