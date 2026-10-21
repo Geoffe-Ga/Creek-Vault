@@ -15,6 +15,17 @@ the route cannot rank a caller-owned id it was not admitted to.
 A write route, so it runs under :func:`~creek_mcp.httpapi.deadline.write_off_loop`:
 abandoning a thread that may still store the letter while telling the caller
 ``503`` would invite a retry that races the write it reported as failed.
+
+**The admission cap is reported here as it is on the reflection route** (#1903
+step 6, contract 0.20). The cap was never per route — both routes resolve the
+one ``generation`` stage through the same factory builder — so a writer held at
+it was already held at it on both, and the only thing that differed was that
+this route told them an outage story. ``429 rate_limited`` with its advisory
+``Retry-After`` is now the answer on either, and nothing is stored on that path
+any more than on the others: the dial is refused before
+:func:`~creek.voice_drafts.create_voice_draft_if_absent` is reached, so a
+capped request leaves the caller-owned slot unwritten and a retry still
+``created``.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek.models import PrivacyTier
 from creek.voice_drafts import VoiceDraftAction
 from creek_mcp.api.models import (
+    LETTER_RATE_LIMITED_SINCE_MINOR,
     OK_STATUS,
     PROVENANCE_SINCE_MINOR,
     CareEscalationResponse,
@@ -44,7 +56,10 @@ from creek_mcp.api.models import (
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
-from creek_mcp.httpapi.generation import declared_minor_at_least
+from creek_mcp.httpapi.generation import (
+    declared_minor_at_least,
+    served_error_code,
+)
 from creek_mcp.httpapi.journal import admissible_external_id
 from creek_mcp.httpapi.vault import configured_vault, request_key_of
 from creek_mcp.provenance import InferenceProvenance
@@ -71,6 +86,7 @@ if TYPE_CHECKING:
 REFUSAL_CODES: Final[dict[LetterRefusal, ErrorCode]] = {
     LetterRefusal.ABOVE_CEILING: ErrorCode.PRIVACY_REFUSED,
     LetterRefusal.PROVIDER_UNAVAILABLE: ErrorCode.TEMPORARILY_UNAVAILABLE,
+    LetterRefusal.RATE_LIMITED: ErrorCode.RATE_LIMITED,
     LetterRefusal.EMPTY_LETTER: ErrorCode.TEMPORARILY_UNAVAILABLE,
     LetterRefusal.STORAGE_BUSY: ErrorCode.TEMPORARILY_UNAVAILABLE,
     LetterRefusal.STORAGE_INVALID: ErrorCode.INTERNAL_ERROR,
@@ -81,6 +97,16 @@ A blank model turn and an unavailable provider are both retryable: neither
 stored anything, and the next attempt may succeed. A slot that is not a valid
 draft is an internal error, never ``privacy_refused`` — that would claim a
 privacy decision the adapter did not make.
+
+``RATE_LIMITED`` is ``429`` rather than a third ``503`` because a cap clears by
+waiting and an outage may not, and because the OpenAPI document carries one
+response object per status, so a code sharing ``503`` could not be documented at
+all. It is the same code, status, message and advisory ``Retry-After``
+``POST /v1/reflections`` has served since contract 0.19 — one per-account cap,
+reported identically wherever a caller meets it (#1903 step 6). A caller below
+:data:`~creek_mcp.api.models.LETTER_RATE_LIMITED_SINCE_MINOR` is served the
+``temporarily_unavailable`` this route answered at ``0.19``, by
+:func:`~creek_mcp.httpapi.generation.served_error_code`.
 """
 
 
@@ -218,11 +244,25 @@ def _letter(
 
 
 def _render(
-    outcome: LetterOutcome, context: RequestContext, inference_source: str | None
+    outcome: LetterOutcome,
+    context: RequestContext,
+    inference_source: str | None,
+    *,
+    serve_rate_limited: bool,
 ) -> Response:
-    """Map one tool outcome onto its wire response."""
+    """Map one tool outcome onto its wire response.
+
+    *serve_rate_limited* is kept separate from *inference_source*'s own gate
+    even though both are read off the declared minor: the field arrived at
+    0.19 and the cap reaches this route at 0.20, and collapsing them into one
+    flag would make a caller's provenance eligibility decide which refusal it
+    is told about.
+    """
     if isinstance(outcome, LetterRefusal):
-        return error_response(REFUSAL_CODES[outcome], context)
+        code = served_error_code(
+            REFUSAL_CODES[outcome], serve_rate_limited=serve_rate_limited
+        )
+        return error_response(code, context)
     if isinstance(outcome, LetterEscalation):
         return _escalation(outcome, context)
     return _letter(outcome, context, inference_source)
@@ -262,4 +302,11 @@ async def handle_letter(request: Request) -> Response:
     if outcome is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
     serve = declared_minor_at_least(request, PROVENANCE_SINCE_MINOR)
-    return _render(outcome, context, provenance.source if serve else None)
+    return _render(
+        outcome,
+        context,
+        provenance.source if serve else None,
+        serve_rate_limited=declared_minor_at_least(
+            request, LETTER_RATE_LIMITED_SINCE_MINOR
+        ),
+    )

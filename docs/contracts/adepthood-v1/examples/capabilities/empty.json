@@ -1,7 +1,7 @@
 {
   "capabilities": [],
-  "contract_minor": "0.19",
-  "contract_version": "0.19.0",
+  "contract_minor": "0.20",
+  "contract_version": "0.20.0",
   "inference_pool": true,
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "request_key_providers": [
@@ -10,6 +10,7 @@
   ],
   "status": "uninitialized",
   "supported_contract_minors": [
+    "0.20",
     "0.19",
     "0.18",
     "0.17",

@@ -3,7 +3,7 @@
 <!-- capability-set: contract-versions -->
 - **Status**: Draft — pending agreement
 - **Date**: 2026-06-30 (surface truthed-up 2026-08-21, #875/#1094)
-- **Contract version**: `0.19.0`
+- **Contract version**: `0.20.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23` (see [Ontology version](#ontology-version))
 <!-- /capability-set -->
 - **Driving issues**: [#748](https://github.com/Geoffe-Ga/Creek-Vault/issues/748) (epic), [#749](https://github.com/Geoffe-Ga/Creek-Vault/issues/749) (this doc), [#875](https://github.com/Geoffe-Ga/Creek-Vault/issues/875) (truth-up), [#1094](https://github.com/Geoffe-Ga/Creek-Vault/issues/1094) (cross-repo reconciliation)
@@ -222,7 +222,7 @@ which.
   "server": "creek-tools-mcp",
   "transport": "stdio",
   "available": true,
-  "contract_version": "0.19.0",
+  "contract_version": "0.20.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "tiers": ["open", "personal", "intimate"],
   "tier_model": { "ceilings": ["open", "personal", "intimate", "all"],
@@ -770,6 +770,7 @@ not upgrade it to a semantic identity.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.20.0` | 2026-10-21 | **The HTTP adapter serves the admission refusal on the letter route too (#1903 step 6, [ADR-0016](../../creek-tools/docs/architecture/ADR/0016-shared-confidential-warm-inference-pool.md)); the MCP tool surface does not move.** `rate_limited` / HTTP 429 is now reachable on `POST /v1/letters/{external_id}` as well as on `POST /v1/reflections`, with the same code, message, envelope and advisory `Retry-After`. The cap did not move and never was per route: both routes resolve the one `generation` stage through the same provider chokepoint, so the refusal is the shared pool's admission decision or the writer's own request key's 429, and one budget was already answering both — what `0.19` left split was the reporting, since `ProviderRateLimitError` subclasses `RuntimeError` and the letter tool's broad catch collapsed a cap into `provider_unavailable`. Nothing is stored on that path, so a capped letter leaves the caller-owned id unwritten and a retry still answers `created`. No model, field, status or route is added; the refusal is withheld from callers below `0.20`, so every `0.19` letter response is byte-identical and `0.19` remains served. |
 | `0.16.0` | 2026-09-11 | **The HTTP adapter gains consumer-scoped Journal withdrawal (#1799); the MCP tool surface does not move.** `DELETE /v1/journal-entries/{external_id}` is the idempotent destructive inverse of Journal upsert. It requires bearer identity, an explicit remote tier ceiling, and a negotiated `0.16` contract, but no request body or entry prose. A complete response means the caller's staged source, fragments, ledger/index/provenance references, and retrieval-facing derived state are absent; incomplete work is retryable and never reported as success. Foreign, unknown, already-withdrawn, and never-present identifiers are indistinguishable successes, so the route cannot be used as an ownership or existence oracle. The route, capability, and one closed response model widen the shared minor; `0.15` remains served without seeing or reaching them. |
 | `0.19.0` | 2026-10-21 | **The HTTP adapter publishes inference provenance and the shared pool's admission refusal (#1894, [ADR-0016](../../creek-tools/docs/architecture/ADR/0016-shared-confidential-warm-inference-pool.md)); the MCP tool surface does not move.** `inference_source` on `ReflectionResponse`, `LetterResponse` and `ClassificationResponse` names the route that answered — `pool:creek`, `pool:attested:<vendor>`, `request_key:<vendor>` or `local` — and is absent rather than guessed when no route this vocabulary names served, or when no model was called at all. `GET /v1/capabilities` gains `inference_pool`. The `rate_limited` code joins the closed vocabulary at HTTP 429 with disposition `retry_with_backoff` and an advisory `Retry-After`. All three are withheld from callers below `0.19`, which keep receiving `temporarily_unavailable` for a shed request, so `0.18` remains served byte-identically. No MCP tool's arguments or return shape moves; the minor is shared, which is why this row exists here. |
 | `0.18.0` | 2026-10-16 | **The HTTP adapter accepts a writer's request-scoped provider key on a managed vault (#1873, [ADR-0015](../../creek-tools/docs/architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)); the MCP tool surface does not move.** `POST /v1/reflections`, `POST /v1/letters/{external_id}` and `POST /v1/classifications` publish two optional headers, `X-Creek-Provider` (`anthropic` \| `openai`) and `X-Creek-Provider-Key`. On a managed vault the key powers that request's OPEN and PERSONAL model calls through the vault's own grounding, voice and classification pipeline; INTIMATE is still forced local or refused by the router chokepoint, the operator's own cloud key stays refused, and the key is never stored, logged or echoed. `GET /v1/capabilities` gains `request_key_providers`, withheld from callers below `0.18`. `0.17` remains served byte-identically. |

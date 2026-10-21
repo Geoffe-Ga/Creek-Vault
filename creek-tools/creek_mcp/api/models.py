@@ -83,6 +83,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.19",
     "0.18",
     "0.17",
     "0.16",
@@ -211,6 +212,14 @@ Contract 0.19 (#1894) adds ``inference_source`` to three published responses,
 refusal is served to such a caller as ``temporarily_unavailable``, the code it
 has always received for a shed request. So a ``0.18`` consumer validating its
 vendored closed schemas is answered byte-identically and stays in the window.
+
+Contract 0.20 (#1903 step 6) serves ``rate_limited`` on
+``POST /v1/letters/{external_id}`` as well, so one per-account cap is reported
+by one surface. No model, field or status is added — ``429`` was already in the
+published set — and the only thing that moves is which route documents and
+reaches it, withheld from callers below
+:data:`LETTER_RATE_LIMITED_SINCE_MINOR`, which keeps every ``0.19`` letter
+response exactly as that minor published it.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -433,6 +442,27 @@ because they are one contract change and a consumer that can name any of them
 can name all of them. Splitting it into three would let a future edit withhold
 the field while serving the code, which is a combination no vendored schema
 describes. It is a literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
+LETTER_RATE_LIMITED_SINCE_MINOR: Final[str] = "0.20"
+"""First contract minor that may meet ``rate_limited`` on the letter route.
+
+A *second* since-minor for one code, and the distinction it carries is which
+question is being asked. ``rate_limited`` and its ``429`` are 0.19's, so
+:data:`PROVENANCE_SINCE_MINOR` already answers "can this caller name the
+code?" — and a 0.19 caller can. What 0.20 answers is "does *this route* reach
+it?", because at 0.19 ``POST /v1/letters/{external_id}`` did not: the
+published document documented no ``429`` on it, and a cap arriving mid-letter
+was collapsed into the ``temporarily_unavailable`` every other provider
+failure earns. Serving the cap there is therefore a response that *moves* on
+a route a published minor already describes, and the only mechanism this
+contract has for that is a minor.
+
+It is **not** a second dialect. The downgrade runs through the same
+:func:`~creek_mcp.httpapi.generation.served_error_code`, to the same code,
+with the same envelope and the same advisory ``Retry-After`` the reflection
+route has served since 0.19 — the datum that differs is when the route began
+reaching the code, which is exactly what a since-minor is.
 """
 
 INFERENCE_SOURCE_LOCAL: Final[str] = "local"
@@ -747,7 +777,13 @@ class ErrorCode(StrEnum):
             served only to callers declaring :data:`PROVENANCE_SINCE_MINOR` or
             later; an older caller receives ``temporarily_unavailable``, which
             is what it has always received for a shed request and the only
-            spelling its vendored vocabulary has.
+            spelling its vendored vocabulary has. Reachable on
+            ``POST /v1/reflections`` from 0.19 and on
+            ``POST /v1/letters/{external_id}`` from
+            :data:`LETTER_RATE_LIMITED_SINCE_MINOR` — **one** budget either
+            way, since both routes dial the single ``generation`` chokepoint
+            and the cap is the pool's admission refusal or the writer's own
+            key's, never a counter this server keeps per route.
         INTERNAL_ERROR: An unexpected server fault.
     """
 

@@ -22,6 +22,7 @@ from starlette.testclient import TestClient
 from creek._fslock import VaultLockTimeoutError
 from creek.care.guardrail import CARE_SIGNAL
 from creek.classify.llm.consent import CLOUD_CONSENT_ENV
+from creek.classify.llm.providers import ProviderRateLimitError
 from creek.classify.llm.router import IntimateRoutingError
 from creek.config import CreekConfig
 from creek.models import PrivacyTier
@@ -43,6 +44,7 @@ from creek_mcp.api.models import (
     VoiceDraftReadResponse,
 )
 from creek_mcp.audit import MCP_AUDIT_RELPATH
+from creek_mcp.httpapi.errors import RETRY_AFTER_HEADER, RETRY_AFTER_SECONDS
 from creek_mcp.tools.letter import (
     LETTER_MAX_OUTPUT_TOKENS,
     MAX_LETTER_CHARS,
@@ -69,7 +71,16 @@ _INCOMPATIBLE: Final[int] = 409
 _INVALID_REQUEST: Final[int] = 422
 _INTERNAL_ERROR: Final[int] = 500
 _UNAVAILABLE: Final[int] = 503
+_RATE_LIMITED: Final[int] = 429
 _OLD_MINOR: Final[str] = "0.16"
+_PRIOR_LETTER_CAP_MINOR: Final[str] = "0.19"
+"""The minor immediately below the one that serves the cap on this route.
+
+Spelled rather than derived from
+:data:`~creek_mcp.api.models.LETTER_RATE_LIMITED_SINCE_MINOR`: a test that
+computes the boundary it is asserting about moves with the boundary and
+stops being a test of it.
+"""
 _EXTERNAL_ID: Final[str] = "adepthood-voicedraft-1862aa"
 _LETTERS_PATH: Final[str] = f"/v1/letters/{_EXTERNAL_ID}"
 _VOICE_DRAFT_PATH: Final[str] = f"/v1/voice-drafts/{_EXTERNAL_ID}"
@@ -101,15 +112,28 @@ class _FactorySpy:
         prompts: One entry per completion, in order.
     """
 
-    def __init__(self, response: str = _LETTER, *, error: Exception | None = None):
-        """Return *response* from every completion, or raise *error* on build.
+    def __init__(
+        self,
+        response: str = _LETTER,
+        *,
+        error: Exception | None = None,
+        completion_error: Exception | None = None,
+    ):
+        """Return *response* from every completion, or raise the given error.
 
         Args:
             response: The raw model turn to hand back.
             error: Raised from ``factory(tier)`` instead of building a client.
+            completion_error: Raised from the completion call itself, after the
+                prompt was recorded. The two are not interchangeable: a cap is
+                reported by the *provider*, mid-turn, so a factory that refuses
+                to build cannot stand in for it — and the distinction is the
+                whole of what tells "nothing was dialled" from "the dial was
+                refused".
         """
         self._response = response
         self._error = error
+        self._completion_error = completion_error
         self.tiers: list[PrivacyTier] = []
         self.max_tokens: list[int] = []
         self.prompts: list[str] = []
@@ -134,6 +158,8 @@ class _FactorySpy:
 
         def _complete(prompt: str) -> str:
             self.prompts.append(prompt)
+            if self._completion_error is not None:
+                raise self._completion_error
             return self._response
 
         return _complete
@@ -740,3 +766,135 @@ def test_an_unchanged_letter_is_returned_exactly_as_stored(tmp_path: Path) -> No
 
     assert parsed.action.value == "unchanged"
     assert parsed.letter == long_draft
+
+
+# --------------------------------------------------------------------------- #
+# The admission cap, on this route as on the reflection route (#1903 step 6)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_rate_limited_letter_is_a_cap_rather_than_an_outage(
+    tmp_path: Path,
+) -> None:
+    """429 ``rate_limited`` with the advisory wait, not 503 ``temporarily_unavailable``.
+
+    The asymmetry this closes: ``ProviderRateLimitError`` subclasses
+    ``RuntimeError``, so before #1903 step 6 the letter route's single
+    provider-failure catch collapsed a cap into ``provider_unavailable`` —
+    while the reflection route beside it, dialling *the same* ``generation``
+    chokepoint against *the same* account, answered 429. One limit, two
+    stories.
+    """
+    vault = seed_vault(tmp_path / "vault")
+    spy = _FactorySpy(completion_error=ProviderRateLimitError("Anthropic: capped"))
+    with _client(vault, spy) as test_client:
+        response = _post(test_client)
+
+    assert _code(response) == (_RATE_LIMITED, ErrorCode.RATE_LIMITED.value)
+    assert response.headers[RETRY_AFTER_HEADER] == RETRY_AFTER_SECONDS
+    # The dial happened and was refused, which is what distinguishes a cap
+    # from the refusals that never reach a provider at all.
+    assert len(spy.prompts) == 1
+
+
+def test_a_rate_limited_letter_persists_nothing_and_a_retry_still_creates(
+    tmp_path: Path,
+) -> None:
+    """A cap that arrives mid-request leaves the slot untouched.
+
+    The failure this forbids is a half-served write: a refusal that latched an
+    empty or partial draft would make the writer's retry return ``unchanged``
+    and hand back nothing, permanently, because the store is
+    first-writer-wins. So the evidence is two-sided — no draft file after the
+    429, and ``created`` (never ``unchanged``) on the retry.
+    """
+    vault = seed_vault(tmp_path / "vault")
+    capped = _FactorySpy(completion_error=ProviderRateLimitError("Anthropic: capped"))
+    with _client(vault, capped) as test_client:
+        refused = _post(test_client)
+
+    assert _code(refused) == (_RATE_LIMITED, ErrorCode.RATE_LIMITED.value)
+    assert _draft_files(vault) == []
+
+    with _client(vault) as test_client:
+        retried = LetterResponse.model_validate(envelope(_post(test_client)))
+
+    assert retried.action.value == "created"
+    assert retried.letter == _LETTER
+    assert len(_draft_files(vault)) == 1
+
+
+def _get_draft(vault: Path) -> httpx.Response:
+    """Read the addressed Voice Draft slot through the published route."""
+    with TestClient(build_app(vault_path=vault)) as test_client:
+        return test_client.get(_VOICE_DRAFT_PATH, headers=headers(ceiling="personal"))
+
+
+def test_a_rate_limited_letter_stores_no_voice_draft_readable_by_its_id(
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/voice-drafts/{id}`` does not answer with a document.
+
+    The on-disk assertion above proves no *file*; this proves no *document*
+    through the route a consumer would actually ask with, so a refusal that
+    wrote a record the filesystem glob happened to miss is still caught. An
+    unwritten slot is the one generic ``privacy_refused`` — the vault never
+    distinguishes absent from forbidden over a caller-owned id — so the
+    positive control is the paragraph below it: the same read *does* answer a
+    document once a letter is written.
+    """
+    vault = seed_vault(tmp_path / "vault")
+    spy = _FactorySpy(completion_error=ProviderRateLimitError("Anthropic: capped"))
+    with _client(vault, spy) as test_client:
+        _post(test_client)
+
+    assert _code(_get_draft(vault)) == (
+        _PRIVACY_REFUSED,
+        ErrorCode.PRIVACY_REFUSED.value,
+    )
+
+    with _client(vault) as test_client:
+        _post(test_client)
+
+    recalled = VoiceDraftReadResponse.model_validate(envelope(_get_draft(vault)))
+    assert recalled.external_id == _EXTERNAL_ID
+
+
+def test_a_minor_below_the_bump_still_receives_temporarily_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A caller at 0.19 is answered exactly as it was before this change.
+
+    ``rate_limited`` and its 429 are 0.19's own, so this is not a vocabulary
+    gate: a 0.19 consumer can name the code. What it cannot have is a *letter*
+    response that moved after its minor was published — the published document
+    documents no 429 on this route at 0.19 — so the downgrade here is the
+    version window holding, not a softening of the truth.
+    """
+    vault = seed_vault(tmp_path / "vault")
+    spy = _FactorySpy(completion_error=ProviderRateLimitError("Anthropic: capped"))
+    with _client(vault, spy) as test_client:
+        response = _post(test_client, minor=_PRIOR_LETTER_CAP_MINOR)
+
+    assert _code(response) == (_UNAVAILABLE, ErrorCode.TEMPORARILY_UNAVAILABLE.value)
+    assert RETRY_AFTER_HEADER not in response.headers
+
+
+def test_the_cap_is_charged_once_per_request_whatever_the_dial_count(
+    tmp_path: Path,
+) -> None:
+    """One letter request is one admission decision, read off the provider.
+
+    The vault keeps **no counter of its own**: a cap is whatever the shared
+    ``generation`` chokepoint — pool admission or the writer's own key —
+    refuses, so the unit the cap is spent in is a *dial*, not a request. #1939
+    will generate up to three candidates per letter, and this pins which way
+    today's implementation behaves so that issue can choose deliberately:
+    every dial faces admission, and the first refusal ends the request.
+    """
+    vault = seed_vault(tmp_path / "vault")
+    spy = _FactorySpy(completion_error=ProviderRateLimitError("Anthropic: capped"))
+    with _client(vault, spy) as test_client:
+        _post(test_client)
+
+    assert len(spy.prompts) == 1

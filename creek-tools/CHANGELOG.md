@@ -9,6 +9,22 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **One cap, one surface: `rate_limited` on the letter route (contract
+  0.20.0, #1903 step 6, ADR-0016).** `POST /v1/letters/{external_id}` now
+  answers an admission cap with `429 rate_limited` and the advisory
+  `Retry-After`, exactly as `POST /v1/reflections` has since 0.19. The cap
+  itself did not move and never was per route — both routes resolve the one
+  `generation` stage through the same provider chokepoint, so a cap met on one
+  is the same budget as a cap met on the other. What was split was the
+  reporting: `ProviderRateLimitError` subclasses `RuntimeError`, so the letter
+  tool's broad provider-failure catch collapsed a cap into
+  `provider_unavailable`, and a writer rate limited on one route was told an
+  outage story on the other. Nothing is stored on the refusal path, so a
+  capped letter leaves the caller-owned id unwritten and a retry still answers
+  `created`. No model, field, status or route is added; the refusal is
+  withheld from callers below `0.20`, so every `0.19` letter response stays
+  byte-identical and `0.19` remains served.
+
 - Managed vaults are now local-only by construction (#1863). Every
   Adepthood-provisioned vault Machine carries `CREEK_MANAGED_VAULT=1`, and a
   managed vault refuses to start while `CREEK_CLOUD_CONSENT` or the legacy

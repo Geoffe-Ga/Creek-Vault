@@ -426,6 +426,27 @@ this route, not that the answer stayed on the device.
 from a caller below `0.19`, so every `0.18` response is byte-identical and
 `0.18` stays in the window.
 
+`0.20.0` (#1903 step 6, [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md))
+serves `rate_limited` on `POST /v1/letters/{external_id}` as well as on
+`POST /v1/reflections`, so **one cap is reported by one surface.**
+
+The cap itself does not move and never was per route: both routes resolve the
+same `generation` stage through the same provider chokepoint, so the refusal is
+the shared pool's admission decision or your own request key's 429, and a
+single budget was already answering both. What `0.19` left split was the
+reporting — a cap arriving mid-letter was collapsed into the
+`temporarily_unavailable` every other provider failure earns — and a caller
+rate limited on one route while being told an outage story on the other is
+being told two things about one limit.
+
+The 429 is identical on both: same code, same message, same envelope, same
+advisory `Retry-After`. Nothing is stored on that path, so a capped letter
+leaves your caller-owned id unwritten and a retry still answers `created`. No
+model, field, status or route is added — `429` was already in the published set
+— and the refusal is withheld from a caller below `0.20`, which keeps every
+`0.19` letter response exactly as `0.19` published it, so `0.19` stays in the
+window.
+
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE
 /v1/connectors/drive` and `POST /v1/connectors/drive/syncs`. It is additive in
@@ -657,9 +678,13 @@ function of `code`. There is no `retryable` field on the wire, ever.
 it means a rate limit rather than an outage: this vault is over its model-call
 admission cap (too many in flight, or too many this hour), or the vendor your
 own request key is spending on returned a 429. It is reachable on
-`POST /v1/reflections` and documented there in the OpenAPI document; the two
-write routes that also call a model keep their existing refusal shapes. It is
-a separate code from
+`POST /v1/reflections` since `0.19.0` and on `POST /v1/letters/{external_id}`
+since `0.20.0` (#1903 step 6), and documented on both in the OpenAPI document.
+**It is one budget, not two**: both routes dial the same `generation`
+chokepoint, so a cap met on one is the same cap on the other, which is exactly
+why they report it identically. `POST /v1/classifications` keeps its existing
+refusal shapes — its model work is accepted as a `202` job, so it cannot refuse
+admission in the response that admits it. It is a separate code from
 `temporarily_unavailable` because the two want different client behaviour: a
 cap clears by waiting, and the writer should be shown a wait rather than an
 outage. It carries an advisory `Retry-After` header, which is deliberately
@@ -668,9 +693,12 @@ contract fact; the header says *when* and is a hint. The message says nothing
 about how much of your allowance is spent, and the header is a constant — a
 number derived from this vault's own recent model use would answer "how busy
 is this vault?" to anyone willing to probe. It is served **only** to a caller
-declaring `0.19` or later; an older minor receives the
-`503 temporarily_unavailable` it has always received for a shed request, which
-is the only spelling its vendored vocabulary has.
+declaring the minor its route began serving it at — `0.19` for reflections,
+`0.20` for letters — and an older minor receives the
+`503 temporarily_unavailable` it has always received for a shed request. For a
+pre-`0.19` caller that is the only spelling its vendored vocabulary has; for a
+`0.19` caller asking for a letter it is the version window holding, because the
+document that minor published records no 429 on that route.
 
 **`unsupported_source` is about the caller's own filename, never the vault.**
 It was the only code added between contract `0.2.0` and `0.19.0` (it arrived

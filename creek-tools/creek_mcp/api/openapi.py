@@ -139,6 +139,7 @@ actually produce.
 _CAPABILITY_ERROR_CODES: Final[dict[Capability, tuple[ErrorCode, ...]]] = {
     Capability.UPLOAD: (ErrorCode.UNSUPPORTED_SOURCE,),
     Capability.REFLECTIONS: (ErrorCode.RATE_LIMITED,),
+    Capability.LETTERS: (ErrorCode.RATE_LIMITED,),
 }
 """Refusals only one capability can produce, keyed by that capability.
 
@@ -155,11 +156,16 @@ return — and omitting it from the one that can leaves a generated client with
 no branch for the refusal it will meet the first time somebody uploads a
 ``conversations.json``.
 :attr:`~creek_mcp.api.models.ErrorCode.RATE_LIMITED` is the same shape at
-contract 0.19 (#1894): only ``POST /v1/reflections`` reaches it, through
-:func:`creek_mcp.httpapi.reflect.reflect_refusal_code`, because it is the one
-route whose model call is admitted against a per-vault cap. The two write
-routes that also call a model keep their existing refusal shapes, which is
-what ADR-0016 Decision 1 item 10 asks of them.
+contract 0.19 (#1894), and at 0.20 (#1903 step 6) it is the reason the table
+earns its keep a second time: ``POST /v1/letters/{external_id}`` joins
+``POST /v1/reflections`` in one line rather than a second branch. Both routes'
+model calls are admitted against the **same** per-account cap — they resolve
+the one ``generation`` stage through the same
+``creek_mcp.server._bounded_generation_factory`` — so documenting it on one and
+not the other published two different stories about one budget. It stays off
+the remaining capabilities because they reach no model, and off
+``POST /v1/classifications``, whose own model work is accepted as a ``202`` job
+and so cannot refuse admission in the response that admits it.
 """
 
 SECURITY_SCHEME_NAME: Final[str] = "bearerAuth"
