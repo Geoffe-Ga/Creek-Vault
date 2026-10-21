@@ -538,7 +538,7 @@
       "capability": null,
       "model": "ClassificationResponse",
       "path": "schemas/ClassificationResponse.schema.json",
-      "sha256": "1de8a93c3d0791278dc1bfbb23443ba398a5274974797c9dd9a232d4dec23d6d",
+      "sha256": "ebdbb0d1adcc6367721f4b8a1288699aab47f1663a62b4c48a5dbc9f46705d18",
       "state": null
     },
     {
@@ -601,7 +601,7 @@
       "capability": null,
       "model": "JobStatusResponse",
       "path": "schemas/JobStatusResponse.schema.json",
-      "sha256": "9f4fb4353f7100e7880a7cec8ba1b9c4853d25ab701b1887a41f54dc9ba56a43",
+      "sha256": "e5cda26a1f2b773e08d7bcc29a378c8a4c9b44300d0cdc617439fc49e7fa4556",
       "state": null
     },
     {
@@ -643,7 +643,7 @@
       "capability": null,
       "model": "LetterResponse",
       "path": "schemas/LetterResponse.schema.json",
-      "sha256": "a157049675b9e2332da5fb04b2e928fd88c14efb2131ba649d1ab3ae2a147777",
+      "sha256": "071e294e25883eaf27c3ce1d9cc3e72621a90e36e6d957c2bae15b395c9d7f75",
       "state": null
     },
     {
@@ -685,7 +685,7 @@
       "capability": null,
       "model": "ReflectionResponse",
       "path": "schemas/ReflectionResponse.schema.json",
-      "sha256": "f41f939e8fef1054f8b5da10ef031520bae9138387cad16513f4c2ad3f862e5f",
+      "sha256": "721a3964c31823a146fe9ae05760a82d2fa5c7ab48ba0ba2a2d6b2dcef3e9ae1",
       "state": null
     },
     {
