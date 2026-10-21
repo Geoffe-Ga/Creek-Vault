@@ -2,11 +2,19 @@
 
 ``ModelRouter`` is the single chokepoint through which every LLM call site
 resolves which provider+model to use for a given pipeline stage, and the single
-place the ``Intimate``-never-cloud privacy invariant is enforced (#647): an
-``Intimate``-tier fragment is redirected off any cloud provider to the local
-``default`` (with a WARNING), or — when even ``default`` is cloud — refused
-loudly via :class:`IntimateRoutingError`. Call sites must never re-check the
-tier themselves; they pass it to :meth:`resolve` and trust the result.
+place the ``Intimate``-never-off-device privacy invariant is enforced (#647):
+an ``Intimate``-tier fragment is redirected off any provider that is not
+intimate-eligible to the local ``default`` (with a WARNING), or — when even
+``default`` is ineligible — refused loudly via :class:`IntimateRoutingError`.
+Call sites must never re-check the tier themselves; they pass it to
+:meth:`resolve` and trust the result.
+
+The gate reads ``intimate_eligible``, not ``is_cloud`` (widened by #1894,
+ADR-0016 Decision 6). The shared confidential inference pool is not cloud —
+no operator key, no consent variable — and still never sees ``Intimate``
+content, because by the time the pool could refuse a tier, the plaintext
+would already have left the vault. Enforcing it here is what makes the pool's
+own refusal defence in depth rather than the first line.
 
 Construction accepts either a :class:`~creek.config.LLMRoutingConfig` (the
 per-stage shape) or a bare :class:`~creek.config.LLMConfig` (treated as the sole
@@ -19,7 +27,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from creek.classify.llm.providers import build_provider, provider_is_cloud
+from creek.classify.llm.providers import (
+    build_provider,
+    provider_intimate_eligible,
+    provider_is_cloud,
+)
 from creek.config import LLMConfig, LLMRoutingConfig
 from creek.models import PrivacyTier
 
@@ -29,28 +41,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _ineligible_kind(provider: str) -> str:
+    """Name why *provider* may not be shown ``Intimate`` content.
+
+    Args:
+        provider: The ``LLMConfig.provider`` string.
+
+    Returns:
+        ``"cloud"`` for a readable cloud vendor, else ``"off-device"`` — the
+        shared inference pool is not cloud (no operator key, no consent
+        variable) yet still never sees ``Intimate`` content.
+    """
+    return "cloud" if provider_is_cloud(provider) else "off-device"
+
+
 class IntimateRoutingError(RuntimeError):
     """Raised when an ``Intimate`` fragment cannot be routed to any local model.
 
-    The router redirects ``Intimate``-tier work off cloud providers to the local
-    ``default``; this is raised only when ``default`` is *also* a cloud provider,
-    so there is no safe local backend — failing loudly is preferable to silently
-    egressing intimate content.
+    The router redirects ``Intimate``-tier work off every provider that is not
+    intimate-eligible — cloud vendors and the shared inference pool alike — to
+    the local ``default``; this is raised only when ``default`` is *also*
+    ineligible, so there is no safe local backend, and failing loudly is
+    preferable to silently egressing intimate content.
 
     Attributes:
-        stage_provider: The cloud provider the stage was configured with.
+        stage_provider: The ineligible provider the stage was configured with.
     """
 
     def __init__(self, stage_provider: str) -> None:
         """Build the error naming the offending provider and the remedy.
 
         Args:
-            stage_provider: The cloud provider configured for the stage.
+            stage_provider: The ineligible provider configured for the stage.
         """
         self.stage_provider = stage_provider
         super().__init__(
-            f"Intimate-tier fragment cannot route to cloud provider "
-            f"{stage_provider!r}, and llm.default is also cloud, so there is no "
+            f"Intimate-tier fragment cannot route to "
+            f"{_ineligible_kind(stage_provider)} provider {stage_provider!r}, "
+            "and llm.default is not intimate-eligible either, so there is no "
             "local backend to fall back to. Set llm.default to a local provider "
             "(e.g. ollama) to process Intimate-tier content.",
         )
@@ -144,13 +172,21 @@ class ModelRouter:
         cfg: LLMConfig,
         tier: PrivacyTier | None,
     ) -> LLMConfig:
-        """Apply the ``Intimate``-never-cloud rule — the ONLY tier gate (#647).
+        """Apply the ``Intimate``-never-off-device rule — the ONLY tier gate.
 
         Non-``Intimate`` tiers (and ``None``) pass through unchanged. An
-        ``Intimate`` fragment bound for a cloud provider is redirected to the
-        local ``default`` with a single WARNING; if ``default`` is itself cloud,
-        :class:`IntimateRoutingError` is raised rather than emitting a cloud
-        call.
+        ``Intimate`` fragment bound for a provider that is not
+        intimate-eligible is redirected to the local ``default`` with a single
+        WARNING; if ``default`` is itself ineligible,
+        :class:`IntimateRoutingError` is raised rather than emitting the call.
+
+        The test is
+        :func:`~creek.classify.llm.providers.provider_intimate_eligible`, not
+        ``is_cloud`` (#647, widened by #1894): the shared inference pool is not
+        cloud — no operator key, no consent variable — and still never sees
+        ``Intimate`` content (ADR-0016 Decision 5). The same test governs the
+        ``default`` rescue target, so a ``default`` stage routed to the pool is
+        never redirected *to*.
 
         Args:
             cfg: The stage's resolved config.
@@ -162,14 +198,15 @@ class ModelRouter:
         Raises:
             IntimateRoutingError: When no local backend exists to redirect to.
         """
-        if tier != PrivacyTier.INTIMATE or not provider_is_cloud(cfg.provider):
+        if tier != PrivacyTier.INTIMATE or provider_intimate_eligible(cfg.provider):
             return cfg
         local = self.routing.for_stage("default")
-        if provider_is_cloud(local.provider):
+        if not provider_intimate_eligible(local.provider):
             raise IntimateRoutingError(stage_provider=cfg.provider)
         logger.warning(
-            "Intimate-tier fragment: redirecting cloud provider %r to local %r "
-            "(cloud egress refused at the routing chokepoint).",
+            "Intimate-tier fragment: redirecting %s provider %r to local %r "
+            "(off-device egress refused at the routing chokepoint).",
+            _ineligible_kind(cfg.provider),
             cfg.provider,
             local.provider,
         )
