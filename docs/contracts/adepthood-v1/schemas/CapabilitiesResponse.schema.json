@@ -96,7 +96,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n\u2014 which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` \u2014 the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.\n    request_key_providers: The vendors whose writer-supplied key this vault\n        will spend on OPEN and PERSONAL model calls, sent per request in\n        ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a\n        self-connected vault, which ignores request keys. Since contract\n        0.18, and omitted for a caller declaring an earlier minor.",
+  "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n\u2014 which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` \u2014 the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.\n    request_key_providers: The vendors whose writer-supplied key this vault\n        will spend on OPEN and PERSONAL model calls, sent per request in\n        ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a\n        self-connected vault, which ignores request keys. Since contract\n        0.18, and omitted for a caller declaring an earlier minor.\n    inference_pool: Whether this vault answers its model calls from the\n        shared confidential inference pool (ADR-0016). ``False`` on a\n        vault that runs its own model. Published so a consumer can detect\n        the route *before* dialling rather than inferring it from the\n        first answer's ``inference_source``. Since contract 0.19, and\n        omitted for a caller declaring an earlier minor.\n    keyless_inference: ``False`` when a model call carrying no writer key\n        is certain to be refused here before any model is dialled: a\n        managed vault with no shared pool pinned. ``True`` when such a\n        call may be attempted. A consumer reading ``False`` should ask\n        the writer for their key instead of charging for a pass that\n        cannot run. Since contract 0.20, and omitted for a caller\n        declaring an earlier minor.",
   "properties": {
     "capabilities": {
       "description": "Capabilities served; empty on an uninitialised vault.",
@@ -115,6 +115,32 @@
       "description": "Full semantic contract version.",
       "title": "Contract Version",
       "type": "string"
+    },
+    "inference_pool": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Whether model calls are answered from the shared inference pool. Since contract 0.19.",
+      "title": "Inference Pool"
+    },
+    "keyless_inference": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "False when a model call without a writer's request key is refused before any model is dialled; true when one may be attempted. Since contract 0.20.",
+      "title": "Keyless Inference"
     },
     "ontology_version": {
       "description": "Shared APTITUDE frequency / Wavelength phase vocabulary.",

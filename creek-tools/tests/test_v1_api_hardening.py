@@ -2632,8 +2632,8 @@ _READ_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
     {
         "capabilities",
         "drive",
+        "generation",
         "provisioning",
-        "reflect",
         "routing",
         "voice_drafts",
         "wheel",
@@ -2647,6 +2647,14 @@ status, while the sync and disconnect routes beside it write.
 ``routing`` reads the durable allocation off-loop. Its provider wake-up is
 single-flighted in a shielded task, so a cancelled caller cannot abandon or
 duplicate that external state transition.
+
+``generation`` holds the dispatch ``reflect`` used to make directly (#1894).
+It is still one declaration in one place rather than an inherited default:
+:func:`~creek_mcp.httpapi.generation.generate_off_loop` is the abandonable
+helper **plus** ADR-0016 Decision 1 item 7's shed path, which closes the pool
+socket the abandoned worker is blocked on — and that pairing is precisely why
+it cannot be spelled at the call site as a bare keyword. ``reflect`` is
+therefore absent from both sets while still dispatching a read.
 """
 
 _WRITE_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(

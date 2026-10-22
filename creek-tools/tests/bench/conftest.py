@@ -19,6 +19,7 @@ from creek_mcp.bench import HARNESS_VERSION
 from creek_mcp.bench.local_only import LocalOnlyFactory
 from creek_mcp.bench.metadata import RunMetadata
 from creek_mcp.bench.runner import Backend, BenchPlan, Workload
+from creek_mcp.bench.usage import TokenUsage, byte_upper_bound_usage
 
 if TYPE_CHECKING:
     from creek.models import PrivacyTier
@@ -54,6 +55,13 @@ class FakeModel:
         unanchored: Quote text that is not in the entry, so reflect drops the
             note and answers ``empty``.
         gather: Hold each call until this many are in flight (0 disables).
+        reports_usage: Whether built callables report their own token usage.
+            ``False`` stands in for a backend with no usage counters.
+        reports_ttft: The time to first token built callables report, in
+            seconds. ``None`` — the default — stands in for a backend that
+            does not stream, which is every backend creek-tools ships today;
+            a float stands in for one that does, so the runner's
+            ``probe.ttft_s`` -> ``Trial.ttft_s`` wiring can be driven.
     """
 
     is_cloud: bool | None = False
@@ -64,6 +72,8 @@ class FakeModel:
     echo_canary: bool = False
     unanchored: bool = False
     gather: int = 0
+    reports_usage: bool = True
+    reports_ttft: float | None = None
     calls: int = 0
     builds: int = 0
     max_in_flight: int = 0
@@ -128,10 +138,29 @@ class _Undeclared:
     def __init__(self, model: FakeModel) -> None:
         """Bind *model*."""
         self._model = model
+        self._usage: TokenUsage | None = None
+        self._ttft_s: float | None = None
 
     def __call__(self, prompt: str) -> str:
-        """Delegate to the fake model."""
-        return self._model.complete(prompt)
+        """Delegate to the fake model, recording this turn's usage."""
+        response = self._model.complete(prompt)
+        if self._model.reports_usage:
+            self._usage = byte_upper_bound_usage(prompt, response)
+        self._ttft_s = self._model.reports_ttft
+        return response
+
+    def token_usage(self) -> TokenUsage | None:
+        """Return the usage of the last completion, if any was reported."""
+        return self._usage
+
+    def time_to_first_token(self) -> float | None:
+        """Return the last completion's TTFT, or ``None`` when not streaming.
+
+        Satisfies :class:`~creek_mcp.bench.protocols.FirstTokenReporting`
+        structurally either way: a non-streaming backend is one that answers
+        ``None``, not one that lacks the method.
+        """
+        return self._ttft_s
 
 
 class _Declared(_Undeclared):
@@ -173,8 +202,14 @@ BASE_WORKLOAD = Workload(
     cold_trials=1,
     warm_trials=2,
     concurrency_levels=(1,),
+    measure_tokens=False,
 )
-"""A small workload: one cold, two warm, one serial concurrency trial."""
+"""A small workload: one cold, two warm, one serial concurrency trial.
+
+The per-surface token pass is **off** here, unlike the shipped default, so the
+sweep tests can assert the sweeps' own model traffic — call counts and the
+evict/trial/sleep order — without the measurement phase's extra turns. The
+tests that exercise the pass pass ``measure_tokens=True`` explicitly."""
 
 
 def make_plan(

@@ -32,6 +32,7 @@ everything else (#1124).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import monotonic
 from typing import TYPE_CHECKING, Final
 from uuid import uuid4
 
@@ -112,6 +113,15 @@ class RequestContext:
         started: Whether the response has begun going out. Checked by the
             layers that would otherwise try to replace a response already on
             the wire — which is a ``RuntimeError``, not a refusal.
+        deadline: The :func:`time.monotonic` instant this request's own
+            deadline fires, set by
+            :class:`~creek_mcp.httpapi.middleware.limits.RequestTimeoutMiddleware`,
+            or ``None`` when no deadline layer is mounted. Recorded so a
+            handler can bound work it hands to something *outside* the
+            process — the shared inference pool's ``deadline_ms``, which must
+            never outlive the vault request that wanted the answer (ADR-0016
+            Decision 1 item 4). It names an instant, never a duration, because
+            a duration read later in the stack would restart the clock.
     """
 
     request_id: str
@@ -119,6 +129,18 @@ class RequestContext:
     route: str = UNMATCHED_ROUTE
     ceiling: TierCeiling = TierCeiling.OPEN
     started: bool = False
+    deadline: float | None = None
+
+    def remaining(self) -> float | None:
+        """Return the seconds left before this request's deadline fires.
+
+        Returns:
+            The remaining budget, which may be zero or negative once spent, or
+            ``None`` when no deadline layer recorded one.
+        """
+        if self.deadline is None:
+            return None
+        return self.deadline - monotonic()
 
 
 def bind_context(scope: Scope) -> RequestContext:

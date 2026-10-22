@@ -53,6 +53,7 @@ over every module in :mod:`creek_mcp` pins the modules that may name
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Final, Literal, Self, TypeAlias
 from urllib.parse import urlparse
@@ -82,6 +83,9 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.20",
+    "0.19",
+    "0.18",
     "0.17",
     "0.16",
     "0.15",
@@ -201,6 +205,28 @@ model-calling routes and one optional handshake field,
 ``request_key_providers``, withheld from callers below
 :data:`REQUEST_KEYS_SINCE_MINOR`. Every ``0.17`` response is byte-identical,
 so ``0.17`` stays in the window.
+
+Contract 0.19 (#1894) adds ``inference_source`` to three published responses,
+``inference_pool`` to the handshake, and the ``rate_limited`` code with its
+``429``. All three are withheld from a caller below
+:data:`PROVENANCE_SINCE_MINOR` — the two fields are omitted, and an admission
+refusal is served to such a caller as ``temporarily_unavailable``, the code it
+has always received for a shed request. So a ``0.18`` consumer validating its
+vendored closed schemas is answered byte-identically and stays in the window.
+
+Contract 0.20 (#1938) adds ``keyless_inference`` to the handshake, withheld
+from callers below :data:`KEYLESS_INFERENCE_SINCE_MINOR`, so every response a
+``0.19`` consumer can reach is byte-identical and ``0.19`` stays in the window.
+
+Contract 0.21 (#1903 step 6) serves ``rate_limited`` on
+``POST /v1/letters/{external_id}`` as well, so one per-account cap is reported
+by one surface. No model, field or status is added — ``429`` was already in the
+published set — and the only thing that moves is which route documents and
+reaches it, withheld from callers below
+:data:`LETTER_RATE_LIMITED_SINCE_MINOR`, which keeps every ``0.20`` letter
+response exactly as that minor published it. It is 0.21 and not 0.20 precisely
+because 0.20 had already shipped: see that constant for why reusing a published
+minor would have been the break this window exists to prevent.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -414,6 +440,142 @@ exists to unblock, and only on the reflections that found a compiled neighbour,
 which is the worst possible distribution of a failure.
 """
 
+PROVENANCE_SINCE_MINOR: Final[str] = "0.19"
+"""First contract minor that may see ADR-0016's three additions (#1894).
+
+One constant for all three — ``inference_source`` on the three model-backed
+responses, ``inference_pool`` on the handshake, and the ``rate_limited`` code —
+because they are one contract change and a consumer that can name any of them
+can name all of them. Splitting it into three would let a future edit withhold
+the field while serving the code, which is a combination no vendored schema
+describes. It is a literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
+KEYLESS_INFERENCE_SINCE_MINOR: Final[str] = "0.20"
+"""First contract minor whose handshake carries ``keyless_inference`` (#1938).
+
+Its own constant rather than :data:`PROVENANCE_SINCE_MINOR`, because it is its
+own contract change: a ``0.19`` consumer vendored a closed
+:class:`CapabilitiesResponse` without it. It is a literal for the reason
+:data:`_UPLOAD_MINOR` is.
+"""
+
+LETTER_RATE_LIMITED_SINCE_MINOR: Final[str] = "0.21"
+"""First contract minor that may meet ``rate_limited`` on the letter route.
+
+A *second* since-minor for one code, and the distinction it carries is which
+question is being asked. ``rate_limited`` and its ``429`` are 0.19's, so
+:data:`PROVENANCE_SINCE_MINOR` already answers "can this caller name the
+code?" — and a 0.19 caller can. What this constant answers is "does *this
+route* reach it?", because until 0.21 ``POST /v1/letters/{external_id}`` did
+not: the published document documented no ``429`` on it, and a cap arriving
+mid-letter was collapsed into the ``temporarily_unavailable`` every other
+provider failure earns. Serving the cap there is a response that *moves* on a
+route an already-published minor describes, and the only mechanism this
+contract has for that is a minor.
+
+**Which is why it is 0.21 rather than 0.20**, even though 0.20 is the minor
+this work was specified against. 0.20 shipped first, for ``keyless_inference``
+(#1938, the constant above), so by the time this landed 0.20 was itself an
+already-published minor describing this path — and a consumer that negotiated
+it for that field never agreed to a ``429`` on a letter. Reusing 0.20 would
+have been exactly the move the paragraph above forbids, committed by the
+change that wrote the paragraph.
+
+It is **not** a second dialect. The downgrade runs through the same
+:func:`~creek_mcp.httpapi.generation.served_error_code`, to the same code,
+with the same envelope and the same advisory ``Retry-After`` the reflection
+route has served since 0.19 — the datum that differs is when the route began
+reaching the code, which is exactly what a since-minor is.
+"""
+
+INFERENCE_SOURCE_LOCAL: Final[str] = "local"
+"""The answer came from a model whose dial never left the device (D1.11).
+
+Published only for a provider that declares
+:func:`~creek.classify.llm.providers.provider_egresses` ``False``, which today
+is the on-device Ollama path. It is deliberately **not** published for a
+backend that merely declines to be a readable cloud vendor: the attested
+enclave is unreadable and still remote, so an enclave-routed answer carries no
+``inference_source`` at all rather than this value (#1894).
+"""
+
+INFERENCE_SOURCE_POOL_CREEK: Final[str] = "pool:creek"
+"""The answer came from a Creek-run shared inference pool (ADR-0016 O3)."""
+
+_ATTESTED_POOL_PREFIX: Final[str] = "pool:attested:"
+_REQUEST_KEY_PREFIX: Final[str] = "request_key:"
+
+_VENDOR_SLUG: Final[str] = "[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+"""Every vendor name the two parameterised provenance values may carry.
+
+Narrow on purpose. One half of each of those values comes from the Machine
+environment or from a request header, so an unconstrained tail would publish
+caller- or operator-supplied bytes in a response field, inside a colon-
+separated value a consumer splits. A slug cannot carry a colon, a space or a
+line break, so the value stays parseable and carries no prose.
+"""
+
+INFERENCE_SOURCE_PATTERN: Final[str] = (
+    f"^(?:{INFERENCE_SOURCE_LOCAL}|{INFERENCE_SOURCE_POOL_CREEK}"
+    f"|{_ATTESTED_POOL_PREFIX}{_VENDOR_SLUG}|{_REQUEST_KEY_PREFIX}{_VENDOR_SLUG})$"
+)
+"""The closed provenance vocabulary, as the published schemas express it.
+
+A ``pattern`` rather than an enum because two of ADR-0016 Decision 1 item 11's
+four values are parameterised by vendor, and an enum would have to be rewritten
+— a contract change — every time a vendor is added or swapped. The constraint
+still reaches the committed schema, which is what stops the field from becoming
+a free-text channel.
+"""
+
+
+def attested_pool_source(vendor: str) -> str | None:
+    """Return the provenance value for a vendor-attested pool, or ``None``.
+
+    Args:
+        vendor: The attesting vendor's short name, as the Machine environment
+            names it.
+
+    Returns:
+        ``pool:attested:<vendor>``, or ``None`` when *vendor* is not a usable
+        slug. ``None`` means the caller omits the field: an unlabelled answer
+        is honest, where a label built from unvalidated bytes is not.
+    """
+    return _parameterised_source(_ATTESTED_POOL_PREFIX, vendor)
+
+
+def request_key_source(vendor: str) -> str | None:
+    """Return the provenance value for a writer's own request key, or ``None``.
+
+    Args:
+        vendor: The key's provider, one of
+            :class:`~creek.classify.llm.request_key.REQUEST_KEY_PROVIDERS`.
+
+    Returns:
+        ``request_key:<vendor>``, or ``None`` when *vendor* is not a usable
+        slug.
+    """
+    return _parameterised_source(_REQUEST_KEY_PREFIX, vendor)
+
+
+def _parameterised_source(prefix: str, vendor: str) -> str | None:
+    """Return *prefix* joined to *vendor*, or ``None`` when it would not match.
+
+    Args:
+        prefix: One of the two vendor-parameterised provenance prefixes.
+        vendor: The vendor name offered.
+
+    Returns:
+        The composed value when it satisfies
+        :data:`INFERENCE_SOURCE_PATTERN`, else ``None``. Checked against the
+        published pattern itself rather than against a second copy of the
+        rule, so the runtime value and the committed schema cannot disagree.
+    """
+    composed = f"{prefix}{vendor}"
+    return composed if re.match(INFERENCE_SOURCE_PATTERN, composed) else None
+
+
 CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.CAPABILITIES: _FOUNDING_MINOR,
     Capability.JOURNAL_UPSERT: _FOUNDING_MINOR,
@@ -602,7 +764,7 @@ class PraxisLifecycle(StrEnum):
 
 
 class ErrorCode(StrEnum):
-    """The ten wire error codes: nine from contract 0.2, one added at 0.8.
+    """The eleven wire error codes: nine from 0.2, one at 0.8, one at 0.19.
 
     There is deliberately **no** ``care_escalation`` member: an escalation is a
     successful, 200-shaped :class:`CareEscalationResponse`, because a person in
@@ -631,6 +793,29 @@ class ErrorCode(StrEnum):
             reachable only on ``POST /v1/uploads``.
         UNAVAILABLE: The vault is absent or unreadable; a human must act.
         TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.
+        RATE_LIMITED: The destination this call would have reached refused to
+            admit it (ADR-0016 Decision 1 items 4 and 8). **Relayed, never
+            minted**: this server keeps no hourly or in-flight counter, so the
+            refusal is the shared pool's own ``429`` or one from whichever
+            vendor the call reached — the writer's request key, or an
+            operator's cloud key on a self-hosted vault. A cap, **not** an
+            outage: it clears by waiting, which is the whole reason it is not
+            ``temporarily_unavailable``. The two concurrency limits in front of
+            every route are a different thing and still shed as
+            ``temporarily_unavailable``. Added at contract 0.19 (#1894) and
+            served only to callers declaring :data:`PROVENANCE_SINCE_MINOR` or
+            later; an older caller receives ``temporarily_unavailable``, which
+            is what it has always received for a shed request and the only
+            spelling its vendored vocabulary has. Reachable on
+            ``POST /v1/reflections`` from 0.19 and on
+            ``POST /v1/letters/{external_id}`` from
+            :data:`LETTER_RATE_LIMITED_SINCE_MINOR` (0.21) — **one** budget
+            either way, and that much is provable here: both routes dial the
+            single ``generation`` chokepoint, and the request this server sends
+            the pool carries no route, verb or capability, so a per-route
+            budget cannot exist even in principle. Whether the budget is scoped
+            per vault or per account is a pool-side fact this contract does not
+            publish.
         INTERNAL_ERROR: An unexpected server fault.
     """
 
@@ -643,6 +828,7 @@ class ErrorCode(StrEnum):
     UNSUPPORTED_SOURCE = "unsupported_source"
     UNAVAILABLE = "unavailable"
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+    RATE_LIMITED = "rate_limited"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -676,6 +862,7 @@ ERROR_STATUS: Final[dict[ErrorCode, int]] = {
     ErrorCode.UNSUPPORTED_SOURCE: 415,
     ErrorCode.UNAVAILABLE: 503,
     ErrorCode.TEMPORARILY_UNAVAILABLE: 503,
+    ErrorCode.RATE_LIMITED: 429,
     ErrorCode.INTERNAL_ERROR: 500,
 }
 """HTTP status for each wire error code.
@@ -693,6 +880,12 @@ carries one response object per status, so a code sharing ``422`` with
 ``INVALID_REQUEST`` could not be documented at all — and, more to the point, a
 client's generic "fix your JSON and retry" handling is exactly the wrong
 handling for "this file format is never going to work".
+
+``429`` is the one status contract 0.19 added, and the reasoning is 415's
+exactly: a client's "the service is briefly down" handling is the wrong
+handling for "you are over your own cap", and a code sharing ``503`` with
+``TEMPORARILY_UNAVAILABLE`` could not be documented at all, because the
+OpenAPI document carries one response object per status.
 
 ``PRIVACY_REFUSED`` is 403 rather than 404 on purpose. 404 would be the very
 oracle :attr:`ErrorCode.NOT_FOUND` is fenced off to avoid: a caller able to
@@ -727,6 +920,11 @@ ERROR_MESSAGES: Final[dict[ErrorCode, str]] = {
     ),
     ErrorCode.UNAVAILABLE: "the vault is not available to serve this request",
     ErrorCode.TEMPORARILY_UNAVAILABLE: "the service is briefly unable to answer",
+    # About the cap and nothing else. Not how many calls are in flight, not
+    # what the cap is, not when it resets: a refusal that quantified the
+    # vault's own recent model use would be a usage oracle on a shared pool,
+    # and the retry hint is the advisory ``Retry-After`` header's job.
+    ErrorCode.RATE_LIMITED: "this vault is over its model-call allowance",
     ErrorCode.INTERNAL_ERROR: "the server failed to complete this request",
 }
 """The one message per error code, and the only text an envelope may carry.
@@ -753,6 +951,7 @@ RETRY_POLICY: Final[dict[ErrorCode, RetryDisposition]] = {
     ErrorCode.UNSUPPORTED_SOURCE: RetryDisposition.TERMINAL,
     ErrorCode.UNAVAILABLE: RetryDisposition.RETRY_AFTER_OPERATOR_ACTION,
     ErrorCode.TEMPORARILY_UNAVAILABLE: RetryDisposition.RETRY_WITH_BACKOFF,
+    ErrorCode.RATE_LIMITED: RetryDisposition.RETRY_WITH_BACKOFF,
     ErrorCode.INTERNAL_ERROR: RetryDisposition.RETRY_WITH_BACKOFF,
 }
 """Retryability, keyed on the code alone — the #1082 answer.
@@ -1032,6 +1231,19 @@ class CapabilitiesResponse(_WireModel):
             ``X-Creek-Provider`` and ``X-Creek-Provider-Key``. Empty on a
             self-connected vault, which ignores request keys. Since contract
             0.18, and omitted for a caller declaring an earlier minor.
+        inference_pool: Whether this vault answers its model calls from the
+            shared confidential inference pool (ADR-0016). ``False`` on a
+            vault that runs its own model. Published so a consumer can detect
+            the route *before* dialling rather than inferring it from the
+            first answer's ``inference_source``. Since contract 0.19, and
+            omitted for a caller declaring an earlier minor.
+        keyless_inference: ``False`` when a model call carrying no writer key
+            is certain to be refused here before any model is dialled: a
+            managed vault with no shared pool pinned. ``True`` when such a
+            call may be attempted. A consumer reading ``False`` should ask
+            the writer for their key instead of charging for a pass that
+            cannot run. Since contract 0.20, and omitted for a caller
+            declaring an earlier minor.
     """
 
     status: CapabilitiesStatus = Field(description="Overall server readiness.")
@@ -1054,6 +1266,21 @@ class CapabilitiesResponse(_WireModel):
             "Vendors whose writer-supplied request key this vault will use for "
             "open and personal model calls; empty when request keys are "
             "ignored. Since contract 0.18."
+        ),
+    )
+    inference_pool: bool | None = Field(
+        default=None,
+        description=(
+            "Whether model calls are answered from the shared inference pool. "
+            "Since contract 0.19."
+        ),
+    )
+    keyless_inference: bool | None = Field(
+        default=None,
+        description=(
+            "False when a model call without a writer's request key is "
+            "refused before any model is dialled; true when one may be "
+            "attempted. Since contract 0.20."
         ),
     )
 
@@ -1351,6 +1578,16 @@ class LetterResponse(_WireModel):
             one is returned exactly as stored, so a draft put by
             ``PUT /v1/voice-drafts`` is never truncated on the way out.
         attribution: Fixed AI attribution and zero voice weight.
+        inference_source: The route that answered, one of ``pool:creek``,
+            ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``
+            (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted
+            for a caller declaring an earlier minor. Also omitted — rather
+            than guessed — on an answer this vocabulary does not label, which
+            today is an operator's own cloud key on a self-hosted vault or an
+            attested enclave (unreadable, and still off-device). The
+            consumer's use for the field is to notice a route it did not
+            expect, so a label the server cannot stand behind would be worse
+            than none.
     """
 
     status: Literal["ok"] = Field(description="Always ok; failure is an error.")
@@ -1365,6 +1602,14 @@ class LetterResponse(_WireModel):
     letter: str = Field(description="The letter text; free model prose.")
     attribution: VoiceDraftAttribution = Field(
         description="Fixed AI attribution and zero voice weight.",
+    )
+    inference_source: str | None = Field(
+        default=None,
+        pattern=INFERENCE_SOURCE_PATTERN,
+        description=(
+            "Route that answered: pool:creek, pool:attested:<vendor>, "
+            "request_key:<vendor> or local. Since contract 0.19."
+        ),
     )
 
 
@@ -1919,6 +2164,17 @@ class ClassificationResponse(_WireModel):
             resumable — that the honest next step is to call again rather than
             to treat the corpus as done. The *reasons* stay in the server log:
             each one names the file it failed on.
+        inference_source: The route that answered, one of ``pool:creek``,
+            ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``
+            (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted
+            for a caller declaring an earlier minor. Also omitted — rather
+            than guessed — on an answer this vocabulary does not label, which
+            today is an operator's own cloud key on a self-hosted vault or an
+            attested enclave (unreadable, and still off-device), and on a pass
+            that called no model at all, such as ``method=rules``. The
+            consumer's use for the field is to notice a route it did not
+            expect, so a label the server cannot stand behind would be worse
+            than none.
     """
 
     status: Literal["ok"] = Field(description="Always ok; failure is an error.")
@@ -1933,6 +2189,14 @@ class ClassificationResponse(_WireModel):
     praxis_marked: int = Field(ge=0, description="Fragments raised to praxis.")
     tags_extracted: int = Field(ge=0, description="Fragments that gained tags.")
     complete: bool = Field(description="Every visited fragment processed cleanly.")
+    inference_source: str | None = Field(
+        default=None,
+        pattern=INFERENCE_SOURCE_PATTERN,
+        description=(
+            "Route that answered: pool:creek, pool:attested:<vendor>, "
+            "request_key:<vendor> or local. Since contract 0.19."
+        ),
+    )
 
 
 class LinkRequest(_WireModel):
@@ -2213,6 +2477,16 @@ class ReflectionResponse(_WireModel):
         notes: The margin notes; empty when ``status`` is ``empty``.
         essay: Optional free prose. Ungrounded by construction.
         essay_grounded: Required, and only ``False`` is admissible at 0.2.
+        inference_source: The route that answered, one of ``pool:creek``,
+            ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``
+            (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted
+            for a caller declaring an earlier minor. Also omitted — rather
+            than guessed — on an answer this vocabulary does not label, which
+            today is an operator's own cloud key on a self-hosted vault or an
+            attested enclave (unreadable, and still off-device). The
+            consumer's use for the field is to notice a route it did not
+            expect, so a label the server cannot stand behind would be worse
+            than none.
     """
 
     status: Literal[ReflectionStatus.OK, ReflectionStatus.EMPTY] = Field(
@@ -2262,6 +2536,18 @@ class ReflectionResponse(_WireModel):
         default=None,
         max_length=_MAX_RELATED_EDDIES,
         description="Eddies the entry belongs to; absent when none.",
+    )
+    # Contract 0.19 (#1894). Dropped when ``None`` by the same ``_dumped``
+    # rule the two 0.9 fields take, and for the same reason: every published
+    # response schema is closed, so a caller validating its vendored 0.18
+    # schema rejects the whole response on a key it never negotiated.
+    inference_source: str | None = Field(
+        default=None,
+        pattern=INFERENCE_SOURCE_PATTERN,
+        description=(
+            "Route that answered: pool:creek, pool:attested:<vendor>, "
+            "request_key:<vendor> or local. Since contract 0.19."
+        ),
     )
 
 

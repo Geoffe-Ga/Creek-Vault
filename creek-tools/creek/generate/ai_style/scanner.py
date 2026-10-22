@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from creek.generate.ai_style.distance import (
     FeatureContribution,
     bad_direction_magnitude,
+    evidence_for,
     voice_distance,
 )
 from creek.generate.ai_style.model import Finding, ScanReport, Span
@@ -161,12 +162,15 @@ def _score_tell(
         if polarity is None
         else bad_direction_magnitude(polarity, draft_rate, user_rate)
     )
+    margin = config.default_margin if tell.margin is None else tell.margin
     contribution = FeatureContribution(
         feature_key=tell.feature_key,
         weight=config.weight_for(category=tell.category, feature_key=tell.feature_key),
         magnitude=magnitude,
+        # The score gates each family at the same margin the finding does
+        # (#1936), so the two can never disagree about whether it diverged.
+        margin=margin,
     )
-    margin = config.default_margin if tell.margin is None else tell.margin
     findings: list[Finding] = []
     if polarity is not None and magnitude > margin:
         direction: Direction = "over" if polarity == "avoid" else "under"
@@ -237,6 +241,7 @@ def scan(
     return ScanReport(
         findings=findings,
         deltas=deltas,
+        family_evidence={c.feature_key: evidence_for(c) for c in contributions},
         voice_distance=distance,
         thin_fingerprint=thin,
     )

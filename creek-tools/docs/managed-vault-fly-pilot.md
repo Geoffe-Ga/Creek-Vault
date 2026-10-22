@@ -90,10 +90,17 @@ separate Fly secret-backed files and are not part of that snapshot.
 - Build the control image from `Dockerfile.control-plane`. Its root bootstrap
   validates that `/data` is the exact mounted volume, narrows ownership and
   modes only for `/data`, `/data/runtime-secrets`, and the seven declared
-  secret-backed files, then irreversibly drops groups, gid, and uid to `10001`
+  secret-backed files, plus the organization pool admin key when — and only
+  when — the Machine declares `CREEK_POOL_ADMIN_KEY_IN_USE = "1"`
+  ([ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md)
+  Decision 3.4; see [the pool runbook](pool-measurement-pin.md) section 4). It
+  then irreversibly drops groups, gid, and uid to `10001`
   before importing the long-running runtime. Secret values in environment
   variables, symlinked files, empty files, extra links, and oversized files
-  are startup failures.
+  are startup failures; the admin key's environment form is refused in both
+  regimes. After the mounts, startup verifies the pool admin key's custody and
+  refuses with its own content-free code when a key declared in use is
+  malformed, undated or expired.
 - A replay vault Machine explicitly starts as root only through
   `creek_mcp.provisioning.fly_vault_bootstrap`. That bootstrap validates the
   exact `/vault` mount and the two exact injected consumer/replay files,
@@ -105,12 +112,40 @@ separate Fly secret-backed files and are not part of that snapshot.
   before accepting a vault. On a fresh ext4 mount, bootstrap removes `lost+found`
   only when it is the sole entry and an empty, non-symlink directory. Recovered
   data and existing vault contents are never removed or overwritten.
-- Managed vaults are local-only for the operator, with one exception for the
-  writer ([ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md),
+- Managed vaults are local-only for the operator, with two exceptions
+  (amended by [ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md)).
+
+  The first is for the **writer**
+  ([ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md),
   amended 2026-10-16). A request that carries the writer's own Anthropic or
   OpenAI key in `X-Creek-Provider` and `X-Creek-Provider-Key` is answered by
   that vendor for OPEN and PERSONAL content, for that request only; INTIMATE
   is still forced local or refused, and the key is never stored or logged.
+
+  The second is the **shared confidential warm-inference pool**. A managed
+  vault ships no inference runtime and a 1 GB Machine cannot hold a model, so
+  OPEN and PERSONAL inference without a writer's key routes to one pool
+  instead of to a local runtime that does not exist. The vault's half of that
+  contract (#1894) is a `pool` provider behind
+  `creek/classify/llm/pool_boundary.py` and exactly one destination beyond
+  loopback, `CREEK_POOL_URL`, read from the Machine environment and settable
+  from no vault config. The pool is not cloud — no operator key is involved
+  and no consent variable is read — and it is not intimate-eligible either:
+  INTIMATE never leaves the vault process under either implementation, forced
+  local or refused at the one `ModelRouter` chokepoint before any dial. The
+  pool is pinned to the same `00-Creek-Meta`-external manifest the local model
+  uses, by `model_name` and `runtime_inventory_digest`, and a pool reporting
+  any other identity is refused before a prompt is sent. `creek-container-health
+  --check pool` reports that identity, and makes no generation, because a
+  canary on the pool would be a billed vendor call. There are no retries and
+  no second destination: pool down, identity mismatch or an admission refusal
+  is a refusal, never a substituted model. What the operator pins, how a
+  re-pin is reviewed, which ADR-0016 Decision 3.3 conditions are still open
+  owner escalations, and the warm-minimum evidence T19 asks for are in
+  [pool-measurement-pin.md](pool-measurement-pin.md). The vendor is not
+  chosen and no spend is authorized, so nothing there may be run against a
+  vendor yet.
+
   Everything below governs the operator's key and is unchanged. The
   provisioner sets `CREEK_MANAGED_VAULT=1`
   on every vault Machine, on both the replay bootstrap and the default image
@@ -144,7 +179,16 @@ placeholder drift, and delimiter-bearing coordinates and pins `app`, one
 `[[http_service.checks]]`, one volume mount, `force_https`, restart policy, and
 one `[[files]]` entry per base64 Fly app secret. It also pins a rolling deploy
 with one unavailable Machine, `SIGTERM`, a 300-second Fly kill timeout, and
-`on-failure` with three retries. The operator must first create
+`on-failure` with three retries. `--pool-admin-key-expires-at` is **optional**
+and omitting it is the default: the rendered config then declares
+`CREEK_POOL_ADMIN_KEY_IN_USE = "0"`, carries no `CREEK_POOL_ADMIN_KEY_B64`
+entry, and requires no admin-key secret — which is the regime a pilot rendered
+today is in, since no vendor is chosen and no admin key exists. Passing a
+timezone-aware instant switches the config into the in-use regime: it appends
+the `CREEK_POOL_ADMIN_KEY_B64` `[[files]]` entry, so that Fly app secret must
+then be set out of band like the other seven, and it makes every admin-key
+custody refusal binding. The operator
+must first create
 the named app and volume and set each declared base64 secret out of band. The
 live `deploy` mode requires the SHA-256 of a private, short-lived authorization
 record bound to the exact app, organization slug and private provider

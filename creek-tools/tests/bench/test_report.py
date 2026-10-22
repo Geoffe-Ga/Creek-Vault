@@ -8,6 +8,7 @@ from creek_mcp.bench.deadline import Verdict
 from creek_mcp.bench.metadata import HostMetadata
 from creek_mcp.bench.outcome import Outcome
 from creek_mcp.bench.report import build_report, capacity_basis, overall_verdict
+from creek_mcp.bench.tokens import unmeasured_tokens
 from creek_mcp.bench.trial import Phase, Sweep, Trial
 from creek_mcp.httpapi.middleware import limits
 from tests.bench.conftest import run_metadata
@@ -39,8 +40,13 @@ def _trial(
         input_words=4,
         latency_s=latency_s,
         generation_s=None,
+        ttft_s=None,
         outcome=outcome,
         model_resident_bytes=None,
+        prompt_tokens=None,
+        output_tokens=None,
+        max_output_tokens=None,
+        token_basis=None,
     )
 
 
@@ -112,7 +118,7 @@ def test_build_report_groups_judges_and_omits_empty_sweeps() -> None:
         _trial(1, latency_s=1e9, sweep=Sweep.CONTEXT),
         _trial(1),
     ]
-    report = build_report(run_metadata(), _HOST, trials)
+    report = build_report(run_metadata(), _HOST, trials, unmeasured_tokens())
     assert set(report.per_sweep) == {Sweep.COLD_WARM, Sweep.CONTEXT, Sweep.CONCURRENCY}
     assert report.per_sweep[Sweep.COLD_WARM].verdict is Verdict.FITS
     assert report.per_sweep[Sweep.CONTEXT].verdict is Verdict.EXCEEDS
@@ -142,7 +148,8 @@ def test_cold_start_is_judged_separately_from_warm(
     trials = [_phase_trial(Phase.COLD, _BUDGET + 1)] + [
         _phase_trial(Phase.WARM, 1.0)
     ] * 30
-    summary = build_report(run_metadata(), _HOST, trials).per_sweep[Sweep.COLD_WARM]
+    report = build_report(run_metadata(), _HOST, trials, unmeasured_tokens())
+    summary = report.per_sweep[Sweep.COLD_WARM]
     assert summary.latency.p95_s == 1.0
     assert summary.per_phase[Phase.COLD].latency.p95_s == _BUDGET + 1
     assert summary.per_phase[Phase.COLD].verdict is Verdict.EXCEEDS

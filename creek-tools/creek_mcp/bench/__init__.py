@@ -16,11 +16,20 @@ Three properties are load-bearing:
   ``tests/test_adepthood_contract_models.py``), so the harness cannot sit there
   and is run as ``python -m creek_mcp.bench`` (``scripts/bench.sh``) rather
   than as a ``creek`` subcommand.
-- **Hermetic and local-only.** The default ``fake`` mode needs no model, key or
-  network. The ``live`` mode targets an operator-supplied Ollama endpoint, and
-  every provider is wrapped in :class:`~creek_mcp.bench.local_only.LocalOnlyFactory`,
-  which refuses a cloud provider before any trial — there is no silent cloud
-  fallback.
+- **Hermetic by default, and never a cloud API.** The default ``fake`` mode
+  needs no model, key or network. The ``live`` mode targets an
+  operator-supplied Ollama endpoint, or — with ``--provider pool`` — the
+  shared confidential warm-inference pool of ADR-0016, which is deliberately
+  remote and records itself as such. Every provider is wrapped in
+  :class:`~creek_mcp.bench.local_only.LocalOnlyFactory`, which refuses a cloud
+  provider and a cloud-offload model tag before any trial — there is no silent
+  cloud fallback. The pool is not cloud (ADR-0016 Decision 6), so it is
+  admitted at construction and contained at the dial instead: a public pool
+  endpoint needs ``--allow-remote-host``, and the report records
+  ``endpoint_scope: remote`` beside ``describes_model_host: false``.
+  ``--provider pool`` is hermetic too unless the mode is ``live``: it drives
+  the real pool client against an in-process fake pool, so no vendor is
+  contacted and nothing is billed.
 - **Content-free.** The corpus is synthetic, confined to a temp directory, and
   never a real vault. The report carries only enums, numbers and
   pattern-constrained identifiers: no prompt, no entry text, no model output.
@@ -34,5 +43,17 @@ from __future__ import annotations
 
 from typing import Final
 
-HARNESS_VERSION: Final[str] = "1.0.0"
-"""Version of the harness and its report schema, recorded in every run."""
+HARNESS_VERSION: Final[str] = "1.2.0"
+"""Version of the harness and its report schema, recorded in every run.
+
+1.1.0 added the measured per-reflection token block (#1893): ``prompt_tokens``,
+``output_tokens`` and ``max_output_tokens`` on every trial, a token summary per
+sweep and phase, and the run-level ``tokens_per_reflection``. Additive, so
+``report.schema_version`` is unchanged — a 1.0.0 consumer still parses a 1.1.0
+report, and a reader needing measured counts can require this version.
+
+1.2.0 added ADR-0016 R2's named budget table (#1895): ``budgets``, a
+``throughput`` block per sweep and phase, ``latency.ttft_p95_s``, and
+``ttft_s`` / ``token_basis`` on every trial. Additive on the same terms, so
+``report.schema_version`` is again unchanged; a reader needing the latency
+budgets, time-to-first-token or tokens/s must require this version."""

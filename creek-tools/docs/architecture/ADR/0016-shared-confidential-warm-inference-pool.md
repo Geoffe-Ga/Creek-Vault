@@ -1,12 +1,17 @@
 # ADR-0016: A shared, confidential, always-warm inference pool for managed vaults
 
-- **Status**: Proposed (drafted 2026-10-17 by Fable, claude-fable-5-1, for
-  #1874; awaiting the owner's answers to Q1 and Q2 in Decision 0). The
-  answers are recorded as a comment on #1849 and folded in by a follow-up
-  docs PR that sets `Accepted (owner decision YYYY-MM-DD)`, as ADR-0015 did.
-  Under a Yes to Q1, Accepted takes effect only once the adepthood ADR 0009
-  amendment merges; until then O3 is the fallback design. Nothing here is a
-  public claim; every claim waits for adepthood B24
+- **Status**: Accepted (owner decision 2026-10-20), drafted 2026-10-17 by
+  Fable, claude-fable-5-1, for #1874. The owner's answers to Decision 0 are
+  recorded as a comment on #1849: Q1 is **Yes**, selecting **O5**, the
+  vendor-attested confidential pool of Decision 3, and accepting the R7
+  deviation explicitly (ciphertext-only egress inside an attestation-bound
+  channel in place of no egress); Q2 is **option (i)**, so the pool serves
+  the embedding model too, under O5 only with an attested embedding model
+  inside the measurement set, falling back to (iii) otherwise. Accepted
+  takes effect only once the adepthood ADR 0009 amendment merges; that
+  amendment has not merged, so until then O3 is the fallback design and this
+  record is not yet in force. Nothing here is a public claim; every claim
+  waits for adepthood B24
   ([adepthood#3076](https://github.com/Geoffe-Ga/adepthood/issues/3076)).
 - **Date**: 2026-10-17
 - **Driving issue**: #1874; parent #1849 (B05); measurement #1850 (B09); model
@@ -267,7 +272,7 @@ are detailed in Decision 2.3.
 | **O2** Creek-run CPU pool on Fly (`performance-8x` 16 GB USD 264.01/mo or `performance-16x` 32 GB USD 528.02/mo, iad/ewr) | Yes | Unmeasured; ADR-0007 rejected CPU-small models for the voice stage; #1850 can measure it | Operator, Fly | Refused | USD 2,640–5,280 / USD 26–53 | Fly private network (Flycast) | Allowed ("a runtime we run"); a paid runtime, 11–21× the pilot cap |
 | **O3** Creek-run GPU pool off Fly, bridged by WireGuard (RunPod L40S 48 GB ≈ USD 796/mo; A100 80 GB ≈ USD 1,307/mo; Hetzner GEX63 96 GB EUR 999/mo; GEX131-1 96 GB EUR 1,197.30/mo; plus setup fees) | Yes | Unmeasured; GPU-class, plausible for #1875's candidates | Operator, the GPU host provider, Fly (as host of the gateway Machine) | Refused | USD 7,960–13,070 or EUR 9,990–11,973 / USD 80–131 or EUR 100–120 (one host; capacity unmeasured) | Flycast on each vault network to a gateway under mutual TLS, one WireGuard tunnel to the host | Allowed ("a runtime we run"); a paid runtime, 32–52× the pilot cap |
 | **O4** Managed inference provider, plain no-retention (DeepInfra Qwen3-32B USD 0.08 / 0.28 per M, "zero retention") | Yes | Vendor-grade | Operator, Fly, **the vendor** | Refused | USD 0.24 / USD 0.24 | Public internet, TLS | **Not selectable**: the app's key would carry journal content to a cloud model (item 3) |
-| **O5** Vendor-attested confidential inference (Privatemode gpt-oss-120b EUR 0.43 / 1.70 per M; Tinfoil gpt-oss-120b USD 0.15 / 0.60, GLM-5.3-Flash USD 0.40 / 1.25) | Yes | Vendor-grade; measured by #1850 before a cohort | Operator and Fly at the vault; at inference only the vendor's attested image. Vendor and host are excluded to the extent the measured image is open-source, reproducibly built and audited, which this record has not verified | Refused by this record; the only pool whose inference leg could qualify later | EUR 1.29 / EUR 1.29 (Privatemode gpt-oss-120b); USD 0.45 / USD 0.45 (Tinfoil gpt-oss-120b) | Public internet, inside an attestation-bound encrypted channel (R7 deviation) | **Not selectable as written**: a cloud model on the app's account (item 3), not "we run" (item 4), D05 not pursued. No listed reopen trigger covers it: both name the runtime we control, and one is conditioned on D05 being proven first. Selecting O5 is a new owner decision outside the triggers |
+| **O5** Vendor-attested confidential inference (Privatemode gpt-oss-120b EUR 0.43 / 1.70 per M; Tinfoil gpt-oss-120b USD 0.15 / 0.60, GLM-5.3-Flash USD 0.40 / 1.25) | Yes | Vendor-grade; measured by #1850 before a cohort | Operator and Fly at the vault; at inference only the vendor's attested image. **Vendor-asserted**: vendor and host are excluded only to the extent the measured image is open-source, reproducibly built and audited, which condition 3.3 (f) covers and this record has not verified for either candidate ([runbook](../../pool-measurement-pin.md)) | Refused by this record; the only pool whose inference leg could qualify later | EUR 1.29 / EUR 1.29 (Privatemode gpt-oss-120b); USD 0.45 / USD 0.45 (Tinfoil gpt-oss-120b) | Public internet, inside an attestation-bound encrypted channel (R7 deviation) | **Not selectable as written**: a cloud model on the app's account (item 3), not "we run" (item 4), D05 not pursued. No listed reopen trigger covers it: both name the runtime we control, and one is conditioned on D05 being proven first. Selecting O5 is a new owner decision outside the triggers |
 | **O6** Creek-run attested GPU pool (Azure `NCC40ads_H100_v5` USD 6.98/h ≈ USD 5,095/mo; Phala H100 TEE USD 3.08/h ≈ USD 2,248/mo) | Yes | GPU-class | Nobody, once D05 is proven on that hardware | Refused until the whole chain is attested | USD 22,480–50,950 / USD 225–510 | WireGuard to the host | Allowed only through D05 in full; a paid runtime, 90–204× the pilot cap |
 
 Reading the table: O1 is rejected by the owner. O4 is excluded by a ratified

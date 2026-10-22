@@ -228,3 +228,12 @@ class FleetTelemetry:
     unconfirmed_deletions: int
     oldest_unconfirmed_deletion_seconds: int | None
     sources: Mapping[str, str]
+    pool_input_tokens: int | None = None
+    pool_output_tokens: int | None = None
+    """Pool tokens the operator copied in from the vendor's usage page.
+
+    The pool is a metered vendor line the provider API does not expose, so
+    like snapshots and egress it is injected rather than measured (ADR-0016
+    Decision 4).  ``None`` means uninjected, which the cost estimate lists as
+    unpriced rather than zeroing.
+    """

@@ -15,11 +15,12 @@ exception handling.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import os
 import secrets
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -36,8 +37,22 @@ from creek.classify.llm.local_boundary import (
     ollama_get,
     ollama_post,
 )
+from creek.classify.llm.pool_boundary import (
+    POOL_REQUEST_ID_HEADER,
+    POOL_REQUEST_TIMEOUT,
+    PoolBoundaryError,
+    PoolPromptTooLongError,
+    admit_pool_url,
+    pool_generate,
+    pool_list_models,
+    pool_prompt_within_cap,
+    pool_response_ok,
+    require_pool_request,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import anthropic
     import openai
     from google import genai
@@ -55,6 +70,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ANTHROPIC_CLOUD_WARNING",
     "DEFAULT_MODELS",
+    "POOL_IDENTITY_SCHEME",
     "AnthropicCompletion",
     "AnthropicProvider",
     "Completion",
@@ -63,13 +79,22 @@ __all__ = [
     "GeminiProvider",
     "OllamaProvider",
     "OpenAIProvider",
+    "PoolIdentityError",
+    "PoolProvider",
     "ProviderRateLimitError",
     "build_provider",
     "call_enclave",
+    "call_pool",
+    "check_pool_available",
     "cloud_warning",
     "known_providers",
+    "pool_identity_digest",
+    "pool_identity_matches",
     "provider_display_name",
+    "provider_egresses",
+    "provider_intimate_eligible",
     "provider_is_cloud",
+    "reported_pool_identity",
     "verify_enclave_attestation",
 ]
 
@@ -374,6 +399,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "gemini": "gemini-3.5-flash",
     "ollama": "mistral",
     "openai": "gpt-5.4",
+    "pool": "gpt-oss-120b",
 }
 
 
@@ -391,6 +417,12 @@ class AnthropicProvider:
 
     is_cloud: bool = True
     """Anthropic sends fragment content off-device; gated by consent."""
+
+    intimate_eligible: bool = False
+    """A readable cloud vendor may never be shown INTIMATE content."""
+
+    egresses: bool = True
+    """The prompt is sent to Anthropic's API; it leaves the device."""
 
     PROVIDER_NAME: str = "Anthropic"
     """Display name woven into consent and cloud-egress messages."""
@@ -942,6 +974,20 @@ class OllamaProvider:
     is_cloud: bool = False
     """Ollama runs locally; content never leaves the device."""
 
+    intimate_eligible: bool = True
+    """On-device inference: the one place INTIMATE content may be read."""
+
+    egresses: bool = False
+    """The dial stays on the device: loopback, and loopback-only when pinned.
+
+    The one registered backend that may publish ``local`` provenance. A
+    self-hosted operator can still point ``ollama_url`` at a LAN host, which
+    this class-level flag cannot see; a managed vault cannot, because the
+    container sets
+    :data:`~creek.classify.llm.local_boundary.LOOPBACK_ONLY_ENV` and every
+    non-loopback endpoint is refused before the dial.
+    """
+
     PROVIDER_NAME: str = "Ollama"
     """Display name (local; never appears in a cloud-egress message)."""
 
@@ -1267,6 +1313,20 @@ class EnclaveProvider:
     is_cloud: bool = False
     """The enclave is operator-unreadable once attested; content stays private."""
 
+    intimate_eligible: bool = True
+    """Attest-then-mount makes the enclave unreadable, so INTIMATE may route here."""
+
+    egresses: bool = True
+    """The prompt is sent to a remote confidential-compute endpoint.
+
+    Unreadable and on-device are different claims, and the enclave makes
+    only the first. :attr:`is_cloud` is ``False`` above because no operator
+    cloud key and no consent variable are involved; the socket still goes to
+    the enclave operator's host over ``https``. That is why the published
+    ``inference_source`` may not call an enclave answer ``local`` (#1894,
+    ADR-0016 T15) — a socket spy would contradict it.
+    """
+
     PROVIDER_NAME: str = "Enclave (GPU-CC)"
     """Display name for the confidential-compute endpoint."""
 
@@ -1371,6 +1431,12 @@ class OpenAIProvider:
 
     is_cloud: bool = True
     """OpenAI sends fragment content off-device; gated by consent."""
+
+    intimate_eligible: bool = False
+    """A readable cloud vendor may never be shown INTIMATE content."""
+
+    egresses: bool = True
+    """The prompt is sent to the OpenAI API; it leaves the device."""
 
     PROVIDER_NAME: str = "OpenAI"
     """Display name woven into consent and cloud-egress messages."""
@@ -1654,6 +1720,12 @@ class GeminiProvider:
     is_cloud: bool = True
     """Gemini sends fragment content off-device; gated by consent."""
 
+    intimate_eligible: bool = False
+    """A readable cloud vendor may never be shown INTIMATE content."""
+
+    egresses: bool = True
+    """The prompt is sent to the Gemini API; it leaves the device."""
+
     PROVIDER_NAME: str = "Gemini"
     """Display name woven into consent and cloud-egress messages."""
 
@@ -1894,10 +1966,423 @@ def _extract_gemini_usage(response: object) -> dict[str, int] | None:
     return counts or None
 
 
+POOL_IDENTITY_SCHEME: Final[str] = "creek-pool-identity/1"
+"""Version tag bound into every pool identity digest.
+
+A pool runtime is not Ollama, so it has no ``/api/tags`` manifest digest to
+report. The #1855 manifest schema is unchanged, so
+``runtime_inventory_digest`` is instead **defined** for a pool runtime as the
+SHA-256 of this tag joined with the runtime name, the runtime version and the
+pinned model name, newline separated. That binds the model to the runtime image
+serving it — which is what the field means for Ollama too — without adding a
+field (ADR-0016 R8).
+"""
+
+_POOL_ECHO_MISMATCH: Final[str] = (
+    "the shared inference pool answered for a different model; discarding it"
+)
+_POOL_MALFORMED: Final[str] = "the shared inference pool answered unusably"
+_POOL_REFUSED: Final[str] = "the shared inference pool refused the request"
+_POOL_RATE_LIMITED: Final[str] = "the shared inference pool is rate limiting"
+
+_POOL_PROMPT_TOO_LONG: Final[str] = (
+    "the prompt exceeds the shared inference pool's token cap"
+)
+
+_POOL_IDENTITY_TIMEOUT: Final[float] = 2.0
+"""Seconds allowed for the identity listing; it precedes every prompt."""
+
+
+class PoolIdentityError(RuntimeError):
+    """The pool is not the pinned runtime and model — no data is sent.
+
+    Raised before a prompt leaves the vault when the pool's identity listing
+    disagrees with the operator's manifest, and after a generation when the
+    answer names a different model. Either way nothing is substituted: the
+    caller sees a refusal, never another model's prose.
+    """
+
+
+def pool_identity_digest(
+    runtime_name: str, runtime_version: str, model_name: str
+) -> str:
+    """Return the canonical pool identity digest for one runtime and model.
+
+    Args:
+        runtime_name: The pool runtime's name, as the pool reports it.
+        runtime_version: The pool runtime's exact version.
+        model_name: The pinned model reference.
+
+    Returns:
+        The lowercase hex SHA-256 defined by :data:`POOL_IDENTITY_SCHEME`.
+    """
+    canonical = "\n".join(
+        (POOL_IDENTITY_SCHEME, runtime_name, runtime_version, model_name)
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def reported_pool_identity(payload: object, model_name: str) -> str | None:
+    """Return the identity digest a pool listing implies, or ``None``.
+
+    Args:
+        payload: The decoded body of the pool's identity listing.
+        model_name: The pinned model the listing must offer.
+
+    Returns:
+        The digest recomputed from the reported runtime and *model_name*, or
+        ``None`` when the listing is malformed or does not offer that model.
+    """
+    if not isinstance(payload, dict):
+        return None
+    runtime = payload.get("runtime")
+    models = payload.get("models")
+    if not isinstance(runtime, dict) or not isinstance(models, list):
+        return None
+    name = runtime.get("name")
+    version = runtime.get("version")
+    if not isinstance(name, str) or not isinstance(version, str):
+        return None
+    offered = any(
+        isinstance(item, dict) and item.get("name") == model_name for item in models
+    )
+    return pool_identity_digest(name, version, model_name) if offered else None
+
+
+def pool_identity_matches(
+    payload: object, *, model_name: str, inventory_digest: str
+) -> bool:
+    """Return whether a pool listing reports exactly the pinned identity.
+
+    Args:
+        payload: The decoded identity listing.
+        model_name: The manifest's pinned model reference.
+        inventory_digest: The manifest's ``runtime_inventory_digest``.
+
+    Returns:
+        ``True`` only when the listing offers *model_name* and the digest it
+        implies equals *inventory_digest*.
+    """
+    reported = reported_pool_identity(payload, model_name)
+    expected = _normalise_digest(inventory_digest)
+    return (
+        reported is not None
+        and bool(expected)
+        and hmac.compare_digest(reported, expected)
+    )
+
+
+def check_pool_available(
+    *,
+    model_name: str,
+    inventory_digest: str | None = None,
+    budget: float | None = None,
+) -> bool:
+    """Return whether the pool offers *model_name*, at its pinned identity.
+
+    Mirrors :func:`check_ollama_available`: the pinned digest is supplied by
+    the caller that holds the manifest, so this module never reads it.
+
+    Args:
+        model_name: The model the pool must offer.
+        inventory_digest: The manifest's pinned identity digest. When ``None``
+            only the listing is checked, not the pin.
+        budget: Seconds left in the vault request. ``None`` means the caller
+            tracks no deadline and the listing's own ceiling applies; a budget
+            already spent refuses rather than taking that ceiling.
+
+    Returns:
+        ``True`` when the pool answers and reports the expected identity;
+        ``False`` on any refusal, transport failure or mismatch.
+    """
+    ceiling = _POOL_IDENTITY_TIMEOUT if budget is None else budget
+    try:
+        response = pool_list_models(budget=ceiling)
+    except PoolBoundaryError:
+        return False
+    if not pool_response_ok(response):
+        return False
+    if inventory_digest is None:
+        return reported_pool_identity(response.payload, model_name) is not None
+    return pool_identity_matches(
+        response.payload,
+        model_name=model_name,
+        inventory_digest=inventory_digest,
+    )
+
+
+def _admit_configured_destination(config: LLMConfig) -> None:
+    """Refuse a vault-config URL that tries to move the pool destination.
+
+    ``LLMConfig`` carries no pool URL, but it does carry a cloud gateway base
+    (``api_base``) and an enclave URL, either of which a writable-vault edit
+    could set on a pool stage. Both are admitted through
+    :func:`~creek.classify.llm.pool_boundary.admit_pool_url`, so anything but
+    the Machine-pinned destination is refused before any dial (ADR-0016 T2).
+
+    Args:
+        config: The stage configuration the router resolved.
+
+    Raises:
+        PoolDestinationError: When a configured URL is not the pinned
+            destination.
+    """
+    for offered in (config.api_base, config.enclave_url):
+        if offered:
+            admit_pool_url(offered)
+
+
+def _pool_status_error(status: int) -> RuntimeError:
+    """Return the refusal for a non-200 pool status; no body is read."""
+    if status == _HTTP_TOO_MANY_REQUESTS:
+        return ProviderRateLimitError(_POOL_RATE_LIMITED)
+    return RuntimeError(f"{_POOL_REFUSED} (HTTP {status})")
+
+
+def _pool_answer(payload: object) -> Mapping[str, object] | None:
+    """Return a pool response body as a mapping, or ``None`` when unusable."""
+    return payload if isinstance(payload, dict) else None
+
+
+def _pool_text(answer: Mapping[str, object]) -> str | None:
+    """Return the generated text, or ``None`` when the field is unusable."""
+    text = answer.get("response")
+    return text if isinstance(text, str) else None
+
+
+def _pool_usage(answer: Mapping[str, object]) -> dict[str, int] | None:
+    """Return the integer token counts the pool reported, or ``None``.
+
+    Non-integer and missing fields are skipped, so a partial usage object
+    never raises and never reaches a caller as a bogus count.
+    """
+    usage = answer.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    counts = {key: value for key, value in usage.items() if isinstance(value, int)}
+    return counts or None
+
+
+def _pool_completion(payload: object, model: str) -> Completion:
+    """Return the :class:`Completion` a pool answer carries.
+
+    Args:
+        payload: The decoded generation response.
+        model: The model the request asked for.
+
+    Returns:
+        The normalised completion.
+
+    Raises:
+        PoolIdentityError: When the answer names a different model — it is
+            discarded rather than returned under the pinned model's name.
+        RuntimeError: When the answer is not a usable shape, or carries no
+            text. A ``RuntimeError`` and not a ``TypeError``: an unusable
+            answer is the pool misbehaving, not the vault calling this wrong,
+            and every call site already degrades on ``RuntimeError``.
+    """
+    answer = _pool_answer(payload)
+    if answer is None:
+        raise RuntimeError(_POOL_MALFORMED)
+    if answer.get("model") != model:
+        raise PoolIdentityError(_POOL_ECHO_MISMATCH)
+    text = _pool_text(answer)
+    if text is None:
+        raise RuntimeError(_POOL_MALFORMED)
+    return Completion(text=text, usage=_pool_usage(answer))
+
+
+def call_pool(
+    config: LLMConfig,
+    prompt: str,
+    *,
+    timeout: float,
+    max_tokens: int | None = None,
+    system: str | None = None,
+) -> Completion:
+    """Send *prompt* to the pinned pool destination and return its answer.
+
+    Exactly one dial, to one destination, with no retry and no fallback to
+    another model or another host (ADR-0016 R9, Decision 1 item 10).
+
+    **The request shape is closed** and is exactly Decision 1 item 4's: the
+    pinned identity, the prompt, the **declared tier**, ``deadline_ms`` capped
+    at :data:`~creek.classify.llm.pool_boundary.POOL_MAX_DEADLINE_MS`, and the
+    optional ``max_tokens`` and ``system``. The random request id rides in
+    :data:`~creek.classify.llm.pool_boundary.POOL_REQUEST_ID_HEADER`, a header
+    and not a body field, because it is a correlation key rather than an
+    inference argument. ``stream`` is **not** sent: this boundary reads one
+    whole answer, and an unknown field against a closed shape is a refusal the
+    vault would have earned for nothing.
+
+    Transmitting the tier is what lets the pool refuse ``intimate`` at all. It
+    is defence in depth and never the first line — the
+    :class:`~creek.classify.llm.router.ModelRouter` chokepoint has already
+    refused or redirected an INTIMATE request before any dial, because by the
+    time a pool could refuse, the plaintext would have left the vault. A
+    context that declared no admitted tier is refused here rather than dialled
+    with the field guessed.
+
+    Args:
+        config: The stage's configuration, read only for the model name.
+        prompt: The fully-formatted prompt.
+        timeout: Seconds left for this call; caps the boundary's own ceiling.
+        max_tokens: Optional output ceiling forwarded to the pool.
+        system: Optional system prompt forwarded to the pool.
+
+    Returns:
+        The pool's :class:`Completion`.
+
+    Raises:
+        PoolIdentityError: When the answer names a different model.
+        ProviderRateLimitError: On a 429 from the pool.
+        RuntimeError: On any other refusal.
+        PoolBoundaryError: On a transport failure, a cancelled dial, or a
+            context that declared no admitted tier.
+    """
+    _admit_configured_destination(config)
+    if not pool_prompt_within_cap(prompt):
+        raise PoolPromptTooLongError(_POOL_PROMPT_TOO_LONG)
+    scope = require_pool_request()
+    model = _resolve_configured_model(config.model, DEFAULT_MODELS["pool"])
+    payload: dict[str, object] = {
+        "model": model,
+        "prompt": prompt,
+        "tier": scope.require_tier(),
+        "deadline_ms": scope.deadline_ms(timeout),
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if system:
+        payload["system"] = system
+    response = pool_generate(
+        payload,
+        budget=timeout,
+        headers={POOL_REQUEST_ID_HEADER: scope.request_id},
+    )
+    if not pool_response_ok(response):
+        raise _pool_status_error(response.status)
+    return _pool_completion(response.payload, model)
+
+
+class PoolProvider:
+    """The shared confidential warm-inference pool (ADR-0016, #1894).
+
+    One destination beyond loopback, pinned in the Machine environment and
+    owned by :mod:`creek.classify.llm.pool_boundary`. The pool holds the warm
+    weights a 1 GB managed-vault Machine cannot, so a reflection never waits
+    on a model load.
+
+    :attr:`is_cloud` is ``False`` because no operator cloud key is involved
+    and no consent variable is read: the pool is not a readable vendor API.
+    :attr:`intimate_eligible` is ``False`` all the same, and that is the
+    distinction this class exists to make. ADR-0016 Decision 5 keeps INTIMATE
+    content inside the vault process under *either* implementation, so the
+    :class:`~creek.classify.llm.router.ModelRouter` chokepoint refuses or
+    redirects an INTIMATE fragment bound here before any dial. The pool's own
+    tier refusal is defence in depth only — by the time the pool could refuse,
+    the plaintext would already have left.
+
+    Attributes:
+        config: The LLM configuration, read only for the model name.
+    """
+
+    is_cloud: bool = False
+    """No operator cloud key and no consent variable; not a readable vendor."""
+
+    intimate_eligible: bool = False
+    """INTIMATE never leaves the vault process, attested pool or not."""
+
+    egresses: bool = True
+    """One destination beyond loopback, pinned in the Machine environment.
+
+    Not cloud and not on-device either. The pool's provenance is named by
+    its own two values rather than by ``local``.
+    """
+
+    PROVIDER_NAME: str = "Shared Pool"
+    """Display name for the shared confidential inference pool."""
+
+    DEFAULT_MODEL: str = DEFAULT_MODELS["pool"]
+    """Default model served by the pool when the config does not override it."""
+
+    REQUEST_TIMEOUT: float = POOL_REQUEST_TIMEOUT
+    """HTTP request timeout for completion calls, in seconds."""
+
+    IDENTITY_TIMEOUT: float = _POOL_IDENTITY_TIMEOUT
+    """Timeout for the identity listing that precedes every prompt."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        """Store the configuration; performs no network I/O.
+
+        Args:
+            config: LLM provider configuration (model name only; the
+                destination is a Machine-environment fact).
+        """
+        self.config = config
+
+    @property
+    def model(self) -> str:
+        """The configured pool model identifier.
+
+        Returns:
+            ``config.model`` verbatim when set; :attr:`DEFAULT_MODEL` when
+            unset (``None`` or blank).
+        """
+        return _resolve_configured_model(self.config.model, self.DEFAULT_MODEL)
+
+    @property
+    def available(self) -> bool:
+        """Whether the pinned pool destination offers this provider's model.
+
+        Returns:
+            ``True`` when the pool's identity listing offers :attr:`model`.
+            The manifest pin is checked by
+            :func:`creek_mcp.model_pin.pinned_model_serves`, which holds it.
+        """
+        try:
+            _admit_configured_destination(self.config)
+        except PoolBoundaryError:
+            return False
+        return check_pool_available(model_name=self.model, budget=self.IDENTITY_TIMEOUT)
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> Completion:
+        """Send *prompt* to the pool and return a normalized :class:`Completion`.
+
+        Args:
+            prompt: The fully-formatted prompt.
+            max_tokens: Optional output-token ceiling.
+            system: Optional system prompt forwarded to the pool.
+
+        Returns:
+            A :class:`Completion` wrapping the pool's response text.
+
+        Raises:
+            PoolIdentityError: When the answer names a different model.
+            ProviderRateLimitError: On a 429 from the pool.
+            RuntimeError: On any other refusal.
+        """
+        return call_pool(
+            self.config,
+            prompt,
+            timeout=self.REQUEST_TIMEOUT,
+            max_tokens=max_tokens,
+            system=system,
+        )
+
+
 #: Registry mapping the ``LLMConfig.provider`` string to its provider class.
 #: The value is the concrete class (not the ``LLMProvider`` protocol) so it is
-#: both constructible and exposes the class-level ``is_cloud`` flag; widen the
-#: union as new providers land.
+#: both constructible and exposes the class-level ``is_cloud``,
+#: ``intimate_eligible`` and ``egresses`` flags; widen the union as new
+#: providers land. mypy rejects a member that is missing any of the three, so
+#: a new backend cannot be registered without answering all three questions.
 _PROVIDER_REGISTRY: dict[
     str,
     type[
@@ -1906,6 +2391,7 @@ _PROVIDER_REGISTRY: dict[
         | OpenAIProvider
         | GeminiProvider
         | EnclaveProvider
+        | PoolProvider
     ],
 ] = {
     "anthropic": AnthropicProvider,
@@ -1913,6 +2399,7 @@ _PROVIDER_REGISTRY: dict[
     "openai": OpenAIProvider,
     "gemini": GeminiProvider,
     "enclave": EnclaveProvider,
+    "pool": PoolProvider,
 }
 
 
@@ -1960,6 +2447,68 @@ def provider_is_cloud(provider: str) -> bool:
     """
     provider_cls = _PROVIDER_REGISTRY.get(provider)
     return bool(provider_cls is not None and provider_cls.is_cloud)
+
+
+def provider_egresses(provider: str) -> bool:
+    """Report whether a prompt sent to *provider* leaves the device (#1894).
+
+    The honest destination question, and deliberately **not**
+    :func:`provider_is_cloud`. That flag means "an operator cloud key, behind
+    the cloud-egress consent gate", which is a question about billing and
+    consent; two registered backends answer ``False`` to it and still open a
+    socket to a remote host — the attested enclave (unreadable, not local) and
+    the shared pool (one pinned destination beyond loopback). Anything that
+    needs to know whether the content left the machine must read this instead,
+    above all the published ``inference_source``: ADR-0016 T15 requires that
+    label to match a socket spy's observed destination on every route, and
+    ``local`` about an enclave answer is the one value it could contradict.
+
+    Read from the class-level ``egresses`` flag without instantiating, exactly
+    as :func:`provider_is_cloud` reads ``is_cloud``. The provider registry's
+    own type is what forces every registered backend to declare it, so a new
+    backend cannot be added without answering the question.
+
+    An unregistered provider is assumed to egress. This is the opposite
+    default to :func:`provider_is_cloud`, which answers ``False`` for an
+    unknown name so the classifier prints no spurious consent warning. Here
+    the fail-closed direction is the other way: a name this process cannot
+    resolve is no evidence that nothing left the device, and the cost of
+    guessing wrong is a published ``local`` on an answer that egressed.
+
+    Args:
+        provider: The ``LLMConfig.provider`` string.
+
+    Returns:
+        ``True`` when the named provider sends content off-device, or when it
+        names no registered backend at all.
+    """
+    provider_cls = _PROVIDER_REGISTRY.get(provider)
+    return provider_cls is None or provider_cls.egresses
+
+
+def provider_intimate_eligible(provider: str) -> bool:
+    """Report whether *provider* may ever be shown INTIMATE content (#1894).
+
+    Read from the class-level ``intimate_eligible`` flag, without
+    instantiating, exactly as :func:`provider_is_cloud` reads ``is_cloud``.
+    This is a strictly narrower question than "is it cloud": the shared
+    inference pool is not a readable cloud vendor, yet ADR-0016 Decision 5
+    keeps INTIMATE content inside the vault process regardless, so ``pool``
+    answers ``False`` here while answering ``False`` to
+    :func:`provider_is_cloud` as well.
+
+    An unregistered provider is **not** eligible. Config validation rejects
+    unknown provider names at load, so this branch is a fail-closed backstop
+    rather than a reachable configuration.
+
+    Args:
+        provider: The ``LLMConfig.provider`` string.
+
+    Returns:
+        ``True`` only for a registered provider that declares itself eligible.
+    """
+    provider_cls = _PROVIDER_REGISTRY.get(provider)
+    return bool(provider_cls is not None and provider_cls.intimate_eligible)
 
 
 def known_providers() -> tuple[str, ...]:

@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Final, Protocol, TypeAlias
 
 from creek._fslock import VaultLockTimeoutError
 from creek.care.guardrail import CARE_POLICY
+from creek.classify.llm.providers import ProviderRateLimitError
 from creek.voice_drafts import (
     VoiceDraftAccessDeniedError,
     VoiceDraftAction,
@@ -104,6 +105,14 @@ class LetterRefusal(StrEnum):
             the caller's ceiling.
         PROVIDER_UNAVAILABLE: No provider may serve this routing tier — it is
             unavailable, unconsented, unpinned, or the router refused to egress.
+        RATE_LIMITED: The dial was admitted nowhere: the shared pool refused
+            admission, or the vendor a writer's request key spends on answered
+            ``429``. Split from ``PROVIDER_UNAVAILABLE`` because only one of
+            the two clears by waiting, and because the reflection route beside
+            this one has reported the distinction since contract 0.19 while
+            dialling the very same ``generation`` chokepoint against the very
+            same account (ADR-0016 Decision 1 items 4 and 8; #1903 step 6).
+            Nothing is stored, exactly as for every other refusal.
         EMPTY_LETTER: The model's turn was blank; nothing is stored.
         STORAGE_BUSY: The Voice Draft mutation lock could not be taken in time.
         STORAGE_INVALID: The addressed slot exists but is not a valid draft.
@@ -111,6 +120,7 @@ class LetterRefusal(StrEnum):
 
     ABOVE_CEILING = "above_ceiling"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    RATE_LIMITED = "rate_limited"
     EMPTY_LETTER = "empty_letter"
     STORAGE_BUSY = "storage_busy"
     STORAGE_INVALID = "storage_invalid"
@@ -275,11 +285,23 @@ def _existing_letter(
 
 
 def _generate(call: LetterCall, source: LetterSource) -> str | LetterRefusal:
-    """Dial the tier-routed model once and return the bounded letter."""
+    """Dial the tier-routed model once and return the bounded letter.
+
+    The cap clause is ordered **first** and that ordering is the whole of
+    #1903 step 6 on this side of the seam:
+    :class:`~creek.classify.llm.providers.ProviderRateLimitError` subclasses
+    ``RuntimeError``, so the broad clause below used to swallow it and report a
+    per-account admission refusal as an unavailable provider — while
+    ``creek_mcp/tools/reflect.py``, dialling the same chokepoint, separated the
+    two. A cap clears by waiting and an outage may not, and the writer is owed
+    the difference on whichever route they happened to ask on.
+    """
     tier = routing_tier(call.ceiling, source.tier)
     try:
         llm = call.build_factory()(tier, max_tokens=LETTER_MAX_OUTPUT_TOKENS)
         completion = llm(build_letter_prompt(source))
+    except ProviderRateLimitError:
+        return LetterRefusal.RATE_LIMITED
     except (RuntimeError, OSError, ValueError):
         # ``IntimateRoutingError`` is a ``RuntimeError``: the router refused to
         # egress and there is no local backend. It never falls back to cloud.

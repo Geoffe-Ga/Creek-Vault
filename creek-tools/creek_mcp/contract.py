@@ -20,8 +20,93 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.18.0"
+CONTRACT_VERSION: Final[str] = "0.21.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.21.0 (#1903 step 6, ADR-0016): **one cap, one surface.**
+``rate_limited`` is served on ``POST /v1/letters/{external_id}`` as well as on
+``POST /v1/reflections``, so a caller refused admission for a model call is
+told the same thing by both model-backed routes it can meet that refusal on —
+the same
+``429``, the same closed code, the same envelope and the same advisory
+``Retry-After``, through the one
+:func:`creek_mcp.httpapi.generation.served_error_code`.
+
+The cap itself does not move and never was per route: both routes resolve the
+one ``generation`` stage through ``_bounded_generation_factory``, so the refusal
+is the shared pool's admission decision or the ``429`` of whichever vendor the
+call reached, and a single budget was already answering both. This server mints
+no cap of its own — it keeps no counter — and the pool request shape carries no
+route, so a per-route budget could not exist even in principle; whether the
+pool's budget is per vault or per account is not visible from here.
+
+What 0.19 left split was the
+*reporting* — a cap arriving mid-letter was collapsed into the
+``temporarily_unavailable`` that every other provider failure earns, because
+``ProviderRateLimitError`` subclasses ``RuntimeError`` and the letter tool
+caught the base class. A caller rate limited on one route and silently told an
+outage story on the other is being told two things about one limit.
+
+No model, field, status or route is added; ``429`` was already in the published
+set. The one thing that moves is which route documents and reaches the code, so
+it is withheld from callers below
+:data:`~creek_mcp.api.models.LETTER_RATE_LIMITED_SINCE_MINOR` and every ``0.20``
+letter response stays exactly as ``0.20`` published it. ``0.20`` therefore stays
+in the window.
+
+**It is 0.21 and not 0.20 for the reason this record exists.** 0.20 was already
+published by #1938 for ``keyless_inference``, so 0.20 is a minor that already
+describes this path; a consumer that negotiated it for that field never agreed
+to a ``429`` on a letter. Serving one to it would be the move this contract's
+whole version window forbids, and would be the ``incompatible_version`` class of
+failure rather than a cosmetic one.
+
+0.20.0 (#1938): ``GET /v1/capabilities`` gains ``keyless_inference``. It is
+``false`` when this vault is certain that a model call carrying no writer key
+will be refused before any model is dialled. Today that means a managed vault
+with no shared pool pinned: it ships no inference runtime and refuses its
+operator's cloud key. ``inference_pool: false`` could not say this, because a
+self-connected vault running its own model reports the same. Without the field
+a consumer could only learn it by charging a writer, dialling, and refunding a
+``temporarily_unavailable`` that retrying never clears. ``true`` means a
+keyless call may be attempted, which is all a self-connected vault has ever
+promised. The field is withheld from callers below 0.20, so every response a
+``0.19`` consumer can reach is byte-identical, and ``0.19`` stays in the window.
+
+0.19.0 (#1894, ADR-0016): **provenance, and the admission refusal the shared
+inference pool needs.** Three additions, all gated on this minor.
+
+``inference_source`` is published on :class:`creek_mcp.api.models.ReflectionResponse`,
+:class:`~creek_mcp.api.models.LetterResponse` and
+:class:`~creek_mcp.api.models.ClassificationResponse` (which a consumer reads
+inside ``JobStatusResponse.result``): the route that answered, one of
+``pool:creek``, ``pool:attested:<vendor>``, ``request_key:<vendor>`` or
+``local``. It is ADR-0016 Decision 1 item 11's "every answer names its route",
+and it is what lets adepthood treat an answer whose route differs from the one
+it disclosed as its existing ``409`` stale-route refusal. The field is
+**absent** rather than guessed on an answer this vocabulary does not label —
+neither an operator's own cloud key on a self-hosted vault nor an attested
+enclave is the pool, the writer's key or local, the enclave because it is
+unreadable without being on-device — and absent on a pass that called no model
+at all, such as ``method=rules`` classification. A label the server cannot
+stand behind would be worse than no label, because the consumer's whole use for
+the field is to detect a route it did not expect.
+
+``GET /v1/capabilities`` gains ``inference_pool``: whether this vault answers
+model calls from the shared pool, so a consumer can detect the route before
+dialling rather than inferring it from the first answer.
+
+``rate_limited`` joins the closed error vocabulary — HTTP **429**, disposition
+``retry_with_backoff`` in the published ``retry-policy.json``, with an advisory
+``Retry-After`` header that is deliberately outside that table. It is the pool's
+admission refusal (Decision 1 items 4 and 8): a per-vault cap, not an outage,
+and a writer should be shown a wait. It is served **only** to callers declaring
+0.19 or later; an older minor keeps receiving ``temporarily_unavailable``, which
+is what it has always received for a shed request and what its vendored closed
+vocabulary can name. ``429`` joins the published status set.
+
+``0.18`` stays in the window: every response a ``0.18`` consumer can reach is
+byte-identical, because all three additions are withheld from it.
 
 0.18.0 (#1873, ADR-0015): a writer's request-scoped provider key.
 ``POST /v1/reflections``, ``POST /v1/letters/{external_id}`` and

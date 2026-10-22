@@ -18,6 +18,12 @@ The sweeps answer the four capacity questions in the D04 decision record:
   threads, the way ``/v1`` serves reads in worker threads.
 - **idle** — evict, wait the idle period, then resume.
 
+After the sweeps, :func:`_measure_tokens` runs the per-surface token pass
+(:mod:`creek_mcp.bench.tokens`): one **untimed** turn each for the ungrounded
+reflection, the grounded reflection and the letter route, which is what
+replaces ADR-0016's 2,500 + 128 planning assumption. It contributes no
+:class:`~creek_mcp.bench.trial.Trial`, so no verdict moves because of it.
+
 Every refusal — a malformed workload, a cloud provider, an unpinned live run —
 happens before the corpus is written or a request is sent.
 """
@@ -30,13 +36,29 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
-import httpx
-
 from creek.care.guardrail import acute_distress_guard
-from creek_mcp.bench.corpus import Corpus, build_corpus, entry_text
+from creek_mcp.bench.corpus import (
+    CONSUMER,
+    Corpus,
+    build_corpus,
+    entry_text,
+    no_grounding,
+)
 from creek_mcp.bench.metadata import RunMetadata, capture_host
-from creek_mcp.bench.outcome import Outcome, TrialProbe, classify_outcome, probe_factory
+from creek_mcp.bench.outcome import (
+    TRIAL_FAILURES,
+    TrialProbe,
+    classify_outcome,
+    probe_factory,
+    reflect_outcome,
+)
 from creek_mcp.bench.report import build_report
+from creek_mcp.bench.tokens import (
+    PROMPT_OVERHEAD_TOKENS,
+    TokenMeasurement,
+    measure_tokens_per_reflection,
+    unmeasured_tokens,
+)
 from creek_mcp.bench.trial import Phase, Sweep, Trial
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.reflect import GroundingSession, reflect_tool
@@ -45,34 +67,14 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from creek.classify.privacy_filter import PrivacyTierOverride
     from creek_mcp.bench.local_only import LocalOnlyFactory
     from creek_mcp.bench.metadata import CpuKind
     from creek_mcp.bench.ollama_client import PinnedModel
     from creek_mcp.bench.protocols import Retriever
     from creek_mcp.bench.report import BenchReport
+    from creek_mcp.bench.tokens import TokensPerReflection
 
 logger = logging.getLogger(__name__)
-
-CONSUMER: Final[str] = "capacity-bench"
-"""Consumer id on the synthetic corpus's audit rows."""
-
-_ANSWERED: Final[frozenset[str]] = frozenset({"ok", "empty"})
-"""Reflect statuses meaning the model answered.
-
-``empty`` (no verbatim-valid note survived parsing) is a *quality* result, not
-a capacity failure: the model was reached and replied within the deadline.
-Quality is scored separately (the report's ``quality_score`` hook).
-"""
-
-_TRIAL_FAILURES: Final[tuple[type[BaseException], ...]] = (
-    MemoryError,
-    OSError,
-    httpx.HTTPError,
-    RuntimeError,
-    ValueError,
-)
-"""Exception types a trial may end in. Anything else is a harness bug."""
 
 _BAD_LEVEL: Final[str] = "concurrency levels must be at least 1"
 _BAD_COUNT: Final[str] = "trial counts must be non-negative"
@@ -82,14 +84,6 @@ _BAD_CONTEXT: Final[str] = (
     "and num_predict"
 )
 
-PROMPT_OVERHEAD_TOKENS: Final[int] = 1536
-"""Token allowance for reflect's prompt around the entry.
-
-An upper bound, not an estimate: it covers the template's *byte* length with
-every grounding slot filled and the largest note budget (1,448 bytes at
-``a5d28a5``), and a byte-level tokenizer never spends less than one byte per
-token. ``tests/bench/test_runner.py`` fails if reflect's template outgrows it.
-"""
 _LIVE_NEEDS_PIN: Final[str] = "a live run needs a digest-verifying backend"
 
 
@@ -112,6 +106,11 @@ class Workload:
         concurrency_levels: Simultaneous reflections per concurrency step.
         idle_cycles: Evict-wait-resume cycles.
         idle_seconds: The wait in each idle cycle.
+        measure_tokens: Whether to run the per-surface token pass (#1893)
+            after the sweeps: one untimed turn each for the ungrounded
+            reflection, the grounded reflection and the letter route. On by
+            default, because every ADR-0016 cost figure needs it; off for a
+            run that is only interested in latency.
     """
 
     seed: int = 0
@@ -124,6 +123,7 @@ class Workload:
     concurrency_levels: tuple[int, ...] = (1,)
     idle_cycles: int = 0
     idle_seconds: float = 0.0
+    measure_tokens: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,23 +188,18 @@ class _Harness:
         return entry_text(seed=self.plan.workload.seed, index=index, words=words)
 
 
-def _no_grounding(query: str, vault: Path, override: PrivacyTierOverride) -> list[str]:
-    """The hermetic grounder: nothing, so no embedding model is loaded."""
-    del query, vault, override
-    return []
+def _reported_ttft(ttft_s: float | None) -> float | None:
+    """Return a first-token time only when the backend reported a usable one.
 
-
-def _trial_outcome(
-    probe: TrialProbe, exc: BaseException | None, result: dict[str, Any] | None
-) -> Outcome:
-    """Decide a trial's outcome from what the probe and reflect each saw."""
-    if probe.outcome is not None:
-        return probe.outcome
-    if exc is not None:
-        return classify_outcome(exc)
-    if result is not None and result.get("status") in _ANSWERED:
-        return Outcome.OK
-    return Outcome.ERROR
+    A negative figure is a skewed clock, not a measurement. Clamping it to
+    ``0.0`` would publish "the first token arrived instantly", which is the
+    one thing :attr:`Trial.ttft_s` promises ``None`` never means. ``None`` is
+    the honest clamp: the backend reported something, and it is unusable, so
+    the time to first token is unknown.
+    """
+    if ttft_s is None or ttft_s < 0.0:
+        return None
+    return ttft_s
 
 
 def run_trial(
@@ -231,10 +226,11 @@ def run_trial(
             privacy_tier_ceiling=TierCeiling.OPEN,
             consumer=CONSUMER,
         )
-    except _TRIAL_FAILURES as caught:
+    except TRIAL_FAILURES as caught:
         exc = caught
     latency = plan.clock() - start
-    outcome = _trial_outcome(probe, exc, result)
+    outcome = reflect_outcome(probe, exc, result)
+    usage = probe.usage
     if exc is not None:
         logger.debug("bench trial raised %s", type(exc).__name__)
     logger.info(
@@ -252,8 +248,13 @@ def run_trial(
         input_words=len(spec.content.split()),
         latency_s=max(latency, 0.0),
         generation_s=probe.generation_s,
+        ttft_s=_reported_ttft(probe.ttft_s),
         outcome=outcome,
         model_resident_bytes=_resident_bytes(plan),
+        prompt_tokens=usage.prompt_tokens if usage is not None else None,
+        output_tokens=usage.output_tokens if usage is not None else None,
+        max_output_tokens=probe.max_output_tokens,
+        token_basis=usage.basis if usage is not None else None,
     )
 
 
@@ -265,7 +266,7 @@ def _resident_bytes(plan: BenchPlan) -> int | None:
     """
     try:
         return plan.backend.resident_bytes()
-    except _TRIAL_FAILURES as exc:
+    except TRIAL_FAILURES as exc:
         logger.debug("bench residency probe raised %s", type(exc).__name__)
         return None
 
@@ -287,7 +288,7 @@ def _evict_then_run(
     """
     try:
         harness.plan.backend.evict()
-    except _TRIAL_FAILURES as exc:
+    except TRIAL_FAILURES as exc:
         logger.debug("bench evict raised %s", type(exc).__name__)
         return Trial(
             sweep=spec.sweep,
@@ -296,8 +297,13 @@ def _evict_then_run(
             input_words=len(spec.content.split()),
             latency_s=0.0,
             generation_s=None,
+            ttft_s=None,
             outcome=classify_outcome(exc),
             model_resident_bytes=None,
+            prompt_tokens=None,
+            output_tokens=None,
+            max_output_tokens=None,
+            token_basis=None,
         )
     if pause_s is not None:
         harness.plan.sleeper(pause_s)
@@ -422,6 +428,43 @@ _SAME_HOST_SCOPES: Final[frozenset[str]] = frozenset({"fake", "loopback"})
 """Endpoint scopes where the model runs on the harness's own host."""
 
 
+def _describes_model_host(metadata: RunMetadata) -> bool:
+    """Return whether the harness's host facts describe the model's host too.
+
+    A fake run answers in process, so they do. A real runtime at a loopback
+    endpoint runs on this host, so they do. A **pool** never does, even on
+    loopback: ADR-0016 Decision 3 item 1 puts a vendor's attesting proxy in
+    the vault image as a loopback sidecar, and the weights it fronts are the
+    vendor's. Claiming this machine's cores and memory described them would
+    be a false capacity fact.
+    """
+    if metadata.endpoint_scope == "fake":
+        return True
+    return metadata.provider != "pool" and metadata.endpoint_scope in _SAME_HOST_SCOPES
+
+
+def _measure_tokens(harness: _Harness) -> TokensPerReflection:
+    """Run the per-surface token pass, or report that it was skipped.
+
+    It runs *after* the sweeps and takes entry indices beyond every trial's,
+    so no measured turn can reuse text a timed one already reflected and no
+    runtime cache can serve one from the other.
+    """
+    plan = harness.plan
+    if not plan.workload.measure_tokens:
+        return unmeasured_tokens()
+    return measure_tokens_per_reflection(
+        TokenMeasurement(
+            vault_path=harness.corpus.root,
+            factory=plan.backend.factory,
+            clock=plan.clock,
+            seed=plan.workload.seed,
+            index=harness.corpus.entry_count + harness.next_index,
+            words=plan.workload.query_words,
+        )
+    )
+
+
 def run_bench(
     plan: BenchPlan,
     corpus_root: Path,
@@ -456,7 +499,7 @@ def run_bench(
         entries=plan.workload.entries,
         words_per_entry=plan.workload.words_per_entry,
     )
-    retrieve = _no_grounding if metadata.grounding == "none" else None
+    retrieve = no_grounding if metadata.grounding == "none" else None
     harness = _Harness(plan=plan, corpus=corpus, retrieve=retrieve)
     session = GroundingSession()
     trials = [
@@ -465,10 +508,11 @@ def run_bench(
         *_concurrency(harness, session),
         *_idle(harness, session),
     ]
+    tokens = _measure_tokens(harness)
     host = capture_host(
         model_store or corpus.root,
         cpu_kind=cpu_kind,
         model_store=model_store is not None,
-        describes_model_host=metadata.endpoint_scope in _SAME_HOST_SCOPES,
+        describes_model_host=_describes_model_host(metadata),
     )
-    return build_report(metadata, host, trials)
+    return build_report(metadata, host, trials, tokens)

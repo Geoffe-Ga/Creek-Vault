@@ -32,6 +32,12 @@ from creek_mcp.provisioning.models import (
     ResourceState,
     RoutableAllocation,
 )
+from creek_mcp.provisioning.pool_bundle import (
+    PoolCredentialInventory,
+    PoolRuntimeBundle,
+    pool_machine_files,
+    pool_runtime_env,
+)
 from creek_mcp.provisioning.replay_contract import is_replay_state
 from creek_mcp.provisioning.routing import FlyReplayTarget, PrivateVaultTarget
 
@@ -151,13 +157,24 @@ class FlyCredential:
 
 @dataclass(frozen=True, slots=True)
 class FlyRuntimeSecrets:
-    """Secret-manager output installed as files in one Machine."""
+    """Secret-manager output installed as files in one Machine.
+
+    ``pool`` is the activation's stored pool bundle (ADR-0016 Decision 1 items
+    1 to 3): the model package manifest, ``CREEK_POOL_URL`` and the pool
+    credential, versioned per activation.  ``_runtime_config`` and
+    ``_runtime_secret_files`` read it from here rather than from the fleet
+    policy, so ``_verify_machine`` compares every Machine against its own
+    activation's stored version and a fleet re-pin rejects nothing until that
+    activation is rolled.  ``None`` is the pool-free path: a self-hosted-shaped
+    allocation, and the standing O3 fallback, both unchanged.
+    """
 
     consumer_credential: str = field(repr=False)
     replay_state: str = field(repr=False)
     consumer_registry: bytes = field(repr=False)
     tls_certificate: bytes = field(repr=False)
     tls_private_key: bytes = field(repr=False)
+    pool: PoolRuntimeBundle | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Refuse incomplete bundles before creating a billable resource."""
@@ -293,13 +310,21 @@ class FlyProviderDriver:
         credential: FlyCredential,
         secrets: FlySecretManager,
         client: httpx.Client | None = None,
+        *,
+        pool_credentials: PoolCredentialInventory | None = None,
     ) -> None:
-        """Bind policy and secret boundaries without exposing their contents."""
+        """Bind policy and secret boundaries without exposing their contents.
+
+        *pool_credentials* is the vendor key listing of ADR-0016 Decision 1
+        item 3, injected so the fleet report can flag a surviving credential;
+        absent, no credential is inventoried.
+        """
         if credential.organization != policy.organization:
             raise ValueError("Fly credential organization does not match policy")
         self._policy = policy
         self._credential = credential
         self._secrets = secrets
+        self._pool_credentials = pool_credentials
         self._client = client or httpx.Client(
             base_url=policy.api_base_url,
             timeout=httpx.Timeout(30),
@@ -514,7 +539,39 @@ class FlyProviderDriver:
                 self._volume_resource(allocation_id, volume)
                 for volume in self._objects(volumes, "Fly volume list")
             )
+        resources.extend(self._pool_credential_resources(activation_ids))
         return tuple(sorted(resources, key=_resource_key))
+
+    def _pool_credential_resources(
+        self,
+        activation_ids: Sequence[str],
+    ) -> tuple[ProviderResource, ...]:
+        """Inventory live pool credentials, so none is left behind (T11).
+
+        Without this a credential that survived a deletion would be invisible
+        to the fleet report; with it the existing orphan path flags it, because
+        its allocation has no desired row.  The listing itself is a vendor call
+        and so sits behind the adapter interface the attesting-provider issue
+        owns; with no adapter injected there is nothing to inventory.
+        """
+        if self._pool_credentials is None:
+            return ()
+        allocations = {
+            self._reference(activation).allocation_id for activation in activation_ids
+        }
+        return tuple(
+            ProviderResource(
+                record.provider_allocation_id,
+                ResourceClass.CREDENTIAL,
+                ResourceState.OTHER,
+                None,
+                None,
+                record.provider_ref,
+            )
+            for record in self._pool_credentials.list_pool_credentials(
+                sorted(allocations)
+            )
+        )
 
     def _organization_app_names(self) -> tuple[str, ...]:
         """Discover app names from the credential's one organization."""
@@ -718,7 +775,7 @@ class FlyProviderDriver:
         runtime_secrets: FlyRuntimeSecrets,
     ) -> dict[str, Any]:
         encoded_files = self._runtime_secret_files(runtime_secrets)
-        runtime = self._runtime_config(reference)
+        runtime = self._runtime_config(reference, runtime_secrets)
         return {
             "name": reference.machine_name,
             "region": self._policy.region,
@@ -758,10 +815,20 @@ class FlyProviderDriver:
         self,
         runtime_secrets: FlyRuntimeSecrets,
     ) -> tuple[tuple[str, bytes], ...]:
-        """Return only the secret files required by the selected runtime."""
+        """Return only the secret files required by the selected runtime.
+
+        The activation's pool files, when it has a bundle, are appended on
+        **both** runtimes: the manifest and the credential's own files, in the
+        bundle's declared order (Decision 6, T12).
+        """
         consumer = (
             "/run/secrets/creek_consumer_tokens",
             runtime_secrets.consumer_registry,
+        )
+        pool = (
+            ()
+            if runtime_secrets.pool is None
+            else pool_machine_files(runtime_secrets.pool)
         )
         if self._policy.fly_replay_enabled:
             return (
@@ -770,24 +837,38 @@ class FlyProviderDriver:
                     "/run/secrets/creek_replay_state",
                     runtime_secrets.replay_state.encode(),
                 ),
+                *pool,
             )
         return (
             consumer,
             ("/run/secrets/tls.crt", runtime_secrets.tls_certificate),
             ("/run/secrets/tls.key", runtime_secrets.tls_private_key),
+            *pool,
         )
 
-    def _runtime_config(self, reference: _AllocationRef) -> dict[str, object]:
-        """Return the managed marker plus Fly-only bootstrap fields.
+    def _runtime_config(
+        self,
+        reference: _AllocationRef,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> dict[str, object]:
+        """Return the managed marker, pool bundle fields and bootstrap fields.
 
         Every managed Machine carries :data:`MANAGED_VAULT_ENV` (#1863). The
         non-replay path runs the image's default entry point, which
         self-hosted containers share, so the marker is the only way that
         runtime knows to refuse cloud consent. Fly coordinates alone cannot
         stand in for it: self-hosted Fly deployments have them too.
+
+        The pool entries come from *runtime_secrets*, never from the fleet
+        policy, so this stays a function of the activation (Decision 1 item 1).
         """
+        pool = (
+            {}
+            if runtime_secrets.pool is None
+            else pool_runtime_env(runtime_secrets.pool)
+        )
         if not self._policy.fly_replay_enabled:
-            return {"env": {MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER}}
+            return {"env": {MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER, **pool}}
         return {
             # Fly ignores config.user; process overrides need both the user
             # and command rather than inheriting config.init.exec.
@@ -808,6 +889,7 @@ class FlyProviderDriver:
                 "CREEK_CONTAINER_EXPECTED_FLY_APP": reference.app_name,
                 "CREEK_CONTAINER_EXPECTED_FLY_REGION": self._policy.region,
                 MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER,
+                **pool,
             },
             "init": {},
         }
@@ -846,7 +928,7 @@ class FlyProviderDriver:
             }
             for path, value in self._runtime_secret_files(runtime_secrets)
         ]
-        runtime = self._runtime_config(reference)
+        runtime = self._runtime_config(reference, runtime_secrets)
         expected_config_keys = {
             "image",
             "rootfs",

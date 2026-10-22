@@ -214,7 +214,7 @@ def test_estimate_uses_injected_then_projected_then_month_to_date_running_hours(
     assert month_to_date.components["volume"] == Decimal("1.00")
     assert month_to_date.components["stopped_rootfs"] == Decimal("0.10")
     assert month_to_date.estimated_month == Decimal("1.11")
-    assert month_to_date.unpriced == ("egress", "snapshot")
+    assert month_to_date.unpriced == ("egress", "pool", "snapshot")
     assert "snapshot" not in month_to_date.components
     assert month_to_date.currency == "USD"
 
@@ -225,11 +225,11 @@ def test_estimate_uses_injected_then_projected_then_month_to_date_running_hours(
     )
     assert priced.components["snapshot"] == Decimal("0.10")
     assert priced.components["egress"] == Decimal("0.20")
-    assert priced.unpriced == ()
+    assert priced.unpriced == ("pool",)
     rate_without_figure = estimate_monthly_cost(
         _telemetry(), _policy(snapshot_gb_month_rate="0.05"), now=early
     )
-    assert rate_without_figure.unpriced == ("egress", "snapshot")
+    assert rate_without_figure.unpriced == ("egress", "pool", "snapshot")
 
 
 def test_billing_estimate_reproduces_adr_figures_from_injected_assumptions() -> None:
@@ -277,7 +277,9 @@ def test_budget_departure_fires_at_equal_and_above_only() -> None:
     )
 
 
-def test_alert_vocabulary_is_exactly_six_kinds_and_each_condition_maps_to_one() -> None:
+def test_alert_vocabulary_is_exactly_seven_kinds_and_each_condition_maps_to_one() -> (
+    None
+):
     """Alerts are a closed vocabulary keyed by identifiers only."""
     policy = _policy()
     estimate = estimate_monthly_cost(_telemetry(), policy, now=_NOW)
@@ -349,6 +351,15 @@ def test_alert_vocabulary_is_exactly_six_kinds_and_each_condition_maps_to_one() 
         "continuous_running",
         "incomplete_create",
         "monthly_budget_departure",
+        # ADR-0016 D1.12: a leftover pool credential is still spendable up to
+        # its cap, unlike an orphaned volume, so it has its own kind (#1900).
+        "pool_credential_orphan",
+        # ADR-0016 Decision 3.4: the organization admin key's own failure
+        # modes, which stop the key lifecycle rather than spending on it
+        # (#1930).  Deliberately distinct from pool_credential_orphan.
+        "pool_admin_key_unusable",
+        "pool_admin_key_rejected",
+        "pool_admin_key_near_expiry",
     }
     assert alerts == (
         Alert(AlertKind.CONTINUOUS_RUNNING, "fly-hot", 7200, "7200", "7200"),
@@ -430,8 +441,13 @@ def test_unknown_rootfs_sizes_are_listed_as_unpriced_not_zeroed() -> None:
         _telemetry(machines_without_rootfs_size=2), policy, now=now
     )
 
-    assert sized.unpriced == ("egress", "snapshot")
-    assert partly_unknown.unpriced == ("egress", "snapshot", "stopped_rootfs")
+    assert sized.unpriced == ("egress", "pool", "snapshot")
+    assert partly_unknown.unpriced == (
+        "egress",
+        "pool",
+        "snapshot",
+        "stopped_rootfs",
+    )
     assert partly_unknown.components["stopped_rootfs"] == Decimal("0.10")
     assert partly_unknown.estimated_month == sized.estimated_month
 
