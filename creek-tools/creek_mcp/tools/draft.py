@@ -88,10 +88,9 @@ from creek.config import load_vault_config
 from creek.generate.compile_routing import (
     NO_COMPILED_SOURCES,
     CompiledSources,
-    compiled_source_ids,
     load_compiled_pages,
 )
-from creek.generate.drafts import DraftGenerator
+from creek.generate.drafts import DraftGenerator, rendered_compiled_sources
 from creek.generate.grounding import GroundingThresholds, default_embedding_fn
 from creek.generate.mining import IdeaMiner
 from creek.models import Phase, PrivacyTier
@@ -230,8 +229,9 @@ def _compiled_source_ids(vault_path: Path, idea: IdeaSeed) -> CompiledSources:
     """
     if not idea.threads and not idea.eddies:
         return NO_COMPILED_SOURCES
-    return compiled_source_ids(
+    return rendered_compiled_sources(
         load_compiled_pages(vault_path),
+        vault_path,
         thread_ids=idea.threads,
         eddy_ids=idea.eddies,
     )
