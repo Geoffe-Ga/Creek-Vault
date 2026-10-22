@@ -363,13 +363,25 @@ _PYTHON_MULTIPART_PATCHED_VERSION = Version("0.0.31")
 
 @dataclass(frozen=True)
 class _AuditFloor:
-    """One dependency boundary reported by the 2026-09-30 audit."""
+    """One security boundary: last vulnerable release, first patched one.
+
+    The tuple below began as the 2026-09-30 audit's findings and is no longer
+    only those: an entry is **superseded in place** when a later advisory wave
+    reaches the same distribution, so the boundary it carries is always the
+    newest one known for that package rather than the one it was filed with.
+    ``virtualenv`` is the first entry to have moved that way (2026-10, #1883).
+    """
 
     distribution: str
     last_vulnerable: Version
     patched: Version
 
 
+#: Named for the audit that created it; the entries are not all September's any
+#: more (see :class:`_AuditFloor`). The name and the three ``test_september_*``
+#: functions below are kept deliberately: they are what the parametrized test
+#: IDs are made of, and renaming them would churn every ID for no gain in
+#: meaning. What matters is that each entry is current for its package.
 _SEPTEMBER_AUDIT_FLOORS = (
     _AuditFloor("oauthlib", Version("3.3.1"), Version("4.0.0")),
     _AuditFloor("pyjwt", Version("2.14.0"), Version("2.15.0")),
