@@ -82,7 +82,12 @@ def test_the_letter_route_is_measured_on_its_own_budget(tmp_path: Path) -> None:
     block = measure_tokens_per_reflection(_measurement(tmp_path / "c", model))
     letter = block.per_surface[Surface.LETTER]
     reflection = block.per_surface[Surface.REFLECTION_GROUNDED]
-    assert reflection.max_output_tokens == _REFLECTION_MAX_OUTPUT_TOKENS
+    # The bench reflects at the tool's default note count, whose budget no
+    # longer reaches the hard cap now that the cap fits a real reply.
+    default_budget = reflect_module._reflection_output_token_budget(
+        reflect_module._DEFAULT_MAX_NOTES
+    )
+    assert reflection.max_output_tokens == default_budget
     assert letter.max_output_tokens is not None
     assert letter.max_output_tokens > _REFLECTION_MAX_OUTPUT_TOKENS
 

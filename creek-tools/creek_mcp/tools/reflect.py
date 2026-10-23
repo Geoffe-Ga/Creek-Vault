@@ -141,14 +141,21 @@ _ALLOWED_KINDS = {"reframe", "fear", "longing", "value", "pattern", "tension", "
 
 _MAX_REQUESTED_NOTES: Final[int] = 10
 _REFLECTION_BASE_OUTPUT_TOKENS: Final[int] = 64
-_REFLECTION_TOKENS_PER_NOTE: Final[int] = 32
-_REFLECTION_MAX_OUTPUT_TOKENS: Final[int] = 128
+_REFLECTION_TOKENS_PER_NOTE: Final[int] = 48
+_REFLECTION_MAX_OUTPUT_TOKENS: Final[int] = 512
 """Trusted output-budget inputs for one reflection model turn (#1820).
 
 The HTTP contract admits one through ten notes. Direct MCP callers still pass
 an ordinary integer, so the count is clamped before it can influence cost. The
-hard cap is the load-bearing production-deadline bound; the smaller values let
-one-note callers buy less generation rather than always paying the maximum.
+hard cap is the production-deadline bound; the smaller values let one-note
+callers buy less generation rather than always paying the maximum.
+
+The cap was 128 until a live measurement (2026-10-23): ``claude-sonnet-4-6``
+answering a ten-note request on an ordinary five-sentence entry wrote ~515
+characters (about 130-150 tokens) for three notes. Truncation is refused rather
+than parsed (``_complete_generation``), so every real reflection on a managed
+vault came back ``temporarily_unavailable``. 512 holds that reply with room for
+longer entries, and stays well under the letter's ``LETTER_MAX_OUTPUT_TOKENS``.
 """
 
 _MAX_LIVE_EMBEDS: Final[int] = 256

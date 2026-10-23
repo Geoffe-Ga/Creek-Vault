@@ -222,7 +222,7 @@ def test_all_ceiling_fails_closed_to_intimate_routing(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("max_notes", "expected_tokens"),
-    [(1, 96), (3, 128), (10, 128), (10_000, 128)],
+    [(1, 112), (3, 208), (8, 448), (10, 512), (10_000, 512)],
 )
 def test_reflection_passes_a_note_bounded_output_budget(
     tmp_path: Path,

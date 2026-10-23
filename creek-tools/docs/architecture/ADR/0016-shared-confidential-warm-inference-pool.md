@@ -118,7 +118,12 @@
   without a cancel path it would keep a pool slot. Vault admission caps:
   `DEFAULT_MAX_CONCURRENCY = 32`, `DEFAULT_MAX_PER_CONSUMER = 8`.
 - **A reflection is short.** `creek_mcp/tools/reflect.py` caps output at
-  `_REFLECTION_MAX_OUTPUT_TOKENS = 128` (64 base + 32 per note). The prompt
+  `_REFLECTION_MAX_OUTPUT_TOKENS = 512` (64 base + 48 per note). It was 128
+  until 2026-10-23, when a live ten-note reflection on an ordinary entry
+  measured ~130-150 output tokens and every real one was refused as
+  truncated; a pool model now has up to four times the earlier output to
+  generate inside the same deadline, so the latency budget below should be
+  re-measured against 512, not 128. The prompt
   is the entry, grounding snippets when any exist, and a template the #1850
   harness budgets at `PROMPT_OVERHEAD_TOKENS = 1536` (`creek_mcp/bench/runner.py`).
 - **A job protocol already exists on `/v1`.** Contract 0.10.0's `pipeline`
