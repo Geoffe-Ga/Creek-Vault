@@ -38,7 +38,14 @@ from creek_mcp.bench.runner import (
 from creek_mcp.bench.tokens import Surface
 from creek_mcp.bench.trial import Phase, Sweep
 from creek_mcp.bench.usage import TokenBasis
-from creek_mcp.tools.reflect import GroundingSession, _build_prompt, reflect_tool
+from creek_mcp.tools.reflect import (
+    _DEFAULT_MAX_NOTES,
+    _REFLECTION_MAX_OUTPUT_TOKENS,
+    GroundingSession,
+    _build_prompt,
+    _reflection_output_token_budget,
+    reflect_tool,
+)
 from tests.bench.conftest import FakeModel, Recorded, make_plan, run_metadata
 
 if TYPE_CHECKING:
@@ -50,8 +57,11 @@ if TYPE_CHECKING:
 
 _DIGEST = "sha256:" + "e" * 64
 _SHA = "f" * 40
-_REFLECT_MAX_OUTPUT_TOKENS = 128
-"""The hard output cap reflect itself applies (#1820)."""
+_REFLECT_MAX_OUTPUT_TOKENS = _REFLECTION_MAX_OUTPUT_TOKENS
+"""The hard output cap reflect itself applies (#1820), read from reflect."""
+
+_REFLECT_DEFAULT_OUTPUT_TOKENS = _reflection_output_token_budget(_DEFAULT_MAX_NOTES)
+"""The budget a bench trial asks for: reflect's own, at its default note count."""
 
 
 def _trials(report: BenchReport, sweep: Sweep) -> tuple[Trial, ...]:
@@ -636,7 +646,7 @@ def test_every_ok_trial_carries_measured_tokens(tmp_path: Path) -> None:
                 seen += 1
                 assert trial.prompt_tokens is not None
                 assert trial.output_tokens is not None
-                assert trial.max_output_tokens == _REFLECT_MAX_OUTPUT_TOKENS
+                assert trial.max_output_tokens == _REFLECT_DEFAULT_OUTPUT_TOKENS
     assert seen >= 4
 
 
