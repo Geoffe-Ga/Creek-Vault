@@ -35,6 +35,8 @@ distinct reasons are a documented accepted residual oracle.
 
 from __future__ import annotations
 
+import logging
+import re
 from functools import partial
 from typing import TYPE_CHECKING, Any, Final, Literal
 
@@ -104,6 +106,47 @@ source snippet. The wire carries neither: every refusal renders one constant
 per code.
 """
 
+REFUSAL_LOGGER_NAME: Final[str] = "creek_mcp.httpapi.reflect"
+"""The logger a refused reflection is recorded on. Stable: an operator filters on it."""
+
+_REFUSAL_LOGGER: Final[logging.Logger] = logging.getLogger(REFUSAL_LOGGER_NAME)
+"""One WARNING per refused reflection, closed-vocabulary by construction.
+
+The wire answers every refusal with one constant per code, so a managed vault
+that refuses every keyed reflection is indistinguishable, from the consumer,
+from one that never received the key. This line is what tells them apart, and
+like the access log it carries facts and no content: the served code, a cause
+from :func:`refusal_cause`, whether a request key arrived (its provider, never
+its value) and the correlation id. WARNING, not INFO, so it reaches a runtime
+that configures no logging at all — Python's last-resort handler prints it.
+"""
+
+_PUBLISHED_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        _NOT_FOUND_REASON,
+        _ABOVE_CEILING_REASON,
+        _NO_CONTENT_REASON,
+        PROMPT_TOO_LONG_REASON,
+        RATE_LIMITED_REASON,
+    }
+)
+"""The tool's constant refusal reasons, safe to log verbatim."""
+
+_TYPE_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+"""A bare exception type name: the only tail a provider-failure reason may log."""
+
+_UNRECOGNISED_CAUSE: Final[str] = "unrecognised"
+"""Logged for any reason this module did not publish, rather than the reason."""
+
+_INVALID_KEY_CAUSE: Final[str] = "invalid_request_key"
+"""Logged when request-key headers were sent but could not be parsed."""
+
+_NO_VAULT_CAUSE: Final[str] = "no_vault"
+"""Logged when no readable vault could be resolved for the request."""
+
+_NO_REQUEST_KEY: Final[str] = "none"
+"""Logged in place of a provider when the request carried no key."""
+
 _NOTE_STATUSES: Final[
     dict[str, Literal[ReflectionStatus.OK, ReflectionStatus.EMPTY]]
 ] = {
@@ -155,6 +198,53 @@ def reflect_refusal_code(reason: str) -> ErrorCode:
     if reason.startswith(_UNAVAILABLE_PREFIX):
         return ErrorCode.TEMPORARILY_UNAVAILABLE
     return ErrorCode.INTERNAL_ERROR
+
+
+def refusal_cause(reason: str) -> str:
+    """Return what the refusal log may say about one tool refusal *reason*.
+
+    Closed vocabulary: a reason this module published is logged verbatim, a
+    provider failure keeps its tail only when that tail is a bare exception
+    type name, and anything else becomes :data:`_UNRECOGNISED_CAUSE` — so a
+    future reason that interpolated content could never reach an operator's log
+    through this line.
+
+    Args:
+        reason: The ``reason`` field of a structured tool refusal.
+
+    Returns:
+        The reason itself, or :data:`_UNRECOGNISED_CAUSE`.
+    """
+    if reason in _PUBLISHED_REASONS:
+        return reason
+    tail = reason.removeprefix(_UNAVAILABLE_PREFIX)
+    if tail != reason and _TYPE_NAME_RE.fullmatch(tail):
+        return reason
+    return _UNRECOGNISED_CAUSE
+
+
+def _refused(
+    code: ErrorCode, context: RequestContext, *, cause: str, request_key: str
+) -> Response:
+    """Log one refused reflection, then render its published refusal.
+
+    Args:
+        code: The code the wire is served.
+        context: The request's context, supplying the correlation id.
+        cause: A closed-vocabulary cause (see :func:`refusal_cause`).
+        request_key: The request key's provider, or :data:`_NO_REQUEST_KEY`.
+
+    Returns:
+        The refusal response for *code*.
+    """
+    _REFUSAL_LOGGER.warning(
+        "reflection refused code=%s cause=%s request_key=%s request_id=%s",
+        code.value,
+        cause,
+        request_key,
+        context.request_id,
+    )
+    return error_response(code, context)
 
 
 async def _parsed_body(request: Request) -> ReflectionRequest | None:
@@ -428,6 +518,7 @@ def _render(
     serve_related: bool,
     provenance: InferenceProvenance,
     serve_provenance: bool,
+    request_key: str,
 ) -> Response:
     """Project the tool's result onto the published response, or a refusal.
 
@@ -439,6 +530,8 @@ def _render(
         provenance: The request's recorder, holding the route that answered.
         serve_provenance: Whether the caller declared a minor that can
             describe ``inference_source`` and name ``rate_limited``.
+        request_key: The request key's provider, or :data:`_NO_REQUEST_KEY`,
+            for the refusal log.
 
     Returns:
         The published response.
@@ -453,9 +546,13 @@ def _render(
             serve_related=serve_related,
             inference_source=provenance.source if serve_provenance else None,
         )
-    code = reflect_refusal_code(str(result.get("reason", "")))
-    return error_response(
-        served_error_code(code, serve_rate_limited=serve_provenance), context
+    reason = str(result.get("reason", ""))
+    code = reflect_refusal_code(reason)
+    return _refused(
+        served_error_code(code, serve_rate_limited=serve_provenance),
+        context,
+        cause=refusal_cause(reason),
+        request_key=request_key,
     )
 
 
@@ -488,7 +585,13 @@ async def handle_reflection(request: Request) -> Response:
     try:
         request_key = request_key_of(request)
     except InvalidRequestKeyError:
-        return error_response(ErrorCode.INVALID_REQUEST, context)
+        return _refused(
+            ErrorCode.INVALID_REQUEST,
+            context,
+            cause=_INVALID_KEY_CAUSE,
+            request_key=_NO_REQUEST_KEY,
+        )
+    key_provider = _NO_REQUEST_KEY if request_key is None else request_key.provider
     provenance = InferenceProvenance()
     result = await generate_off_loop(
         context,
@@ -502,11 +605,17 @@ async def handle_reflection(request: Request) -> Response:
         provenance,
     )
     if result is None:
-        return error_response(ErrorCode.UNAVAILABLE, context)
+        return _refused(
+            ErrorCode.UNAVAILABLE,
+            context,
+            cause=_NO_VAULT_CAUSE,
+            request_key=key_provider,
+        )
     return _render(
         result,
         context,
         serve_related=_serves_related(request),
         provenance=provenance,
         serve_provenance=serves_provenance(request),
+        request_key=key_provider,
     )
