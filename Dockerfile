@@ -16,9 +16,12 @@ COPY creek-tools/pyproject.toml creek-tools/uv.lock ./
 
 # Install the committed production resolution directly from uv.lock into a
 # relocatable venv. The source tree is copied only in the final stage, so
-# dependency reuse never risks retaining operator files.
+# dependency reuse never risks retaining operator files. The only extras are
+# the SDKs for the vendors a managed vault advertises in
+# `request_key_providers` (ADR-0015): a writer's relayed key is useless without
+# them. tests/test_container_image_contract.py pins the set to RequestKeyProvider.
 RUN python -m pip install --no-cache-dir "uv==0.11.16" \
-    && uv sync --locked --no-dev --no-install-project
+    && uv sync --locked --no-dev --no-install-project --extra anthropic --extra openai
 
 FROM python:3.12.14-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
 
