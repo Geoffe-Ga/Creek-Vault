@@ -9,6 +9,8 @@ from pathlib import Path
 
 import yaml
 
+from creek_mcp.api.models import RequestKeyProvider
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKERIGNORE = REPO_ROOT / ".dockerignore"
@@ -27,6 +29,24 @@ def test_base_image_is_version_and_digest_pinned() -> None:
     assert "uv sync --locked --no-dev --no-install-project" in text
     assert "--all-extras" not in text
     assert "UV_PROJECT_ENVIRONMENT=/opt/venv" in text
+
+
+def test_image_installs_exactly_the_request_key_provider_sdks() -> None:
+    """Every vendor a managed vault advertises for a writer's key has its SDK.
+
+    A managed vault lists :class:`RequestKeyProvider` in
+    ``request_key_providers`` (ADR-0015), so a consumer relays the writer's key
+    and the vault dials that vendor's SDK. An image without the SDK accepts the
+    key and then dies on ``ModuleNotFoundError`` for every keyed reflection.
+    Exact equality keeps the image minimal: no other extra rides along.
+    """
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    sync = re.search(
+        r"uv sync --locked --no-dev --no-install-project(?P<flags>[^\n]*)", text
+    )
+    assert sync is not None
+    installed = set(re.findall(r"--extra (\S+)", sync["flags"]))
+    assert installed == {provider.value for provider in RequestKeyProvider}
 
 
 def test_image_has_nonroot_runtime_and_no_implicit_volume() -> None:

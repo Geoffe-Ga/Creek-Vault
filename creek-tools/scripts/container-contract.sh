@@ -145,6 +145,11 @@ docker volume create "$VOLUME_B" >/dev/null
 start_container "$NAME_A" "adepthood-a" 18823 "$VOLUME_A"
 wait_healthy "$NAME_A"
 
+# A managed vault relays a writer's key to these vendors' SDKs (ADR-0015);
+# the image must ship them or every keyed reflection dies on import.
+docker exec "$NAME_A" python -c 'import anthropic, openai' \
+    || fail "image is missing a request-key provider SDK"
+
 [[ "$(get_health "adepthood-a" "$TOKEN_A" 18823)" == '{"status":"ok"}' ]] \
     || fail "first boot did not serve authenticated /v1 health"
 
