@@ -145,10 +145,12 @@ docker volume create "$VOLUME_B" >/dev/null
 start_container "$NAME_A" "adepthood-a" 18823 "$VOLUME_A"
 wait_healthy "$NAME_A"
 
-# A managed vault relays a writer's key to these vendors' SDKs (ADR-0015);
-# the image must ship them or every keyed reflection dies on import.
-docker exec "$NAME_A" python -c 'import anthropic, openai' \
-    || fail "image is missing a request-key provider SDK"
+# A managed vault relays a writer's key to these vendors' SDKs (ADR-0015), and
+# /v1/uploads parses documents, spreadsheets and presentations with these
+# libraries; the image must ship them or the request dies on import.
+docker exec "$NAME_A" python -c \
+    'import anthropic, openai, docx, pdfminer, markdownify, openpyxl, pptx' \
+    || fail "image is missing a request-key SDK or an upload parser"
 
 [[ "$(get_health "adepthood-a" "$TOKEN_A" 18823)" == '{"status":"ok"}' ]] \
     || fail "first boot did not serve authenticated /v1 health"

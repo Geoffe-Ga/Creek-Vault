@@ -6,9 +6,11 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Final
 
 import yaml
 
+from creek.ingest.gdrive import _EXTENSION_ROUTES
 from creek_mcp.api.models import RequestKeyProvider
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -31,22 +33,64 @@ def test_base_image_is_version_and_digest_pinned() -> None:
     assert "UV_PROJECT_ENVIRONMENT=/opt/venv" in text
 
 
-def test_image_installs_exactly_the_request_key_provider_sdks() -> None:
-    """Every vendor a managed vault advertises for a writer's key has its SDK.
+_ROUTE_EXTRAS: Final[dict[str, str]] = {
+    "document": "documents",
+    "spreadsheet": "spreadsheets",
+    "presentation": "presentations",
+}
+"""The ``pyproject`` extra each upload ingestor route imports its parser from."""
 
-    A managed vault lists :class:`RequestKeyProvider` in
-    ``request_key_providers`` (ADR-0015), so a consumer relays the writer's key
-    and the vault dials that vendor's SDK. An image without the SDK accepts the
-    key and then dies on ``ModuleNotFoundError`` for every keyed reflection.
-    Exact equality keeps the image minimal: no other extra rides along.
+_ROUTES_WITHOUT_EXTRA: Final[frozenset[str]] = frozenset({"markdown"})
+"""Routes whose ingestor parses with the standard library alone."""
+
+_ROUTES_DEGRADING_WITHOUT_EXTRA: Final[frozenset[str]] = frozenset({"image"})
+"""Routes deliberately left without their extra in the image.
+
+``image`` needs the ``ocr`` extra *and* the ``tesseract`` / ``poppler`` system
+binaries; without them the image ingestor catches the ``ImportError`` and
+degrades instead of crashing, so shipping OCR is its own image decision.
+"""
+
+
+def _installed_extras() -> set[str]:
+    """Return the ``--extra`` names the image's ``uv sync`` installs.
+
+    Follows backslash continuations, so the flags may span several lines of
+    the one ``RUN`` instruction exactly as Docker reads them.
     """
     text = DOCKERFILE.read_text(encoding="utf-8")
     sync = re.search(
-        r"uv sync --locked --no-dev --no-install-project(?P<flags>[^\n]*)", text
+        r"uv sync --locked --no-dev --no-install-project"
+        r"(?P<flags>(?:[^\n]*\\\n)*[^\n]*)",
+        text,
     )
     assert sync is not None
-    installed = set(re.findall(r"--extra (\S+)", sync["flags"]))
-    assert installed == {provider.value for provider in RequestKeyProvider}
+    return set(re.findall(r"--extra (\S+)", sync["flags"]))
+
+
+def test_image_installs_exactly_the_request_key_and_upload_parser_extras() -> None:
+    """The image ships each advertised SDK and each upload route's parser, nothing more.
+
+    A managed vault lists :class:`RequestKeyProvider` in
+    ``request_key_providers`` (ADR-0015), so it must ship each vendor's SDK; and
+    ``POST /v1/uploads`` routes every suffix in ``_EXTENSION_ROUTES`` to an
+    ingestor that imports its parser from an extra. An image missing either
+    accepts the request and then dies on ``ModuleNotFoundError`` (2026-10-23: a
+    ``.docx`` upload, ``No module named 'docx'``). Exact equality keeps the image
+    minimal: no other extra rides along.
+    """
+    expected = {provider.value for provider in RequestKeyProvider}
+    expected |= set(_ROUTE_EXTRAS.values())
+    assert _installed_extras() == expected
+
+
+def test_every_upload_route_is_accounted_for() -> None:
+    """A new upload route cannot ship without deciding where its parser comes from."""
+    routes = {route for route in _EXTENSION_ROUTES.values() if isinstance(route, str)}
+    accounted = (
+        set(_ROUTE_EXTRAS) | _ROUTES_WITHOUT_EXTRA | _ROUTES_DEGRADING_WITHOUT_EXTRA
+    )
+    assert routes <= accounted, sorted(routes - accounted)
 
 
 def test_image_has_nonroot_runtime_and_no_implicit_volume() -> None:

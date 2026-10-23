@@ -18,10 +18,15 @@ COPY creek-tools/pyproject.toml creek-tools/uv.lock ./
 # relocatable venv. The source tree is copied only in the final stage, so
 # dependency reuse never risks retaining operator files. The only extras are
 # the SDKs for the vendors a managed vault advertises in
-# `request_key_providers` (ADR-0015): a writer's relayed key is useless without
-# them. tests/test_container_image_contract.py pins the set to RequestKeyProvider.
+# `request_key_providers` (ADR-0015), and the parsers POST /v1/uploads routes
+# documents, spreadsheets and presentations to: without them a relayed key or
+# an uploaded .docx dies on ModuleNotFoundError. OCR is deliberately absent
+# (it also needs system binaries; the image ingestor degrades without it).
+# tests/test_container_image_contract.py pins the exact set.
 RUN python -m pip install --no-cache-dir "uv==0.11.16" \
-    && uv sync --locked --no-dev --no-install-project --extra anthropic --extra openai
+    && uv sync --locked --no-dev --no-install-project \
+       --extra anthropic --extra openai \
+       --extra documents --extra spreadsheets --extra presentations
 
 FROM python:3.12.14-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
 
