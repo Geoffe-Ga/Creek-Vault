@@ -31,6 +31,7 @@ from creek_mcp.container_runtime import (
     run,
 )
 from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV
+from tests.agent_token_support import FakeClock
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -667,3 +668,234 @@ def test_a_bearer_only_container_serves_no_agent_verifier(
 ) -> None:
     """No resource server: ``/mcp`` keeps the static registry alone."""
     assert _served_agent_verifier(_settings(tmp_path), monkeypatch) is None
+
+
+# --------------------------------------------------------------------------- #
+# The consumer secret is followed, not read once (#1965)
+# --------------------------------------------------------------------------- #
+
+_ROTATED = "rotated-consumer-token-that-is-thirty-two-characters"
+
+
+def _follow_on(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """Put the reloading verifier on a hand-moved clock.
+
+    Args:
+        monkeypatch: Pytest's monkeypatch.
+
+    Returns:
+        The clock, to advance past the poll interval.
+    """
+    from creek_mcp import credential_reload
+
+    clock = FakeClock()
+    monkeypatch.setattr(credential_reload, "_monotonic", clock)
+    return clock
+
+
+def test_the_secret_records_the_digest_of_the_bytes_it_was_parsed_from(
+    tmp_path: Path,
+) -> None:
+    """The reload baseline is the boot read itself, so no edit can slip between."""
+    from creek_mcp.credential_reload import content_digest
+
+    secret_path = tmp_path / "tokens"
+    secret_path.write_text(f"adepthood={_TOKEN}\n", encoding="utf-8")
+
+    secret = load_consumer_secret(secret_path)
+
+    assert secret.source_digest == content_digest(secret_path.read_bytes())
+    assert secret.source_digest not in repr(secret)
+
+
+def test_a_secret_that_is_not_utf8_is_refused_at_boot(tmp_path: Path) -> None:
+    """A decode failure is the same generic refusal as any invalid secret."""
+    secret_path = tmp_path / "tokens"
+    secret_path.write_bytes(b"adepthood=\xff" + _TOKEN.encode())
+
+    with pytest.raises(ContainerConfigurationError, match="invalid") as caught:
+        load_consumer_secret(secret_path)
+
+    assert "0xff" not in str(caught.value)
+
+
+def test_a_rotated_secret_reaches_v1_and_mcp_without_a_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Narrowing the mounted set revokes the old token on both surfaces (#1965).
+
+    Nothing is patched between the secret mount and the served app: one
+    verifier instance answers ``/v1`` and ``/mcp``, and it follows the file.
+    The reload reads the file itself, so no token reaches the environment.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        monkeypatch: Captures the served app and moves the poll clock.
+    """
+    from starlette.testclient import TestClient
+
+    from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+    from creek_mcp import container_runtime as runtime
+    from creek_mcp.credential_reload import RELOAD_POLL_SECONDS
+    from tests.mcp_http_support import initialize_body, mcp_headers, open_session
+    from tests.v1_api_support import CAPABILITIES_PATH, headers
+
+    for name in (CONFIG_PATH_ENV_VAR, "CREEK_VAULT_PATH", LOOPBACK_ONLY_ENV):
+        monkeypatch.setenv(name, "")
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+    clock = _follow_on(monkeypatch)
+    served: list[Starlette] = []
+    monkeypatch.setattr(runtime, "serve", lambda app, _args: served.append(app))
+    settings = _settings(tmp_path)
+
+    run(settings)
+
+    (app,) = served
+    with TestClient(app) as test_client:
+        assert test_client.get(
+            CAPABILITIES_PATH, headers=headers(token=_TOKEN)
+        ).is_success
+        settings.consumer_tokens_file.write_text(
+            f"adepthood={_ROTATED}\n", encoding="utf-8"
+        )
+        clock.advance(RELOAD_POLL_SECONDS)
+        old_v1 = test_client.get(CAPABILITIES_PATH, headers=headers(token=_TOKEN))
+        new_v1 = test_client.get(CAPABILITIES_PATH, headers=headers(token=_ROTATED))
+        old_mcp = test_client.post(
+            "/mcp", json=initialize_body(), headers=mcp_headers(_TOKEN)
+        )
+        open_session(test_client, _ROTATED)
+
+    assert old_v1.status_code == 401
+    assert new_v1.status_code == 200
+    assert old_mcp.status_code == 401
+    assert CONSUMER_TOKENS_ENV not in os.environ
+    assert all(_ROTATED not in value for value in os.environ.values())
+
+
+def _following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str
+) -> tuple[Path, FakeClock, object]:
+    """Boot a container secret from *content* and follow its file.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        monkeypatch: Moves the poll clock.
+        content: The secret file's boot-time text.
+
+    Returns:
+        The file, the clock and the reloading verifier.
+    """
+    clock = _follow_on(monkeypatch)
+    secret_path = tmp_path / "tokens"
+    secret_path.write_text(content, encoding="utf-8")
+    secret = load_consumer_secret(secret_path)
+    return secret_path, clock, secret.reloading_verifier(secret_path)
+
+
+def _client_of(verifier: object, token: str) -> str | None:
+    """Return the consumer *token* authenticates as through *verifier*.
+
+    Args:
+        verifier: A token verifier.
+        token: The bearer.
+
+    Returns:
+        The consumer, or ``None``.
+    """
+    import asyncio
+
+    from creek_mcp.remote_auth import ConsumerTokenVerifier
+
+    assert isinstance(verifier, ConsumerTokenVerifier)
+    access = asyncio.run(verifier.verify_token(token))
+    return None if access is None else access.client_id
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (f"renamed-identity={_ROTATED}\n", "different identity"),
+        (
+            f"adepthood={_TOKEN};renamed-identity={_ROTATED}\n",
+            "exactly one identity",
+        ),
+        ("adepthood=short\n", "below the 32-char minimum"),
+    ],
+    ids=["renamed", "second-identity", "weak-token"],
+)
+def test_a_reload_the_container_would_refuse_at_boot_keeps_the_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    content: str,
+    reason: str,
+) -> None:
+    """A container serves one identity for its life; a reload rotates its tokens.
+
+    The limiter's buckets, the journal's single-owner rule and a managed
+    vault's JWT subject pin are all built from the identity the container
+    booted with, so a reload may not swap it.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        monkeypatch: Moves the poll clock.
+        capsys: Captures the refusal.
+        content: A secret the reload must refuse.
+        reason: The refusal's wording.
+    """
+    from creek_mcp.credential_reload import RELOAD_POLL_SECONDS
+
+    secret_path, clock, verifier = _following(
+        tmp_path, monkeypatch, f"adepthood={_TOKEN}\n"
+    )
+    secret_path.write_text(content, encoding="utf-8")
+    clock.advance(RELOAD_POLL_SECONDS)
+
+    assert _client_of(verifier, _TOKEN) == "adepthood"
+    assert _client_of(verifier, _ROTATED) is None
+    err = capsys.readouterr().err
+    assert reason in err
+    assert "renamed-identity" not in err
+    assert _TOKEN not in err
+    assert _ROTATED not in err
+
+
+def test_a_reload_regates_the_container_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A grant suffix added to the mounted entry takes effect without a restart."""
+    import asyncio
+
+    from creek_mcp.credential_reload import RELOAD_POLL_SECONDS
+    from creek_mcp.remote_auth import REMOTE_SCOPE, ConsumerTokenVerifier
+
+    secret_path, clock, verifier = _following(
+        tmp_path, monkeypatch, f"adepthood={_TOKEN}\n"
+    )
+    secret_path.write_text(f"adepthood={_TOKEN}@vault:read\n", encoding="utf-8")
+    clock.advance(RELOAD_POLL_SECONDS)
+
+    assert isinstance(verifier, ConsumerTokenVerifier)
+    access = asyncio.run(verifier.verify_token(_TOKEN))
+    assert access is not None
+    assert access.scopes == [REMOTE_SCOPE, "vault:read"]
+
+
+def test_the_container_serves_the_reloading_verifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run`` hands the app the verifier that follows the mounted file."""
+    from creek_mcp import container_runtime as runtime
+    from creek_mcp.credential_reload import ReloadingConsumerTokenVerifier
+
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+    served: list[object] = []
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier, **_kwargs: verifier)
+    monkeypatch.setattr(runtime, "serve", lambda app, _args: served.append(app))
+
+    run(_settings(tmp_path))
+
+    (verifier,) = served
+    assert isinstance(verifier, ReloadingConsumerTokenVerifier)

@@ -6,6 +6,11 @@ before the HTTP server can bind.  Consumer tokens are parsed directly from a
 secret file into the verifier and are never copied into the process environment
 or command line.
 
+The served verifier follows that file (#1965): an edit is picked up within
+seconds, with the boot-time parse and its refusals, so rotating or revoking the
+consumer's token needs no restart. A reload may change the identity's tokens and
+grants, never the identity itself (:meth:`SingleConsumerSecret.reloading_verifier`).
+
 A machine carrying the managed-vault marker (#1863) is local-only by
 construction: it refuses to start while cloud consent is set, and pins consent
 off for as long as it serves.
@@ -46,6 +51,10 @@ from creek.config import (
     generate_default_config,
 )
 from creek.scaffold import deploy_canonical
+from creek_mcp.credential_reload import (
+    ReloadingConsumerTokenVerifier,
+    content_digest,
+)
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.cli import DEFAULT_API_PORT, serve
 from creek_mcp.oauth_resource import load_resource_server_config
@@ -59,7 +68,7 @@ from creek_mcp.remote_auth import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from creek_mcp.agent_tokens import JwtAgentTokenVerifier
     from creek_mcp.oauth_resource import ResourceServerConfig
@@ -146,17 +155,41 @@ class SingleConsumerSecret:
     structured log cannot accidentally serialize credential material.
     ``grants`` is the entry's grant suffix (#1964), or ``None`` when it carries
     none: that consumer is ungated on ``/mcp``, as it would be on the
-    environment-configured network transport.
+    environment-configured network transport. ``source_digest`` identifies the
+    exact bytes this secret was parsed from (#1965), so the verifier that
+    follows the file starts from them; ``None`` when it was built in memory.
     """
 
     consumer: str
     tokens: tuple[str, ...] = field(repr=False)
     grants: frozenset[Grant] | None = None
+    source_digest: str | None = field(default=None, repr=False, compare=False)
 
     def verifier(self) -> ConsumerTokenVerifier:
         """Build the shared constant-time verifier over this identity."""
         grants = None if self.grants is None else {self.consumer: self.grants}
         return ConsumerTokenVerifier({self.consumer: self.tokens}, grants=grants)
+
+    def reloading_verifier(self, source: Path) -> ReloadingConsumerTokenVerifier:
+        """Build the verifier the container serves: this secret, following *source*.
+
+        The reload parser is the boot parser plus one rule: the file must still
+        name this identity. Its tokens and grants may change; the name may not,
+        because the per-consumer limiter, the journal's single-owner rule and a
+        managed vault's JWT subject pin were all built from it when the app was.
+
+        Args:
+            source: The mounted secret file this secret was read from.
+
+        Returns:
+            A verifier serving this secret until the file changes.
+        """
+        return ReloadingConsumerTokenVerifier(
+            source,
+            _same_identity_parser(self.consumer),
+            initial=self.verifier(),
+            baseline=self.source_digest,
+        )
 
 
 @dataclass(frozen=True)
@@ -383,26 +416,79 @@ def prepare_vault(settings: ContainerSettings) -> PreparedVault:
     return PreparedVault(config_path, BootstrapState.INITIALIZED)
 
 
+_SINGLE_IDENTITY: Final[str] = "consumer secret must configure exactly one identity"
+
+
+class _IdentityCountError(ValueError):
+    """A consumer secret that names no identity, or more than one."""
+
+
+def _parsed_secret(raw: str) -> SingleConsumerSecret:
+    """Parse one consumer registry's text, refusing anything but one identity.
+
+    Args:
+        raw: The secret file's text.
+
+    Returns:
+        The secret, without a source digest.
+
+    Raises:
+        ValueError: From the shared registry parser, whose messages name
+            consumers and lengths, never a token.
+        _IdentityCountError: When the registry names no identity, or several.
+    """
+    registry = {CONSUMER_TOKENS_ENV: raw.strip()}
+    parsed = load_consumer_tokens(registry)
+    grants = load_consumer_grants(registry)
+    if len(parsed) != 1:
+        raise _IdentityCountError(_SINGLE_IDENTITY)
+    consumer, tokens = next(iter(parsed.items()))
+    return SingleConsumerSecret(consumer, tokens, grants.get(consumer))
+
+
+def _same_identity_parser(consumer: str) -> Callable[[str], ConsumerTokenVerifier]:
+    """Return the reload parser for a container booted as *consumer*.
+
+    Args:
+        consumer: The identity the container serves.
+
+    Returns:
+        A parser that builds the replacement verifier, or raises
+        :class:`ValueError` for a file the boot path would refuse or one naming
+        another identity. The refusal never names the new identity: in a file
+        an operator mistyped, that "name" may be a pasted secret.
+    """
+
+    def parse(raw: str) -> ConsumerTokenVerifier:
+        secret = _parsed_secret(raw)
+        if secret.consumer != consumer:
+            msg = (
+                "the consumer secret names a different identity than the vault "
+                f"started with ({consumer!r}); a reload may rotate that "
+                "identity's tokens and grants, and serving another identity "
+                "needs a restart"
+            )
+            raise ValueError(msg)
+        return secret.verifier()
+
+    return parse
+
+
 def load_consumer_secret(path: Path) -> SingleConsumerSecret:
     """Read and validate exactly one consumer registry from a secret mount."""
     try:
-        raw = path.read_text(encoding="utf-8").strip()
+        content = path.read_bytes()
     except OSError as exc:
         raise ContainerConfigurationError(
             "consumer secret mount is missing or unreadable"
         ) from exc
-    registry = {CONSUMER_TOKENS_ENV: raw}
     try:
-        parsed = load_consumer_tokens(registry)
-        grants = load_consumer_grants(registry)
+        secret = _parsed_secret(content.decode("utf-8"))
+    except _IdentityCountError as exc:
+        raise ContainerConfigurationError(_SINGLE_IDENTITY) from exc
     except ValueError as exc:
         raise ContainerConfigurationError("consumer secret is invalid") from exc
-    if len(parsed) != 1:
-        raise ContainerConfigurationError(
-            "consumer secret must configure exactly one identity"
-        )
-    consumer, tokens = next(iter(parsed.items()))
-    return SingleConsumerSecret(consumer, tokens, grants.get(consumer))
+    return replace(secret, source_digest=content_digest(content))
 
 
 def _require_tls_file(path: Path, label: str) -> None:
@@ -429,7 +515,7 @@ def run(settings: ContainerSettings) -> None:
     _require_tls_file(settings.tls_cert_file, "certificate")
     _require_tls_file(settings.tls_key_file, "private-key")
     secret = load_consumer_secret(settings.consumer_tokens_file)
-    verifier = secret.verifier()
+    verifier = secret.reloading_verifier(settings.consumer_tokens_file)
     os.environ[CONFIG_PATH_ENV_VAR] = str(prepared.config_path)
     os.environ["CREEK_VAULT_PATH"] = str(settings.vault_path)
     os.environ[LOOPBACK_ONLY_ENV] = "1"
