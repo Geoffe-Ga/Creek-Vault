@@ -18,7 +18,7 @@
 > `0.4.0 (draft)` while the change log's own top row said `0.9.0`; that was a
 > **stale header, not five unrecorded contract events**. `creek_mcp/contract.py`
 > has always been the runtime source of truth, and each minor between `0.1.0`
-> and `0.18.0` is now recorded in the [change log](#change-log) with the change
+> and `0.22.0` is now recorded in the [change log](#change-log) with the change
 > that earned it — four of those rows (`0.5.0`–`0.8.0`) were written by the
 > 2026-08-21 truth-up, which found them missing.
 > `test_the_change_log_has_a_row_for_every_minor_up_to_the_current_one` asserts
@@ -67,15 +67,16 @@ argument parser's own published choices.
 | `--transport` | What it is | Auth | Remote tier cap |
 |---|---|---|---|
 | `stdio` (default) | JSON-RPC over stdio; the consumer launches the server as a child process and no socket is bound. | None. Whoever can spawn the process is the operator. | None — a local caller is not capped. |
-| `network` | Authenticated **streamable-HTTP**. Binds `--host`/`--port` (default `127.0.0.1:8000`) and serves `server.run(transport="streamable-http")`. | **Required.** Per-consumer bearer tokens from `CREEK_MCP_CONSUMER_TOKENS`; the process refuses to start without them. A non-loopback `--host` additionally requires `--tls-cert`/`--tls-key`. | `open` and `personal` only. See [Tier ceiling semantics](#tier-ceiling-semantics). |
+| `network` | Authenticated **streamable-HTTP**. Binds `--host`/`--port` (default `127.0.0.1:8000`) and serves `server.run(transport="streamable-http")`. The same server is also mounted at `/mcp` inside every `/v1` process (#1962); see [Agents over `/mcp`](#agents-over-mcp-epic-1961). | **Required.** Per-consumer bearer tokens from `CREEK_MCP_CONSUMER_TOKENS`, Adepthood-issued OAuth access tokens when `CREEK_MCP_RESOURCE_URL` and `CREEK_MCP_AUTHORIZATION_SERVER` are set (#1963), or both; the process refuses to start with neither. A non-loopback `--host` additionally requires `--tls-cert`/`--tls-key`. | `open` and `personal` only. See [Tier ceiling semantics](#tier-ceiling-semantics). |
 <!-- /capability-set -->
 
 Code: `creek_mcp/server.py` — the `--transport` argument and its
 `--host`/`--port`/`--tls-cert`/`--tls-key` companions in `_build_arg_parser`;
 `_serve_network`, which calls `server.run(transport="streamable-http")`;
-`DEFAULT_MCP_NETWORK_PORT = 8000`; and the `main` branch that refuses to serve
-`network` without `CREEK_MCP_CONSUMER_TOKENS` and calls
-`_require_transport_confidentiality` before binding.
+`DEFAULT_MCP_NETWORK_PORT = 8000`; `_network_credentials`, which refuses to
+serve `network` with neither `CREEK_MCP_CONSUMER_TOKENS` nor an OAuth issuer
+(#1963); and the `main` branch that calls `_require_transport_confidentiality`
+before binding.
 
 This supersedes the original draft's "there is no network listener … remote is
 out of scope for this contract version, being decided in #755". **#755 is
@@ -107,6 +108,7 @@ four — the cap is about the network, not about the tier.
 | Consumer identity (local stdio) | `CREEK_MCP_CONSUMER` | **No — audit-only** | Tags every audit-log entry so calls from `claude-code` vs `crawdad` vs an Adepthood consumer are distinguishable. Free-form string; defaults to `unknown`; read once at server start (`_consumer_from_env`, `server.py`). It grants and denies nothing. |
 | Consumer identity (network) | *(none — from the bearer token)* | **Yes — it is the credential** | A network call is audited under the consumer its bearer token names, resolved **per call** from the request-scoped access token (`_caller_identity` → `CallerIdentity(consumer=token.client_id, is_remote=True)`). `creek_mcp/policy.py:effective_consumer` returns that consumer for a remote call and **raises** when a remote identity names none, rather than falling back to the local default. |
 | Consumer auth (network) | `CREEK_MCP_CONSUMER_TOKENS` | **Yes — constant-time compare** | `consumer=token` pairs. `ConsumerTokenVerifier.verify_token` compares the supplied bearer against every known token with `hmac.compare_digest` over UTF-8 bytes and returns an `AccessToken` whose `client_id` **is** the consumer name. Duplicate consumer names and shared token values are refused at load; a rotation window is announced on stderr. There is no anonymous access in network mode. |
+| Consumer identity & auth (OAuth agent, network) | `CREEK_MCP_RESOURCE_URL`, `CREEK_MCP_AUTHORIZATION_SERVER` (both non-secret) | **Yes — a verified JWT** | An agent a person connected through Adepthood presents an access token Adepthood issued (#1963). `creek_mcp/agent_tokens.py::JwtAgentTokenVerifier` accepts it only when its signature verifies against the issuer's JWKS and its `iss`, single-string `aud` and lifetime hold; its `sub` becomes the consumer and its `scope` claim the grants. On a managed vault `sub` must also equal the vault's own consumer identity. See [Agents over `/mcp`](#agents-over-mcp-epic-1961). |
 | Elevated operations | `CREEK_MCP_ELEVATED_TOKEN` | **Yes — constant-time HMAC compare** | Gates the destructive `creek.purge.*` family only ([`creek_mcp/auth.py`](../../creek-tools/creek_mcp/auth.py)). Fails closed when either side is empty. Adepthood is **not** expected to hold this token; purge is out of the Adepthood surface, and a per-consumer bearer alone does not satisfy it. |
 
 An Adepthood consumer on **stdio** SHOULD set `CREEK_MCP_CONSUMER=adepthood` so
@@ -125,6 +127,128 @@ consumer-auth model … is part of #755, not this version."
 > (raising there would skip the audit entry for the very call whose attribution
 > is suspect — the reasoning is recorded in `creek_mcp/policy.py`). Do not read
 > this section as "the verifier boundary is fully closed".
+
+## Agents over `/mcp` (epic #1961)
+
+Epic [#1961](https://github.com/Geoffe-Ga/Creek-Vault/issues/1961) lets a person
+connect an agent they already run — OpenClaw, Claude Code, a ChatGPT or Claude
+connector — to their own vault, with Adepthood as the OAuth 2.1 authorization
+server and the vault as the resource server. Adepthood's half of the same
+agreement — the access-token claim set, `sub`, refresh rotation, the key set and
+revocation timing — is recorded in Adepthood's
+[`docs/creek-vault-mcp-contract.md`, "Vault-agent access tokens"](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/creek-vault-mcp-contract.md#vault-agent-access-tokens-adepthood-owned),
+and the plain-words copy for each grant in its
+["Agent grants in plain words, and the Settings list"](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/creek-vault-mcp-contract.md#agent-grants-in-plain-words-and-the-settings-list-adepthood-owned);
+neither is restated here. What a person pastes into each client is in
+[`creek-tools/docs/mcp.md`, "Agents"](../../creek-tools/docs/mcp.md#agents-connecting-openclaw-claude-code-or-chatgpt-to-a-vault-1961).
+
+None of the agent surface below moved the contract minor on its own: #1962 to
+#1967 shipped while `0.21` was current, and `0.22.0` (#1968) was cut after them,
+so a `0.22` server carries all of it. See the documentation row of 2026-10-24 in
+the [change log](#change-log).
+
+### `/mcp` on managed vaults
+
+Every process that serves `/v1` — `creek-tools-api`, the container image and the
+Fly vault Machine — also serves this MCP server at exactly `/mcp`
+(`creek_mcp/mcp_path.py::MCP_PATH`) on the same port and TLS listener (8823 in
+the image), built over the same tool registry, verifier and `/v1` job runtime
+(`creek_mcp/httpapi/mcp_mount.py`). MCP negotiates its own protocol revision, so
+`/mcp` reads neither `X-Creek-Contract-Version` nor `X-Creek-Tier-Ceiling`; the
+ceiling is each tool's `privacy_tier_ceiling` argument and the remote cap
+applies unchanged. On Fly, one public edge (`https://<pilot-app>.fly.dev`) fronts
+every managed vault: it selects the vault realm for the `/mcp` subtree and the
+two metadata paths below (`creek_mcp/provisioning/pilot_control.py`), and the
+replay router replays `/mcp` to the owner's Machine — by the per-allocation
+routing credential, or, given `--oauth-authorization-server`, by an agent
+token's verified `sub` (`creek_mcp/httpapi/routing.py`). The resource URL of a
+managed vault is therefore the edge's, `https://<pilot-app>.fly.dev/mcp`, shared
+by all of them; the Machine pins `sub` to its own consumer identity so it
+accepts no one else's token.
+
+**Not yet end to end.** The Machine reads `CREEK_MCP_RESOURCE_URL` and
+`CREEK_MCP_AUTHORIZATION_SERVER` from its environment, and provisioning does not
+write them yet ([#1974](https://github.com/Geoffe-Ga/Creek-Vault/issues/1974)),
+so a managed vault today refuses agent tokens on `/mcp`; only its static
+consumer credential is served there.
+
+### OAuth resource metadata
+
+With both settings present (`creek_mcp/oauth_resource.py`), the vault publishes
+RFC 9728 protected-resource metadata at `/.well-known/oauth-protected-resource/mcp`
+and at the root-level fallback `/.well-known/oauth-protected-resource`:
+
+```json
+{"resource": "<CREEK_MCP_RESOURCE_URL>",
+ "authorization_servers": ["<CREEK_MCP_AUTHORIZATION_SERVER>"],
+ "scopes_supported": ["vault:read", "vault:desk", "vault:journal", "vault:pipeline"],
+ "bearer_methods_supported": ["header"]}
+```
+
+A `/mcp` request with no token, or one the vault refuses, is `401` with
+`WWW-Authenticate: Bearer error="invalid_token", resource_metadata="<metadata URL>",
+scope="vault:read vault:desk"`; a verified token whose `scope` names no grant is
+`403` with `error="insufficient_scope"`. The `scope` in the challenge is
+`creek_mcp/policy.py::DEFAULT_GRANTS`. A token is accepted only when it is signed
+`RS256` or `ES256` by a key the issuer's JWKS publishes under its `kid`, its
+`iss` equals the configured issuer, its `aud` is **one string** exactly equal to
+`CREEK_MCP_RESOURCE_URL`, and `exp`/`iat` (and `nbf` when present) hold within
+30 s. The token is never forwarded to any provider, pool or Drive request. The
+handshake's `auth` field reads `oauth` on such a vault.
+
+`scopes_supported` lists all four grants, so a client that requests whatever the
+metadata advertises asks for all four unless it is pinned. Both OpenClaw and
+Claude Code did that on 2026-10-24; the client recipes pin the default.
+
+### Grant names
+
+Four grants, defined in `creek_mcp/policy.py` (`Grant`, `TOOL_GRANTS`) and
+spelled identically in a static token's grant suffix
+(`consumer=<token>@vault:read+vault:desk`) and an access token's `scope` claim,
+which `creek_mcp/policy.py::granted_by_scopes` reads the same way:
+
+| Grant | Tools |
+|---|---|
+| `vault:read` | `creek.handshake`, `creek.state.read`, `creek.wheel`, `creek.mine`, `creek.classify.entry`, `creek.lint` |
+| `vault:desk` | `creek.draft`, `creek.author`, `creek.reflect`, `creek.save`, `creek.jobs.read` |
+| `vault:journal` | `creek.journal`, `creek.upload` |
+| `vault:pipeline` | `creek.classify`, `creek.link`, `creek.compile`, `creek.report`, `creek.skills.refresh`, `creek.ingest`, `creek.redact.scan`, `creek.state.render` |
+
+`tools/list` answers with only the tools a caller's grants admit, so the
+handshake's `capabilities` is the caller's own profile. A call outside it is
+refused before dispatch with one constant reason and audited as refused under
+the tool name only. `creek.purge.*` is in no grant. An unrecognised scope confers
+nothing, and `creek:ungated` in an access token is ignored. A static consumer
+with no suffix stays *ungated* — the pre-#1964 reach, including writes — which is
+how the Adepthood service bearer keeps working.
+
+### `creek.jobs.read` and the long-call envelope
+
+`creek.draft` and `creek.author` answer synchronously within
+`CREEK_MCP_SYNC_DEADLINE_SECONDS` (default `90`), and otherwise with
+`{status: "accepted", tool, tier_ceiling, job_id, state: "running"}` while the
+same worker keeps composing (`creek_mcp/composition_jobs.py`). A client that sent
+a `progressToken` receives one `notifications/progress` per stage, carrying the
+stage name only. `creek.jobs.read(job_id)` returns
+`{status: "ok", tool, tier_ceiling, job_id, state}`, `state` one of `queued` /
+`running` / `succeeded` / `failed`, plus a content-free `result` once it has
+succeeded (`creek_mcp/tools/jobs.py`). The job is bound to the consumer it was
+audited under, one long call runs per consumer across `/mcp` and `/v1`, and any
+id the caller does not own reads as `unavailable`. The synchronous `creek.draft`
+envelope gained `source_count` and `voice_guard_status`. `creek.jobs.read` is in
+`vault:desk` and, like `creek.draft` and `creek.author`, outside the Adepthood
+capability table above, which records the tools Adepthood's backend calls.
+
+### Per-agent attribution
+
+The consumer an OAuth call is audited under is the token's `sub`, which names the
+**person**, not the agent: on a self-hosted vault `adepthood-account-` plus 32
+hex digits, on a managed vault the vault's consumer identity. Every agent one
+person connects is therefore one consumer on the audit chain, in the job slot,
+and in `GET /v1/agent-activity` (`0.22.0`). Adepthood already mints the RFC 9068
+`client_id` claim in every access token; auditing per agent from it is
+[#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976). A static-token
+agent is audited under its own consumer name.
 
 ## Privacy gate and care gate — who enforces what
 
@@ -792,6 +916,7 @@ not upgrade it to a semantic identity.
 
 | Contract version | Date | Change |
 |---|---|---|
+| *(no contract change)* | 2026-10-24 | **Documentation: the agent surface of epic #1961 is recorded (#1969).** Adds [Agents over `/mcp`](#agents-over-mcp-epic-1961) — `/mcp` inside every `/v1` process and behind the Fly edge (#1962), the RFC 9728 metadata, `401`/`403` challenges and JWT acceptance rules (#1963), the four grant names and their tool sets (#1964), `creek.jobs.read` and the `accepted` long-call envelope (#1966) and the per-person attribution limit (#1976) — adds the OAuth row to [Consumer identity & auth model](#consumer-identity--auth-model), corrects the `network` transport row (an issuer alone now satisfies its auth requirement), and moves this document's two "every minor up to …" notes from `0.18.0` to `0.22.0`. **No minor moved here, and none moved for #1962–#1967 either**: they changed the agent adapter's surface — a new tool (`creek.jobs.read`), a new `status` value and two new keys on `creek.draft`, a grant-filtered `tools/list`, two new handshake keys (`auth`, #1963; `request_key_providers`, #1967), the BYOK headers and `inference_source` on the three model-calling tools (#1967) — while `0.21` was current, and `0.22.0` (#1968) was cut after all of them, so every `0.22` server carries them and a `0.21` server may already. This row records that fact rather than a new contract event. `creek.jobs.read` has been in the shipped-surface test's `NON_ADEPTHOOD_TOOLS` since #1966: it is an agent tool, not one Adepthood's backend calls. |
 | `0.22.0` | 2026-10-24 | **The HTTP adapter publishes `agent-activity` (#1968), and the MCP adapter audits one more refusal; no tool's arguments or return shape move.** `GET /v1/agent-activity` projects this adapter's audit chain onto content-free `{consumer, tool, at, outcome}` rows for the vault's owner, with `outcome` closed at `admitted \| refused` and every argument summary, path, fragment id and hash withheld. To make an agent's reach above `personal` visible there, `_BoundedFastMCP.call_tool` now audits a remote call refused by `admitted_ceiling` exactly as it audits an out-of-profile call (#1964): `"outcome": "refused"` under the tool name only, no argument summary, and the transport-default `open` ceiling rather than the one requested. The refusal itself is unchanged and still precedes dispatch. A detached composition's `accepted` / `completed` entries (#1966) are read as one call, not three. `0.21` remains served. |
 | `0.21.0` | 2026-10-21 | **The HTTP adapter serves the admission refusal on the letter route too (#1903 step 6, [ADR-0016](../../creek-tools/docs/architecture/ADR/0016-shared-confidential-warm-inference-pool.md)); the MCP tool surface does not move.** `rate_limited` / HTTP 429 is now reachable on `POST /v1/letters/{external_id}` as well as on `POST /v1/reflections`, with the same code, message, envelope and advisory `Retry-After`. The cap did not move and never was per route: both routes resolve the one `generation` stage through the same provider chokepoint, so the refusal is the shared pool's admission decision or the writer's own request key's 429, and one budget was already answering both — what `0.19` left split was the reporting, since `ProviderRateLimitError` subclasses `RuntimeError` and the letter tool's broad catch collapsed a cap into `provider_unavailable`. Nothing is stored on that path, so a capped letter leaves the caller-owned id unwritten and a retry still answers `created`. No model, field, status or route is added; the refusal is withheld from callers below `0.21`, so every `0.20` letter response is byte-identical and `0.20` remains served. It is `0.21` and not `0.20` because `0.20` had already shipped for `keyless_inference` (#1938), and reusing a published minor to move a route's behaviour is the break this window exists to prevent. |
 | `0.16.0` | 2026-09-11 | **The HTTP adapter gains consumer-scoped Journal withdrawal (#1799); the MCP tool surface does not move.** `DELETE /v1/journal-entries/{external_id}` is the idempotent destructive inverse of Journal upsert. It requires bearer identity, an explicit remote tier ceiling, and a negotiated `0.16` contract, but no request body or entry prose. A complete response means the caller's staged source, fragments, ledger/index/provenance references, and retrieval-facing derived state are absent; incomplete work is retryable and never reported as success. Foreign, unknown, already-withdrawn, and never-present identifiers are indistinguishable successes, so the route cannot be used as an ownership or existence oracle. The route, capability, and one closed response model widen the shared minor; `0.15` remains served without seeing or reaching them. |
@@ -817,7 +942,7 @@ not upgrade it to a semantic identity.
 | `0.2.0` | 2026-07-30 | `unclassified` (untiered) content now ranks with `personal`, not `open`, on the MCP ceiling — matching `creek.classify.privacy_filter` since #876 (#961). `open`-ceiling consumers no longer read untiered content; remedy is `creek classify`. See the amendment note under [Tier ceiling semantics](#tier-ceiling-semantics). |
 | `0.1.0` | 2026-06-30 | Initial draft, mirroring `adepthood#950`. Enumerates capabilities, maps to existing (`creek.ingest`, `creek.classify`) and planned (`creek.handshake`/`reflect`/`wheel`) tools, fixes tier/care/auth/transport semantics, pins ontology version. |
 
-> **Every minor from `0.1.0` to `0.18.0` has a row above**, including the four
+> **Every minor from `0.1.0` to `0.22.0` has a row above**, including the four
 > — `0.5.0`, `0.6.0`, `0.7.0`, `0.8.0` — that this document omitted until
 > 2026-08-21. Three of them moved the MCP surface and belonged here all along:
 > `0.5.0` changed `creek.link` / `creek.journal` / `creek.upload` return
@@ -827,4 +952,4 @@ not upgrade it to a semantic identity.
 > concerns the HTTP half, the fuller account is in the [sibling ADR's change
 > log](./2026-07-31-adepthood-http-application-api.md#change-log).
 > `SUPPORTED_CONTRACT_MINORS` (`creek_mcp/api/models.py`) is the authority on
-> which minors are served, and it currently spans `0.2`–`0.17`.
+> which minors are served, and it currently spans `0.2`–`0.22`.
