@@ -8,7 +8,7 @@ from http import HTTPStatus
 from ipaddress import IPv6Address, IPv6Network, ip_address
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
-from creek_mcp.mcp_path import in_mcp_realm
+from creek_mcp.mcp_path import in_mcp_realm, in_metadata_realm
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, MutableMapping
@@ -66,9 +66,10 @@ _STRIPPED_EDGE_HEADERS: Final[frozenset[bytes]] = frozenset(
 class FlyEdgeApplication:
     """Dispatch one attested ``*.fly.dev`` listener into two auth realms.
 
-    ``/control/`` is the control plane's realm; ``/v1/`` and the ``/mcp``
-    subtree are the vault realm, handed to the replay router. Anything else is
-    the content-free routing miss.
+    ``/control/`` is the control plane's realm; ``/v1/``, the ``/mcp`` subtree
+    and the two RFC 9728 protected-resource metadata paths (#1963) are the
+    vault realm, handed to the replay router. Anything else is the
+    content-free routing miss.
     """
 
     control: ASGIApp = field(repr=False)
@@ -102,10 +103,7 @@ class FlyEdgeApplication:
             return
         if isinstance(path, str) and path.startswith("/control/"):
             selected = self.control
-        elif (isinstance(path, str) and path.startswith("/v1/")) or in_mcp_realm(path):
-            # The vault realm: /v1 and the MCP surface (#1962). The edge selects
-            # the realm for the whole /mcp subtree; what exists beneath it is
-            # the vault realm's own answer, not a route table kept here.
+        elif _in_vault_realm(path):
             selected = self.router
         else:
             await _empty_response(send, self.routing_miss_status)
@@ -131,6 +129,27 @@ class FlyEdgeApplication:
             if observed != [value]:
                 return False
         return True
+
+
+def _in_vault_realm(path: object) -> bool:
+    """Return whether *path* belongs to the vault realm the replay router serves.
+
+    ``/v1/``, the whole ``/mcp`` subtree (#1962) — what exists beneath it is
+    the vault realm's own answer, not a route table kept here — and the
+    protected-resource metadata a client reads before it holds any credential
+    (#1963), which the router answers itself.
+
+    Args:
+        path: The request's ASGI path, unvalidated.
+
+    Returns:
+        ``True`` for a vault-realm path.
+    """
+    return (
+        (isinstance(path, str) and path.startswith("/v1/"))
+        or in_mcp_realm(path)
+        or in_metadata_realm(path)
+    )
 
 
 async def _empty_response(send: Send, status: int | HTTPStatus) -> None:

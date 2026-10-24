@@ -307,3 +307,64 @@ def test_main_serves_the_composed_app_and_closes_it_on_shutdown(
 
     assert served == [bundle.app]
     assert bundle.closed is True
+
+
+def _replay_bundle(tmp_path: Path, *extra: str) -> routing_cli.ReplayRoutingBundle:
+    """Compose the Fly replay router with *extra* arguments.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        extra: Further command-line arguments.
+
+    Returns:
+        The bundle.
+    """
+    parser = routing_cli.build_parser()
+    args = parser.parse_args([*_arguments(tmp_path), *extra])
+    return routing_cli.compose_replay(
+        args,
+        parser,
+        clock=lambda: _NOW,
+        provider_transport=httpx.MockTransport(
+            lambda request: httpx.Response(404, request=request)
+        ),
+    )
+
+
+def test_the_replay_router_routes_agents_once_an_issuer_is_configured(
+    tmp_path: Path,
+) -> None:
+    """``--oauth-*`` turns on the edge's resource-server answers (#1963)."""
+    bundle = _replay_bundle(
+        tmp_path,
+        "--oauth-authorization-server",
+        "https://api.adepthood.example",
+        "--oauth-resource-url",
+        "https://creek-control-pilot.fly.dev/mcp",
+    )
+    with TestClient(bundle.app) as client:
+        metadata = client.get("/.well-known/oauth-protected-resource/mcp")
+        refused = client.post("/mcp", content=b"{}")
+    bundle.close()
+
+    assert metadata.json()["resource"] == "https://creek-control-pilot.fly.dev/mcp"
+    assert metadata.json()["authorization_servers"] == ["https://api.adepthood.example"]
+    assert "resource_metadata=" in refused.headers["www-authenticate"]
+
+
+def test_the_replay_router_without_an_issuer_routes_no_agents(tmp_path: Path) -> None:
+    """No issuer: the router is exactly the pre-#1963 router."""
+    bundle = _replay_bundle(tmp_path)
+    with TestClient(bundle.app) as client:
+        metadata = client.get("/.well-known/oauth-protected-resource/mcp")
+    bundle.close()
+
+    assert metadata.status_code == 401
+
+
+def test_an_issuer_without_a_resource_url_refuses_to_start(tmp_path: Path) -> None:
+    """Agent routing with no audience to verify against is a startup refusal."""
+    with pytest.raises(SystemExit):
+        _replay_bundle(
+            tmp_path, "--oauth-authorization-server", "https://api.adepthood.example"
+        )
