@@ -94,7 +94,7 @@ from creek.generate.compile_routing import (
     compiled_source_ids,
     load_compiled_pages,
 )
-from creek.generate.drafts import DraftGenerator
+from creek.generate.drafts import INFERENCE_SOURCE_FRONTMATTER_KEY, DraftGenerator
 from creek.generate.grounding import GroundingThresholds, default_embedding_fn
 from creek.generate.mining import IdeaMiner
 from creek.models import Phase, PrivacyTier
@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.generate.mining import IdeaSeed
+    from creek_mcp.provenance import InferenceProvenance
 
 TOOL_NAME = "creek.draft"
 
@@ -127,7 +128,7 @@ _JOB_RESULT_KEYS: Final[tuple[str, ...]] = (
     "source_count",
     "voice_guard_status",
 )
-"""The content-free keys of a success envelope a job record may keep.
+"""The content-free keys of a success envelope a job record always keeps.
 
 ``title`` and ``source_fragments`` are the two keys left out, on purpose: the
 first is the seed's own title, the second names fragments. A job result is
@@ -272,6 +273,7 @@ def draft_tool(
     index: int = 0,
     consumer: str = "unknown",
     on_stage: StageCallback = ignore_stage,
+    provenance: InferenceProvenance | None = None,
 ) -> dict[str, Any]:
     """Mine ideas, draft the *index*-th, and persist with full provenance.
 
@@ -297,11 +299,17 @@ def draft_tool(
         on_stage: Sink told each :data:`DRAFT_STAGES` boundary as the draft
             crosses it (#1966) — ``SEED`` here, the rest from the generator.
             Stage names only; defaults to a no-op.
+        provenance: The call's route recorder (#1967), filled by the
+            production factory when it resolves the provider. Its label is
+            stamped into the draft's frontmatter and echoed as
+            ``inference_source``; ``None`` (or nothing recorded) stamps
+            nothing.
 
     Returns:
         ``{status, tool, tier_ceiling, ...}`` — ``ok`` with the saved
-        ``draft_path`` (plus its ``source_count`` and
-        ``voice_guard_status``), ``empty`` when mining surfaced no seeds, or a
+        ``draft_path`` (plus its ``source_count``, ``voice_guard_status`` and,
+        when recorded, ``inference_source``), ``empty`` when mining surfaced
+        no seeds, or a
         structured ``refused`` response for an out-of-range *index*, an
         unavailable provider, the router's
         :class:`~creek.classify.llm.router.IntimateRoutingError` when
@@ -380,8 +388,9 @@ def draft_tool(
             ceiling=privacy_tier_ceiling,
             reason=str(exc),
         )
-    saved = generator.save_draft(draft, vault_path)
-    return {
+    source = None if provenance is None else provenance.source
+    saved = generator.save_draft(draft, vault_path, inference_source=source)
+    response: dict[str, Any] = {
         "status": "ok",
         "tool": TOOL_NAME,
         "tier_ceiling": privacy_tier_ceiling.value,
@@ -392,6 +401,9 @@ def draft_tool(
         "source_count": len(draft.source_fragments),
         "voice_guard_status": _voice_guard_status(saved),
     }
+    if source is not None:
+        response[INFERENCE_SOURCE_FRONTMATTER_KEY] = source
+    return response
 
 
 def _voice_guard_status(saved: Path) -> str | None:
@@ -431,4 +443,9 @@ def draft_job_result(response: dict[str, Any]) -> dict[str, Any] | None:
     """
     if response.get("status") != "ok":
         return None
-    return {key: response.get(key) for key in _JOB_RESULT_KEYS}
+    result = {key: response.get(key) for key in _JOB_RESULT_KEYS}
+    if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
+        result[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[
+            INFERENCE_SOURCE_FRONTMATTER_KEY
+        ]
+    return result

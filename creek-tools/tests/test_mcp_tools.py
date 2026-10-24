@@ -414,7 +414,13 @@ def test_draft_success_path_saves_file(
                 generated_date=datetime(2026, 5, 11, tzinfo=UTC),
             )
 
-        def save_draft(self, draft: Draft, vault_path: Path) -> Path:
+        def save_draft(
+            self,
+            draft: Draft,
+            vault_path: Path,
+            *,
+            inference_source: str | None = None,
+        ) -> Path:
             target = vault_path / "07-Voice" / "Drafts" / "2026-05-11-stub.md"
             target.write_text("body", encoding="utf-8")
             return target
@@ -607,7 +613,13 @@ def _patch_generator(monkeypatch: pytest.MonkeyPatch) -> None:
                 generated_date=datetime(2026, 5, 11, tzinfo=UTC),
             )
 
-        def save_draft(self, draft: Draft, vault_path: Path) -> Path:
+        def save_draft(
+            self,
+            draft: Draft,
+            vault_path: Path,
+            *,
+            inference_source: str | None = None,
+        ) -> Path:
             """Write a placeholder draft file and return its path."""
             del draft
             target = vault_path / "07-Voice" / "Drafts" / "2026-05-11-routing.md"

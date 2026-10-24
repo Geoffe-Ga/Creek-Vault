@@ -22,7 +22,7 @@ import frontmatter
 
 from creek.author import plan_author, require_supported_medium, run_author
 from creek.author.models import ZERO_EVIDENCE_WARNING, has_zero_evidence
-from creek.generate.drafts import reserve_draft_path
+from creek.generate.drafts import INFERENCE_SOURCE_FRONTMATTER_KEY, reserve_draft_path
 from creek.progress import CompositionStage, StageCallback, ignore_stage
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from creek.author.client import AuthorLLMClient
     from creek.author.models import FindingDimension
     from creek.models import PrivacyTier
+    from creek_mcp.provenance import InferenceProvenance
 
 TOOL_NAME = "creek.author"
 
@@ -277,6 +278,7 @@ def author_tool(
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
     on_stage: StageCallback = ignore_stage,
+    provenance: InferenceProvenance | None = None,
 ) -> dict[str, Any]:
     """Author *query* via the real Writing Desk and return the result.
 
@@ -305,6 +307,10 @@ def author_tool(
         on_stage: Sink told each :data:`AUTHOR_STAGES` boundary the desk
             crosses (#1966). Stage names only; defaults to a no-op. The dry
             run composes nothing and reports nothing.
+        provenance: The call's route recorder (#1967), filled by the
+            production voice factory when it resolves a provider. A success
+            envelope echoes its label as ``inference_source``; a deterministic
+            render, a dry run and a refusal carry none.
 
     Returns:
         On success, the draft envelope (body, verdict, provenance, cited
@@ -378,7 +384,11 @@ def author_tool(
         return _error_response(
             str(exc), tier_ceiling=privacy_tier_ceiling, dry_run=dry_run
         )
-    return _draft_response(draft, tier_ceiling=privacy_tier_ceiling)
+    response = _draft_response(draft, tier_ceiling=privacy_tier_ceiling)
+    source = None if provenance is None else provenance.source
+    if response["status"] == "ok" and source is not None:
+        response[INFERENCE_SOURCE_FRONTMATTER_KEY] = source
+    return response
 
 
 def save_authored_draft(vault_path: Path, response: dict[str, Any]) -> Path:
@@ -417,6 +427,10 @@ def save_authored_draft(vault_path: Path, response: dict[str, Any]) -> Path:
         source_fragments=_cited_fragment_ids(response),
         generated_date=generated.isoformat(),
     )
+    if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
+        post[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[
+            INFERENCE_SOURCE_FRONTMATTER_KEY
+        ]
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
     return target
 
@@ -451,7 +465,7 @@ def author_job_result(
     """
     if response.get("status") != "ok":
         return None
-    return {
+    result = {
         "status": "ok",
         "tool": TOOL_NAME,
         "tier_ceiling": response["tier_ceiling"],
@@ -463,3 +477,8 @@ def author_job_result(
         "source_count": len(_cited_fragment_ids(response)),
         "warnings": list(response["warnings"]),
     }
+    if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
+        result[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[
+            INFERENCE_SOURCE_FRONTMATTER_KEY
+        ]
+    return result

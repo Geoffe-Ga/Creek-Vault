@@ -80,9 +80,13 @@ def _draft_llm(
     itself is replaced; *gate*, when given, holds each draft open.
     """
 
-    def _build(vault: Path, tier: object) -> Callable[[str], str]:
-        """Return a client that waits on *gate*, then drafts."""
-        del vault, tier
+    def _build(vault: Path, tier: object, **scope: object) -> Callable[[str], str]:
+        """Return a client that waits on *gate*, then drafts.
+
+        *scope* is the call's request key and route recorder (#1967), which
+        this stand-in neither needs nor keeps.
+        """
+        del vault, tier, scope
 
         def _llm(prompt: str) -> str:
             """Return the canned body once released."""
