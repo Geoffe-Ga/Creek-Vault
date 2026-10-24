@@ -123,6 +123,64 @@ put_journal() {
         "https://127.0.0.1:${port}/v1/journal-entries/${external_id}"
 }
 
+mcp_post() {
+    local identity="$1"
+    local token="$2"
+    local port="$3"
+    local body="$4"
+    shift 4
+    local config
+    config="$(curl_config "$identity" "$token")"
+    curl --config "$config" \
+        --cacert "$TMP_ROOT/$identity/secrets/tls.crt" \
+        --request POST \
+        --header 'Content-Type: application/json' \
+        --header 'Accept: application/json, text/event-stream' \
+        "$@" \
+        --data "$body" \
+        "https://127.0.0.1:${port}/mcp"
+}
+
+# The agent surface (#1962): MCP streamable-HTTP at /mcp on the same TLS port
+# and with the same mounted consumer token as /v1, completing initialize and a
+# creek.handshake tools/call that must report the network transport.
+mcp_handshake() {
+    local identity="$1"
+    local token="$2"
+    local port="$3"
+    local head="$TMP_ROOT/$identity/mcp-initialize.headers"
+    local init session result anonymous
+    init="$(mcp_post "$identity" "$token" "$port" \
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"container-contract","version":"0"}}}' \
+        --dump-header "$head")" || fail "MCP initialize was refused at /mcp"
+    [[ "$init" == *'"name":"creek-tools-mcp"'* ]] \
+        || fail "MCP initialize did not reach creek-tools-mcp"
+    session="$(tr -d '\r' < "$head" | awk 'tolower($1) == "mcp-session-id:" { print $2 }')"
+    [[ -n "$session" ]] || fail "MCP initialize returned no session id"
+    mcp_post "$identity" "$token" "$port" \
+        '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+        --header "mcp-session-id: $session" >/dev/null \
+        || fail "MCP initialized notification was refused"
+    result="$(mcp_post "$identity" "$token" "$port" \
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"creek.handshake","arguments":{}}}' \
+        --header "mcp-session-id: $session")" || fail "MCP creek.handshake call was refused"
+    printf '%s' "$result" | python3 -c '
+import json, sys
+data = [line[5:].strip() for line in sys.stdin.read().splitlines() if line.startswith("data:")]
+handshake = json.loads(data[-1])["result"]["structuredContent"]
+assert handshake.get("transport") == "network", handshake.get("transport")
+' || fail "MCP creek.handshake did not report the network transport"
+    anonymous="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+        --cacert "$TMP_ROOT/$identity/secrets/tls.crt" \
+        --request POST \
+        --header 'Content-Type: application/json' \
+        --header 'Accept: application/json, text/event-stream' \
+        --data '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
+        "https://127.0.0.1:${port}/mcp")"
+    [[ "$anonymous" == "401" ]] || fail "unauthenticated MCP was not refused 401"
+    assert_no_secret "MCP handshake" "$init$result"
+}
+
 hash_in_container() {
     local name="$1"
     local path="$2"
@@ -154,6 +212,7 @@ docker exec "$NAME_A" python -c \
 
 [[ "$(get_health "adepthood-a" "$TOKEN_A" 18823)" == '{"status":"ok"}' ]] \
     || fail "first boot did not serve authenticated /v1 health"
+mcp_handshake "adepthood-a" "$TOKEN_A" 18823
 
 response_a="$(put_journal "adepthood-a" "$TOKEN_A" 18823 \
     'container-contract-a' 'isolated journal sentinel alpha')"

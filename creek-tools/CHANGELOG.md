@@ -9,6 +9,15 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Serve the MCP streamable-HTTP server at `/mcp` from the `/v1` process (#1962).
+  `create_app()` builds it with `build_server(transport=NETWORK)` and the same
+  `ConsumerTokenVerifier` instance as `/v1`, mounted below the access log and
+  error boundary and above every `/v1`-only layer (version gate, timeout, body
+  cap, bearer and ceiling header gates). The container and Fly vault entry
+  points serve it with no new flag; the Fly edge routes the `/mcp` realm to the
+  replay router, which replays `/mcp` to the owner's vault. The container
+  contract now completes an MCP handshake over TLS.
+
 - Give each remote MCP consumer a per-agent tool profile (#1964). Four grants
   (`vault:read`, `vault:desk`, `vault:journal`, `vault:pipeline`) are decided in
   `creek_mcp/policy.py` beside the tier cap: `admitted_tool` refuses an

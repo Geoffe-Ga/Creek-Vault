@@ -208,6 +208,43 @@ def test_http_api_cold_import_does_not_require_the_optional_author_stack() -> No
     assert result.returncode == 0, result.stderr
 
 
+def test_the_combined_app_builds_its_mcp_surface_without_numpy(tmp_path: Path) -> None:
+    """``create_app`` builds the ``/mcp`` server in the image's NumPy-free stack.
+
+    Building the MCP server imports the whole tool registry (#1962); a
+    module-level NumPy import anywhere on it would stop every managed vault at
+    boot rather than at the first call that needed it.
+
+    Args:
+        tmp_path: A scratch vault directory.
+    """
+    result = _run_without_numpy(
+        "from pathlib import Path\n"
+        "from creek_mcp.httpapi.app import create_app\n"
+        "from creek_mcp.remote_auth import ConsumerTokenVerifier\n"
+        f"app = create_app(vault_path=Path({str(tmp_path)!r}), "
+        "verifier=ConsumerTokenVerifier({'adepthood': ('t' * 32,)}))\n"
+        "assert app.state.mcp_server is not None\n"
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_container_contract_completes_an_mcp_handshake_over_tls() -> None:
+    """The real-Docker contract drives ``/mcp`` with the mounted consumer token.
+
+    ``initialize``, then ``tools/call creek.handshake``, over the container's
+    TLS listener, asserting the network transport — the in-process twin is
+    ``tests/test_container_runtime.py``'s served-app handshake.
+    """
+    script = CONTRACT_SCRIPT.read_text(encoding="utf-8")
+    assert "https://127.0.0.1:${port}/mcp" in script
+    assert '"method":"initialize"' in script
+    assert '"name":"creek.handshake"' in script
+    assert 'handshake.get("transport") == "network"' in script
+    assert 'mcp_handshake "adepthood-a" "$TOKEN_A" 18823' in script
+    assert "mcp_handshake" in script
+
+
 def test_reflection_route_imports_the_author_stack_without_numpy() -> None:
     """``POST /v1/reflections`` loads ``creek.author`` on first use; NumPy is an extra.
 

@@ -30,7 +30,11 @@ from creek_mcp.httpapi.cli import serve
 from creek_mcp.provisioning.pilot_control import validate_fly_runtime
 from creek_mcp.provisioning.production_secrets import read_owner_only_file
 from creek_mcp.provisioning.replay_contract import is_replay_state
-from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV, announce_rotation_window
+from creek_mcp.remote_auth import (
+    CONSUMER_TOKENS_ENV,
+    announce_rotation_window,
+    announce_ungated_consumers,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
@@ -133,6 +137,7 @@ def run(settings: FlyVaultSettings) -> None:
         managed_local_only(),
     ):
         announce_rotation_window(verifier)
+        announce_ungated_consumers(verifier)
         serve(
             create_app(verifier=verifier, fly_replay_state=replay_state),
             args,

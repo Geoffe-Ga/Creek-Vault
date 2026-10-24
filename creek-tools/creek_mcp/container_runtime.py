@@ -44,11 +44,15 @@ from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
     announce_rotation_window,
+    announce_ungated_consumers,
+    load_consumer_grants,
     load_consumer_tokens,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from creek_mcp.policy import Grant
 
 VAULT_PATH_ENV: Final[str] = "CREEK_CONTAINER_VAULT_PATH"
 """Non-secret environment setting naming the durable volume mount."""
@@ -125,18 +129,23 @@ class PreparedVault:
 
 @dataclass(frozen=True)
 class SingleConsumerSecret:
-    """One identity and its currently valid rotation tokens.
+    """One identity, its currently valid rotation tokens, and its grants.
 
     The token tuple is excluded from ``repr`` so an exception, debugger, or
     structured log cannot accidentally serialize credential material.
+    ``grants`` is the entry's grant suffix (#1964), or ``None`` when it carries
+    none: that consumer is ungated on ``/mcp``, as it would be on the
+    environment-configured network transport.
     """
 
     consumer: str
     tokens: tuple[str, ...] = field(repr=False)
+    grants: frozenset[Grant] | None = None
 
     def verifier(self) -> ConsumerTokenVerifier:
         """Build the shared constant-time verifier over this identity."""
-        return ConsumerTokenVerifier({self.consumer: self.tokens})
+        grants = None if self.grants is None else {self.consumer: self.grants}
+        return ConsumerTokenVerifier({self.consumer: self.tokens}, grants=grants)
 
 
 @dataclass(frozen=True)
@@ -326,8 +335,10 @@ def load_consumer_secret(path: Path) -> SingleConsumerSecret:
         raise ContainerConfigurationError(
             "consumer secret mount is missing or unreadable"
         ) from exc
+    registry = {CONSUMER_TOKENS_ENV: raw}
     try:
-        parsed = load_consumer_tokens({CONSUMER_TOKENS_ENV: raw})
+        parsed = load_consumer_tokens(registry)
+        grants = load_consumer_grants(registry)
     except ValueError as exc:
         raise ContainerConfigurationError("consumer secret is invalid") from exc
     if len(parsed) != 1:
@@ -335,7 +346,7 @@ def load_consumer_secret(path: Path) -> SingleConsumerSecret:
             "consumer secret must configure exactly one identity"
         )
     consumer, tokens = next(iter(parsed.items()))
-    return SingleConsumerSecret(consumer, tokens)
+    return SingleConsumerSecret(consumer, tokens, grants.get(consumer))
 
 
 def _require_tls_file(path: Path, label: str) -> None:
@@ -368,6 +379,9 @@ def run(settings: ContainerSettings) -> None:
     os.environ[LOOPBACK_ONLY_ENV] = "1"
     os.environ.pop(CONSUMER_TOKENS_ENV, None)
     announce_rotation_window(verifier)
+    # The served app answers /mcp (#1962), so an ungated consumer is named here
+    # exactly as creek-tools-mcp --transport network names it (#1964).
+    announce_ungated_consumers(verifier)
     with managed_local_only() if settings.managed else nullcontext():
         serve(
             create_app(verifier=verifier),

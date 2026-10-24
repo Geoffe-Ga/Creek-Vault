@@ -73,6 +73,27 @@ def configured_vault(request: Request) -> Path | None:
         ``None`` when the configuration cannot be read at all.
     """
     configured: Path | None = request.app.state.vault_path
+    return resolve_vault(configured)
+
+
+def resolve_vault(configured: Path | None) -> Path | None:
+    """Return *configured*, or the vault ``creek_config.yaml`` names, or ``None``.
+
+    The one resolution rule, shared by :func:`configured_vault` — which applies
+    it per ``/v1`` request — and by :func:`creek_mcp.httpapi.app.create_app`,
+    which applies it **once**, at build, for the ``/mcp`` surface: MCP tools
+    are bound to their vault when the server is built (#1409), exactly as
+    ``creek-tools-mcp`` binds them.
+
+    **Blocking**, for the reason :func:`configured_vault` gives.
+
+    Args:
+        configured: The explicitly configured vault, or ``None`` to resolve it
+            from configuration.
+
+    Returns:
+        The vault path, or ``None`` when the configuration cannot be read.
+    """
     if configured is not None:
         return configured
     try:

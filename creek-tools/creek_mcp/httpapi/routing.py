@@ -33,6 +33,7 @@ from creek_mcp.httpapi.middleware.limits import (
     ConcurrencyLimitMiddleware,
     RequestTimeoutMiddleware,
 )
+from creek_mcp.mcp_path import MCP_PATH
 from creek_mcp.provisioning.driver import ProviderError
 
 if TYPE_CHECKING:
@@ -76,6 +77,12 @@ _REQUEST_ONLY_HEADERS: Final[frozenset[bytes]] = frozenset(
         b"x-forwarded-proto",
     }
 )
+_MCP_METHODS: Final[tuple[str, ...]] = ("POST", "GET", "DELETE")
+"""The three verbs MCP streamable-HTTP uses: messages, the stream, session end."""
+
+_IMPLICIT_HEAD: Final[str] = "HEAD"
+"""The verb Starlette adds beside ``GET`` and neither surface publishes."""
+
 _PUBLISHED_STATUSES: Final[frozenset[int]] = PUBLISHED_SUCCESS_STATUSES | frozenset(
     ERROR_STATUS.values()
 )
@@ -366,7 +373,39 @@ def _route_for(
         name=spec.operation_id,
     )
     if route.methods is not None:
-        route.methods.discard("HEAD")
+        route.methods.discard(_IMPLICIT_HEAD)
+    return route
+
+
+def _mcp_replay_route(router: AllocationReplayRouter) -> Route:
+    """Replay ``/mcp`` to the caller's own vault, as every ``/v1`` route is (#1962).
+
+    The same owner resolution, deletion fences and replay state as ``/v1``:
+    only the path differs. Exact path only — the subtree is the published
+    routing miss here, as it is inside the vault.
+
+    Args:
+        router: The replay router the ``/v1`` routes share.
+
+    Returns:
+        The mounted route, serving the streamable-HTTP verbs and no ``HEAD``.
+    """
+
+    async def endpoint(request: Request) -> Response:
+        """Record the route for the access log, then replay.
+
+        Args:
+            request: The request in flight.
+
+        Returns:
+            The replay, or the router's refusal.
+        """
+        context_of(request.scope).route = MCP_PATH
+        return await router.proxy(request)
+
+    route = Route(MCP_PATH, endpoint, methods=list(_MCP_METHODS), name="mcp")
+    if route.methods is not None:
+        route.methods.discard(_IMPLICIT_HEAD)
     return route
 
 
@@ -416,9 +455,14 @@ def build_fly_replay_routing_app(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> Starlette:
-    """Build the router used only behind the attested Fly edge listener."""
+    """Build the router used only behind the attested Fly edge listener.
+
+    Replays every published ``/v1`` route and ``/mcp`` (#1962) to the
+    authenticated owner's vault Machine.
+    """
     router = AllocationReplayRouter(store, provider)
     routes = [_route_for(spec, router) for spec in ROUTES]
+    routes.append(_mcp_replay_route(router))
     replay_caps = {**ROUTE_BODY_CAPS, "/v1/uploads": DEFAULT_MAX_BODY_BYTES}
     app = Starlette(
         routes=routes,

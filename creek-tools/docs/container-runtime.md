@@ -294,7 +294,9 @@ recovery mechanism; there is no user recovery ceremony or reset promise.
 
 `scripts/container-contract.sh` builds on these instructions in CI. It boots
 two containers with two volumes and two consumer secrets, writes through real
-`/v1`, restarts one, verifies content and credential persistence, proves
+`/v1`, completes an MCP `initialize` and `creek.handshake` over `/mcp` on the
+same TLS port with the same consumer token (#1962), restarts one, verifies
+content and credential persistence, proves
 cross-volume isolation, exercises missing-volume and missing-config refusals,
 checks each health state, and scans image history, process arguments, logs, and
 the vault corpus for the test credentials.

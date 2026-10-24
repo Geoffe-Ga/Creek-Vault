@@ -54,7 +54,7 @@ from creek_mcp.api.openapi import build_openapi
 from creek_mcp.httpapi import SERVER_NAME
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.auth import build_verifier
-from creek_mcp.remote_auth import announce_rotation_window
+from creek_mcp.remote_auth import announce_rotation_window, announce_ungated_consumers
 from creek_mcp.transport_posture import require_transport_confidentiality
 
 if TYPE_CHECKING:
@@ -268,4 +268,7 @@ def main(argv: list[str] | None = None) -> None:
     # not close it (#895). On stderr: stdout on this entry point carries the
     # ``--print-openapi`` document, which consumers pipe into code generators.
     announce_rotation_window(verifier)
+    # This app serves /mcp too (#1962), so an ungated consumer is named at start
+    # exactly as creek-tools-mcp --transport network names it (#1964).
+    announce_ungated_consumers(verifier)
     serve(create_app(verifier=verifier), args)
