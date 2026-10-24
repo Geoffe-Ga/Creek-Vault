@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.21.0",
+    "version": "0.22.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -2229,6 +2229,135 @@
         }
       }
     },
+    "/v1/agent-activity": {
+      "get": {
+        "operationId": "getAgentActivity",
+        "summary": "Return the most recent MCP calls: who, which tool, when, outcome.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Most rows to return, newest first; values above 200 are clamped to 200.",
+            "schema": {
+              "default": 50,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Inclusive lower bound on at, with an explicit UTC offset.",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Return the most recent MCP calls: who, which tool, when, outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentActivityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "getHealth",
@@ -2321,6 +2450,63 @@
   },
   "components": {
     "schemas": {
+      "AgentActivityOutcome": {
+        "description": "Whether one call got past the server's pre-dispatch gates.\n\nClosed at two members on purpose. The audit chain records a pre-dispatch\nrefusal — an out-of-profile tool (#1964) or a remote ceiling above\n``personal`` (#1968) — and records nothing about how a tool that *ran*\nanswered: by the read-gate discipline (:mod:`creek_mcp.read_gate`), a tool\nlogs the attempt before resolving its target and never the result, so the\ntrail cannot answer \"did consumer X read fragment F?\". ``admitted``\ntherefore means \"dispatched to the tool\", not \"returned content\", and\nthe projection cannot say more without becoming that oracle.\n\nAttributes:\n    ADMITTED: The call passed every pre-dispatch gate and reached its tool.\n    REFUSED: The call was refused before any tool ran.",
+        "enum": [
+          "admitted",
+          "refused"
+        ],
+        "title": "AgentActivityOutcome",
+        "type": "string"
+      },
+      "AgentActivityRow": {
+        "additionalProperties": false,
+        "description": "One MCP call, reduced to who, what, when and whether.\n\nFour fields, and never a fifth. The audit entry behind a row also carries\nan argument summary, the caller's ceiling, write-side paths and fragment\nids, and two hashes; none of them crosses, because each is either derived\nfrom what the caller sent or names an object in the vault.\n\nAttributes:\n    consumer: The audit stamp — the bearer's consumer or the credential's\n        client id — verbatim, so the app's own ``adepthood`` calls are\n        labelled as such.\n    tool: The tool name the entry was written under.\n    at: When the call was audited, in UTC, to the whole second.\n    outcome: Whether the call got past the pre-dispatch gates.",
+        "properties": {
+          "consumer": {
+            "description": "The audit stamp of the caller.",
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\u0000-\u001f]+$",
+            "title": "Consumer",
+            "type": "string"
+          },
+          "tool": {
+            "description": "The tool the call asked for.",
+            "maxLength": 128,
+            "pattern": "^(?:[a-z][a-z0-9_-]*(?:\\.[a-z0-9_-]+)*|<unregistered>)$",
+            "title": "Tool",
+            "type": "string"
+          },
+          "at": {
+            "description": "When the call was audited, UTC.",
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/AgentActivityOutcome",
+            "description": "Whether the call got past the pre-dispatch gates."
+          }
+        },
+        "required": [
+          "consumer",
+          "tool",
+          "at",
+          "outcome"
+        ],
+        "title": "AgentActivityRow",
+        "type": "object"
+      },
+      "WireTierCeiling": {
+        "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime — they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology §13.2).\n    PERSONAL: Adds personal — and, per #961, ``unclassified`` — content.",
+        "enum": [
+          "open",
+          "personal"
+        ],
+        "title": "WireTierCeiling",
+        "type": "string"
+      },
       "CapabilitiesStatus": {
         "description": "Overall readiness reported by the capabilities handshake.\n\nAttributes:\n    OK: The vault is present and this server can serve the contract.\n    UNINITIALIZED: No vault has been scaffolded yet. Both version strings\n        are still reported, so a client can always negotiate versions\n        against a server whose vault does not exist.\n    INCOMPATIBLE: The client's requested contract minor is not in\n        :data:`SUPPORTED_CONTRACT_MINORS`.",
         "enum": [
@@ -2332,7 +2518,7 @@
         "type": "string"
       },
       "Capability": {
-        "description": "The ten capabilities ``/v1`` publishes.\n\nThe list was identical for every minor in\n:data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3\ngrew the *MCP* tool surface (``creek.upload``, #1023) and added no ``/v1``\nroute, so a ``0.2`` client and a ``0.7`` client were answered from the same\nfour names. Contract 0.8 (#1524) ends that by publishing ``UPLOAD``, and\nthe list is therefore **no longer minor-independent**: what a caller is\ntold, and what it is served, are both keyed on\n:data:`CAPABILITY_SINCE_MINOR`.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.\n    UPLOAD: Idempotent document upload — base64 bytes plus a filename,\n        dispatched to an ingestor by extension. Since contract 0.8.\n    DRIVE_CONNECTOR: The read-only Google Drive connector's *state* and\n        its two verbs — one incremental sync, and disconnection. Since\n        contract 0.9 (#1527). Three routes rather than one, and one\n        capability rather than three, because a client cannot usefully\n        negotiate \"may I read the connector's state\" separately from \"may\n        I sync it\": they are one feature, and splitting them would let a\n        server advertise half a connector.\n\n        **It does not include authorisation.** No route begins, completes\n        or carries an OAuth flow; the credential is minted locally by\n        ``creek gdrive --download`` and never leaves the host.\n    PIPELINE: Whole-vault classification and linking — the two passes that\n        turn ingested bytes into a *usable* corpus. Since contract 0.10\n        (#1570). Two routes and one capability, for the\n        ``drive-connector`` reason: a consumer cannot usefully negotiate\n        \"may I classify\" apart from \"may I link\", because a classified\n        corpus with no resonances is as inert as an unclassified one, and\n        a server advertising half the pipeline would be advertising a\n        vault it cannot finish.\n\n        **It is the tightening half of the surface, not a widening one.**\n        :data:`creek_mcp.tier_ceiling._TIER_RANK` admits ``unclassified``\n        at ceiling ``personal``, so a network-seeded corpus is *already*\n        readable by a remote consumer; classification is what can move a\n        fragment up to ``intimate`` and out of that reach. Neither\n        response carries a fragment id, a path or a byte of prose, which\n        is what makes running the whole vault under a remote ceiling\n        disclose nothing.\n    VOICE_DRAFTS: AI-attributed draft upsert, recall, and retraction by a\n        caller-owned external id. Since contract 0.15 (#1727).\n    JOURNAL_WITHDRAW: Consumer-scoped, idempotent journal erasure. Since\n        contract 0.16 (#1799).\n    LETTERS: The vault writes one margin note's Voice Draft letter and\n        stores it at a caller-owned external id. Since contract 0.17\n        (#1862).",
+        "description": "The eleven capabilities ``/v1`` publishes.\n\nThe list was identical for every minor in\n:data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3\ngrew the *MCP* tool surface (``creek.upload``, #1023) and added no ``/v1``\nroute, so a ``0.2`` client and a ``0.7`` client were answered from the same\nfour names. Contract 0.8 (#1524) ends that by publishing ``UPLOAD``, and\nthe list is therefore **no longer minor-independent**: what a caller is\ntold, and what it is served, are both keyed on\n:data:`CAPABILITY_SINCE_MINOR`.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.\n    UPLOAD: Idempotent document upload — base64 bytes plus a filename,\n        dispatched to an ingestor by extension. Since contract 0.8.\n    DRIVE_CONNECTOR: The read-only Google Drive connector's *state* and\n        its two verbs — one incremental sync, and disconnection. Since\n        contract 0.9 (#1527). Three routes rather than one, and one\n        capability rather than three, because a client cannot usefully\n        negotiate \"may I read the connector's state\" separately from \"may\n        I sync it\": they are one feature, and splitting them would let a\n        server advertise half a connector.\n\n        **It does not include authorisation.** No route begins, completes\n        or carries an OAuth flow; the credential is minted locally by\n        ``creek gdrive --download`` and never leaves the host.\n    PIPELINE: Whole-vault classification and linking — the two passes that\n        turn ingested bytes into a *usable* corpus. Since contract 0.10\n        (#1570). Two routes and one capability, for the\n        ``drive-connector`` reason: a consumer cannot usefully negotiate\n        \"may I classify\" apart from \"may I link\", because a classified\n        corpus with no resonances is as inert as an unclassified one, and\n        a server advertising half the pipeline would be advertising a\n        vault it cannot finish.\n\n        **It is the tightening half of the surface, not a widening one.**\n        :data:`creek_mcp.tier_ceiling._TIER_RANK` admits ``unclassified``\n        at ceiling ``personal``, so a network-seeded corpus is *already*\n        readable by a remote consumer; classification is what can move a\n        fragment up to ``intimate`` and out of that reach. Neither\n        response carries a fragment id, a path or a byte of prose, which\n        is what makes running the whole vault under a remote ceiling\n        disclose nothing.\n    VOICE_DRAFTS: AI-attributed draft upsert, recall, and retraction by a\n        caller-owned external id. Since contract 0.15 (#1727).\n    JOURNAL_WITHDRAW: Consumer-scoped, idempotent journal erasure. Since\n        contract 0.16 (#1799).\n    LETTERS: The vault writes one margin note's Voice Draft letter and\n        stores it at a caller-owned external id. Since contract 0.17\n        (#1862).\n    AGENT_ACTIVITY: A content-free projection of the MCP audit chain —\n        who asked the vault for what, when, and whether it was admitted.\n        Since contract 0.22 (#1968).",
         "enum": [
           "capabilities",
           "journal-upsert",
@@ -2343,7 +2529,8 @@
           "pipeline",
           "voice-drafts",
           "journal-withdraw",
-          "letters"
+          "letters",
+          "agent-activity"
         ],
         "title": "Capability",
         "type": "string"
@@ -2405,15 +2592,6 @@
         ],
         "title": "VaultState",
         "type": "object"
-      },
-      "WireTierCeiling": {
-        "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime — they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology §13.2).\n    PERSONAL: Adds personal — and, per #961, ``unclassified`` — content.",
-        "enum": [
-          "open",
-          "personal"
-        ],
-        "title": "WireTierCeiling",
-        "type": "string"
       },
       "CareResource": {
         "additionalProperties": false,
@@ -2973,6 +3151,74 @@
           "F10"
         ],
         "title": "WheelFrequencies",
+        "type": "object"
+      },
+      "AgentActivityQuery": {
+        "additionalProperties": false,
+        "description": "The query string ``GET /v1/agent-activity`` accepts, and nothing else.\n\nPublished as a model so the bounds a consumer reads and the bounds the\nserver validates are one declaration. Closed like every wire model: an\nunknown parameter — a consumer filter, say — is ``invalid_request`` rather\nthan silently ignored, because nothing is hidden by consumer.\n\nAttributes:\n    limit: The most rows wanted, newest first. Values above\n        :data:`AGENT_ACTIVITY_MAX_LIMIT` are clamped to it.\n    since: An inclusive lower bound on ``at``, with an explicit offset. A\n        ``since`` older than the log's first entry returns from the start.",
+        "properties": {
+          "limit": {
+            "default": 50,
+            "description": "Most rows to return, newest first; values above 200 are clamped to 200.",
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "since": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Inclusive lower bound on at, with an explicit UTC offset.",
+            "title": "Since"
+          }
+        },
+        "title": "AgentActivityQuery",
+        "type": "object"
+      },
+      "AgentActivityResponse": {
+        "additionalProperties": false,
+        "description": "The most recent MCP calls against this vault, newest first.\n\nAttributes:\n    status: Always ``\"ok\"``. An empty or absent log is ``rows: []``, not\n        an error.\n    tier_ceiling: The caller's declared ceiling, echoed for uniformity.\n        The route reads no content, so it filters nothing.\n    skipped: How many lines of the log could not be projected — malformed\n        JSON, a missing or out-of-pattern field, an outcome the closed\n        enum cannot name. Counted over the whole log, because a line that\n        cannot be read has no trustworthy instant to filter on.\n    rows: At most :data:`AGENT_ACTIVITY_MAX_LIMIT` calls, newest first.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Caller's declared ceiling."
+          },
+          "skipped": {
+            "description": "Log lines that could not be projected.",
+            "minimum": 0,
+            "title": "Skipped",
+            "type": "integer"
+          },
+          "rows": {
+            "description": "The most recent calls, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/AgentActivityRow"
+            },
+            "maxItems": 200,
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "skipped",
+          "rows"
+        ],
+        "title": "AgentActivityResponse",
         "type": "object"
       },
       "CapabilitiesResponse": {

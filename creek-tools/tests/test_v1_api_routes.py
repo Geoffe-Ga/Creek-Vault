@@ -39,6 +39,8 @@ from pydantic import BaseModel
 
 from creek_mcp.api.models import (
     CONTRACT_MODELS,
+    AgentActivityQuery,
+    AgentActivityResponse,
     CapabilitiesResponse,
     Capability,
     ClassificationRequest,
@@ -254,6 +256,15 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/agent-activity",
+        "GET",
+        "getAgentActivity",
+        Capability.AGENT_ACTIVITY,
+        None,
+        AgentActivityResponse,
+        True,
+    ),
+    (
         "/v1/health",
         "GET",
         "getHealth",
@@ -283,10 +294,11 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "classifications",
     "links",
     "job-status",
+    "agent-activity",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 19
+_EXPECTED_ROUTE_COUNT: Final[int] = 20
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -618,11 +630,11 @@ def test_exactly_one_route_declares_no_capability() -> None:
     assert uncapable == ["/v1/health"]
 
 
-def test_implemented_capabilities_is_exactly_the_published_ten() -> None:
-    """Every published capability answers for real, letters included (#1862).
+def test_implemented_capabilities_is_exactly_the_published_eleven() -> None:
+    """Every published capability answers for real, agent activity included.
 
     An exhaustive literal, not a containment check, and still named one by
-    one: an eleventh capability added to ``Capability`` has to change this line
+    one (#1968): a twelfth capability added to ``Capability`` has to change this line
     before it can be advertised, which is what keeps a new endpoint's landing a
     visible edit rather than a silent widening.
     """
@@ -639,6 +651,7 @@ def test_implemented_capabilities_is_exactly_the_published_ten() -> None:
                 Capability.VOICE_DRAFTS,
                 Capability.JOURNAL_WITHDRAW,
                 Capability.LETTERS,
+                Capability.AGENT_ACTIVITY,
             }
         )
         == IMPLEMENTED_CAPABILITIES
@@ -725,7 +738,7 @@ def test_every_route_model_is_a_published_contract_model() -> None:
 
 
 def test_route_spec_declares_the_published_fields() -> None:
-    """``RouteSpec`` carries exactly the eleven fields the adapter consumes."""
+    """``RouteSpec`` carries exactly the twelve fields the adapter consumes."""
     assert {field.name for field in fields(RouteSpec)} == {
         "path",
         "method",
@@ -738,6 +751,7 @@ def test_route_spec_declares_the_published_fields() -> None:
         "max_body_bytes",
         "success_responses",
         "accepts_request_key",
+        "query_model",
     }
 
 
@@ -813,3 +827,16 @@ def test_route_spec_uses_slots() -> None:
     """
     assert "__slots__" in RouteSpec.__dict__
     assert not hasattr(ROUTES[0], "__dict__")
+
+
+def test_only_the_agent_activity_route_declares_a_query_model() -> None:
+    """The first published query string is agent activity's, and only it (#1968).
+
+    Every other route still takes no query parameters, so a client generator
+    that sees ``in: query`` anywhere else is reading a regression.
+    """
+    assert {
+        spec.operation_id: spec.query_model
+        for spec in ROUTES
+        if spec.query_model is not None
+    } == {"getAgentActivity": AgentActivityQuery}

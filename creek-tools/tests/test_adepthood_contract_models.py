@@ -78,6 +78,9 @@ from creek_mcp.api.models import (
     ERROR_STATUS,
     RETRY_POLICY,
     SUPPORTED_CONTRACT_MINORS,
+    AgentActivityQuery,
+    AgentActivityResponse,
+    AgentActivityRow,
     CapabilitiesResponse,
     CapabilitiesStatus,
     CareEscalationResponse,
@@ -198,6 +201,7 @@ CAPABILITIES_RESPONSE_PAYLOAD: dict[str, Any] = {
         "voice-drafts",
         "journal-withdraw",
         "letters",
+        "agent-activity",
     ],
 }
 
@@ -289,6 +293,25 @@ LETTER_RESPONSE_PAYLOAD: dict[str, Any] = {
     "title": "Ridge letter",
     "letter": "Synthetic letter about waiting for the fog to lift.",
     "attribution": VOICE_DRAFT_ATTRIBUTION_PAYLOAD,
+}
+
+AGENT_ACTIVITY_QUERY_PAYLOAD: dict[str, Any] = {
+    "limit": 20,
+    "since": "2026-10-24T00:00:00Z",
+}
+
+AGENT_ACTIVITY_ROW_PAYLOAD: dict[str, Any] = {
+    "consumer": "acct_91",
+    "tool": "creek.draft",
+    "at": "2026-10-24T18:02:11Z",
+    "outcome": "admitted",
+}
+
+AGENT_ACTIVITY_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "open",
+    "skipped": 0,
+    "rows": [AGENT_ACTIVITY_ROW_PAYLOAD],
 }
 
 VOICE_DRAFT_READ_RESPONSE_PAYLOAD: dict[str, Any] = {
@@ -484,6 +507,9 @@ NOT_APPLICABLE_EXAMPLE_PAYLOAD: dict[str, Any] = {
 # Keyed by ``__name__`` rather than by a literal, so the table cannot drift
 # from the classes it describes and every imported model is genuinely used.
 HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
+    AgentActivityQuery.__name__: AGENT_ACTIVITY_QUERY_PAYLOAD,
+    AgentActivityResponse.__name__: AGENT_ACTIVITY_RESPONSE_PAYLOAD,
+    AgentActivityRow.__name__: AGENT_ACTIVITY_ROW_PAYLOAD,
     CapabilitiesResponse.__name__: CAPABILITIES_RESPONSE_PAYLOAD,
     CareEscalationResponse.__name__: CARE_ESCALATION_RESPONSE_PAYLOAD,
     CareResource.__name__: CARE_RESOURCE_PAYLOAD,
@@ -613,6 +639,8 @@ EXPECTED_UNREACHABLE_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("voice-drafts", "care-escalation"),
         ("journal-withdraw", "care-escalation"),
         ("journal-withdraw", "refusal"),
+        ("agent-activity", "care-escalation"),
+        ("agent-activity", "refusal"),
     }
 )
 
@@ -1075,7 +1103,7 @@ def test_bundle_root_name_matches_the_declared_dir_name() -> None:
 
 
 def test_capability_and_state_axes_are_pinned() -> None:
-    """The fixture matrix is 10 capabilities x 7 states = 70 cells."""
+    """The fixture matrix is 11 capabilities x 7 states = 77 cells."""
     assert CAPABILITIES == (
         "capabilities",
         "journal-upsert",
@@ -1087,6 +1115,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "voice-drafts",
         "journal-withdraw",
         "letters",
+        "agent-activity",
     )
     assert EXAMPLE_STATES == (
         "success",
@@ -1097,7 +1126,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 70
+    assert len(_matrix()) == 77
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
@@ -1186,7 +1215,7 @@ def test_retry_policy_json_mirrors_the_runtime_table() -> None:
 
 
 def test_unreachable_cells_are_the_structurally_impossible_states() -> None:
-    """Only reflections and letters escalate; withdrawal cannot refuse."""
+    """Only reflections and letters escalate; withdrawal and activity cannot refuse."""
     assert UNREACHABLE_CELLS == EXPECTED_UNREACHABLE_CELLS
 
 
@@ -1292,7 +1321,7 @@ def test_no_committed_fixture_carries_an_intimate_tier_value() -> None:
     The model-level tests pin three typed fields, but a fixture is a hand-built
     payload and the security invariant is about the bytes a consumer vendors:
     no ``intimate``-tier success response may be published, and every INTIMATE
-    example must be a refusal. This walks every string value of all 70
+    example must be a refusal. This walks every string value of all 77
     committed examples rather than trusting the fields that happen to be typed.
     """
     offenders = [
@@ -1870,9 +1899,12 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.21 widened the compatibility window rather than shifting it.
+    """0.22 widened the compatibility window rather than shifting it.
 
-    A ``0.20`` client has ``rate_limited`` in its vendored vocabulary but no
+    A ``0.21`` client has no ``agent-activity`` capability, route or model in
+    its vendored contract, and the since-minor gate both withholds and refuses
+    it (#1968) while every response it already knows stays byte-identical. A
+    ``0.20`` client has ``rate_limited`` in its vendored vocabulary but no
     ``429`` documented on ``POST /v1/letters/{external_id}``, and every
     response it can receive keeps its byte-identical shape under #1903 step 6:
     an admission refusal on that route reaches it as the
@@ -1887,6 +1919,7 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.21" in SUPPORTED_CONTRACT_MINORS
     assert "0.20" in SUPPORTED_CONTRACT_MINORS
     assert "0.19" in SUPPORTED_CONTRACT_MINORS
     assert "0.18" in SUPPORTED_CONTRACT_MINORS
@@ -1900,7 +1933,7 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.21"
+    assert CONTRACT_MINOR == "0.22"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

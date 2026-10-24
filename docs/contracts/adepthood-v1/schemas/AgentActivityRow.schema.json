@@ -1,0 +1,50 @@
+{
+  "$defs": {
+    "AgentActivityOutcome": {
+      "description": "Whether one call got past the server's pre-dispatch gates.\n\nClosed at two members on purpose. The audit chain records a pre-dispatch\nrefusal \u2014 an out-of-profile tool (#1964) or a remote ceiling above\n``personal`` (#1968) \u2014 and records nothing about how a tool that *ran*\nanswered: by the read-gate discipline (:mod:`creek_mcp.read_gate`), a tool\nlogs the attempt before resolving its target and never the result, so the\ntrail cannot answer \"did consumer X read fragment F?\". ``admitted``\ntherefore means \"dispatched to the tool\", not \"returned content\", and\nthe projection cannot say more without becoming that oracle.\n\nAttributes:\n    ADMITTED: The call passed every pre-dispatch gate and reached its tool.\n    REFUSED: The call was refused before any tool ran.",
+      "enum": [
+        "admitted",
+        "refused"
+      ],
+      "title": "AgentActivityOutcome",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One MCP call, reduced to who, what, when and whether.\n\nFour fields, and never a fifth. The audit entry behind a row also carries\nan argument summary, the caller's ceiling, write-side paths and fragment\nids, and two hashes; none of them crosses, because each is either derived\nfrom what the caller sent or names an object in the vault.\n\nAttributes:\n    consumer: The audit stamp \u2014 the bearer's consumer or the credential's\n        client id \u2014 verbatim, so the app's own ``adepthood`` calls are\n        labelled as such.\n    tool: The tool name the entry was written under.\n    at: When the call was audited, in UTC, to the whole second.\n    outcome: Whether the call got past the pre-dispatch gates.",
+  "properties": {
+    "at": {
+      "description": "When the call was audited, UTC.",
+      "format": "date-time",
+      "title": "At",
+      "type": "string"
+    },
+    "consumer": {
+      "description": "The audit stamp of the caller.",
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^[^\u0000-\u001f\u007f]+$",
+      "title": "Consumer",
+      "type": "string"
+    },
+    "outcome": {
+      "$ref": "#/$defs/AgentActivityOutcome",
+      "description": "Whether the call got past the pre-dispatch gates."
+    },
+    "tool": {
+      "description": "The tool the call asked for.",
+      "maxLength": 128,
+      "pattern": "^(?:[a-z][a-z0-9_-]*(?:\\.[a-z0-9_-]+)*|<unregistered>)$",
+      "title": "Tool",
+      "type": "string"
+    }
+  },
+  "required": [
+    "consumer",
+    "tool",
+    "at",
+    "outcome"
+  ],
+  "title": "AgentActivityRow",
+  "type": "object"
+}
