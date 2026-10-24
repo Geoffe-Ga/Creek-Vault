@@ -849,20 +849,59 @@ routable by design and requires TLS.
   [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
   overlapping static tokens, rather than short-lived derived credentials, is
   the shape of that runbook.
-- **A consumer token grants remote _write_ access, by design.** A valid
-  `CREEK_MCP_CONSUMER_TOKENS` entry can reach every non-purge tool at or below
-  the `personal` ceiling — including the **write** tools (`creek.journal`,
-  `creek.ingest`, `creek.classify`, `creek.link`, `creek.report`,
-  `creek.compile`, `creek.save`, `creek.skills.refresh`), not just reads. This
-  is intentional (Adepthood writes journal entries remotely), so treat each
-  token as a write-capable credential — a meaningfully larger attack surface
-  than "remote read-only." Purge tools stay gated separately by
-  `CREEK_MCP_ELEVATED_TOKEN` (a per-consumer bearer alone cannot purge). The
-  one *destructive* path a consumer token could reach without the elevated
-  token is now closed: `creek.journal`'s update-in-place refuses to overwrite a
-  fragment above the caller's ceiling (#970), and remote callers are capped at
-  `personal`, so a remote consumer can no longer destroy an `intimate` journal
-  fragment.
+- **A consumer token reaches only the tools its grants admit (#1964).** Each
+  consumer holds a *grant set* drawn from four profiles, and the server
+  answers `tools/list` with only the tools that set admits — so the
+  `creek.handshake` capability list is the caller's own profile too. A
+  `tools/call` outside it is **refused before dispatch** with one constant
+  reason, `this credential is not granted the requested tool`, which names
+  neither the tool list nor the grants held, and is audited as refused
+  (`"outcome": "refused"`) under the tool name only, with no argument summary.
+  The decision is transport-neutral policy in
+  `creek_mcp/policy.py::admitted_tool`, beside the tier cap, and the grant
+  table is `creek_mcp/policy.py::TOOL_GRANTS`:
+
+  | Grant            | Tools |
+  |------------------|-------|
+  | `vault:read`     | `creek.handshake`, `creek.state.read`, `creek.wheel`, `creek.mine`, `creek.classify.entry`, `creek.lint` |
+  | `vault:desk`     | `creek.draft`, `creek.author`, `creek.reflect`, `creek.save` |
+  | `vault:journal`  | `creek.journal`, `creek.upload` |
+  | `vault:pipeline` | `creek.classify`, `creek.link`, `creek.compile`, `creek.report`, `creek.skills.refresh`, `creek.ingest`, `creek.redact.scan`, `creek.state.render` |
+
+  The `creek.purge.*` tools are in **no** profile, so a gated consumer never
+  reaches them whatever it holds. The default profile for a new agent is
+  `vault:read vault:desk`: it can draft and reflect, but cannot journal, and
+  cannot run hours of re-classify / re-link / compile passes over the corpus.
+
+  A static consumer is gated by a **grant suffix** on its entry — `@` ends the
+  token set, `+` separates the grants, and the suffix covers every token in a
+  rotation window:
+
+  ```bash
+  export CREEK_MCP_CONSUMER_TOKENS="openclaw=<token>@vault:read+vault:desk;adepthood=<token>"
+  ```
+
+  An unknown grant or an empty suffix is refused at startup, naming the
+  consumer and the valid grants (never the entry). The verifier stamps the
+  grants onto the token's `scopes` — exactly where an OAuth access token
+  carries them — and `creek_mcp/policy.py::granted_by_scopes` is the one place
+  either becomes a grant set; a token carrying no grant scope holds no grants
+  and is refused every tool.
+- **An ungated consumer token still grants remote _write_ access.** A consumer
+  configured with **no** grant suffix (`adepthood=<token>` above) is
+  *ungated*: it keeps exactly the reach a consumer token had before #1964, so
+  existing deployments do not break, and startup names every ungated consumer
+  on stderr until it is gated. Such a token reaches every non-purge tool at or
+  below the `personal` ceiling — including the **write** tools
+  (`creek.journal`, `creek.ingest`, `creek.classify`, `creek.link`,
+  `creek.report`, `creek.compile`, `creek.save`, `creek.skills.refresh`), not
+  just reads — so treat it as a write-capable credential, and prefer a suffix.
+  Purge tools stay gated separately by `CREEK_MCP_ELEVATED_TOKEN` (a
+  per-consumer bearer alone cannot purge). The one *destructive* path a
+  consumer token could reach without the elevated token is now closed:
+  `creek.journal`'s update-in-place refuses to overwrite a fragment above the
+  caller's ceiling (#970), and remote callers are capped at `personal`, so a
+  remote consumer can no longer destroy an `intimate` journal fragment.
 - **INTIMATE is never reachable remotely.** The cap is
   **adapter-independent policy**, in `creek_mcp/policy.py::admitted_ceiling`
   — not a property of the MCP transport wrapper. "Remote" is a fact each

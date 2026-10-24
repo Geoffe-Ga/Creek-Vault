@@ -56,7 +56,7 @@ from starlette.testclient import TestClient
 from creek_mcp import remote_auth as remote_auth_mod
 from creek_mcp import server as server_mod
 from creek_mcp.audit import MCP_AUDIT_RELPATH
-from creek_mcp.policy import Transport
+from creek_mcp.policy import UNGATED_SCOPE, Transport
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     REMOTE_SCOPE,
@@ -98,7 +98,9 @@ def _fake_token(consumer: str) -> AccessToken:
     return AccessToken(
         token="opaque",  # test literal, not a real credential
         client_id=consumer,
-        scopes=[REMOTE_SCOPE],
+        # The verifier stamps the ungated marker on a consumer configured with
+        # no grant suffix (#1964); these tests exercise that pre-#1964 reach.
+        scopes=[REMOTE_SCOPE, UNGATED_SCOPE],
         expires_at=None,
     )
 
@@ -345,7 +347,7 @@ def test_verify_token_returns_access_token_for_valid_bearer() -> None:
     token = asyncio.run(verifier.verify_token("secret123"))
     assert token is not None
     assert token.client_id == "adepthood"
-    assert token.scopes == [REMOTE_SCOPE]
+    assert token.scopes == [REMOTE_SCOPE, UNGATED_SCOPE]
 
 
 def test_verify_token_rejects_unknown_bearer() -> None:
@@ -729,7 +731,7 @@ def test_every_token_in_the_window_verifies_as_the_same_consumer(
         token = asyncio.run(verifier.verify_token(presented))
         assert token is not None
         assert token.client_id == "adepthood"
-        assert token.scopes == [REMOTE_SCOPE]
+        assert token.scopes == [REMOTE_SCOPE, UNGATED_SCOPE]
         assert token.token == presented
         assert token.expires_at == 1_000_000 + _DEFAULT_TTL_SECONDS
 

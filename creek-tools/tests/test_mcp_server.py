@@ -1587,15 +1587,20 @@ def test_network_startup_is_silent_when_no_rotation_window_is_open(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """One token per consumer is the steady state, and the steady state says nothing.
+    """One gated token per consumer is the steady state, and it says nothing.
 
     A notice on every start is a notice operators stop reading, at which point
-    the one that matters goes unread too.
+    the one that matters goes unread too. Since #1964 the steady state also
+    carries a grant suffix: a consumer without one is *ungated* and is named
+    at startup until it is gated, which ``tests/test_mcp_tool_grants.py`` pins.
     """
     from creek_mcp import server as server_module
 
     monkeypatch.delenv(ELEVATED_TOKEN_ENV, raising=False)
-    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_CONSUMER_TOKEN}")
+    monkeypatch.setenv(
+        CONSUMER_TOKENS_ENV,
+        f"adepthood={_STRONG_CONSUMER_TOKEN}@vault:read+vault:desk+vault:journal",
+    )
     served = _stub_network_startup(monkeypatch)
 
     server_module.main(["--transport", "network", "--host", "127.0.0.1"])

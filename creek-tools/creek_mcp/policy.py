@@ -1,10 +1,14 @@
-"""Transport-neutral admission + consumer-identity policy (#1073).
+"""Transport-neutral admission + consumer-identity policy (#1073, #1964).
 
-Two questions have to be answered the same way for every caller, whichever
+Three questions have to be answered the same way for every caller, whichever
 transport carried the call:
 
 1. *May this caller request this tier ceiling?* — :func:`admitted_ceiling`;
-2. *Whose identity is this call audited under?* — :func:`effective_consumer`.
+2. *Whose identity is this call audited under?* — :func:`effective_consumer`;
+3. *May this caller reach this tool at all?* — :func:`admitted_tool`, decided
+   on the caller's :class:`Grant` set (#1964). A remote consumer holds a grant
+   set, ``tools/list`` shows only what that set admits, and a call outside it
+   is refused before dispatch with one constant reason.
 
 Until #1073 both answers lived inside :mod:`creek_mcp.server`, keyed off the
 MCP SDK's request-scoped ``get_access_token()`` and reachable only from
@@ -61,11 +65,15 @@ to call.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import StrEnum
-from typing import Final
+from dataclasses import dataclass, field
+from enum import Enum, StrEnum
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, TypeAlias
 
 from creek_mcp.tier_ceiling import TierCeiling
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
 
 
 class Transport(StrEnum):
@@ -165,16 +173,173 @@ def offered_ceilings(transport: Transport) -> tuple[TierCeiling, ...]:
     return tuple(ceiling for ceiling in TierCeiling if ceiling in admitted)
 
 
+class Grant(StrEnum):
+    """One of the four things a remote consumer may be granted (#1964).
+
+    Four grants rather than one scope per tool, on purpose: an OAuth client
+    such as Claude's connector UI requests whatever ``scopes_supported``
+    lists, and a person reads four words on a consent screen far more
+    readily than twenty. The ``vault:`` prefix is what makes each value read
+    correctly there. The values *are* the OAuth scope names — C2's JWT
+    ``scope`` claim and a static token's grant suffix spell them identically,
+    which is what lets :func:`granted_by_scopes` be the one seam for both.
+
+    Which tools each grant reaches is :data:`TOOL_GRANTS`; nothing else.
+    """
+
+    READ = "vault:read"
+    DESK = "vault:desk"
+    JOURNAL = "vault:journal"
+    PIPELINE = "vault:pipeline"
+
+
+class Ungated(Enum):
+    """The marker for a remote consumer configured with no grant set at all.
+
+    A single-member enum rather than ``None`` so it can never be confused with
+    the *empty* grant set, which means the opposite: empty refuses every tool,
+    ungated refuses none. It exists for one population only — static
+    ``CREEK_MCP_CONSUMER_TOKENS`` consumers configured before #1964 with no
+    grant suffix — so that existing deployments keep exactly the reach they
+    had, and startup names each of them as ungated so the operator can see
+    what is still open (:func:`creek_mcp.remote_auth.announce_ungated_consumers`).
+    """
+
+    UNGATED = "ungated"
+
+
+UNGATED: Final = Ungated.UNGATED
+"""The one :class:`Ungated` value, spelled once."""
+
+GrantSet: TypeAlias = "frozenset[Grant] | Ungated"
+"""What a caller holds: an explicit grant set, or :data:`UNGATED`."""
+
+UNGATED_SCOPE: Final[str] = "creek:ungated"
+"""The scope a static verifier stamps on an ungated consumer's token.
+
+A positive marker, never inferred from absence: a token carrying *no* grant
+scope holds no grants and is refused for every tool, so a credential minted by
+a verifier that knows nothing of grants — C2's JWTs included — fails closed.
+Only :class:`creek_mcp.remote_auth.ConsumerTokenVerifier` mints this, and it is
+deliberately not one of the :class:`Grant` values, so it never appears in an
+OAuth ``scopes_supported`` list. An OAuth resource server must not honour it
+from a token it did not mint itself.
+"""
+
+DEFAULT_GRANTS: Final[frozenset[Grant]] = frozenset({Grant.READ, Grant.DESK})
+"""The profile a newly connected agent is offered: read, draft and reflect.
+
+Not journaling, and not the corpus passes — a drafting assistant should not be
+able to run hours of re-classify / re-link / compile over a person's vault.
+"""
+
+TOOL_GRANTS: Final[Mapping[str, Grant]] = MappingProxyType(
+    {
+        "creek.handshake": Grant.READ,
+        "creek.state.read": Grant.READ,
+        "creek.wheel": Grant.READ,
+        "creek.mine": Grant.READ,
+        "creek.classify.entry": Grant.READ,
+        "creek.lint": Grant.READ,
+        "creek.draft": Grant.DESK,
+        "creek.author": Grant.DESK,
+        "creek.reflect": Grant.DESK,
+        "creek.save": Grant.DESK,
+        "creek.journal": Grant.JOURNAL,
+        "creek.upload": Grant.JOURNAL,
+        "creek.classify": Grant.PIPELINE,
+        "creek.link": Grant.PIPELINE,
+        "creek.compile": Grant.PIPELINE,
+        "creek.report": Grant.PIPELINE,
+        "creek.skills.refresh": Grant.PIPELINE,
+        "creek.ingest": Grant.PIPELINE,
+        "creek.redact.scan": Grant.PIPELINE,
+        "creek.state.render": Grant.PIPELINE,
+    }
+)
+"""The grant every registered non-purge MCP tool requires (#1964).
+
+Exactly one grant per tool, so a profile is a partition and never an overlap.
+``creek.wheel`` is read-only and cheap, so it sits in ``vault:read``;
+``creek.state.render`` is a full corpus walk, so it sits in ``vault:pipeline``
+with the other corpus passes.
+
+**The ``creek.purge.*`` tools are in no profile.** A gated remote identity
+therefore never reaches them, whatever it holds; the elevated token
+(``CREEK_MCP_ELEVATED_TOKEN``) remains their only gate for every caller that
+can reach them at all — local stdio, and an :data:`UNGATED` static consumer.
+
+Read-only (a :class:`types.MappingProxyType`), so no caller holding a reference
+can widen it at runtime. ``tests/test_mcp_tool_grants.py`` pins that every
+registered non-purge tool appears here, and that
+:data:`creek_mcp.read_gate.TOOL_POSTURES`' grant column agrees with it.
+"""
+
+_GRANT_VALUES: Final[frozenset[str]] = frozenset(grant.value for grant in Grant)
+"""Every :class:`Grant` value, for an exact, non-raising membership test."""
+
+TOOL_NOT_GRANTED_REASON: Final[str] = (
+    "this credential is not granted the requested tool"
+)
+"""The single reason every out-of-profile call is given (#1964, after #1090).
+
+One constant, not a template. It names no tool, no tool list, no grant held and
+no consumer, so a refusal tells a remote caller nothing beyond the published
+rule — in particular it cannot be used to tell an *unregistered* tool name from
+a registered one the caller was not granted, which would make the refusal an
+existence oracle over the tool surface. The tests pin the wording against a
+hard-coded literal and pin that it carries no ``{``, ``}`` or ``%``.
+"""
+
+
+def granted_by_scopes(scopes: Iterable[str]) -> GrantSet:
+    """Return the grant set a credential's *scopes* confer.
+
+    The one identity -> grants seam. An adapter hands over whatever scopes the
+    caller's credential carries — a static token's from
+    :class:`creek_mcp.remote_auth.ConsumerTokenVerifier`, an OAuth access
+    token's from its ``scope`` claim (C2) — and gets back what policy decides
+    on. Matching is exact: a scope that is not a :class:`Grant` value
+    (``creek:remote``, ``openid``, ``VAULT:READ``) confers nothing.
+
+    Explicit grants win over :data:`UNGATED_SCOPE`. A credential carrying both
+    is read restrictively, never as unrestricted, so a marker that leaked into
+    a gated credential cannot widen it.
+
+    Args:
+        scopes: The scopes the caller's credential carries.
+
+    Returns:
+        The :class:`Grant` members named; else :data:`UNGATED` when the
+        credential carries the ungated marker; else the empty set, which
+        :func:`admitted_tool` refuses for every tool.
+    """
+    held = tuple(scopes)
+    grants = frozenset(Grant(scope) for scope in held if scope in _GRANT_VALUES)
+    if grants:
+        return grants
+    if UNGATED_SCOPE in held:
+        return UNGATED
+    return frozenset()
+
+
 @dataclass(frozen=True, slots=True)
 class CallerIdentity:
-    """Who is calling, and whether they reached us over the network.
+    """Who is calling, whether they reached us over the network, and their grants.
 
-    Neither field has a default, on purpose. ``is_remote: bool = False`` would
-    make a *forgotten* field fail open — a new adapter wired up by somebody who
-    never heard of the flag would be treated as local and uncapped, which is
-    precisely the #1073 bug reintroduced by omission. Requiring both makes
-    "which side of the network is this?" a question the adapter has to answer
-    out loud.
+    ``consumer`` and ``is_remote`` have no default, on purpose.
+    ``is_remote: bool = False`` would make a *forgotten* field fail open — a new
+    adapter wired up by somebody who never heard of the flag would be treated
+    as local and uncapped, which is precisely the #1073 bug reintroduced by
+    omission. Requiring both makes "which side of the network is this?" a
+    question the adapter has to answer out loud.
+
+    ``grants`` *does* have a default, and the default is what makes that safe:
+    the empty set, which :func:`admitted_tool` refuses for every tool on a
+    remote identity and ignores on a local one. Forgetting it therefore fails
+    closed, never open — and the adapters that only ask the ceiling question
+    (``/v1``'s ceiling middleware) need not invent an answer to a question they
+    do not ask.
 
     Frozen because the answer must not change between the adapter's assertion
     and the decision: a mutable identity is a time-of-check/time-of-use hole
@@ -187,10 +352,13 @@ class CallerIdentity:
             :func:`effective_consumer`).
         is_remote: Whether the call arrived over the network. Asserted by the
             adapter from its own transport, never inferred here.
+        grants: What the caller's credential grants (#1964), normally from
+            :func:`granted_by_scopes`. Consulted for remote callers only.
     """
 
     consumer: str | None
     is_remote: bool
+    grants: GrantSet = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +368,9 @@ class Admission:
     Attributes:
         ceiling: The parsed ceiling the caller is admitted at, or ``None`` for
             "policy imposes no cap" — see :func:`admitted_ceiling` for why
-            those are one answer rather than two.
+            those are one answer rather than two. :func:`admitted_tool` always
+            answers ``None``: whether a tool is reachable says nothing about
+            the ceiling it is reached at, which stays the ceiling question's.
     """
 
     ceiling: TierCeiling | None
@@ -211,13 +381,47 @@ class Refusal:
     """The call is refused before dispatch, and this is all the caller is told.
 
     Attributes:
-        reason: Always :data:`REMOTE_CEILING_REFUSAL_REASON`. Carried as a
-            field rather than looked up by the adapter so a second refusal
-            rule can be added later without every adapter growing a branch —
-            but it stays a constant, never a message built from the request.
+        reason: :data:`REMOTE_CEILING_REFUSAL_REASON` from
+            :func:`admitted_ceiling`, or :data:`TOOL_NOT_GRANTED_REASON` from
+            :func:`admitted_tool`. Carried as a field rather than looked up by
+            the adapter so the second rule needed no adapter branch — and each
+            stays a constant, never a message built from the request.
     """
 
     reason: str
+
+
+def admitted_tool(identity: CallerIdentity, tool_name: str) -> Admission | Refusal:
+    """Decide whether *identity* may reach the tool named *tool_name* (#1964).
+
+    A local (stdio) identity is never restricted: the network is the boundary,
+    exactly as for the tier cap. A remote identity marked :data:`UNGATED` is
+    not restricted either — that is a static consumer configured before grants
+    existed, and it keeps the reach it had (the elevated token still guards
+    purge for it, as before). Every other remote identity is admitted only to a
+    tool whose :data:`TOOL_GRANTS` entry it holds, so:
+
+    - a remote identity with no grants is refused for every tool;
+    - a ``creek.purge.*`` tool, which is in no profile, is refused for every
+      gated identity, whatever it holds;
+    - a name that is not a registered tool is refused with the same reason as
+      a registered tool the caller was not granted, so the refusal is not an
+      existence oracle.
+
+    Args:
+        identity: Who is calling, from which side of the network, holding what.
+        tool_name: The tool the caller asked for, as it spelled it.
+
+    Returns:
+        ``Admission(ceiling=None)`` when the tool is reachable, else a
+        :class:`Refusal` carrying :data:`TOOL_NOT_GRANTED_REASON`.
+    """
+    if not identity.is_remote or isinstance(identity.grants, Ungated):
+        return Admission(ceiling=None)
+    required = TOOL_GRANTS.get(tool_name)
+    if required is not None and required in identity.grants:
+        return Admission(ceiling=None)
+    return Refusal(reason=TOOL_NOT_GRANTED_REASON)
 
 
 def _parse_ceiling(requested: object) -> TierCeiling | None:

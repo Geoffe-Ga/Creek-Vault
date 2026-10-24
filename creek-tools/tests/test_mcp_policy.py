@@ -551,17 +551,24 @@ def test_caller_identity_requires_both_fields_explicitly() -> None:
 
 
 def test_caller_identity_fields_declare_no_defaults() -> None:
-    """Neither field carries a default or a default factory.
+    """Neither ``consumer`` nor ``is_remote`` carries a default or a factory.
 
     More precise than the ``TypeError`` above, which would still be raised if
     only *one* field lost its default. This reads the dataclass metadata
     directly, so a default added to either field is caught by name.
+
+    ``grants`` (#1964) is the one field that *does* default, and only because
+    its default fails closed: the empty set, which refuses every tool to a
+    remote identity. That is pinned here too, so the default can never drift
+    to something that admits.
     """
     declared = {field.name: field for field in fields(CallerIdentity)}
-    assert set(declared) == {"consumer", "is_remote"}
-    for field in declared.values():
-        assert field.default is MISSING
-        assert field.default_factory is MISSING
+    assert set(declared) == {"consumer", "is_remote", "grants"}
+    for name in ("consumer", "is_remote"):
+        assert declared[name].default is MISSING
+        assert declared[name].default_factory is MISSING
+    assert declared["grants"].default is MISSING
+    assert declared["grants"].default_factory is frozenset
 
 
 def test_caller_identity_is_frozen() -> None:
