@@ -56,6 +56,12 @@ from creek_mcp.policy import UNGATED_SCOPE, Grant, Transport
 from creek_mcp.remote_auth import REMOTE_SCOPE
 from creek_mcp.server import UNREGISTERED_TOOL_AUDIT_NAME, build_server
 from creek_mcp.tier_ceiling import TierCeiling
+from tests.agent_token_support import (
+    AGENT_CLIENT_ID,
+    AGENT_SUBJECT,
+    agent_verifier,
+    mint,
+)
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CONSUMER,
@@ -421,6 +427,30 @@ def test_a_dispatched_mcp_call_shows_as_admitted(
     assert [(row["consumer"], row["tool"], row["outcome"]) for row in rows] == [
         ("openclaw", "creek.wheel", "admitted")
     ]
+
+
+def test_a_jwt_agent_is_shown_under_its_subject(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OAuth agent (#1963) is on the card under its ``sub``, admitted and refused.
+
+    The token is minted and verified by the real resource-server verifier, so
+    the stamp is whatever that verifier hands the audit log: the ``sub``, never
+    the registered OAuth ``client_id``, and never any other claim.
+    """
+    verified = asyncio.run(agent_verifier().verify_token(mint()))
+    assert verified is not None
+    server = _remote_server(vault, monkeypatch, verified)
+    asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}))
+    asyncio.run(server.call_tool("creek.link", {"stage": "temporal"}))
+    response = _get(vault)
+    assert [
+        (row["consumer"], row["tool"], row["outcome"]) for row in _rows(response)
+    ] == [
+        (AGENT_SUBJECT, "creek.link", "refused"),
+        (AGENT_SUBJECT, "creek.wheel", "admitted"),
+    ]
+    assert AGENT_CLIENT_ID not in response.text
 
 
 # --------------------------------------------------------------------------- #
