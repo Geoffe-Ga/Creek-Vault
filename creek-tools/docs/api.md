@@ -156,21 +156,24 @@ Generate and rotate:
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-**Revocation and rotation are different operations, and both end in a
-restart.** `CREEK_MCP_TOKEN_TTL_SECONDS` bounds how long an individually
+**Revocation and rotation are different operations, and both end with the
+edited set in force** — within 5 s when it lives in a mounted secret file (the
+container image and the Fly vault Machine follow theirs, #1965), at the next
+restart when it lives in `CREEK_MCP_CONSUMER_TOKENS`.
+`CREEK_MCP_TOKEN_TTL_SECONDS` bounds how long an individually
 captured `AccessToken` object stays valid; it does **not** revoke the
 underlying shared secret, because the bearer is re-verified and re-issued on
 every request.
 
 - **Revocation** is immediate and hard: remove a consumer's entry (or a
-  single token from its `,`-separated set) from `CREEK_MCP_CONSUMER_TOKENS`
-  and restart. The credential stops working the moment the restarted process
-  is serving — there is no overlap and no grace period.
+  single token from its `,`-separated set) from the secret file, or from
+  `CREEK_MCP_CONSUMER_TOKENS` and restart. The credential stops working the
+  moment the edited set is in force — there is no overlap and no grace period.
 - **Rotation** replaces a secret without downtime by holding two
   currently-valid tokens for one consumer at once (`adepthood=<old>,<new>`)
   while the consumer redeploys onto the new one, then dropping the old one.
-  It still costs two restarts, but the consumer is never locked out
-  mid-swap. Follow the numbered runbook in
+  On a secret file it costs no restart; on the environment it costs two.
+  Either way the consumer is never locked out mid-swap. Follow the numbered runbook in
   [`docs/mcp.md`](mcp.md#rotating-a-consumers-secret-no-downtime); see also
   [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
   the credential is still a static, long-lived secret rather than something

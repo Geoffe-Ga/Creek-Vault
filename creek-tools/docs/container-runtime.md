@@ -60,6 +60,14 @@ The token file uses Creek's existing registry format:
 may temporarily be comma-separated. A semicolon would add a second consumer,
 which this image refuses.
 
+The running container follows this file (#1965): an edit is picked up within
+5 s, with no restart, so rotating or revoking the consumer's token is an edit.
+A file the container would refuse at boot is refused on reload too — named on
+stderr without the token, with the previous set still serving — and so is one
+naming a different consumer. Mount the secret *directory*, as above, so a
+secret manager's write-and-rename reaches the container. The steps are the
+rotation runbook in [`mcp.md`](mcp.md#rotating-a-consumers-secret-no-downtime).
+
 Credentials must arrive through `/run/secrets`; do not use environment values,
 Docker build arguments, command arguments, or image layers. The only supported
 environment settings are non-secret paths and the port:
