@@ -126,7 +126,9 @@ def run(settings: FlyVaultSettings) -> None:
     prepared = prepare_vault(settings.container)
     secret = load_consumer_secret(settings.container.consumer_tokens_file)
     replay_state = _load_replay_state(settings.replay_state_file)
-    verifier = secret.verifier()
+    # Follows the mounted secret, so rotating the consumer's token is an edit to
+    # the Fly secret, not a Machine restart (#1965).
+    verifier = secret.reloading_verifier(settings.container.consumer_tokens_file)
     args = argparse.Namespace(
         host=settings.container.host,
         port=settings.container.port,

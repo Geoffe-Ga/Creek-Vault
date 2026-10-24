@@ -20,6 +20,7 @@ from creek_mcp.container_runtime import (
     PreparedVault,
     SingleConsumerSecret,
 )
+from creek_mcp.credential_reload import ReloadingConsumerTokenVerifier
 from creek_mcp.fly_vault_runtime import FlyVaultSettings, _load_replay_state
 from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV
 from tests.v1_api_support import client, headers, seed_vault
@@ -216,6 +217,8 @@ def test_fly_runtime_uses_plaintext_only_with_replay_and_bearer_guards(
 
     assert observed["state"] == _STATE
     assert observed["agent_verifier"] is None
+    # The served registry follows the mounted secret file (#1965).
+    assert isinstance(observed["verifier"], ReloadingConsumerTokenVerifier)
     assert observed["token_env"] is None
     assert observed["config_env"] == str(config)
     assert observed["vault_env"] == str(vault)

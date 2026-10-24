@@ -71,7 +71,7 @@ import hmac
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, NoReturn
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -670,6 +670,25 @@ def _load_registry(
     return tokens, grants
 
 
+@dataclass(frozen=True)
+class _Registry:
+    """One validated configuration: every consumer's tokens and grants.
+
+    Held by :class:`ConsumerTokenVerifier` as a **single** reference, so a
+    reload (#1965) replaces tokens and grants in one assignment and no request
+    ever reads one configuration's tokens beside another's grants. Neither
+    field reaches ``repr``: a traceback or a debugger dump of a verifier must
+    not serialize credential material.
+
+    Attributes:
+        tokens: ``{consumer: (token, ...)}``, normalised.
+        grants: ``{consumer: grants}`` for the gated consumers only.
+    """
+
+    tokens: dict[str, tuple[str, ...]] = field(repr=False)
+    grants: dict[str, frozenset[Grant]] = field(repr=False)
+
+
 class ConsumerTokenVerifier(TokenVerifier):
     """Verifies a bearer token against the configured per-consumer token sets.
 
@@ -711,8 +730,24 @@ class ConsumerTokenVerifier(TokenVerifier):
                 value is configured more than once, or if *grants* names a
                 consumer with no tokens or gives one an empty grant set.
         """
-        self._tokens = _normalized_token_sets(tokens)
-        self._grants = _normalized_grants(self._tokens, grants or {})
+        normalized = _normalized_token_sets(tokens)
+        self._registry = _Registry(
+            tokens=normalized, grants=_normalized_grants(normalized, grants or {})
+        )
+
+    def _adopt(self, other: ConsumerTokenVerifier) -> None:
+        """Serve *other*'s configuration from now on, in one assignment (#1965).
+
+        The swap a reloading subclass makes once it has a fully validated
+        replacement: *other* was built through :meth:`__init__`, so it carries
+        every refusal the constructor makes, and nothing half-parsed can be
+        adopted. A call already scanning the previous registry finishes against
+        it; the next call sees the new one.
+
+        Args:
+            other: A verifier built from the replacement configuration.
+        """
+        self._registry = other._registry
 
     @property
     def consumers(self) -> tuple[str, ...]:
@@ -732,7 +767,7 @@ class ConsumerTokenVerifier(TokenVerifier):
         Returns:
             The configured consumer names.
         """
-        return tuple(self._tokens)
+        return tuple(self._registry.tokens)
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Return the consumer's :class:`AccessToken` for a valid token, else ``None``.
@@ -758,9 +793,16 @@ class ConsumerTokenVerifier(TokenVerifier):
         stays valid (#837). That expiry does not revoke the underlying shared
         secret: the SDK's bearer middleware calls ``verify_token`` fresh on
         every request, so a consumer that keeps presenting a configured value
-        is re-verified indefinitely. What revokes it is dropping it from
-        :data:`CONSUMER_TOKENS_ENV` and restarting — the closing half of the
-        rotation runbook in the network-transport section of ``docs/mcp.md``.
+        is re-verified indefinitely. What revokes it is dropping it from the
+        configuration: from a mounted secret file, which the container entry
+        points follow without a restart (#1965,
+        :class:`~creek_mcp.credential_reload.ReloadingConsumerTokenVerifier`),
+        or from :data:`CONSUMER_TOKENS_ENV` and restarting — the closing half
+        of the rotation runbook in the network-transport section of
+        ``docs/mcp.md``.
+
+        The registry is read **once**, before the scan, so a reload landing
+        mid-call cannot pair one configuration's match with another's grants.
 
         Args:
             token: The bearer token presented on the request.
@@ -769,9 +811,10 @@ class ConsumerTokenVerifier(TokenVerifier):
             The matching consumer's access token, or ``None`` when no
             configured token matches.
         """
+        registry = self._registry
         supplied = token.encode("utf-8")
         matched: str | None = None
-        for consumer, known_tokens in self._tokens.items():
+        for consumer, known_tokens in registry.tokens.items():
             for known in known_tokens:
                 if hmac.compare_digest(supplied, known.encode("utf-8")):
                     matched = consumer
@@ -780,25 +823,9 @@ class ConsumerTokenVerifier(TokenVerifier):
         return AccessToken(
             token=token,
             client_id=matched,
-            scopes=[REMOTE_SCOPE, *self._grant_scopes(matched)],
+            scopes=[REMOTE_SCOPE, *_grant_scopes(registry, matched)],
             expires_at=int(_now()) + _token_ttl_seconds(),
         )
-
-    def _grant_scopes(self, consumer: str) -> list[str]:
-        """Return the grant scopes *consumer*'s tokens carry (#1964).
-
-        Args:
-            consumer: A configured consumer.
-
-        Returns:
-            Its grants' values in :class:`~creek_mcp.policy.Grant` declaration
-            order, so the scope list is stable; or the ungated marker alone
-            when the consumer has no configured grants.
-        """
-        held = self._grants.get(consumer)
-        if held is None:
-            return [UNGATED_SCOPE]
-        return [grant.value for grant in Grant if grant in held]
 
     def ungated_notice(self) -> str | None:
         """Return the operator notice naming every ungated consumer, else ``None``.
@@ -814,7 +841,8 @@ class ConsumerTokenVerifier(TokenVerifier):
             give it the default profile, or ``None`` when every consumer is
             gated.
         """
-        ungated = [name for name in self._tokens if name not in self._grants]
+        registry = self._registry
+        ungated = [name for name in registry.tokens if name not in registry.grants]
         if not ungated:
             return None
         default = _GRANT_SEPARATOR.join(
@@ -848,7 +876,7 @@ class ConsumerTokenVerifier(TokenVerifier):
         """
         windows = [
             (consumer, len(configured))
-            for consumer, configured in self._tokens.items()
+            for consumer, configured in self._registry.tokens.items()
             if len(configured) > _SETTLED_TOKEN_COUNT
         ]
         if not windows:
@@ -859,8 +887,9 @@ class ConsumerTokenVerifier(TokenVerifier):
         return (
             f"{CONSUMER_TOKENS_ENV}: rotation window open — {held}. "
             "Each of those tokens authenticates as its consumer for as long as "
-            "it stays configured; drop the retired secret and restart once the "
-            "consumer has redeployed."
+            "it stays configured; drop the retired secret once the consumer has "
+            "redeployed (a mounted secret file is re-read within seconds; the "
+            "environment variable needs a restart)."
         )
 
 
@@ -905,6 +934,24 @@ class NamedConsumerVerifier(TokenVerifier):
         if access is None or not names_a_consumer(access.client_id):
             return None
         return access
+
+
+def _grant_scopes(registry: _Registry, consumer: str) -> list[str]:
+    """Return the grant scopes *consumer*'s tokens carry (#1964).
+
+    Args:
+        registry: The configuration the call matched against.
+        consumer: A configured consumer.
+
+    Returns:
+        Its grants' values in :class:`~creek_mcp.policy.Grant` declaration
+        order, so the scope list is stable; or the ungated marker alone when
+        the consumer has no configured grants.
+    """
+    held = registry.grants.get(consumer)
+    if held is None:
+        return [UNGATED_SCOPE]
+    return [grant.value for grant in Grant if grant in held]
 
 
 def _normalized_grants(

@@ -913,8 +913,10 @@ routable by design and requires TLS.
   outside the server) would remain valid. It does **not** bound the
   configured secret itself and it is not a rotation mechanism — a consumer
   that keeps presenting a value from `CREEK_MCP_CONSUMER_TOKENS` is
-  re-verified indefinitely. Dropping a token from the set and restarting is
-  what revokes it; see "Rotating a consumer's secret" below, and
+  re-verified indefinitely. Dropping a token from the set is what revokes it —
+  within seconds when the set lives in a mounted secret file, at the next
+  restart when it lives in the environment; see "Rotating a consumer's
+  secret" below, and
   [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
   overlapping static tokens, rather than short-lived derived credentials, is
   the shape of that runbook.
@@ -1161,7 +1163,8 @@ An access token is accepted only when **all** of these hold
 - signed `RS256` or `ES256` (never `none`, never `HS*`) by a key the issuer's
   JWKS publishes under the token's `kid`, the header `alg` equal to that key's
   own algorithm; keys are cached 300 s and refetched early for an unknown
-  `kid` at most once a minute, keeping the last good set if a fetch fails;
+  `kid` at most once a minute, keeping the last good set if a fetch fails
+  (see "When the issuer rotates its signing key" below);
 - `iss` equals the configured issuer and `aud` equals
   `CREEK_MCP_RESOURCE_URL` **exactly** — one string, not a list, so a token
   for another vault is refused;
@@ -1189,49 +1192,115 @@ routes an agent's token on `/mcp` by its verified `sub` to that person's vault.
 
 Rotation widens a consumer's token set so the old and new secrets both work,
 lets the consumer redeploy onto the new one, then narrows the set back to
-one. Two restarts bound the window, and **the window is not closed until the
-second restart runs** — until then the retired secret still authenticates as
-that consumer, exactly like the new one.
+one. **The window is not closed until the narrowed set is in force** — until
+then the retired secret still authenticates as that consumer, exactly like
+the new one.
+
+Where the set lives decides how an edit takes effect (#1965):
+
+| Registry | Served by | An edit takes effect |
+|---|---|---|
+| Mounted secret file (`CREEK_CONTAINER_CONSUMER_TOKENS_FILE`) | the container image, the Fly vault Machine | within 5 s, on the next request — **no restart** |
+| `CREEK_MCP_CONSUMER_TOKENS` | `creek-tools-mcp`, `creek-tools-api` | at the next restart of every process that reads it — an environment is read once |
 
 1. Generate a fresh token for the consumer being rotated:
    ```bash
    python -c "import secrets; print(secrets.token_urlsafe(32))"
    ```
-2. Add it alongside the consumer's current token in
-   `CREEK_MCP_CONSUMER_TOKENS`, comma-separated, current value first:
+2. Add it alongside the consumer's current token, comma-separated, current
+   value first, keeping any grant suffix:
    ```bash
+   # mounted secret file (one consumer per file on a container):
+   printf 'adepthood=<current>,<new>@vault:read+vault:desk\n' > ./run-secrets/creek_consumer_tokens
+   # or the environment:
    export CREEK_MCP_CONSUMER_TOKENS="adepthood=<current>,<new>;other=<token>"
    ```
-3. Restart **every** process that reads this variable — `creek-tools-mcp`,
-   `creek-tools-api`, or both, if the host runs the two adapters side by side.
-   They share one registry, so a process that was not restarted is still
-   serving the pre-edit set. Startup prints a
-   rotation notice to stderr naming `adepthood` and its token count — that
-   notice is the reminder that a window is open, not a one-time line to
-   dismiss. From this restart on, both `<current>` and `<new>` authenticate
-   as `adepthood`.
+3. Let it take effect. A **file** needs nothing more: within 5 s the vault
+   prints `creek: consumer credentials: reloaded from the secret file` on
+   stderr, followed by the rotation notice. The **environment** needs a restart
+   of **every** process that reads it — `creek-tools-mcp`, `creek-tools-api`,
+   or both, if the host runs the two adapters side by side; a process that was
+   not restarted is still serving the pre-edit set. Either way the rotation
+   notice names `adepthood` and its token count; it is the reminder that a
+   window is open, not a one-time line to dismiss. From here on, both
+   `<current>` and `<new>` authenticate as `adepthood`.
 4. Redeploy the consumer onto `<new>` and confirm *at the consumer* that it
    is presenting the new token. (The audit log at
    `<vault>/00-Creek-Meta/audit/mcp.jsonl` attributes every call to
    `adepthood` regardless of which token authenticated it, so it cannot tell
    you which one is in use — check the consumer's own configuration.)
-5. Remove `<current>` from `CREEK_MCP_CONSUMER_TOKENS`, leaving only `<new>`:
+5. Remove `<current>`, leaving only `<new>`:
    ```bash
+   printf 'adepthood=<new>@vault:read+vault:desk\n' > ./run-secrets/creek_consumer_tokens
+   # or
    export CREEK_MCP_CONSUMER_TOKENS="adepthood=<new>;other=<token>"
    ```
-6. Restart again — every process you restarted in step 3, not just one of
-   them. **This step is not optional.** Until it runs, `<current>` still
-   authenticates as `adepthood` on any process still holding the widened set,
-   and the rotation notice keeps firing at that process's every startup as a
-   reminder. This second restart is the only thing that actually revokes the
-   retired secret — nothing else in this system does.
+6. Let it take effect, as in step 3: within 5 s for a file — `<current>` is
+   `401` on its next call — or by restarting every process from step 3 for the
+   environment. **This step is not optional.** Until it is in force,
+   `<current>` still authenticates as `adepthood`, and the rotation notice keeps
+   firing at every reload and every start as a reminder. Narrowing the set is
+   the only thing that actually revokes the retired secret.
 
-Skipping step 6 does not fail loudly; it leaves a permanently widened
-credential set that keeps working indefinitely. The startup notice is the
+Skipping step 5 does not fail loudly; it leaves a permanently widened
+credential set that keeps working indefinitely. The rotation notice is the
 only pressure against that, so treat it as an open task, not a status line.
-See [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
+Revoking a leaked token outright is step 5 alone: drop it and, on a file, it
+stops working within 5 s. See
+[ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
 this overlapping-token runbook, rather than short-lived derived credentials,
-is the shape of rotation today.
+is the shape of static-token rotation.
+
+#### How a secret file is followed (#1965)
+
+The verifier the container entry points serve is the one instance `/v1` and
+`/mcp` both hold (`creek_mcp/credential_reload.py`), so a reload reaches both
+surfaces at once.
+
+- **Polled, not watched.** A request arriving 5 s or more after the last look
+  re-reads the file — never more often — and compares the SHA-256 of its
+  bytes with the bytes the set in force came from, so a same-size rewrite that
+  keeps the mtime is still seen and a `touch` is not a reload. Polling rather
+  than inotify is deliberate: it works the same on a Fly secret mount, a
+  Docker bind mount and a Kubernetes projected volume.
+- **Parsed exactly as at boot.** A file the boot path would refuse — a token
+  below 32 characters, a consumer named twice, a token value used twice, an
+  unreadable grant suffix — is **refused**: one line on stderr
+  (`creek: consumer credentials: reload refused: <reason>; the previous
+  credential set stays in force`) and the previous set keeps serving, so a
+  typo never locks the consumer out and nothing is ever served half-parsed.
+  The reason names consumers and lengths, never a token, and no line names the
+  file's path or a byte of it. The same refusal is not repeated while the file
+  stays unchanged.
+- **Grants follow the file too.** Adding, changing or removing a grant suffix
+  is a reload like any other; the reloaded consumer carries exactly the grants
+  the boot parse would have given it.
+- **One identity for the life of a container.** A container's file names one
+  consumer, and a reload may rotate that consumer's tokens and grants but not
+  replace it: the per-consumer concurrency buckets, the journal's single-owner
+  rule and a managed vault's JWT subject pin were all built from it at start.
+  A file naming a different identity, or a second one, is refused like any
+  invalid edit; serving another identity takes a restart.
+- **Unreadable is not empty.** A file that cannot be read for a moment (a
+  secret manager mid-swap) keeps the previous set, noted once.
+- **Never in the environment.** The reload reads the file directly; no token
+  is copied into the process environment or a command line, as at boot.
+- **Mount the directory, not the file.** An editor or secret manager that
+  writes a new file and renames it over the old one replaces the inode; a
+  bind mount of the single file keeps showing the old one. Mount the secret
+  directory, as the [container guide](container-runtime.md) does.
+
+#### When the issuer rotates its signing key
+
+An OAuth-serving vault's key cache (`creek_mcp/agent_tokens.py::JwksCache`)
+needs no restart either. A token signed by a key the issuer has just published
+names an unknown `kid`, which refetches the key set early — at most once a
+minute — so the new key is accepted within a minute of its first use. A key
+the issuer removes keeps verifying until the next **successful** refresh (the
+300 s TTL, or an unknown-`kid` refetch), then is refused. A failed fetch keeps
+the last good set, so an issuer outage refuses nothing it already signed; the
+outage is logged once on `creek_mcp.agent_tokens` when it begins and once when
+it ends, never naming the issuer URL or a `kid`.
 
 The transport is a thin wrapper around the MCP SDK's `TokenVerifier` /
 streamable-http app; the tool registry, tier-ceiling rules, and hash-chained
