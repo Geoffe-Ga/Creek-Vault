@@ -33,6 +33,12 @@ from creek.author.reflection import ReflectionNode
 from creek.author.voice import VoiceAgent
 from creek.compile.provenance import ProvenanceEntry
 from creek.models import PrivacyTier
+from creek.progress import (
+    CompositionStage,
+    StageCallback,
+    ignore_stage,
+    once_per_stage,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -358,6 +364,7 @@ class Conductor:
         query: str,
         vault: Path,
         override: PrivacyTierOverride | None = None,
+        on_stage: StageCallback = ignore_stage,
     ) -> AuthoredDraft:
         """Run the full author pipeline and return a shaped draft.
 
@@ -367,6 +374,11 @@ class Conductor:
             vault: The vault to author from.
             override: The privacy admission ceiling (#660); above-ceiling
                 fragments are excluded from the evidence. ``None`` => ``OPEN``.
+            on_stage: Sink told each stage boundary the desk crosses (#1966):
+                ``SOURCES`` once the evidence is gathered, then ``COMPOSED``
+                and ``VOICE_GUARDED`` after the voice and reflection nodes.
+                Wrapped in :func:`creek.progress.once_per_stage`, so a revision
+                round reports nothing new and the sequence stays monotonic.
 
         Returns:
             The :class:`AuthoredDraft` with mock provenance and a verdict. A
@@ -377,7 +389,9 @@ class Conductor:
             ValueError: When *medium* is unsupported.
         """
         validated = require_supported_medium(medium)
+        report = once_per_stage(on_stage)
         evidence = self.gather_evidence(query, vault, override=override)
+        report(CompositionStage.SOURCES)
         # #661: route the voice call by the evidence's content tier so Intimate
         # content is redirected to a local provider by the chokepoint. The
         # factory (built per content tier) takes precedence over a static client.
@@ -408,6 +422,7 @@ class Conductor:
                 contract=self.contract,
                 client=voice_client,
             )
+            report(CompositionStage.COMPOSED)
             result = self.reflection.review(
                 body,
                 evidence,
@@ -417,6 +432,7 @@ class Conductor:
                 fingerprint=fingerprint,
                 ai_style_config=ai_style_config,
             )
+            report(CompositionStage.VOICE_GUARDED)
             verdict = result.decision
             findings = result.findings
             if verdict != "REVISE":
@@ -518,6 +534,7 @@ def run_author(
     llm_client: AuthorLLMClient | None = None,
     voice_client_factory: VoiceClientFactory | None = None,
     override: PrivacyTierOverride | None = None,
+    on_stage: StageCallback = ignore_stage,
 ) -> AuthoredDraft:
     """Author *query* for *medium* against *vault* with the default desk.
 
@@ -536,6 +553,8 @@ def run_author(
         override: The privacy admission ceiling (#660) threaded to the
             specialists; above-ceiling fragments are excluded. ``None`` =>
             ``OPEN``.
+        on_stage: Sink told each stage boundary the desk crosses (#1966); see
+            :meth:`Conductor.run`. Defaults to a no-op.
 
     Returns:
         The shaped :class:`AuthoredDraft`.
@@ -548,7 +567,13 @@ def run_author(
         llm_client=llm_client,
         voice_client_factory=voice_client_factory,
         contract=contract,
-    ).run(medium=medium, query=query, vault=vault, override=override)
+    ).run(
+        medium=medium,
+        query=query,
+        vault=vault,
+        override=override,
+        on_stage=on_stage,
+    )
     return _enforce_chat_ceiling(draft)
 
 

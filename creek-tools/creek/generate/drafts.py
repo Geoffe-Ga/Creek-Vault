@@ -112,6 +112,7 @@ from creek.models import (
     PrivacyTier,
     Thread,
 )
+from creek.progress import CompositionStage, StageCallback, ignore_stage
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
@@ -910,6 +911,7 @@ class DraftGenerator:
         ai_style_config: AIStyleConfig | None = None,
         voice_guard_no_llm: bool = False,
         cohesion: bool = False,
+        on_stage: StageCallback = ignore_stage,
     ) -> None:
         """Initialise with an LLM client (or tier-keyed factory) and skill tree root.
 
@@ -982,6 +984,12 @@ class DraftGenerator:
                 by the deterministic entity-preservation guard and a
                 biographical-grounding re-check; any violation falls back to
                 the pre-cohesion body.
+            on_stage: Sink told each :class:`~creek.progress.CompositionStage`
+                boundary :meth:`generate_draft` and :meth:`save_draft` cross
+                (#1966) — ``SKILLS``, ``SOURCES`` and ``COMPOSED``, then
+                ``VOICE_GUARDED`` and ``SAVED``. It receives the stage and
+                nothing else, so it can be forwarded to a remote caller
+                without a privacy argument. Defaults to a no-op.
 
         Raises:
             ValueError: When neither or both of *llm* and *llm_factory* are
@@ -1021,6 +1029,7 @@ class DraftGenerator:
         self._ai_style_config = ai_style_config
         self._voice_guard_no_llm = voice_guard_no_llm
         self._cohesion = cohesion
+        self._on_stage = on_stage
 
     def present_idea(self, idea: IdeaSeed) -> str:
         """Format *idea* as an invitation rather than an imperative.
@@ -1483,12 +1492,14 @@ class DraftGenerator:
             current_phase=current_phase,
             fragments=fragments,
         )
+        self._on_stage(CompositionStage.SKILLS)
         source_material = self.gather_source_material(
             idea,
             vault_path=vault_path,
             fragments=fragments,
             compiled_pages=compiled_pages,
         )
+        self._on_stage(CompositionStage.SOURCES)
         prompt = self._compose_prompt(idea, skill_stack, source_material)
         # Before the first call that could reach a provider, and after the
         # sources are known (#1031). The cohesion and voice-guard hops below
@@ -1518,6 +1529,7 @@ class DraftGenerator:
             source_fragments=idea.source_fragments,
             fragments=fragments,
         )
+        self._on_stage(CompositionStage.COMPOSED)
         return Draft(
             title=idea.title,
             body=body,
@@ -2676,6 +2688,7 @@ class DraftGenerator:
             vault_path=vault_path,
             source_fragments=draft.source_fragments,
         )
+        self._on_stage(CompositionStage.VOICE_GUARDED)
         post = frontmatter.Post(
             content=_draft_file_body(body, truncated=draft.truncated),
             type="draft",
@@ -2712,6 +2725,7 @@ class DraftGenerator:
         for key, value in voice_fields.items():
             post[key] = value
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
+        self._on_stage(CompositionStage.SAVED)
         return target
 
 
