@@ -9,6 +9,18 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Document connecting an agent to a vault (#1969). `docs/mcp.md` gains an
+  "Agents" section for the vault's owner: what the default `vault:read
+  vault:desk` profile reaches and never reaches, the address to paste, signing
+  in and stopping an agent through Adepthood, the static-token path for a
+  self-hosted vault, client timeouts above the long-call deadline, and recipes
+  for OpenClaw, Claude Code, ChatGPT and the hosted Claude apps — the first two
+  run once by hand on 2026-10-24 — plus a client-support matrix with a source
+  and date for every row. The Adepthood contract record gains "Agents over
+  `/mcp`" (managed-vault `/mcp`, RFC 9728 metadata, grant names,
+  `creek.jobs.read`, per-person attribution) and a documentation change-log
+  row. No code or contract version moves.
+
 - Publish `GET /v1/agent-activity` at contract `0.22.0` (#1968): a content-free
   projection of the MCP audit chain so a vault's owner can see what each
   connected agent asked for and when. Rows are `{consumer, tool, at, outcome}`,
