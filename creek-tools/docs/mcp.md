@@ -893,6 +893,45 @@ routable by design and requires TLS.
   `creek_mcp/server.py` is now MCP's thin adapter over it, unchanged in
   behaviour.
 
+### Served at `/mcp` inside the `/v1` process (#1962)
+
+A vault that serves `/v1` — the container image (`python -m
+creek_mcp.container_runtime`), the Fly vault Machine
+(`creek_mcp.fly_vault_runtime`) and `creek-tools-api` — also serves this MCP
+server at **`/mcp`** on the same port and TLS listener (8823 in the image),
+with no new flag, secret or health probe. An agent connects to the vault URL
+plus `/mcp`:
+
+```bash
+claude mcp add --transport http creek https://<vault-host>/mcp \
+  --header "Authorization: Bearer <consumer token>"
+```
+
+- **Same server, same verifier.** The tools are the ones
+  `creek-tools-mcp --transport network` serves, authenticated by the *same*
+  `ConsumerTokenVerifier` instance as `/v1`: a consumer token that opens `/v1`
+  opens `/mcp`, and the remote tier cap applies identically. An unauthenticated
+  request is `401` with a `WWW-Authenticate: Bearer` challenge.
+- **No `/v1` headers.** MCP negotiates its own protocol version in
+  `initialize`, so `X-Creek-Contract-Version` is neither required nor read;
+  the ceiling is each tool's `privacy_tier_ceiling` argument, not
+  `X-Creek-Tier-Ceiling`.
+- **Logged and enveloped like `/v1`.** Every `/mcp` request writes one line on
+  `creek_mcp.httpapi.access` (route `/mcp`, the verified consumer), and a fault
+  is answered as the published `500 internal_error`. `/mcp` has its own
+  concurrency pool and no 30 s request timeout, because a streamable-HTTP
+  response is an SSE stream.
+- **Exact path.** `/mcp/` and anything beneath it answer exactly as an unrouted
+  `/v1` path does. On Fly the edge forwards the whole `/mcp` subtree into the
+  vault realm and the replay router replays `/mcp` to the owner's Machine, where
+  the replay-state guard applies as it does to `/v1`.
+- **Stateful sessions.** One Machine serves one person, so FastMCP's default
+  in-memory session table (`stateless_http=False`) is kept.
+- **Bound once.** The tools are bound to the vault when the app is built. If
+  the configuration cannot be read at startup, `/v1` still serves (and reports
+  the vault unavailable) while `/mcp` is not mounted until a restart; the
+  operator is told on `creek_mcp.httpapi.mcp`.
+
 ### Rotating a consumer's secret (no downtime)
 
 Rotation widens a consumer's token set so the old and new secrets both work,
