@@ -105,6 +105,12 @@ from creek_mcp.httpapi import handlers
 from creek_mcp.httpapi.auth import BearerAuthMiddleware, build_verifier
 from creek_mcp.httpapi.context import SCOPE_KEY, bind_context, context_of
 from creek_mcp.httpapi.errors import error_response
+from creek_mcp.httpapi.mcp_mount import (
+    McpMountMiddleware,
+    build_mcp_server,
+    mcp_lifespan,
+    warn_not_mounted,
+)
 from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
 from creek_mcp.httpapi.middleware.boundary import (
     ErrorBoundaryMiddleware,
@@ -122,15 +128,17 @@ from creek_mcp.httpapi.middleware.limits import (
     ConsumerConcurrencyLimitMiddleware,
     RequestTimeoutMiddleware,
 )
+from creek_mcp.httpapi.vault import resolve_vault
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
     from typing import Any
 
+    from mcp.server.fastmcp import FastMCP
     from starlette.requests import Request
     from starlette.responses import Response
-    from starlette.types import ExceptionHandler
+    from starlette.types import ASGIApp, ExceptionHandler
 
     from creek_mcp.api.routes import RouteSpec
     from creek_mcp.httpapi.context import RequestContext
@@ -465,11 +473,15 @@ def _middleware(
     max_concurrency: int,
     max_per_consumer: int,
     fly_replay_state: str | None,
+    mcp_app: ASGIApp | None,
 ) -> list[Middleware]:
-    """Return the ordinary eight layers plus an optional Fly replay guard.
+    """Return the ordinary eight layers plus the ``/mcp`` mount and Fly guard.
 
     The order is load-bearing and pinned by a test; see
-    :mod:`creek_mcp.httpapi.middleware` for what each adjacent pair buys.
+    :mod:`creek_mcp.httpapi.middleware` for what each adjacent pair buys. The
+    ``/mcp`` mount sits directly below the access log and the error boundary
+    and above everything ``/v1``-specific; :mod:`creek_mcp.httpapi.mcp_mount`
+    says why each layer below it is one ``/mcp`` must not pass through.
 
     Args:
         verifier: The shared consumer-token verifier.
@@ -482,7 +494,10 @@ def _middleware(
             consumer. A second ceiling below authentication, never a
             replacement for the process-wide one above it (#1110).
         fly_replay_state: Exact mounted Fly replay state, or ``None`` to keep
-            the ordinary TLS runtime's eight-layer stack unchanged.
+            the ordinary TLS runtime's eight-layer stack unchanged. Guards
+            ``/mcp`` as well as ``/v1``.
+        mcp_app: The SDK's streamable-HTTP app to serve at ``/mcp``, or
+            ``None`` when no vault could be resolved to bind it to.
 
     Returns:
         The middleware stack.
@@ -490,6 +505,17 @@ def _middleware(
     layers = [
         Middleware(AccessLogMiddleware),
         Middleware(ErrorBoundaryMiddleware),
+    ]
+    if mcp_app is not None:
+        layers.append(
+            Middleware(
+                McpMountMiddleware,
+                mcp_app=mcp_app,
+                max_concurrency=max_concurrency,
+                fly_replay_state=fly_replay_state,
+            )
+        )
+    layers += [
         Middleware(ConcurrencyLimitMiddleware, max_concurrency=max_concurrency),
         Middleware(RequestTimeoutMiddleware, timeout_seconds=timeout_seconds),
     ]
@@ -516,6 +542,30 @@ def _middleware(
     return layers
 
 
+def _mcp_server_for(
+    vault_path: Path | None,
+    verifier: ConsumerTokenVerifier,
+    reflect_llm_factory: Callable[[], _LLMFactory] | None,
+) -> FastMCP | None:
+    """Return the MCP server for ``/mcp``, or ``None`` when no vault resolves.
+
+    Args:
+        vault_path: The explicitly configured vault, or ``None``.
+        verifier: The ``/v1`` app's verifier instance.
+        reflect_llm_factory: The ``/v1`` app's reflection thunk.
+
+    Returns:
+        The built server, or ``None`` after warning the operator.
+    """
+    served = resolve_vault(vault_path)
+    if served is None:
+        warn_not_mounted()
+        return None
+    return build_mcp_server(
+        vault_path=served, verifier=verifier, reflect_llm_factory=reflect_llm_factory
+    )
+
+
 def create_app(
     *,
     vault_path: Path | None = None,
@@ -528,7 +578,13 @@ def create_app(
     letter_llm_factory: Callable[[], LetterLLMFactory] | None = None,
     fly_replay_state: str | None = None,
 ) -> Starlette:
-    """Build the ``/v1`` application.
+    """Build the ``/v1`` application, with the MCP surface mounted at ``/mcp``.
+
+    The MCP server (#1962) is built here, from the same *verifier* instance
+    the ``/v1`` bearer gate holds, and its tools are bound to the vault once:
+    *vault_path*, or the one the configuration names now. When neither can be
+    resolved, ``/mcp`` is not mounted and the operator is told; ``/v1`` keeps
+    its per-request resolution and its "repair the config, retry" promise.
 
     Args:
         vault_path: Vault root to serve, or ``None`` to resolve it from
@@ -560,6 +616,8 @@ def create_app(
             (#1862): a thunk returning the tier-keyed letter factory, or
             ``None`` to build the production one, bound to the resolved vault,
             only once a letter has passed every gate.
+        fly_replay_state: Exact mounted Fly replay state, or ``None`` off Fly.
+            Required on ``/v1`` and ``/mcp`` alike.
 
     Returns:
         The configured application.
@@ -572,6 +630,7 @@ def create_app(
             notices.
     """
     configured_verifier = verifier if verifier is not None else build_verifier()
+    mcp_server = _mcp_server_for(vault_path, configured_verifier, reflect_llm_factory)
     app = Starlette(
         routes=[_route_for(spec) for spec in ROUTES],
         middleware=_middleware(
@@ -581,11 +640,18 @@ def create_app(
             max_concurrency,
             max_per_consumer,
             fly_replay_state,
+            None if mcp_server is None else mcp_server.streamable_http_app(),
         ),
         exception_handlers=routing_exception_handlers(),
+        lifespan=None if mcp_server is None else mcp_lifespan(mcp_server),
     )
     app.router.redirect_slashes = REDIRECT_SLASHES
     app.state.vault_path = vault_path
+    # The one MCP server this process serves at /mcp, or None when it is not
+    # mounted. Exposed so the adapter's later layers (#1963's resource-server
+    # metadata, #1967's request-scoped keys) reach the server they extend
+    # rather than building a second one.
+    app.state.mcp_server = mcp_server
     # The withdrawal adapter uses only the cardinality of this authenticated
     # registry when deciding whether a pre-0.16, unscoped staged entry has one
     # unambiguous owner. The token values are never retained on app state.

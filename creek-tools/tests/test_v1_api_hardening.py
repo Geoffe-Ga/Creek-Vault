@@ -83,6 +83,7 @@ from creek_mcp.httpapi.context import LIFESPAN_SCOPE, UnsupportedScopeError
 from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import NO_STORE
 from creek_mcp.httpapi.logging import ACCESS_LOGGER_NAME, ERROR_LOGGER_NAME
+from creek_mcp.httpapi.mcp_mount import McpMountMiddleware
 from creek_mcp.httpapi.middleware import limits as limits_module
 from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
 from creek_mcp.httpapi.middleware.boundary import ErrorBoundaryMiddleware
@@ -287,6 +288,7 @@ def _streamed(payload: bytes) -> Iterator[bytes]:
 _EXPECTED_STACK: Final[tuple[type, ...]] = (
     AccessLogMiddleware,
     ErrorBoundaryMiddleware,
+    McpMountMiddleware,
     ConcurrencyLimitMiddleware,
     RequestTimeoutMiddleware,
     BearerAuthMiddleware,
@@ -301,7 +303,10 @@ def test_middleware_order_is_pinned_outermost_first(vault: Path) -> None:
 
     Reading outward-in: the access log mints the ``request_id`` and never
     refuses, so it must see every response including the boundary's own
-    ``500``. The boundary wraps everything below it. The concurrency and
+    ``500``. The boundary wraps everything below it. The ``/mcp`` mount (#1962)
+    is next: inside those two, so every MCP request is logged and enveloped,
+    and above every ``/v1``-specific layer, none of which ``/mcp`` may cross
+    (``tests/test_mcp_mount.py`` covers why, layer by layer). The concurrency and
     timeout limits sit above authentication so a flood of *unauthenticated*
     requests is shed rather than each paying for a token comparison.
     Authentication is above the router, so a ``401`` never depends on whether
@@ -1917,6 +1922,14 @@ async def _discard(message: Message) -> None:
 _LAYERS: Final[tuple[tuple[str, Callable[[ASGIApp], ASGIApp]], ...]] = (
     ("access-log", AccessLogMiddleware),
     ("boundary", ErrorBoundaryMiddleware),
+    (
+        "mcp-mount",
+        # The app below doubles as the MCP surface, so a scope relayed down
+        # either branch of the dispatch is a scope that reached it.
+        lambda app: McpMountMiddleware(
+            app, mcp_app=app, max_concurrency=1, fly_replay_state=None
+        ),
+    ),
     ("concurrency", lambda app: ConcurrencyLimitMiddleware(app, max_concurrency=1)),
     (
         "timeout",

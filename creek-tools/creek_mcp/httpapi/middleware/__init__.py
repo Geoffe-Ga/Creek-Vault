@@ -37,4 +37,9 @@ every property the modules below promise depends on it:
    make the server buffer a large body.
 8. :mod:`~creek_mcp.httpapi.middleware.ceiling` — last before the router, above
    every handler, so no vault read can precede the admission decision.
+
+Between 2 and 3 sits :class:`creek_mcp.httpapi.mcp_mount.McpMountMiddleware`
+(#1962), which is not one of the eight: it hands the exact path ``/mcp`` to the
+MCP surface, inside the access log and the error boundary and outside every
+``/v1``-specific layer, and relays everything else to 3 unchanged.
 """

@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+    from starlette.applications import Starlette
+
 _TOKEN = "consumer-token-that-is-at-least-thirty-two-characters"
 
 
@@ -434,3 +436,41 @@ def test_managed_container_pins_consent_off_while_serving(
     run(settings)
 
     assert observed == {"consent": False}
+
+
+def test_the_served_container_app_answers_mcp_with_the_mounted_consumer_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one entry point serves ``/v1`` and ``/mcp`` together, no new flag (#1962).
+
+    Nothing is patched between the secret mount and the served app: the token
+    the container read from its secret file is the bearer that completes an
+    MCP handshake, and the handshake reports the network transport.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        monkeypatch: Captures the served app and restores the runtime env.
+    """
+    from starlette.testclient import TestClient
+
+    from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+    from creek_mcp import container_runtime as runtime
+    from creek_mcp.policy import Transport
+    from tests.mcp_http_support import call_handshake, open_session
+
+    for name in (CONFIG_PATH_ENV_VAR, "CREEK_VAULT_PATH", LOOPBACK_ONLY_ENV):
+        monkeypatch.setenv(name, "")
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
+    served: list[Starlette] = []
+    monkeypatch.setattr(runtime, "serve", lambda app, _args: served.append(app))
+
+    run(_settings(tmp_path))
+
+    (app,) = served
+    assert app.state.mcp_server is not None
+    with TestClient(app) as test_client:
+        session = open_session(test_client, _TOKEN)
+        handshake = call_handshake(test_client, session["headers"])
+    assert handshake["transport"] == Transport.NETWORK.value
