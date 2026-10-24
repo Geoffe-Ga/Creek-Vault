@@ -83,10 +83,8 @@ construction site to :func:`_routing_miss`.
 
 from __future__ import annotations
 
-import asyncio
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Final, NoReturn
-from uuid import uuid4
 
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
@@ -105,6 +103,7 @@ from creek_mcp.httpapi import handlers
 from creek_mcp.httpapi.auth import BearerAuthMiddleware, build_verifier
 from creek_mcp.httpapi.context import SCOPE_KEY, bind_context, context_of
 from creek_mcp.httpapi.errors import error_response
+from creek_mcp.httpapi.job_runtime import JobRuntime
 from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
 from creek_mcp.httpapi.middleware.boundary import (
     ErrorBoundaryMiddleware,
@@ -590,11 +589,10 @@ def create_app(
     # registry when deciding whether a pre-0.16, unscoped staged entry has one
     # unambiguous owner. The token values are never retained on app state.
     app.state.consumer_ids = frozenset(configured_verifier.consumers)
-    app.state.pipeline_worker_id = uuid4().hex
-    app.state.pipeline_job_admission_lock = asyncio.Lock()
-    app.state.pipeline_job_tasks = set()
-    app.state.pipeline_active_job_ids = set()
-    app.state.pipeline_active_job_by_consumer = {}
+    # One job runtime per process (#1966): the worker id, the detached tasks
+    # and the one-active-job-per-consumer admission rule (#1605), shareable
+    # with an MCP server mounted beside these routes.
+    app.state.pipeline_jobs = JobRuntime()
     app.state.reflect_llm_factory = reflect_llm_factory
     app.state.letter_llm_factory = letter_llm_factory
     # One grounding session per app (#1034), so ``POST /v1/reflections`` builds
