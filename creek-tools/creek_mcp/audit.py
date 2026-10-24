@@ -80,7 +80,9 @@ AUDIT_OUTCOME_REFUSED: Final[str] = "refused"
 """The ``outcome`` an entry carries when the call was refused before dispatch.
 
 Written by the MCP adapter when :func:`creek_mcp.policy.admitted_tool` refuses
-an out-of-profile call (#1964). Such an entry records the tool name and this
+an out-of-profile call (#1964), and when :func:`creek_mcp.policy.admitted_ceiling`
+refuses a remote call above ``personal`` (#1968). Such an entry records the
+tool name and this
 outcome only — no argument summary — because the call never reached a tool
 that could say which of its arguments were safe to summarise. Entries written
 by the tools themselves carry no ``outcome`` key, exactly as before.

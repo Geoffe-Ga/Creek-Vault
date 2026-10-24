@@ -417,8 +417,22 @@ def test_remote_call_above_personal_is_refused_before_dispatch(
     assert result["status"] == "refused"
     assert result["tool"] == "creek.wheel"
     assert "not reachable over the network" in result["reason"]
-    # Refused before dispatch => nothing was audited for the tool call.
-    assert not (vault / MCP_AUDIT_RELPATH).exists()
+    # Refused before dispatch, and audited as refused (#1968) so the owner's
+    # activity card can show the attempt: the tool name and the outcome only,
+    # under the transport-default ceiling. Never the ceiling that was asked
+    # for, and no argument summary, because no tool ran to vouch for one.
+    entries = [
+        json.loads(line)
+        for line in (vault / MCP_AUDIT_RELPATH).read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.wheel"
+    assert entries[0]["outcome"] == "refused"
+    assert entries[0]["args_summary"] == {}
+    assert entries[0]["tier_ceiling"] == "open"
+    assert entries[0]["consumer"] == "adepthood"
+    assert ceiling not in json.dumps(entries[0])
 
 
 @pytest.mark.parametrize("ceiling", ["open", "personal"])
@@ -1863,6 +1877,46 @@ def _entries_for(vault: Path, tool: str) -> list[dict[str, object]]:
     return [entry for entry in _audit_entries(vault) if entry["tool"] == tool]
 
 
+def _assert_only_a_refusal_was_audited(vault: Path, tool: str) -> None:
+    """Assert *tool* never ran: its one entry is the pre-dispatch refusal (#1968).
+
+    A refused call is audited as ``"outcome": "refused"`` under the tool name,
+    with no argument summary and the transport-default ``open`` ceiling, so the
+    owner's activity card can show it. Nothing the tool itself writes is there,
+    because the tool never ran.
+
+    Args:
+        vault: The vault root.
+        tool: Dot-namespaced tool name the caller asked for.
+    """
+    entries = _audit_entries(vault)
+    assert [entry["tool"] for entry in entries] == [tool]
+    assert entries[0]["outcome"] == "refused"
+    assert entries[0]["args_summary"] == {}
+    assert entries[0]["tier_ceiling"] == "open"
+
+
+def _dispatched_consumers_for(vault: Path, tool: str) -> list[object]:
+    """Return the ``consumer`` of every entry *tool* itself wrote, in write order.
+
+    Pre-dispatch refusals are excluded: they are audited (#1968), but they are
+    the adapter's entries, not the tool's, and the remoteness pins below are
+    about which calls *ran*.
+
+    Args:
+        vault: The vault root.
+        tool: Dot-namespaced tool name to filter on.
+
+    Returns:
+        The consumer identifiers, one per dispatched call.
+    """
+    return [
+        entry["consumer"]
+        for entry in _entries_for(vault, tool)
+        if entry.get("outcome") != "refused"
+    ]
+
+
 def _consumers_for(vault: Path, tool: str) -> list[object]:
     """Return the ``consumer`` of every audit entry for *tool*, in write order.
 
@@ -1891,7 +1945,8 @@ def test_remote_cap_refuses_every_non_admitted_ceiling(
     else. Everything here — the two over-ceiling tiers, wrong case, leading or
     trailing whitespace, ``None``, the empty string, unknown tier names, and
     every non-string scalar or container — is refused *before dispatch* with
-    the one hard-coded reason, and leaves no audit entry behind.
+    the one hard-coded reason, and leaves only its own refused entry behind
+    (#1968): the tool never ran, so nothing the tool writes is in the log.
 
     Args:
         vault: Seeded vault root.
@@ -1905,8 +1960,8 @@ def test_remote_cap_refuses_every_non_admitted_ceiling(
     assert result["status"] == "refused"
     assert result["tool"] == "creek.wheel"
     assert result["reason"] == _CAP_REFUSAL_REASON
-    # Refused before dispatch => the tool never ran, so nothing was audited.
-    assert not (vault / MCP_AUDIT_RELPATH).exists()
+    # Refused before dispatch => the tool never ran; only the refusal is audited.
+    _assert_only_a_refusal_was_audited(vault, "creek.wheel")
 
 
 @pytest.mark.parametrize("ceiling", ["intimate", "all", "bogus-tier"])
@@ -2088,13 +2143,13 @@ def test_cap_re_evaluates_remoteness_remote_then_local(
     refused = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
     assert refused is not None
     assert refused["reason"] == _CAP_REFUSAL_REASON
-    assert not (vault / MCP_AUDIT_RELPATH).exists()
+    _assert_only_a_refusal_was_audited(vault, "creek.wheel")
 
     bearer[0] = None
     admitted = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
     assert admitted is not None
     assert admitted.get("status") != "refused"
-    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+    assert _dispatched_consumers_for(vault, "creek.wheel") == ["env-default"]
 
 
 def test_cap_re_evaluates_remoteness_local_then_remote(
@@ -2115,14 +2170,16 @@ def test_cap_re_evaluates_remoteness_local_then_remote(
     admitted = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
     assert admitted is not None
     assert admitted.get("status") != "refused"
-    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+    assert _dispatched_consumers_for(vault, "creek.wheel") == ["env-default"]
 
     bearer[0] = _fake_token("adepthood")
     refused = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
     assert refused is not None
     assert refused["reason"] == _CAP_REFUSAL_REASON
-    # Refused before dispatch => no second entry joined the first.
-    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+    # Refused before dispatch => no second dispatched entry joined the first;
+    # the refusal itself is audited under the remote consumer (#1968).
+    assert _dispatched_consumers_for(vault, "creek.wheel") == ["env-default"]
+    assert _consumers_for(vault, "creek.wheel") == ["env-default", "adepthood"]
 
 
 # --------------------------------------------------------------------------- #

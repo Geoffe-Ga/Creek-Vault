@@ -279,7 +279,13 @@ class _BoundedFastMCP(FastMCP):
 
         The tool verdict is asked first: a tool the caller was not granted is
         refused whatever ceiling it named, and audited as refused under the
-        tool name only (:meth:`_refuse_ungranted`). Then the ceiling verdict.
+        tool name only (:meth:`_refuse_audited`). Then the ceiling verdict,
+        whose refusal is audited the same way (#1968): the owner's activity
+        card (``GET /v1/agent-activity``) shows an agent reaching above
+        ``personal`` as a refused call. The entry is content-free by
+        construction — the refusal depends on nothing but the caller's own
+        argument, never on a fragment's tier — and it records the
+        transport-default ``OPEN`` rather than the ceiling that was asked for.
 
         The missing-key default is *adapter* vocabulary rather than policy's: a
         tool that declares no ``privacy_tier_ceiling`` is read here as having
@@ -307,23 +313,23 @@ class _BoundedFastMCP(FastMCP):
         # narrows to a type that has no ``reason``, mypy fails the build rather
         # than leaving the regression to be noticed at runtime.
         if not isinstance(granted, Admission):
-            return await self._refuse_ungranted(name, identity, granted.reason)
+            return await self._refuse_audited(name, identity, granted.reason)
         raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
         verdict = admitted_ceiling(identity, raw)
         if isinstance(verdict, Admission):
             return await super().call_tool(name, arguments)
         # ``ceiling=OPEN`` rather than the requested one: the refusal echoes
         # the transport's own default, never the value that was refused.
-        return refusal_response(
-            tool=name,
-            ceiling=TierCeiling.OPEN,
-            reason=verdict.reason,
-        )
+        return await self._refuse_audited(name, identity, verdict.reason)
 
-    async def _refuse_ungranted(
+    async def _refuse_audited(
         self, name: str, identity: CallerIdentity, reason: str
     ) -> dict[str, Any]:
-        """Audit an out-of-profile call as refused, then answer the refusal.
+        """Audit a pre-dispatch refusal as refused, then answer the refusal.
+
+        Shared by both pre-dispatch verdicts — an out-of-profile tool (#1964)
+        and an over-ceiling remote call (#1968) — so the two cannot drift into
+        two shapes of refused entry.
 
         The audit entry carries the tool name and
         :data:`~creek_mcp.audit.AUDIT_OUTCOME_REFUSED` only — no argument
