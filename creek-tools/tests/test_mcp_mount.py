@@ -32,7 +32,9 @@ from creek_mcp.policy import Transport
 from creek_mcp.server import SERVER_NAME
 from tests.mcp_http_support import (
     call_handshake,
+    call_tool,
     initialize_body,
+    listed_tools,
     mcp_headers,
     open_session,
     sse_payload,
@@ -611,3 +613,39 @@ def test_a_configured_vault_is_resolved_once_for_the_mcp_surface(
 
     assert seen == [vault]
     assert app.state.vault_path is None
+
+
+# --------------------------------------------------------------------------- #
+# The mounted server is the grant-filtered one (#1964)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_gated_consumer_sees_and_reaches_only_its_profile_at_mcp(
+    vault: Path,
+) -> None:
+    """``/mcp`` serves the per-agent profile: listed tools and dispatch both filtered.
+
+    Args:
+        vault: A seeded vault.
+    """
+    from creek_mcp.policy import DEFAULT_GRANTS, TOOL_GRANTS, TOOL_NOT_GRANTED_REASON
+    from creek_mcp.remote_auth import ConsumerTokenVerifier
+
+    gated = ConsumerTokenVerifier(
+        {CONSUMER: (STRONG_TOKEN,)}, grants={CONSUMER: DEFAULT_GRANTS}
+    )
+    with TestClient(build_app(vault_path=vault, verifier=gated)) as test_client:
+        session = open_session(test_client)
+        listed = listed_tools(test_client, session["headers"])
+        refused = call_tool(
+            test_client,
+            session["headers"],
+            "creek.link",
+            {"privacy_tier_ceiling": "personal"},
+        )
+
+    assert listed == {
+        tool for tool, grant in TOOL_GRANTS.items() if grant in DEFAULT_GRANTS
+    }
+    assert refused["status"] == "refused"
+    assert refused["reason"] == TOOL_NOT_GRANTED_REASON

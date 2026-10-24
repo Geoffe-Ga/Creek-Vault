@@ -462,3 +462,59 @@ def test_the_served_fly_app_answers_a_replayed_mcp_handshake(
     )
     assert handshake["transport"] == Transport.NETWORK.value
     assert direct.status_code == 401
+
+
+def test_fly_runtime_announces_an_ungated_consumer_before_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Fly entry point names an ungated consumer at start (#1964).
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        monkeypatch: Records the announcement and stubs the server.
+    """
+    from creek_mcp import fly_vault_runtime as runtime
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    replay_state = tmp_path / "replay-state"
+    replay_state.write_text(_STATE, encoding="ascii")
+    replay_state.chmod(0o600)
+    settings = FlyVaultSettings.from_environ(
+        {
+            "FLY_APP_NAME": "creek-vault-pilot",
+            "FLY_MACHINE_ID": "machine-001",
+            "FLY_REGION": "iad",
+            "FLY_PRIVATE_IP": "fdaa:0:1::2",
+            "CREEK_CONTAINER_EXPECTED_FLY_APP": "creek-vault-pilot",
+            "CREEK_CONTAINER_EXPECTED_FLY_REGION": "iad",
+            "CREEK_CONTAINER_VAULT_PATH": str(vault),
+            "CREEK_CONTAINER_FLY_REPLAY_STATE_FILE": str(replay_state),
+        }
+    )
+    monkeypatch.setattr(
+        runtime,
+        "prepare_vault",
+        lambda _settings: PreparedVault(vault / "creek.yaml", BootstrapState.EXISTING),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "load_consumer_secret",
+        lambda _path: SingleConsumerSecret("adepthood", (_TOKEN,)),
+    )
+    announced: list[object] = []
+    served: list[object] = []
+    monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
+    monkeypatch.setattr(runtime, "announce_ungated_consumers", announced.append)
+    monkeypatch.setattr(
+        runtime,
+        "create_app",
+        lambda *, verifier, fly_replay_state: (verifier, fly_replay_state),
+    )
+    monkeypatch.setattr(runtime, "serve", lambda app, _args: served.append(app))
+
+    runtime.run(settings)
+
+    assert len(announced) == 1
+    assert served == [(announced[0], _STATE)]

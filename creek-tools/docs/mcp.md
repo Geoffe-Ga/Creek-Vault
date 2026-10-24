@@ -964,6 +964,11 @@ claude mcp add --transport http creek https://<vault-host>/mcp \
   `/v1` path does. On Fly the edge forwards the whole `/mcp` subtree into the
   vault realm and the replay router replays `/mcp` to the owner's Machine, where
   the replay-state guard applies as it does to `/v1`.
+- **Per-agent profiles apply.** The mounted server is the grant-filtered one
+  (#1964). A container's consumer-secret file takes the same grant suffix as
+  `CREEK_MCP_CONSUMER_TOKENS` (`adepthood=<token>@vault:read+vault:desk`); with
+  none the consumer is ungated, and every entry point that serves `/mcp` names
+  it on stderr at start.
 - **Stateful sessions.** One Machine serves one person, so FastMCP's default
   in-memory session table (`stateless_http=False`) is kept.
 - **Bound once.** The tools are bound to the vault when the app is built. If

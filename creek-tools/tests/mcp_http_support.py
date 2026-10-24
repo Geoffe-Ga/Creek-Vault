@@ -110,6 +110,72 @@ def open_session(test_client: TestClient, token: str = STRONG_TOKEN) -> dict[str
     return {"headers": session_headers, "initialize": sse_payload(init.text)["result"]}
 
 
+def rpc(
+    test_client: TestClient,
+    session_headers: dict[str, str],
+    method: str,
+    params: dict[str, Any],
+) -> Any:
+    """Send one JSON-RPC request over the open session; return its ``result``.
+
+    Args:
+        test_client: A client whose lifespan is running.
+        session_headers: The headers :func:`open_session` returned.
+        method: The JSON-RPC method.
+        params: Its parameters.
+
+    Returns:
+        The decoded ``result`` member.
+    """
+    response = test_client.post(
+        MCP_PATH,
+        json={"jsonrpc": "2.0", "id": 2, "method": method, "params": params},
+        headers=session_headers,
+    )
+    assert response.status_code == HTTP_OK, response.text
+    return sse_payload(response.text)["result"]
+
+
+def call_tool(
+    test_client: TestClient,
+    session_headers: dict[str, str],
+    name: str,
+    arguments: dict[str, Any],
+) -> Any:
+    """Call tool *name* over the open session; return its structured result.
+
+    Args:
+        test_client: A client whose lifespan is running.
+        session_headers: The headers :func:`open_session` returned.
+        name: The tool name.
+        arguments: Its arguments.
+
+    Returns:
+        The tool's ``structuredContent``.
+    """
+    result = rpc(
+        test_client,
+        session_headers,
+        "tools/call",
+        {"name": name, "arguments": arguments},
+    )
+    return result["structuredContent"]
+
+
+def listed_tools(test_client: TestClient, session_headers: dict[str, str]) -> set[str]:
+    """Return the tool names ``tools/list`` shows this session.
+
+    Args:
+        test_client: A client whose lifespan is running.
+        session_headers: The headers :func:`open_session` returned.
+
+    Returns:
+        The listed names.
+    """
+    result = rpc(test_client, session_headers, "tools/list", {})
+    return {tool["name"] for tool in result["tools"]}
+
+
 def call_handshake(test_client: TestClient, session_headers: dict[str, str]) -> Any:
     """Call ``creek.handshake`` over the open session; return its structured result.
 
@@ -120,15 +186,4 @@ def call_handshake(test_client: TestClient, session_headers: dict[str, str]) -> 
     Returns:
         The tool's ``structuredContent``.
     """
-    response = test_client.post(
-        MCP_PATH,
-        json={
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "creek.handshake", "arguments": {}},
-        },
-        headers=session_headers,
-    )
-    assert response.status_code == HTTP_OK, response.text
-    return sse_payload(response.text)["result"]["structuredContent"]
+    return call_tool(test_client, session_headers, "creek.handshake", {})
