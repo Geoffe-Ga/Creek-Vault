@@ -25,8 +25,9 @@ those are wrong for MCP:
 * the **``/v1`` bearer gate** answers ``401`` with ``/v1``'s envelope and no
   RFC 9728 challenge, and it can only ever accept static consumer tokens. MCP
   authenticates in the SDK's own ``RequireAuthMiddleware``, through the same
-  verifier, and that ``401`` (with its ``WWW-Authenticate``) is the response
-  #1963 extends with protected-resource metadata;
+  static verifier composed with the agent-token verifier when the vault is an
+  OAuth resource server (#1963), and that ``401`` carries the challenge that
+  points at the vault's protected-resource metadata;
 * the **ceiling header gate** reads ``X-Creek-Tier-Ceiling``, which MCP does
   not use: the ceiling is a tool argument, and
   :meth:`creek_mcp.server._BoundedFastMCP.call_tool` applies the one shared
@@ -98,6 +99,7 @@ if TYPE_CHECKING:
     from starlette.applications import Starlette
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
     from creek_mcp.httpapi.job_runtime import JobRuntime
     from creek_mcp.remote_auth import ConsumerTokenVerifier
     from creek_mcp.tools.reflect import _LLMFactory
@@ -116,6 +118,7 @@ def build_mcp_server(
     *,
     vault_path: Path,
     verifier: ConsumerTokenVerifier,
+    agent_verifier: JwtAgentTokenVerifier | None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None,
     job_runtime: JobRuntime | None = None,
 ) -> FastMCP:
@@ -125,10 +128,17 @@ def build_mcp_server(
     pulls in the whole tool registry, the Writing Desk included, and importing
     :mod:`creek_mcp.httpapi.app` must stay free of that stack (the cold-import
     contract in ``tests/test_container_image_contract.py``).
+    :mod:`creek_mcp.agent_tokens` is too, for the root-time import surface
+    ``tests/test_pool_admin_key_custody.py`` measures: it brings PyJWT and the
+    x509 stack, which the container bootstrap must not load before it drops
+    privileges.
 
     Args:
         vault_path: The vault the tools are bound to, resolved once.
         verifier: The ``/v1`` app's verifier — the same instance, not a copy.
+        agent_verifier: The OAuth agent-token verifier (#1963), composed with
+            *verifier* so static tokens keep working, or ``None`` on a
+            bearer-only vault.
         reflect_llm_factory: The ``/v1`` app's reflection thunk, or ``None``
             for the production default.
         job_runtime: The ``/v1`` app's job runtime (#1966), so
@@ -140,13 +150,15 @@ def build_mcp_server(
         :data:`~creek_mcp.mcp_path.MCP_PATH` so the SDK's own route and this
         mount's dispatch cannot drift apart.
     """
+    from creek_mcp.agent_tokens import mcp_token_verifier
     from creek_mcp.server import build_server
 
     server = build_server(
         transport=Transport.NETWORK,
         vault_path=vault_path,
         reflect_llm_factory=reflect_llm_factory,
-        token_verifier=verifier,
+        token_verifier=mcp_token_verifier(verifier, agent_verifier),
+        resource_server=None if agent_verifier is None else agent_verifier.config,
         job_runtime=job_runtime,
     )
     # Both are read by the SDK when the app is built, not by this package, so

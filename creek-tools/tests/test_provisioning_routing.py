@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 
 from creek_mcp.httpapi.middleware.limits import DEFAULT_MAX_BODY_BYTES
 from creek_mcp.httpapi.routing import (
+    AgentRouting,
     AllocationRouter,
     build_fly_replay_routing_app,
     build_routing_app,
@@ -725,3 +726,248 @@ def test_paths_beneath_mcp_are_a_routing_miss_at_the_replay_router(
     assert response.status_code == 404
     assert "Fly-Replay" not in response.headers
     assert provider.calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# Agents' OAuth access tokens on /mcp (#1963)
+# --------------------------------------------------------------------------- #
+
+_EDGE_MCP_URL = "https://creek-control-pilot.fly.dev/mcp"
+_OWNER = RoutingPrincipal("adepthood", "user-001", "s" * 64)
+
+
+class _FakeAgentPrincipals:
+    """Resolve one consumer identity to the allocation's owner."""
+
+    def __init__(self) -> None:
+        """Start with no lookups recorded."""
+        self.lookups: list[str] = []
+
+    async def principal_for_consumer(
+        self, consumer_identity: str
+    ) -> RoutingPrincipal | None:
+        """Return the owner for ``user-001`` only.
+
+        Args:
+            consumer_identity: A verified subject.
+
+        Returns:
+            The owner, or ``None``.
+        """
+        self.lookups.append(consumer_identity)
+        return _OWNER if consumer_identity == "user-001" else None
+
+
+def _agent_routing() -> tuple[AgentRouting, _FakeAgentPrincipals]:
+    """Return an agent route for the edge's MCP URL over the local JWKS.
+
+    Returns:
+        The route and its principal resolver.
+    """
+    from tests.agent_token_support import agent_verifier
+
+    principals = _FakeAgentPrincipals()
+    return (
+        AgentRouting(agent_verifier(resource_url=_EDGE_MCP_URL), principals),
+        principals,
+    )
+
+
+def _agent_client(
+    tmp_path: Path,
+) -> tuple[TestClient, _McpReplayProvider, _FakeAgentPrincipals]:
+    """Return a replay-router client with agent routing configured.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+
+    Returns:
+        The client, the replay provider and the principal resolver.
+    """
+    store = ProvisioningStore(tmp_path / "routing.sqlite3")
+    _ready_allocation(store)
+    provider = _McpReplayProvider()
+    agent, principals = _agent_routing()
+    app = build_fly_replay_routing_app(
+        store, FakeRoutingVerifier(_OWNER), provider, agent=agent
+    )
+    return TestClient(app), provider, principals
+
+
+def _agent_token(**claims: object) -> str:
+    """Return an agent JWT for the edge's MCP URL and ``user-001``.
+
+    Args:
+        claims: Claim overrides.
+
+    Returns:
+        The token.
+    """
+    from tests.agent_token_support import mint
+
+    return mint(**{"aud": _EDGE_MCP_URL, "sub": "user-001", **claims})
+
+
+def test_an_agent_token_is_replayed_to_its_subjects_vault(tmp_path: Path) -> None:
+    """A verified JWT routes by ``sub`` to the owner's vault, with its state.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    client, provider, principals = _agent_client(tmp_path)
+
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {_agent_token()}"},
+        content=b"{}",
+    )
+
+    assert response.status_code == 307
+    assert response.headers["Fly-Replay"] == (
+        f"app=creek-vault-a1b2;instance={'0' * 14};state={'s' * 64}"
+    )
+    assert principals.lookups == ["user-001"]
+    assert provider.calls == 1
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"aud": "https://elsewhere.example/mcp"},
+        {"exp": 1_000},
+        {"iss": "https://evil.example"},
+        {"sub": "user-unknown"},
+    ],
+)
+def test_a_refused_agent_token_never_wakes_a_vault(
+    tmp_path: Path, claims: dict[str, object]
+) -> None:
+    """Wrong audience, expired, foreign, or no allocation: ``401``, no target.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        claims: The claim that makes the token unroutable.
+    """
+    from tests.agent_token_support import resource_config
+
+    client, provider, _principals = _agent_client(tmp_path)
+
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {_agent_token(**claims)}"},
+        content=b"{}",
+    )
+
+    assert response.status_code == 401
+    assert "Fly-Replay" not in response.headers
+    assert response.headers["www-authenticate"] == resource_config(
+        _EDGE_MCP_URL
+    ).challenge(401)
+    assert provider.calls == 0
+
+
+def test_an_agent_token_never_routes_v1(tmp_path: Path) -> None:
+    """``/v1`` stays the static routing credential's alone.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    client, provider, principals = _agent_client(tmp_path)
+
+    response = client.get(
+        "/v1/capabilities",
+        headers={**_HEADERS, "Authorization": f"Bearer {_agent_token()}"},
+    )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == 'Bearer realm="creek"'
+    assert principals.lookups == []
+    assert provider.calls == 0
+
+
+def test_the_static_credential_still_routes_mcp_beside_agents(tmp_path: Path) -> None:
+    """Adepthood's routing credential keeps reaching ``/mcp``.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    client, provider, principals = _agent_client(tmp_path)
+
+    response = client.post(
+        "/mcp", headers={"Authorization": f"Bearer {_TOKEN}"}, content=b"{}"
+    )
+
+    assert response.status_code == 307
+    assert principals.lookups == []
+    assert provider.calls == 1
+
+
+def test_an_anonymous_mcp_call_is_challenged_toward_the_metadata(
+    tmp_path: Path,
+) -> None:
+    """The edge's ``401`` on ``/mcp`` starts a client's OAuth sign-in.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    from tests.agent_token_support import resource_config
+
+    client, _provider, _principals = _agent_client(tmp_path)
+
+    response = client.post("/mcp", content=b"{}")
+
+    challenges = [
+        value
+        for name, value in response.headers.multi_items()
+        if name == "www-authenticate"
+    ]
+    assert response.status_code == 401
+    assert challenges == [resource_config(_EDGE_MCP_URL).challenge(401)]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource",
+    ],
+)
+def test_the_router_publishes_the_edge_resource_metadata(
+    tmp_path: Path, path: str
+) -> None:
+    """Unauthenticated, before any store or provider is touched.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        path: A metadata path.
+    """
+    from tests.agent_token_support import resource_config
+
+    client, provider, _principals = _agent_client(tmp_path)
+
+    response = client.get(path)
+
+    assert response.status_code == 200
+    assert response.json() == resource_config(_EDGE_MCP_URL).metadata_document()
+    assert provider.calls == 0
+
+
+def test_a_router_without_agents_is_unchanged(tmp_path: Path) -> None:
+    """No issuer: no metadata, and the ``/mcp`` refusal keeps its old challenge.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    store = ProvisioningStore(tmp_path / "routing.sqlite3")
+    _ready_allocation(store)
+    client = TestClient(
+        build_fly_replay_routing_app(
+            store, FakeRoutingVerifier(_OWNER), _McpReplayProvider()
+        )
+    )
+
+    metadata = client.get("/.well-known/oauth-protected-resource/mcp")
+    refused = client.post("/mcp", content=b"{}")
+
+    assert metadata.status_code == 401
+    assert refused.headers["www-authenticate"] == 'Bearer realm="creek"'

@@ -236,7 +236,7 @@ def test_runtime_keeps_credentials_out_of_environment_and_process_args(
     settings = _settings(tmp_path)
     observed: dict[str, object] = {}
     monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
-    monkeypatch.setattr(runtime, "create_app", lambda *, verifier: verifier)
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier, **_kwargs: verifier)
     monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
 
     def fake_serve(app: object, args: object) -> None:
@@ -327,7 +327,7 @@ def test_run_sets_loopback_only_flag(
     observed: dict[str, str | None] = {}
     monkeypatch.setenv(LOOPBACK_ONLY_ENV, "")
     monkeypatch.delenv(LOOPBACK_ONLY_ENV)
-    monkeypatch.setattr(runtime, "create_app", lambda *, verifier: verifier)
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier, **_kwargs: verifier)
     monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
 
     def fake_serve(_app: object, _args: object) -> None:
@@ -402,7 +402,7 @@ def test_self_connected_container_still_honours_cloud_consent(
     monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
     assert ContainerSettings.from_environ({CLOUD_CONSENT_ENV: "1"}).managed is False
     observed: dict[str, bool] = {}
-    monkeypatch.setattr(runtime, "create_app", lambda *, verifier: verifier)
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier, **_kwargs: verifier)
     monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
     monkeypatch.setattr(
         runtime,
@@ -424,7 +424,7 @@ def test_managed_container_pins_consent_off_while_serving(
 
     settings = replace(_settings(tmp_path), managed=True)
     observed: dict[str, bool] = {}
-    monkeypatch.setattr(runtime, "create_app", lambda *, verifier: verifier)
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier, **_kwargs: verifier)
     monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
 
     def fake_serve(_app: object, _args: object) -> None:
@@ -526,10 +526,144 @@ def test_runtime_announces_an_ungated_consumer_before_serving(
     served: list[object] = []
     monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
     monkeypatch.setattr(runtime, "announce_ungated_consumers", announced.append)
-    monkeypatch.setattr(runtime, "create_app", lambda *, verifier: verifier)
+    monkeypatch.setattr(runtime, "create_app", lambda *, verifier, **_kwargs: verifier)
     monkeypatch.setattr(runtime, "serve", lambda app, _args: served.append(app))
 
     run(_settings(tmp_path))
 
     assert announced == served
     assert len(announced) == 1
+
+
+# --------------------------------------------------------------------------- #
+# OAuth resource server settings (#1963)
+# --------------------------------------------------------------------------- #
+
+_RESOURCE = "https://v-7q2k.creek.example/mcp"
+_ISSUER = "https://api.adepthood.example"
+
+
+def _oauth_environ(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """Return a container environment with both resource-server settings.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        extra: Further settings.
+
+    Returns:
+        The environment.
+    """
+    from creek_mcp.oauth_resource import AUTHORIZATION_SERVER_ENV, RESOURCE_URL_ENV
+
+    return {
+        VAULT_PATH_ENV: str(tmp_path / "vault"),
+        RESOURCE_URL_ENV: _RESOURCE,
+        AUTHORIZATION_SERVER_ENV: _ISSUER,
+        **extra,
+    }
+
+
+def test_the_resource_server_settings_load_from_the_environment(
+    tmp_path: Path,
+) -> None:
+    """The two non-secret settings the control plane writes reach the settings."""
+    settings = ContainerSettings.from_environ(_oauth_environ(tmp_path))
+
+    assert settings.resource_server is not None
+    assert settings.resource_server.resource_url == _RESOURCE
+    assert settings.resource_server.authorization_server == _ISSUER
+
+
+def test_no_resource_server_settings_is_a_bearer_only_container(
+    tmp_path: Path,
+) -> None:
+    """Without them the container serves exactly as before #1963."""
+    settings = ContainerSettings.from_environ({VAULT_PATH_ENV: str(tmp_path)})
+
+    assert settings.resource_server is None
+
+
+def test_a_half_configured_resource_server_refuses_startup(tmp_path: Path) -> None:
+    """One setting without the other is a startup refusal, not half OAuth."""
+    from creek_mcp.oauth_resource import AUTHORIZATION_SERVER_ENV
+
+    environ = _oauth_environ(tmp_path)
+    del environ[AUTHORIZATION_SERVER_ENV]
+
+    with pytest.raises(ContainerConfigurationError, match="set together") as refused:
+        ContainerSettings.from_environ(environ)
+
+    assert _RESOURCE not in str(refused.value)
+
+
+def _served_agent_verifier(
+    settings: ContainerSettings, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Run the container and return the agent verifier it served ``/mcp`` behind.
+
+    Args:
+        settings: The container settings.
+        monkeypatch: Pytest's monkeypatch.
+
+    Returns:
+        The ``agent_verifier`` handed to ``create_app``.
+    """
+    from creek_mcp import container_runtime as runtime
+
+    captured: dict[str, object] = {}
+
+    def fake_create_app(*, verifier: object, agent_verifier: object) -> object:
+        captured["agent"] = agent_verifier
+        return verifier
+
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+    monkeypatch.setattr(runtime, "create_app", fake_create_app)
+    monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
+    monkeypatch.setattr(runtime, "announce_ungated_consumers", lambda _verifier: None)
+    monkeypatch.setattr(runtime, "serve", lambda _app, _args: None)
+    run(settings)
+    return captured["agent"]
+
+
+def test_a_managed_oauth_container_pins_the_subject_to_its_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed Machine accepts only its own person's tokens."""
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
+    from creek_mcp.oauth_resource import ResourceServerConfig
+
+    config = ResourceServerConfig.build(
+        resource_url=_RESOURCE, authorization_server=_ISSUER
+    )
+    settings = replace(_settings(tmp_path), managed=True, resource_server=config)
+
+    agent = _served_agent_verifier(settings, monkeypatch)
+
+    assert isinstance(agent, JwtAgentTokenVerifier)
+    assert agent.config == config
+    assert agent.expected_subject == "adepthood"
+
+
+def test_a_self_hosted_oauth_container_does_not_pin_the_subject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A self-hosted vault's static consumer name is not the person's ``sub``."""
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
+    from creek_mcp.oauth_resource import ResourceServerConfig
+
+    config = ResourceServerConfig.build(
+        resource_url=_RESOURCE, authorization_server=_ISSUER
+    )
+    settings = replace(_settings(tmp_path), resource_server=config)
+
+    agent = _served_agent_verifier(settings, monkeypatch)
+
+    assert isinstance(agent, JwtAgentTokenVerifier)
+    assert agent.expected_subject is None
+
+
+def test_a_bearer_only_container_serves_no_agent_verifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No resource server: ``/mcp`` keeps the static registry alone."""
+    assert _served_agent_verifier(_settings(tmp_path), monkeypatch) is None

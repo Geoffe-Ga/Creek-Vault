@@ -18,9 +18,13 @@ Every dial lands on a loopback listener this suite opened (see
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import pytest
+from mcp.server.auth.middleware.auth_context import auth_context_var
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 
 from creek.classify.llm.pool_boundary import (
     POOL_MAX_DEADLINE_MS,
@@ -52,6 +56,7 @@ from creek.classify.llm.providers import (
     reported_pool_identity,
 )
 from creek.config import LLMConfig
+from tests.agent_token_support import mint
 from tests.pool_support import (
     PINNED_MODEL,
     FakePool,
@@ -456,6 +461,46 @@ class TestClosedRequestShape:
 
         assert pool.headers[0][POOL_REQUEST_ID_HEADER.lower()] == declared
         assert "request_id" not in pool.bodies[0]
+
+    def test_an_agent_access_token_never_reaches_the_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No token passthrough (#1963): the pool request is unchanged by one.
+
+        A pool call made while an agent's OAuth access token is the request's
+        authenticated credential — exactly the context a ``creek.draft`` from a
+        connected agent runs in — must carry the identical request-scoped
+        header set as one made with no credential at all, and no
+        ``Authorization`` header. The token authenticates the call to the
+        vault and goes no further.
+        """
+        agent_jwt = mint()
+        pool = FakePool.serving(generation())
+        pool.pin(monkeypatch)
+        user = AuthenticatedUser(
+            AccessToken(
+                token=agent_jwt,
+                client_id="acct_91",
+                scopes=["creek:remote", "vault:desk"],
+            )
+        )
+        try:
+            with declared_pool_request("personal"):
+                PoolProvider(_config()).complete("prompt")
+            reset = auth_context_var.set(user)
+            try:
+                with declared_pool_request("personal"):
+                    PoolProvider(_config()).complete("prompt")
+            finally:
+                auth_context_var.reset(reset)
+        finally:
+            pool.close()
+
+        without, with_token = pool.headers
+        assert set(with_token) == set(without)
+        assert "authorization" not in with_token
+        assert all(agent_jwt not in value for value in with_token.values())
+        assert all(agent_jwt not in json.dumps(body) for body in pool.bodies)
 
     def test_an_intimate_tier_is_never_spelled_on_the_wire(
         self, monkeypatch: pytest.MonkeyPatch

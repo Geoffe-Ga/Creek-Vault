@@ -84,6 +84,8 @@ from creek_mcp.token_policy import require_min_length
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence, Set
 
+    from creek_mcp.oauth_resource import ResourceServerConfig
+
 CONSUMER_TOKENS_ENV: Final[str] = "CREEK_MCP_CONSUMER_TOKENS"
 """Env var holding ``consumer=token`` entries (tokens never in code).
 
@@ -128,10 +130,19 @@ _SETTLED_TOKEN_COUNT: Final[int] = 1
 # expires_at arithmetic is exact; production keeps wall-clock time.
 _now = time.time
 
-# Non-secret placeholder URLs — this is a self-hosted resource server using bearer
-# tokens, not an OAuth authorization-server flow, but AuthSettings requires them.
-_ISSUER_URL: Final[str] = "https://creek.invalid/mcp"
-_RESOURCE_URL: Final[str] = "https://creek.invalid/mcp"
+_UNSERVED_ISSUER_URL: Final[str] = "https://issuer.unconfigured.invalid"
+"""The SDK's required ``issuer_url`` on a bearer-only vault, and never served.
+
+:class:`~mcp.server.auth.settings.AuthSettings` will not validate without an
+issuer, but a vault with no ``CREEK_MCP_AUTHORIZATION_SERVER`` has none. The SDK
+reads the field in exactly two places — its authorization-server routes, which
+need an auth provider this package never passes, and its protected-resource
+metadata, which needs a ``resource_server_url`` this settings object leaves
+``None`` — so no response can carry it. That is the difference from the
+``creek.invalid`` placeholders it replaces (#1963), which *were* served: as the
+``resource_metadata`` of every ``401`` and as a metadata document naming a host
+that does not exist.
+"""
 
 
 def _token_ttl_seconds() -> int:
@@ -963,12 +974,39 @@ def announce_rotation_window(verifier: ConsumerTokenVerifier) -> None:
         print(notice, file=sys.stderr)
 
 
-def remote_auth_settings() -> AuthSettings:
-    """Return the :class:`AuthSettings` requiring the remote scope on every call."""
+def remote_auth_settings(
+    resource_server: ResourceServerConfig | None = None,
+) -> AuthSettings:
+    """Return the :class:`AuthSettings` requiring the remote scope on every call.
+
+    With a resource server configured (#1963) the SDK is handed the real
+    issuer and resource URLs, so its request-scoped ``get_access_token()`` and
+    its ``RequireAuthMiddleware`` behave exactly as for any OAuth resource
+    server. ``validate_token_resource`` is ``False`` because the audience is
+    checked where it can be checked strictly — in
+    :class:`~creek_mcp.agent_tokens.JwtAgentTokenVerifier`, against the JWT's
+    ``aud`` — and because the SDK's own check would refuse every static token,
+    which names no resource. Without one, no resource URL exists to publish and
+    the SDK publishes none.
+
+    Args:
+        resource_server: This vault's resource-server configuration, or
+            ``None`` on a bearer-only vault.
+
+    Returns:
+        The settings.
+    """
+    if resource_server is None:
+        return AuthSettings(
+            issuer_url=AnyHttpUrl(_UNSERVED_ISSUER_URL),
+            resource_server_url=None,
+            required_scopes=[REMOTE_SCOPE],
+        )
     return AuthSettings(
-        issuer_url=AnyHttpUrl(_ISSUER_URL),
-        resource_server_url=AnyHttpUrl(_RESOURCE_URL),
+        issuer_url=AnyHttpUrl(resource_server.authorization_server),
+        resource_server_url=AnyHttpUrl(resource_server.resource_url),
         required_scopes=[REMOTE_SCOPE],
+        validate_token_resource=False,
     )
 
 

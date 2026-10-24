@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
+from creek_mcp.agent_tokens import JwtAgentTokenVerifier
 from creek_mcp.httpapi.cli import serve
 from creek_mcp.httpapi.middleware.limits import (
     DEFAULT_MAX_BODY_BYTES,
@@ -20,9 +21,11 @@ from creek_mcp.httpapi.middleware.limits import (
     DEFAULT_TIMEOUT_SECONDS,
 )
 from creek_mcp.httpapi.routing import (
+    AgentRouting,
     build_fly_replay_routing_app,
     build_routing_app,
 )
+from creek_mcp.oauth_resource import ResourceServerConfig
 from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.fly import (
     FlyCredential,
@@ -175,7 +178,50 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=DEFAULT_MAX_CONCURRENCY,
     )
+    _add_oauth_arguments(parser)
+    parser.add_argument("--oauth-resource-url", default=None)
     return parser
+
+
+def _add_oauth_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the optional agent-token routing settings (#1963).
+
+    Without ``--oauth-authorization-server`` the replay router routes static
+    routing credentials only, exactly as before.
+
+    Args:
+        parser: The parser to extend.
+    """
+    parser.add_argument("--oauth-authorization-server", default=None)
+    parser.add_argument("--oauth-jwks-url", default=None)
+
+
+def agent_routing(
+    args: argparse.Namespace,
+    principals: EncryptedFileRoutingCredentialVerifier,
+) -> AgentRouting | None:
+    """Return the edge's agent-token route, or ``None`` when no issuer is set.
+
+    Args:
+        args: Parsed arguments carrying the ``--oauth-*`` settings.
+        principals: The bundle store that resolves a verified subject.
+
+    Returns:
+        The route, verifying tokens for ``--oauth-resource-url``.
+
+    Raises:
+        ValueError: When an issuer is set but the resource URL is missing or
+            any URL is unsafe.
+    """
+    issuer = args.oauth_authorization_server
+    if not issuer:
+        return None
+    config = ResourceServerConfig.build(
+        resource_url=args.oauth_resource_url or "",
+        authorization_server=issuer,
+        jwks_url=args.oauth_jwks_url,
+    )
+    return AgentRouting(JwtAgentTokenVerifier(config), principals)
 
 
 def compose(
@@ -338,6 +384,7 @@ def compose_replay(
             max_body_bytes=args.max_body_bytes,
             timeout_seconds=args.request_timeout_seconds,
             max_concurrency=args.max_concurrency,
+            agent=agent_routing(args, verifier),
         )
         return ReplayRoutingBundle(
             app,
