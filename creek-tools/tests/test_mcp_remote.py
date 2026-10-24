@@ -2299,32 +2299,34 @@ def test_remote_purge_with_valid_elevated_token_clears_both_gates(
 
 
 def test_remote_auth_settings_urls_are_parsed_pydantic_urls() -> None:
-    """``AuthSettings`` exposes both URLs as ``AnyHttpUrl``, not raw ``str``.
+    """``AuthSettings`` exposes its issuer as ``AnyHttpUrl``, not raw ``str``.
 
     This is the characterisation of the constructor's *existing* coercion: the
     module hands ``AuthSettings`` plain strings and pydantic validates them
     into ``AnyHttpUrl``. It pins the post-validation type so the typing sweep
     in #850 — which passes ``AnyHttpUrl`` in rather than ``str`` — cannot
-    change what the network auth path actually serves.
+    change what the network auth path actually serves. A bearer-only vault has
+    no resource URL to publish (#1963), so the SDK is handed none.
     """
     settings = remote_auth_settings()
 
     assert isinstance(settings.issuer_url, AnyHttpUrl)
-    assert isinstance(settings.resource_server_url, AnyHttpUrl)
+    assert settings.resource_server_url is None
 
 
-def test_remote_auth_settings_urls_keep_their_exact_spelling() -> None:
-    """Neither URL is rewritten — no trailing slash, no scheme or host change.
+def test_remote_auth_settings_serve_no_placeholder_url() -> None:
+    """The retired ``creek.invalid`` placeholders are gone (#1963).
 
-    pydantic's URL types normalise a bare host by appending ``/``. Both of
-    these carry a path, so the round-trip is byte-identical; asserting the
-    exact string is what would catch a normalisation change slipping in with
-    a type change.
+    They were served: as the ``resource_metadata`` of every ``401`` and as a
+    metadata document naming a host that does not exist. A bearer-only vault
+    now has no ``resource_server_url`` at all, so the SDK publishes neither;
+    its required ``issuer_url`` is a sentinel that no response can carry.
     """
     settings = remote_auth_settings()
 
-    assert str(settings.issuer_url) == "https://creek.invalid/mcp"
-    assert str(settings.resource_server_url) == "https://creek.invalid/mcp"
+    assert "creek.invalid/mcp" not in settings.model_dump_json()
+    assert settings.resource_server_url is None
+    assert str(settings.issuer_url) == "https://issuer.unconfigured.invalid/"
 
 
 def test_remote_auth_settings_requires_only_the_remote_scope() -> None:

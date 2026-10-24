@@ -28,6 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from creek.care.guardrail import acute_distress_guard
 from creek.classify.llm.pool_boundary import declared_pool_request
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
+from creek_mcp.agent_tokens import JwtAgentTokenVerifier, mcp_token_verifier
 from creek_mcp.audit import AUDIT_OUTCOME_REFUSED, MCPAuditLog
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.model_pin import (
@@ -35,6 +36,11 @@ from creek_mcp.model_pin import (
     pin_refuses_stage,
     provider_may_serve,
     request_key_admitted,
+)
+from creek_mcp.oauth_resource import (
+    ProtectedResourceMetadataMiddleware,
+    ResourceChallengeMiddleware,
+    load_resource_server_config,
 )
 from creek_mcp.policy import (
     Admission,
@@ -89,6 +95,7 @@ from creek_mcp.tools import (
     wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.handshake import AuthMode
 from creek_mcp.tools.reflect import GroundingSession
 from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
@@ -100,6 +107,7 @@ if TYPE_CHECKING:
     from mcp.server.auth.settings import AuthSettings
     from mcp.types import ContentBlock
     from mcp.types import Tool as MCPTool
+    from starlette.applications import Starlette
     from starlette.types import ASGIApp
 
     from creek.author.client import AuthorLLMClient
@@ -109,6 +117,7 @@ if TYPE_CHECKING:
     from creek.compile.engine import CompileLLM
     from creek.config import LLMConfig
     from creek.models import PrivacyTier
+    from creek_mcp.oauth_resource import ResourceServerConfig
     from creek_mcp.tools.author import AuthorLLMFactory
     from creek_mcp.tools.compile import CompileLLMFactory
     from creek_mcp.tools.draft import DraftLLMFactory
@@ -227,6 +236,7 @@ class _BoundedFastMCP(FastMCP):
         consumer: str,
         token_verifier: TokenVerifier | None = None,
         auth: AuthSettings | None = None,
+        resource_server: ResourceServerConfig | None = None,
     ) -> None:
         """Build the adapter over *vault*, auditing refusals there.
 
@@ -240,10 +250,40 @@ class _BoundedFastMCP(FastMCP):
             token_verifier: The bearer verifier for the network transport, or
                 ``None`` for stdio.
             auth: The SDK auth settings that accompany *token_verifier*.
+            resource_server: This vault's OAuth resource-server configuration
+                (#1963), or ``None`` on a bearer-only or local server.
         """
         super().__init__(name, token_verifier=token_verifier, auth=auth)
         self._audit_vault = vault
         self._audit_consumer = consumer
+        self._resource_server = resource_server
+
+    def streamable_http_app(self) -> Starlette:
+        """Return the SDK's streamable-HTTP app, publishing this resource (#1963).
+
+        With a resource server configured, two layers go on the outside of the
+        SDK's app.
+        :class:`~creek_mcp.oauth_resource.ProtectedResourceMetadataMiddleware`
+        answers the RFC 9728 paths with this vault's document — shadowing the
+        SDK's own, which would advertise ``creek:remote`` as the only scope and
+        re-spell the issuer with a trailing slash — and
+        :class:`~creek_mcp.oauth_resource.ResourceChallengeMiddleware` replaces
+        the SDK's ``401``/``403`` challenge with one that also names the scope
+        to request. Both the standalone network server and the ``/mcp`` mount
+        build their app here, so both get the same answers.
+
+        Returns:
+            The app.
+        """
+        app = super().streamable_http_app()
+        if self._resource_server is not None:
+            app.add_middleware(
+                ResourceChallengeMiddleware, config=self._resource_server
+            )
+            app.add_middleware(
+                ProtectedResourceMetadataMiddleware, config=self._resource_server
+            )
+        return app
 
     async def list_tools(self) -> list[MCPTool]:
         """List only the tools the caller in flight is admitted to (#1964).
@@ -803,6 +843,7 @@ def build_server(
     compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
     token_verifier: TokenVerifier | None = None,
+    resource_server: ResourceServerConfig | None = None,
 ) -> FastMCP:
     """Construct a :class:`FastMCP` instance with all FEAT-010/011 tools.
 
@@ -839,13 +880,22 @@ def build_server(
             verifier accepts (no anonymous access), and remote calls are
             capped below INTIMATE. ``None`` (the default) is the local stdio
             server, unauthenticated as before.
+        resource_server: This vault's OAuth resource-server configuration
+            (#1963): the SDK is given its real issuer and resource URLs, the
+            served app publishes its RFC 9728 metadata and challenge, and the
+            handshake reports ``oauth``. *token_verifier* is then expected to
+            accept the issuer's JWTs —
+            :func:`creek_mcp.agent_tokens.mcp_token_verifier` builds it.
 
     Raises:
         ValueError: When a ``token_verifier`` is supplied for a non-network
             *transport*. The two are asserted separately, so they can disagree;
             a server that authenticates remote consumers while telling them it
             is on stdio is precisely the defect #1583 fixed, and it is refused
-            here rather than served.
+            here rather than served. Also when a *resource_server* is supplied
+            without a *token_verifier*: metadata inviting clients to sign in to
+            a server that authenticates nobody is the same kind of
+            misdescription.
     """
     if token_verifier is not None and not transport.is_remote:
         # A verifier is only ever wired up for the authenticated network
@@ -857,6 +907,12 @@ def build_server(
             f"token_verifier is only served on {Transport.NETWORK.value!r}; "
             f"refusing to build a {transport.value!r} server that would tell "
             "an authenticated consumer it is local"
+        )
+        raise ValueError(msg)
+    if resource_server is not None and token_verifier is None:
+        msg = (
+            "resource_server is only served behind a token_verifier; refusing "
+            "to publish OAuth metadata for a server that authenticates nobody"
         )
         raise ValueError(msg)
     # Wrapped, never used bare (#1100). ``token_verifier`` is an arbitrary
@@ -875,7 +931,8 @@ def build_server(
             vault=vault,
             consumer=consumer,
             token_verifier=named,
-            auth=remote_auth_settings(),
+            auth=remote_auth_settings(resource_server),
+            resource_server=resource_server,
         )
         if named is not None
         else _BoundedFastMCP(SERVER_NAME, vault=vault, consumer=consumer)
@@ -897,6 +954,7 @@ def build_server(
         vault=vault,
         consumer=consumer,
         transport=transport,
+        auth=_auth_mode(named, resource_server),
         reflect_factory=reflect_factory,
         grounding_session=GroundingSession(),
     )
@@ -918,12 +976,31 @@ def build_server(
     return server
 
 
+def _auth_mode(
+    verifier: TokenVerifier | None, resource_server: ResourceServerConfig | None
+) -> AuthMode:
+    """Return how this server's callers authenticate, for the handshake (#1963).
+
+    Args:
+        verifier: The wired verifier, or ``None`` for stdio.
+        resource_server: The OAuth configuration, or ``None``.
+
+    Returns:
+        ``oauth`` with an issuer configured, ``bearer`` with static tokens
+        only, ``none`` for the unauthenticated local server.
+    """
+    if resource_server is not None:
+        return AuthMode.OAUTH
+    return AuthMode.NONE if verifier is None else AuthMode.BEARER
+
+
 def _register_conversation_tools(
     server: FastMCP,
     *,
     vault: Path,
     consumer: str,
     transport: Transport,
+    auth: AuthMode,
     reflect_factory: Callable[[], _LLMFactory],
     grounding_session: GroundingSession,
 ) -> None:
@@ -948,6 +1025,8 @@ def _register_conversation_tools(
             handshake used to answer from a module-level ``"stdio"``
             literal (#1583). It is threaded explicitly rather than
             re-derived so it cannot be dropped silently.
+        auth: How this server's callers authenticate, which
+            ``creek.handshake`` publishes (#1963).
         reflect_factory: Thunk returning the tier-keyed LLM factory for
             ``creek.reflect``. Invoked lazily per call.
         grounding_session: The server-scoped :class:`GroundingSession` whose
@@ -968,6 +1047,7 @@ def _register_conversation_tools(
             capabilities=sorted(tool.name for tool in tools),
             server_name=SERVER_NAME,
             transport=transport,
+            auth=auth,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
@@ -1643,13 +1723,50 @@ def _require_strong_elevated_token(parser: argparse.ArgumentParser) -> None:
         parser.error(str(exc))
 
 
+def _network_credentials(
+    parser: argparse.ArgumentParser,
+) -> tuple[ConsumerTokenVerifier, ResourceServerConfig | None]:
+    """Read the network transport's credentials, or exit naming what to fix.
+
+    Args:
+        parser: The CLI parser, used to report errors in argparse style.
+
+    Returns:
+        The static registry's verifier and, when ``CREEK_MCP_RESOURCE_URL``
+        and ``CREEK_MCP_AUTHORIZATION_SERVER`` are set, the resource-server
+        configuration (#1963).
+    """
+    try:
+        tokens = load_consumer_tokens()
+        grants = load_consumer_grants()
+        resource_server = load_resource_server_config()
+    except ValueError as exc:
+        # An unreadable consumer-token configuration: a token below the
+        # minimum-strength floor (#838), a consumer named twice, one token
+        # value configured for two consumers (#895), or an unreadable grant
+        # suffix (#1964) — or a half-configured or unsafe resource server
+        # (#1963). Exit naming the setting to fix rather than serve a weak or
+        # ambiguous registry; no such message ever carries a token value.
+        parser.error(str(exc))
+    if not tokens and resource_server is None:
+        # No anonymous access: refuse to expose the vault without per-consumer
+        # tokens or an issuer, rather than serving unauthenticated. An OAuth
+        # vault needs no static consumer: an agent's JWT is the credential.
+        parser.error(
+            f"network transport requires {CONSUMER_TOKENS_ENV} "
+            "(consumer=token pairs); refusing to serve without authentication"
+        )
+    return ConsumerTokenVerifier(tokens, grants=grants), resource_server
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the MCP server over stdio (local) or the authenticated network transport.
 
     Startup is fail-closed four times over. On *every* transport it refuses
     an elevated token below the minimum-strength floor (#907). The network
-    branch additionally refuses to start without per-consumer tokens (no
-    anonymous access), refuses a consumer-token configuration the parser
+    branch additionally refuses to start without per-consumer tokens or a
+    configured issuer (no anonymous access), refuses a half-configured OAuth
+    resource server (#1963), refuses a consumer-token configuration the parser
     cannot read unambiguously — a token below the same floor (#838), a
     consumer named twice, a token value shared by two consumers (#895) — and
     refuses a non-loopback bind unless TLS is configured (no cleartext bearer
@@ -1676,33 +1793,22 @@ def main(argv: list[str] | None = None) -> None:
     _require_strong_elevated_token(parser)
 
     if args.transport is Transport.NETWORK:
-        try:
-            tokens = load_consumer_tokens()
-            grants = load_consumer_grants()
-        except ValueError as exc:
-            # An unreadable consumer-token configuration: a token below the
-            # minimum-strength floor (#838), a consumer named twice, one token
-            # value configured for two consumers (#895), or an unreadable grant
-            # suffix (#1964). Exit naming the
-            # setting to fix rather than serve a weak or ambiguous registry;
-            # no such message ever carries a token value.
-            parser.error(str(exc))
-        if not tokens:
-            # No anonymous access: refuse to expose the vault without per-consumer
-            # tokens, rather than serving unauthenticated.
-            parser.error(
-                f"network transport requires {CONSUMER_TOKENS_ENV} "
-                "(consumer=token pairs); refusing to serve without authentication"
-            )
+        verifier, resource_server = _network_credentials(parser)
         _require_transport_confidentiality(parser, args)
-        verifier = ConsumerTokenVerifier(tokens, grants=grants)
         # A rotation window has to be closed again, and an operator who cannot
         # see one is open will not close it (#895). On stderr: stdout on this
         # entry point belongs to the stdio transport's JSON-RPC framing. An
         # ungated consumer is announced for the same reason (#1964).
         announce_rotation_window(verifier)
         announce_ungated_consumers(verifier)
-        server = build_server(transport=args.transport, token_verifier=verifier)
+        agent = (
+            None if resource_server is None else JwtAgentTokenVerifier(resource_server)
+        )
+        server = build_server(
+            transport=args.transport,
+            token_verifier=mcp_token_verifier(verifier, agent),
+            resource_server=resource_server,
+        )
         server.settings.host = args.host
         server.settings.port = args.port
         _serve_network(server, args)

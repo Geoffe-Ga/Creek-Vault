@@ -9,6 +9,14 @@ or command line.
 A machine carrying the managed-vault marker (#1863) is local-only by
 construction: it refuses to start while cloud consent is set, and pins consent
 off for as long as it serves.
+
+When the control plane writes ``CREEK_MCP_RESOURCE_URL`` and
+``CREEK_MCP_AUTHORIZATION_SERVER`` (#1963) — both non-secret — the served
+``/mcp`` is also an OAuth resource server for agents the person connected
+through Adepthood. On a managed vault the accepted JWT subject is pinned to the
+one consumer identity the mounted secret names, which is the same identity
+Adepthood puts in ``sub``: a managed Machine serves one person and accepts no
+one else's token.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from creek.config import (
 from creek.scaffold import deploy_canonical
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.cli import DEFAULT_API_PORT, serve
+from creek_mcp.oauth_resource import load_resource_server_config
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
@@ -52,6 +61,8 @@ from creek_mcp.remote_auth import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
+    from creek_mcp.oauth_resource import ResourceServerConfig
     from creek_mcp.policy import Grant
 
 VAULT_PATH_ENV: Final[str] = "CREEK_CONTAINER_VAULT_PATH"
@@ -169,6 +180,7 @@ class ContainerSettings:
     mountinfo_file: Path = _DEFAULT_MOUNTINFO
     network: ContainerNetwork = field(default_factory=ContainerNetwork)
     managed: bool = False
+    resource_server: ResourceServerConfig | None = None
 
     @property
     def host(self) -> str:
@@ -204,6 +216,7 @@ class ContainerSettings:
         config_value = source.get(CONFIG_FILE_ENV)
         config = Path(config_value) if config_value else vault / VAULT_CONFIG_RELPATH
         port = _parse_port(source.get(PORT_ENV, str(DEFAULT_API_PORT)))
+        resource_server = _resource_server(source)
         return cls(
             vault_path=vault,
             config_path=config,
@@ -217,11 +230,54 @@ class ContainerSettings:
             ),
             network=ContainerNetwork(port=port),
             managed=managed,
+            resource_server=resource_server,
         )
 
     def with_config_path(self, path: Path) -> ContainerSettings:
         """Return a copy using *path*, primarily for explicit-mount tests."""
         return replace(self, config_path=path)
+
+
+def _resource_server(source: Mapping[str, str]) -> ResourceServerConfig | None:
+    """Return the OAuth resource-server settings, or refuse a broken pair.
+
+    Args:
+        source: The container environment.
+
+    Returns:
+        The configuration, or ``None`` when neither setting is present.
+
+    Raises:
+        ContainerConfigurationError: When the pair is half-set or a URL is
+            unsafe. The message names the settings, never their values.
+    """
+    try:
+        return load_resource_server_config(source)
+    except ValueError as exc:
+        raise ContainerConfigurationError(str(exc)) from None
+
+
+def agent_verifier_for(
+    settings: ContainerSettings, secret: SingleConsumerSecret
+) -> JwtAgentTokenVerifier | None:
+    """Return the agent-token verifier this container serves ``/mcp`` behind.
+
+    Args:
+        settings: The container settings.
+        secret: The mounted single-consumer registry.
+
+    Returns:
+        ``None`` without a resource server; otherwise a verifier for it, whose
+        subject is pinned to *secret*'s consumer identity on a managed vault.
+    """
+    if settings.resource_server is None:
+        return None
+    # Lazy: this module is the root-time bootstrap baseline, and PyJWT brings
+    # the x509 stack with it (tests/test_pool_admin_key_custody.py).
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
+
+    pin = secret.consumer if settings.managed else None
+    return JwtAgentTokenVerifier(settings.resource_server, expected_subject=pin)
 
 
 def _parse_port(raw: str) -> int:
@@ -384,7 +440,9 @@ def run(settings: ContainerSettings) -> None:
     announce_ungated_consumers(verifier)
     with managed_local_only() if settings.managed else nullcontext():
         serve(
-            create_app(verifier=verifier),
+            create_app(
+                verifier=verifier, agent_verifier=agent_verifier_for(settings, secret)
+            ),
             _server_args(settings, prepared.config_path),
         )
 

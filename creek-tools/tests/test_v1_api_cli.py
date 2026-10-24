@@ -601,3 +601,64 @@ def test_the_mcp_server_still_exposes_its_posture_aliases() -> None:
     assert server_mod._is_loopback("127.0.0.1") is True
     assert server_mod._is_loopback("example.com") is False
     assert callable(server_mod._require_transport_confidentiality)
+
+
+# --------------------------------------------------------------------------- #
+# OAuth resource server (#1963)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_api_serves_oauth_metadata_when_an_issuer_is_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The two settings turn ``/mcp`` on this app into a resource server.
+
+    Args:
+        monkeypatch: Configures tokens and settings, and stubs the serve loop.
+        tmp_path: Pytest's per-test directory.
+    """
+    from starlette.testclient import TestClient
+
+    from creek_mcp.mcp_path import PROTECTED_RESOURCE_PATH
+    from creek_mcp.oauth_resource import AUTHORIZATION_SERVER_ENV, RESOURCE_URL_ENV
+    from tests.v1_api_support import seed_vault
+
+    vault = seed_vault(tmp_path)
+    _configure_tokens(monkeypatch, _gated_tokens())
+    monkeypatch.setenv(RESOURCE_URL_ENV, "https://vault.example/mcp")
+    monkeypatch.setenv(AUTHORIZATION_SERVER_ENV, "https://api.adepthood.example")
+    monkeypatch.setattr(
+        "creek_mcp.httpapi.app.resolve_vault", lambda _path: vault, raising=True
+    )
+    recorder = _stub_serve(monkeypatch)
+
+    main([])
+
+    (app, _args) = recorder.calls[0]
+    with TestClient(app) as client:
+        metadata = client.get(PROTECTED_RESOURCE_PATH)
+    assert metadata.json()["resource"] == "https://vault.example/mcp"
+    assert metadata.json()["authorization_servers"] == ["https://api.adepthood.example"]
+
+
+def test_the_api_refuses_a_half_configured_resource_server(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One setting alone exits before serving, naming both settings.
+
+    Args:
+        monkeypatch: Configures tokens and settings, and stubs the serve loop.
+        capsys: Pytest's output capture.
+    """
+    from creek_mcp.oauth_resource import AUTHORIZATION_SERVER_ENV, RESOURCE_URL_ENV
+
+    _configure_tokens(monkeypatch, _gated_tokens())
+    monkeypatch.setenv(RESOURCE_URL_ENV, "https://vault.example/mcp")
+    monkeypatch.delenv(AUTHORIZATION_SERVER_ENV, raising=False)
+    recorder = _stub_serve(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        main([])
+
+    assert recorder.calls == []
+    assert AUTHORIZATION_SERVER_ENV in capsys.readouterr().err

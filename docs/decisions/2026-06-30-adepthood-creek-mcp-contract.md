@@ -221,6 +221,7 @@ which.
   "tier_ceiling": "open",
   "server": "creek-tools-mcp",
   "transport": "stdio",
+  "auth": "none",
   "available": true,
   "contract_version": "0.21.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
@@ -246,6 +247,13 @@ It answers "which channel am I on?", which is not the same question as "am I
 capped?": the cap is decided per call from `CallerIdentity.is_remote`, asserted
 by the adapter, and a consumer that wants to know what it may request should
 read `tier_model.ceilings` above rather than infer it from this field.
+
+`auth` (#1963) names how this server's callers authenticate: `oauth` when the
+vault is an OAuth 2.1 resource server for an issuer (`CREEK_MCP_RESOURCE_URL`
+and `CREEK_MCP_AUTHORIZATION_SERVER` set; agents present Adepthood-issued JWTs
+whose audience is this vault's MCP URL, and static consumer tokens keep
+working beside them), `bearer` when only static consumer tokens are accepted,
+and `none` on the local `stdio` server, which authenticates nobody.
 
 ### Journal entry — `creek.journal`
 

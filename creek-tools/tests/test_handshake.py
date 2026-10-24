@@ -20,7 +20,12 @@ from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.policy import REMOTE_ADMITTED_CEILINGS, Transport
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools import handshake as handshake_module
-from creek_mcp.tools.handshake import CREEK_MARKER, TOOL_NAME, handshake_tool
+from creek_mcp.tools.handshake import (
+    CREEK_MARKER,
+    TOOL_NAME,
+    AuthMode,
+    handshake_tool,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -52,6 +57,7 @@ def _call(vault: Path, **overrides: object) -> dict[str, object]:
         "capabilities": _CAPS,
         "server_name": _SERVER,
         "transport": Transport.STDIO,
+        "auth": AuthMode.NONE,
     }
     kwargs.update(overrides)
     return handshake_tool(**kwargs)  # type: ignore[arg-type]
@@ -304,4 +310,35 @@ def test_the_transport_argument_has_no_default(tmp_path: Path) -> None:
             vault_path=_vault(tmp_path, creek=True),
             capabilities=_CAPS,
             server_name=_SERVER,
+            auth=AuthMode.NONE,
+        )
+
+
+@pytest.mark.parametrize("mode", list(AuthMode))
+def test_the_handshake_reports_how_callers_authenticate(
+    tmp_path: Path, mode: AuthMode
+) -> None:
+    """``auth`` is the wire value of the mode ``build_server`` states (#1963).
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        mode: An authentication mode.
+    """
+    result = _call(_vault(tmp_path, creek=True), auth=mode)
+
+    assert result["auth"] == mode.value
+    assert {member.value for member in AuthMode} == {"oauth", "bearer", "none"}
+
+
+def test_the_auth_argument_has_no_default(tmp_path: Path) -> None:
+    """Like ``transport``, the scheme is stated by the caller, never guessed."""
+    parameter = inspect.signature(handshake_tool).parameters["auth"]
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError, match="auth"):
+        handshake_tool(  # type: ignore[call-arg]
+            vault_path=_vault(tmp_path, creek=True),
+            capabilities=_CAPS,
+            server_name=_SERVER,
+            transport=Transport.NETWORK,
         )

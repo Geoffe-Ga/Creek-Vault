@@ -21,6 +21,7 @@ from creek.config import CONFIG_PATH_ENV_VAR
 from creek_mcp.container_runtime import (
     ContainerConfigurationError,
     ContainerSettings,
+    agent_verifier_for,
     load_consumer_secret,
     prepare_vault,
     require_local_only,
@@ -139,7 +140,11 @@ def run(settings: FlyVaultSettings) -> None:
         announce_rotation_window(verifier)
         announce_ungated_consumers(verifier)
         serve(
-            create_app(verifier=verifier, fly_replay_state=replay_state),
+            create_app(
+                verifier=verifier,
+                fly_replay_state=replay_state,
+                agent_verifier=agent_verifier_for(settings.container, secret),
+            ),
             args,
         )
 

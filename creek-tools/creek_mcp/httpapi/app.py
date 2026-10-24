@@ -129,6 +129,7 @@ from creek_mcp.httpapi.middleware.limits import (
     RequestTimeoutMiddleware,
 )
 from creek_mcp.httpapi.vault import resolve_vault
+from creek_mcp.oauth_resource import ProtectedResourceMetadataMiddleware
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -140,6 +141,7 @@ if TYPE_CHECKING:
     from starlette.responses import Response
     from starlette.types import ASGIApp, ExceptionHandler
 
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
     from creek_mcp.api.routes import RouteSpec
     from creek_mcp.httpapi.context import RequestContext
     from creek_mcp.httpapi.handlers import Handler
@@ -474,6 +476,7 @@ def _middleware(
     max_per_consumer: int,
     fly_replay_state: str | None,
     mcp_app: ASGIApp | None,
+    agent_verifier: JwtAgentTokenVerifier | None = None,
 ) -> list[Middleware]:
     """Return the ordinary eight layers plus the ``/mcp`` mount and Fly guard.
 
@@ -498,6 +501,11 @@ def _middleware(
             ``/mcp`` as well as ``/v1``.
         mcp_app: The SDK's streamable-HTTP app to serve at ``/mcp``, or
             ``None`` when no vault could be resolved to bind it to.
+        agent_verifier: The OAuth agent-token verifier, or ``None``. When set
+            and ``/mcp`` is mounted, the RFC 9728 metadata is answered right
+            above the mount (#1963) — below the access log and the error
+            boundary, above every ``/v1`` layer, because a client reads it
+            before it holds any credential the bearer gate could accept.
 
     Returns:
         The middleware stack.
@@ -506,6 +514,12 @@ def _middleware(
         Middleware(AccessLogMiddleware),
         Middleware(ErrorBoundaryMiddleware),
     ]
+    if mcp_app is not None and agent_verifier is not None:
+        layers.append(
+            Middleware(
+                ProtectedResourceMetadataMiddleware, config=agent_verifier.config
+            )
+        )
     if mcp_app is not None:
         layers.append(
             Middleware(
@@ -545,6 +559,7 @@ def _middleware(
 def _mcp_server_for(
     vault_path: Path | None,
     verifier: ConsumerTokenVerifier,
+    agent_verifier: JwtAgentTokenVerifier | None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None,
 ) -> FastMCP | None:
     """Return the MCP server for ``/mcp``, or ``None`` when no vault resolves.
@@ -552,6 +567,7 @@ def _mcp_server_for(
     Args:
         vault_path: The explicitly configured vault, or ``None``.
         verifier: The ``/v1`` app's verifier instance.
+        agent_verifier: The OAuth agent-token verifier, or ``None``.
         reflect_llm_factory: The ``/v1`` app's reflection thunk.
 
     Returns:
@@ -562,7 +578,10 @@ def _mcp_server_for(
         warn_not_mounted()
         return None
     return build_mcp_server(
-        vault_path=served, verifier=verifier, reflect_llm_factory=reflect_llm_factory
+        vault_path=served,
+        verifier=verifier,
+        agent_verifier=agent_verifier,
+        reflect_llm_factory=reflect_llm_factory,
     )
 
 
@@ -577,6 +596,7 @@ def create_app(
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
     letter_llm_factory: Callable[[], LetterLLMFactory] | None = None,
     fly_replay_state: str | None = None,
+    agent_verifier: JwtAgentTokenVerifier | None = None,
 ) -> Starlette:
     """Build the ``/v1`` application, with the MCP surface mounted at ``/mcp``.
 
@@ -618,6 +638,11 @@ def create_app(
             only once a letter has passed every gate.
         fly_replay_state: Exact mounted Fly replay state, or ``None`` off Fly.
             Required on ``/v1`` and ``/mcp`` alike.
+        agent_verifier: The OAuth agent-token verifier (#1963), or ``None``
+            for a bearer-only vault. When set, ``/mcp`` also accepts the
+            issuer's JWTs for this vault — composed with *verifier*, so static
+            tokens keep working — and the vault publishes its RFC 9728
+            metadata. ``/v1`` is unaffected: it stays the static registry's.
 
     Returns:
         The configured application.
@@ -630,7 +655,9 @@ def create_app(
             notices.
     """
     configured_verifier = verifier if verifier is not None else build_verifier()
-    mcp_server = _mcp_server_for(vault_path, configured_verifier, reflect_llm_factory)
+    mcp_server = _mcp_server_for(
+        vault_path, configured_verifier, agent_verifier, reflect_llm_factory
+    )
     app = Starlette(
         routes=[_route_for(spec) for spec in ROUTES],
         middleware=_middleware(
@@ -641,6 +668,7 @@ def create_app(
             max_per_consumer,
             fly_replay_state,
             None if mcp_server is None else mcp_server.streamable_http_app(),
+            agent_verifier,
         ),
         exception_handlers=routing_exception_handlers(),
         lifespan=None if mcp_server is None else mcp_lifespan(mcp_server),
