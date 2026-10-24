@@ -120,9 +120,10 @@ _BOOTSTRAP_BARE_LOAD_CONFIG: Final[dict[tuple[str, str], str]] = {
     "before any vault is known, so scoping it to a vault would be circular.",
     (
         "creek_mcp.httpapi.vault",
-        "configured_vault",
+        "resolve_vault",
     ): "Bootstrap: the HTTP surface's equivalent of _resolve_vault, resolving "
-    "app.state.vault_path's fallback. Same circularity.",
+    "app.state.vault_path's fallback (per /v1 request, and once for /mcp at "
+    "build). Same circularity.",
     (
         "creek.cli",
         "_gdrive_revoke",

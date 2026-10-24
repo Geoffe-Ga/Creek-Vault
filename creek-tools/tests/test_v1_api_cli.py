@@ -119,6 +119,16 @@ def _valid_tokens() -> str:
     return f"{CONSUMER}={STRONG_TOKEN}"
 
 
+def _gated_tokens() -> str:
+    """Return a well-formed, grant-suffixed ``CREEK_MCP_CONSUMER_TOKENS`` value.
+
+    Returns:
+        The :func:`_valid_tokens` pair, gated to the default profile (#1964), so
+        nothing about it is announced at startup.
+    """
+    return f"{_valid_tokens()}@vault:read+vault:desk"
+
+
 # 44 chars each. Low-entropy test literals, not real credentials.
 _ROTATION_TOKEN_A: Final[str] = "api-test-rotation-token-" + "e" * 20
 _ROTATION_TOKEN_B: Final[str] = "api-test-rotation-token-" + "f" * 20
@@ -486,8 +496,33 @@ def test_serving_without_a_rotation_window_announces_nothing(
 ) -> None:
     """Steady state is silent, so the notice means something when it appears.
 
+    Steady state is one token per consumer *and* every consumer gated: this
+    entry point also serves ``/mcp`` (#1962), so an ungated consumer is named
+    at start exactly as ``creek-tools-mcp --transport network`` names it.
+
     Args:
-        monkeypatch: Configures one token per consumer and stubs the serve loop.
+        monkeypatch: Configures one gated token per consumer and stubs serving.
+        capsys: Captures both streams.
+    """
+    _configure_tokens(monkeypatch, _gated_tokens())
+    recorder = _stub_serve(monkeypatch)
+    main(["--host", "127.0.0.1"])
+    captured = capsys.readouterr()
+
+    assert len(recorder.calls) == 1
+    assert captured.err == ""
+
+
+def test_serving_an_ungated_consumer_announces_it_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``creek-tools-api`` serves ``/mcp`` too, so it names an ungated consumer.
+
+    Compared against the verifier's own ``ungated_notice()``, so this entry
+    point emits the shared wording rather than a second one.
+
+    Args:
+        monkeypatch: Configures an ungated consumer and stubs the serve loop.
         capsys: Captures both streams.
     """
     _configure_tokens(monkeypatch, _valid_tokens())
@@ -495,8 +530,12 @@ def test_serving_without_a_rotation_window_announces_nothing(
     main(["--host", "127.0.0.1"])
     captured = capsys.readouterr()
 
+    expected = build_verifier({CONSUMER_TOKENS_ENV: _valid_tokens()}).ungated_notice()
     assert len(recorder.calls) == 1
-    assert captured.err == ""
+    assert expected is not None
+    assert expected in captured.err
+    assert STRONG_TOKEN not in captured.err
+    assert captured.out == ""
 
 
 def test_print_openapi_stdout_stays_pure_json_during_a_rotation_window(
