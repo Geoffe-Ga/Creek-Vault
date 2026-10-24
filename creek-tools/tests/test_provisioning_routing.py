@@ -622,3 +622,106 @@ def test_private_target_type_refuses_public_or_caller_shaped_destinations() -> N
     ):
         with pytest.raises(ValueError, match="private HTTPS origin"):
             PrivateVaultTarget(url)
+
+
+class _McpReplayProvider:
+    """Return one checked replay target and count preparations."""
+
+    def __init__(self) -> None:
+        """Start with no preparations recorded."""
+        self.calls = 0
+
+    def prepare_replay(self, allocation: RoutableAllocation) -> FlyReplayTarget:
+        """Return the owning vault's replay coordinates."""
+        del allocation
+        self.calls += 1
+        return FlyReplayTarget("creek-vault-a1b2", "0" * 14)
+
+
+@pytest.mark.parametrize("method", ["POST", "GET", "DELETE"])
+def test_mcp_is_replayed_to_the_owning_vault_without_v1_headers(
+    tmp_path: Path, method: str
+) -> None:
+    """An MCP request needs only the bearer to reach its vault through the edge (#1962).
+
+    No contract-version or ceiling header: MCP negotiates its own protocol
+    version and carries the ceiling as a tool argument, so the router must not
+    demand ``/v1``'s headers before replaying.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+        method: One of the three verbs streamable-HTTP uses.
+    """
+    store = ProvisioningStore(tmp_path / "routing.sqlite3")
+    _ready_allocation(store)
+    provider = _McpReplayProvider()
+    verifier = FakeRoutingVerifier(RoutingPrincipal("adepthood", "user-001", "s" * 64))
+    client = TestClient(build_fly_replay_routing_app(store, verifier, provider))
+
+    response = client.request(
+        method,
+        "/mcp",
+        headers={
+            "Authorization": f"Bearer {_TOKEN}",
+            "Accept": "application/json, text/event-stream",
+        },
+        content=b'{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+        if method == "POST"
+        else None,
+    )
+
+    assert response.status_code == 307
+    assert response.content == b""
+    assert response.headers["Fly-Replay"] == (
+        f"app=creek-vault-a1b2;instance={'0' * 14};state={'s' * 64}"
+    )
+    assert provider.calls == 1
+
+
+def test_mcp_without_a_routing_credential_is_refused_before_any_target(
+    tmp_path: Path,
+) -> None:
+    """No bearer, no replay: the edge never names a vault to an anonymous caller.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    store = ProvisioningStore(tmp_path / "routing.sqlite3")
+    _ready_allocation(store)
+    provider = _McpReplayProvider()
+    verifier = FakeRoutingVerifier(RoutingPrincipal("adepthood", "user-001", "s" * 64))
+    client = TestClient(build_fly_replay_routing_app(store, verifier, provider))
+
+    anonymous = client.post("/mcp", content=b"{}")
+    wrong = client.post(
+        "/mcp", headers={"Authorization": f"Bearer {_OTHER_TOKEN}"}, content=b"{}"
+    )
+
+    for response in (anonymous, wrong):
+        assert response.status_code == 401
+        assert "Fly-Replay" not in response.headers
+        assert "creek-vault" not in response.text
+    assert provider.calls == 0
+
+
+def test_paths_beneath_mcp_are_a_routing_miss_at_the_replay_router(
+    tmp_path: Path,
+) -> None:
+    """Only ``/mcp`` itself is replayed; the subtree gets the published miss.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    store = ProvisioningStore(tmp_path / "routing.sqlite3")
+    _ready_allocation(store)
+    provider = _McpReplayProvider()
+    verifier = FakeRoutingVerifier(RoutingPrincipal("adepthood", "user-001", "s" * 64))
+    client = TestClient(build_fly_replay_routing_app(store, verifier, provider))
+
+    response = client.post(
+        "/mcp/extra", headers={"Authorization": f"Bearer {_TOKEN}"}, content=b"{}"
+    )
+
+    assert response.status_code == 404
+    assert "Fly-Replay" not in response.headers
+    assert provider.calls == 0
