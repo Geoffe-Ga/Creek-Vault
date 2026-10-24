@@ -755,3 +755,179 @@ def test_jwt_module_rejects_none_by_default() -> None:
             algorithms=list(ACCEPTED_ALGORITHMS),
             key=rsa_key().private_key.public_key(),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Key rotation at the issuer (#1965)
+# --------------------------------------------------------------------------- #
+
+_NEXT_KID: Final[str] = "rsa-2026-11"
+"""The key id the issuer rotates onto."""
+
+
+def _rotating(document: object) -> tuple[StaticJwks, FakeClock, Any]:
+    """Return an issuer fixture, a clock, and a verifier caching its keys.
+
+    Args:
+        document: The key set the issuer publishes first.
+
+    Returns:
+        ``(fetcher, clock, verifier)``.
+    """
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
+
+    fetcher = StaticJwks(document)
+    clock = FakeClock()
+    verifier = JwtAgentTokenVerifier(
+        resource_config(), keys=JwksCache(fetcher, clock=clock)
+    )
+    return fetcher, clock, verifier
+
+
+def test_a_token_signed_by_a_rotated_in_key_is_accepted() -> None:
+    """The issuer publishes a new key and signs with it; no restart, no TTL wait."""
+    fetcher, clock, verifier = _rotating(jwks(rsa_key()))
+    incoming = rsa_key(_NEXT_KID)
+
+    async def drive() -> list[AccessToken | None]:
+        seen = [await verifier.verify_token(mint())]
+        fetcher.document = jwks(rsa_key(), incoming)
+        clock.advance(JWKS_MIN_REFRESH_SECONDS)
+        seen.append(await verifier.verify_token(mint(incoming)))
+        seen.append(await verifier.verify_token(mint()))
+        return seen
+
+    seen = asyncio.run(drive())
+
+    assert all(access is not None for access in seen)
+    assert fetcher.calls == 2
+
+
+def test_a_rotated_in_key_inside_the_refresh_floor_waits_for_it() -> None:
+    """An unknown ``kid`` cannot force a fetch sooner than once a minute."""
+    fetcher, clock, verifier = _rotating(jwks(rsa_key()))
+    incoming = rsa_key(_NEXT_KID)
+
+    async def drive() -> list[AccessToken | None]:
+        await verifier.verify_token(mint())
+        fetcher.document = jwks(rsa_key(), incoming)
+        clock.advance(JWKS_MIN_REFRESH_SECONDS - 1)
+        early = await verifier.verify_token(mint(incoming))
+        clock.advance(1)
+        return [early, await verifier.verify_token(mint(incoming))]
+
+    early, late = asyncio.run(drive())
+
+    assert early is None
+    assert late is not None
+
+
+def test_a_key_the_issuer_removed_is_refused_after_the_next_refresh() -> None:
+    """Cached until the TTL, then gone: a retired key stops verifying."""
+    fetcher, clock, verifier = _rotating(jwks(rsa_key(), rsa_key(_NEXT_KID)))
+    retired = mint()
+
+    async def drive() -> list[AccessToken | None]:
+        seen = [await verifier.verify_token(retired)]
+        fetcher.document = jwks(rsa_key(_NEXT_KID))
+        clock.advance(JWKS_TTL_SECONDS - 1)
+        seen.append(await verifier.verify_token(retired))
+        clock.advance(1)
+        seen.append(await verifier.verify_token(retired))
+        seen.append(await verifier.verify_token(mint(rsa_key(_NEXT_KID))))
+        return seen
+
+    first, cached, refreshed, current = asyncio.run(drive())
+
+    assert first is not None
+    assert cached is not None
+    assert refreshed is None
+    assert current is not None
+
+
+def test_a_removed_key_survives_a_failed_refresh_until_one_succeeds() -> None:
+    """Removal takes effect on a *successful* refresh, never on an outage."""
+    fetcher, clock, verifier = _rotating(jwks(rsa_key()))
+    token = mint()
+
+    async def drive() -> list[AccessToken | None]:
+        await verifier.verify_token(token)
+        fetcher.failing = True
+        clock.advance(JWKS_TTL_SECONDS)
+        during = await verifier.verify_token(token)
+        fetcher.failing = False
+        fetcher.document = jwks(rsa_key(_NEXT_KID))
+        clock.advance(JWKS_MIN_REFRESH_SECONDS)
+        return [during, await verifier.verify_token(token)]
+
+    during, after = asyncio.run(drive())
+
+    assert during is not None
+    assert after is None
+
+
+def _refresh_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the key-set refresh warnings captured so far.
+
+    Args:
+        caplog: Pytest's log capture.
+
+    Returns:
+        Their messages.
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == AGENT_TOKEN_LOGGER_NAME and record.levelno == logging.WARNING
+    ]
+
+
+def test_a_fetch_failure_is_logged_once_per_outage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An issuer outage is one warning, not one per refresh attempt."""
+    fetcher = StaticJwks()
+    clock = FakeClock()
+    cache = JwksCache(fetcher, clock=clock)
+    caplog.set_level(logging.INFO, logger=AGENT_TOKEN_LOGGER_NAME)
+
+    async def drive() -> None:
+        await cache.key_for(rsa_key().kid)
+        fetcher.failing = True
+        for _ in range(3):
+            clock.advance(JWKS_TTL_SECONDS)
+            await cache.key_for(rsa_key().kid)
+
+    asyncio.run(drive())
+
+    assert fetcher.calls == 4
+    warnings = _refresh_warnings(caplog)
+    assert len(warnings) == 1
+    assert "keeping 2" in warnings[0]
+
+
+def test_a_new_outage_after_a_recovery_is_logged_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A recovery is noted, and re-arms the one warning the next outage gets."""
+    fetcher = StaticJwks()
+    clock = FakeClock()
+    cache = JwksCache(fetcher, clock=clock)
+    caplog.set_level(logging.INFO, logger=AGENT_TOKEN_LOGGER_NAME)
+
+    async def drive() -> None:
+        for failing in (True, True, False, False, True):
+            fetcher.failing = failing
+            clock.advance(JWKS_TTL_SECONDS)
+            await cache.key_for(rsa_key().kid)
+
+    asyncio.run(drive())
+
+    assert len(_refresh_warnings(caplog)) == 2
+    recovered = [
+        record
+        for record in caplog.records
+        if record.name == AGENT_TOKEN_LOGGER_NAME and "recovered" in record.getMessage()
+    ]
+    assert len(recovered) == 1
+    assert ISSUER not in caplog.text

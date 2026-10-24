@@ -9,7 +9,8 @@ specification makes mandatory or that the threat model needs:
 * **Signature against the issuer's JWKS**, fetched from the configured
   :attr:`~creek_mcp.oauth_resource.ResourceServerConfig.jwks_url` and cached
   (:class:`JwksCache`: TTL :data:`JWKS_TTL_SECONDS`, refreshed early on an
-  unknown ``kid`` at most every :data:`JWKS_MIN_REFRESH_SECONDS`). The key is
+  unknown ``kid`` at most every :data:`JWKS_MIN_REFRESH_SECONDS`; an issuer
+  outage keeps the last good set and is logged once). The key is
   chosen by ``kid`` only — never by a ``jku``, ``x5u`` or embedded ``jwk``
   header — and only RSA and EC P-256 public keys can enter the set, so a
   symmetric key, and therefore every ``HS*`` token, is unverifiable by
@@ -309,13 +310,17 @@ def parse_jwks(document: object) -> dict[str, PyJWK]:
 class JwksCache:
     """The issuer's verification keys, fetched lazily and cached.
 
-    The seam #1965 (C4) finishes: it owns *when* the set is refetched and what
-    happens on failure, and nothing else reads the keys. Today the set is
-    fetched on first use, again once it is :data:`JWKS_TTL_SECONDS` old, and
-    early when a token names an unknown ``kid`` — never more often than every
-    :data:`JWKS_MIN_REFRESH_SECONDS`. A failed fetch keeps the last good set,
-    so an issuer outage does not refuse the tokens it already signed; a key
-    the issuer removes is refused after the next successful fetch.
+    It owns *when* the set is refetched and what happens on failure, and
+    nothing else reads the keys, so the issuer rotating its signing key never
+    needs a vault restart (#1965). The set is fetched on first use, again once
+    it is :data:`JWKS_TTL_SECONDS` old, and early when a token names an
+    unknown ``kid`` — never more often than every
+    :data:`JWKS_MIN_REFRESH_SECONDS`. A key the issuer adds is therefore
+    accepted within a minute of its first use; a key it removes is refused
+    after the next *successful* fetch, because a fetch that fails keeps the
+    last good set, so an issuer outage does not refuse the tokens it already
+    signed. The outage is logged once, when it begins, and its end once, so a
+    long one is two lines rather than one per attempt.
     """
 
     def __init__(
@@ -341,6 +346,7 @@ class JwksCache:
         self._keys: dict[str, PyJWK] = {}
         self._fetched_at: float | None = None
         self._attempted_at: float | None = None
+        self._failing = False
         self._lock = asyncio.Lock()
 
     async def key_for(self, kid: str) -> PyJWK | None:
@@ -405,14 +411,29 @@ class JwksCache:
             try:
                 keys = parse_jwks(await self._fetch())
             except OSError:
-                _LOGGER.warning(
-                    "agent-token key set refresh failed; keeping %d previously "
-                    "fetched key(s)",
-                    len(self._keys),
-                )
+                self._note_failure()
                 return
+            if self._failing:
+                _LOGGER.info("agent-token key set refresh recovered")
+            self._failing = False
             self._keys = keys
             self._fetched_at = self._attempted_at
+
+    def _note_failure(self) -> None:
+        """Log the first failed fetch of an outage, and only that one.
+
+        Every later attempt in the same outage is silent: an issuer that stays
+        down for an hour would otherwise write one warning a minute, which is
+        how an operator learns to stop reading them.
+        """
+        if self._failing:
+            return
+        self._failing = True
+        _LOGGER.warning(
+            "agent-token key set refresh failed; keeping %d previously "
+            "fetched key(s) until a refresh succeeds",
+            len(self._keys),
+        )
 
 
 def looks_like_jwt(token: str) -> bool:
