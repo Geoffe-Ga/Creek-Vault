@@ -9,6 +9,19 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Give each remote MCP consumer a per-agent tool profile (#1964). Four grants
+  (`vault:read`, `vault:desk`, `vault:journal`, `vault:pipeline`) are decided in
+  `creek_mcp/policy.py` beside the tier cap: `admitted_tool` refuses an
+  out-of-profile `tools/call` before dispatch with one constant reason, audited
+  as `"outcome": "refused"` under the tool name only, and `tools/list` shows
+  each caller only its own profile. Purge tools are in no profile. Static
+  consumers are gated by a grant suffix in `CREEK_MCP_CONSUMER_TOKENS`
+  (`openclaw=<token>@vault:read+vault:desk`); one with no suffix stays ungated,
+  keeping its pre-#1964 reach, and is named on stderr at startup. Grants travel
+  in the access token's `scopes`, so an OAuth token's `scope` claim feeds the
+  same `granted_by_scopes` seam. The default profile for a new agent is
+  `vault:read vault:desk`.
+
 - Give the organization pool admin key a declared custody path before any such
   key exists (#1930). `creek_mcp.provisioning.pool_admin_key` fails closed with
   its own content-free verdict codes (40-44, never reusing `--check pool`'s 30):

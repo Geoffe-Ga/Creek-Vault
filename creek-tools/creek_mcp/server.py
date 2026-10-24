@@ -28,6 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from creek.care.guardrail import acute_distress_guard
 from creek.classify.llm.pool_boundary import declared_pool_request
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
+from creek_mcp.audit import AUDIT_OUTCOME_REFUSED, MCPAuditLog
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.model_pin import (
     build_request_scoped_provider,
@@ -40,7 +41,9 @@ from creek_mcp.policy import (
     CallerIdentity,
     Transport,
     admitted_ceiling,
+    admitted_tool,
     effective_consumer,
+    granted_by_scopes,
 )
 from creek_mcp.provenance import (
     InferenceProvenance,
@@ -52,6 +55,8 @@ from creek_mcp.remote_auth import (
     ConsumerTokenVerifier,
     NamedConsumerVerifier,
     announce_rotation_window,
+    announce_ungated_consumers,
+    load_consumer_grants,
     load_consumer_tokens,
     remote_auth_settings,
 )
@@ -92,7 +97,9 @@ if TYPE_CHECKING:
 
     import uvicorn
     from mcp.server.auth.provider import AccessToken, TokenVerifier
+    from mcp.server.auth.settings import AuthSettings
     from mcp.types import ContentBlock
+    from mcp.types import Tool as MCPTool
     from starlette.types import ASGIApp
 
     from creek.author.client import AuthorLLMClient
@@ -119,6 +126,16 @@ with ``address already in use`` — a collision that is trivial to prevent and
 annoying to diagnose. The value itself is unchanged.
 """
 
+UNREGISTERED_TOOL_AUDIT_NAME: Final[str] = "<unregistered>"
+"""The ``tool`` an out-of-profile refusal is audited under for an unknown name.
+
+A remote caller can ask for any name at all. Writing that name verbatim into
+the hash-chained audit log would let it put arbitrary text of arbitrary length
+there, so a name that is not a registered tool is recorded as this constant
+instead (#1964). A registered tool's name is a fixed server-side string and is
+recorded as itself.
+"""
+
 
 def _current_access_token() -> AccessToken | None:
     """Return the current request's authenticated token, or ``None`` for stdio.
@@ -139,7 +156,11 @@ def _caller_identity() -> CallerIdentity:
     The MCP half of the #1073 split: policy decides, this states which side of
     the network the call arrived from and whose credential it carried. An
     authenticated network request has an access token whose ``client_id`` is
-    the consumer; a local stdio call has neither.
+    the consumer and whose ``scopes`` carry its grants (#1964) — a static
+    token's from :class:`~creek_mcp.remote_auth.ConsumerTokenVerifier`, an
+    OAuth token's from its ``scope`` claim — read through
+    :func:`creek_mcp.policy.granted_by_scopes`, the one identity -> grants
+    seam. A local stdio call has none of these.
 
     **Call this per call. Never hoist it.** ``get_access_token()`` is
     request-scoped, while the ``consumer`` that :func:`build_server` resolves
@@ -153,7 +174,11 @@ def _caller_identity() -> CallerIdentity:
     token = _current_access_token()
     if token is None:
         return CallerIdentity(consumer=None, is_remote=False)
-    return CallerIdentity(consumer=token.client_id, is_remote=True)
+    return CallerIdentity(
+        consumer=token.client_id,
+        is_remote=True,
+        grants=granted_by_scopes(token.scopes),
+    )
 
 
 def _effective_consumer(default: str) -> str:
@@ -170,28 +195,84 @@ def _effective_consumer(default: str) -> str:
 
 
 class _BoundedFastMCP(FastMCP):
-    """The MCP adapter for :mod:`creek_mcp.policy`'s remote tier-ceiling cap.
+    """The MCP adapter for :mod:`creek_mcp.policy`'s remote admission rules.
 
     Every tool call flows through :meth:`call_tool`, the one MCP-side chokepoint
-    at which the requested ceiling is still a raw argument. The cap is not
-    decided here: since #1073 it is adapter-independent policy in
-    :func:`creek_mcp.policy.admitted_ceiling`, so the ``/v1`` HTTP surface
-    reaches the same verdict without an MCP request context to key off. What
-    this class owns is the two things only MCP can answer — *who is the caller*
-    and *is this remote*, via :func:`_caller_identity` — plus what a refusal
-    looks like on this transport: the
-    :func:`creek_mcp.tier_ceiling.refusal_response` payload, where ``/v1``
-    deliberately answers ``422 invalid_request`` instead.
+    at which the tool name and the requested ceiling are still raw arguments.
+    Neither rule is decided here: since #1073 the tier cap is adapter-independent
+    policy in :func:`creek_mcp.policy.admitted_ceiling`, and since #1964 so is
+    the per-agent tool profile, in :func:`creek_mcp.policy.admitted_tool`, so
+    the ``/v1`` HTTP surface can reach the same verdicts without an MCP request
+    context to key off. What this class owns is the things only MCP can answer —
+    *who is the caller*, *is this remote* and *what does its credential grant*,
+    via :func:`_caller_identity` — plus what a refusal looks like on this
+    transport: the :func:`creek_mcp.tier_ceiling.refusal_response` payload,
+    where ``/v1`` deliberately answers ``422 invalid_request`` instead.
+
+    :meth:`list_tools` applies the same tool verdict, so a caller is shown
+    exactly the tools it may call — including through ``creek.handshake``,
+    whose capability list is read from it.
 
     A refused remote call is refused **before dispatch**, so intimate content is
-    never even read for it. Local stdio calls pass through unchanged — the
-    default per-tool ``OPEN`` ceiling still applies.
+    never even read for it, and an out-of-profile tool never runs at all. Local
+    stdio calls pass through unchanged — the default per-tool ``OPEN`` ceiling
+    still applies.
     """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        vault: Path,
+        consumer: str,
+        token_verifier: TokenVerifier | None = None,
+        auth: AuthSettings | None = None,
+    ) -> None:
+        """Build the adapter over *vault*, auditing refusals there.
+
+        Args:
+            name: The MCP server name.
+            vault: The served vault, whose audit log records a refused
+                out-of-profile call (#1964).
+            consumer: The process-default audit identity — what a refusal is
+                audited under for a local caller, via
+                :func:`creek_mcp.policy.effective_consumer`.
+            token_verifier: The bearer verifier for the network transport, or
+                ``None`` for stdio.
+            auth: The SDK auth settings that accompany *token_verifier*.
+        """
+        super().__init__(name, token_verifier=token_verifier, auth=auth)
+        self._audit_vault = vault
+        self._audit_consumer = consumer
+
+    async def list_tools(self) -> list[MCPTool]:
+        """List only the tools the caller in flight is admitted to (#1964).
+
+        The identity is rebuilt **per call, never hoisted** — the same rule as
+        :func:`_caller_identity` — so two consumers listing through one built
+        server each see their own profile. A local caller and an ungated
+        static consumer see every registered tool, exactly as before.
+
+        Returns:
+            The registered tools :func:`creek_mcp.policy.admitted_tool`
+            admits for this caller, in registration order.
+        """
+        identity = _caller_identity()
+        tools = await super().list_tools()
+        return [
+            tool
+            for tool in tools
+            if isinstance(admitted_tool(identity, tool.name), Admission)
+        ]
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> Sequence[ContentBlock] | dict[str, Any]:
-        """Refuse over-ceiling remote calls, else dispatch normally.
+        """Refuse out-of-profile and over-ceiling remote calls, else dispatch.
+
+        The tool verdict is asked first: a tool the caller was not granted is
+        refused whatever ceiling it named, and audited as refused under the
+        tool name only (:meth:`_refuse_ungranted`). Then the ceiling verdict.
 
         The missing-key default is *adapter* vocabulary rather than policy's: a
         tool that declares no ``privacy_tier_ceiling`` is read here as having
@@ -200,21 +281,28 @@ class _BoundedFastMCP(FastMCP):
         ``None`` would also be safe — it fails closed — but it would refuse the
         purge tools below rather than admitting them.
 
-        Note: this ceiling gate is a **no-op for the ``creek.purge.*`` tools** —
+        Note: the ceiling gate is a **no-op for the ``creek.purge.*`` tools** —
         they declare no ``privacy_tier_ceiling`` parameter, so ``arguments.get``
         below always falls back to ``OPEN`` (admitted) for them. That is
         intentional: purge is not tier-scoped and is instead gated, fail-closed,
         by ``CREEK_MCP_ELEVATED_TOKEN`` (see ``creek_mcp.auth.is_elevated`` and the
-        purge tools), which a per-consumer bearer alone does not satisfy. Do not
-        rely on this gate — or on :mod:`creek_mcp.policy` — for purge protection.
+        purge tools), which a per-consumer bearer alone does not satisfy. Purge
+        is in no grant profile either, so a *gated* remote identity is refused
+        it by the tool verdict; for a local caller or an ungated static
+        consumer the elevated token remains its only gate. Do not rely on the
+        ceiling gate — or on :mod:`creek_mcp.policy` — for purge protection.
         """
-        raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
-        verdict = admitted_ceiling(_caller_identity(), raw)
+        identity = _caller_identity()
+        granted = admitted_tool(identity, name)
         # Dispatch on the POSITIVE verdict, never on "not a refusal". If policy
         # ever grows a third verdict, this falls to the refusal branch instead
         # of silently uncapping the call — and because the branch below then
         # narrows to a type that has no ``reason``, mypy fails the build rather
         # than leaving the regression to be noticed at runtime.
+        if not isinstance(granted, Admission):
+            return await self._refuse_ungranted(name, identity, granted.reason)
+        raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
+        verdict = admitted_ceiling(identity, raw)
         if isinstance(verdict, Admission):
             return await super().call_tool(name, arguments)
         # ``ceiling=OPEN`` rather than the requested one: the refusal echoes
@@ -224,6 +312,39 @@ class _BoundedFastMCP(FastMCP):
             ceiling=TierCeiling.OPEN,
             reason=verdict.reason,
         )
+
+    async def _refuse_ungranted(
+        self, name: str, identity: CallerIdentity, reason: str
+    ) -> dict[str, Any]:
+        """Audit an out-of-profile call as refused, then answer the refusal.
+
+        The audit entry carries the tool name and
+        :data:`~creek_mcp.audit.AUDIT_OUTCOME_REFUSED` only — no argument
+        summary, because no tool ran to say which arguments were safe to
+        summarise — and the transport-default ``OPEN`` ceiling, never the one
+        requested. A name that is not a registered tool is recorded as
+        :data:`UNREGISTERED_TOOL_AUDIT_NAME`, so a caller cannot write
+        arbitrary text into the log by asking for it.
+
+        Args:
+            name: The tool the caller asked for, as it spelled it.
+            identity: The caller, as :func:`_caller_identity` built it for
+                this call.
+            reason: The refusal's reason, from policy.
+
+        Returns:
+            The :func:`creek_mcp.tier_ceiling.refusal_response` payload, which
+            echoes *name* back to the caller who supplied it.
+        """
+        registered = {tool.name for tool in await super().list_tools()}
+        MCPAuditLog(self._audit_vault).append(
+            tool=name if name in registered else UNREGISTERED_TOOL_AUDIT_NAME,
+            args={},
+            tier_ceiling=TierCeiling.OPEN,
+            consumer=effective_consumer(identity, self._audit_consumer),
+            outcome=AUDIT_OUTCOME_REFUSED,
+        )
+        return refusal_response(tool=name, ceiling=TierCeiling.OPEN, reason=reason)
 
 
 def _resolve_vault(vault_path: Path | None) -> Path:
@@ -744,13 +865,21 @@ def build_server(
     # audit line the call wrote. ``NamedConsumerVerifier`` maps that onto the
     # unauthenticated answer, so the refusal lands before dispatch.
     named = None if token_verifier is None else NamedConsumerVerifier(token_verifier)
-    server: FastMCP = (
-        _BoundedFastMCP(SERVER_NAME, token_verifier=named, auth=remote_auth_settings())
-        if named is not None
-        else _BoundedFastMCP(SERVER_NAME)
-    )
+    # Resolved before the server is built: the adapter audits the refusals it
+    # makes itself (#1964), so it needs the vault and the default identity.
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
+    server: FastMCP = (
+        _BoundedFastMCP(
+            SERVER_NAME,
+            vault=vault,
+            consumer=consumer,
+            token_verifier=named,
+            auth=remote_auth_settings(),
+        )
+        if named is not None
+        else _BoundedFastMCP(SERVER_NAME, vault=vault, consumer=consumer)
+    )
     # Each default builder is bound to the vault this server serves (#1409).
     # They used to resolve their config from the process cwd, which silently
     # routed one vault's text with another vault's model routing.
@@ -1528,7 +1657,8 @@ def main(argv: list[str] | None = None) -> None:
 
     Having started, the network branch *announces* on stderr any consumer
     holding more than one currently-valid token, so an open rotation window
-    is visible rather than permanent (#895).
+    is visible rather than permanent (#895), and any consumer configured with
+    no grant suffix, which is ungated (#1964).
 
     Args:
         argv: Optional list of command-line arguments. When ``None``
@@ -1548,10 +1678,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.transport is Transport.NETWORK:
         try:
             tokens = load_consumer_tokens()
+            grants = load_consumer_grants()
         except ValueError as exc:
             # An unreadable consumer-token configuration: a token below the
-            # minimum-strength floor (#838), a consumer named twice, or one
-            # token value configured for two consumers (#895). Exit naming the
+            # minimum-strength floor (#838), a consumer named twice, one token
+            # value configured for two consumers (#895), or an unreadable grant
+            # suffix (#1964). Exit naming the
             # setting to fix rather than serve a weak or ambiguous registry;
             # no such message ever carries a token value.
             parser.error(str(exc))
@@ -1563,11 +1695,13 @@ def main(argv: list[str] | None = None) -> None:
                 "(consumer=token pairs); refusing to serve without authentication"
             )
         _require_transport_confidentiality(parser, args)
-        verifier = ConsumerTokenVerifier(tokens)
+        verifier = ConsumerTokenVerifier(tokens, grants=grants)
         # A rotation window has to be closed again, and an operator who cannot
         # see one is open will not close it (#895). On stderr: stdout on this
-        # entry point belongs to the stdio transport's JSON-RPC framing.
+        # entry point belongs to the stdio transport's JSON-RPC framing. An
+        # ungated consumer is announced for the same reason (#1964).
         announce_rotation_window(verifier)
+        announce_ungated_consumers(verifier)
         server = build_server(transport=args.transport, token_verifier=verifier)
         server.settings.host = args.host
         server.settings.port = args.port

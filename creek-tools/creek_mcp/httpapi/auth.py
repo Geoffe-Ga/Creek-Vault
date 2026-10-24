@@ -44,6 +44,7 @@ from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
     access_has_expired,
+    load_consumer_grants,
     load_consumer_tokens,
     names_a_consumer,
 )
@@ -73,6 +74,11 @@ def build_verifier(
     whether any consumer is configured at all, and an empty map is still the
     only way to answer "no".
 
+    The consumers' grant suffixes (#1964) are carried into the verifier too,
+    so its tokens name the same grants the MCP surface's do. ``/v1`` itself
+    does not consult them today; carrying them means any MCP surface served
+    behind this verifier cannot silently read a gated consumer as ungated.
+
     Args:
         environ: Environment mapping to read, or ``None`` for
             :data:`os.environ`. Tests always pass one explicitly, so no test
@@ -101,7 +107,7 @@ def build_verifier(
             "authentication configured."
         )
         raise ValueError(msg)
-    return ConsumerTokenVerifier(tokens)
+    return ConsumerTokenVerifier(tokens, grants=load_consumer_grants(environ))
 
 
 def _presented_token(scope: Scope) -> str | None:
