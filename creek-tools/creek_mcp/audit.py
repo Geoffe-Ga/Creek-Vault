@@ -76,6 +76,16 @@ MCP_AUDIT_RELPATH = Path("00-Creek-Meta/audit/mcp.jsonl")
 ENTRY_HASH_FIELD = "entry_hash"
 """Reserved field carrying ``sha256`` of the entry's content."""
 
+AUDIT_OUTCOME_REFUSED: Final[str] = "refused"
+"""The ``outcome`` an entry carries when the call was refused before dispatch.
+
+Written by the MCP adapter when :func:`creek_mcp.policy.admitted_tool` refuses
+an out-of-profile call (#1964). Such an entry records the tool name and this
+outcome only — no argument summary — because the call never reached a tool
+that could say which of its arguments were safe to summarise. Entries written
+by the tools themselves carry no ``outcome`` key, exactly as before.
+"""
+
 _SHARED_LOG_CACHE_SIZE: Final[int] = 32
 """How many distinct log paths keep a warm chain-hash cache.
 
@@ -197,6 +207,7 @@ class MCPAuditLog:
         created_path: str | None = None,
         created_tier: str | None = None,
         affected_fragment_ids: list[str] | None = None,
+        outcome: str | None = None,
     ) -> None:
         """Append one structured entry for an MCP tool call.
 
@@ -216,6 +227,10 @@ class MCPAuditLog:
             affected_fragment_ids: IDs of fragments touched by the call
                 (FEAT-011 write-side field). Stored as IDs, never as
                 bodies, so the audit log remains body-free.
+            outcome: How the call ended, when that is not "the tool ran" —
+                :data:`AUDIT_OUTCOME_REFUSED` for a pre-dispatch refusal
+                (#1964). Omitted from the entry when ``None``, so entries the
+                tools write are byte-identical to before.
         """
         entry: dict[str, Any] = {
             "tool": tool,
@@ -230,6 +245,8 @@ class MCPAuditLog:
             entry["created_tier"] = created_tier
         if affected_fragment_ids is not None:
             entry["affected_fragment_ids"] = list(affected_fragment_ids)
+        if outcome is not None:
+            entry["outcome"] = outcome
         # entry_hash before prev_hash: prev_hash is added inside
         # AuditLog.append and folds entry_hash into the chained bytes,
         # so a verifier that recomputes entry_hash on read sees an
