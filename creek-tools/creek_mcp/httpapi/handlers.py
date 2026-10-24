@@ -57,6 +57,7 @@ from starlette.responses import Response
 from creek_mcp.api.models import ErrorCode
 from creek_mcp.api.routes import (
     IMPLEMENTED_CAPABILITIES,
+    OP_AGENT_ACTIVITY,
     OP_CAPABILITIES,
     OP_CLASSIFY,
     OP_DRIVE_AUTHORIZE,
@@ -78,6 +79,7 @@ from creek_mcp.api.routes import (
     OP_WHEEL,
     ROUTES,
 )
+from creek_mcp.httpapi.agent_activity import handle_agent_activity
 from creek_mcp.httpapi.capabilities import handle_capabilities
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.drive import (
@@ -204,6 +206,7 @@ async def handle_health(_request: Request) -> Response:
 
 
 _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
+    OP_AGENT_ACTIVITY: handle_agent_activity,
     OP_CAPABILITIES: handle_capabilities,
     OP_CLASSIFY: handle_classification,
     OP_DRIVE_AUTHORIZE: handle_drive_authorize,

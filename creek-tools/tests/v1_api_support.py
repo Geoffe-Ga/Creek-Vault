@@ -251,6 +251,9 @@ JOB_TEMPLATE: Final[str] = "/v1/jobs/{job_id}"
 JOB_PATH: Final[str] = "/v1/jobs/00000000-0000-4000-8000-000000000000"
 """One syntactically valid concrete job path for route-wide assertions."""
 
+AGENT_ACTIVITY_PATH: Final[str] = "/v1/agent-activity"
+"""The owner's content-free activity projection (#1968)."""
+
 HEALTH_PATH: Final[str] = "/v1/health"
 """The liveness probe."""
 
@@ -308,6 +311,7 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("POST", CLASSIFICATIONS_PATH),
     ("POST", LINKS_PATH),
     ("GET", JOB_PATH),
+    ("GET", AGENT_ACTIVITY_PATH),
     ("GET", HEALTH_PATH),
 )
 """Every ``(method, concrete path)`` pair a client can actually reach."""
@@ -327,6 +331,7 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
     "classifications",
     "links",
     "job-status",
+    "agent-activity",
     "health",
 )
 """Stable parametrize ids for :data:`MOUNTED`, in the same order."""
@@ -345,8 +350,9 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("POST", CLASSIFICATIONS_PATH),
     ("POST", LINKS_PATH),
     ("GET", JOB_PATH),
+    ("GET", AGENT_ACTIVITY_PATH),
 )
-"""The eleven routes the contract-version gate applies to."""
+"""The concrete-path routes the contract-version gate applies to."""
 
 VERSIONED_IDS: Final[tuple[str, ...]] = (
     "journal-upsert",
@@ -362,6 +368,7 @@ VERSIONED_IDS: Final[tuple[str, ...]] = (
     "classifications",
     "links",
     "job-status",
+    "agent-activity",
 )
 """Stable parametrize ids for :data:`VERSIONED`."""
 

@@ -1,7 +1,56 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.21.0",
+  "contract_version": "0.22.0",
   "files": [
+    {
+      "capability": "agent-activity",
+      "model": "NotApplicableExample",
+      "path": "examples/agent-activity/care-escalation.json",
+      "sha256": "340f5faee0dd9f946e24e02d09ba23e378562dc96023a999f4cdecfc55c1d7fa",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "agent-activity",
+      "model": "AgentActivityResponse",
+      "path": "examples/agent-activity/empty.json",
+      "sha256": "dc197f8a1cc9411f772a12725befcf4d3d4776a74f84d46d8841c69d7e91e1df",
+      "state": "empty"
+    },
+    {
+      "capability": "agent-activity",
+      "model": "ErrorEnvelope",
+      "path": "examples/agent-activity/incompatible-version.json",
+      "sha256": "68155caf438a52199ca41ecbf667a1583ac113b95c68e092ae01c7458a6671e0",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "agent-activity",
+      "model": "ErrorEnvelope",
+      "path": "examples/agent-activity/malformed-input.json",
+      "sha256": "9f64e590193b837acc82840276d0ec247947d1e8eae1ac65b7ed88f4eb383582",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "agent-activity",
+      "model": "NotApplicableExample",
+      "path": "examples/agent-activity/refusal.json",
+      "sha256": "a025e80e4b8223fd864c0dfef629f8ea809fcb61c0221940ad8625089e48562d",
+      "state": "refusal"
+    },
+    {
+      "capability": "agent-activity",
+      "model": "AgentActivityResponse",
+      "path": "examples/agent-activity/success.json",
+      "sha256": "5c894510d76769dc77197ea64911f3325ac00d92d99fe84acda9ea99658acda8",
+      "state": "success"
+    },
+    {
+      "capability": "agent-activity",
+      "model": "ErrorEnvelope",
+      "path": "examples/agent-activity/unavailable-service.json",
+      "sha256": "4fd021809d1f39b749d794869ecc62eec8410375dde49d09bdebd334ae6bf9a9",
+      "state": "unavailable-service"
+    },
     {
       "capability": "capabilities",
       "model": "NotApplicableExample",
@@ -13,7 +62,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "6955478640caa52721f5de6a96ffc3160723c6fd560f052322722bc994152652",
+      "sha256": "edb786df8a4d0938a2abac9645cd9e3b5cf593c918df1efafcd46fa167cdd6f9",
       "state": "empty"
     },
     {
@@ -41,7 +90,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "7118cfc155ef6708eba4ea377b56cdec9fe7d2e63b63402deaed1c983cbee0e2",
+      "sha256": "0c6b072663dfce10f84c426c71e6a16f35791835d04c0e281b571d9387395fc9",
       "state": "success"
     },
     {
@@ -501,9 +550,30 @@
     },
     {
       "capability": null,
+      "model": "AgentActivityQuery",
+      "path": "schemas/AgentActivityQuery.schema.json",
+      "sha256": "210fd2e56f4353f4320c6165cc99ac1ea88dfda80863f585345f0b4134913a6d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "AgentActivityResponse",
+      "path": "schemas/AgentActivityResponse.schema.json",
+      "sha256": "6c202f22211fec11fb6e8d9c3deb4977312ae95cb6d259d5feb2e7cdf152b7b0",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "AgentActivityRow",
+      "path": "schemas/AgentActivityRow.schema.json",
+      "sha256": "64fc4e86188f63b7b2c9c0f3a6e482f5a13e64424e0c5c51b9331e0ee0dba108",
+      "state": null
+    },
+    {
+      "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "b8161715c2fb7588c44c17988fb603ef4d6013053ec07e57c8022dfb16ffd58c",
+      "sha256": "6a39db50eee719f36e7697d63544c0c4ecff147dd2f95a06bc5c58125ce05964",
       "state": null
     },
     {

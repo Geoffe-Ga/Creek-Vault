@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from creek_mcp.api.models import (
+    AgentActivityQuery,
+    AgentActivityResponse,
     CapabilitiesResponse,
     Capability,
     ClassificationRequest,
@@ -171,6 +173,9 @@ OP_LINK: Final[str] = "createLink"
 
 OP_JOB_STATUS: Final[str] = "getPipelineJob"
 """``operation_id`` of ``GET /v1/jobs/{job_id}``."""
+
+OP_AGENT_ACTIVITY: Final[str] = "getAgentActivity"
+"""``operation_id`` of ``GET /v1/agent-activity``."""
 
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``.
@@ -318,6 +323,12 @@ class RouteSpec:
             :data:`PROVIDER_KEY_HEADER`, ADR-0015). Only the routes that call a
             model do; a route that makes no model call has nothing to spend a
             key on and does not publish the headers.
+        query_model: The wire model governing the query string, or ``None``
+            when the route takes no query parameters (#1968). One model
+            rather than a list of parameters so the bounds the published
+            document states and the bounds the handler validates are one
+            declaration; the OpenAPI generator publishes one ``in: query``
+            parameter per field.
     """
 
     path: str
@@ -331,6 +342,7 @@ class RouteSpec:
     max_body_bytes: int | None = None
     success_responses: tuple[tuple[int, type[BaseModel] | None], ...] | None = None
     accepts_request_key: bool = False
+    query_model: type[BaseModel] | None = None
 
     @property
     def published_success_responses(
@@ -613,6 +625,17 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         response_model=JobStatusResponse,
         requires_contract_version=True,
         summary="Report one durable pipeline job's counts-only state.",
+    ),
+    RouteSpec(
+        path="/v1/agent-activity",
+        method="GET",
+        operation_id=OP_AGENT_ACTIVITY,
+        capability=Capability.AGENT_ACTIVITY,
+        request_model=None,
+        response_model=AgentActivityResponse,
+        requires_contract_version=True,
+        summary="Return the most recent MCP calls: who, which tool, when, outcome.",
+        query_model=AgentActivityQuery,
     ),
     RouteSpec(
         path="/v1/health",

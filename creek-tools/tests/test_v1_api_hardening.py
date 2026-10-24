@@ -2643,6 +2643,7 @@ _HTTPAPI_DIR: Final[Path] = Path(httpapi_package.__file__).parent
 
 _READ_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
     {
+        "agent_activity",
         "capabilities",
         "drive",
         "generation",

@@ -983,7 +983,11 @@ routable by design and requires TLS.
   remote caller is capped at `personal`, a request for a
   `privacy_tier_ceiling` above it (`intimate` / `all`, or any unrecognised
   value) is **refused before dispatch**, so intimate content is never even
-  read for a network consumer, and stdio calls are unaffected — the
+  read for a network consumer. The refusal is audited as refused
+  (`"outcome": "refused"`) under the tool name only, with no argument summary
+  and the transport-default `open` ceiling rather than the one asked for, so
+  the owner sees the attempt on `GET /v1/agent-activity` (#1968). Stdio calls
+  are unaffected — the
   per-tool `open` default still applies locally, and `intimate` remains
   reachable for the local owner. `_BoundedFastMCP.call_tool` is still the
   MCP-side chokepoint that enforces this; it now renders a verdict

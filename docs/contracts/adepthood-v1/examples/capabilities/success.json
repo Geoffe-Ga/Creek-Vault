@@ -9,10 +9,11 @@
     "pipeline",
     "voice-drafts",
     "journal-withdraw",
-    "letters"
+    "letters",
+    "agent-activity"
   ],
-  "contract_minor": "0.21",
-  "contract_version": "0.21.0",
+  "contract_minor": "0.22",
+  "contract_version": "0.22.0",
   "inference_pool": true,
   "keyless_inference": true,
   "ontology_version": "aptitude-wavelength/2026-05-23",
@@ -22,6 +23,7 @@
   ],
   "status": "ok",
   "supported_contract_minors": [
+    "0.22",
     "0.21",
     "0.20",
     "0.19",
