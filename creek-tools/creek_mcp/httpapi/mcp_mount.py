@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     from starlette.applications import Starlette
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from creek_mcp.httpapi.job_runtime import JobRuntime
     from creek_mcp.remote_auth import ConsumerTokenVerifier
     from creek_mcp.tools.reflect import _LLMFactory
 
@@ -116,6 +117,7 @@ def build_mcp_server(
     vault_path: Path,
     verifier: ConsumerTokenVerifier,
     reflect_llm_factory: Callable[[], _LLMFactory] | None,
+    job_runtime: JobRuntime | None = None,
 ) -> FastMCP:
     """Build the network MCP server this process serves at ``/mcp``.
 
@@ -129,6 +131,9 @@ def build_mcp_server(
         verifier: The ``/v1`` app's verifier — the same instance, not a copy.
         reflect_llm_factory: The ``/v1`` app's reflection thunk, or ``None``
             for the production default.
+        job_runtime: The ``/v1`` app's job runtime (#1966), so
+            ``creek.draft`` / ``creek.author`` share its worker id and its
+            one-active-job-per-consumer slot; ``None`` builds a fresh one.
 
     Returns:
         The built server, its streamable-HTTP path pinned to
@@ -142,6 +147,7 @@ def build_mcp_server(
         vault_path=vault_path,
         reflect_llm_factory=reflect_llm_factory,
         token_verifier=verifier,
+        job_runtime=job_runtime,
     )
     # Both are read by the SDK when the app is built, not by this package, so
     # they are handed over as one validated copy of the settings rather than

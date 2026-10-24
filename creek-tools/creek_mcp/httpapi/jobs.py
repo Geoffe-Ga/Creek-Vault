@@ -4,12 +4,20 @@ Job records live inside the vault so an accepted request survives the HTTP
 process that accepted it.  The public projection is deliberately smaller than
 the record: callers see only an opaque id, a lifecycle state, and the same
 counts-only response a synchronous pipeline request returns.
+
+**Two surfaces share this store (#1966).** ``/v1`` writes ``classification``
+and ``link`` jobs; the MCP server writes ``draft`` and ``author`` jobs when a
+composition outlives its synchronous deadline. One directory, one lock, one
+record type and one stale-worker recovery rule — but each reader is confined
+to its own kinds (:data:`PIPELINE_KINDS`, :data:`COMPOSITION_KINDS`), and the
+kind check runs *before* recovery, so neither surface can mark the other's
+live job failed merely by being asked about it.
 """
 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeAlias
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -24,11 +32,21 @@ from creek_mcp.api.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from collections.abc import Set as AbstractSet
     from pathlib import Path
 
 _JOB_DIRECTORY: Final[tuple[str, ...]] = ("00-Creek-Meta", "State", "jobs")
 _JOB_LOCK_NAME: Final[str] = "jobs.lock"
+
+JobKind: TypeAlias = Literal["classification", "link", "draft", "author"]
+"""What a job runs: a ``/v1`` pipeline pass or an MCP composition."""
+
+PIPELINE_KINDS: Final[frozenset[str]] = frozenset({"classification", "link"})
+"""The kinds ``GET /v1/jobs/{job_id}`` projects through its counts-only models."""
+
+COMPOSITION_KINDS: Final[frozenset[str]] = frozenset({"draft", "author"})
+"""The kinds ``creek.jobs.read`` resolves (#1966)."""
 
 
 class StoredJob(BaseModel):
@@ -38,7 +56,7 @@ class StoredJob(BaseModel):
 
     job_id: str
     consumer: str
-    kind: Literal["classification", "link"]
+    kind: JobKind
     method: str
     retier: bool = False
     ceiling: str
@@ -85,7 +103,7 @@ def create_job(
     vault: Path,
     *,
     consumer: str,
-    kind: Literal["classification", "link"],
+    kind: JobKind,
     method: str,
     retier: bool,
     ceiling: str,
@@ -126,9 +144,14 @@ def finish_job(
     vault: Path,
     job_id: str,
     worker_id: str,
-    result: ClassificationResponse | LinkResponse | None,
+    result: ClassificationResponse | LinkResponse | Mapping[str, Any] | None,
 ) -> None:
-    """Atomically record a terminal state if this worker still owns the job."""
+    """Atomically record a terminal state if this worker still owns the job.
+
+    *result* is a pipeline response model, or — for a composition job — the
+    already content-free envelope the MCP tool projected; ``None`` records the
+    failed state.
+    """
     with vault_lock(_lock_path(vault)):
         record = _read(_path(vault, job_id))
         if (
@@ -140,12 +163,92 @@ def finish_job(
         terminal = record.model_copy(
             update={
                 "state": JobState.SUCCEEDED if result is not None else JobState.FAILED,
-                "result": (
-                    result.model_dump(mode="json") if result is not None else None
-                ),
+                "result": _dumped(result),
             }
         )
         _write(vault, terminal)
+
+
+def _dumped(
+    result: BaseModel | Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return *result* as the JSON-ready dict a record stores."""
+    if result is None:
+        return None
+    if isinstance(result, BaseModel):
+        return result.model_dump(mode="json")
+    return dict(result)
+
+
+def _recovered(
+    vault: Path,
+    job_id: str,
+    *,
+    consumer: str,
+    kinds: AbstractSet[str],
+    worker_id: str,
+    active_job_ids: AbstractSet[str],
+) -> StoredJob | None:
+    """Return one consumer's record of an admitted kind, recovering stale work.
+
+    The kind and consumer checks run before the recovery write: a record this
+    reader may not see is left exactly as it was found.
+    """
+    try:
+        canonical_id = str(UUID(job_id))
+    except ValueError:
+        return None
+    if canonical_id != job_id:
+        return None
+
+    with vault_lock(_lock_path(vault)):
+        record = _read(_path(vault, canonical_id))
+        if record is None or record.consumer != consumer or record.kind not in kinds:
+            return None
+        if record.state in {JobState.QUEUED, JobState.RUNNING} and (
+            record.worker_id != worker_id or record.job_id not in active_job_ids
+        ):
+            record = record.model_copy(
+                update={"state": JobState.FAILED, "result": None}
+            )
+            _write(vault, record)
+    return record
+
+
+def composition_job_for(
+    vault: Path,
+    job_id: str,
+    *,
+    consumer: str,
+    worker_id: str,
+    active_job_ids: AbstractSet[str],
+) -> StoredJob | None:
+    """Return one consumer's ``draft`` / ``author`` record, recovering stale work.
+
+    The MCP twin of :func:`status_for`, under the same recovery rule: a queued
+    or running record this worker is not executing is rewritten ``failed``, so
+    a server restart never leaves a job running forever. Malformed, unknown,
+    another consumer's and another surface's ids are all the same ``None``.
+
+    Args:
+        vault: The vault holding the job directory.
+        job_id: The caller-supplied id, accepted only in canonical UUID form.
+        consumer: The caller's identity; a record is bound to the one that
+            started it.
+        worker_id: This process's worker id.
+        active_job_ids: The ids this process is executing right now.
+
+    Returns:
+        The record, or ``None``.
+    """
+    return _recovered(
+        vault,
+        job_id,
+        consumer=consumer,
+        kinds=COMPOSITION_KINDS,
+        worker_id=worker_id,
+        active_job_ids=active_job_ids,
+    )
 
 
 def status_for(
@@ -157,24 +260,16 @@ def status_for(
     active_job_ids: AbstractSet[str],
 ) -> JobStatusResponse | None:
     """Return one consumer's public job state, recovering stale work as failed."""
-    try:
-        canonical_id = str(UUID(job_id))
-    except ValueError:
+    record = _recovered(
+        vault,
+        job_id,
+        consumer=consumer,
+        kinds=PIPELINE_KINDS,
+        worker_id=worker_id,
+        active_job_ids=active_job_ids,
+    )
+    if record is None:
         return None
-    if canonical_id != job_id:
-        return None
-
-    with vault_lock(_lock_path(vault)):
-        record = _read(_path(vault, canonical_id))
-        if record is None or record.consumer != consumer:
-            return None
-        if record.state in {JobState.QUEUED, JobState.RUNNING} and (
-            record.worker_id != worker_id or record.job_id not in active_job_ids
-        ):
-            record = record.model_copy(
-                update={"state": JobState.FAILED, "result": None}
-            )
-            _write(vault, record)
 
     result: ClassificationResponse | LinkResponse | None = None
     if record.result is not None:

@@ -89,7 +89,7 @@ _READ_TOOLS: Final[frozenset[str]] = frozenset(
     }
 )
 _DESK_TOOLS: Final[frozenset[str]] = frozenset(
-    {"creek.draft", "creek.author", "creek.reflect", "creek.save"}
+    {"creek.draft", "creek.author", "creek.reflect", "creek.save", "creek.jobs.read"}
 )
 _JOURNAL_TOOLS: Final[frozenset[str]] = frozenset({"creek.journal", "creek.upload"})
 _PIPELINE_TOOLS: Final[frozenset[str]] = frozenset(
@@ -113,7 +113,7 @@ _PURGE_TOOLS: Final[frozenset[str]] = frozenset(
         "creek.purge.vault",
     }
 )
-_DEFAULT_PROFILE_TOOL_COUNT: Final[int] = 10
+_DEFAULT_PROFILE_TOOL_COUNT: Final[int] = 11
 
 # Floor-clearing (>= 32 chars) fake test literals, never real credentials.
 _GATED_TOKEN: Final[str] = "gated-consumer-test-token-" + "g" * 20
@@ -481,10 +481,10 @@ def test_only_elevated_token_tools_carry_no_grant() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_list_tools_for_the_default_profile_is_ten_tools(
+def test_list_tools_for_the_default_profile_is_eleven_tools(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The issue's example: 10 tools, no ``creek.link``, no ``creek.purge.*``."""
+    """#1964's 10 tools plus ``creek.jobs.read`` (#1966); no link, no purge."""
     server = _server(vault)
     _present(monkeypatch, _token("acct_91", _gated_scopes(Grant.READ, Grant.DESK)))
     listed = _listed(server)

@@ -48,7 +48,7 @@ cross-repo contract is
 | `creek.lint`          | Run the unified hygiene lint pass (FEAT-008).              |
 | `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
 | `creek.wheel`         | Return a per-frequency balance read of the corpus for the Map: an ordered `F1..F10` map of `{name, count, share}`, where `share` is the fraction of *classified* fragments at that frequency. A corpus walk (the same shape as `state.render` and `report`), so it **excludes** above-ceiling fragments from the tally rather than refusing (#969). |
-| `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
+| `creek.draft`         | Draft an essay from a mined idea (requires an LLM). Streams progress, and past the server deadline answers with a job handle — see [Long calls](#long-calls-progress-a-deadline-and-job-handles-1966). |
 | `creek.redact.scan`   | Regex-scan a path for secrets/PII (FEAT-027); scoped to `00-Creek-Meta/Inbound/` at every ceiling, `intimate`/`all` elsewhere in the vault (#972). |
 | `creek.classify.entry` | Report the ontology classification one named fragment **already carries on disk** (#874). Takes `entry_ref` plus `ceiling`; computes nothing. |
 
@@ -265,7 +265,8 @@ confinement boundary.
 
 | Tool           | Inputs                                                                  | Purpose                                                                       |
 |----------------|------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk.                         |
+| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). |
+| `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` job handle to `{status, job_id, state, result?}`. |
 
 Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
 `medium`, `query`, `body`, `provenance` (a list of provenance entries),
@@ -336,6 +337,68 @@ CrawDad feeds it verbatim into an LLM composer — so renaming the key changes
 no bytes on the wire and only makes the leak harder to see. A caller that
 legitimately needs the text in order to revise should re-run at a ceiling that
 excludes the offending fragment, or re-tier the fragment.
+
+### Long calls: progress, a deadline and job handles (#1966)
+
+A draft on the vault's pinned local model can take minutes, and MCP clients
+own their own request timeouts (OpenClaw's documented example is 20 s; the Fly
+edge drops an idle connection long before a cold model finishes). So
+`creek.draft` and `creek.author` run through `creek_mcp/composition_jobs.py`:
+
+- **Progress.** A client that sends a `progressToken` receives one
+  `notifications/progress` per stage boundary the pipeline crosses. The
+  message is the stage *name* and nothing else — never a title, fragment id or
+  line of prose:
+
+  | Tool | Notifications, in order |
+  |------|-------------------------|
+  | `creek.draft` | `1/6 seed`, `2/6 skills`, `3/6 sources`, `4/6 composed`, `5/6 voice_guarded`, `6/6 saved` |
+  | `creek.author` | `1/3 sources`, `2/3 composed`, `3/3 voice_guarded` (once each, however many revision rounds run) |
+
+- **A server deadline.** `CREEK_MCP_SYNC_DEADLINE_SECONDS` (default `90`, read
+  when the server is built; anything but a positive, finite number refuses to
+  start) bounds the synchronous path. A call that beats it answers exactly as
+  before. One that does not answers
+  `{status: "accepted", tool, tier_ceiling, job_id, state: "running"}` and the
+  same worker keeps composing. A detached `creek.draft` writes its draft to
+  `07-Voice/Drafts/` as always; a detached `creek.author` — whose synchronous
+  answer carries the body instead of saving it — files the body there too, as
+  `YYYY-MM-DD-writing-desk-<medium>.md`, so it is not lost.
+- **`creek.jobs.read(job_id)`** returns
+  `{status: "ok", tool, tier_ceiling, job_id, state}` with `state` one of
+  `queued` / `running` / `succeeded` / `failed`, plus `result` once the job
+  has succeeded. `result` is the composing tool's success envelope with every
+  content-bearing key dropped — for `creek.draft`: `status`, `tool`,
+  `tier_ceiling`, `draft_path`, `idea_strategy`, `source_count`,
+  `voice_guard_status`; for `creek.author`: `status`, `tool`, `tier_ceiling`,
+  `medium`, `verdict`, `rounds`, `draft_path`, `claim_count`, `source_count`,
+  `warnings`. Never the body, title, query, claims or fragment ids. A refused
+  or failed composition is `state: "failed"` with no `result`, as on `/v1`.
+  The synchronous `creek.draft` envelope gained `source_count` and
+  `voice_guard_status` alongside its existing keys.
+
+Jobs reuse the `/v1` durable job store (`creek_mcp/httpapi/jobs.py`, kinds
+`draft` and `author` beside `classification` and `link`) and its rules:
+
+- **One active long call per consumer** (#1605). A second `creek.draft` or
+  `creek.author` while one runs is refused with the static
+  `unavailable` refusal (`status: "refused"`, `code: "unavailable"`). The slot
+  lives on `creek_mcp/httpapi/job_runtime.py::JobRuntime`. The server mounted
+  at `/mcp` inside the `/v1` process is built with the `/v1` app's runtime
+  (`build_server(job_runtime=...)`), so a consumer holds one slot across both
+  surfaces: a running `/v1` LLM classification refuses its `creek.draft`, and
+  the other way round.
+- **Bound to the caller.** The record carries the consumer the call was
+  audited under, so a JWT agent and the `adepthood` service bearer never see
+  each other's jobs. Another consumer's id, an unknown id, a malformed id and
+  a `/v1` pipeline id all get the same `unavailable` refusal.
+- **A restart fails in-flight work.** A queued or running job this server
+  process is not executing reads back as `failed`, exactly as
+  `GET /v1/jobs/{job_id}` does.
+- **Two audit entries.** A detached call appends `"outcome": "accepted"` when
+  it hands off and `"outcome": "completed"` (with the terminal `state`) when
+  the worker finishes, both carrying the same `job_id`, always in that order.
+  The tool's own ordinary entry precedes both.
 
 ### Write tools (FEAT-011)
 
@@ -459,7 +522,7 @@ of you and closing one channel says nothing about the others:
 | Egress channel | What is checked | Which tools | Forced? |
 |----------------|-----------------|-------------|---------|
 | **JSON response** | The tool is called at `ceiling=open` against a vault holding an `intimate` fragment whose title, body and tags each carry a unique sentinel; that sentinel must appear nowhere in the serialised response. | Thirteen of the fourteen `GATED` tools. Only `creek.draft` carries a recorded exemption, and its stated reason is executed rather than trusted, exactly as its prompt-channel one is: on a fixture this small the idea miner falls back to an ontology-tuple seed, so a successful draft comes back citing no fragment and carrying no corpus text of any tier — a canary assertion over that envelope could neither fail nor pass for a reason. (`creek.author` carried the second exemption until [#1279](https://github.com/Geoffe-Ga/Creek-Vault/issues/1279); every load-bearing clause of its reason was false — the desk answers `status: ok` with cited corpus content on a bare, offline fixture — and it is probed here now.) For `creek.skills.refresh` and `creek.classify.entry` the envelope sweep is a tripwire rather than evidence, and both say so at their probe: neither response can carry a sentinel even with its gate deleted, so each carries a stronger per-tool test alongside — the bytes of the tree `skills.refresh` writes, and the admitted/refused *verdict* for `classify.entry` under one fixed ceiling. | Yes, and twice over. A newly `GATED` tool must grow a probe or record a justified exemption; it cannot inherit silence. The exemption set is *pinned*, so a tool cannot move into it unnoticed, and every exemption must name a test that runs its reason — the two holes that let `creek.author`'s false reason stand. |
-| **Model prompt** | The tool is driven all the way *to* the provider with a recording client, and neither the `intimate` sentinel nor the above-ceiling **`personal`** one may appear in any prompt it sent — nor in the response of that same call ([#1036](https://github.com/Geoffe-Ga/Creek-Vault/issues/1036)). | `creek.reflect`, `creek.compile` and `creek.author`. `creek.draft` is exempt, and its stated reason is executed rather than trusted. **This column is derived, and a derived set is not an enumeration of every prompt channel on this surface** — read it as "the tools the derivation can reach", not as "the tools that talk to a model". `creek.classify` is one that sits outside it, and it is outside for two independent reasons: it is `METADATA_ONLY`, so it never enters the `GATED` candidate set, and `classify_tool` takes no LLM factory — so adding a factory alone would enrol nothing. With `method="llm"` it is nonetheless a whole-corpus prompt-channel egress at every tier and every ceiling. Its exclusion is now *pinned* rather than incidental, and it carries a separate per-tool probe asserting which provider each tier's body was dispatched to ([#1274](https://github.com/Geoffe-Ga/Creek-Vault/issues/1274)); it cannot share the assertion above, because for classify the `intimate` body legitimately reaches a prompt — the local one. | Yes. The set is *derived* from the tools' own signatures — a `GATED` tool taking both an LLM factory and a ceiling — so a tool cannot become model-backed without being asked for a prompt probe. **The derivation is keyed on posture and signature, not on provider reachability**, which is why a tool like `creek.classify` needs its own pin and probe; generalising it over all 25 `TOOL_POSTURES` entries is tracked in [#1749](https://github.com/Geoffe-Ga/Creek-Vault/issues/1749). |
+| **Model prompt** | The tool is driven all the way *to* the provider with a recording client, and neither the `intimate` sentinel nor the above-ceiling **`personal`** one may appear in any prompt it sent — nor in the response of that same call ([#1036](https://github.com/Geoffe-Ga/Creek-Vault/issues/1036)). | `creek.reflect`, `creek.compile` and `creek.author`. `creek.draft` is exempt, and its stated reason is executed rather than trusted. **This column is derived, and a derived set is not an enumeration of every prompt channel on this surface** — read it as "the tools the derivation can reach", not as "the tools that talk to a model". `creek.classify` is one that sits outside it, and it is outside for two independent reasons: it is `METADATA_ONLY`, so it never enters the `GATED` candidate set, and `classify_tool` takes no LLM factory — so adding a factory alone would enrol nothing. With `method="llm"` it is nonetheless a whole-corpus prompt-channel egress at every tier and every ceiling. Its exclusion is now *pinned* rather than incidental, and it carries a separate per-tool probe asserting which provider each tier's body was dispatched to ([#1274](https://github.com/Geoffe-Ga/Creek-Vault/issues/1274)); it cannot share the assertion above, because for classify the `intimate` body legitimately reaches a prompt — the local one. | Yes. The set is *derived* from the tools' own signatures — a `GATED` tool taking both an LLM factory and a ceiling — so a tool cannot become model-backed without being asked for a prompt probe. **The derivation is keyed on posture and signature, not on provider reachability**, which is why a tool like `creek.classify` needs its own pin and probe; generalising it over every `TOOL_POSTURES` entry is tracked in [#1749](https://github.com/Geoffe-Ga/Creek-Vault/issues/1749). |
 | **Disk artifacts** | The bytes the call writes into the vault carry no sentinel, and a refused call leaves the bytes it would have overwritten untouched. | `creek.report`, `creek.state.render`, `creek.journal`, `creek.upload`. | **No.** Four per-tool tests and no forcing function: nothing obliges the fifth artifact-writing tool to grow a fifth test. Tracked in [#1273](https://github.com/Geoffe-Ga/Creek-Vault/issues/1273). |
 
 The `warnings` field #1372 added to `creek.journal` and `creek.upload` needs no JSON-response probe of its own: it carries only `IngestRunResult.ceiling_safe_warnings`, proven content-free at the producer rather than filtered at this response boundary — see the per-tool doctrine under "Write tools" above.
@@ -864,7 +927,7 @@ routable by design and requires TLS.
   | Grant            | Tools |
   |------------------|-------|
   | `vault:read`     | `creek.handshake`, `creek.state.read`, `creek.wheel`, `creek.mine`, `creek.classify.entry`, `creek.lint` |
-  | `vault:desk`     | `creek.draft`, `creek.author`, `creek.reflect`, `creek.save` |
+  | `vault:desk`     | `creek.draft`, `creek.author`, `creek.reflect`, `creek.save`, `creek.jobs.read` |
   | `vault:journal`  | `creek.journal`, `creek.upload` |
   | `vault:pipeline` | `creek.classify`, `creek.link`, `creek.compile`, `creek.report`, `creek.skills.refresh`, `creek.ingest`, `creek.redact.scan`, `creek.state.render` |
 
