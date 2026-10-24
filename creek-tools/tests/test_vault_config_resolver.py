@@ -751,12 +751,15 @@ def test_build_server_binds_the_served_vault_into_its_default_llm_builder(
     _isolate(monkeypatch, tmp_path)
     bound: list[Path] = []
 
-    def _recording_builder(vault: Path, *_args: Any) -> Callable[..., None]:
+    def _recording_builder(
+        vault: Path, *_args: Any, **_scope: Any
+    ) -> Callable[..., None]:
         """Record the vault this builder was bound to and build nothing.
 
         Args:
             vault: The vault ``build_server`` bound in.
             *_args: The tier, which this seam does not assert on.
+            **_scope: The call's request key and route recorder (#1967).
 
         Returns:
             An inert callable, so a caller may invoke the result.

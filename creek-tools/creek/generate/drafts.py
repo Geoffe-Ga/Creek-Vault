@@ -132,6 +132,14 @@ logger = logging.getLogger(__name__)
 DRAFTS_SUBDIR: str = "07-Voice/Drafts"
 """Relative path under the vault where drafts are stored."""
 
+INFERENCE_SOURCE_FRONTMATTER_KEY: str = "inference_source"
+"""The draft frontmatter key naming the route that wrote the body (#1967).
+
+The same word, and the same closed vocabulary, as the ``inference_source``
+field ``/v1`` publishes on its model-backed answers (ADR-0016 D1.11), so a
+reader of a saved draft and a reader of a ``/v1`` answer ask one question.
+"""
+
 _FRAGMENTS_SUBDIR: str = "01-Fragments"
 _THREADS_SUBDIR: str = "02-Threads"
 _EDDIES_SUBDIR: str = "03-Eddies"
@@ -2685,7 +2693,9 @@ class DraftGenerator:
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
 
-    def save_draft(self, draft: Draft, vault_path: Path) -> Path:
+    def save_draft(
+        self, draft: Draft, vault_path: Path, *, inference_source: str | None = None
+    ) -> Path:
         """Write *draft* to ``07-Voice/Drafts/YYYY-MM-DD-{slug}.md``.
 
         The frontmatter captures every provenance field so the draft
@@ -2694,6 +2704,12 @@ class DraftGenerator:
         Args:
             draft: The draft to persist.
             vault_path: Vault root under which ``07-Voice/Drafts`` lives.
+            inference_source: The route that wrote the body — one of the
+                closed ``inference_source`` labels (``local``, ``pool:creek``,
+                ``pool:attested:<vendor>``, ``request_key:<vendor>``) the MCP
+                adapter recorded when it resolved the provider (#1967) — or
+                ``None`` to stamp nothing, as the CLI does. A route label,
+                never a key.
 
         Returns:
             The absolute path of the written markdown file.
@@ -2740,6 +2756,8 @@ class DraftGenerator:
             post[key] = value
         for key, value in voice_fields.items():
             post[key] = value
+        if inference_source is not None:
+            post[INFERENCE_SOURCE_FRONTMATTER_KEY] = inference_source
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         self._on_stage(CompositionStage.SAVED)
         return target

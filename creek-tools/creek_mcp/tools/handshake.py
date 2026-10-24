@@ -17,13 +17,16 @@ from __future__ import annotations
 import logging
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.policy import Transport, offered_ceilings
 from creek_mcp.tier_ceiling import TierCeiling
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +151,7 @@ def handshake_tool(
     auth: AuthMode,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
+    request_key_providers: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Negotiate vault presence, versions, tier model, and capability list.
 
@@ -195,12 +199,21 @@ def handshake_tool(
             not gate anything here, but it is audited like every other call.
         consumer: Free-form consumer identifier (e.g. ``"adepthood"``), recorded
             in the audit log.
+        request_key_providers: The vendors whose writer-supplied key
+            (ADR-0015, ``X-Creek-Provider`` + ``X-Creek-Provider-Key``) this
+            server would spend on ``creek.draft``, ``creek.author`` and
+            ``creek.reflect`` (#1967) — both on a managed vault served over
+            the network, none on a self-connected vault or over stdio. It
+            mirrors ``GET /v1/capabilities``. Defaults to none, the
+            conservative answer: an agent told nothing is told generation is
+            pool-or-local only, which is true of every server that cannot
+            spend a key.
 
     Returns:
         A dict with at least ``available``, ``contract_version``,
         ``ontology_version``, ``tiers``, and ``capabilities``, plus the
-        ``tier_model``, ``transport``, ``auth`` and ``server`` name for the
-        client.
+        ``tier_model``, ``transport``, ``auth``, ``request_key_providers`` and
+        ``server`` name for the client.
     """
     available = vault_available(vault_path)
     _record_call(
@@ -226,4 +239,5 @@ def handshake_tool(
             "intimate_never_egresses": True,
         },
         "capabilities": capabilities.copy(),
+        "request_key_providers": list(request_key_providers),
     }

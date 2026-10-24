@@ -1114,11 +1114,12 @@ def test_build_server_wires_the_production_author_llm_factory(
 
     reached: list[object] = []
 
-    def _recording(_vault: Path, tier: object) -> None:
+    def _recording(_vault: Path, tier: object, **_scope: object) -> None:
         """Record the tier the desk asked for and decline to voice.
 
         Takes the vault ``build_server`` binds with ``functools.partial`` since
-        #1409, so the stand-in has the production signature.
+        #1409, and the call's request key and route recorder since #1967, so
+        the stand-in has the production signature.
         """
         reached.append(tier)
         return None
@@ -1318,7 +1319,13 @@ def test_build_server_wires_the_production_draft_llm_factory(
                 generated_date=datetime(2026, 5, 11, tzinfo=UTC),
             )
 
-        def save_draft(self, draft: Draft, vault_path: Path) -> Path:
+        def save_draft(
+            self,
+            draft: Draft,
+            vault_path: Path,
+            *,
+            inference_source: str | None = None,
+        ) -> Path:
             """Persist a placeholder file so the tool can report its path."""
             del draft
             target = vault_path / "07-Voice" / "Drafts" / "2026-05-11-wired.md"
