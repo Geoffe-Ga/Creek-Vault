@@ -122,3 +122,40 @@ an upload, which does.
   `build_request_scoped_provider`) and is reached from three routes. A future
   route that wants a request key must opt in with
   `RouteSpec.accepts_request_key`, which also publishes the headers.
+
+## Amendment (2026-10-24, #1967): the MCP transport takes the same headers
+
+Since #1962 `/mcp` is served inside the `/v1` process, and the headers an agent
+sends reach the MCP SDK's request unchanged. Three MCP tools —
+`creek.draft`, `creek.author` and `creek.reflect` — now honour the same two
+headers on the network transport. This widens where the key may arrive, not
+what it may do:
+
+- **One decision, still.** `creek_mcp/httpapi/mcp_request_key.py` only extracts: it
+  parses the pair with the same `parse_request_key`, binds the result for the
+  one tool call, and the tool hands it to the same generation chokepoint the
+  `/v1` routes use. `request_key_admitted` and
+  `build_request_scoped_provider` remain the whole exception; the router
+  remains the one tier gate, so an intimate-derived draft is forced local or
+  refused.
+- **The same refusal.** A malformed pair is refused before dispatch with the
+  MCP refusal envelope carrying `/v1`'s fixed `invalid_request` message, and
+  audited as refused with no argument summary.
+- **Stdio never reads headers**, and a self-connected vault still ignores a
+  key. `creek.handshake` reports `request_key_providers` exactly as
+  `GET /v1/capabilities` does (empty over stdio).
+- **Held for one call, kept nowhere.** A composition that detaches past the
+  MCP deadline (#1966) carries the key in its worker's closure for that run;
+  the job record, its audit entries, its progress messages and the saved draft
+  never hold it. `tests/test_mcp_request_scoped_byok.py` sweeps a canary key
+  from every response, log record and file on the synchronous, detached and
+  vendor-`401` paths.
+- **The agent's credential is not a key.** Only `X-Creek-Provider-Key` is
+  read; an OAuth access token or static consumer token is never forwarded to a
+  vendor (#1963).
+- **Provenance.** A successful answer names its route in `inference_source`,
+  and a saved draft carries it in its frontmatter.
+
+Clients that cannot set custom headers — hosted Claude connectors and ChatGPT
+developer-mode connectors — run pool-or-local only; `docs/mcp.md` lists which
+clients can send them.

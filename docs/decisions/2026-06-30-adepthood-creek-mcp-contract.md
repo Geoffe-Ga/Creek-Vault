@@ -228,7 +228,8 @@ which.
   "tiers": ["open", "personal", "intimate"],
   "tier_model": { "ceilings": ["open", "personal", "intimate", "all"],
                   "default": "open", "intimate_never_egresses": true },
-  "capabilities": ["creek.classify", "creek.handshake", "creek.ingest", "..."]
+  "capabilities": ["creek.classify", "creek.handshake", "creek.ingest", "..."],
+  "request_key_providers": []
 }
 ```
 <!-- /capability-set -->
@@ -254,6 +255,19 @@ and `CREEK_MCP_AUTHORIZATION_SERVER` set; agents present Adepthood-issued JWTs
 whose audience is this vault's MCP URL, and static consumer tokens keep
 working beside them), `bearer` when only static consumer tokens are accepted,
 and `none` on the local `stdio` server, which authenticates nobody.
+
+`request_key_providers` (#1967, ADR-0015) names the vendors whose
+writer-supplied key this server would spend on `creek.draft`, `creek.author`
+and `creek.reflect`: `["anthropic", "openai"]` on a managed vault served over
+`network`, `[]` on a self-connected vault and always `[]` over `stdio`, which
+carries no headers. It mirrors `GET /v1/capabilities`. An agent that cannot
+send `X-Creek-Provider` and `X-Creek-Provider-Key` — or that is told `[]` —
+should read generation on this vault as pool-or-local only. A malformed pair
+on one of those three tools is a `status: "refused"` envelope carrying `/v1`'s fixed
+`invalid_request` message, and neither header value is echoed or audited. A
+successful answer from those tools carries `inference_source` — the same closed
+label `/v1` publishes — and a `creek.draft` stamps it into the saved draft's
+frontmatter; it is absent when no route was recorded.
 
 ### Journal entry — `creek.journal`
 

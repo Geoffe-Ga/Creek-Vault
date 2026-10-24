@@ -24,6 +24,21 @@ to locate the originating commit for any reference below.
   `personal` as `"outcome": "refused"` under the tool name only, so such an
   attempt shows on the card. `0.21` stays served.
 
+- Honour a writer's request-scoped provider key on `/mcp` (#1967, ADR-0015).
+  `creek.draft`, `creek.author` and `creek.reflect` read `X-Creek-Provider` and
+  `X-Creek-Provider-Key` off the streamable-HTTP request (network transport
+  only; stdio never reads headers) through the same parse `/v1` uses, and hand
+  the key to the same generation chokepoint, so a managed vault drafts,
+  authors and reflects with the writer's own vendor for OPEN and PERSONAL while
+  an intimate-derived call is still forced local or refused. A malformed pair is
+  refused before dispatch with `/v1`'s fixed `invalid_request` message, audited
+  as refused with no argument summary. The key stays in memory for the one call
+  — through a detached composition's worker — and never reaches a log, audit
+  entry, job record, progress message or file. `creek.handshake` reports
+  `request_key_providers` as `GET /v1/capabilities` does; a successful answer
+  carries `inference_source`, and a saved draft's frontmatter names it.
+  `docs/mcp.md` lists which clients can send the headers.
+
 - Serve the MCP streamable-HTTP server at `/mcp` from the `/v1` process (#1962).
   `create_app()` builds it with `build_server(transport=NETWORK)` and the same
   `ConsumerTokenVerifier` instance as `/v1`, mounted below the access log and
