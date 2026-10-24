@@ -2,7 +2,7 @@
 
 :func:`build_bundle` renders the whole of ``docs/contracts/adepthood-v1/`` from
 the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, a
-10x7 matrix of worked example responses, the retry table, and a manifest that
+11x7 matrix of worked example responses, the retry table, and a manifest that
 hashes every one of them. :func:`write_bundle` materialises it.
 
 **Why generate it instead of hand-writing it.** A hand-written fixture bundle
@@ -30,7 +30,7 @@ its whole error-handling surface against fixtures:
 - ``refusal`` — an :class:`~creek_mcp.api.models.ErrorEnvelope` carrying
   ``privacy_refused``. **These are the intimate examples, and every one of them
   is a refusal rather than a success** — that is the point of publishing them.
-- ``care-escalation`` — ``reflections`` and ``letters`` only; the other eight
+- ``care-escalation`` — ``reflections`` and ``letters`` only; the other nine
   cells are :class:`~creek_mcp.api.models.NotApplicableExample`, because the
   acute-distress guard runs only on those two paths.
 - ``malformed-input`` / ``incompatible-version`` / ``unavailable-service`` —
@@ -70,6 +70,7 @@ from creek_mcp.api.models import (
     OK_STATUS,
     RETRY_POLICY,
     SUPPORTED_CONTRACT_MINORS,
+    AgentActivityOutcome,
     CapabilitiesStatus,
     Capability,
     ClassificationMethod,
@@ -178,6 +179,7 @@ UNREACHABLE_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
             if capability not in _ESCALATING_CAPABILITIES
         ),
         (Capability.JOURNAL_WITHDRAW.value, _STATE_REFUSAL),
+        (Capability.AGENT_ACTIVITY.value, _STATE_REFUSAL),
     }
 )
 """The matrix cells that have no reachable response shape.
@@ -187,7 +189,10 @@ the matrix it describes. The acute-distress guard runs only on the
 reflection and letter paths (:data:`_ESCALATING_CAPABILITIES`), so every other
 capability can never escalate. Journal withdrawal additionally
 has no privacy-refusal state: foreign, absent, and already-withdrawn resources
-are deliberately indistinguishable successes. Each cell is filled with a
+are deliberately indistinguishable successes. Agent activity has none
+either: it resolves no vault object and reads no content, only the audit
+chain's content-free projection, and an inadmissible ceiling header is refused
+at the edge as ``invalid_request``. Each cell is filled with a
 :class:`~creek_mcp.api.models.NotApplicableExample` that says why.
 """
 
@@ -224,7 +229,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "inference_pool": True,
     "keyless_inference": True,
 }
-"""A ready managed server: vault present, all ten capabilities served, a
+"""A ready managed server: vault present, all eleven capabilities served, a
 writer's own Anthropic or OpenAI key accepted per request (#1873), and model
 calls answered from the shared confidential inference pool (#1894)."""
 
@@ -613,6 +618,54 @@ _WITHDRAWAL_REFUSAL_UNREACHABLE_PAYLOAD: Final[dict[str, Any]] = {
 }
 """Why journal withdrawal has no object-state refusal response."""
 
+_AGENT_ACTIVITY_REFUSAL_UNREACHABLE_PAYLOAD: Final[dict[str, Any]] = {
+    "unreachable": True,
+    "reason": (
+        "agent activity resolves no vault object and reads no content, only "
+        "the audit chain's content-free projection, so it has no "
+        "privacy-refusal response shape"
+    ),
+}
+"""Why agent activity has no privacy-refusal response (#1968)."""
+
+_EXAMPLE_AGENT_CONSUMER: Final[str] = "acct_91"
+"""A synthetic agent consumer stamp, in the shape an OAuth client id takes."""
+
+_AGENT_ACTIVITY_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.OPEN.value,
+    "skipped": 0,
+    "rows": [
+        {
+            "consumer": _EXAMPLE_AGENT_CONSUMER,
+            "tool": "creek.draft",
+            "at": "2026-10-24T18:02:11Z",
+            "outcome": AgentActivityOutcome.ADMITTED.value,
+        },
+        {
+            "consumer": _EXAMPLE_AGENT_CONSUMER,
+            "tool": "creek.link",
+            "at": "2026-10-24T18:01:50Z",
+            "outcome": AgentActivityOutcome.REFUSED.value,
+        },
+        {
+            "consumer": "adepthood",
+            "tool": "creek.journal",
+            "at": "2026-10-24T17:40:03Z",
+            "outcome": AgentActivityOutcome.ADMITTED.value,
+        },
+    ],
+}
+"""An agent's draft, its refused re-sort, and the app's own journal write."""
+
+_AGENT_ACTIVITY_EMPTY: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.OPEN.value,
+    "skipped": 0,
+    "rows": [],
+}
+"""A vault no agent has called yet: no rows, and emphatically not an error."""
+
 _EXAMPLE_FREQUENCY_COUNT: Final[int] = 1
 """One classified fragment per frequency, so the shares are readable."""
 
@@ -664,7 +717,7 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 
 
 # --------------------------------------------------------------------------
-# The 10 x 7 matrix
+# The 11 x 7 matrix
 # --------------------------------------------------------------------------
 
 _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
@@ -707,6 +760,10 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.LETTERS.value: _Example(
         model="LetterResponse",
         payload=_LETTER_SUCCESS,
+    ),
+    Capability.AGENT_ACTIVITY.value: _Example(
+        model="AgentActivityResponse",
+        payload=_AGENT_ACTIVITY_SUCCESS,
     ),
 }
 """The ``success`` column: one canonical happy response per capability.
@@ -760,15 +817,26 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
         model="LetterResponse",
         payload=_LETTER_EMPTY,
     ),
+    Capability.AGENT_ACTIVITY.value: _Example(
+        model="AgentActivityResponse",
+        payload=_AGENT_ACTIVITY_EMPTY,
+    ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""
+
+
+_REFUSAL_UNREACHABLE_PAYLOADS: Final[dict[str, dict[str, Any]]] = {
+    Capability.JOURNAL_WITHDRAW.value: _WITHDRAWAL_REFUSAL_UNREACHABLE_PAYLOAD,
+    Capability.AGENT_ACTIVITY.value: _AGENT_ACTIVITY_REFUSAL_UNREACHABLE_PAYLOAD,
+}
+"""Why each capability with no ``refusal`` shape has none, keyed by capability."""
 
 
 def _unreachable_example(capability: str, state: str) -> _Example:
     """Return the reason-bearing marker for one unreachable matrix cell."""
     payload = (
-        _WITHDRAWAL_REFUSAL_UNREACHABLE_PAYLOAD
-        if (capability, state) == (Capability.JOURNAL_WITHDRAW.value, _STATE_REFUSAL)
+        _REFUSAL_UNREACHABLE_PAYLOADS[capability]
+        if state == _STATE_REFUSAL
         else _CARE_UNREACHABLE_PAYLOAD
     )
     return _Example(model="NotApplicableExample", payload=payload)
@@ -782,7 +850,7 @@ def _care_example(capability: str) -> _Example:
 
     Returns:
         The real escalation envelope for ``reflections`` and ``letters``; an
-        explicit unreachability marker for the eight that cannot escalate.
+        explicit unreachability marker for the nine that cannot escalate.
     """
     if (capability, _STATE_CARE_ESCALATION) in UNREACHABLE_CELLS:
         return _unreachable_example(capability, _STATE_CARE_ESCALATION)
@@ -983,7 +1051,7 @@ def build_bundle() -> dict[str, str]:
 
     Returns:
         Every generated file: ``schemas/<Model>.schema.json`` for each
-        published model, ``examples/<capability>/<state>.json`` for all 70
+        published model, ``examples/<capability>/<state>.json`` for all 77
         matrix cells, ``retry-policy.json``, and ``manifest.json``. The
         committed bundle must equal this exactly, minus the docs-owned
         ``README.md``.

@@ -240,6 +240,7 @@ from typing import TYPE_CHECKING
 
 from creek.classify.privacy_filter import filter_fragments_by_tier
 from creek.vault.reader import iter_vault_fragments
+from creek_mcp.policy import Grant
 from creek_mcp.tier_ceiling import refusal_response, tier_allowed, to_privacy_override
 
 if TYPE_CHECKING:
@@ -295,6 +296,12 @@ class ToolPosture:
         rationale: The specific, checkable fact that justifies *posture* —
             this is the audit record, and it is meant to be read against the
             tool's source rather than taken on trust.
+        grant: The :class:`~creek_mcp.policy.Grant` a remote consumer must
+            hold to reach the tool (#1964), or ``None`` for a tool in no
+            profile — exactly the ``AUTH_TOKEN`` purge tools. Required, with no
+            default, so a new entry has to decide it; the authority is
+            :data:`creek_mcp.policy.TOOL_GRANTS`, and
+            ``tests/test_mcp_tool_grants.py`` asserts this column equals it.
         gate_module: Dotted path of the module holding the gate. Set on
             ``GATED`` entries only.
         gate_symbol: Name of the gate callable within *gate_module*. Set on
@@ -307,6 +314,7 @@ class ToolPosture:
 
     posture: ReadPosture
     rationale: str
+    grant: Grant | None
     gate_module: str | None = None
     gate_symbol: str | None = None
     gap_issue: int | None = None
@@ -384,6 +392,7 @@ _PURGE_RATIONALE = (
 TOOL_POSTURES: dict[str, ToolPosture] = {
     "creek.handshake": ToolPosture(
         posture=ReadPosture.NO_UNSUPPLIED_READ,
+        grant=Grant.READ,
         rationale=(
             "Returns tool names, the contract and ontology versions and the "
             "tier model itself — no vault content of any kind."
@@ -391,6 +400,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.reflect": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.DESK,
         rationale=(
             "Three unsupplied reads, under three gates. (1) An entry_ref "
             "resolves a fragment the caller did not supply; _above_ceiling "
@@ -415,6 +425,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.compile": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.PIPELINE,
         rationale=(
             "Source fragment_ids name fragments the caller did not supply; "
             "_survey_sources ranks every one of them with write_tier_allowed "
@@ -431,6 +442,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.wheel": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.READ,
         rationale=(
             "Converts the ceiling to a PrivacyTierOverride and threads it "
             "into the corpus walk via tier_within_override, so above-ceiling "
@@ -441,6 +453,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.mine": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.READ,
         rationale=(
             "Converts the ceiling to a PrivacyTierOverride and threads it "
             "into IdeaMiner's corpus walk, so above-ceiling fragments are "
@@ -451,6 +464,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.draft": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.DESK,
         rationale=(
             "Converts the ceiling to a PrivacyTierOverride and threads it "
             "into DraftGenerator's corpus walk, so above-ceiling fragments "
@@ -461,6 +475,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.author": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.DESK,
         rationale=(
             "Converts the ceiling to a PrivacyTierOverride and threads it "
             "into the Writing Desk specialists (#660), so above-ceiling "
@@ -471,6 +486,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.report": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.PIPELINE,
         rationale=(
             "Converts the ceiling with to_privacy_override and threads it "
             "into all six generators (tags, voice, lexicon, decisions, "
@@ -490,6 +506,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.state.read": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.READ,
         rationale=(
             "Refuses, rather than excludes, on the artifact's own privacy_tier "
             "stamp: its target is one atomic cached artifact, so there is "
@@ -511,6 +528,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.state.render": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.PIPELINE,
         rationale=(
             "Converts the ceiling with to_privacy_override and threads it "
             "into StateReportGenerator, which admits ten of its eleven "
@@ -542,6 +560,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.skills.refresh": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.PIPELINE,
         rationale=(
             "Converts the ceiling with to_privacy_override and threads it "
             "into SkillTreeGenerator, whose corpus walk admits a fragment "
@@ -596,6 +615,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.journal": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.JOURNAL,
         rationale=(
             "The entry body is the caller's own and write_tier_allowed gates "
             "the tier it creates, but the idempotent update-in-place destroys "
@@ -636,6 +656,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.upload": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.JOURNAL,
         rationale=(
             "creek.journal's gate applied to document bytes instead of text "
             "(#1023). The uploaded bytes are the caller's own and "
@@ -672,6 +693,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.lint": ToolPosture(
         posture=ReadPosture.METADATA_ONLY,
+        grant=Grant.READ,
         rationale=(
             "The checks read fragment frontmatter (paradox, unnamed and "
             "orphan-compiled scan 01-Fragments), never bodies; the MCP "
@@ -695,16 +717,35 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "whole-or-nothing decision creek state did."
         ),
     ),
+    "creek.jobs.read": ToolPosture(
+        posture=ReadPosture.METADATA_ONLY,
+        grant=Grant.DESK,
+        rationale=(
+            "Reads one job record the caller itself started and returns its "
+            "state plus the result that record stores. That result is not read "
+            "from the corpus at all: it is the projection draft_job_result / "
+            "author_job_result made of the composing tool's own success "
+            "envelope when the job finished -- a draft path, provenance counts "
+            "and status words, with the body, title, query, claims and "
+            "fragment ids dropped -- so nothing above any ceiling can be in it, "
+            "and the ceiling is audited for the trail, not enforced (#1966). "
+            "composition_job_for refuses another consumer's id, a /v1 pipeline "
+            "id, and an unknown or malformed id with one identical refusal."
+        ),
+    ),
     "creek.link": ToolPosture(
         posture=ReadPosture.METADATA_ONLY,
+        grant=Grant.PIPELINE,
         rationale=_COUNTS_ONLY_RATIONALE,
     ),
     "creek.classify": ToolPosture(
         posture=ReadPosture.METADATA_ONLY,
+        grant=Grant.PIPELINE,
         rationale=_CLASSIFY_PROMPT_CHANNEL_RATIONALE,
     ),
     "creek.classify.entry": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.READ,
         rationale=(
             "One unsupplied read: an entry_ref names a fragment the caller "
             "did not supply, and the tool hands back that fragment's "
@@ -733,6 +774,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.redact.scan": ToolPosture(
         posture=ReadPosture.GATED,
+        grant=Grant.PIPELINE,
         rationale=(
             "Closed by narrowing the tool's domain, not by filtering its "
             "output: the scan is a regex pass over bytes that reads no "
@@ -808,6 +850,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.save": ToolPosture(
         posture=ReadPosture.NO_UNSUPPLIED_READ,
+        grant=Grant.DESK,
         rationale=(
             "The content is the caller's own; write_tier_allowed gates the "
             "tier the call would create."
@@ -815,6 +858,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.ingest": ToolPosture(
         posture=ReadPosture.NO_UNSUPPLIED_READ,
+        grant=Grant.PIPELINE,
         rationale=(
             "The content is the caller's own — a source path they supplied — "
             "and write_tier_allowed gates the tier the call would create."
@@ -822,22 +866,27 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.purge.fragment": ToolPosture(
         posture=ReadPosture.AUTH_TOKEN,
+        grant=None,
         rationale=_PURGE_RATIONALE,
     ),
     "creek.purge.source": ToolPosture(
         posture=ReadPosture.AUTH_TOKEN,
+        grant=None,
         rationale=_PURGE_RATIONALE,
     ),
     "creek.purge.classifications": ToolPosture(
         posture=ReadPosture.AUTH_TOKEN,
+        grant=None,
         rationale=_PURGE_RATIONALE,
     ),
     "creek.purge.daterange": ToolPosture(
         posture=ReadPosture.AUTH_TOKEN,
+        grant=None,
         rationale=_PURGE_RATIONALE,
     ),
     "creek.purge.vault": ToolPosture(
         posture=ReadPosture.AUTH_TOKEN,
+        grant=None,
         rationale=(
             f"{_PURGE_RATIONALE} It additionally requires a matching "
             "confirm_vault_path."

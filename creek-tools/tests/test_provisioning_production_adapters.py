@@ -640,3 +640,46 @@ def test_real_adapters_reconcile_full_fake_provider_and_callback_lifecycle(
         delete_rotation,
     ):
         assert canary.encode() not in persisted
+
+
+@pytest.mark.asyncio
+async def test_routing_verifier_resolves_a_verified_agent_subject_to_its_owner(
+    tmp_path: Path,
+) -> None:
+    """An agent token's ``sub`` selects the owner the same scan would (#1963)."""
+    manager = _secret_manager(tmp_path)
+    issued = manager.issue(_ACTIVATION, _CONSUMER, requester_identity=_REQUESTER)
+    verifier = EncryptedFileRoutingCredentialVerifier(
+        tmp_path / "runtime-secrets",
+        master_key_file=tmp_path / "master-key",
+    )
+
+    owner = await verifier.principal_for_consumer(_CONSUMER)
+    stranger = await verifier.principal_for_consumer("someone-else")
+
+    assert owner == RoutingPrincipal(_REQUESTER, _CONSUMER, issued.replay_state)
+    assert stranger is None
+
+
+@pytest.mark.asyncio
+async def test_routing_verifier_refuses_a_revoked_or_shared_agent_subject(
+    tmp_path: Path,
+) -> None:
+    """Two owners for one consumer, or a revoked one, fail closed (#1963)."""
+    manager = _secret_manager(tmp_path)
+    manager.issue(_ACTIVATION, _CONSUMER, requester_identity=_REQUESTER)
+    verifier = EncryptedFileRoutingCredentialVerifier(
+        tmp_path / "runtime-secrets",
+        master_key_file=tmp_path / "master-key",
+    )
+    manager.issue("activation-second-owner", _CONSUMER, requester_identity="other")
+
+    assert await verifier.principal_for_consumer(_CONSUMER) is None
+
+    manager.revoke("activation-second-owner")
+    remaining = await verifier.principal_for_consumer(_CONSUMER)
+    assert remaining is not None
+    assert remaining.requester_identity == _REQUESTER
+
+    manager.revoke(_ACTIVATION)
+    assert await verifier.principal_for_consumer(_CONSUMER) is None

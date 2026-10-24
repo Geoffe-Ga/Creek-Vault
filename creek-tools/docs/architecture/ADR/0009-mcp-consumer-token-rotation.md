@@ -163,3 +163,62 @@ exactly the moment a fresh secret is typed in.
   That is a materially different transport/verification design (likely
   requiring the derived-credential path above) and would be its own ADR, not
   an amendment to this one.
+
+## Amended by #1963 (2026-10-24)
+
+This record stays as written. Its "Revisit when" named a new auth scheme as
+the trigger for short-lived credentials, and #1963 supplies one: Adepthood is
+now an OAuth 2.1 authorization server and the vault's `/mcp` is its resource
+server. What changes, and what does not:
+
+- **Short-lived credentials exist for agents.** When the control plane sets
+  `CREEK_MCP_RESOURCE_URL` and `CREEK_MCP_AUTHORIZATION_SERVER`, `/mcp`
+  publishes RFC 9728 protected-resource metadata, answers an unauthenticated
+  call `401` with a challenge pointing at it, and accepts Adepthood-issued
+  RS256/ES256 JWTs verified against the issuer's JWKS, with the issuer pinned
+  and the audience equal to the vault's own MCP URL. Revoking an agent is
+  Adepthood's job: its access token lives ten minutes, and its refresh token
+  is revoked there. No vault restart is involved.
+- **Static tokens stay, for self-hosted vaults and for Adepthood's own
+  service bearer.** A composed verifier tries a JWT-shaped bearer as a JWT
+  first and otherwise uses the constant-time static match this ADR decided.
+  A vault with no issuer configured serves no metadata and behaves exactly as
+  before. The overlapping-window rotation runbook is unchanged for those
+  tokens; #1965 removes its restarts.
+- **`/v1` is unchanged.** It authenticates static consumer tokens only. An
+  agent's JWT is an `/mcp` credential.
+
+## Amended by #1965 (2026-10-24)
+
+This record stays as written; #1965 removes the restarts its runbook needed
+wherever the token set lives in a file, and answers the "Revisit when" bullet
+about revocation-without-restart for that case without the derived-credential
+redesign it anticipated.
+
+- **A mounted secret file is followed, not read once.** The container image
+  and the Fly vault Machine serve a
+  `creek_mcp.credential_reload.ReloadingConsumerTokenVerifier`: the one
+  verifier instance `/v1` and `/mcp` hold re-reads its file at most once every
+  5 s, on a request, compares a SHA-256 of the bytes, and swaps the parsed set
+  in one assignment. Widening the set (step 3) and narrowing it (step 6, the
+  step that revokes) are therefore edits, effective within 5 s. Polling was
+  chosen over inotify because it behaves the same on a Fly secret mount, a
+  Docker bind mount and a Kubernetes projected volume.
+- **The same fail-closed parse, and the previous set on refusal.** A reload is
+  parsed by the boot-time parser, so the 32-character floor, the
+  repeated-consumer refusal and the global token-uniqueness refusal this ADR
+  decided all hold on reload. A refused file is named on stderr once, without a
+  token value, and the previous set keeps serving; nothing is served
+  half-parsed. A container may rotate its one identity's tokens and grants but
+  not replace the identity, because per-consumer state is built from it at
+  start.
+- **The rotation notice fires on reload as it does at start**, so "the notice is
+  the only pressure against a window left open" now holds between restarts too.
+- **The environment is unchanged.** `CREEK_MCP_CONSUMER_TOKENS` is still read
+  once per process, so `creek-tools-mcp` and `creek-tools-api` keep both
+  restarts. The credentials are still static, long-lived secrets, and the
+  window is still operator-bounded; only the restart is gone.
+- **The issuer's signing key rotates without a restart too.** An OAuth vault's
+  JWKS cache (#1963) accepts a newly published key within a minute of its first
+  use and refuses a removed one after the next successful refresh; an issuer
+  outage keeps the last good key set and is logged once.

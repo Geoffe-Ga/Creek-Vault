@@ -59,7 +59,14 @@ from typing import Final, Literal, Self, TypeAlias
 from urllib.parse import urlparse
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from creek_mcp.contract import CONTRACT_VERSION
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
@@ -83,6 +90,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.21",
     "0.20",
     "0.19",
     "0.18",
@@ -228,6 +236,11 @@ response exactly as that minor published it. It is 0.21 and not 0.20 precisely
 because 0.20 had already shipped: see that constant for why reusing a published
 minor would have been the break this window exists to prevent.
 
+Contract 0.22 (#1968) adds the ``agent-activity`` capability, one read route
+and three wire models. Every older response is byte-identical, and the
+since-minor gate both withholds the capability from a ``0.21`` caller's
+handshake and refuses it the route, so ``0.21`` stays in the window.
+
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
 version alone silently drops the outgoing current minor out of this window and
@@ -290,7 +303,7 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The ten capabilities ``/v1`` publishes.
+    """The eleven capabilities ``/v1`` publishes.
 
     The list was identical for every minor in
     :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
@@ -347,6 +360,9 @@ class Capability(StrEnum):
         LETTERS: The vault writes one margin note's Voice Draft letter and
             stores it at a caller-owned external id. Since contract 0.17
             (#1862).
+        AGENT_ACTIVITY: A content-free projection of the MCP audit chain —
+            who asked the vault for what, when, and whether it was admitted.
+            Since contract 0.22 (#1968).
     """
 
     CAPABILITIES = "capabilities"
@@ -359,6 +375,7 @@ class Capability(StrEnum):
     VOICE_DRAFTS = "voice-drafts"
     JOURNAL_WITHDRAW = "journal-withdraw"
     LETTERS = "letters"
+    AGENT_ACTIVITY = "agent-activity"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -412,6 +429,13 @@ _LETTERS_MINOR: Final[str] = "0.17"
 
 Literal so a later contract bump cannot hide the capability from clients that
 correctly vendored 0.17.
+"""
+
+_AGENT_ACTIVITY_MINOR: Final[str] = "0.22"
+"""The minor ``agent-activity`` was published at (#1968).
+
+Literal so a later contract bump cannot hide the capability from clients that
+correctly vendored 0.22.
 """
 
 REQUEST_KEYS_SINCE_MINOR: Final[str] = "0.18"
@@ -587,6 +611,7 @@ CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.VOICE_DRAFTS: _VOICE_DRAFTS_MINOR,
     Capability.JOURNAL_WITHDRAW: _JOURNAL_WITHDRAW_MINOR,
     Capability.LETTERS: _LETTERS_MINOR,
+    Capability.AGENT_ACTIVITY: _AGENT_ACTIVITY_MINOR,
 }
 """The contract minor each capability was first published at.
 
@@ -2665,6 +2690,161 @@ class WheelResponse(_WireModel):
     wheel: WheelFrequencies = Field(description="The ten frequency slices.")
 
 
+# --------------------------------------------------------------------------
+# Agent activity (#1968)
+# --------------------------------------------------------------------------
+
+AGENT_ACTIVITY_DEFAULT_LIMIT: Final[int] = 50
+"""How many rows ``GET /v1/agent-activity`` returns when ``limit`` is absent."""
+
+AGENT_ACTIVITY_MAX_LIMIT: Final[int] = 200
+"""The most rows one ``GET /v1/agent-activity`` returns.
+
+A clamp, not a refusal: ``limit=500`` is answered with two hundred rows. The
+route is an activity card, not a log viewer, and a larger page would only make
+the read behind it longer for a person who cannot use that many rows anyway.
+"""
+
+_MAX_ACTIVITY_CONSUMER_CHARS: Final[int] = 256
+"""Upper bound on a row's ``consumer``: an identity stamp, never a sentence."""
+
+_MAX_ACTIVITY_TOOL_CHARS: Final[int] = 128
+"""Upper bound on a row's ``tool``: comfortably above the longest tool name."""
+
+AGENT_ACTIVITY_CONSUMER_PATTERN: Final[str] = "^[^\u0000-\u001f\u007f]+$"
+"""What a row's ``consumer`` may be made of: no control characters, no newlines.
+
+Consumer stamps are operator-configured names or a credential's client id, so
+the vocabulary is open; the pattern keeps it one printable line, so an entry
+cannot smuggle a second line of text into a consumer's rendering.
+"""
+
+AGENT_ACTIVITY_TOOL_PATTERN: Final[str] = (
+    "^(?:[a-z][a-z0-9_-]*(?:\\.[a-z0-9_-]+)*|<unregistered>)$"
+)
+"""What a row's ``tool`` may be: a dotted tool name, or the unregistered stamp.
+
+Every tool writes a fixed, server-side dotted name (``creek.draft``,
+``creek.voice-draft.read``), and an out-of-profile call for a name that is not
+a registered tool is audited as ``<unregistered>``
+(:data:`creek_mcp.server.UNREGISTERED_TOOL_AUDIT_NAME`). A pattern rather than
+an enum so a new tool is not a contract change, and narrow enough that a tool
+field can never carry prose: no space, no capital, no punctuation but ``.``,
+``_`` and ``-``.
+"""
+
+
+class AgentActivityOutcome(StrEnum):
+    """Whether one call got past the server's pre-dispatch gates.
+
+    Closed at two members on purpose. The audit chain records a pre-dispatch
+    refusal — an out-of-profile tool (#1964) or a remote ceiling above
+    ``personal`` (#1968) — and records nothing about how a tool that *ran*
+    answered: by the read-gate discipline (:mod:`creek_mcp.read_gate`), a tool
+    logs the attempt before resolving its target and never the result, so the
+    trail cannot answer "did consumer X read fragment F?". ``admitted``
+    therefore means "dispatched to the tool", not "returned content", and
+    the projection cannot say more without becoming that oracle.
+
+    Attributes:
+        ADMITTED: The call passed every pre-dispatch gate and reached its tool.
+        REFUSED: The call was refused before any tool ran.
+    """
+
+    ADMITTED = "admitted"
+    REFUSED = "refused"
+
+
+class AgentActivityQuery(_WireModel):
+    """The query string ``GET /v1/agent-activity`` accepts, and nothing else.
+
+    Published as a model so the bounds a consumer reads and the bounds the
+    server validates are one declaration. Closed like every wire model: an
+    unknown parameter — a consumer filter, say — is ``invalid_request`` rather
+    than silently ignored, because nothing is hidden by consumer.
+
+    Attributes:
+        limit: The most rows wanted, newest first. Values above
+            :data:`AGENT_ACTIVITY_MAX_LIMIT` are clamped to it.
+        since: An inclusive lower bound on ``at``, with an explicit offset. A
+            ``since`` older than the log's first entry returns from the start.
+    """
+
+    limit: int = Field(
+        default=AGENT_ACTIVITY_DEFAULT_LIMIT,
+        ge=1,
+        description=(
+            "Most rows to return, newest first; values above "
+            f"{AGENT_ACTIVITY_MAX_LIMIT} are clamped to {AGENT_ACTIVITY_MAX_LIMIT}."
+        ),
+    )
+    since: AwareDatetime | None = Field(
+        default=None,
+        description="Inclusive lower bound on at, with an explicit UTC offset.",
+    )
+
+
+class AgentActivityRow(_WireModel):
+    """One MCP call, reduced to who, what, when and whether.
+
+    Four fields, and never a fifth. The audit entry behind a row also carries
+    an argument summary, the caller's ceiling, write-side paths and fragment
+    ids, and two hashes; none of them crosses, because each is either derived
+    from what the caller sent or names an object in the vault.
+
+    Attributes:
+        consumer: The audit stamp — the bearer's consumer or the credential's
+            client id — verbatim, so the app's own ``adepthood`` calls are
+            labelled as such.
+        tool: The tool name the entry was written under.
+        at: When the call was audited, in UTC, to the whole second.
+        outcome: Whether the call got past the pre-dispatch gates.
+    """
+
+    consumer: str = Field(
+        min_length=1,
+        max_length=_MAX_ACTIVITY_CONSUMER_CHARS,
+        pattern=AGENT_ACTIVITY_CONSUMER_PATTERN,
+        description="The audit stamp of the caller.",
+    )
+    tool: str = Field(
+        max_length=_MAX_ACTIVITY_TOOL_CHARS,
+        pattern=AGENT_ACTIVITY_TOOL_PATTERN,
+        description="The tool the call asked for.",
+    )
+    at: AwareDatetime = Field(description="When the call was audited, UTC.")
+    outcome: AgentActivityOutcome = Field(
+        description="Whether the call got past the pre-dispatch gates.",
+    )
+
+
+class AgentActivityResponse(_WireModel):
+    """The most recent MCP calls against this vault, newest first.
+
+    Attributes:
+        status: Always ``"ok"``. An empty or absent log is ``rows: []``, not
+            an error.
+        tier_ceiling: The caller's declared ceiling, echoed for uniformity.
+            The route reads no content, so it filters nothing.
+        skipped: How many lines of the log could not be projected — malformed
+            JSON, a missing or out-of-pattern field, an outcome the closed
+            enum cannot name. Counted over the whole log, because a line that
+            cannot be read has no trustworthy instant to filter on.
+        rows: At most :data:`AGENT_ACTIVITY_MAX_LIMIT` calls, newest first.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Caller's declared ceiling.")
+    skipped: int = Field(
+        ge=_MIN_COUNT,
+        description="Log lines that could not be projected.",
+    )
+    rows: list[AgentActivityRow] = Field(
+        max_length=AGENT_ACTIVITY_MAX_LIMIT,
+        description="The most recent calls, newest first.",
+    )
+
+
 class NotApplicableExample(_WireModel):
     """Marks a fixture-matrix cell that has no response shape to document.
 
@@ -2697,6 +2877,9 @@ class NotApplicableExample(_WireModel):
 
 
 CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
+    "AgentActivityQuery": AgentActivityQuery,
+    "AgentActivityResponse": AgentActivityResponse,
+    "AgentActivityRow": AgentActivityRow,
     "CapabilitiesResponse": CapabilitiesResponse,
     "CareEscalationResponse": CareEscalationResponse,
     "CareResource": CareResource,

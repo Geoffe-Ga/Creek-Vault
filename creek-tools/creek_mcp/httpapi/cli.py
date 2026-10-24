@@ -54,12 +54,13 @@ from creek_mcp.api.openapi import build_openapi
 from creek_mcp.httpapi import SERVER_NAME
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.auth import build_verifier
-from creek_mcp.remote_auth import announce_rotation_window
+from creek_mcp.remote_auth import announce_rotation_window, announce_ungated_consumers
 from creek_mcp.transport_posture import require_transport_confidentiality
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette
 
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
     from creek_mcp.remote_auth import ConsumerTokenVerifier
 
 DEFAULT_API_PORT: Final[int] = 8823
@@ -180,6 +181,34 @@ def _verifier_or_exit(parser: argparse.ArgumentParser) -> ConsumerTokenVerifier:
     return verifier
 
 
+def _agent_verifier_or_exit(
+    parser: argparse.ArgumentParser,
+) -> JwtAgentTokenVerifier | None:
+    """Return the OAuth agent-token verifier, or exit naming the setting to fix.
+
+    ``/mcp`` on this app becomes an OAuth resource server when
+    ``CREEK_MCP_RESOURCE_URL`` and ``CREEK_MCP_AUTHORIZATION_SERVER`` are both
+    set (#1963); with neither it serves static consumer tokens exactly as
+    before. ``/v1`` is the static registry's either way.
+
+    Args:
+        parser: The parser, used to report errors in argparse style.
+
+    Returns:
+        The verifier, or ``None`` on a bearer-only vault.
+    """
+    # Lazy, so importing this CLI module keeps PyJWT out of the root-time
+    # import surface the container bootstrap measures.
+    from creek_mcp.agent_tokens import build_agent_verifier
+
+    try:
+        return build_agent_verifier()
+    except ValueError as exc:
+        # A half-configured or unsafe resource server. The message names the
+        # settings, never their values.
+        parser.error(str(exc))
+
+
 def build_uvicorn_config(app: Starlette, args: argparse.Namespace) -> uvicorn.Config:
     """Build the uvicorn configuration this CLI serves *app* under.
 
@@ -259,6 +288,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     _apply_config(parser, args)
     verifier = _verifier_or_exit(parser)
+    agent_verifier = _agent_verifier_or_exit(parser)
     require_transport_confidentiality(parser, args)
     # After every refusal, never before one: a process about to exit 2 has
     # nothing to announce, and announcing above the posture gate printed a
@@ -268,4 +298,7 @@ def main(argv: list[str] | None = None) -> None:
     # not close it (#895). On stderr: stdout on this entry point carries the
     # ``--print-openapi`` document, which consumers pipe into code generators.
     announce_rotation_window(verifier)
-    serve(create_app(verifier=verifier), args)
+    # This app serves /mcp too (#1962), so an ungated consumer is named at start
+    # exactly as creek-tools-mcp --transport network names it (#1964).
+    announce_ungated_consumers(verifier)
+    serve(create_app(verifier=verifier, agent_verifier=agent_verifier), args)

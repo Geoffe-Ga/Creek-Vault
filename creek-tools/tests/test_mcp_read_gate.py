@@ -271,7 +271,7 @@ if TYPE_CHECKING:
 # METADATA_ONLY (or upgrades a tracked gap to a gate it never grew) fails.
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 25
+_EXPECTED_TOOL_COUNT = 26
 
 _EXPECTED_PRIMITIVES = frozenset({"refuse_above_ceiling", "iter_admitted_fragments"})
 

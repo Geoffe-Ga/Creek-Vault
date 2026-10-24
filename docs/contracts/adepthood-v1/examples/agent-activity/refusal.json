@@ -1,0 +1,4 @@
+{
+  "reason": "agent activity resolves no vault object and reads no content, only the audit chain's content-free projection, so it has no privacy-refusal response shape",
+  "unreachable": true
+}

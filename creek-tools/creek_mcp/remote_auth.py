@@ -47,6 +47,20 @@ token in a consumer's set and not only the first, because a rotation is exactly
 when a fresh secret gets typed in. Generate compliant tokens with
 ``python -c "import secrets; print(secrets.token_urlsafe(32))"``.
 
+A consumer may also carry a **grant suffix** (#1964) naming which of the four
+:class:`~creek_mcp.policy.Grant` profiles its token reaches —
+``openclaw=<token>@vault:read+vault:desk``. ``@`` ends the token set and ``+``
+separates the grants; the suffix belongs to the whole entry, so every token in
+a rotation window shares it. The verifier stamps the grants onto the token's
+``scopes``, which is exactly where an OAuth access token (C2) carries them, so
+:func:`creek_mcp.policy.granted_by_scopes` is the one place either becomes a
+grant set. A consumer with **no** suffix is *ungated*: it keeps the full reach a
+consumer token had before #1964, its token carries
+:data:`~creek_mcp.policy.UNGATED_SCOPE`, and startup names it as ungated on
+stderr (:func:`announce_ungated_consumers`) so the operator can see what is
+still open. An unknown grant or an empty suffix is refused at load time, naming
+the consumer and the valid grants and never echoing the entry.
+
 Stdio (local CrawDad / Claude Code) is unaffected: no verifier is wired, so
 ``get_access_token()`` is ``None`` and calls run as before.
 """
@@ -57,22 +71,27 @@ import hmac
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, NoReturn
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from pydantic import AnyHttpUrl
 
+from creek_mcp.policy import DEFAULT_GRANTS, UNGATED_SCOPE, Grant
 from creek_mcp.token_policy import require_min_length
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping, Sequence, Set
+
+    from creek_mcp.oauth_resource import ResourceServerConfig
 
 CONSUMER_TOKENS_ENV: Final[str] = "CREEK_MCP_CONSUMER_TOKENS"
 """Env var holding ``consumer=token`` entries (tokens never in code).
 
 ``;`` separates one consumer from the next; ``,`` inside a single entry lists
-the several tokens that consumer may currently present (#895).
+the several tokens that consumer may currently present (#895); an optional
+``@`` suffix names the consumer's grants, ``+``-separated (#1964).
 """
 
 REMOTE_SCOPE: Final[str] = "creek:remote"
@@ -93,6 +112,17 @@ _TOKEN_SEPARATOR: Final[str] = ","
 _NAME_VALUE_SEPARATOR: Final[str] = "="
 """Separates a consumer's name from its token set."""
 
+_GRANT_SUFFIX_SEPARATOR: Final[str] = "@"
+"""Ends a consumer's token set and begins its grant suffix (#1964).
+
+The *last* ``@`` in the entry is the separator, so a legacy token that itself
+contains ``@`` and carries a suffix still parses. ``secrets.token_urlsafe``
+never emits ``@``.
+"""
+
+_GRANT_SEPARATOR: Final[str] = "+"
+"""Separates the grants within one consumer's grant suffix (#1964)."""
+
 _SETTLED_TOKEN_COUNT: Final[int] = 1
 """How many tokens a consumer holds when it is *not* mid-rotation."""
 
@@ -100,10 +130,19 @@ _SETTLED_TOKEN_COUNT: Final[int] = 1
 # expires_at arithmetic is exact; production keeps wall-clock time.
 _now = time.time
 
-# Non-secret placeholder URLs — this is a self-hosted resource server using bearer
-# tokens, not an OAuth authorization-server flow, but AuthSettings requires them.
-_ISSUER_URL: Final[str] = "https://creek.invalid/mcp"
-_RESOURCE_URL: Final[str] = "https://creek.invalid/mcp"
+_UNSERVED_ISSUER_URL: Final[str] = "https://issuer.unconfigured.invalid"
+"""The SDK's required ``issuer_url`` on a bearer-only vault, and never served.
+
+:class:`~mcp.server.auth.settings.AuthSettings` will not validate without an
+issuer, but a vault with no ``CREEK_MCP_AUTHORIZATION_SERVER`` has none. The SDK
+reads the field in exactly two places — its authorization-server routes, which
+need an auth provider this package never passes, and its protected-resource
+metadata, which needs a ``resource_server_url`` this settings object leaves
+``None`` — so no response can carry it. That is the difference from the
+``creek.invalid`` placeholders it replaces (#1963), which *were* served: as the
+``resource_metadata`` of every ``401`` and as a metadata document naming a host
+that does not exist.
+"""
 
 
 def _token_ttl_seconds() -> int:
@@ -172,8 +211,74 @@ def _token_segments(value: str) -> tuple[str, ...]:
     return tuple(segment for segment in stripped if segment)
 
 
-def _parsed_entry(entry: str) -> tuple[str, tuple[str, ...]] | None:
-    """Return the ``(consumer, tokens)`` one env entry configures, or ``None``.
+@dataclass(frozen=True)
+class _Entry:
+    """One parsed ``consumer=tokens[@grants]`` entry.
+
+    Attributes:
+        consumer: The consumer name, stripped.
+        tokens: The configured tokens, stripped, in configured order.
+        grants: The suffix's grants, or ``None`` when the entry has no suffix
+            (an ungated consumer).
+    """
+
+    consumer: str
+    tokens: tuple[str, ...]
+    grants: frozenset[Grant] | None
+
+
+def _refuse_bad_grants(consumer: str) -> NoReturn:
+    """Refuse a grant suffix that names no grant, or one that is not a grant.
+
+    The message names the consumer and every valid grant, and deliberately
+    **not** the offending suffix: the suffix is split off the entry at its last
+    ``@``, so for a legacy token that itself contains ``@`` and carries no
+    suffix, the "suffix" is the tail of a secret.
+
+    Args:
+        consumer: The consumer whose suffix is unreadable.
+
+    Raises:
+        ValueError: Always.
+    """
+    valid = ", ".join(grant.value for grant in Grant)
+    msg = (
+        f"consumer {consumer!r} has an unreadable grant suffix in "
+        f"{CONSUMER_TOKENS_ENV}; after '{_GRANT_SUFFIX_SEPARATOR}' list one or "
+        f"more of {valid}, separated by '{_GRANT_SEPARATOR}', or drop the "
+        "suffix to leave the consumer ungated"
+    )
+    raise ValueError(msg)
+
+
+def _parsed_grants(consumer: str, suffix: str) -> frozenset[Grant]:
+    """Return the grants a consumer's suffix names, or refuse it.
+
+    Whitespace around a ``+`` and an empty segment (``++``, a trailing ``+``)
+    are operator formatting, absorbed the way :func:`_token_segments` absorbs
+    stray commas. Matching is otherwise exact.
+
+    Args:
+        consumer: The consumer the suffix belongs to.
+        suffix: Everything after the entry's last ``@``.
+
+    Returns:
+        The named grants.
+
+    Raises:
+        ValueError: Via :func:`_refuse_bad_grants`, when the suffix names no
+            grant at all or names something that is not a grant.
+    """
+    names = [part.strip() for part in suffix.split(_GRANT_SEPARATOR)]
+    named = [name for name in names if name]
+    valid = {grant.value: grant for grant in Grant}
+    if not named or any(name not in valid for name in named):
+        _refuse_bad_grants(consumer)
+    return frozenset(valid[name] for name in named)
+
+
+def _parsed_entry(entry: str) -> _Entry | None:
+    """Return what one env entry configures, or ``None``.
 
     ``None`` is the "nothing configured here" answer, and it is deliberately
     silent: a blank entry, a ``name=`` with no token, an ``=orphan`` with no
@@ -182,19 +287,30 @@ def _parsed_entry(entry: str) -> tuple[str, tuple[str, ...]] | None:
     them without comment before #895, and the comma form must reach the same
     verdict rather than registering a consumer the verifier then refuses.
 
+    A grant suffix (#1964) is split off at the value's last ``@`` *before*
+    the tokens are read, so a suffixed entry authenticates exactly the tokens
+    an unsuffixed one would.
+
     Args:
         entry: One ``;``-delimited entry of :data:`CONSUMER_TOKENS_ENV`.
 
     Returns:
-        The consumer name and its ordered token set, or ``None`` when the
-        entry names no consumer or configures no token.
+        The consumer name, its ordered token set and its grants, or ``None``
+        when the entry names no consumer or configures no token.
+
+    Raises:
+        ValueError: When a configured consumer's grant suffix is unreadable.
     """
     name, _, value = entry.partition(_NAME_VALUE_SEPARATOR)
     consumer = name.strip()
-    tokens = _token_segments(value)
+    token_part, separator, suffix = value.rpartition(_GRANT_SUFFIX_SEPARATOR)
+    if not separator:
+        token_part = suffix
+    tokens = _token_segments(token_part)
     if not consumer or not tokens:
         return None
-    return consumer, tokens
+    grants = _parsed_grants(consumer, suffix) if separator else None
+    return _Entry(consumer=consumer, tokens=tokens, grants=grants)
 
 
 def _refuse_repeated_consumer(consumer: str) -> NoReturn:
@@ -467,6 +583,12 @@ def load_consumer_tokens(
     unchanged on the wire and lands as a one-element tuple, so an operator who
     has never rotated anything parses exactly as before.
 
+    A grant suffix (``openclaw=<token>@vault:read+vault:desk``, #1964) is
+    validated and stripped here, so every caller that only needs the tokens —
+    the ``/v1`` app, the container runtime, provisioning — authenticates a
+    suffixed entry exactly as an unsuffixed one. Read the grants themselves
+    with :func:`load_consumer_grants`.
+
     Blank entries, entries with no name, and entries with no token — including
     the comma spelling ``name=,,`` — are skipped. Returns an empty dict when
     unset: the caller treats "no tokens configured" as "network mode not
@@ -481,23 +603,90 @@ def load_consumer_tokens(
     Raises:
         ValueError: If a configured token is shorter than
             :data:`creek_mcp.token_policy.MIN_TOKEN_LEN` characters (#838), if
-            a consumer is named more than once, or if one token value is
-            configured more than once. Every message names the configuration
+            a consumer is named more than once, if one token value is
+            configured more than once, or if a grant suffix is unreadable
+            (#1964). Every message names the configuration
             at fault — consumers, lengths, the rotation recipe — and never a
             token value, because a startup error lands in logs, terminals and
             process supervisors.
     """
+    return _normalized_token_sets(_load_registry(environ)[0])
+
+
+def load_consumer_grants(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, frozenset[Grant]]:
+    """Parse the grant suffixes of ``CREEK_MCP_CONSUMER_TOKENS`` (#1964).
+
+    Reads the same registry :func:`load_consumer_tokens` does, with every one
+    of its refusals, so the two can never disagree about whether a
+    configuration is valid. Pass the result to :class:`ConsumerTokenVerifier`
+    as ``grants=`` alongside the tokens.
+
+    Args:
+        environ: Environment mapping (defaults to :data:`os.environ`).
+
+    Returns:
+        ``{consumer: grants}`` for every consumer that carries a suffix. A
+        consumer with no suffix is absent: it is ungated.
+
+    Raises:
+        ValueError: On everything :func:`load_consumer_tokens` refuses, and on
+            an unreadable grant suffix.
+    """
+    return _load_registry(environ)[1]
+
+
+def _load_registry(
+    environ: Mapping[str, str] | None,
+) -> tuple[dict[str, tuple[str, ...]], dict[str, frozenset[Grant]]]:
+    """Parse and validate the registry into its token and grant halves.
+
+    Args:
+        environ: Environment mapping (defaults to :data:`os.environ`).
+
+    Returns:
+        ``({consumer: tokens}, {consumer: grants})``; the second holds only the
+        consumers that carry a grant suffix.
+
+    Raises:
+        ValueError: On a weak token, a repeated consumer, a token value
+            configured twice, or an unreadable grant suffix — the full set, so
+            either public loader refuses exactly what the other does.
+    """
     raw = (environ if environ is not None else os.environ).get(CONSUMER_TOKENS_ENV, "")
-    parsed: dict[str, tuple[str, ...]] = {}
-    for entry in raw.split(_CONSUMER_SEPARATOR):
-        item = _parsed_entry(entry)
-        if item is None:
+    tokens: dict[str, tuple[str, ...]] = {}
+    grants: dict[str, frozenset[Grant]] = {}
+    for line in raw.split(_CONSUMER_SEPARATOR):
+        entry = _parsed_entry(line)
+        if entry is None:
             continue
-        consumer, tokens = item
-        if consumer in parsed:
-            _refuse_repeated_consumer(consumer)
-        parsed[consumer] = _validated_tokens(consumer, tokens)
-    return _normalized_token_sets(parsed)
+        if entry.consumer in tokens:
+            _refuse_repeated_consumer(entry.consumer)
+        tokens[entry.consumer] = _validated_tokens(entry.consumer, entry.tokens)
+        if entry.grants is not None:
+            grants[entry.consumer] = entry.grants
+    _normalized_token_sets(tokens)
+    return tokens, grants
+
+
+@dataclass(frozen=True)
+class _Registry:
+    """One validated configuration: every consumer's tokens and grants.
+
+    Held by :class:`ConsumerTokenVerifier` as a **single** reference, so a
+    reload (#1965) replaces tokens and grants in one assignment and no request
+    ever reads one configuration's tokens beside another's grants. Neither
+    field reaches ``repr``: a traceback or a debugger dump of a verifier must
+    not serialize credential material.
+
+    Attributes:
+        tokens: ``{consumer: (token, ...)}``, normalised.
+        grants: ``{consumer: grants}`` for the gated consumers only.
+    """
+
+    tokens: dict[str, tuple[str, ...]] = field(repr=False)
+    grants: dict[str, frozenset[Grant]] = field(repr=False)
 
 
 class ConsumerTokenVerifier(TokenVerifier):
@@ -507,7 +696,9 @@ class ConsumerTokenVerifier(TokenVerifier):
     token so a match leaks no timing signal about which consumer — or which
     token of that consumer's set — matched. A verified token yields an
     :class:`AccessToken` whose ``client_id`` is the consumer name and whose
-    scope is :data:`REMOTE_SCOPE`.
+    scopes are :data:`REMOTE_SCOPE` plus the consumer's grants (#1964) — or,
+    for a consumer configured with no grants, plus
+    :data:`~creek_mcp.policy.UNGATED_SCOPE`.
 
     A consumer maps to a **sequence** of tokens and never to a bare ``str``.
     The signature is not ``str | Sequence[str]``, because that union is
@@ -516,21 +707,47 @@ class ConsumerTokenVerifier(TokenVerifier):
     is the runtime half of the same guard.
     """
 
-    def __init__(self, tokens: Mapping[str, Sequence[str]]) -> None:
-        """Store the ``{consumer: tokens}`` map to verify against.
+    def __init__(
+        self,
+        tokens: Mapping[str, Sequence[str]],
+        grants: Mapping[str, Set[Grant]] | None = None,
+    ) -> None:
+        """Store the ``{consumer: tokens}`` map, and any grants, to verify against.
 
         Args:
             tokens: The configured consumers and their ordered token sets. An
                 empty mapping is legal and refuses every bearer: "no consumers
                 configured" is the callers' *network denied* posture, which is
                 a different statement from "this consumer has no tokens".
+            grants: ``{consumer: grants}`` for the consumers that are gated,
+                normally :func:`load_consumer_grants`. A consumer absent from
+                it — every consumer, when this is ``None`` — is ungated and
+                keeps its pre-#1964 reach.
 
         Raises:
             TypeError: If a consumer's value is a bare :class:`str`.
-            ValueError: If a named consumer holds no tokens, or if one token
-                value is configured more than once.
+            ValueError: If a named consumer holds no tokens, if one token
+                value is configured more than once, or if *grants* names a
+                consumer with no tokens or gives one an empty grant set.
         """
-        self._tokens = _normalized_token_sets(tokens)
+        normalized = _normalized_token_sets(tokens)
+        self._registry = _Registry(
+            tokens=normalized, grants=_normalized_grants(normalized, grants or {})
+        )
+
+    def _adopt(self, other: ConsumerTokenVerifier) -> None:
+        """Serve *other*'s configuration from now on, in one assignment (#1965).
+
+        The swap a reloading subclass makes once it has a fully validated
+        replacement: *other* was built through :meth:`__init__`, so it carries
+        every refusal the constructor makes, and nothing half-parsed can be
+        adopted. A call already scanning the previous registry finishes against
+        it; the next call sees the new one.
+
+        Args:
+            other: A verifier built from the replacement configuration.
+        """
+        self._registry = other._registry
 
     @property
     def consumers(self) -> tuple[str, ...]:
@@ -550,7 +767,7 @@ class ConsumerTokenVerifier(TokenVerifier):
         Returns:
             The configured consumer names.
         """
-        return tuple(self._tokens)
+        return tuple(self._registry.tokens)
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Return the consumer's :class:`AccessToken` for a valid token, else ``None``.
@@ -576,9 +793,16 @@ class ConsumerTokenVerifier(TokenVerifier):
         stays valid (#837). That expiry does not revoke the underlying shared
         secret: the SDK's bearer middleware calls ``verify_token`` fresh on
         every request, so a consumer that keeps presenting a configured value
-        is re-verified indefinitely. What revokes it is dropping it from
-        :data:`CONSUMER_TOKENS_ENV` and restarting — the closing half of the
-        rotation runbook in the network-transport section of ``docs/mcp.md``.
+        is re-verified indefinitely. What revokes it is dropping it from the
+        configuration: from a mounted secret file, which the container entry
+        points follow without a restart (#1965,
+        :class:`~creek_mcp.credential_reload.ReloadingConsumerTokenVerifier`),
+        or from :data:`CONSUMER_TOKENS_ENV` and restarting — the closing half
+        of the rotation runbook in the network-transport section of
+        ``docs/mcp.md``.
+
+        The registry is read **once**, before the scan, so a reload landing
+        mid-call cannot pair one configuration's match with another's grants.
 
         Args:
             token: The bearer token presented on the request.
@@ -587,9 +811,10 @@ class ConsumerTokenVerifier(TokenVerifier):
             The matching consumer's access token, or ``None`` when no
             configured token matches.
         """
+        registry = self._registry
         supplied = token.encode("utf-8")
         matched: str | None = None
-        for consumer, known_tokens in self._tokens.items():
+        for consumer, known_tokens in registry.tokens.items():
             for known in known_tokens:
                 if hmac.compare_digest(supplied, known.encode("utf-8")):
                     matched = consumer
@@ -598,8 +823,37 @@ class ConsumerTokenVerifier(TokenVerifier):
         return AccessToken(
             token=token,
             client_id=matched,
-            scopes=[REMOTE_SCOPE],
+            scopes=[REMOTE_SCOPE, *_grant_scopes(registry, matched)],
             expires_at=int(_now()) + _token_ttl_seconds(),
+        )
+
+    def ungated_notice(self) -> str | None:
+        """Return the operator notice naming every ungated consumer, else ``None``.
+
+        An ungated consumer — one configured with no grant suffix — keeps the
+        full reach a consumer token had before #1964, writes included, so it is
+        named at every start until it is gated, the way an open rotation window
+        is. Built from consumer **names** and grant names only, so it cannot
+        echo a secret by construction.
+
+        Returns:
+            A message naming each ungated consumer and the suffix that would
+            give it the default profile, or ``None`` when every consumer is
+            gated.
+        """
+        registry = self._registry
+        ungated = [name for name in registry.tokens if name not in registry.grants]
+        if not ungated:
+            return None
+        default = _GRANT_SEPARATOR.join(
+            grant.value for grant in Grant if grant in DEFAULT_GRANTS
+        )
+        return (
+            f"{CONSUMER_TOKENS_ENV}: ungated consumer(s) — {', '.join(ungated)}. "
+            "Each reaches every MCP tool a consumer token reached before "
+            "per-agent grants, writes included. Gate one by appending a grant "
+            f"suffix to its entry, e.g. {ungated[0]}=<token>"
+            f"{_GRANT_SUFFIX_SEPARATOR}{default}."
         )
 
     def rotation_notice(self) -> str | None:
@@ -622,7 +876,7 @@ class ConsumerTokenVerifier(TokenVerifier):
         """
         windows = [
             (consumer, len(configured))
-            for consumer, configured in self._tokens.items()
+            for consumer, configured in self._registry.tokens.items()
             if len(configured) > _SETTLED_TOKEN_COUNT
         ]
         if not windows:
@@ -633,8 +887,9 @@ class ConsumerTokenVerifier(TokenVerifier):
         return (
             f"{CONSUMER_TOKENS_ENV}: rotation window open — {held}. "
             "Each of those tokens authenticates as its consumer for as long as "
-            "it stays configured; drop the retired secret and restart once the "
-            "consumer has redeployed."
+            "it stays configured; drop the retired secret once the consumer has "
+            "redeployed (a mounted secret file is re-read within seconds; the "
+            "environment variable needs a restart)."
         )
 
 
@@ -681,6 +936,69 @@ class NamedConsumerVerifier(TokenVerifier):
         return access
 
 
+def _grant_scopes(registry: _Registry, consumer: str) -> list[str]:
+    """Return the grant scopes *consumer*'s tokens carry (#1964).
+
+    Args:
+        registry: The configuration the call matched against.
+        consumer: A configured consumer.
+
+    Returns:
+        Its grants' values in :class:`~creek_mcp.policy.Grant` declaration
+        order, so the scope list is stable; or the ungated marker alone when
+        the consumer has no configured grants.
+    """
+    held = registry.grants.get(consumer)
+    if held is None:
+        return [UNGATED_SCOPE]
+    return [grant.value for grant in Grant if grant in held]
+
+
+def _normalized_grants(
+    tokens: Mapping[str, tuple[str, ...]], grants: Mapping[str, Set[Grant]]
+) -> dict[str, frozenset[Grant]]:
+    """Return *grants* as frozensets, refusing the shapes that cannot work.
+
+    Args:
+        tokens: The verifier's normalised token sets.
+        grants: The constructor's ``{consumer: grants}`` mapping.
+
+    Returns:
+        The same mapping with every value a :class:`frozenset`.
+
+    Raises:
+        ValueError: Via :func:`_refuse_bad_grants` for an empty grant set —
+            a consumer that authenticates and can call nothing is a typo, not
+            a posture — or when *grants* names a consumer holding no tokens.
+    """
+    normalized: dict[str, frozenset[Grant]] = {}
+    for consumer, held in grants.items():
+        if consumer not in tokens:
+            msg = (
+                f"grants are configured for consumer {consumer!r}, which holds "
+                "no token; configure its token or drop its grants"
+            )
+            raise ValueError(msg)
+        if not held:
+            _refuse_bad_grants(consumer)
+        normalized[consumer] = frozenset(held)
+    return normalized
+
+
+def announce_ungated_consumers(verifier: ConsumerTokenVerifier) -> None:
+    """Print *verifier*'s ungated-consumer notice to stderr, when it has one.
+
+    stderr for the reason :func:`announce_rotation_window` gives: stdout on
+    the MCP entry point belongs to the stdio transport's JSON-RPC framing.
+
+    Args:
+        verifier: The verifier the MCP adapter is about to serve behind.
+    """
+    notice = verifier.ungated_notice()
+    if notice is not None:
+        print(notice, file=sys.stderr)
+
+
 def announce_rotation_window(verifier: ConsumerTokenVerifier) -> None:
     """Print *verifier*'s rotation notice to stderr, when it has one (#895).
 
@@ -703,12 +1021,39 @@ def announce_rotation_window(verifier: ConsumerTokenVerifier) -> None:
         print(notice, file=sys.stderr)
 
 
-def remote_auth_settings() -> AuthSettings:
-    """Return the :class:`AuthSettings` requiring the remote scope on every call."""
+def remote_auth_settings(
+    resource_server: ResourceServerConfig | None = None,
+) -> AuthSettings:
+    """Return the :class:`AuthSettings` requiring the remote scope on every call.
+
+    With a resource server configured (#1963) the SDK is handed the real
+    issuer and resource URLs, so its request-scoped ``get_access_token()`` and
+    its ``RequireAuthMiddleware`` behave exactly as for any OAuth resource
+    server. ``validate_token_resource`` is ``False`` because the audience is
+    checked where it can be checked strictly — in
+    :class:`~creek_mcp.agent_tokens.JwtAgentTokenVerifier`, against the JWT's
+    ``aud`` — and because the SDK's own check would refuse every static token,
+    which names no resource. Without one, no resource URL exists to publish and
+    the SDK publishes none.
+
+    Args:
+        resource_server: This vault's resource-server configuration, or
+            ``None`` on a bearer-only vault.
+
+    Returns:
+        The settings.
+    """
+    if resource_server is None:
+        return AuthSettings(
+            issuer_url=AnyHttpUrl(_UNSERVED_ISSUER_URL),
+            resource_server_url=None,
+            required_scopes=[REMOTE_SCOPE],
+        )
     return AuthSettings(
-        issuer_url=AnyHttpUrl(_ISSUER_URL),
-        resource_server_url=AnyHttpUrl(_RESOURCE_URL),
+        issuer_url=AnyHttpUrl(resource_server.authorization_server),
+        resource_server_url=AnyHttpUrl(resource_server.resource_url),
         required_scopes=[REMOTE_SCOPE],
+        validate_token_resource=False,
     )
 
 

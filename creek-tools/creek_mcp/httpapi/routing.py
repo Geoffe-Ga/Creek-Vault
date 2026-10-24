@@ -1,8 +1,24 @@
-"""Authenticated public data-plane route to private managed vaults (#1807)."""
+"""Authenticated public data-plane route to private managed vaults (#1807).
+
+**Agents' OAuth tokens on ``/mcp`` (#1963).** The Fly edge is one public
+listener for every managed vault, and until #1963 it routed only by the
+per-allocation static routing credential. With an :class:`AgentRouting`
+configured, the replay router also accepts, **on ``/mcp`` only**, an agent's
+access token issued by the pinned authorization server for this edge's MCP
+URL: it is verified in full — signature against the issuer's keys, issuer,
+audience, lifetime — before any store lookup or Machine wake, and its subject
+(the consumer identity the allocation was issued for) selects the owner
+through the same encrypted bundle scan the static route uses. The owning
+vault verifies the token again, pinned to its own consumer. ``/v1`` stays the
+static route's alone. The router also answers the RFC 9728 metadata itself,
+before authentication, and gives a refused ``/mcp`` call the challenge that
+points at it.
+"""
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Final, TypeAlias
 
@@ -12,6 +28,7 @@ from starlette.middleware import Middleware
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
+from creek_mcp.agent_tokens import looks_like_jwt
 from creek_mcp.api.models import ERROR_STATUS, ErrorCode
 from creek_mcp.api.routes import PUBLISHED_SUCCESS_STATUSES, ROUTE_BODY_CAPS, ROUTES
 from creek_mcp.httpapi.app import (
@@ -33,6 +50,11 @@ from creek_mcp.httpapi.middleware.limits import (
     ConcurrencyLimitMiddleware,
     RequestTimeoutMiddleware,
 )
+from creek_mcp.mcp_path import MCP_PATH
+from creek_mcp.oauth_resource import (
+    ProtectedResourceMetadataMiddleware,
+    ResourceChallengeMiddleware,
+)
 from creek_mcp.provisioning.driver import ProviderError
 
 if TYPE_CHECKING:
@@ -41,9 +63,11 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from creek_mcp.agent_tokens import JwtAgentTokenVerifier
     from creek_mcp.api.routes import RouteSpec
     from creek_mcp.provisioning.models import RoutableAllocation
     from creek_mcp.provisioning.routing import (
+        AgentPrincipalResolver,
         FlyReplayTarget,
         PrivateVaultTarget,
         ReplayRoutingProvider,
@@ -76,18 +100,71 @@ _REQUEST_ONLY_HEADERS: Final[frozenset[bytes]] = frozenset(
         b"x-forwarded-proto",
     }
 )
+_MCP_METHODS: Final[tuple[str, ...]] = ("POST", "GET", "DELETE")
+"""The three verbs MCP streamable-HTTP uses: messages, the stream, session end."""
+
+_IMPLICIT_HEAD: Final[str] = "HEAD"
+"""The verb Starlette adds beside ``GET`` and neither surface publishes."""
+
 _PUBLISHED_STATUSES: Final[frozenset[int]] = PUBLISHED_SUCCESS_STATUSES | frozenset(
     ERROR_STATUS.values()
 )
 
 
+@dataclass(frozen=True, slots=True)
+class AgentRouting:
+    """How the edge routes an agent's OAuth access token on ``/mcp`` (#1963).
+
+    Attributes:
+        verifier: Verifies the token for this edge's MCP URL.
+        principals: Resolves its verified subject to the vault's owner.
+    """
+
+    verifier: JwtAgentTokenVerifier
+    principals: AgentPrincipalResolver
+
+
 class RoutingAuthMiddleware:
     """Authenticate a routing credential before resolving any allocation."""
 
-    def __init__(self, app: ASGIApp, *, verifier: RoutingCredentialVerifier) -> None:
-        """Wrap *app* behind the injected dynamic credential verifier."""
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        verifier: RoutingCredentialVerifier,
+        agent: AgentRouting | None = None,
+    ) -> None:
+        """Wrap *app* behind the injected dynamic credential verifier.
+
+        Args:
+            app: The router below.
+            verifier: The static routing-credential verifier.
+            agent: The agent-token route for ``/mcp``, or ``None``.
+        """
         self.app = app
         self._verifier = verifier
+        self._agent = agent
+
+    async def _principal(self, scope: Scope, token: str) -> RoutingPrincipal | None:
+        """Return the owner *token* proves, by the route its path allows.
+
+        Args:
+            scope: The ASGI scope.
+            token: The presented bearer.
+
+        Returns:
+            The principal, or ``None``.
+        """
+        if (
+            self._agent is None
+            or scope.get("path") != MCP_PATH
+            or not looks_like_jwt(token)
+        ):
+            return await self._verifier.verify_credential(token)
+        access = await self._agent.verifier.verify_token(token)
+        if access is None:
+            return None
+        return await self._agent.principals.principal_for_consumer(access.client_id)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Bind verified ownership while logging only the requester identity."""
@@ -95,9 +172,7 @@ class RoutingAuthMiddleware:
             await pass_through(self.app, scope, receive, send)
             return
         token = _presented_token(scope)
-        principal = (
-            None if token is None else await self._verifier.verify_credential(token)
-        )
+        principal = None if token is None else await self._principal(scope, token)
         if principal is None:
             refusal = error_response(ErrorCode.UNAUTHENTICATED, context_of(scope))
             await refusal(scope, receive, send)
@@ -366,7 +441,39 @@ def _route_for(
         name=spec.operation_id,
     )
     if route.methods is not None:
-        route.methods.discard("HEAD")
+        route.methods.discard(_IMPLICIT_HEAD)
+    return route
+
+
+def _mcp_replay_route(router: AllocationReplayRouter) -> Route:
+    """Replay ``/mcp`` to the caller's own vault, as every ``/v1`` route is (#1962).
+
+    The same owner resolution, deletion fences and replay state as ``/v1``:
+    only the path differs. Exact path only — the subtree is the published
+    routing miss here, as it is inside the vault.
+
+    Args:
+        router: The replay router the ``/v1`` routes share.
+
+    Returns:
+        The mounted route, serving the streamable-HTTP verbs and no ``HEAD``.
+    """
+
+    async def endpoint(request: Request) -> Response:
+        """Record the route for the access log, then replay.
+
+        Args:
+            request: The request in flight.
+
+        Returns:
+            The replay, or the router's refusal.
+        """
+        context_of(request.scope).route = MCP_PATH
+        return await router.proxy(request)
+
+    route = Route(MCP_PATH, endpoint, methods=list(_MCP_METHODS), name="mcp")
+    if route.methods is not None:
+        route.methods.discard(_IMPLICIT_HEAD)
     return route
 
 
@@ -407,6 +514,27 @@ def build_routing_app(
     return app
 
 
+def _oauth_layers(agent: AgentRouting | None) -> list[Middleware]:
+    """Return the resource-server layers the edge router places, if configured.
+
+    Args:
+        agent: The agent-token route, or ``None``.
+
+    Returns:
+        The metadata layer and the ``/mcp``-confined challenge layer, or
+        nothing: a router without an issuer answers exactly as before #1963.
+    """
+    if agent is None:
+        return []
+    config = agent.verifier.config
+    return [
+        Middleware(ProtectedResourceMetadataMiddleware, config=config),
+        Middleware(
+            ResourceChallengeMiddleware, config=config, paths=frozenset({MCP_PATH})
+        ),
+    ]
+
+
 def build_fly_replay_routing_app(
     store: ProvisioningStore,
     verifier: RoutingCredentialVerifier,
@@ -415,22 +543,31 @@ def build_fly_replay_routing_app(
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    agent: AgentRouting | None = None,
 ) -> Starlette:
-    """Build the router used only behind the attested Fly edge listener."""
+    """Build the router used only behind the attested Fly edge listener.
+
+    Replays every published ``/v1`` route and ``/mcp`` (#1962) to the
+    authenticated owner's vault Machine. With *agent* configured (#1963) it
+    also routes agents' OAuth access tokens on ``/mcp``, publishes the RFC 9728
+    metadata, and challenges a refused ``/mcp`` call toward it.
+    """
     router = AllocationReplayRouter(store, provider)
     routes = [_route_for(spec, router) for spec in ROUTES]
+    routes.append(_mcp_replay_route(router))
     replay_caps = {**ROUTE_BODY_CAPS, "/v1/uploads": DEFAULT_MAX_BODY_BYTES}
     app = Starlette(
         routes=routes,
         middleware=[
             Middleware(AccessLogMiddleware),
             Middleware(ErrorBoundaryMiddleware),
+            *_oauth_layers(agent),
             Middleware(
                 ConcurrencyLimitMiddleware,
                 max_concurrency=max_concurrency,
             ),
             Middleware(RequestTimeoutMiddleware, timeout_seconds=timeout_seconds),
-            Middleware(RoutingAuthMiddleware, verifier=verifier),
+            Middleware(RoutingAuthMiddleware, verifier=verifier, agent=agent),
             Middleware(
                 BodySizeLimitMiddleware,
                 max_body_bytes=max_body_bytes,

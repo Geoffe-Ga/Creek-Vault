@@ -21,6 +21,7 @@ from creek.config import CONFIG_PATH_ENV_VAR
 from creek_mcp.container_runtime import (
     ContainerConfigurationError,
     ContainerSettings,
+    agent_verifier_for,
     load_consumer_secret,
     prepare_vault,
     require_local_only,
@@ -30,7 +31,11 @@ from creek_mcp.httpapi.cli import serve
 from creek_mcp.provisioning.pilot_control import validate_fly_runtime
 from creek_mcp.provisioning.production_secrets import read_owner_only_file
 from creek_mcp.provisioning.replay_contract import is_replay_state
-from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV, announce_rotation_window
+from creek_mcp.remote_auth import (
+    CONSUMER_TOKENS_ENV,
+    announce_rotation_window,
+    announce_ungated_consumers,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
@@ -121,7 +126,9 @@ def run(settings: FlyVaultSettings) -> None:
     prepared = prepare_vault(settings.container)
     secret = load_consumer_secret(settings.container.consumer_tokens_file)
     replay_state = _load_replay_state(settings.replay_state_file)
-    verifier = secret.verifier()
+    # Follows the mounted secret, so rotating the consumer's token is an edit to
+    # the Fly secret, not a Machine restart (#1965).
+    verifier = secret.reloading_verifier(settings.container.consumer_tokens_file)
     args = argparse.Namespace(
         host=settings.container.host,
         port=settings.container.port,
@@ -133,8 +140,13 @@ def run(settings: FlyVaultSettings) -> None:
         managed_local_only(),
     ):
         announce_rotation_window(verifier)
+        announce_ungated_consumers(verifier)
         serve(
-            create_app(verifier=verifier, fly_replay_state=replay_state),
+            create_app(
+                verifier=verifier,
+                fly_replay_state=replay_state,
+                agent_verifier=agent_verifier_for(settings.container, secret),
+            ),
             args,
         )
 

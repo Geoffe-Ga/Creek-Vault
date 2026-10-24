@@ -79,7 +79,7 @@ from creek_mcp.httpapi.vault import (
     request_key_providers,
 )
 from creek_mcp.policy import Transport
-from creek_mcp.tools.handshake import handshake_tool, vault_available
+from creek_mcp.tools.handshake import AuthMode, handshake_tool, vault_available
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -265,6 +265,9 @@ def _negotiate(vault: Path, context: RequestContext, advertised: list[str]) -> b
             # module crossed a network, so the transport is a property of the
             # adapter rather than a runtime choice (#1583).
             transport=Transport.NETWORK,
+            # ``/v1`` authenticates the configured static consumers only; an
+            # agent's OAuth token is an ``/mcp`` credential (#1963).
+            auth=AuthMode.BEARER,
             privacy_tier_ceiling=context.ceiling,
             consumer=context.consumer,
         )

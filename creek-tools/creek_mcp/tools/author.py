@@ -15,10 +15,15 @@ are untouched.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Protocol
+
+import frontmatter
 
 from creek.author import plan_author, require_supported_medium, run_author
 from creek.author.models import ZERO_EVIDENCE_WARNING, has_zero_evidence
+from creek.generate.drafts import INFERENCE_SOURCE_FRONTMATTER_KEY, reserve_draft_path
+from creek.progress import CompositionStage, StageCallback, ignore_stage
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
 
@@ -29,8 +34,24 @@ if TYPE_CHECKING:
     from creek.author.client import AuthorLLMClient
     from creek.author.models import FindingDimension
     from creek.models import PrivacyTier
+    from creek_mcp.provenance import InferenceProvenance
 
 TOOL_NAME = "creek.author"
+
+AUTHOR_STAGES: Final[tuple[CompositionStage, ...]] = (
+    CompositionStage.SOURCES,
+    CompositionStage.COMPOSED,
+    CompositionStage.VOICE_GUARDED,
+)
+"""The three boundaries a ``creek.author`` call reports, in order (#1966).
+
+The desk mines no seed and assembles no skill stack, and its synchronous
+answer carries the body rather than saving it, so it crosses three of the six
+:class:`~creek.progress.CompositionStage` boundaries.
+"""
+
+_AUTHORED_DRAFT_STRATEGY: Final[str] = "writing_desk"
+"""The ``idea_strategy`` stamped on a draft the desk wrote to the vault."""
 
 
 # The one reflection dimension whose presence turns a finished draft into a
@@ -256,6 +277,8 @@ def author_tool(
     dry_run: bool = False,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
+    on_stage: StageCallback = ignore_stage,
+    provenance: InferenceProvenance | None = None,
 ) -> dict[str, Any]:
     """Author *query* via the real Writing Desk and return the result.
 
@@ -281,6 +304,13 @@ def author_tool(
         dry_run: When set, return the plan + evidence summary, not a draft.
         privacy_tier_ceiling: Privacy gate (FEAT-010).
         consumer: Audit consumer identifier.
+        on_stage: Sink told each :data:`AUTHOR_STAGES` boundary the desk
+            crosses (#1966). Stage names only; defaults to a no-op. The dry
+            run composes nothing and reports nothing.
+        provenance: The call's route recorder (#1967), filled by the
+            production voice factory when it resolves a provider. A success
+            envelope echoes its label as ``inference_source``; a deterministic
+            render, a dry run and a refusal carry none.
 
     Returns:
         On success, the draft envelope (body, verdict, provenance, cited
@@ -348,9 +378,107 @@ def author_tool(
             max_rounds=max_rounds,
             voice_client_factory=llm_factory,
             override=override,
+            on_stage=on_stage,
         )
     except Exception as exc:
         return _error_response(
             str(exc), tier_ceiling=privacy_tier_ceiling, dry_run=dry_run
         )
-    return _draft_response(draft, tier_ceiling=privacy_tier_ceiling)
+    response = _draft_response(draft, tier_ceiling=privacy_tier_ceiling)
+    source = None if provenance is None else provenance.source
+    if response["status"] == "ok" and source is not None:
+        response[INFERENCE_SOURCE_FRONTMATTER_KEY] = source
+    return response
+
+
+def save_authored_draft(vault_path: Path, response: dict[str, Any]) -> Path:
+    """Write a successful ``creek.author`` envelope's draft into the vault.
+
+    The synchronous verb hands its body straight back and saves nothing. A call
+    that outlived the MCP deadline has nobody to hand it to (#1966), so the
+    detached path files it beside ``creek draft``'s drafts, under the same
+    naming rule (:func:`creek.generate.drafts.reserve_draft_path`), where the
+    person and ``creek.state.read`` can reach it. Only ever called with an
+    ``ok`` envelope: a draft the privacy gate condemned carries no body and is
+    never written.
+
+    Args:
+        vault_path: The vault the draft was authored from.
+        response: The ``ok`` envelope :func:`author_tool` returned.
+
+    Returns:
+        The absolute path of the written draft.
+    """
+    generated = datetime.now(tz=UTC)
+    # Named for the desk and the medium, never the query: the path is the one
+    # piece of this draft a job result carries, and it should carry no prose.
+    target = reserve_draft_path(
+        vault_path, f"{_AUTHORED_DRAFT_STRATEGY} {response['medium']}", generated
+    )
+    post = frontmatter.Post(
+        content=str(response["body"]),
+        type="draft",
+        title=str(response["query"]),
+        status="draft",
+        idea_strategy=_AUTHORED_DRAFT_STRATEGY,
+        medium=response["medium"],
+        verdict=response["verdict"],
+        rounds=response["rounds"],
+        source_fragments=_cited_fragment_ids(response),
+        generated_date=generated.isoformat(),
+    )
+    if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
+        post[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[
+            INFERENCE_SOURCE_FRONTMATTER_KEY
+        ]
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _cited_fragment_ids(response: dict[str, Any]) -> list[str]:
+    """Return the distinct fragment ids an ``ok`` envelope cites, in order."""
+    cited: list[str] = []
+    for claim in response["claims"]:
+        for fragment_id in claim["source_fragments"]:
+            if fragment_id not in cited:
+                cited.append(fragment_id)
+    return cited
+
+
+def author_job_result(
+    response: dict[str, Any], draft_path: str | None
+) -> dict[str, Any] | None:
+    """Project a ``creek.author`` response onto what a job record may keep.
+
+    Status words and counts only: no ``body``, no ``query``, no ``claims`` and
+    no ``provenance`` — a job result is served to whoever holds the handle,
+    long after the call. Any status other than ``ok`` projects to ``None``,
+    the job store's ``failed``, as on ``/v1`` (#1605).
+
+    Args:
+        response: The dict :func:`author_tool` returned.
+        draft_path: The vault-relative path :func:`save_authored_draft` wrote,
+            or ``None`` when the body went back synchronously instead.
+
+    Returns:
+        The content-free result, or ``None``.
+    """
+    if response.get("status") != "ok":
+        return None
+    result = {
+        "status": "ok",
+        "tool": TOOL_NAME,
+        "tier_ceiling": response["tier_ceiling"],
+        "medium": response["medium"],
+        "verdict": response["verdict"],
+        "rounds": response["rounds"],
+        "draft_path": draft_path,
+        "claim_count": len(response["claims"]),
+        "source_count": len(_cited_fragment_ids(response)),
+        "warnings": list(response["warnings"]),
+    }
+    if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
+        result[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[
+            INFERENCE_SOURCE_FRONTMATTER_KEY
+        ]
+    return result

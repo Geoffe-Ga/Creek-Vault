@@ -85,6 +85,16 @@ class RoutingCredentialVerifier(Protocol):
         """Return credential-owned identities, or ``None`` without explanation."""
 
 
+class AgentPrincipalResolver(Protocol):
+    """Resolve a verified agent token's subject to the owner of its vault (#1963)."""
+
+    async def principal_for_consumer(
+        self,
+        consumer_identity: str,
+    ) -> RoutingPrincipal | None:
+        """Return the one live owner for *consumer_identity*, or ``None``."""
+
+
 class RoutingProvider(Protocol):
     """Wake and locate one store-resolved allocation on the private network."""
 

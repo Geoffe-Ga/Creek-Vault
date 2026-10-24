@@ -35,7 +35,13 @@ read-only and needs no LLM provider, so the negotiation succeeds on any host and
 even on a fresh/absent vault. It returns at least `available`,
 `contract_version`, `ontology_version`, `tiers` (`open`/`personal`/`intimate`),
 and `capabilities` (the names of the tools actually registered), plus the
-`tier_model` and `transport`. Versions come from `creek_mcp/contract.py`; the
+`tier_model`, `transport` and `auth` — `oauth` when the vault is an OAuth
+resource server (#1963), `bearer` for static consumer tokens only, `none` on
+stdio — and `request_key_providers`, the vendors whose writer-supplied key the
+vault would spend on `creek.draft`, `creek.author` and `creek.reflect`
+(`["anthropic", "openai"]` on a managed vault over the network, `[]` otherwise;
+see [A writer's own model key on `/mcp`](#a-writers-own-model-key-on-mcp-1967)).
+Versions come from `creek_mcp/contract.py`; the
 cross-repo contract is
 [`docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md`](../../docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md).
 
@@ -48,7 +54,7 @@ cross-repo contract is
 | `creek.lint`          | Run the unified hygiene lint pass (FEAT-008).              |
 | `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
 | `creek.wheel`         | Return a per-frequency balance read of the corpus for the Map: an ordered `F1..F10` map of `{name, count, share}`, where `share` is the fraction of *classified* fragments at that frequency. A corpus walk (the same shape as `state.render` and `report`), so it **excludes** above-ceiling fragments from the tally rather than refusing (#969). |
-| `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
+| `creek.draft`         | Draft an essay from a mined idea (requires an LLM). Streams progress, and past the server deadline answers with a job handle — see [Long calls](#long-calls-progress-a-deadline-and-job-handles-1966). |
 | `creek.redact.scan`   | Regex-scan a path for secrets/PII (FEAT-027); scoped to `00-Creek-Meta/Inbound/` at every ceiling, `intimate`/`all` elsewhere in the vault (#972). |
 | `creek.classify.entry` | Report the ontology classification one named fragment **already carries on disk** (#874). Takes `entry_ref` plus `ceiling`; computes nothing. |
 
@@ -265,7 +271,8 @@ confinement boundary.
 
 | Tool           | Inputs                                                                  | Purpose                                                                       |
 |----------------|------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk.                         |
+| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). |
+| `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` job handle to `{status, job_id, state, result?}`. |
 
 Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
 `medium`, `query`, `body`, `provenance` (a list of provenance entries),
@@ -336,6 +343,68 @@ CrawDad feeds it verbatim into an LLM composer — so renaming the key changes
 no bytes on the wire and only makes the leak harder to see. A caller that
 legitimately needs the text in order to revise should re-run at a ceiling that
 excludes the offending fragment, or re-tier the fragment.
+
+### Long calls: progress, a deadline and job handles (#1966)
+
+A draft on the vault's pinned local model can take minutes, and MCP clients
+own their own request timeouts (OpenClaw's documented example is 20 s; the Fly
+edge drops an idle connection long before a cold model finishes). So
+`creek.draft` and `creek.author` run through `creek_mcp/composition_jobs.py`:
+
+- **Progress.** A client that sends a `progressToken` receives one
+  `notifications/progress` per stage boundary the pipeline crosses. The
+  message is the stage *name* and nothing else — never a title, fragment id or
+  line of prose:
+
+  | Tool | Notifications, in order |
+  |------|-------------------------|
+  | `creek.draft` | `1/6 seed`, `2/6 skills`, `3/6 sources`, `4/6 composed`, `5/6 voice_guarded`, `6/6 saved` |
+  | `creek.author` | `1/3 sources`, `2/3 composed`, `3/3 voice_guarded` (once each, however many revision rounds run) |
+
+- **A server deadline.** `CREEK_MCP_SYNC_DEADLINE_SECONDS` (default `90`, read
+  when the server is built; anything but a positive, finite number refuses to
+  start) bounds the synchronous path. A call that beats it answers exactly as
+  before. One that does not answers
+  `{status: "accepted", tool, tier_ceiling, job_id, state: "running"}` and the
+  same worker keeps composing. A detached `creek.draft` writes its draft to
+  `07-Voice/Drafts/` as always; a detached `creek.author` — whose synchronous
+  answer carries the body instead of saving it — files the body there too, as
+  `YYYY-MM-DD-writing-desk-<medium>.md`, so it is not lost.
+- **`creek.jobs.read(job_id)`** returns
+  `{status: "ok", tool, tier_ceiling, job_id, state}` with `state` one of
+  `queued` / `running` / `succeeded` / `failed`, plus `result` once the job
+  has succeeded. `result` is the composing tool's success envelope with every
+  content-bearing key dropped — for `creek.draft`: `status`, `tool`,
+  `tier_ceiling`, `draft_path`, `idea_strategy`, `source_count`,
+  `voice_guard_status`; for `creek.author`: `status`, `tool`, `tier_ceiling`,
+  `medium`, `verdict`, `rounds`, `draft_path`, `claim_count`, `source_count`,
+  `warnings`. Never the body, title, query, claims or fragment ids. A refused
+  or failed composition is `state: "failed"` with no `result`, as on `/v1`.
+  The synchronous `creek.draft` envelope gained `source_count` and
+  `voice_guard_status` alongside its existing keys.
+
+Jobs reuse the `/v1` durable job store (`creek_mcp/httpapi/jobs.py`, kinds
+`draft` and `author` beside `classification` and `link`) and its rules:
+
+- **One active long call per consumer** (#1605). A second `creek.draft` or
+  `creek.author` while one runs is refused with the static
+  `unavailable` refusal (`status: "refused"`, `code: "unavailable"`). The slot
+  lives on `creek_mcp/httpapi/job_runtime.py::JobRuntime`. The server mounted
+  at `/mcp` inside the `/v1` process is built with the `/v1` app's runtime
+  (`build_server(job_runtime=...)`), so a consumer holds one slot across both
+  surfaces: a running `/v1` LLM classification refuses its `creek.draft`, and
+  the other way round.
+- **Bound to the caller.** The record carries the consumer the call was
+  audited under, so a JWT agent and the `adepthood` service bearer never see
+  each other's jobs. Another consumer's id, an unknown id, a malformed id and
+  a `/v1` pipeline id all get the same `unavailable` refusal.
+- **A restart fails in-flight work.** A queued or running job this server
+  process is not executing reads back as `failed`, exactly as
+  `GET /v1/jobs/{job_id}` does.
+- **Two audit entries.** A detached call appends `"outcome": "accepted"` when
+  it hands off and `"outcome": "completed"` (with the terminal `state`) when
+  the worker finishes, both carrying the same `job_id`, always in that order.
+  The tool's own ordinary entry precedes both.
 
 ### Write tools (FEAT-011)
 
@@ -459,7 +528,7 @@ of you and closing one channel says nothing about the others:
 | Egress channel | What is checked | Which tools | Forced? |
 |----------------|-----------------|-------------|---------|
 | **JSON response** | The tool is called at `ceiling=open` against a vault holding an `intimate` fragment whose title, body and tags each carry a unique sentinel; that sentinel must appear nowhere in the serialised response. | Thirteen of the fourteen `GATED` tools. Only `creek.draft` carries a recorded exemption, and its stated reason is executed rather than trusted, exactly as its prompt-channel one is: on a fixture this small the idea miner falls back to an ontology-tuple seed, so a successful draft comes back citing no fragment and carrying no corpus text of any tier — a canary assertion over that envelope could neither fail nor pass for a reason. (`creek.author` carried the second exemption until [#1279](https://github.com/Geoffe-Ga/Creek-Vault/issues/1279); every load-bearing clause of its reason was false — the desk answers `status: ok` with cited corpus content on a bare, offline fixture — and it is probed here now.) For `creek.skills.refresh` and `creek.classify.entry` the envelope sweep is a tripwire rather than evidence, and both say so at their probe: neither response can carry a sentinel even with its gate deleted, so each carries a stronger per-tool test alongside — the bytes of the tree `skills.refresh` writes, and the admitted/refused *verdict* for `classify.entry` under one fixed ceiling. | Yes, and twice over. A newly `GATED` tool must grow a probe or record a justified exemption; it cannot inherit silence. The exemption set is *pinned*, so a tool cannot move into it unnoticed, and every exemption must name a test that runs its reason — the two holes that let `creek.author`'s false reason stand. |
-| **Model prompt** | The tool is driven all the way *to* the provider with a recording client, and neither the `intimate` sentinel nor the above-ceiling **`personal`** one may appear in any prompt it sent — nor in the response of that same call ([#1036](https://github.com/Geoffe-Ga/Creek-Vault/issues/1036)). | `creek.reflect`, `creek.compile` and `creek.author`. `creek.draft` is exempt, and its stated reason is executed rather than trusted. **This column is derived, and a derived set is not an enumeration of every prompt channel on this surface** — read it as "the tools the derivation can reach", not as "the tools that talk to a model". `creek.classify` is one that sits outside it, and it is outside for two independent reasons: it is `METADATA_ONLY`, so it never enters the `GATED` candidate set, and `classify_tool` takes no LLM factory — so adding a factory alone would enrol nothing. With `method="llm"` it is nonetheless a whole-corpus prompt-channel egress at every tier and every ceiling. Its exclusion is now *pinned* rather than incidental, and it carries a separate per-tool probe asserting which provider each tier's body was dispatched to ([#1274](https://github.com/Geoffe-Ga/Creek-Vault/issues/1274)); it cannot share the assertion above, because for classify the `intimate` body legitimately reaches a prompt — the local one. | Yes. The set is *derived* from the tools' own signatures — a `GATED` tool taking both an LLM factory and a ceiling — so a tool cannot become model-backed without being asked for a prompt probe. **The derivation is keyed on posture and signature, not on provider reachability**, which is why a tool like `creek.classify` needs its own pin and probe; generalising it over all 25 `TOOL_POSTURES` entries is tracked in [#1749](https://github.com/Geoffe-Ga/Creek-Vault/issues/1749). |
+| **Model prompt** | The tool is driven all the way *to* the provider with a recording client, and neither the `intimate` sentinel nor the above-ceiling **`personal`** one may appear in any prompt it sent — nor in the response of that same call ([#1036](https://github.com/Geoffe-Ga/Creek-Vault/issues/1036)). | `creek.reflect`, `creek.compile` and `creek.author`. `creek.draft` is exempt, and its stated reason is executed rather than trusted. **This column is derived, and a derived set is not an enumeration of every prompt channel on this surface** — read it as "the tools the derivation can reach", not as "the tools that talk to a model". `creek.classify` is one that sits outside it, and it is outside for two independent reasons: it is `METADATA_ONLY`, so it never enters the `GATED` candidate set, and `classify_tool` takes no LLM factory — so adding a factory alone would enrol nothing. With `method="llm"` it is nonetheless a whole-corpus prompt-channel egress at every tier and every ceiling. Its exclusion is now *pinned* rather than incidental, and it carries a separate per-tool probe asserting which provider each tier's body was dispatched to ([#1274](https://github.com/Geoffe-Ga/Creek-Vault/issues/1274)); it cannot share the assertion above, because for classify the `intimate` body legitimately reaches a prompt — the local one. | Yes. The set is *derived* from the tools' own signatures — a `GATED` tool taking both an LLM factory and a ceiling — so a tool cannot become model-backed without being asked for a prompt probe. **The derivation is keyed on posture and signature, not on provider reachability**, which is why a tool like `creek.classify` needs its own pin and probe; generalising it over every `TOOL_POSTURES` entry is tracked in [#1749](https://github.com/Geoffe-Ga/Creek-Vault/issues/1749). |
 | **Disk artifacts** | The bytes the call writes into the vault carry no sentinel, and a refused call leaves the bytes it would have overwritten untouched. | `creek.report`, `creek.state.render`, `creek.journal`, `creek.upload`. | **No.** Four per-tool tests and no forcing function: nothing obliges the fifth artifact-writing tool to grow a fifth test. Tracked in [#1273](https://github.com/Geoffe-Ga/Creek-Vault/issues/1273). |
 
 The `warnings` field #1372 added to `creek.journal` and `creek.upload` needs no JSON-response probe of its own: it carries only `IngestRunResult.ceiling_safe_warnings`, proven content-free at the producer rather than filtered at this response boundary — see the per-tool doctrine under "Write tools" above.
@@ -739,10 +808,16 @@ Add an entry to your project's `.mcp.json` (or to user-level
 `CREEK_MCP_CONSUMER` is recorded on every audit-log entry so we can
 tell apart calls from Claude Code, CrawDad, or operator-driven runs.
 
+This is the local stdio registration, for a vault on the same computer. To
+connect Claude Code to a vault over the network, see
+[Agents](#agents-connecting-openclaw-claude-code-or-chatgpt-to-a-vault-1961).
+
 ## Claude Desktop / Cursor / Zed
 
 All three read the same `mcp.json` schema; the registration entry
-above works verbatim. Drop it in the host's MCP config location.
+above works verbatim. Drop it in the host's MCP config location. For a remote
+vault, see the client-support matrix under
+[Agents](#agents-connecting-openclaw-claude-code-or-chatgpt-to-a-vault-1961).
 
 ## CrawDad
 
@@ -751,12 +826,375 @@ CrawDad (FEAT-013+) treats this server's tool registry as its
 stdio child process. Set `CREEK_MCP_CONSUMER=crawdad` in the bot's
 environment so the audit trail distinguishes Discord-driven calls.
 
+## Agents: connecting OpenClaw, Claude Code or ChatGPT to a vault (#1961)
+
+This section is for the person whose vault it is. It covers what to paste into
+an agent you already run so that it can query your vault over the network: mine
+seeds, draft in your voice, reflect, and file a draft back. The sections after it
+(from [Network transport](#network-transport-authenticated-epic-757--759--837)
+on) are the operator's reference for the same surface; the recipes below link
+into them rather than repeating them.
+
+An agent reaches your vault in one of two ways:
+
+- **Signed in through Adepthood (OAuth).** The agent sends you to Adepthood, you
+  sign in and approve what it may do, and it receives short-lived tokens that
+  only your vault accepts. Nothing is pasted except the vault's address.
+- **A static token (self-hosted vaults).** You generate a secret, give it a grant
+  suffix, and paste it into the agent as an `Authorization` header.
+
+### What an agent can reach
+
+What a credential reaches is its **grants**, enforced by the vault before a tool
+runs (`creek_mcp/policy.py::TOOL_GRANTS`; the full table is under
+[Network transport](#network-transport-authenticated-epic-757--759--837)). The
+default for a new agent is `vault:read vault:desk`
+(`creek_mcp/policy.py::DEFAULT_GRANTS`), which is also the `scope` a vault's `401`
+challenge asks for:
+
+- **It can** read and search your Open and Personal writing (`creek.handshake`,
+  `creek.state.read`, `creek.wheel`, `creek.mine`, `creek.classify.entry`,
+  `creek.lint`), and draft, author, reflect, save and check on a draft in
+  progress (`creek.draft`, `creek.author`, `creek.reflect`, `creek.save`,
+  `creek.jobs.read`). A draft from `creek.draft` lands in `07-Voice/Drafts/`.
+- **It cannot** add journal entries or uploads unless it also holds
+  `vault:journal`, and cannot run the pipeline passes (`creek.ingest`,
+  `creek.classify`, `creek.link`, `creek.compile`, `creek.report`,
+  `creek.skills.refresh`, `creek.redact.scan`, `creek.state.render`) unless it
+  also holds `vault:pipeline`. Such a call is refused before it runs and is
+  recorded as refused.
+- **Never, whatever it holds:** your Intimate writing (every remote caller is
+  capped at `personal`; a request for `intimate` or `all` is refused before
+  dispatch — see "INTIMATE is never reachable remotely" under Network transport),
+  and the `creek.purge.*` tools, which are in no grant at all.
+
+What a person reads on Adepthood's consent page and Settings list for each grant
+is Adepthood's copy, owned there: see
+[Agent grants in plain words, and the Settings list](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/creek-vault-mcp-contract.md#agent-grants-in-plain-words-and-the-settings-list-adepthood-owned)
+in Adepthood's contract document. This page does not restate it.
+
+### The address to paste
+
+An agent is configured with one URL: the vault's base URL plus `/mcp`
+(`creek_mcp/mcp_path.py::MCP_PATH`), with no trailing slash — `/mcp/` answers as
+an unrouted path. For OAuth it must be spelled exactly as the vault's
+`CREEK_MCP_RESOURCE_URL`, because that string is the token audience the vault
+compares exactly.
+
+| Vault | Address shape | Where to read it |
+|---|---|---|
+| Self-hosted, `creek-tools-api` | `https://<your-vault-host>:8823/mcp` (8823 is `creek_mcp.httpapi.cli.DEFAULT_API_PORT`) | Adepthood Settings, "Where your writing lives", once the vault is connected: the connection's `mcp_address` is this exact string |
+| Self-hosted, `creek-tools-mcp --transport network` | `https://<your-vault-host>:<port>/mcp` (`--port` defaults to `8000`) | Whatever `--host`/`--port` and TLS front you chose. Static tokens only in practice: Adepthood issues tokens for the connected `/v1` address plus `/mcp`, and this server serves no `/v1` |
+| Managed | `https://<pilot-app>.fly.dev/mcp`: one edge address shared by every managed vault, which routes your agent's token to your vault by its subject | Not shown yet: Adepthood reports no `mcp_address` for a managed vault. See [Known gaps](#known-gaps-on-2026-10-24) |
+
+Plain `http` is accepted for the vault's address only on loopback (`127.0.0.1`,
+`::1`, `localhost`), for a vault and agent on the same computer; the issuer is
+always `https`. Hosted agents (claude.ai, ChatGPT) connect
+from their vendor's cloud, so they need a vault — and an Adepthood — reachable
+over public HTTPS.
+
+### Signing in, from the person's side
+
+1. Add the vault's address to the agent (the recipes below), then start its
+   sign-in.
+2. The agent opens Adepthood. Sign in with your Adepthood email and password.
+   (An account that signs in only with Google or Apple cannot sign in on that
+   page yet.)
+3. Read the list of what the agent is asking for and the address it will send you
+   back to, then **Approve** or **Decline**. With the default grants the list
+   has two items, plus "Stay connected without asking you again" when the agent
+   asked for a refresh token. Intimate entries are never included, and the page
+   says so.
+4. Done: the agent receives an access token for your vault alone. It lasts
+   600 seconds and the agent refreshes it on its own, which is when Adepthood
+   records the agent as last used.
+
+**Check the list before you approve.** A client that is not told which grants to
+ask for may ask for every grant the vault advertises (`scopes_supported` in the
+vault's metadata lists all four). On 2026-10-24 both OpenClaw's
+`openclaw mcp login` and Claude Code's `claude mcp login` did exactly that when
+left unpinned, so the consent page also listed "Add journal entries" and
+"Re-sort your vault". The page approves or declines the whole request, so pin the
+grants in the client (each recipe shows how) and sign in again rather than
+approving more than you meant to. Approving the same agent again replaces its
+grants.
+
+### Stopping an agent
+
+Under Adepthood Settings, "Where your writing lives", "Agents that may read your
+vault", choose **Stop** beside the agent. Adepthood revokes its refresh tokens at
+once; the access token it already holds runs out within its 600 seconds, because
+the vault verifies tokens offline and never calls Adepthood back. So the agent's
+calls stop within one access-token lifetime, with no vault restart. To stop a
+static-token agent instead, drop its token from the consumer registry (see
+[Rotating a consumer's secret](#rotating-a-consumers-secret-no-downtime)): within
+5 s on a mounted secret file, at the next restart for an environment variable.
+
+### A self-hosted vault: the two settings, or a static token
+
+For OAuth, the vault operator sets `CREEK_MCP_RESOURCE_URL` (the address above)
+and `CREEK_MCP_AUTHORIZATION_SERVER` (Adepthood's issuer URL, exactly as
+Adepthood's `/.well-known/oauth-authorization-server` spells `issuer`); see
+[Signing in through Adepthood: OAuth on `/mcp`](#signing-in-through-adepthood-oauth-on-mcp-1963)
+for the full contract. The person then connects that vault in Adepthood Settings
+so Adepthood will issue tokens for it: Adepthood names only the account's own
+connected vault as an audience.
+
+Without them — or beside them — give each agent its own static consumer token,
+gated with the default grants by a suffix (`@` ends the token, `+` separates
+grants):
+
+```bash
+# Generate the agent's token once:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+export CREEK_MCP_CONSUMER_TOKENS="openclaw=<token>@vault:read+vault:desk;adepthood=<token>"
+creek-tools-api --host 0.0.0.0 --port 8823 \
+  --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+```
+
+The agent then sends `Authorization: Bearer <token>` (the recipes show where).
+The vault audits its calls under the consumer name `openclaw` and gates every one
+to `vault:read vault:desk`; `adepthood=<token>` is the Adepthood app's own
+credential, the one entered when the vault was connected in Settings. A token with no suffix is
+*ungated* and write-capable: see "An ungated consumer token still grants remote
+_write_ access" under Network transport.
+
+### Recipes
+
+The OpenClaw and Claude Code recipes were each run once against a real vault on
+2026-10-24, with the client version named. The **OAuth** runs used a self-hosted vault (`creek-tools-api` at
+`main`, OAuth settings on) and Adepthood's authorization server at `main`, both
+on one computer behind a local HTTPS origin; the **static-token** runs used
+`creek-tools-mcp --transport network` on `127.0.0.1`. ChatGPT and the hosted
+Claude apps connect from their vendors' clouds, which a vault on one computer
+cannot be reached from, so those two recipes follow the vendors' documentation
+and were **not** run.
+
+#### OpenClaw recipe
+
+Tested with OpenClaw 2026.10.7. OpenClaw's server entries live under
+`mcp.servers` in its config; `transport: "streamable-http"` must be set, because
+an entry without it is treated as SSE. Set `requestTimeoutMs` above the vault's
+deadline (see [Slow tools](#slow-tools-set-the-client-timeout-above-the-deadline)).
+
+OAuth, signing in through Adepthood:
+
+```bash
+openclaw mcp set creek '{"url":"https://<your-vault-host>:8823/mcp","transport":"streamable-http","auth":"oauth","oauth":{"scope":"vault:read vault:desk offline_access"},"requestTimeoutMs":120000}'
+openclaw mcp login creek      # prints the Adepthood sign-in URL and waits for the redirect
+openclaw mcp probe creek      # lists the tools your grants admit
+```
+
+`oauth.scope` pins the request to the default grants; `offline_access` lets
+OpenClaw refresh without a new sign-in. With `auth: "oauth"` OpenClaw ignores a
+static `Authorization` header. If the browser cannot reach OpenClaw's loopback
+listener, `openclaw mcp login creek --code <code>` finishes the sign-in by hand.
+
+Static token, on a self-hosted vault:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "creek": {
+        "url": "https://<your-vault-host>:8823/mcp",
+        "transport": "streamable-http",
+        "requestTimeoutMs": 120000,
+        "headers": { "Authorization": "Bearer ${CREEK_TOKEN}" }
+      }
+    }
+  }
+}
+```
+
+OpenClaw expands `${CREEK_TOKEN}` from its environment (or its `.env`) when it
+reads the config, so the file holds only the reference; note that
+`openclaw mcp show` prints the expanded value. OpenClaw renames each tool for its
+model, so `creek.draft` appears as `creek__creek-draft`. What was run: the OAuth
+form through `mcp login` and `mcp probe` (11 tools, the default grants'), and the
+static form through `mcp probe` (11 tools). The OAuth sign-in needed one
+workaround, described under [Known gaps](#known-gaps-on-2026-10-24).
+
+#### Claude Code recipe
+
+Tested with Claude Code 2.1.310. `claude mcp add --transport http` takes the
+name, then the URL; `claude mcp add-json` takes a whole entry, which is how the
+grants and a timeout are pinned.
+
+OAuth, signing in through Adepthood:
+
+```bash
+claude mcp add-json creek '{"type":"http","url":"https://<your-vault-host>:8823/mcp","timeout":120000,"oauth":{"scopes":"vault:read vault:desk"}}'
+claude mcp login creek        # or /mcp inside a session; --no-browser prints the URL instead
+claude mcp list               # "creek: … (HTTP) - √ Connected"
+```
+
+Claude Code identifies itself with its own Client ID Metadata Document, which
+Adepthood accepts, and listens on a `localhost` loopback port for the redirect.
+`oauth.scopes` pins the request; Claude Code adds `offline_access` itself because
+Adepthood advertises it. Do not add an `Authorization` header to an OAuth
+entry: Claude Code sends a configured one instead, and reports a rejected one as
+a failed connection rather than falling back to OAuth.
+
+Static token, on a self-hosted vault:
+
+```bash
+claude mcp add --transport http creek https://<your-vault-host>:8823/mcp \
+  --header "Authorization: Bearer $CREEK_TOKEN"
+```
+
+What was run: the OAuth form through `claude mcp login` (the consent page listed
+the two default grants and "Stay connected") and `claude mcp list` (Connected);
+the static form through `claude mcp list` (Connected). Add `"timeout": 120000`
+to a static entry too, with `claude mcp add-json`, if it will draft.
+
+#### ChatGPT recipe
+
+Not run (see above); follows OpenAI's documentation as found on 2026-10-24.
+ChatGPT connects to remote MCP servers over OAuth from OpenAI's cloud: it
+registers itself by Dynamic Client Registration, uses PKCE and sends the
+`resource` parameter, all of which Adepthood supports.
+
+1. In ChatGPT on the web, create a custom connector for a remote MCP server. The
+   path has moved during 2026 — from Settings, Connectors, Advanced, Developer
+   mode, to a Plugins menu that no longer requires developer mode — so follow
+   OpenAI's current help article,
+   [Developer mode and MCP apps in ChatGPT](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
+2. Enter the vault's address and choose OAuth.
+3. Sign in to Adepthood and approve, as above. OpenAI asks the server to issue
+   refresh tokens, which is what "Stay connected" grants.
+
+**Which plans can do this is not settled here.** OpenAI's own help pages, as
+quoted by search on 2026-10-24, give full MCP (read and write) to Business and
+Enterprise/Edu and read/fetch only to Pro, while third-party setup guides
+disagree with that and with each other about Plus and Pro. Check OpenAI's current
+help page for your plan. OpenAI documents no custom-header setting for these
+connectors, so a writer's own model key cannot be sent from ChatGPT.
+
+#### Claude on claude.ai, Desktop and mobile recipe
+
+Not run (see above); follows Anthropic's connector documentation, read on
+2026-10-24. A custom connector is added by URL on Free (one connector), Pro,
+Max, Team and Enterprise, and is then available in all three apps; on Team and
+Enterprise an Owner adds it for the organization and each member then connects.
+
+1. Open **Customize > Connectors** and choose **Add custom connector** (Owners:
+   **Organization settings > Connectors**, **Add**, **Custom**).
+2. Enter the vault's address. For the OAuth client choose **Use Claude's
+   published identity** (its Client ID Metadata Document, which Adepthood
+   accepts); **Register automatically** (Dynamic Client Registration) also
+   works. Add it, then **Connect**.
+3. Sign in to Adepthood and approve. The redirect goes to
+   `https://claude.ai/api/mcp/auth_callback`.
+
+Anthropic documents that the hosted apps request the scope a `401` challenge
+names — the vault's names the default grants — and add `offline_access`; check
+the consent list all the same. Request headers (`static_headers`) are a beta for
+a limited set of organizations, and a header name outside the standard set needs
+Anthropic's approval, so a writer's own model key cannot be sent from these apps
+either.
+
+### Slow tools: set the client timeout above the deadline
+
+`creek.draft` and `creek.author` answer within `CREEK_MCP_SYNC_DEADLINE_SECONDS`
+(default `90`) or hand back a job handle — `{status: "accepted", job_id, state:
+"running"}` — while the draft keeps composing on the vault; the agent then calls
+`creek.jobs.read(job_id)` until `state` is `succeeded` or `failed`. See
+[Long calls](#long-calls-progress-a-deadline-and-job-handles-1966). An agent that
+sends a `progressToken` sees one stage name per step meanwhile. For this to work
+the client must wait longer than the deadline:
+
+| Client | Its timeout | Set it to |
+|---|---|---|
+| OpenClaw | `requestTimeoutMs` per server (its documented example is 20 000) | `120000` |
+| Claude Code | per-server `timeout` in ms; otherwise each request waits at most 60 s for the first response byte | `120000` |
+| Claude (hosted apps) | 240 s per tool call | nothing to set |
+| ChatGPT | not documented in what was read | nothing settable; the job handle is the fallback |
+
+A client that gives up before the deadline loses that call's answer, not the
+draft: a detached `creek.draft` still saves to `07-Voice/Drafts/`. Only one long
+call per consumer runs at a time, and a second is refused as `unavailable` —
+which, for agents signed in through Adepthood, means one per *person* until
+[#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976) (see below).
+
+### A writer's own model key
+
+`creek.draft`, `creek.author` and `creek.reflect` honour the
+`X-Creek-Provider` / `X-Creek-Provider-Key` pair on a managed vault, and
+`creek.handshake` reports which vendors this vault would spend a key on
+(`request_key_providers`). Only a client that can set custom headers can send
+them: OpenClaw (`headers`, beside `auth: "oauth"`) and Claude Code (`--header`).
+See [A writer's own model key on `/mcp`](#a-writers-own-model-key-on-mcp-1967)
+for the rules and the exact snippets.
+
+### What the person sees afterwards
+
+Adepthood Settings lists every connected agent by the name it gave itself, with
+its grants in plain words, when it was last used (stamped at sign-in and at each
+refresh, not on each call), and **Stop**. A content-free list of what each agent
+asked the vault for is the vault's `GET /v1/agent-activity` (contract `0.22.0`,
+see [`api.md`](api.md)); the Settings card that shows it is Adepthood's, and is
+forthcoming (adepthood#3535, not yet merged). One limit applies: the vault's audit log names
+the token's subject, which is the *person*, so until
+[#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976) lands every agent
+one person connects through Adepthood is recorded under the same consumer, and
+the activity rows cannot yet say which agent made a call. A static-token agent is
+recorded under its own consumer name.
+
+### Client-support matrix (verified 2026-10-24)
+
+Each row was checked against the vendor's own documentation where this session
+could reach it. "Search index only" means the vendor host refused this session's
+connection, so the claim rests on the vendor page as quoted by a search engine,
+not on a read of the page. A row that says "not verified" found no primary source
+for MCP client support; it is a statement about the evidence, not about the
+product.
+
+| Client | Version checked | Transport | Auth supported | Custom headers possible | Verified on | Source |
+|---|---|---|---|---|---|---|
+| OpenClaw | 2026.10.7 | streamable-http (also `sse`, stdio) | OAuth (DCR; `openclaw mcp login`), bearer header | yes (`headers`) | 2026-10-24 | `docs/cli/mcp/transports.md` in the published `openclaw@2026.10.7` package ([docs.openclaw.ai](https://docs.openclaw.ai/cli/mcp/transports)); run by hand |
+| Claude Code | 2.1.310 | `http` (streamable HTTP), `sse`, stdio | OAuth (CIMD, else DCR), bearer header | yes (`--header`, `headers`) | 2026-10-24 | [code.claude.com/docs/en/mcp](https://code.claude.com/docs/en/mcp); run by hand |
+| Claude (claude.ai, Desktop, mobile) | hosted, unversioned | streamable HTTP (SSE for an `/sse` URL) | OAuth (CIMD, DCR, or your own client); `static_headers` in beta | beta, limited organizations; custom names need Anthropic's approval | 2026-10-24 | [Authentication for connectors](https://claude.com/docs/connectors/building/authentication), [Add a connector that isn't in the directory](https://claude.com/docs/connectors/custom/add-unlisted) |
+| ChatGPT | hosted, unversioned | remote MCP | OAuth (DCR, PKCE, `resource`), or none | none documented | 2026-10-24 | [help.openai.com 12584461](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt), [Apps SDK authentication](https://developers.openai.com/apps-sdk/build/auth) (search index only) |
+| Cursor | not checked (docs unreachable) | stdio, SSE, streamable HTTP | OAuth, bearer header | yes (`headers`); an open forum report says extra headers are dropped on `tools/call` | 2026-10-24 | [cursor.com/docs/context/mcp](https://cursor.com/docs/context/mcp) (search index only) |
+| Meta Muse | consumer app, unversioned | not verified | not verified | not verified | 2026-10-24 | Meta's help page [How Muse works with Connectors](https://www.meta.com/help/artificial-intelligence/1687253048996149/) (search index only) describes custom connectors Muse builds from a service's API and does not name MCP; third-party guides claiming an MCP route are not primary |
+| OpenAI Dot | not verified | not verified | not verified | not verified | 2026-10-24 | No OpenAI page found for dots and MCP; third-party posts describe dots reusing ChatGPT's custom-connector path |
+| Claude Duet | research preview (announced 2026-10-21) | not verified | not verified | not verified | 2026-10-24 | No Duet page in Anthropic's docs index ([claude.com/docs/llms.txt](https://claude.com/docs/llms.txt)); press coverage says Duet carries over a Claude account's connectors, which Anthropic has not documented |
+| Instinct | no public MCP client found | none found | none found | none found | 2026-10-24 | None found: no public developer documentation; reviews report no API |
+| GrokBot | not verified | not verified | not verified | not verified | 2026-10-24 | xAI documents custom remote MCP connectors for Grok ([docs.x.ai/grok/connectors](https://docs.x.ai/grok/connectors), search index only); no xAI page confirming how Grok Bot itself connects one was read |
+
+Verified set: OpenClaw, Claude Code, Claude (hosted), ChatGPT and Cursor support
+remote MCP; only OpenClaw and Claude Code were run against a vault. Meta Muse,
+OpenAI Dot, Claude Duet, Instinct and GrokBot could not be confirmed as MCP
+clients from a primary source on this date.
+
+### Known gaps on 2026-10-24
+
+- **Managed vaults cannot take agent tokens yet.** The edge routes an agent's
+  token by subject (`--oauth-authorization-server` on the replay router), but the
+  vault Machine is not yet handed `CREEK_MCP_RESOURCE_URL` and
+  `CREEK_MCP_AUTHORIZATION_SERVER`, so it refuses the token
+  ([#1974](https://github.com/Geoffe-Ga/Creek-Vault/issues/1974)). Adepthood also
+  shows no address for a managed vault. Until both land, the recipes work against
+  a self-hosted vault only.
+- **OpenClaw's OAuth sign-in stops after registration.** Adepthood's
+  registration response carries `"logo_uri": null` when the client sent no logo,
+  and the MCP TypeScript SDK that OpenClaw 2026.10.7 ships (1.32.0) rejects a
+  null there, so `openclaw mcp login` fails with no message right after
+  registering. The run above succeeded with that one field dropped from the
+  response in transit; it needs a fix on Adepthood's side. Claude Code is not
+  affected, because it registers by metadata document rather than by
+  registration.
+- **Per-agent attribution** waits on
+  [#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976), as above.
+
 ## Network transport (authenticated, epic #757 / #759 / #837)
 
 Local consumers (Claude Code, CrawDad) speak JSON-RPC over **stdio** — the
 default, unchanged. To reach a user's per-user-VM vault from a remote
-Adepthood backend, the server also serves an **authenticated
-streamable-http** transport:
+consumer — the Adepthood backend, or an agent the person connects (see
+[Agents](#agents-connecting-openclaw-claude-code-or-chatgpt-to-a-vault-1961)) —
+the server also serves an **authenticated streamable-http** transport:
 
 ```bash
 # Generate each consumer token as a high-entropy secret, once, per consumer:
@@ -844,25 +1282,66 @@ routable by design and requires TLS.
   outside the server) would remain valid. It does **not** bound the
   configured secret itself and it is not a rotation mechanism — a consumer
   that keeps presenting a value from `CREEK_MCP_CONSUMER_TOKENS` is
-  re-verified indefinitely. Dropping a token from the set and restarting is
-  what revokes it; see "Rotating a consumer's secret" below, and
+  re-verified indefinitely. Dropping a token from the set is what revokes it —
+  within seconds when the set lives in a mounted secret file, at the next
+  restart when it lives in the environment; see "Rotating a consumer's
+  secret" below, and
   [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
   overlapping static tokens, rather than short-lived derived credentials, is
   the shape of that runbook.
-- **A consumer token grants remote _write_ access, by design.** A valid
-  `CREEK_MCP_CONSUMER_TOKENS` entry can reach every non-purge tool at or below
-  the `personal` ceiling — including the **write** tools (`creek.journal`,
-  `creek.ingest`, `creek.classify`, `creek.link`, `creek.report`,
-  `creek.compile`, `creek.save`, `creek.skills.refresh`), not just reads. This
-  is intentional (Adepthood writes journal entries remotely), so treat each
-  token as a write-capable credential — a meaningfully larger attack surface
-  than "remote read-only." Purge tools stay gated separately by
-  `CREEK_MCP_ELEVATED_TOKEN` (a per-consumer bearer alone cannot purge). The
-  one *destructive* path a consumer token could reach without the elevated
-  token is now closed: `creek.journal`'s update-in-place refuses to overwrite a
-  fragment above the caller's ceiling (#970), and remote callers are capped at
-  `personal`, so a remote consumer can no longer destroy an `intimate` journal
-  fragment.
+- **A consumer token reaches only the tools its grants admit (#1964).** Each
+  consumer holds a *grant set* drawn from four profiles, and the server
+  answers `tools/list` with only the tools that set admits — so the
+  `creek.handshake` capability list is the caller's own profile too. A
+  `tools/call` outside it is **refused before dispatch** with one constant
+  reason, `this credential is not granted the requested tool`, which names
+  neither the tool list nor the grants held, and is audited as refused
+  (`"outcome": "refused"`) under the tool name only, with no argument summary.
+  The decision is transport-neutral policy in
+  `creek_mcp/policy.py::admitted_tool`, beside the tier cap, and the grant
+  table is `creek_mcp/policy.py::TOOL_GRANTS`:
+
+  | Grant            | Tools |
+  |------------------|-------|
+  | `vault:read`     | `creek.handshake`, `creek.state.read`, `creek.wheel`, `creek.mine`, `creek.classify.entry`, `creek.lint` |
+  | `vault:desk`     | `creek.draft`, `creek.author`, `creek.reflect`, `creek.save`, `creek.jobs.read` |
+  | `vault:journal`  | `creek.journal`, `creek.upload` |
+  | `vault:pipeline` | `creek.classify`, `creek.link`, `creek.compile`, `creek.report`, `creek.skills.refresh`, `creek.ingest`, `creek.redact.scan`, `creek.state.render` |
+
+  The `creek.purge.*` tools are in **no** profile, so a gated consumer never
+  reaches them whatever it holds. The default profile for a new agent is
+  `vault:read vault:desk`: it can draft and reflect, but cannot journal, and
+  cannot run hours of re-classify / re-link / compile passes over the corpus.
+
+  A static consumer is gated by a **grant suffix** on its entry — `@` ends the
+  token set, `+` separates the grants, and the suffix covers every token in a
+  rotation window:
+
+  ```bash
+  export CREEK_MCP_CONSUMER_TOKENS="openclaw=<token>@vault:read+vault:desk;adepthood=<token>"
+  ```
+
+  An unknown grant or an empty suffix is refused at startup, naming the
+  consumer and the valid grants (never the entry). The verifier stamps the
+  grants onto the token's `scopes` — exactly where an OAuth access token
+  carries them — and `creek_mcp/policy.py::granted_by_scopes` is the one place
+  either becomes a grant set; a token carrying no grant scope holds no grants
+  and is refused every tool.
+- **An ungated consumer token still grants remote _write_ access.** A consumer
+  configured with **no** grant suffix (`adepthood=<token>` above) is
+  *ungated*: it keeps exactly the reach a consumer token had before #1964, so
+  existing deployments do not break, and startup names every ungated consumer
+  on stderr until it is gated. Such a token reaches every non-purge tool at or
+  below the `personal` ceiling — including the **write** tools
+  (`creek.journal`, `creek.ingest`, `creek.classify`, `creek.link`,
+  `creek.report`, `creek.compile`, `creek.save`, `creek.skills.refresh`), not
+  just reads — so treat it as a write-capable credential, and prefer a suffix.
+  Purge tools stay gated separately by `CREEK_MCP_ELEVATED_TOKEN` (a
+  per-consumer bearer alone cannot purge). The one *destructive* path a
+  consumer token could reach without the elevated token is now closed:
+  `creek.journal`'s update-in-place refuses to overwrite a fragment above the
+  caller's ceiling (#970), and remote callers are capped at `personal`, so a
+  remote consumer can no longer destroy an `intimate` journal fragment.
 - **INTIMATE is never reachable remotely.** The cap is
   **adapter-independent policy**, in `creek_mcp/policy.py::admitted_ceiling`
   — not a property of the MCP transport wrapper. "Remote" is a fact each
@@ -877,7 +1356,11 @@ routable by design and requires TLS.
   remote caller is capped at `personal`, a request for a
   `privacy_tier_ceiling` above it (`intimate` / `all`, or any unrecognised
   value) is **refused before dispatch**, so intimate content is never even
-  read for a network consumer, and stdio calls are unaffected — the
+  read for a network consumer. The refusal is audited as refused
+  (`"outcome": "refused"`) under the tool name only, with no argument summary
+  and the transport-default `open` ceiling rather than the one asked for, so
+  the owner sees the attempt on `GET /v1/agent-activity` (#1968). Stdio calls
+  are unaffected — the
   per-tool `open` default still applies locally, and `intimate` remains
   reachable for the local owner. `_BoundedFastMCP.call_tool` is still the
   MCP-side chokepoint that enforces this; it now renders a verdict
@@ -893,53 +1376,303 @@ routable by design and requires TLS.
   `creek_mcp/server.py` is now MCP's thin adapter over it, unchanged in
   behaviour.
 
+### Served at `/mcp` inside the `/v1` process (#1962)
+
+A vault that serves `/v1` — the container image (`python -m
+creek_mcp.container_runtime`), the Fly vault Machine
+(`creek_mcp.fly_vault_runtime`) and `creek-tools-api` — also serves this MCP
+server at **`/mcp`** on the same port and TLS listener (8823 in the image),
+with no new flag, secret or health probe. An agent connects to the vault URL
+plus `/mcp`:
+
+```bash
+claude mcp add --transport http creek https://<vault-host>/mcp \
+  --header "Authorization: Bearer <consumer token>"
+```
+
+- **Same server, same verifier.** The tools are the ones
+  `creek-tools-mcp --transport network` serves, authenticated by the *same*
+  `ConsumerTokenVerifier` instance as `/v1`: a consumer token that opens `/v1`
+  opens `/mcp`, and the remote tier cap applies identically. An unauthenticated
+  request is `401` with a `WWW-Authenticate: Bearer` challenge.
+- **No `/v1` headers.** MCP negotiates its own protocol version in
+  `initialize`, so `X-Creek-Contract-Version` is neither required nor read;
+  the ceiling is each tool's `privacy_tier_ceiling` argument, not
+  `X-Creek-Tier-Ceiling`.
+- **Logged and enveloped like `/v1`.** Every `/mcp` request writes one line on
+  `creek_mcp.httpapi.access` (route `/mcp`, the verified consumer), and a fault
+  is answered as the published `500 internal_error`. `/mcp` has its own
+  concurrency pool and no 30 s request timeout, because a streamable-HTTP
+  response is an SSE stream.
+- **Exact path.** `/mcp/` and anything beneath it answer exactly as an unrouted
+  `/v1` path does. On Fly the edge forwards the whole `/mcp` subtree into the
+  vault realm and the replay router replays `/mcp` to the owner's Machine, where
+  the replay-state guard applies as it does to `/v1`.
+- **Per-agent profiles apply.** The mounted server is the grant-filtered one
+  (#1964). A container's consumer-secret file takes the same grant suffix as
+  `CREEK_MCP_CONSUMER_TOKENS` (`adepthood=<token>@vault:read+vault:desk`); with
+  none the consumer is ungated, and every entry point that serves `/mcp` names
+  it on stderr at start.
+- **Stateful sessions.** One Machine serves one person, so FastMCP's default
+  in-memory session table (`stateless_http=False`) is kept.
+- **Bound once.** The tools are bound to the vault when the app is built. If
+  the configuration cannot be read at startup, `/v1` still serves (and reports
+  the vault unavailable) while `/mcp` is not mounted until a restart; the
+  operator is told on `creek_mcp.httpapi.mcp`.
+
+### A writer's own model key on `/mcp` (#1967)
+
+`creek.draft`, `creek.author` and `creek.reflect` honour the two
+[ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)
+headers `/v1` already takes on its model-calling routes, on any call that
+arrives over the network transport (stdio never reads them):
+
+| Header | Value |
+|---|---|
+| `X-Creek-Provider` | `anthropic` or `openai` |
+| `X-Creek-Provider-Key` | the writer's own key for that vendor |
+
+On a **managed vault** a call carrying both is composed by the vault — its
+grounding, voice and guard — and generated by the writer's vendor, for OPEN and
+PERSONAL content only. Nothing else moves: the tier is still derived from the
+sources the prompt would carry, so an intimate-derived draft is forced onto the
+pinned local model or refused and is never handed to the vendor; the operator's
+own cloud key stays refused; a self-connected vault parses the pair but never
+spends it. `creek.handshake` reports `request_key_providers` so an agent can
+tell before it sends anything — `["anthropic", "openai"]` on a managed vault,
+`[]` on a self-connected one and over stdio.
+
+Both or neither. One header alone, an unknown vendor or a value that is not
+key-shaped is refused **before dispatch** with a `status: "refused"` envelope
+whose `reason` is `/v1`'s fixed `invalid_request` message, "the request does
+not satisfy the published schema", and is audited as refused under the tool
+name with no argument summary. Neither value is echoed, logged, audited, written
+into a job record or a progress message, or forwarded anywhere but the vendor
+call it pays for. A composition that outlives the synchronous deadline keeps the
+key in its worker for that run only; the job record, its audit entries and the
+saved draft never hold it. The agent's `Authorization` credential is never
+used as a provider key.
+
+A successful answer names the route that wrote it in `inference_source` —
+`request_key:<vendor>`, `pool:creek`, `pool:attested:<vendor>` or `local`, the
+labels `/v1` publishes — and `creek.draft` stamps the same value into the saved
+draft's frontmatter (`inference_source:`). A refusal, a deterministic Writing
+Desk render and a route this vocabulary does not label carry none.
+
+**Which clients can send the headers.** Only a client that lets its user set
+custom request headers on a streamable-HTTP MCP server:
+
+- **OpenClaw** (2026.3.31 or later) — the streamable-HTTP server entry's
+  `headers` map, beside `auth: "oauth"`; the entry below shows the shape, and
+  your OpenClaw version's own MCP docs are the authority on the surrounding
+  keys:
+
+  ```json
+  {
+    "creek": {
+      "transport": "streamable-http",
+      "url": "https://<vault>/mcp",
+      "auth": "oauth",
+      "headers": {
+        "X-Creek-Provider": "anthropic",
+        "X-Creek-Provider-Key": "<your Anthropic key>"
+      }
+    }
+  }
+  ```
+
+- **Claude Code** — `--header`, once per header:
+
+  ```bash
+  claude mcp add --transport http creek https://<vault>/mcp \
+    --header "X-Creek-Provider: anthropic" \
+    --header "X-Creek-Provider-Key: $ANTHROPIC_API_KEY"
+  ```
+
+Hosted **Claude connectors** (claude.ai) and **ChatGPT developer-mode
+connectors** sign in with OAuth and cannot send these two headers — ChatGPT
+documents no custom headers, and Claude's request headers are a beta for a
+limited set of organizations whose non-standard header names need Anthropic's
+approval — so their calls carry no writer key: generation on a managed vault
+runs on the shared pool or the pinned local model only, and a vault with neither
+refuses it. Such a client
+reads `request_key_providers` and still cannot use it; the field tells it why
+its drafts are pool-or-local.
+
+### Signing in through Adepthood: OAuth on `/mcp` (#1963)
+
+A vault's `/mcp` is an OAuth 2.1 **resource server** when two non-secret
+settings are present; Adepthood is the authorization server:
+
+| Setting | Value |
+|---|---|
+| `CREEK_MCP_RESOURCE_URL` | The URL a person types into their client: the public vault URL plus `/mcp`. Must be `https` (plain `http` only on loopback), with no credentials, query or fragment. |
+| `CREEK_MCP_AUTHORIZATION_SERVER` | The issuer, exactly as its RFC 8414 metadata spells it. |
+| `CREEK_MCP_JWKS_URL` (optional) | Where the issuer's keys are fetched. Default: the issuer plus `/.well-known/jwks.json`. |
+
+Both or neither: one without the other refuses startup. With neither, the
+vault serves static consumer tokens exactly as before, publishes no metadata,
+and its `401` names no metadata URL. What a client meets with both set:
+
+```text
+GET /.well-known/oauth-protected-resource/mcp     (and the root-level fallback)
+→ 200 {"resource":"<CREEK_MCP_RESOURCE_URL>","authorization_servers":["<issuer>"],
+       "scopes_supported":["vault:read","vault:desk","vault:journal","vault:pipeline"],
+       "bearer_methods_supported":["header"]}
+
+POST /mcp  (no token, or one this vault refuses)
+→ 401  WWW-Authenticate: Bearer error="invalid_token",
+         resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp",
+         scope="vault:read vault:desk"
+
+POST /mcp  (a token whose scope names no grant)
+→ 403  WWW-Authenticate: Bearer error="insufficient_scope", resource_metadata=…, scope=…
+```
+
+An access token is accepted only when **all** of these hold
+(`creek_mcp/agent_tokens.py`):
+
+- signed `RS256` or `ES256` (never `none`, never `HS*`) by a key the issuer's
+  JWKS publishes under the token's `kid`, the header `alg` equal to that key's
+  own algorithm; keys are cached 300 s and refetched early for an unknown
+  `kid` at most once a minute, keeping the last good set if a fetch fails
+  (see "When the issuer rotates its signing key" below);
+- `iss` equals the configured issuer and `aud` equals
+  `CREEK_MCP_RESOURCE_URL` **exactly** — one string, not a list, so a token
+  for another vault is refused;
+- `exp`, `nbf` and `iat` hold within 30 s of skew, and `iss`, `sub`, `aud`,
+  `exp`, `iat` are all present;
+- on a managed vault, `sub` is the vault's own consumer identity.
+
+The token's `sub` becomes the consumer (on the audit log, the access log and
+the tier cap) and its `scope` claim the grants, read exactly as a static
+token's grant suffix is. `creek:ungated` in a token is ignored. The remote tier
+cap applies unchanged, so a JWT caller asking for `intimate` is refused with
+the same reason any remote caller gets. Static consumer tokens keep working on
+the same endpoint; `/v1` accepts static tokens only. The token is never
+forwarded: no provider, pool or Drive request carries it, and no log line
+names a token or a `kid`.
+
+The standalone `creek-tools-mcp --transport network` server reads the same
+settings, and with an issuer configured needs no `CREEK_MCP_CONSUMER_TOKENS`.
+On the managed-vault Fly edge the replay router answers the metadata itself,
+challenges a refused `/mcp` call toward it, and — given
+`--oauth-authorization-server` (`CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER`) —
+routes an agent's token on `/mcp` by its verified `sub` to that person's vault.
+
 ### Rotating a consumer's secret (no downtime)
 
 Rotation widens a consumer's token set so the old and new secrets both work,
 lets the consumer redeploy onto the new one, then narrows the set back to
-one. Two restarts bound the window, and **the window is not closed until the
-second restart runs** — until then the retired secret still authenticates as
-that consumer, exactly like the new one.
+one. **The window is not closed until the narrowed set is in force** — until
+then the retired secret still authenticates as that consumer, exactly like
+the new one.
+
+Where the set lives decides how an edit takes effect (#1965):
+
+| Registry | Served by | An edit takes effect |
+|---|---|---|
+| Mounted secret file (`CREEK_CONTAINER_CONSUMER_TOKENS_FILE`) | the container image, the Fly vault Machine | within 5 s, on the next request — **no restart** |
+| `CREEK_MCP_CONSUMER_TOKENS` | `creek-tools-mcp`, `creek-tools-api` | at the next restart of every process that reads it — an environment is read once |
 
 1. Generate a fresh token for the consumer being rotated:
    ```bash
    python -c "import secrets; print(secrets.token_urlsafe(32))"
    ```
-2. Add it alongside the consumer's current token in
-   `CREEK_MCP_CONSUMER_TOKENS`, comma-separated, current value first:
+2. Add it alongside the consumer's current token, comma-separated, current
+   value first, keeping any grant suffix:
    ```bash
+   # mounted secret file (one consumer per file on a container):
+   printf 'adepthood=<current>,<new>@vault:read+vault:desk\n' > ./run-secrets/creek_consumer_tokens
+   # or the environment:
    export CREEK_MCP_CONSUMER_TOKENS="adepthood=<current>,<new>;other=<token>"
    ```
-3. Restart **every** process that reads this variable — `creek-tools-mcp`,
-   `creek-tools-api`, or both, if the host runs the two adapters side by side.
-   They share one registry, so a process that was not restarted is still
-   serving the pre-edit set. Startup prints a
-   rotation notice to stderr naming `adepthood` and its token count — that
-   notice is the reminder that a window is open, not a one-time line to
-   dismiss. From this restart on, both `<current>` and `<new>` authenticate
-   as `adepthood`.
+3. Let it take effect. A **file** needs nothing more: within 5 s the vault
+   prints `creek: consumer credentials: reloaded from the secret file` on
+   stderr, followed by the rotation notice. The **environment** needs a restart
+   of **every** process that reads it — `creek-tools-mcp`, `creek-tools-api`,
+   or both, if the host runs the two adapters side by side; a process that was
+   not restarted is still serving the pre-edit set. Either way the rotation
+   notice names `adepthood` and its token count; it is the reminder that a
+   window is open, not a one-time line to dismiss. From here on, both
+   `<current>` and `<new>` authenticate as `adepthood`.
 4. Redeploy the consumer onto `<new>` and confirm *at the consumer* that it
    is presenting the new token. (The audit log at
    `<vault>/00-Creek-Meta/audit/mcp.jsonl` attributes every call to
    `adepthood` regardless of which token authenticated it, so it cannot tell
    you which one is in use — check the consumer's own configuration.)
-5. Remove `<current>` from `CREEK_MCP_CONSUMER_TOKENS`, leaving only `<new>`:
+5. Remove `<current>`, leaving only `<new>`:
    ```bash
+   printf 'adepthood=<new>@vault:read+vault:desk\n' > ./run-secrets/creek_consumer_tokens
+   # or
    export CREEK_MCP_CONSUMER_TOKENS="adepthood=<new>;other=<token>"
    ```
-6. Restart again — every process you restarted in step 3, not just one of
-   them. **This step is not optional.** Until it runs, `<current>` still
-   authenticates as `adepthood` on any process still holding the widened set,
-   and the rotation notice keeps firing at that process's every startup as a
-   reminder. This second restart is the only thing that actually revokes the
-   retired secret — nothing else in this system does.
+6. Let it take effect, as in step 3: within 5 s for a file — `<current>` is
+   `401` on its next call — or by restarting every process from step 3 for the
+   environment. **This step is not optional.** Until it is in force,
+   `<current>` still authenticates as `adepthood`, and the rotation notice keeps
+   firing at every reload and every start as a reminder. Narrowing the set is
+   the only thing that actually revokes the retired secret.
 
-Skipping step 6 does not fail loudly; it leaves a permanently widened
-credential set that keeps working indefinitely. The startup notice is the
+Skipping step 5 does not fail loudly; it leaves a permanently widened
+credential set that keeps working indefinitely. The rotation notice is the
 only pressure against that, so treat it as an open task, not a status line.
-See [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
+Revoking a leaked token outright is step 5 alone: drop it and, on a file, it
+stops working within 5 s. See
+[ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
 this overlapping-token runbook, rather than short-lived derived credentials,
-is the shape of rotation today.
+is the shape of static-token rotation.
+
+#### How a secret file is followed (#1965)
+
+The verifier the container entry points serve is the one instance `/v1` and
+`/mcp` both hold (`creek_mcp/credential_reload.py`), so a reload reaches both
+surfaces at once.
+
+- **Polled, not watched.** A request arriving 5 s or more after the last look
+  re-reads the file — never more often — and compares the SHA-256 of its
+  bytes with the bytes the set in force came from, so a same-size rewrite that
+  keeps the mtime is still seen and a `touch` is not a reload. Polling rather
+  than inotify is deliberate: it works the same on a Fly secret mount, a
+  Docker bind mount and a Kubernetes projected volume.
+- **Parsed exactly as at boot.** A file the boot path would refuse — a token
+  below 32 characters, a consumer named twice, a token value used twice, an
+  unreadable grant suffix — is **refused**: one line on stderr
+  (`creek: consumer credentials: reload refused: <reason>; the previous
+  credential set stays in force`) and the previous set keeps serving, so a
+  typo never locks the consumer out and nothing is ever served half-parsed.
+  The reason names consumers and lengths, never a token, and no line names the
+  file's path or a byte of it. The same refusal is not repeated while the file
+  stays unchanged.
+- **Grants follow the file too.** Adding, changing or removing a grant suffix
+  is a reload like any other; the reloaded consumer carries exactly the grants
+  the boot parse would have given it.
+- **One identity for the life of a container.** A container's file names one
+  consumer, and a reload may rotate that consumer's tokens and grants but not
+  replace it: the per-consumer concurrency buckets, the journal's single-owner
+  rule and a managed vault's JWT subject pin were all built from it at start.
+  A file naming a different identity, or a second one, is refused like any
+  invalid edit; serving another identity takes a restart.
+- **Unreadable is not empty.** A file that cannot be read for a moment (a
+  secret manager mid-swap) keeps the previous set, noted once.
+- **Never in the environment.** The reload reads the file directly; no token
+  is copied into the process environment or a command line, as at boot.
+- **Mount the directory, not the file.** An editor or secret manager that
+  writes a new file and renames it over the old one replaces the inode; a
+  bind mount of the single file keeps showing the old one. Mount the secret
+  directory, as the [container guide](container-runtime.md) does.
+
+#### When the issuer rotates its signing key
+
+An OAuth-serving vault's key cache (`creek_mcp/agent_tokens.py::JwksCache`)
+needs no restart either. A token signed by a key the issuer has just published
+names an unknown `kid`, which refetches the key set early — at most once a
+minute — so the new key is accepted within a minute of its first use. A key
+the issuer removes keeps verifying until the next **successful** refresh (the
+300 s TTL, or an unknown-`kid` refetch), then is refused. A failed fetch keeps
+the last good set, so an issuer outage refuses nothing it already signed; the
+outage is logged once on `creek_mcp.agent_tokens` when it begins and once when
+it ends, never naming the issuer URL or a `kid`.
 
 The transport is a thin wrapper around the MCP SDK's `TokenVerifier` /
 streamable-http app; the tool registry, tier-ceiling rules, and hash-chained

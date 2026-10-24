@@ -222,8 +222,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=_PORT, choices=(_PORT,))
     parser.add_argument("--maximum-live-allocations", type=int, default=5, choices=(5,))
     parser.add_argument("--disable-new-activations", action="store_true")
+    parser.add_argument(
+        "--oauth-authorization-server",
+        default=os.environ.get("CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER"),
+    )
+    parser.add_argument(
+        "--oauth-jwks-url",
+        default=os.environ.get("CREEK_PILOT_OAUTH_JWKS_URL"),
+    )
     parser.set_defaults(
         routing_public_url=None,
+        oauth_resource_url=None,
         private_tls_ca_certificate_file=None,
         tls_cert=None,
         tls_key=None,
@@ -260,6 +269,8 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
     )
     expected_origin = f"https://{args.fly_app_name}.fly.dev"
     args.routing_public_url = expected_origin
+    # The edge's MCP URL is what an agent's token is issued for (#1963).
+    args.oauth_resource_url = f"{expected_origin}/mcp"
     if args.max_body_bytes != _REPLAY_BODY_CEILING:
         parser.error("--max-body-bytes must equal Fly replay's one MiB ceiling")
     if args.maximum_live_allocations != _MAX_LIVE_ALLOCATIONS:

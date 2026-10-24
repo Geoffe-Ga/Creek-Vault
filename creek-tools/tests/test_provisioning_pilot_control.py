@@ -156,3 +156,113 @@ def test_fly_health_fails_content_free_when_any_supervised_component_dies() -> N
 
     assert response.status_code == 503
     assert response.content == b""
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/", "/mcp/anything"])
+def test_fly_edge_routes_the_mcp_realm_to_the_vault_router(path: str) -> None:
+    """``/mcp`` and its subtree select the vault realm, bearer and path intact (#1962).
+
+    Args:
+        path: ``/mcp`` itself or a path beneath it.
+    """
+    app = build_edge_application(
+        _recording_app("control"),
+        _recording_app("router"),
+        expected_host=_HOST,
+        fly_app_name="creek-control-pilot",
+        fly_machine_id="machine-001",
+        routing_miss_status=ROUTING_MISS_STATUS,
+    )
+
+    routed = TestClient(app).get(
+        path,
+        headers={**_EDGE_HEADERS, "Authorization": "Bearer vault-token"},
+    )
+
+    assert routed.json() == {
+        "app": "router",
+        "authorization": "Bearer vault-token",
+        "edge_headers": 0,
+    }
+
+
+@pytest.mark.parametrize("path", ["/mcpx", "/mc", "/v1", "/control", "/", "/mcp-v1"])
+def test_fly_edge_answers_every_other_path_with_the_existing_routing_miss(
+    path: str,
+) -> None:
+    """Lookalikes of a realm prefix are misses; ``/control/`` dispatch is unchanged.
+
+    Args:
+        path: A path that names neither realm.
+    """
+    app = build_edge_application(
+        _recording_app("control"),
+        _recording_app("router"),
+        expected_host=_HOST,
+        fly_app_name="creek-control-pilot",
+        fly_machine_id="machine-001",
+        routing_miss_status=ROUTING_MISS_STATUS,
+    )
+    client = TestClient(app)
+
+    miss = client.get(path, headers=_EDGE_HEADERS)
+    control = client.get("/control/v1/jobs/job-1", headers=_EDGE_HEADERS)
+
+    assert miss.status_code == ROUTING_MISS_STATUS
+    assert miss.content == b""
+    assert control.json()["app"] == "control"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource",
+    ],
+)
+def test_fly_edge_routes_the_resource_metadata_to_the_vault_router(path: str) -> None:
+    """The RFC 9728 metadata reaches the router, which answers it (#1963).
+
+    Args:
+        path: A protected-resource metadata path.
+    """
+    app = build_edge_application(
+        _recording_app("control"),
+        _recording_app("router"),
+        expected_host=_HOST,
+        fly_app_name="creek-control-pilot",
+        fly_machine_id="machine-001",
+        routing_miss_status=ROUTING_MISS_STATUS,
+    )
+
+    routed = TestClient(app).get(path, headers=_EDGE_HEADERS)
+
+    assert routed.json()["app"] == "router"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/.well-known/oauth-protected-resource/v1",
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/jwks.json",
+    ],
+)
+def test_fly_edge_routes_no_other_well_known_path(path: str) -> None:
+    """Only the two metadata paths: the edge is not the authorization server.
+
+    Args:
+        path: A well-known path that is not this resource's metadata.
+    """
+    app = build_edge_application(
+        _recording_app("control"),
+        _recording_app("router"),
+        expected_host=_HOST,
+        fly_app_name="creek-control-pilot",
+        fly_machine_id="machine-001",
+        routing_miss_status=ROUTING_MISS_STATUS,
+    )
+
+    miss = TestClient(app).get(path, headers=_EDGE_HEADERS)
+
+    assert miss.status_code == ROUTING_MISS_STATUS

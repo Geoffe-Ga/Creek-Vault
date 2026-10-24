@@ -66,6 +66,13 @@ dependencies = [
     # 3.15 as the number the advisory fixes and 3.19 as the number the
     # lock resolves.
     "idna>=3.19",
+    # creek_mcp.agent_tokens verifies Adepthood-issued agent access tokens
+    # (RS256 / ES256 JWTs against the issuer's JWKS, #1963) and imports jwt at
+    # module scope, so pyjwt is a direct dependency rather than left
+    # transitive via mcp -> pyjwt[crypto]. The [crypto] extra is what makes
+    # the two asymmetric algorithms available. The floor is the same
+    # first-fully-patched release the constraint below records (#1823).
+    "pyjwt[crypto]>=2.15.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -372,10 +379,26 @@ constraint-dependencies = [
     # extension on the shared MCP path.
     "rpds-py>=2026.6.3",
     # Security: virtualenv is build/dev tooling pulled by pre-commit.
-    # PYSEC-2026-4011 through PYSEC-2026-4014 land across 21.7.11,
-    # 21.7.12, and 21.7.13; 21.7.13 is the first release fixing all four
-    # (#1823).
-    "virtualenv>=21.7.13",
+    # Raised IN PLACE from >=21.7.13 by the 2026-10 advisory wave.
+    # 21.14.9 is the first release carrying NO known advisory, verified
+    # release-by-release against the index rather than taken from a
+    # commit message: 21.14.2 and .3 still carry CVE-2026-113722,
+    # -113725 and -113726; .4 through .6 carry -113722 and -113725; .7
+    # and .8 still carry -113722; .9 is the first clean one.
+    #
+    # PR #1943 moved the lock to 21.14.12 (clean) to clear that wave but
+    # left this floor at the September boundary, so 21.7.13 through
+    # 21.14.8 stayed admissible and a later `uv lock` could resolve back
+    # onto a vulnerable release with every pin guard still passing --
+    # exactly the gap #1882 was filed for. That PR's own message also
+    # said the wave was "fixed in 21.14.2 and later", which the index
+    # contradicts; the number here comes from the advisory data.
+    #
+    # Superseded in place rather than appended beside, per the pattern
+    # the cryptography floor documents (#1167). The September boundary
+    # this replaces was PYSEC-2026-4011 through -4014, first fully fixed
+    # in 21.7.13 (#1823); that wave is covered a fortiori here.
+    "virtualenv>=21.14.9",
     # Security: certifi below 2026.10.19 ships an emSign CA root whose
     # intermediate keys are compromised — PYSEC-2026-4320
     # (GHSA-6q48-6c7w-9gw2). Transitive via requests/httpx; 2026.10.19

@@ -38,6 +38,7 @@ does and does not yet do.
 | `POST /v1/links` | **Implemented.** One linker stage over the whole vault, via the shared `creek.link` tool. Body is `{method}`, required and undefaulted because the stages write different artefacts. `temporal`, `eddies`, and `threads` retain their synchronous, byte-identical `200` responses. The unbounded O(n²) `embeddings` stage is accepted as a durable job and returns the same `202` handle as an LLM classification (#1605). `eddies` and `threads` may still take minutes on a cold local embedding cache; because they are existing write paths, they continue to run synchronously to completion rather than reporting a timeout about work that landed. Every result is counts only. `oversized_discarded` remains explicit because a discarded fragment carries no link at all — data loss a caller must not mistake for a clean pass. Published synchronously at contract `0.10.0` (#1570); `embeddings` jobs at `0.14.0` (#1605). |
 | `GET /v1/jobs/{job_id}` | **Implemented.** Poll one durable pipeline job. The opaque UUID is bound to the authenticated consumer: another consumer and an unknown id both receive the same `503 unavailable`, preventing enumeration. The response contains only `status`, `job_id`, `state`, and a nullable counts-only `result`; state is one of `queued`, `running`, `succeeded`, or `failed`. No fragment id, path, title, prose, or tool error crosses this boundary. Records live under the vault's private state directory and are atomically replaced. If the server restarts while a job is active, the next poll marks it `failed` rather than claiming it is still running. Admission is limited to one active detached pipeline job per authenticated consumer; another long-method request receives the same static `503 unavailable` until that worker completes, so inexpensive `202` requests cannot fan out unbounded full-vault work. Published at contract `0.14.0` (#1605). |
 | `GET /v1/wheel` | **Implemented.** The **frequency distribution over the classified corpus** — how many ceiling-admitted fragments sit at each APTITUDE frequency F1–F10, and each frequency's share of the classified total. **This is not a curriculum-progress or fullness measure.** Adepthood's Map validates a ten-member `{aspects: [{stage_number, aspect, fullness}]}` shape from its own 36-week curriculum; that projection is Adepthood's and is owned there (Geoffe-Ga/adepthood#1937). Ten members on both sides is a coincidence of cardinality, not a shared meaning — reading one as the other renders confidently wrong numbers. An empty or missing corpus is `200` with all ten entries at `count: 0`, never `404` and never an error (#1076). |
+| `GET /v1/agent-activity` | **Implemented.** What each connected agent asked your vault for, and when — never what it read. Reads `00-Creek-Meta/audit/mcp.jsonl` and returns `{status, tier_ceiling, skipped, rows: [{consumer, tool, at, outcome}]}`, newest first. `consumer` is the audit stamp, so the app's own `adepthood` calls are listed beside every agent's; nothing is hidden by consumer. `outcome` is `admitted` (the call reached its tool) or `refused` (refused before dispatch: an out-of-profile tool, or a remote ceiling above `personal`). No argument summary, fragment id, path, hash or prose crosses. `?limit=` defaults to 50 and is clamped to 200; `?since=` is an inclusive, offset-bearing lower bound on `at`, and one older than the log returns from the start. A detached composition's `accepted`/`completed` job entries are not separate calls and are not listed. A line the projection cannot read is counted in `skipped` rather than failing the route, and an absent log is `200` with `rows: []`. The chain is read, never rewritten, and not re-verified per request, so the response carries no `chain_verified_at`. Published at contract `0.22.0` (#1968). |
 
 **Every published route is now built, and none of them was ever allowed to
 fake it on the way here.** While a route was unbuilt it answered `501
@@ -73,13 +74,14 @@ list of names:
 | `voice-drafts` | `0.15` |
 | `journal-withdraw` | `0.16` |
 | `letters` | `0.17` |
+| `agent-activity` | `0.22` |
 <!-- /capability-set -->
 
 **The advertised list is caller-dependent, and the count above is the ceiling,
 not the answer.** What a given caller is shown is the intersection of that set
 with what its *declared* contract minor published, off `CAPABILITY_SINCE_MINOR`
 in `creek_mcp/api/models.py`: a caller declaring `0.2` is shown the first four,
-one declaring `0.17` — or declaring no minor at all — is shown all ten. The
+one declaring `0.22` — or declaring no minor at all — is shown all eleven. The
 route that serves a withheld capability refuses the same caller off the same
 table, so what is hidden here is unreachable there.
 
@@ -88,7 +90,7 @@ single constant, `IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so
 they cannot disagree. The table above is machine-checked against the enum by
 `tests/test_v1_api_capabilities.py`, along with the committed
 `docs/contracts/adepthood-v1/examples/capabilities/success.json` fixture and a
-live response — one four-way equality, so an eleventh capability cannot be added
+live response — one four-way equality, so a twelfth capability cannot be added
 without this page moving with it.
 
 > **On the issue's `not_implemented` spelling.** Issue #1074 was written before
@@ -156,21 +158,24 @@ Generate and rotate:
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-**Revocation and rotation are different operations, and both end in a
-restart.** `CREEK_MCP_TOKEN_TTL_SECONDS` bounds how long an individually
+**Revocation and rotation are different operations, and both end with the
+edited set in force** — within 5 s when it lives in a mounted secret file (the
+container image and the Fly vault Machine follow theirs, #1965), at the next
+restart when it lives in `CREEK_MCP_CONSUMER_TOKENS`.
+`CREEK_MCP_TOKEN_TTL_SECONDS` bounds how long an individually
 captured `AccessToken` object stays valid; it does **not** revoke the
 underlying shared secret, because the bearer is re-verified and re-issued on
 every request.
 
 - **Revocation** is immediate and hard: remove a consumer's entry (or a
-  single token from its `,`-separated set) from `CREEK_MCP_CONSUMER_TOKENS`
-  and restart. The credential stops working the moment the restarted process
-  is serving — there is no overlap and no grace period.
+  single token from its `,`-separated set) from the secret file, or from
+  `CREEK_MCP_CONSUMER_TOKENS` and restart. The credential stops working the
+  moment the edited set is in force — there is no overlap and no grace period.
 - **Rotation** replaces a secret without downtime by holding two
   currently-valid tokens for one consumer at once (`adepthood=<old>,<new>`)
   while the consumer redeploys onto the new one, then dropping the old one.
-  It still costs two restarts, but the consumer is never locked out
-  mid-swap. Follow the numbered runbook in
+  On a secret file it costs no restart; on the environment it costs two.
+  Either way the consumer is never locked out mid-swap. Follow the numbered runbook in
   [`docs/mcp.md`](mcp.md#rotating-a-consumers-secret-no-downtime); see also
   [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
   the credential is still a static, long-lived secret rather than something
@@ -358,10 +363,10 @@ could put on any wire position that names it.
 `/v1` is the HTTP major. Below it, one `contract_version` covers both this
 surface and MCP.
 
-The seventeen capability routes — `PUT` and `DELETE /v1/journal-entries/{external_id}`,
+The eighteen capability routes — `PUT` and `DELETE /v1/journal-entries/{external_id}`,
 `POST /v1/reflections`, `GET /v1/wheel`, `POST /v1/uploads`, the five
-`/v1/connectors/drive` verbs, `POST /v1/classifications`, `POST /v1/links`, and
-`GET /v1/jobs/{job_id}`, plus the three verbs on
+`/v1/connectors/drive` verbs, `POST /v1/classifications`, `POST /v1/links`,
+`GET /v1/jobs/{job_id}` and `GET /v1/agent-activity`, plus the three verbs on
 `/v1/voice-drafts/{external_id}` and `POST /v1/letters/{external_id}` —
 require `X-Creek-Contract-Version: <major.minor>`, for example `0.11`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
@@ -464,6 +469,20 @@ window. It is `0.21` and not `0.20` because `0.20` had already shipped for
 `keyless_inference` (#1938): if you negotiated `0.20` for that field you never
 agreed to a `429` on a letter, and this contract does not move a published
 minor's responses under it.
+
+`0.22.0` (#1968) adds the `agent-activity` capability and `GET
+/v1/agent-activity`, a content-free projection of the MCP audit chain for the
+person who owns the vault: who asked it for what, when, and whether the call got
+past the pre-dispatch gates. It publishes the contract's first **query
+parameters**, `limit` and `since`, documented in the OpenAPI document from the
+same `AgentActivityQuery` model the handler validates with, so an unknown or
+repeated parameter is `422 invalid_request`. Alongside it the MCP adapter now
+audits a remote call refused for a ceiling above `personal` as
+`"outcome": "refused"` under the tool name only, exactly as it already audited
+an out-of-profile call, so an agent reaching for `intimate` shows on the card;
+no tool's return shape moves. A `0.21` client knows neither the route nor its
+three closed models, so the since-minor gate withholds and refuses it while its
+known routes remain byte-identical, and `0.21` stays in the window.
 
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE

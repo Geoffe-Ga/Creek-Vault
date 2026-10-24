@@ -1,0 +1,29 @@
+{
+  "additionalProperties": false,
+  "description": "The query string ``GET /v1/agent-activity`` accepts, and nothing else.\n\nPublished as a model so the bounds a consumer reads and the bounds the\nserver validates are one declaration. Closed like every wire model: an\nunknown parameter \u2014 a consumer filter, say \u2014 is ``invalid_request`` rather\nthan silently ignored, because nothing is hidden by consumer.\n\nAttributes:\n    limit: The most rows wanted, newest first. Values above\n        :data:`AGENT_ACTIVITY_MAX_LIMIT` are clamped to it.\n    since: An inclusive lower bound on ``at``, with an explicit offset. A\n        ``since`` older than the log's first entry returns from the start.",
+  "properties": {
+    "limit": {
+      "default": 50,
+      "description": "Most rows to return, newest first; values above 200 are clamped to 200.",
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+    },
+    "since": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Inclusive lower bound on at, with an explicit UTC offset.",
+      "title": "Since"
+    }
+  },
+  "title": "AgentActivityQuery",
+  "type": "object"
+}

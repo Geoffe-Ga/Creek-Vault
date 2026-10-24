@@ -607,12 +607,58 @@ class EncryptedFileRoutingCredentialVerifier:
         """Return the one exact owner bound to *credential*, or fail closed."""
         return await asyncio.to_thread(self._verify_credential, credential)
 
+    async def principal_for_consumer(
+        self, consumer_identity: str
+    ) -> RoutingPrincipal | None:
+        """Return the one live owner of *consumer_identity*'s vault, or fail closed.
+
+        The edge's route for an agent's OAuth access token (#1963): the token
+        has already been verified, and its ``sub`` is the consumer identity
+        this store issued the allocation for. Same scan, same refusals — a
+        revoked or unreadable bundle, or two owners for one consumer, answers
+        ``None`` — so the agent route can never reach a vault the static
+        credential route could not.
+
+        Args:
+            consumer_identity: A verified token's subject.
+
+        Returns:
+            The owning principal, with its replay state.
+        """
+        return await asyncio.to_thread(self._principal_for_consumer, consumer_identity)
+
+    def _principal_for_consumer(
+        self, consumer_identity: str
+    ) -> RoutingPrincipal | None:
+        """Scan every active bundle for the one issued to *consumer_identity*."""
+        return self._unique_owner(
+            lambda document: document.consumer_identity == consumer_identity
+        )
+
     def _verify_credential(self, credential: str) -> RoutingPrincipal | None:
         """Scan every active bundle so comparison timing does not select an owner."""
         try:
             presented = credential.encode()
         except UnicodeError:
             return None
+        return self._unique_owner(
+            lambda document: hmac.compare_digest(
+                document.consumer_credential.encode(), presented
+            )
+        )
+
+    def _unique_owner(
+        self, matches: Callable[[_BundleDocument], bool]
+    ) -> RoutingPrincipal | None:
+        """Return the one owner whose bundle *matches*, scanning every bundle.
+
+        Args:
+            matches: The predicate one bundle must satisfy.
+
+        Returns:
+            The owner, or ``None`` on no match, a conflicting second match, or
+            any revoked or unreadable bundle.
+        """
         matched: RoutingPrincipal | None = None
         conflicting = False
         for bundle_path in sorted(self._state_directory.glob("*.bundle")):
@@ -628,8 +674,7 @@ class EncryptedFileRoutingCredentialVerifier:
                 return None
             if revoked_path.exists():
                 return None
-            candidate = document.consumer_credential.encode()
-            if hmac.compare_digest(candidate, presented):
+            if matches(document):
                 principal = RoutingPrincipal(
                     document.requester_identity,
                     document.consumer_identity,

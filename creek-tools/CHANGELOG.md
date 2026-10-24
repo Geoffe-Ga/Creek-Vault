@@ -9,6 +9,70 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Document connecting an agent to a vault (#1969). `docs/mcp.md` gains an
+  "Agents" section for the vault's owner: what the default `vault:read
+  vault:desk` profile reaches and never reaches, the address to paste, signing
+  in and stopping an agent through Adepthood, the static-token path for a
+  self-hosted vault, client timeouts above the long-call deadline, and recipes
+  for OpenClaw, Claude Code, ChatGPT and the hosted Claude apps — the first two
+  run once by hand on 2026-10-24 — plus a client-support matrix with a source
+  and date for every row. The Adepthood contract record gains "Agents over
+  `/mcp`" (managed-vault `/mcp`, RFC 9728 metadata, grant names,
+  `creek.jobs.read`, per-person attribution) and a documentation change-log
+  row. No code or contract version moves.
+
+- Publish `GET /v1/agent-activity` at contract `0.22.0` (#1968): a content-free
+  projection of the MCP audit chain so a vault's owner can see what each
+  connected agent asked for and when. Rows are `{consumer, tool, at, outcome}`,
+  newest first, with `outcome` closed at `admitted | refused`; no argument
+  summary, fragment id, path, hash or prose crosses, and nothing is hidden by
+  consumer (the app's own `adepthood` calls are listed under their stamp).
+  `?limit=` defaults to 50 and is clamped to 200, `?since=` is an inclusive
+  lower bound, malformed lines are counted in `skipped`, and a detached
+  composition's `accepted`/`completed` entries are one call, not three. The log
+  is read, never rewritten, and not re-verified per request. The route
+  publishes the contract's first query parameters (`RouteSpec.query_model`),
+  and the MCP adapter now audits a remote call refused for a ceiling above
+  `personal` as `"outcome": "refused"` under the tool name only, so such an
+  attempt shows on the card. `0.21` stays served.
+
+- Honour a writer's request-scoped provider key on `/mcp` (#1967, ADR-0015).
+  `creek.draft`, `creek.author` and `creek.reflect` read `X-Creek-Provider` and
+  `X-Creek-Provider-Key` off the streamable-HTTP request (network transport
+  only; stdio never reads headers) through the same parse `/v1` uses, and hand
+  the key to the same generation chokepoint, so a managed vault drafts,
+  authors and reflects with the writer's own vendor for OPEN and PERSONAL while
+  an intimate-derived call is still forced local or refused. A malformed pair is
+  refused before dispatch with `/v1`'s fixed `invalid_request` message, audited
+  as refused with no argument summary. The key stays in memory for the one call
+  — through a detached composition's worker — and never reaches a log, audit
+  entry, job record, progress message or file. `creek.handshake` reports
+  `request_key_providers` as `GET /v1/capabilities` does; a successful answer
+  carries `inference_source`, and a saved draft's frontmatter names it.
+  `docs/mcp.md` lists which clients can send the headers.
+
+- Serve the MCP streamable-HTTP server at `/mcp` from the `/v1` process (#1962).
+  `create_app()` builds it with `build_server(transport=NETWORK)` and the same
+  `ConsumerTokenVerifier` instance as `/v1`, mounted below the access log and
+  error boundary and above every `/v1`-only layer (version gate, timeout, body
+  cap, bearer and ceiling header gates). The container and Fly vault entry
+  points serve it with no new flag; the Fly edge routes the `/mcp` realm to the
+  replay router, which replays `/mcp` to the owner's vault. The container
+  contract now completes an MCP handshake over TLS.
+
+- Give each remote MCP consumer a per-agent tool profile (#1964). Four grants
+  (`vault:read`, `vault:desk`, `vault:journal`, `vault:pipeline`) are decided in
+  `creek_mcp/policy.py` beside the tier cap: `admitted_tool` refuses an
+  out-of-profile `tools/call` before dispatch with one constant reason, audited
+  as `"outcome": "refused"` under the tool name only, and `tools/list` shows
+  each caller only its own profile. Purge tools are in no profile. Static
+  consumers are gated by a grant suffix in `CREEK_MCP_CONSUMER_TOKENS`
+  (`openclaw=<token>@vault:read+vault:desk`); one with no suffix stays ungated,
+  keeping its pre-#1964 reach, and is named on stderr at startup. Grants travel
+  in the access token's `scopes`, so an OAuth token's `scope` claim feeds the
+  same `granted_by_scopes` seam. The default profile for a new agent is
+  `vault:read vault:desk`.
+
 - Give the organization pool admin key a declared custody path before any such
   key exists (#1930). `creek_mcp.provisioning.pool_admin_key` fails closed with
   its own content-free verdict codes (40-44, never reusing `--check pool`'s 30):

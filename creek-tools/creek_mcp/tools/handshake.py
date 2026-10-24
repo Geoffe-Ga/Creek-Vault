@@ -15,8 +15,9 @@ from the tools actually registered.
 from __future__ import annotations
 
 import logging
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
@@ -24,12 +25,30 @@ from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.policy import Transport, offered_ceilings
 from creek_mcp.tier_ceiling import TierCeiling
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "creek.handshake"
 
 CREEK_MARKER = Path("00-Creek-Meta")
 """The directory whose presence means "a vault has been scaffolded here"."""
+
+
+class AuthMode(StrEnum):
+    """How a caller of this server authenticates, as the handshake reports it (#1963).
+
+    A client that already connected learns from this whether the vault is an
+    OAuth resource server (it should refresh through the issuer) or a
+    bearer-token one (its credential is a configured secret). ``none`` is the
+    local stdio server, which authenticates nobody and says so rather than
+    claiming a scheme it does not run.
+    """
+
+    OAUTH = "oauth"
+    BEARER = "bearer"
+    NONE = "none"
 
 
 def vault_available(vault_path: Path) -> bool:
@@ -129,8 +148,10 @@ def handshake_tool(
     capabilities: list[str],
     server_name: str,
     transport: Transport,
+    auth: AuthMode,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
+    request_key_providers: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Negotiate vault presence, versions, tier model, and capability list.
 
@@ -170,16 +191,29 @@ def handshake_tool(
             has to answer out loud, exactly as
             :attr:`creek_mcp.policy.CallerIdentity.is_remote` does for the
             per-call question.
+        auth: How callers authenticate (#1963): ``oauth`` when an issuer is
+            configured, ``bearer`` for static consumer tokens only, ``none``
+            on stdio. No default, for the same reason *transport* has none.
         privacy_tier_ceiling: The ceiling the caller declared; recorded and
             echoed. Handshake returns no fragment content, so the ceiling does
             not gate anything here, but it is audited like every other call.
         consumer: Free-form consumer identifier (e.g. ``"adepthood"``), recorded
             in the audit log.
+        request_key_providers: The vendors whose writer-supplied key
+            (ADR-0015, ``X-Creek-Provider`` + ``X-Creek-Provider-Key``) this
+            server would spend on ``creek.draft``, ``creek.author`` and
+            ``creek.reflect`` (#1967) — both on a managed vault served over
+            the network, none on a self-connected vault or over stdio. It
+            mirrors ``GET /v1/capabilities``. Defaults to none, the
+            conservative answer: an agent told nothing is told generation is
+            pool-or-local only, which is true of every server that cannot
+            spend a key.
 
     Returns:
         A dict with at least ``available``, ``contract_version``,
         ``ontology_version``, ``tiers``, and ``capabilities``, plus the
-        ``tier_model``, ``transport``, and ``server`` name for the client.
+        ``tier_model``, ``transport``, ``auth``, ``request_key_providers`` and
+        ``server`` name for the client.
     """
     available = vault_available(vault_path)
     _record_call(
@@ -194,6 +228,7 @@ def handshake_tool(
         "tier_ceiling": privacy_tier_ceiling.value,
         "server": server_name,
         "transport": transport.value,
+        "auth": auth.value,
         "available": available,
         "contract_version": CONTRACT_VERSION,
         "ontology_version": ONTOLOGY_VERSION,
@@ -204,4 +239,5 @@ def handshake_tool(
             "intimate_never_egresses": True,
         },
         "capabilities": capabilities.copy(),
+        "request_key_providers": list(request_key_providers),
     }

@@ -81,19 +81,28 @@ site, all of them load-bearing:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
+
+import frontmatter
 
 from creek.classify.privacy_filter import max_source_tier, source_tiers
 from creek.config import load_vault_config
+from creek.generate.ai_style.guard import VOICE_GUARD_STATUS_KEY
 from creek.generate.compile_routing import (
     NO_COMPILED_SOURCES,
     CompiledSources,
     load_compiled_pages,
 )
-from creek.generate.drafts import DraftGenerator, rendered_compiled_sources
+from creek.generate.drafts import (
+    INFERENCE_SOURCE_FRONTMATTER_KEY,
+    DraftGenerator,
+    rendered_compiled_sources,
+)
 from creek.generate.grounding import GroundingThresholds, default_embedding_fn
 from creek.generate.mining import IdeaMiner
 from creek.models import Phase, PrivacyTier
+from creek.progress import CompositionStage, StageCallback, ignore_stage
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import (
     TierCeiling,
@@ -106,8 +115,29 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.generate.mining import IdeaSeed
+    from creek_mcp.provenance import InferenceProvenance
 
 TOOL_NAME = "creek.draft"
+
+DRAFT_STAGES: Final[tuple[CompositionStage, ...]] = tuple(CompositionStage)
+"""The six boundaries a ``creek.draft`` call reports, in order (#1966)."""
+
+_JOB_RESULT_KEYS: Final[tuple[str, ...]] = (
+    "status",
+    "tool",
+    "tier_ceiling",
+    "draft_path",
+    "idea_strategy",
+    "source_count",
+    "voice_guard_status",
+)
+"""The content-free keys of a success envelope a job record always keeps.
+
+``title`` and ``source_fragments`` are the two keys left out, on purpose: the
+first is the seed's own title, the second names fragments. A job result is
+served to whoever holds the handle, possibly long after the call, so it keeps
+only paths, counts and status words (#1966).
+"""
 
 
 class _DraftLLM(Protocol):
@@ -246,6 +276,8 @@ def draft_tool(
     phase: str = "unclassified",
     index: int = 0,
     consumer: str = "unknown",
+    on_stage: StageCallback = ignore_stage,
+    provenance: InferenceProvenance | None = None,
 ) -> dict[str, Any]:
     """Mine ideas, draft the *index*-th, and persist with full provenance.
 
@@ -268,10 +300,20 @@ def draft_tool(
             :func:`creek_mcp.tier_ceiling.to_privacy_override`) *and*
             contributes to the routing tier, but it is a floor rather
             than the whole answer — see the module docstring.
+        on_stage: Sink told each :data:`DRAFT_STAGES` boundary as the draft
+            crosses it (#1966) — ``SEED`` here, the rest from the generator.
+            Stage names only; defaults to a no-op.
+        provenance: The call's route recorder (#1967), filled by the
+            production factory when it resolves the provider. Its label is
+            stamped into the draft's frontmatter and echoed as
+            ``inference_source``; ``None`` (or nothing recorded) stamps
+            nothing.
 
     Returns:
         ``{status, tool, tier_ceiling, ...}`` — ``ok`` with the saved
-        ``draft_path``, ``empty`` when mining surfaced no seeds, or a
+        ``draft_path`` (plus its ``source_count``, ``voice_guard_status`` and,
+        when recorded, ``inference_source``), ``empty`` when mining surfaced
+        no seeds, or a
         structured ``refused`` response for an out-of-range *index*, an
         unavailable provider, the router's
         :class:`~creek.classify.llm.router.IntimateRoutingError` when
@@ -305,6 +347,7 @@ def draft_tool(
             reason=f"index {index} out of range (0..{len(seeds) - 1})",
         )
     idea = seeds[index]
+    on_stage(CompositionStage.SEED)
     # Deriving the tier and building the client sit here — below both
     # non-drafting exits, above anything that touches a model — so a call that
     # produces no prompt never reaches a provider.
@@ -339,6 +382,7 @@ def draft_tool(
         # ``DraftGenerator`` skips the guard when either is missing (#1040).
         embedding_fn=default_embedding_fn(config.embeddings),
         grounding_thresholds=GroundingThresholds.from_config(config.draft),
+        on_stage=on_stage,
     )
     try:
         draft = generator.generate_draft(idea, vault_path=vault_path)
@@ -348,8 +392,9 @@ def draft_tool(
             ceiling=privacy_tier_ceiling,
             reason=str(exc),
         )
-    saved = generator.save_draft(draft, vault_path)
-    return {
+    source = None if provenance is None else provenance.source
+    saved = generator.save_draft(draft, vault_path, inference_source=source)
+    response: dict[str, Any] = {
         "status": "ok",
         "tool": TOOL_NAME,
         "tier_ceiling": privacy_tier_ceiling.value,
@@ -357,4 +402,54 @@ def draft_tool(
         "title": draft.title,
         "idea_strategy": draft.idea_strategy,
         "source_fragments": list(draft.source_fragments),
+        "source_count": len(draft.source_fragments),
+        "voice_guard_status": _voice_guard_status(saved),
     }
+    if source is not None:
+        response[INFERENCE_SOURCE_FRONTMATTER_KEY] = source
+    return response
+
+
+def _voice_guard_status(saved: Path) -> str | None:
+    """Return the ``voice_guard_status`` the generator stamped on *saved*.
+
+    Read back from the file rather than threaded out of the generator, because
+    the stamp is the generator's own record of what its guard did — a status
+    word such as ``rewritten`` or ``skipped:disabled``, never prose. An
+    unreadable file or a missing stamp is ``None``.
+
+    Args:
+        saved: The draft file the generator just wrote.
+
+    Returns:
+        The stamped status, or ``None``.
+    """
+    try:
+        status = frontmatter.load(saved).get(VOICE_GUARD_STATUS_KEY)
+    except FRONTMATTER_LOAD_ERRORS:
+        return None
+    return status if isinstance(status, str) else None
+
+
+def draft_job_result(response: dict[str, Any]) -> dict[str, Any] | None:
+    """Project a ``creek.draft`` response onto what a job record may keep.
+
+    The success envelope minus its two content-bearing keys — see
+    :data:`_JOB_RESULT_KEYS`. Any other status projects to ``None``, the job
+    store's ``failed``: like ``/v1`` (#1605), a job never republishes a tool's
+    refusal text.
+
+    Args:
+        response: The dict :func:`draft_tool` returned.
+
+    Returns:
+        The content-free result, or ``None``.
+    """
+    if response.get("status") != "ok":
+        return None
+    result = {key: response.get(key) for key in _JOB_RESULT_KEYS}
+    if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
+        result[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[
+            INFERENCE_SOURCE_FRONTMATTER_KEY
+        ]
+    return result

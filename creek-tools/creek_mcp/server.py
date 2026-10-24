@@ -23,24 +23,49 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from creek.care.guardrail import acute_distress_guard
 from creek.classify.llm.pool_boundary import declared_pool_request
+from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
+from creek_mcp.agent_tokens import JwtAgentTokenVerifier, mcp_token_verifier
+from creek_mcp.audit import AUDIT_OUTCOME_REFUSED, MCPAuditLog
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
+from creek_mcp.composition_jobs import (
+    CompositionJobs,
+    author_call,
+    draft_call,
+    sync_deadline_seconds,
+)
+from creek_mcp.httpapi import mcp_request_key
+from creek_mcp.httpapi.job_runtime import JobRuntime
+from creek_mcp.httpapi.mcp_request_key import (
+    INVALID_REQUEST_KEY_REASON,
+    REQUEST_KEY_TOOLS,
+    bound_for_call,
+    bound_request_key,
+)
+from creek_mcp.httpapi.vault import request_key_providers
 from creek_mcp.model_pin import (
     build_request_scoped_provider,
     pin_refuses_stage,
     provider_may_serve,
     request_key_admitted,
 )
+from creek_mcp.oauth_resource import (
+    ProtectedResourceMetadataMiddleware,
+    ResourceChallengeMiddleware,
+    load_resource_server_config,
+)
 from creek_mcp.policy import (
     Admission,
     CallerIdentity,
     Transport,
     admitted_ceiling,
+    admitted_tool,
     effective_consumer,
+    granted_by_scopes,
 )
 from creek_mcp.provenance import (
     InferenceProvenance,
@@ -52,6 +77,8 @@ from creek_mcp.remote_auth import (
     ConsumerTokenVerifier,
     NamedConsumerVerifier,
     announce_rotation_window,
+    announce_ungated_consumers,
+    load_consumer_grants,
     load_consumer_tokens,
     remote_auth_settings,
 )
@@ -84,15 +111,20 @@ from creek_mcp.tools import (
     wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.handshake import AuthMode
 from creek_mcp.tools.reflect import GroundingSession
 from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from typing import TypeAlias, TypeVar
 
     import uvicorn
     from mcp.server.auth.provider import AccessToken, TokenVerifier
+    from mcp.server.auth.settings import AuthSettings
     from mcp.types import ContentBlock
+    from mcp.types import Tool as MCPTool
+    from starlette.applications import Starlette
     from starlette.types import ASGIApp
 
     from creek.author.client import AuthorLLMClient
@@ -102,10 +134,18 @@ if TYPE_CHECKING:
     from creek.compile.engine import CompileLLM
     from creek.config import LLMConfig
     from creek.models import PrivacyTier
+    from creek_mcp.oauth_resource import ResourceServerConfig
     from creek_mcp.tools.author import AuthorLLMFactory
     from creek_mcp.tools.compile import CompileLLMFactory
     from creek_mcp.tools.draft import DraftLLMFactory
     from creek_mcp.tools.reflect import _LLM, _LLMFactory
+
+    _FactoryT = TypeVar("_FactoryT")
+
+    _ScopedFactory: TypeAlias = Callable[
+        [RequestKey | None, InferenceProvenance], _FactoryT
+    ]
+    """Builds one call's LLM factory from its request key and route recorder."""
 
 SERVER_NAME = "creek-tools-mcp"
 
@@ -117,6 +157,16 @@ it picked a *different* one (#1074). The two adapters are meant to run side by
 side on one host, so a shared default would make the second one to start fail
 with ``address already in use`` — a collision that is trivial to prevent and
 annoying to diagnose. The value itself is unchanged.
+"""
+
+UNREGISTERED_TOOL_AUDIT_NAME: Final[str] = "<unregistered>"
+"""The ``tool`` an out-of-profile refusal is audited under for an unknown name.
+
+A remote caller can ask for any name at all. Writing that name verbatim into
+the hash-chained audit log would let it put arbitrary text of arbitrary length
+there, so a name that is not a registered tool is recorded as this constant
+instead (#1964). A registered tool's name is a fixed server-side string and is
+recorded as itself.
 """
 
 
@@ -139,7 +189,11 @@ def _caller_identity() -> CallerIdentity:
     The MCP half of the #1073 split: policy decides, this states which side of
     the network the call arrived from and whose credential it carried. An
     authenticated network request has an access token whose ``client_id`` is
-    the consumer; a local stdio call has neither.
+    the consumer and whose ``scopes`` carry its grants (#1964) — a static
+    token's from :class:`~creek_mcp.remote_auth.ConsumerTokenVerifier`, an
+    OAuth token's from its ``scope`` claim — read through
+    :func:`creek_mcp.policy.granted_by_scopes`, the one identity -> grants
+    seam. A local stdio call has none of these.
 
     **Call this per call. Never hoist it.** ``get_access_token()`` is
     request-scoped, while the ``consumer`` that :func:`build_server` resolves
@@ -153,7 +207,11 @@ def _caller_identity() -> CallerIdentity:
     token = _current_access_token()
     if token is None:
         return CallerIdentity(consumer=None, is_remote=False)
-    return CallerIdentity(consumer=token.client_id, is_remote=True)
+    return CallerIdentity(
+        consumer=token.client_id,
+        is_remote=True,
+        grants=granted_by_scopes(token.scopes),
+    )
 
 
 def _effective_consumer(default: str) -> str:
@@ -170,28 +228,135 @@ def _effective_consumer(default: str) -> str:
 
 
 class _BoundedFastMCP(FastMCP):
-    """The MCP adapter for :mod:`creek_mcp.policy`'s remote tier-ceiling cap.
+    """The MCP adapter for :mod:`creek_mcp.policy`'s remote admission rules.
 
     Every tool call flows through :meth:`call_tool`, the one MCP-side chokepoint
-    at which the requested ceiling is still a raw argument. The cap is not
-    decided here: since #1073 it is adapter-independent policy in
-    :func:`creek_mcp.policy.admitted_ceiling`, so the ``/v1`` HTTP surface
-    reaches the same verdict without an MCP request context to key off. What
-    this class owns is the two things only MCP can answer — *who is the caller*
-    and *is this remote*, via :func:`_caller_identity` — plus what a refusal
-    looks like on this transport: the
-    :func:`creek_mcp.tier_ceiling.refusal_response` payload, where ``/v1``
-    deliberately answers ``422 invalid_request`` instead.
+    at which the tool name and the requested ceiling are still raw arguments.
+    Neither rule is decided here: since #1073 the tier cap is adapter-independent
+    policy in :func:`creek_mcp.policy.admitted_ceiling`, and since #1964 so is
+    the per-agent tool profile, in :func:`creek_mcp.policy.admitted_tool`, so
+    the ``/v1`` HTTP surface can reach the same verdicts without an MCP request
+    context to key off. What this class owns is the things only MCP can answer —
+    *who is the caller*, *is this remote* and *what does its credential grant*,
+    via :func:`_caller_identity` — plus what a refusal looks like on this
+    transport: the :func:`creek_mcp.tier_ceiling.refusal_response` payload,
+    where ``/v1`` deliberately answers ``422 invalid_request`` instead.
+
+    :meth:`list_tools` applies the same tool verdict, so a caller is shown
+    exactly the tools it may call — including through ``creek.handshake``,
+    whose capability list is read from it.
 
     A refused remote call is refused **before dispatch**, so intimate content is
-    never even read for it. Local stdio calls pass through unchanged — the
-    default per-tool ``OPEN`` ceiling still applies.
+    never even read for it, and an out-of-profile tool never runs at all. Local
+    stdio calls pass through unchanged — the default per-tool ``OPEN`` ceiling
+    still applies.
+
+    It is also where a writer's request-scoped key is **extracted** (#1967,
+    ADR-0015): for the three
+    :data:`~creek_mcp.httpapi.mcp_request_key.REQUEST_KEY_TOOLS` on a network
+    server, the two headers are parsed off the HTTP request in
+    flight and bound for that one dispatch, or a malformed pair is refused
+    before dispatch with ``/v1``'s fixed ``invalid_request`` message. Whether
+    the key is *used* is decided in :mod:`creek_mcp.model_pin`, never here.
     """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        vault: Path,
+        consumer: str,
+        token_verifier: TokenVerifier | None = None,
+        auth: AuthSettings | None = None,
+        resource_server: ResourceServerConfig | None = None,
+        reads_request_keys: bool = False,
+    ) -> None:
+        """Build the adapter over *vault*, auditing refusals there.
+
+        Args:
+            name: The MCP server name.
+            vault: The served vault, whose audit log records a refused
+                out-of-profile call (#1964).
+            consumer: The process-default audit identity — what a refusal is
+                audited under for a local caller, via
+                :func:`creek_mcp.policy.effective_consumer`.
+            token_verifier: The bearer verifier for the network transport, or
+                ``None`` for stdio.
+            auth: The SDK auth settings that accompany *token_verifier*.
+            resource_server: This vault's OAuth resource-server configuration
+                (#1963), or ``None`` on a bearer-only or local server.
+            reads_request_keys: Whether calls may carry a writer's
+                request-scoped key in their HTTP headers (#1967) — ``True``
+                only on the network transport. On stdio the headers are never
+                consulted, because there are none to consult.
+        """
+        super().__init__(name, token_verifier=token_verifier, auth=auth)
+        self._audit_vault = vault
+        self._audit_consumer = consumer
+        self._resource_server = resource_server
+        self._reads_request_keys = reads_request_keys
+
+    def streamable_http_app(self) -> Starlette:
+        """Return the SDK's streamable-HTTP app, publishing this resource (#1963).
+
+        With a resource server configured, two layers go on the outside of the
+        SDK's app.
+        :class:`~creek_mcp.oauth_resource.ProtectedResourceMetadataMiddleware`
+        answers the RFC 9728 paths with this vault's document — shadowing the
+        SDK's own, which would advertise ``creek:remote`` as the only scope and
+        re-spell the issuer with a trailing slash — and
+        :class:`~creek_mcp.oauth_resource.ResourceChallengeMiddleware` replaces
+        the SDK's ``401``/``403`` challenge with one that also names the scope
+        to request. Both the standalone network server and the ``/mcp`` mount
+        build their app here, so both get the same answers.
+
+        Returns:
+            The app.
+        """
+        app = super().streamable_http_app()
+        if self._resource_server is not None:
+            app.add_middleware(
+                ResourceChallengeMiddleware, config=self._resource_server
+            )
+            app.add_middleware(
+                ProtectedResourceMetadataMiddleware, config=self._resource_server
+            )
+        return app
+
+    async def list_tools(self) -> list[MCPTool]:
+        """List only the tools the caller in flight is admitted to (#1964).
+
+        The identity is rebuilt **per call, never hoisted** — the same rule as
+        :func:`_caller_identity` — so two consumers listing through one built
+        server each see their own profile. A local caller and an ungated
+        static consumer see every registered tool, exactly as before.
+
+        Returns:
+            The registered tools :func:`creek_mcp.policy.admitted_tool`
+            admits for this caller, in registration order.
+        """
+        identity = _caller_identity()
+        tools = await super().list_tools()
+        return [
+            tool
+            for tool in tools
+            if isinstance(admitted_tool(identity, tool.name), Admission)
+        ]
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> Sequence[ContentBlock] | dict[str, Any]:
-        """Refuse over-ceiling remote calls, else dispatch normally.
+        """Refuse out-of-profile and over-ceiling remote calls, else dispatch.
+
+        The tool verdict is asked first: a tool the caller was not granted is
+        refused whatever ceiling it named, and audited as refused under the
+        tool name only (:meth:`_refuse_audited`). Then the ceiling verdict,
+        whose refusal is audited the same way (#1968): the owner's activity
+        card (``GET /v1/agent-activity``) shows an agent reaching above
+        ``personal`` as a refused call. The entry is content-free by
+        construction — the refusal depends on nothing but the caller's own
+        argument, never on a fragment's tier — and it records the
+        transport-default ``OPEN`` rather than the ceiling that was asked for.
 
         The missing-key default is *adapter* vocabulary rather than policy's: a
         tool that declares no ``privacy_tier_ceiling`` is read here as having
@@ -200,30 +365,103 @@ class _BoundedFastMCP(FastMCP):
         ``None`` would also be safe — it fails closed — but it would refuse the
         purge tools below rather than admitting them.
 
-        Note: this ceiling gate is a **no-op for the ``creek.purge.*`` tools** —
+        Note: the ceiling gate is a **no-op for the ``creek.purge.*`` tools** —
         they declare no ``privacy_tier_ceiling`` parameter, so ``arguments.get``
         below always falls back to ``OPEN`` (admitted) for them. That is
         intentional: purge is not tier-scoped and is instead gated, fail-closed,
         by ``CREEK_MCP_ELEVATED_TOKEN`` (see ``creek_mcp.auth.is_elevated`` and the
-        purge tools), which a per-consumer bearer alone does not satisfy. Do not
-        rely on this gate — or on :mod:`creek_mcp.policy` — for purge protection.
+        purge tools), which a per-consumer bearer alone does not satisfy. Purge
+        is in no grant profile either, so a *gated* remote identity is refused
+        it by the tool verdict; for a local caller or an ungated static
+        consumer the elevated token remains its only gate. Do not rely on the
+        ceiling gate — or on :mod:`creek_mcp.policy` — for purge protection.
         """
-        raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
-        verdict = admitted_ceiling(_caller_identity(), raw)
+        identity = _caller_identity()
+        granted = admitted_tool(identity, name)
         # Dispatch on the POSITIVE verdict, never on "not a refusal". If policy
         # ever grows a third verdict, this falls to the refusal branch instead
         # of silently uncapping the call — and because the branch below then
         # narrows to a type that has no ``reason``, mypy fails the build rather
         # than leaving the regression to be noticed at runtime.
+        if not isinstance(granted, Admission):
+            return await self._refuse_audited(name, identity, granted.reason)
+        raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
+        verdict = admitted_ceiling(identity, raw)
         if isinstance(verdict, Admission):
-            return await super().call_tool(name, arguments)
+            return await self._dispatch(name, arguments, identity)
         # ``ceiling=OPEN`` rather than the requested one: the refusal echoes
         # the transport's own default, never the value that was refused.
-        return refusal_response(
-            tool=name,
-            ceiling=TierCeiling.OPEN,
-            reason=verdict.reason,
+        return await self._refuse_audited(name, identity, verdict.reason)
+
+    async def _dispatch(
+        self, name: str, arguments: dict[str, Any], identity: CallerIdentity
+    ) -> Sequence[ContentBlock] | dict[str, Any]:
+        """Dispatch an admitted call, binding its request-scoped key (#1967).
+
+        Only a :data:`~creek_mcp.httpapi.mcp_request_key.REQUEST_KEY_TOOLS` call on a
+        network server reads the headers, mirroring ``/v1``, whose routes that
+        call no model never parse them. A malformed pair is refused before
+        dispatch and audited as refused under the tool name with no argument
+        summary, through the same :meth:`_refuse_audited` as the two policy
+        verdicts, so neither header value reaches the audit chain or the
+        answer. A well-formed key — or none — is bound for this one dispatch
+        and unbound when it returns.
+
+        Args:
+            name: The admitted tool's name.
+            arguments: Its arguments.
+            identity: The caller, for a refusal's audit attribution.
+
+        Returns:
+            The tool's answer, or the ``invalid_request`` refusal.
+        """
+        if not self._reads_request_keys or name not in REQUEST_KEY_TOOLS:
+            return await super().call_tool(name, arguments)
+        try:
+            request_key = mcp_request_key.request_key_in_flight()
+        except InvalidRequestKeyError:
+            return await self._refuse_audited(
+                name, identity, INVALID_REQUEST_KEY_REASON
+            )
+        with bound_for_call(request_key):
+            return await super().call_tool(name, arguments)
+
+    async def _refuse_audited(
+        self, name: str, identity: CallerIdentity, reason: str
+    ) -> dict[str, Any]:
+        """Audit a pre-dispatch refusal as refused, then answer the refusal.
+
+        Shared by every pre-dispatch refusal — an out-of-profile tool (#1964),
+        an over-ceiling remote call (#1968) and a malformed request-scoped key
+        (#1967) — so they cannot drift into different shapes of refused entry.
+
+        The audit entry carries the tool name and
+        :data:`~creek_mcp.audit.AUDIT_OUTCOME_REFUSED` only — no argument
+        summary, because no tool ran to say which arguments were safe to
+        summarise — and the transport-default ``OPEN`` ceiling, never the one
+        requested. A name that is not a registered tool is recorded as
+        :data:`UNREGISTERED_TOOL_AUDIT_NAME`, so a caller cannot write
+        arbitrary text into the log by asking for it.
+
+        Args:
+            name: The tool the caller asked for, as it spelled it.
+            identity: The caller, as :func:`_caller_identity` built it for
+                this call.
+            reason: The refusal's reason, from policy.
+
+        Returns:
+            The :func:`creek_mcp.tier_ceiling.refusal_response` payload, which
+            echoes *name* back to the caller who supplied it.
+        """
+        registered = {tool.name for tool in await super().list_tools()}
+        MCPAuditLog(self._audit_vault).append(
+            tool=name if name in registered else UNREGISTERED_TOOL_AUDIT_NAME,
+            args={},
+            tier_ceiling=TierCeiling.OPEN,
+            consumer=effective_consumer(identity, self._audit_consumer),
+            outcome=AUDIT_OUTCOME_REFUSED,
         )
+        return refusal_response(tool=name, ceiling=TierCeiling.OPEN, reason=reason)
 
 
 def _resolve_vault(vault_path: Path | None) -> Path:
@@ -247,7 +485,13 @@ def _consumer_from_env() -> str:
     return os.environ.get("CREEK_MCP_CONSUMER", "unknown")
 
 
-def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
+def _build_draft_llm(
+    vault: Path,
+    tier: PrivacyTier,
+    *,
+    request_key: RequestKey | None = None,
+    provenance: InferenceProvenance | None = None,
+) -> Callable[[str], str]:
     """Return the draft-side LLM callable, routed for *tier* (#958).
 
     Mirrors :func:`_build_compile_llm`: the ``generation`` stage is resolved
@@ -275,6 +519,11 @@ def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
             be decided by wherever the server happened to be started.
         tier: The routing tier ``draft_tool`` computed from the caller's
             ceiling and the seed's source fragments' own classifications.
+        request_key: The writer's request-scoped key from the MCP request
+            (ADR-0015, #1967), or ``None``. Held by the returned closure for
+            as long as the draft runs — through a detached composition's
+            worker thread included — and never written anywhere.
+        provenance: The call's route recorder, or ``None``.
 
     Returns:
         A prompt → completion-text callable bound to the resolved provider.
@@ -287,7 +536,7 @@ def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
             back to. ``draft_tool`` turns either into a refusal.
     """
     router = load_vault_config(vault).model_router
-    provider = _generation_provider(router, tier, "draft")
+    provider = _generation_provider(router, tier, "draft", request_key, provenance)
 
     def _draft(prompt: str) -> str:
         with declared_pool_request(tier):
@@ -506,9 +755,10 @@ def _record_source(provenance: InferenceProvenance | None, source: str | None) -
     """Record *source* on *provenance*, when this request has a recorder.
 
     Args:
-        provenance: The request's recorder, or ``None`` outside a ``/v1``
-            request — the MCP transport publishes no provenance field, and a
-            CLI pass has nobody to publish it to.
+        provenance: The request's recorder, or ``None`` when nobody will
+            publish the route — a CLI pass, or a factory a caller injected.
+            Since #1967 the MCP transport mints one per model-calling tool
+            call, as ``/v1`` does per request.
         source: The published provenance value, or ``None`` for a route this
             contract does not label.
     """
@@ -517,7 +767,7 @@ def _record_source(provenance: InferenceProvenance | None, source: str | None) -
 
 
 def _resolve_generation_stage(
-    router: ModelRouter, tier: PrivacyTier, request_key: RequestKey | None
+    router: ModelRouter, tier: PrivacyTier | None, request_key: RequestKey | None
 ) -> LLMConfig:
     """Return the ``generation`` stage for *tier*, with a request key considered.
 
@@ -530,7 +780,8 @@ def _resolve_generation_stage(
 
     Args:
         router: The served vault's model router.
-        tier: The request's routing tier.
+        tier: The request's routing tier, or ``None`` for a Writing Desk run
+            whose evidence carries no classification.
         request_key: The writer's request-scoped key, or ``None``.
 
     Returns:
@@ -622,7 +873,13 @@ def _complete_reflection(
     return completion.text
 
 
-def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient | None:
+def _build_author_llm(
+    vault: Path,
+    tier: PrivacyTier | None,
+    *,
+    request_key: RequestKey | None = None,
+    provenance: InferenceProvenance | None = None,
+) -> AuthorLLMClient | None:
     """Return the Writing Desk's voice client, routed for *tier* (#658/#661).
 
     The author-side sibling of :func:`_build_draft_llm`, extracted from
@@ -650,6 +907,11 @@ def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient 
             whichever vault the server's directory happened to name (#1409).
         tier: The run's content tier, or ``None`` when the evidence carries no
             classification to route on.
+        request_key: The writer's request-scoped key (ADR-0015, #1967), or
+            ``None``. Tried first, through :func:`_request_keyed_voice`; when
+            it is not admitted for this tier the voice role resolves exactly
+            as before.
+        provenance: The call's route recorder, or ``None``.
 
     Returns:
         The resolved :class:`~creek.author.client.AuthorLLMClient`, or ``None``
@@ -662,15 +924,65 @@ def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient 
     from creek.author.client import VOICE_DRAFTER_ROLE, AuthorLLMClient
 
     config = load_vault_config(vault)
+    keyed = _request_keyed_voice(config.model_router, tier, request_key, provenance)
+    if keyed is not None:
+        return keyed
     voice = config.model_router.resolve_role(VOICE_DRAFTER_ROLE, tier)
     if pin_refuses_stage(voice):
         return None
-    return AuthorLLMClient.for_voice_or_none(
+    client = AuthorLLMClient.for_voice_or_none(
         config.model_router,
         author=config.author,
         tier=tier,
         may_serve=provider_may_serve,
     )
+    if client is not None:
+        _record_source(provenance, stage_inference_source(voice.provider))
+    return client
+
+
+def _request_keyed_voice(
+    router: ModelRouter,
+    tier: PrivacyTier | None,
+    request_key: RequestKey | None,
+    provenance: InferenceProvenance | None,
+) -> AuthorLLMClient | None:
+    """Return the desk's voice client bought with the writer's key, or ``None``.
+
+    The same decision :func:`_generation_provider` makes for draft and
+    reflection: the key's stage is resolved through
+    :func:`_resolve_generation_stage` — the vault's routing with
+    ``generation`` set to the key's provider — so an INTIMATE run is
+    redirected to the local ``default`` (and then not admitted) or refused
+    with ``IntimateRoutingError``, and
+    :func:`~creek_mcp.model_pin.request_key_admitted` alone says whether the
+    key may build the provider. A vault's ``writing_desk`` voice entry cannot
+    redirect a writer's key to another model, exactly as ADR-0015 fixes the
+    key to its vendor's default.
+
+    Args:
+        router: The served vault's model router.
+        tier: The run's content tier, or ``None``.
+        request_key: The writer's request-scoped key, or ``None``.
+        provenance: The call's route recorder, or ``None``.
+
+    Returns:
+        A client over the writer's provider, or ``None`` when there is no key
+        or it is not admitted for this run.
+
+    Raises:
+        IntimateRoutingError: For INTIMATE with a key when the vault's
+            ``default`` is itself cloud. ``author_tool`` reports it.
+    """
+    from creek.author.client import AuthorLLMClient
+
+    if request_key is None:
+        return None
+    cfg = _resolve_generation_stage(router, tier, request_key)
+    if not request_key_admitted(cfg, request_key):
+        return None
+    _record_source(provenance, request_key_inference_source(request_key))
+    return AuthorLLMClient(build_request_scoped_provider(request_key))
 
 
 def build_server(
@@ -682,6 +994,8 @@ def build_server(
     compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
     token_verifier: TokenVerifier | None = None,
+    resource_server: ResourceServerConfig | None = None,
+    job_runtime: JobRuntime | None = None,
 ) -> FastMCP:
     """Construct a :class:`FastMCP` instance with all FEAT-010/011 tools.
 
@@ -718,13 +1032,29 @@ def build_server(
             verifier accepts (no anonymous access), and remote calls are
             capped below INTIMATE. ``None`` (the default) is the local stdio
             server, unauthenticated as before.
+        resource_server: This vault's OAuth resource-server configuration
+            (#1963): the SDK is given its real issuer and resource URLs, the
+            served app publishes its RFC 9728 metadata and challenge, and the
+            handshake reports ``oauth``. *token_verifier* is then expected to
+            accept the issuer's JWTs —
+            :func:`creek_mcp.agent_tokens.mcp_token_verifier` builds it.
+        job_runtime: The process's job runtime (#1966) — the worker id and the
+            one-active-job-per-consumer admission state ``creek.draft`` and
+            ``creek.author`` run under. ``None`` builds a fresh one; a server
+            mounted beside the ``/v1`` app passes that app's
+            ``state.pipeline_jobs`` so one consumer holds one slot across both
+            surfaces. The synchronous deadline is read from
+            ``CREEK_MCP_SYNC_DEADLINE_SECONDS`` here, at build time.
 
     Raises:
         ValueError: When a ``token_verifier`` is supplied for a non-network
             *transport*. The two are asserted separately, so they can disagree;
             a server that authenticates remote consumers while telling them it
             is on stdio is precisely the defect #1583 fixed, and it is refused
-            here rather than served.
+            here rather than served. Also when a *resource_server* is supplied
+            without a *token_verifier*: metadata inviting clients to sign in to
+            a server that authenticates nobody is the same kind of
+            misdescription.
     """
     if token_verifier is not None and not transport.is_remote:
         # A verifier is only ever wired up for the authenticated network
@@ -738,26 +1068,49 @@ def build_server(
             "an authenticated consumer it is local"
         )
         raise ValueError(msg)
+    if resource_server is not None and token_verifier is None:
+        msg = (
+            "resource_server is only served behind a token_verifier; refusing "
+            "to publish OAuth metadata for a server that authenticates nobody"
+        )
+        raise ValueError(msg)
     # Wrapped, never used bare (#1100). ``token_verifier`` is an arbitrary
     # ``TokenVerifier`` — nothing here can vouch for what its ``client_id``
     # says — and an ``AccessToken`` naming nobody would be stamped on every
     # audit line the call wrote. ``NamedConsumerVerifier`` maps that onto the
     # unauthenticated answer, so the refusal lands before dispatch.
     named = None if token_verifier is None else NamedConsumerVerifier(token_verifier)
-    server: FastMCP = (
-        _BoundedFastMCP(SERVER_NAME, token_verifier=named, auth=remote_auth_settings())
-        if named is not None
-        else _BoundedFastMCP(SERVER_NAME)
-    )
+    # Resolved before the server is built: the adapter audits the refusals it
+    # makes itself (#1964), so it needs the vault and the default identity.
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
+    server: FastMCP = (
+        _BoundedFastMCP(
+            SERVER_NAME,
+            vault=vault,
+            consumer=consumer,
+            token_verifier=named,
+            auth=remote_auth_settings(resource_server),
+            resource_server=resource_server,
+            reads_request_keys=transport.is_remote,
+        )
+        if named is not None
+        else _BoundedFastMCP(
+            SERVER_NAME,
+            vault=vault,
+            consumer=consumer,
+            reads_request_keys=transport.is_remote,
+        )
+    )
     # Each default builder is bound to the vault this server serves (#1409).
     # They used to resolve their config from the process cwd, which silently
-    # routed one vault's text with another vault's model routing.
-    factory = draft_llm_factory or partial(_build_draft_llm, vault)
-    author_factory = author_llm_factory or partial(_build_author_llm, vault)
+    # routed one vault's text with another vault's model routing. The three
+    # model-calling tools get theirs per call (#1967), so each call's
+    # request-scoped key and route recorder reach the factory it builds.
+    factory = partial(_draft_factory_for, vault, draft_llm_factory)
+    author_factory = partial(_author_factory_for, vault, author_llm_factory)
     compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
-    reflect_factory = reflect_llm_factory or partial(_build_reflect_llm_factory, vault)
+    reflect_factory = partial(_reflect_factory_for, vault, reflect_llm_factory)
 
     # One grounding session per server (#1034): ``creek.reflect``'s retrieval
     # specialist is built and warmed once here rather than per call, so the
@@ -768,6 +1121,7 @@ def build_server(
         vault=vault,
         consumer=consumer,
         transport=transport,
+        auth=_auth_mode(named, resource_server),
         reflect_factory=reflect_factory,
         grounding_session=GroundingSession(),
     )
@@ -777,6 +1131,11 @@ def build_server(
         consumer=consumer,
         draft_factory=factory,
         author_factory=author_factory,
+        jobs=CompositionJobs(
+            vault=vault,
+            runtime=job_runtime if job_runtime is not None else JobRuntime(),
+            deadline_seconds=sync_deadline_seconds(),
+        ),
     )
     _register_pipeline_tools(
         server,
@@ -789,13 +1148,144 @@ def build_server(
     return server
 
 
+def _draft_factory_for(
+    vault: Path,
+    injected: DraftLLMFactory | None,
+    request_key: RequestKey | None,
+    provenance: InferenceProvenance,
+) -> DraftLLMFactory:
+    """Return one ``creek.draft`` call's tier-keyed factory (#1967).
+
+    Args:
+        vault: The served vault, bound by ``build_server`` (#1409).
+        injected: A factory the caller handed ``build_server``, which wins and
+            sees neither the key nor the recorder.
+        request_key: The call's bound request-scoped key, or ``None``.
+        provenance: The call's route recorder.
+
+    Returns:
+        *injected*, or :func:`_build_draft_llm` bound to this call.
+    """
+    if injected is not None:
+        return injected
+    return partial(
+        _build_draft_llm, vault, request_key=request_key, provenance=provenance
+    )
+
+
+def _author_factory_for(
+    vault: Path,
+    injected: AuthorLLMFactory | None,
+    request_key: RequestKey | None,
+    provenance: InferenceProvenance,
+) -> AuthorLLMFactory:
+    """Return one ``creek.author`` call's tier-keyed voice factory (#1967).
+
+    Args:
+        vault: The served vault.
+        injected: A factory the caller handed ``build_server``, which wins.
+        request_key: The call's bound request-scoped key, or ``None``.
+        provenance: The call's route recorder.
+
+    Returns:
+        *injected*, or :func:`_build_author_llm` bound to this call.
+    """
+    if injected is not None:
+        return injected
+    return partial(
+        _build_author_llm, vault, request_key=request_key, provenance=provenance
+    )
+
+
+def _reflect_factory_for(
+    vault: Path,
+    injected: Callable[[], _LLMFactory] | None,
+    request_key: RequestKey | None,
+    provenance: InferenceProvenance,
+) -> _LLMFactory:
+    """Return one ``creek.reflect`` call's tier-keyed factory (#1967).
+
+    The same builder ``POST /v1/reflections`` calls with its request's key and
+    recorder, so the two surfaces resolve a reflection's provider one way.
+
+    Args:
+        vault: The served vault.
+        injected: A thunk the caller handed ``build_server``, which wins.
+        request_key: The call's bound request-scoped key, or ``None``.
+        provenance: The call's route recorder.
+
+    Returns:
+        The injected thunk's factory, or
+        :func:`_build_reflect_llm_factory` bound to this call.
+    """
+    if injected is not None:
+        return injected()
+    return _build_reflect_llm_factory(vault, request_key, provenance)
+
+
+def _labelled(
+    response: dict[str, Any], provenance: InferenceProvenance
+) -> dict[str, Any]:
+    """Add the recorded route to a successful *response*, as ``/v1`` does (#1967).
+
+    A refusal carries no route, and an answer whose route was not recorded —
+    an injected factory, or a route the vocabulary does not label — carries
+    none either: absent rather than guessed (ADR-0016 D1.11).
+
+    Args:
+        response: A tool's answer.
+        provenance: The call's route recorder.
+
+    Returns:
+        *response*, with ``inference_source`` when it is ``ok`` and labelled.
+    """
+    if response.get("status") == "ok" and provenance.source is not None:
+        return {**response, "inference_source": provenance.source}
+    return response
+
+
+def _advertised_request_key_providers(transport: Transport) -> list[str]:
+    """Return the request-key providers ``creek.handshake`` reports (#1967).
+
+    The answer ``GET /v1/capabilities`` gives — both vendors on a managed
+    vault, none on a self-connected one — on the network transport, the only
+    one whose calls carry headers. Over stdio a key cannot arrive, so none.
+
+    Args:
+        transport: The channel this server is served on.
+
+    Returns:
+        The providers, in their published order.
+    """
+    return request_key_providers() if transport.is_remote else []
+
+
+def _auth_mode(
+    verifier: TokenVerifier | None, resource_server: ResourceServerConfig | None
+) -> AuthMode:
+    """Return how this server's callers authenticate, for the handshake (#1963).
+
+    Args:
+        verifier: The wired verifier, or ``None`` for stdio.
+        resource_server: The OAuth configuration, or ``None``.
+
+    Returns:
+        ``oauth`` with an issuer configured, ``bearer`` with static tokens
+        only, ``none`` for the unauthenticated local server.
+    """
+    if resource_server is not None:
+        return AuthMode.OAUTH
+    return AuthMode.NONE if verifier is None else AuthMode.BEARER
+
+
 def _register_conversation_tools(
     server: FastMCP,
     *,
     vault: Path,
     consumer: str,
     transport: Transport,
-    reflect_factory: Callable[[], _LLMFactory],
+    auth: AuthMode,
+    reflect_factory: _ScopedFactory[_LLMFactory],
     grounding_session: GroundingSession,
 ) -> None:
     """Register the five conversational tools on *server*.
@@ -819,8 +1309,11 @@ def _register_conversation_tools(
             handshake used to answer from a module-level ``"stdio"``
             literal (#1583). It is threaded explicitly rather than
             re-derived so it cannot be dropped silently.
-        reflect_factory: Thunk returning the tier-keyed LLM factory for
-            ``creek.reflect``. Invoked lazily per call.
+        auth: How this server's callers authenticate, which
+            ``creek.handshake`` publishes (#1963).
+        reflect_factory: Builds the tier-keyed LLM factory for one
+            ``creek.reflect`` call from its request-scoped key and route
+            recorder (#1967). Invoked lazily per call.
         grounding_session: The server-scoped :class:`GroundingSession` whose
             warmed retrieval specialist every ``creek.reflect`` call reuses
             (#1034). Constructed by ``build_server`` and threaded in rather
@@ -839,8 +1332,10 @@ def _register_conversation_tools(
             capabilities=sorted(tool.name for tool in tools),
             server_name=SERVER_NAME,
             transport=transport,
+            auth=auth,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
+            request_key_providers=_advertised_request_key_providers(transport),
         )
 
     @server.tool(name="creek.reflect")
@@ -850,9 +1345,10 @@ def _register_conversation_tools(
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
         """Return anchored Higher-Self margin notes on a single journal entry."""
-        return reflect_tool(
+        provenance = InferenceProvenance()
+        response = reflect_tool(
             vault_path=vault,
-            llm_factory=reflect_factory(),
+            llm_factory=reflect_factory(bound_request_key(), provenance),
             content=content,
             entry_ref=entry_ref,
             care_guard=acute_distress_guard,
@@ -860,6 +1356,7 @@ def _register_conversation_tools(
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
+        return _labelled(response, provenance)
 
     @server.tool(name="creek.wheel")
     def _wheel(
@@ -918,25 +1415,36 @@ def _register_authoring_tools(
     *,
     vault: Path,
     consumer: str,
-    draft_factory: DraftLLMFactory,
-    author_factory: AuthorLLMFactory,
+    draft_factory: _ScopedFactory[DraftLLMFactory],
+    author_factory: _ScopedFactory[AuthorLLMFactory],
+    jobs: CompositionJobs,
 ) -> None:
-    """Register the seven state-and-authoring tools on *server*.
+    """Register the eight state-and-authoring tools on *server*.
 
     ``creek.state.read``, ``creek.state.render``, ``creek.lint``,
-    ``creek.mine``, ``creek.draft``, ``creek.author`` and ``creek.save`` --
-    the Writing Desk's read side and the two verbs that call a model.
+    ``creek.mine``, ``creek.draft``, ``creek.author``, ``creek.save`` and
+    ``creek.jobs.read`` -- the Writing Desk's read side, the two verbs that
+    call a model, and the handle reader for those two verbs (#1966).
+
+    **This registrar is now at the nested-def ceiling** of
+    ``tests/test_mcp_tool_registration_surface.py`` (eight). The next
+    authoring tool splits this function.
 
     Args:
         server: The :class:`FastMCP` instance to register on.
         vault: The resolved vault root this server serves.
         consumer: The audit identity recorded for calls arriving without an
             authenticated caller.
-        draft_factory: Tier-keyed factory for the draft LLM, invoked lazily
-            by ``creek.draft`` once it knows which seed it is drafting.
-        author_factory: Tier-keyed factory for the Writing Desk's voice
-            client, invoked lazily by ``creek.author`` inside the run and
-            not at all on the ``dry_run`` path.
+        draft_factory: Builds one ``creek.draft`` call's tier-keyed factory
+            from its request-scoped key and route recorder (#1967); the
+            factory is invoked lazily, once the seed is known.
+        author_factory: Builds one ``creek.author`` call's tier-keyed voice
+            factory the same way; invoked lazily inside the run and not at
+            all on the ``dry_run`` path.
+        jobs: The server's :class:`~creek_mcp.composition_jobs.CompositionJobs`:
+            ``creek.draft`` and a non-dry-run ``creek.author`` run through it
+            for admission, progress and the synchronous deadline, and
+            ``creek.jobs.read`` resolves the handles it hands out.
     """
     # Aliased rather than renamed in the 119 moved lines below, so the move
     # is provably byte-identical while the public parameter name still reads
@@ -999,43 +1507,66 @@ def _register_authoring_tools(
         )
 
     @server.tool(name="creek.draft")
-    def _draft(
+    async def _draft(
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
         phase: str = "unclassified",
         index: int = 0,
+        *,
+        ctx: Context,
     ) -> dict[str, Any]:
         """Generate an essay draft from a mined idea."""
-        return draft_tool(
+        caller = _effective_consumer(consumer)
+        provenance = InferenceProvenance()
+        work = partial(
+            draft_tool,
             vault_path=vault,
-            llm_factory=factory,
+            llm_factory=factory(bound_request_key(), provenance),
             privacy_tier_ceiling=privacy_tier_ceiling,
             phase=phase,
             index=index,
-            consumer=_effective_consumer(consumer),
+            consumer=caller,
+            provenance=provenance,
+        )
+        return await jobs.run(
+            draft_call(work, consumer=caller, ceiling=privacy_tier_ceiling), ctx
         )
 
     @server.tool(name="creek.author")
-    def _author(
+    async def _author(
         query: str,
         medium: str = "research",
         max_rounds: int | None = None,
         dry_run: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+        *,
+        ctx: Context,
     ) -> dict[str, Any]:
         """Author a draft for a query via the Writing Desk.
 
         ``max_rounds`` defaults to the vault's ``author.max_author_rounds`` (3).
         """
-        return author_tool(
+        caller = _effective_consumer(consumer)
+        provenance = InferenceProvenance()
+        work = partial(
+            author_tool,
             vault_path=vault,
             query=query,
-            llm_factory=author_factory,
+            llm_factory=author_factory(bound_request_key(), provenance),
+            provenance=provenance,
             medium=medium,
             max_rounds=max_rounds,
             dry_run=dry_run,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=_effective_consumer(consumer),
+            consumer=caller,
         )
+        if dry_run:
+            # The plan composes nothing, so it neither reports progress nor
+            # takes a job slot; it answers synchronously, as it always has.
+            return work()
+        call = author_call(
+            work, vault=vault, consumer=caller, ceiling=privacy_tier_ceiling
+        )
+        return await jobs.run(call, ctx)
 
     @server.tool(name="creek.save")
     def _save(
@@ -1063,6 +1594,18 @@ def _register_authoring_tools(
             saved_by=saved_by,
             full_body=full_body,
             privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+    @server.tool(name="creek.jobs.read")
+    async def _jobs_read(
+        job_id: str,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Resolve a creek.draft / creek.author job handle to its state."""
+        return await jobs.read(
+            job_id=job_id,
+            ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
 
@@ -1514,13 +2057,50 @@ def _require_strong_elevated_token(parser: argparse.ArgumentParser) -> None:
         parser.error(str(exc))
 
 
+def _network_credentials(
+    parser: argparse.ArgumentParser,
+) -> tuple[ConsumerTokenVerifier, ResourceServerConfig | None]:
+    """Read the network transport's credentials, or exit naming what to fix.
+
+    Args:
+        parser: The CLI parser, used to report errors in argparse style.
+
+    Returns:
+        The static registry's verifier and, when ``CREEK_MCP_RESOURCE_URL``
+        and ``CREEK_MCP_AUTHORIZATION_SERVER`` are set, the resource-server
+        configuration (#1963).
+    """
+    try:
+        tokens = load_consumer_tokens()
+        grants = load_consumer_grants()
+        resource_server = load_resource_server_config()
+    except ValueError as exc:
+        # An unreadable consumer-token configuration: a token below the
+        # minimum-strength floor (#838), a consumer named twice, one token
+        # value configured for two consumers (#895), or an unreadable grant
+        # suffix (#1964) — or a half-configured or unsafe resource server
+        # (#1963). Exit naming the setting to fix rather than serve a weak or
+        # ambiguous registry; no such message ever carries a token value.
+        parser.error(str(exc))
+    if not tokens and resource_server is None:
+        # No anonymous access: refuse to expose the vault without per-consumer
+        # tokens or an issuer, rather than serving unauthenticated. An OAuth
+        # vault needs no static consumer: an agent's JWT is the credential.
+        parser.error(
+            f"network transport requires {CONSUMER_TOKENS_ENV} "
+            "(consumer=token pairs); refusing to serve without authentication"
+        )
+    return ConsumerTokenVerifier(tokens, grants=grants), resource_server
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the MCP server over stdio (local) or the authenticated network transport.
 
     Startup is fail-closed four times over. On *every* transport it refuses
     an elevated token below the minimum-strength floor (#907). The network
-    branch additionally refuses to start without per-consumer tokens (no
-    anonymous access), refuses a consumer-token configuration the parser
+    branch additionally refuses to start without per-consumer tokens or a
+    configured issuer (no anonymous access), refuses a half-configured OAuth
+    resource server (#1963), refuses a consumer-token configuration the parser
     cannot read unambiguously — a token below the same floor (#838), a
     consumer named twice, a token value shared by two consumers (#895) — and
     refuses a non-loopback bind unless TLS is configured (no cleartext bearer
@@ -1528,7 +2108,8 @@ def main(argv: list[str] | None = None) -> None:
 
     Having started, the network branch *announces* on stderr any consumer
     holding more than one currently-valid token, so an open rotation window
-    is visible rather than permanent (#895).
+    is visible rather than permanent (#895), and any consumer configured with
+    no grant suffix, which is ungated (#1964).
 
     Args:
         argv: Optional list of command-line arguments. When ``None``
@@ -1546,29 +2127,22 @@ def main(argv: list[str] | None = None) -> None:
     _require_strong_elevated_token(parser)
 
     if args.transport is Transport.NETWORK:
-        try:
-            tokens = load_consumer_tokens()
-        except ValueError as exc:
-            # An unreadable consumer-token configuration: a token below the
-            # minimum-strength floor (#838), a consumer named twice, or one
-            # token value configured for two consumers (#895). Exit naming the
-            # setting to fix rather than serve a weak or ambiguous registry;
-            # no such message ever carries a token value.
-            parser.error(str(exc))
-        if not tokens:
-            # No anonymous access: refuse to expose the vault without per-consumer
-            # tokens, rather than serving unauthenticated.
-            parser.error(
-                f"network transport requires {CONSUMER_TOKENS_ENV} "
-                "(consumer=token pairs); refusing to serve without authentication"
-            )
+        verifier, resource_server = _network_credentials(parser)
         _require_transport_confidentiality(parser, args)
-        verifier = ConsumerTokenVerifier(tokens)
         # A rotation window has to be closed again, and an operator who cannot
         # see one is open will not close it (#895). On stderr: stdout on this
-        # entry point belongs to the stdio transport's JSON-RPC framing.
+        # entry point belongs to the stdio transport's JSON-RPC framing. An
+        # ungated consumer is announced for the same reason (#1964).
         announce_rotation_window(verifier)
-        server = build_server(transport=args.transport, token_verifier=verifier)
+        announce_ungated_consumers(verifier)
+        agent = (
+            None if resource_server is None else JwtAgentTokenVerifier(resource_server)
+        )
+        server = build_server(
+            transport=args.transport,
+            token_verifier=mcp_token_verifier(verifier, agent),
+            resource_server=resource_server,
+        )
         server.settings.host = args.host
         server.settings.port = args.port
         _serve_network(server, args)
