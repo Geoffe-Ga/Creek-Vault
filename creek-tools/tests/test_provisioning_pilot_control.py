@@ -211,3 +211,58 @@ def test_fly_edge_answers_every_other_path_with_the_existing_routing_miss(
     assert miss.status_code == ROUTING_MISS_STATUS
     assert miss.content == b""
     assert control.json()["app"] == "control"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource",
+    ],
+)
+def test_fly_edge_routes_the_resource_metadata_to_the_vault_router(path: str) -> None:
+    """The RFC 9728 metadata reaches the router, which answers it (#1963).
+
+    Args:
+        path: A protected-resource metadata path.
+    """
+    app = build_edge_application(
+        _recording_app("control"),
+        _recording_app("router"),
+        expected_host=_HOST,
+        fly_app_name="creek-control-pilot",
+        fly_machine_id="machine-001",
+        routing_miss_status=ROUTING_MISS_STATUS,
+    )
+
+    routed = TestClient(app).get(path, headers=_EDGE_HEADERS)
+
+    assert routed.json()["app"] == "router"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/.well-known/oauth-protected-resource/v1",
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/jwks.json",
+    ],
+)
+def test_fly_edge_routes_no_other_well_known_path(path: str) -> None:
+    """Only the two metadata paths: the edge is not the authorization server.
+
+    Args:
+        path: A well-known path that is not this resource's metadata.
+    """
+    app = build_edge_application(
+        _recording_app("control"),
+        _recording_app("router"),
+        expected_host=_HOST,
+        fly_app_name="creek-control-pilot",
+        fly_machine_id="machine-001",
+        routing_miss_status=ROUTING_MISS_STATUS,
+    )
+
+    miss = TestClient(app).get(path, headers=_EDGE_HEADERS)
+
+    assert miss.status_code == ROUTING_MISS_STATUS

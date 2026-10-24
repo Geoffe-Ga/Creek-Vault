@@ -66,6 +66,13 @@ dependencies = [
     # 3.15 as the number the advisory fixes and 3.19 as the number the
     # lock resolves.
     "idna>=3.19",
+    # creek_mcp.agent_tokens verifies Adepthood-issued agent access tokens
+    # (RS256 / ES256 JWTs against the issuer's JWKS, #1963) and imports jwt at
+    # module scope, so pyjwt is a direct dependency rather than left
+    # transitive via mcp -> pyjwt[crypto]. The [crypto] extra is what makes
+    # the two asymmetric algorithms available. The floor is the same
+    # first-fully-patched release the constraint below records (#1823).
+    "pyjwt[crypto]>=2.15.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

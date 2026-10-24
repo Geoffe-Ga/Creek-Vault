@@ -191,9 +191,12 @@ def test_fly_runtime_uses_plaintext_only_with_replay_and_bearer_guards(
     monkeypatch.setattr(runtime, "load_consumer_secret", lambda _path: secret)
     monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
 
-    def fake_app(*, verifier: object, fly_replay_state: str) -> object:
+    def fake_app(
+        *, verifier: object, fly_replay_state: str, agent_verifier: object
+    ) -> object:
         observed["state"] = fly_replay_state
         observed["verifier"] = verifier
+        observed["agent_verifier"] = agent_verifier
         return object()
 
     def fake_serve(app: object, args: object) -> None:
@@ -212,6 +215,7 @@ def test_fly_runtime_uses_plaintext_only_with_replay_and_bearer_guards(
     runtime.run(settings)
 
     assert observed["state"] == _STATE
+    assert observed["agent_verifier"] is None
     assert observed["token_env"] is None
     assert observed["config_env"] == str(config)
     assert observed["vault_env"] == str(vault)
@@ -510,7 +514,7 @@ def test_fly_runtime_announces_an_ungated_consumer_before_serving(
     monkeypatch.setattr(
         runtime,
         "create_app",
-        lambda *, verifier, fly_replay_state: (verifier, fly_replay_state),
+        lambda *, verifier, fly_replay_state, **_kwargs: (verifier, fly_replay_state),
     )
     monkeypatch.setattr(runtime, "serve", lambda app, _args: served.append(app))
 

@@ -156,6 +156,8 @@ def test_composition_shares_state_and_exposes_one_attested_endpoint(
     bundle = pilot_cli.compose(args, parser)
 
     expected_origin = "https://creek-control-pilot.fly.dev"
+    # The edge's MCP URL is the audience agents' tokens are issued for (#1963).
+    assert args.oauth_resource_url == f"{expected_origin}/mcp"
     assert observed == [
         (
             name,

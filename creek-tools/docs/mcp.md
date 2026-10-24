@@ -35,7 +35,9 @@ read-only and needs no LLM provider, so the negotiation succeeds on any host and
 even on a fresh/absent vault. It returns at least `available`,
 `contract_version`, `ontology_version`, `tiers` (`open`/`personal`/`intimate`),
 and `capabilities` (the names of the tools actually registered), plus the
-`tier_model` and `transport`. Versions come from `creek_mcp/contract.py`; the
+`tier_model`, `transport` and `auth` — `oauth` when the vault is an OAuth
+resource server (#1963), `bearer` for static consumer tokens only, `none` on
+stdio. Versions come from `creek_mcp/contract.py`; the
 cross-repo contract is
 [`docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md`](../../docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md).
 
@@ -1038,6 +1040,66 @@ claude mcp add --transport http creek https://<vault-host>/mcp \
   the configuration cannot be read at startup, `/v1` still serves (and reports
   the vault unavailable) while `/mcp` is not mounted until a restart; the
   operator is told on `creek_mcp.httpapi.mcp`.
+
+### Signing in through Adepthood: OAuth on `/mcp` (#1963)
+
+A vault's `/mcp` is an OAuth 2.1 **resource server** when two non-secret
+settings are present; Adepthood is the authorization server:
+
+| Setting | Value |
+|---|---|
+| `CREEK_MCP_RESOURCE_URL` | The URL a person types into their client: the public vault URL plus `/mcp`. Must be `https` (plain `http` only on loopback), with no credentials, query or fragment. |
+| `CREEK_MCP_AUTHORIZATION_SERVER` | The issuer, exactly as its RFC 8414 metadata spells it. |
+| `CREEK_MCP_JWKS_URL` (optional) | Where the issuer's keys are fetched. Default: the issuer plus `/.well-known/jwks.json`. |
+
+Both or neither: one without the other refuses startup. With neither, the
+vault serves static consumer tokens exactly as before, publishes no metadata,
+and its `401` names no metadata URL. What a client meets with both set:
+
+```text
+GET /.well-known/oauth-protected-resource/mcp     (and the root-level fallback)
+→ 200 {"resource":"<CREEK_MCP_RESOURCE_URL>","authorization_servers":["<issuer>"],
+       "scopes_supported":["vault:read","vault:desk","vault:journal","vault:pipeline"],
+       "bearer_methods_supported":["header"]}
+
+POST /mcp  (no token, or one this vault refuses)
+→ 401  WWW-Authenticate: Bearer error="invalid_token",
+         resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp",
+         scope="vault:read vault:desk"
+
+POST /mcp  (a token whose scope names no grant)
+→ 403  WWW-Authenticate: Bearer error="insufficient_scope", resource_metadata=…, scope=…
+```
+
+An access token is accepted only when **all** of these hold
+(`creek_mcp/agent_tokens.py`):
+
+- signed `RS256` or `ES256` (never `none`, never `HS*`) by a key the issuer's
+  JWKS publishes under the token's `kid`, the header `alg` equal to that key's
+  own algorithm; keys are cached 300 s and refetched early for an unknown
+  `kid` at most once a minute, keeping the last good set if a fetch fails;
+- `iss` equals the configured issuer and `aud` equals
+  `CREEK_MCP_RESOURCE_URL` **exactly** — one string, not a list, so a token
+  for another vault is refused;
+- `exp`, `nbf` and `iat` hold within 30 s of skew, and `iss`, `sub`, `aud`,
+  `exp`, `iat` are all present;
+- on a managed vault, `sub` is the vault's own consumer identity.
+
+The token's `sub` becomes the consumer (on the audit log, the access log and
+the tier cap) and its `scope` claim the grants, read exactly as a static
+token's grant suffix is. `creek:ungated` in a token is ignored. The remote tier
+cap applies unchanged, so a JWT caller asking for `intimate` is refused with
+the same reason any remote caller gets. Static consumer tokens keep working on
+the same endpoint; `/v1` accepts static tokens only. The token is never
+forwarded: no provider, pool or Drive request carries it, and no log line
+names a token or a `kid`.
+
+The standalone `creek-tools-mcp --transport network` server reads the same
+settings, and with an issuer configured needs no `CREEK_MCP_CONSUMER_TOKENS`.
+On the managed-vault Fly edge the replay router answers the metadata itself,
+challenges a refused `/mcp` call toward it, and — given
+`--oauth-authorization-server` (`CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER`) —
+routes an agent's token on `/mcp` by its verified `sub` to that person's vault.
 
 ### Rotating a consumer's secret (no downtime)
 

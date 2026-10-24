@@ -15,6 +15,7 @@ from the tools actually registered.
 from __future__ import annotations
 
 import logging
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,21 @@ TOOL_NAME = "creek.handshake"
 
 CREEK_MARKER = Path("00-Creek-Meta")
 """The directory whose presence means "a vault has been scaffolded here"."""
+
+
+class AuthMode(StrEnum):
+    """How a caller of this server authenticates, as the handshake reports it (#1963).
+
+    A client that already connected learns from this whether the vault is an
+    OAuth resource server (it should refresh through the issuer) or a
+    bearer-token one (its credential is a configured secret). ``none`` is the
+    local stdio server, which authenticates nobody and says so rather than
+    claiming a scheme it does not run.
+    """
+
+    OAUTH = "oauth"
+    BEARER = "bearer"
+    NONE = "none"
 
 
 def vault_available(vault_path: Path) -> bool:
@@ -129,6 +145,7 @@ def handshake_tool(
     capabilities: list[str],
     server_name: str,
     transport: Transport,
+    auth: AuthMode,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
 ) -> dict[str, Any]:
@@ -170,6 +187,9 @@ def handshake_tool(
             has to answer out loud, exactly as
             :attr:`creek_mcp.policy.CallerIdentity.is_remote` does for the
             per-call question.
+        auth: How callers authenticate (#1963): ``oauth`` when an issuer is
+            configured, ``bearer`` for static consumer tokens only, ``none``
+            on stdio. No default, for the same reason *transport* has none.
         privacy_tier_ceiling: The ceiling the caller declared; recorded and
             echoed. Handshake returns no fragment content, so the ceiling does
             not gate anything here, but it is audited like every other call.
@@ -179,7 +199,8 @@ def handshake_tool(
     Returns:
         A dict with at least ``available``, ``contract_version``,
         ``ontology_version``, ``tiers``, and ``capabilities``, plus the
-        ``tier_model``, ``transport``, and ``server`` name for the client.
+        ``tier_model``, ``transport``, ``auth`` and ``server`` name for the
+        client.
     """
     available = vault_available(vault_path)
     _record_call(
@@ -194,6 +215,7 @@ def handshake_tool(
         "tier_ceiling": privacy_tier_ceiling.value,
         "server": server_name,
         "transport": transport.value,
+        "auth": auth.value,
         "available": available,
         "contract_version": CONTRACT_VERSION,
         "ontology_version": ONTOLOGY_VERSION,
