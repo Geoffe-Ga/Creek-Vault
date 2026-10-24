@@ -120,6 +120,7 @@ if TYPE_CHECKING:
 
     from creek.classify.llm.request_key import RequestKey
     from creek_mcp.httpapi.context import RequestContext
+    from creek_mcp.httpapi.job_runtime import JobRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -397,9 +398,15 @@ def _create_pipeline_job(
         method=method,
         retier=retier,
         ceiling=context.ceiling.value,
-        worker_id=str(request.app.state.pipeline_worker_id),
+        worker_id=_runtime(request).worker_id,
     )
     return vault, record
+
+
+def _runtime(request: Request) -> JobRuntime:
+    """Return the process's shared job runtime (#1966)."""
+    runtime: JobRuntime = request.app.state.pipeline_jobs
+    return runtime
 
 
 def _claimed_job(vault: Path, record: StoredJob) -> StoredJob | None:
@@ -470,21 +477,6 @@ def _execute_pipeline_job(
     _finish_pipeline_job(vault, claimed, result)
 
 
-def _forget_task(
-    task: asyncio.Task[None],
-    tasks: set[asyncio.Task[None]],
-    active_job_ids: set[str],
-    active_job_by_consumer: dict[str, str],
-    consumer: str,
-    job_id: str,
-) -> None:
-    """Release event-loop-confined admission state for a completed job."""
-    tasks.discard(task)
-    active_job_ids.discard(job_id)
-    if active_job_by_consumer.get(consumer) == job_id:
-        del active_job_by_consumer[consumer]
-
-
 async def _accepted_job(
     request: Request,
     *,
@@ -497,16 +489,15 @@ async def _accepted_job(
     """Durably queue at most one active pass per consumer and return its handle.
 
     Admission is event-loop serialised and the tracking collections are mutated
-    only on that loop.  The detached worker never touches them, so correctness
-    does not rely on cross-thread ``set`` operations being atomic.  A consumer
-    already running an expensive pass receives the contract's static
-    ``unavailable`` refusal and can retry after polling its accepted job.
+    only on that loop (:class:`~creek_mcp.httpapi.job_runtime.JobRuntime`).
+    The detached worker never touches them, so correctness does not rely on
+    cross-thread ``set`` operations being atomic.  A consumer already running an
+    expensive pass receives the contract's static ``unavailable`` refusal and
+    can retry after polling its accepted job.
     """
-    async with request.app.state.pipeline_job_admission_lock:
-        active_job_by_consumer: dict[str, str] = (
-            request.app.state.pipeline_active_job_by_consumer
-        )
-        if context.consumer in active_job_by_consumer:
+    runtime = _runtime(request)
+    async with runtime.admission_lock:
+        if runtime.busy(context.consumer):
             return error_response(ErrorCode.UNAVAILABLE, context)
 
         queued = await write_off_loop(
@@ -518,21 +509,7 @@ async def _accepted_job(
         task = asyncio.create_task(
             asyncio.to_thread(_execute_pipeline_job, vault, record, request_key)
         )
-        tasks: set[asyncio.Task[None]] = request.app.state.pipeline_job_tasks
-        active_job_ids: set[str] = request.app.state.pipeline_active_job_ids
-        tasks.add(task)
-        active_job_ids.add(record.job_id)
-        active_job_by_consumer[context.consumer] = record.job_id
-        task.add_done_callback(
-            partial(
-                _forget_task,
-                tasks=tasks,
-                active_job_ids=active_job_ids,
-                active_job_by_consumer=active_job_by_consumer,
-                consumer=context.consumer,
-                job_id=record.job_id,
-            )
-        )
+        runtime.track(context.consumer, record.job_id, task)
     payload = JobAcceptedResponse(
         status="accepted", job_id=UUID(record.job_id), state=JobState.QUEUED
     )
@@ -552,7 +529,7 @@ def _job_status(
         vault,
         request.path_params["job_id"],
         consumer=context.consumer,
-        worker_id=str(request.app.state.pipeline_worker_id),
+        worker_id=_runtime(request).worker_id,
         active_job_ids=active_job_ids,
     )
 
@@ -627,7 +604,7 @@ async def handle_job_status(request: Request) -> Response:
     context = context_of(request.scope)
     # Snapshot on the event loop; the blocking job-file read receives an
     # immutable value instead of sharing the loop-owned set with a worker.
-    active_job_ids = frozenset(request.app.state.pipeline_active_job_ids)
+    active_job_ids = frozenset(_runtime(request).active_job_ids)
     status = await write_off_loop(_job_status, request, context, active_job_ids)
     if status is None:
         return error_response(ErrorCode.UNAVAILABLE, context)

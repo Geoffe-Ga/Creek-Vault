@@ -86,6 +86,22 @@ that could say which of its arguments were safe to summarise. Entries written
 by the tools themselves carry no ``outcome`` key, exactly as before.
 """
 
+AUDIT_OUTCOME_ACCEPTED: Final[str] = "accepted"
+"""The ``outcome`` of the entry written when a composition becomes a job.
+
+``creek.draft`` / ``creek.author`` past the synchronous deadline (#1966). The
+entry's argument summary is the job id only; the call's own arguments were
+already summarised by the tool's ordinary entry.
+"""
+
+AUDIT_OUTCOME_COMPLETED: Final[str] = "completed"
+"""The ``outcome`` of the entry written when a detached composition finishes.
+
+Paired with an :data:`AUDIT_OUTCOME_ACCEPTED` entry carrying the same job id,
+and always appended after it (#1966). Its argument summary is the job id and
+the terminal state.
+"""
+
 _SHARED_LOG_CACHE_SIZE: Final[int] = 32
 """How many distinct log paths keep a warm chain-hash cache.
 

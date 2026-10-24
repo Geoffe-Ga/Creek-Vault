@@ -717,6 +717,22 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "whole-or-nothing decision creek state did."
         ),
     ),
+    "creek.jobs.read": ToolPosture(
+        posture=ReadPosture.METADATA_ONLY,
+        grant=Grant.DESK,
+        rationale=(
+            "Reads one job record the caller itself started and returns its "
+            "state plus the result that record stores. That result is not read "
+            "from the corpus at all: it is the projection draft_job_result / "
+            "author_job_result made of the composing tool's own success "
+            "envelope when the job finished -- a draft path, provenance counts "
+            "and status words, with the body, title, query, claims and "
+            "fragment ids dropped -- so nothing above any ceiling can be in it, "
+            "and the ceiling is audited for the trail, not enforced (#1966). "
+            "composition_job_for refuses another consumer's id, a /v1 pipeline "
+            "id, and an unknown or malformed id with one identical refusal."
+        ),
+    ),
     "creek.link": ToolPosture(
         posture=ReadPosture.METADATA_ONLY,
         grant=Grant.PIPELINE,

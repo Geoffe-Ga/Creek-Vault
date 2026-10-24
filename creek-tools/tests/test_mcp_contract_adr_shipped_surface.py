@@ -92,6 +92,7 @@ NON_ADEPTHOOD_TOOLS: Final[frozenset[str]] = frozenset(
         "creek.draft",
         "creek.author",
         "creek.save",
+        "creek.jobs.read",
         "creek.redact.scan",
         "creek.link",
         "creek.report",

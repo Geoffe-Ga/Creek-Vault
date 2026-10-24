@@ -245,6 +245,12 @@ TOOL_GRANTS: Final[Mapping[str, Grant]] = MappingProxyType(
         "creek.author": Grant.DESK,
         "creek.reflect": Grant.DESK,
         "creek.save": Grant.DESK,
+        # #1966: the handle reader for the two desk verbs above. Only a
+        # creek.draft / creek.author call can mint a handle, and handles are
+        # bound to the consumer that minted them, so a caller without DESK
+        # could never hold one to read; READ would advertise a tool that can
+        # only ever refuse.
+        "creek.jobs.read": Grant.DESK,
         "creek.journal": Grant.JOURNAL,
         "creek.upload": Grant.JOURNAL,
         "creek.classify": Grant.PIPELINE,
