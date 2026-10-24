@@ -383,9 +383,11 @@ Jobs reuse the `/v1` durable job store (`creek_mcp/httpapi/jobs.py`, kinds
 - **One active long call per consumer** (#1605). A second `creek.draft` or
   `creek.author` while one runs is refused with the static
   `unavailable` refusal (`status: "refused"`, `code: "unavailable"`). The slot
-  lives on `creek_mcp/httpapi/job_runtime.py::JobRuntime`; a server built with
-  the `/v1` app's runtime (`build_server(job_runtime=...)`) shares one slot per
-  consumer across both surfaces.
+  lives on `creek_mcp/httpapi/job_runtime.py::JobRuntime`. The server mounted
+  at `/mcp` inside the `/v1` process is built with the `/v1` app's runtime
+  (`build_server(job_runtime=...)`), so a consumer holds one slot across both
+  surfaces: a running `/v1` LLM classification refuses its `creek.draft`, and
+  the other way round.
 - **Bound to the caller.** The record carries the consumer the call was
   audited under, so a JWT agent and the `adepthood` service bearer never see
   each other's jobs. Another consumer's id, an unknown id, a malformed id and
