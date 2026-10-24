@@ -9,6 +9,21 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Publish `GET /v1/agent-activity` at contract `0.22.0` (#1968): a content-free
+  projection of the MCP audit chain so a vault's owner can see what each
+  connected agent asked for and when. Rows are `{consumer, tool, at, outcome}`,
+  newest first, with `outcome` closed at `admitted | refused`; no argument
+  summary, fragment id, path, hash or prose crosses, and nothing is hidden by
+  consumer (the app's own `adepthood` calls are listed under their stamp).
+  `?limit=` defaults to 50 and is clamped to 200, `?since=` is an inclusive
+  lower bound, malformed lines are counted in `skipped`, and a detached
+  composition's `accepted`/`completed` entries are one call, not three. The log
+  is read, never rewritten, and not re-verified per request. The route
+  publishes the contract's first query parameters (`RouteSpec.query_model`),
+  and the MCP adapter now audits a remote call refused for a ceiling above
+  `personal` as `"outcome": "refused"` under the tool name only, so such an
+  attempt shows on the card. `0.21` stays served.
+
 - Serve the MCP streamable-HTTP server at `/mcp` from the `/v1` process (#1962).
   `create_app()` builds it with `build_server(transport=NETWORK)` and the same
   `ConsumerTokenVerifier` instance as `/v1`, mounted below the access log and

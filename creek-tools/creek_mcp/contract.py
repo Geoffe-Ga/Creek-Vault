@@ -20,8 +20,23 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.21.0"
+CONTRACT_VERSION: Final[str] = "0.22.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.22.0 (#1968): ``/v1`` publishes an eleventh capability, ``agent-activity``,
+served by ``GET /v1/agent-activity?limit=&since=``: a content-free projection
+of the MCP audit chain, so a person can see what each connected agent asked
+their vault for and when. Each row is ``{consumer, tool, at, outcome}`` with
+``outcome`` closed at ``admitted | refused``; no argument summary, fragment id,
+path, hash or prose crosses. ``limit`` defaults to 50 and is clamped to 200;
+malformed log lines are counted in ``skipped`` rather than failing the route.
+The chain is read, never rewritten, and not re-verified per request. Three
+wire models (``AgentActivityQuery``, ``AgentActivityRow``,
+``AgentActivityResponse``) and the first published query parameters widen the
+HTTP contract. Alongside it the MCP adapter audits a remote call refused for a
+ceiling above ``personal`` as ``"outcome": "refused"`` under the tool name
+only, so such an attempt shows on the card; no tool's return shape moves.
+``0.21`` remains served without seeing or reaching the route.
 
 0.21.0 (#1903 step 6, ADR-0016): **one cap, one surface.**
 ``rate_limited`` is served on ``POST /v1/letters/{external_id}`` as well as on

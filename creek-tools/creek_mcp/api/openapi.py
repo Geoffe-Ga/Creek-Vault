@@ -579,12 +579,13 @@ def _parameters(spec: RouteSpec) -> list[dict[str, Any]]:
         spec: The route under consideration.
 
     Returns:
-        Path parameters first, then the two ``/v1`` headers, then the two
-        request-key headers on a route that accepts one.
+        Path parameters first, then query parameters, then the two ``/v1``
+        headers, then the two request-key headers on a route that accepts one.
     """
     parameters: list[dict[str, Any]] = [
         _path_parameter(name) for name in _PATH_PARAMETER.findall(spec.path)
     ]
+    parameters.extend(_query_parameters(spec))
     if spec.requires_contract_version:
         parameters.append(
             _header_parameter(
@@ -603,6 +604,69 @@ def _parameters(spec: RouteSpec) -> list[dict[str, Any]]:
     if spec.accepts_request_key:
         parameters.extend(_request_key_parameters())
     return parameters
+
+
+_SCHEMA_ANNOTATION_KEYS: Final[frozenset[str]] = frozenset({"title", "description"})
+"""Field-schema keys that belong on the parameter object, not in its schema."""
+
+_NULL_SCHEMA: Final[dict[str, str]] = {"type": "null"}
+"""The ``anyOf`` member Pydantic emits for an optional field's ``None``."""
+
+
+def _query_parameter_schema(field_schema: dict[str, Any]) -> dict[str, Any]:
+    """Return the published schema of one query parameter.
+
+    A query parameter is either present with a value or absent, never
+    ``null``, so the ``{"type": "null"}`` member Pydantic emits for an optional
+    field is dropped along with its ``null`` default. The title and
+    description move to the parameter object itself.
+
+    Args:
+        field_schema: One property of the query model's JSON Schema.
+
+    Returns:
+        The schema the parameter is published with.
+    """
+    schema = {
+        key: value
+        for key, value in field_schema.items()
+        if key not in _SCHEMA_ANNOTATION_KEYS
+        and not (key == "default" and value is None)
+    }
+    members = schema.pop("anyOf", None)
+    if members is None:
+        return schema
+    (present,) = (member for member in members if member != _NULL_SCHEMA)
+    return {**present, **schema}
+
+
+def _query_parameters(spec: RouteSpec) -> list[dict[str, Any]]:
+    """Return one ``in: query`` parameter per field of *spec*'s query model.
+
+    Derived from the model the handler validates with, so the document cannot
+    publish a bound the server does not enforce (#1968).
+
+    Args:
+        spec: The route under consideration.
+
+    Returns:
+        The query parameters, in field order; none for a route without a
+        query model.
+    """
+    if spec.query_model is None:
+        return []
+    model_schema = spec.query_model.model_json_schema()
+    required = set(model_schema.get("required", ()))
+    return [
+        {
+            "name": name,
+            "in": "query",
+            "required": name in required,
+            "description": field_schema["description"],
+            "schema": _query_parameter_schema(field_schema),
+        }
+        for name, field_schema in model_schema["properties"].items()
+    ]
 
 
 def _request_key_parameters() -> list[dict[str, Any]]:

@@ -184,12 +184,12 @@ def test_the_tier_model_is_the_standing_promise(vault: Path) -> None:
 def test_a_present_vault_advertises_only_the_built_capabilities(
     vault: Path,
 ) -> None:
-    """At #1862 that is every published capability, letters too.
+    """At #1968 that is every published capability, agent activity too.
 
     Spelled as a literal rather than derived from
     ``IMPLEMENTED_CAPABILITIES`` — that derivation already has its own test
     below. This one is the pin that makes a capability's landing *visible* in
-    a diff: a tenth capability has to add its name here, and a handler wired
+    a diff: a twelfth capability has to add its name here, and a handler wired
     without the constant (or vice versa) cannot slip past both.
 
     The request carries the current minor (``headers()`` defaults to it), so
@@ -211,6 +211,7 @@ def test_a_present_vault_advertises_only_the_built_capabilities(
         "voice-drafts",
         "journal-withdraw",
         "letters",
+        "agent-activity",
     ]
 
 

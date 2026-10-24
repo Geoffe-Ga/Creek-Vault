@@ -3,7 +3,7 @@
 <!-- capability-set: contract-versions -->
 - **Status**: Draft — pending agreement
 - **Date**: 2026-06-30 (surface truthed-up 2026-08-21, #875/#1094)
-- **Contract version**: `0.21.0`
+- **Contract version**: `0.22.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23` (see [Ontology version](#ontology-version))
 <!-- /capability-set -->
 - **Driving issues**: [#748](https://github.com/Geoffe-Ga/Creek-Vault/issues/748) (epic), [#749](https://github.com/Geoffe-Ga/Creek-Vault/issues/749) (this doc), [#875](https://github.com/Geoffe-Ga/Creek-Vault/issues/875) (truth-up), [#1094](https://github.com/Geoffe-Ga/Creek-Vault/issues/1094) (cross-repo reconciliation)
@@ -222,7 +222,7 @@ which.
   "server": "creek-tools-mcp",
   "transport": "stdio",
   "available": true,
-  "contract_version": "0.21.0",
+  "contract_version": "0.22.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "tiers": ["open", "personal", "intimate"],
   "tier_model": { "ceilings": ["open", "personal", "intimate", "all"],
@@ -770,6 +770,7 @@ not upgrade it to a semantic identity.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.22.0` | 2026-10-24 | **The HTTP adapter publishes `agent-activity` (#1968), and the MCP adapter audits one more refusal; no tool's arguments or return shape move.** `GET /v1/agent-activity` projects this adapter's audit chain onto content-free `{consumer, tool, at, outcome}` rows for the vault's owner, with `outcome` closed at `admitted \| refused` and every argument summary, path, fragment id and hash withheld. To make an agent's reach above `personal` visible there, `_BoundedFastMCP.call_tool` now audits a remote call refused by `admitted_ceiling` exactly as it audits an out-of-profile call (#1964): `"outcome": "refused"` under the tool name only, no argument summary, and the transport-default `open` ceiling rather than the one requested. The refusal itself is unchanged and still precedes dispatch. A detached composition's `accepted` / `completed` entries (#1966) are read as one call, not three. `0.21` remains served. |
 | `0.21.0` | 2026-10-21 | **The HTTP adapter serves the admission refusal on the letter route too (#1903 step 6, [ADR-0016](../../creek-tools/docs/architecture/ADR/0016-shared-confidential-warm-inference-pool.md)); the MCP tool surface does not move.** `rate_limited` / HTTP 429 is now reachable on `POST /v1/letters/{external_id}` as well as on `POST /v1/reflections`, with the same code, message, envelope and advisory `Retry-After`. The cap did not move and never was per route: both routes resolve the one `generation` stage through the same provider chokepoint, so the refusal is the shared pool's admission decision or the writer's own request key's 429, and one budget was already answering both — what `0.19` left split was the reporting, since `ProviderRateLimitError` subclasses `RuntimeError` and the letter tool's broad catch collapsed a cap into `provider_unavailable`. Nothing is stored on that path, so a capped letter leaves the caller-owned id unwritten and a retry still answers `created`. No model, field, status or route is added; the refusal is withheld from callers below `0.21`, so every `0.20` letter response is byte-identical and `0.20` remains served. It is `0.21` and not `0.20` because `0.20` had already shipped for `keyless_inference` (#1938), and reusing a published minor to move a route's behaviour is the break this window exists to prevent. |
 | `0.16.0` | 2026-09-11 | **The HTTP adapter gains consumer-scoped Journal withdrawal (#1799); the MCP tool surface does not move.** `DELETE /v1/journal-entries/{external_id}` is the idempotent destructive inverse of Journal upsert. It requires bearer identity, an explicit remote tier ceiling, and a negotiated `0.16` contract, but no request body or entry prose. A complete response means the caller's staged source, fragments, ledger/index/provenance references, and retrieval-facing derived state are absent; incomplete work is retryable and never reported as success. Foreign, unknown, already-withdrawn, and never-present identifiers are indistinguishable successes, so the route cannot be used as an ownership or existence oracle. The route, capability, and one closed response model widen the shared minor; `0.15` remains served without seeing or reaching them. |
 | `0.20.0` | 2026-10-21 | #1938: `GET /v1/capabilities` gains `keyless_inference`, `false` when a model call carrying no writer key is certain to be refused before any model is dialled. Today that is exactly a managed vault with no shared pool pinned. `inference_pool: false` could not say it, because a self-connected vault running its own model reports the same. Withheld from callers below `0.20`, so `0.19` stays served byte-identically; no route, code, status or MCP tool moves, and the OpenAPI golden advances deliberately. |

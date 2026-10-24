@@ -1,0 +1,25 @@
+{
+  "rows": [
+    {
+      "at": "2026-10-24T18:02:11Z",
+      "consumer": "acct_91",
+      "outcome": "admitted",
+      "tool": "creek.draft"
+    },
+    {
+      "at": "2026-10-24T18:01:50Z",
+      "consumer": "acct_91",
+      "outcome": "refused",
+      "tool": "creek.link"
+    },
+    {
+      "at": "2026-10-24T17:40:03Z",
+      "consumer": "adepthood",
+      "outcome": "admitted",
+      "tool": "creek.journal"
+    }
+  ],
+  "skipped": 0,
+  "status": "ok",
+  "tier_ceiling": "open"
+}

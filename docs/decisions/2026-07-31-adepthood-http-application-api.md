@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.21.0`
+- **Contract version**: `0.22.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -222,6 +222,7 @@ every content route refuses an undeclared minor anyway.
 | `voice-drafts` | `0.15` |
 | `journal-withdraw` | `0.16` |
 | `letters` | `0.17` |
+| `agent-activity` | `0.22` |
 <!-- /capability-set -->
 
 **The build-out divergence is closed (#1112).** While epic #1071 was being
@@ -404,6 +405,62 @@ withdrawal ledger on the Adepthood side applies to a vault-written letter
 unchanged. The audit row records lengths, the declared tier and the consumer;
 the log records one closed-vocabulary outcome; neither carries the entry, the
 note, the prompt or the letter.
+
+## Agent activity
+
+`GET /v1/agent-activity?limit=50&since=<iso>` is the vault side of the
+"what the person sees" decision of epic
+[#1961](https://github.com/Geoffe-Ga/Creek-Vault/issues/1961) (#1968): a person
+who connected an agent can see what it asked their vault for and when, so they
+can tell a quiet helper from a noisy one and revoke with a reason. Adepthood
+renders it under the agents list.
+
+It is a **projection of the MCP audit chain** (`00-Creek-Meta/audit/mcp.jsonl`)
+and of nothing else. Each row is `{consumer, tool, at, outcome}` and the
+response model is closed at that; `args_summary`, the caller's ceiling,
+write-side paths and fragment ids, `entry_hash` and `prev_hash` never cross.
+The rules, each pinned by `tests/test_v1_api_agent_activity.py`:
+
+1. **`consumer` is the audit stamp, verbatim, and nothing is hidden by
+   consumer.** The app's own `adepthood` calls through `/v1` are in the same
+   log and are listed beside every agent's. There is no consumer filter, and
+   an unknown query parameter is `422 invalid_request`.
+2. **`outcome` is closed at `admitted | refused`.** `refused` is an entry the
+   MCP adapter wrote for a pre-dispatch refusal — an out-of-profile tool
+   (#1964) or, from this minor, a remote ceiling above `personal`, which the
+   adapter now audits the same way: tool name only, no argument summary, the
+   transport-default `open` ceiling rather than the one asked for. Every other
+   entry is `admitted`, meaning *the call reached its tool* and not *content
+   was returned*: by the read-gate ordering a tool logs the attempt before
+   resolving its target and never the result, so the chain cannot say more
+   without becoming the "did consumer X read fragment F?" oracle it was built
+   to avoid. An outcome the enum cannot name is counted, not guessed.
+3. **A detached composition is one row.** A `creek.draft` or `creek.author`
+   past the synchronous deadline writes its ordinary entry plus `accepted` and
+   `completed` entries sharing a job id (#1966). The person asked for one
+   draft, so the lifecycle entries are neither rows nor `skipped`.
+4. **Bounded and forgiving.** `limit` defaults to 50 and is clamped to 200 —
+   an activity card, not a log viewer. `since` is an inclusive, offset-bearing
+   lower bound compared against the full-precision instant; `at` is rendered in
+   UTC to the whole second. A `since` older than the log returns from the
+   start. A line the projection cannot read — malformed JSON, a missing field,
+   a `tool` outside the published dotted-name pattern, a `consumer` carrying a
+   control character — is counted in `skipped` over the whole log rather than
+   failing the route, and an absent log is `200` with `rows: []`.
+5. **Read, never rewritten, never verified per request.** The route opens the
+   log read-only, appends nothing of its own (so a refresh cannot grow the trail
+   it reads), and does not run `verify_mcp_audit_chain`, whose cost grows with
+   the log. The response therefore carries no `chain_verified_at`: a timestamp
+   of a check the request did not perform would tell the person the rows were
+   verified when they were not. Tamper-evidence stays with the verifier.
+
+The envelope keeps `tier_ceiling`, echoing the admitted header, for uniformity
+with every other success; the route reads no content and filters nothing by
+it. `privacy_refused` has no reachable shape here, which the fixture matrix
+records as an unreachable cell. This is the first route with **query
+parameters**: `RouteSpec.query_model` names the closed `AgentActivityQuery`
+model the handler validates with, and the OpenAPI generator publishes one
+`in: query` parameter per field from that same model.
 
 ## Reflection
 
@@ -935,6 +992,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.22.0` | 2026-10-24 | #1968 publishes the **eleventh capability**, `agent-activity`, as `GET /v1/agent-activity?limit=&since=`: a content-free projection of the MCP audit chain, so the vault's owner can see what each connected agent asked for and when (epic #1961). Rows are `{consumer, tool, at, outcome}` with `outcome` closed at `admitted \| refused`; no argument summary, fragment id, path, hash or prose crosses, and nothing is hidden by consumer — the app's own `adepthood` calls are listed under their stamp. `limit` defaults to 50 and is clamped to 200; malformed lines are counted in `skipped`; the chain is read, never rewritten, and not re-verified per request, so no `chain_verified_at` is published. Three wire models (`AgentActivityQuery`, `AgentActivityRow`, `AgentActivityResponse`) and the contract's first query parameters (`RouteSpec.query_model`) widen the HTTP contract, and the fixture matrix grows to 11 x 7 with `agent-activity/refusal` unreachable. The MCP adapter now audits a remote call refused for a ceiling above `personal` as `"outcome": "refused"` under the tool name only, so that attempt shows on the card. `0.21` remains served without seeing or reaching the route; the OpenAPI golden advances deliberately. |
 | `0.21.0` | 2026-10-21 | #1903 step 6 ([ADR-0016](../../creek-tools/docs/architecture/ADR/0016-shared-confidential-warm-inference-pool.md)) serves the admission refusal on the **letter** route as well: `rate_limited` / HTTP **429** is now reachable on `POST /v1/letters/{external_id}`, documented there in the OpenAPI document, and identical in every published respect to the reflection route's — same code, same static message, same envelope, same advisory `Retry-After`. The owner's ratification (2026-10-21) is the reason: *if the cap is per-account, the surface should be per-account too.* It already was per-account — `_build_reflect_llm_factory` and `_build_letter_llm_factory` are both `_bounded_generation_factory` over the one `generation` stage, so the refusal is the shared pool's admission decision or the writer's own key's 429 and no per-route counter exists — and only the reporting was split, because `ProviderRateLimitError` subclasses `RuntimeError` and `creek_mcp.tools.letter._generate`'s broad catch reported a cap as `provider_unavailable`. The refusal stores nothing: it is raised before `create_voice_draft_if_absent`, so a capped request leaves the caller-owned slot unwritten and a retry still answers `created`. No `CONTRACT_MODELS` entry, field, status or route is added — `429` was already published — and the refusal is withheld from callers below `0.21` by `LETTER_RATE_LIMITED_SINCE_MINOR`, which keeps every `0.20` letter response exactly as that minor published it. It is `0.21` and not `0.20` because `0.20` had already shipped for `keyless_inference` (#1938): a consumer that negotiated `0.20` for that field never agreed to a `429` on a letter, and reusing a published minor to move a route's behaviour is the break this window exists to prevent; the OpenAPI golden advances deliberately. |
 | `0.20.0` | 2026-10-21 | #1938: `GET /v1/capabilities` gains `keyless_inference`, `false` when a model call carrying no writer key is certain to be refused before any model is dialled. Today that is exactly a managed vault with no shared pool pinned. `inference_pool: false` could not say it, because a self-connected vault running its own model reports the same. Withheld from callers below `0.20`, so `0.19` stays served byte-identically; no route, code, status or MCP tool moves, and the OpenAPI golden advances deliberately. |
 | `0.19.0` | 2026-10-21 | #1894 ([ADR-0016](../../creek-tools/docs/architecture/ADR/0016-shared-confidential-warm-inference-pool.md)) publishes **provenance** and the shared inference pool's admission refusal. `inference_source` is added to `ReflectionResponse`, `LetterResponse` and `ClassificationResponse` (which a consumer reads inside `JobStatusResponse.result`): the route that answered, one of `pool:creek`, `pool:attested:<vendor>`, `request_key:<vendor>` or `local`, constrained on the wire by a `pattern` rather than an enum because two of the four are vendor-parameterised. The field is **absent** rather than guessed when there is no route this vocabulary names — an operator's own cloud key on a self-hosted vault — and absent on an answer that called no model, such as a `method=rules` classification or a repeat letter returned as stored. `GET /v1/capabilities` gains `inference_pool`, so a consumer can detect the route before dialling. `rate_limited` joins the closed error vocabulary at HTTP **429**, disposition `retry_with_backoff` in `retry-policy.json`, with an advisory `Retry-After` header deliberately outside that table; it is this vault's own admission cap and not an outage, so a writer is shown a wait. All three are withheld from a caller below `0.19`: the two fields are omitted and an admission refusal is served as `temporarily_unavailable`, which is what such a caller has always received for a shed request. No `CONTRACT_MODELS` entry is added, `0.18` stays served byte-identically, and the OpenAPI golden advances deliberately. |
