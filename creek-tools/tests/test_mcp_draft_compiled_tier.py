@@ -35,6 +35,7 @@ from creek.models import (
     FrequencyClassification,
     PrivacyTier,
     SourcePlatform,
+    Thread,
     VoiceClassification,
 )
 from creek_mcp.tier_ceiling import TierCeiling
@@ -102,6 +103,16 @@ def _write_compiled_page(
     post = frontmatter.Post(content="Synthesised body text.")
     post.metadata.update(page.model_dump(mode="json"))
     path = vault / reldir / f"{target_id}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+def _write_thread_note(vault: Path, thread_id: str) -> None:
+    """Write a plain, uncompiled ``Thread`` note whose description will render."""
+    thread = Thread(id=thread_id, title="Uncompiled", description="Derived text.")
+    post = frontmatter.Post(content="Derived text.")
+    post.metadata.update(thread.model_dump(mode="json"))
+    path = vault / _THREAD_DIR / f"{thread_id}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
@@ -228,6 +239,9 @@ def test_thread_with_no_compiled_page_fails_closed(vault: Path) -> None:
     safe assumption is the worst one.
     """
     _write_fragment(vault, "frag-open", PrivacyTier.OPEN)
+    # The description fallback needs a note to render; without it this test
+    # was asserting INTIMATE for a section that put no text in the prompt.
+    _write_thread_note(vault, "thread-missing")
 
     tier = _source_routing_tier(
         vault,
@@ -236,6 +250,23 @@ def test_thread_with_no_compiled_page_fails_closed(vault: Path) -> None:
     )
 
     assert tier == PrivacyTier.INTIMATE
+
+
+def test_thread_that_renders_nothing_contributes_no_tier(vault: Path) -> None:
+    """No compiled page and no note: the section is empty, so nothing is surveyed.
+
+    The MCP twin of the CLI rule — both reduce over
+    :func:`creek.generate.drafts.rendered_compiled_sources`.
+    """
+    _write_fragment(vault, "frag-open", PrivacyTier.OPEN)
+
+    tier = _source_routing_tier(
+        vault,
+        _seed(source_fragments=("frag-open",), threads=("thread-missing",)),
+        TierCeiling.OPEN,
+    )
+
+    assert tier == PrivacyTier.OPEN
 
 
 def test_compiled_page_without_provenance_fails_closed(vault: Path) -> None:

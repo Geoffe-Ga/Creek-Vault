@@ -776,6 +776,85 @@ def _compiled_section_tiers(
     return tiers
 
 
+def rendered_compiled_sources(
+    index: CompiledPageIndex,
+    vault_path: Path,
+    *,
+    thread_ids: Sequence[str],
+    eddy_ids: Sequence[str],
+) -> CompiledSources:
+    """Survey the compiled sections over only the targets that render text.
+
+    The compiled-layer twin of the "named, resolves, but filtered out" case in
+    :meth:`DraftGenerator._bind_routing_tier`: a named thread or eddy whose
+    section entry renders **no text** contributes no tier. A missing page is
+    still opaque — :func:`~creek.generate.compile_routing.compiled_source_ids`
+    fails closed on it unchanged — but opacity is a property of text in the
+    prompt, and an entry that renders nothing carries none.
+
+    An entry renders exactly when ``_compose_thread_section`` /
+    ``_compose_eddy_section`` would emit it: the target has a compiled page,
+    or its plain note resolves **by id** for the description fallback. The
+    common no-text case is a ``[[title]]`` reference to an uncompiled eddy:
+    ``creek link`` writes eddy membership that way, the compiled lookup
+    normalises it (#881), but the id-keyed fallback does not, so nothing
+    renders. Surveying it anyway pinned every such draft to the local model.
+
+    Args:
+        index: The compiled-page index the prompt is rendered from — the same
+            one, so the survey and the render agree on which pages exist.
+        vault_path: Vault root; plain notes are read from ``02-Threads`` and
+            ``03-Eddies`` only when some target has no compiled page.
+        thread_ids: Thread references the seed names.
+        eddy_ids: Eddy references the seed names.
+
+    Returns:
+        The :class:`~creek.generate.compile_routing.CompiledSources` survey
+        over the rendering targets.
+    """
+    return compiled_source_ids(
+        index,
+        thread_ids=_rendered_targets(
+            thread_ids,
+            index.thread,
+            lambda: _load_threads_by_id(vault_path / _THREADS_SUBDIR),
+        ),
+        eddy_ids=_rendered_targets(
+            eddy_ids,
+            index.eddy,
+            lambda: _load_eddies_by_id(vault_path / _EDDIES_SUBDIR),
+        ),
+    )
+
+
+def _rendered_targets(
+    target_ids: Sequence[str],
+    lookup: Callable[[str], CompiledPage | None],
+    load_notes: Callable[[], Mapping[str, object]],
+) -> list[str]:
+    """Return the *target_ids* whose section entry renders text.
+
+    Args:
+        target_ids: The references a seed names.
+        lookup: The compiled-page lookup for this target kind.
+        load_notes: Loads ``{id: note}`` for the description fallback; called
+            at most once, and only on a compiled-page miss.
+
+    Returns:
+        The rendering subset of *target_ids*, in order.
+    """
+    notes: Mapping[str, object] | None = None
+    rendered: list[str] = []
+    for target_id in target_ids:
+        if lookup(target_id) is None:
+            if notes is None:
+                notes = load_notes()
+            if target_id not in notes:
+                continue
+        rendered.append(target_id)
+    return rendered
+
+
 def _fragment_matches_dimensions(
     fragment: Fragment,
     *,
@@ -1533,8 +1612,9 @@ class DraftGenerator:
             vault_path,
             idea.source_fragments,
             fragments,
-            compiled=compiled_source_ids(
+            compiled=rendered_compiled_sources(
                 compiled_pages,
+                vault_path,
                 thread_ids=idea.threads,
                 eddy_ids=idea.eddies,
             ),
@@ -2107,8 +2187,9 @@ class DraftGenerator:
             vault_path,
             [*idea.source_fragments, *union_fragment_ids(slices)],
             fragments,
-            compiled=compiled_source_ids(
+            compiled=rendered_compiled_sources(
                 compiled_pages,
+                vault_path,
                 thread_ids=idea.threads,
                 eddy_ids=idea.eddies,
             ),
@@ -2449,8 +2530,9 @@ class DraftGenerator:
             vault_path,
             [*idea.source_fragments, *union_fragment_ids(slices)],
             fragments,
-            compiled=compiled_source_ids(
+            compiled=rendered_compiled_sources(
                 compiled_pages,
+                vault_path,
                 thread_ids=idea.threads,
                 eddy_ids=idea.eddies,
             ),
