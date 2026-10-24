@@ -163,3 +163,27 @@ exactly the moment a fresh secret is typed in.
   That is a materially different transport/verification design (likely
   requiring the derived-credential path above) and would be its own ADR, not
   an amendment to this one.
+
+## Amended by #1963 (2026-10-24)
+
+This record stays as written. Its "Revisit when" named a new auth scheme as
+the trigger for short-lived credentials, and #1963 supplies one: Adepthood is
+now an OAuth 2.1 authorization server and the vault's `/mcp` is its resource
+server. What changes, and what does not:
+
+- **Short-lived credentials exist for agents.** When the control plane sets
+  `CREEK_MCP_RESOURCE_URL` and `CREEK_MCP_AUTHORIZATION_SERVER`, `/mcp`
+  publishes RFC 9728 protected-resource metadata, answers an unauthenticated
+  call `401` with a challenge pointing at it, and accepts Adepthood-issued
+  RS256/ES256 JWTs verified against the issuer's JWKS, with the issuer pinned
+  and the audience equal to the vault's own MCP URL. Revoking an agent is
+  Adepthood's job: its access token lives ten minutes, and its refresh token
+  is revoked there. No vault restart is involved.
+- **Static tokens stay, for self-hosted vaults and for Adepthood's own
+  service bearer.** A composed verifier tries a JWT-shaped bearer as a JWT
+  first and otherwise uses the constant-time static match this ADR decided.
+  A vault with no issuer configured serves no metadata and behaves exactly as
+  before. The overlapping-window rotation runbook is unchanged for those
+  tokens; #1965 removes its restarts.
+- **`/v1` is unchanged.** It authenticates static consumer tokens only. An
+  agent's JWT is an `/mcp` credential.
