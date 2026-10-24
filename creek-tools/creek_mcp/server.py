@@ -23,13 +23,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from creek.care.guardrail import acute_distress_guard
 from creek.classify.llm.pool_boundary import declared_pool_request
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.audit import AUDIT_OUTCOME_REFUSED, MCPAuditLog
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
+from creek_mcp.composition_jobs import (
+    CompositionJobs,
+    author_call,
+    draft_call,
+    sync_deadline_seconds,
+)
+from creek_mcp.httpapi.job_runtime import JobRuntime
 from creek_mcp.model_pin import (
     build_request_scoped_provider,
     pin_refuses_stage,
@@ -803,6 +810,7 @@ def build_server(
     compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
     token_verifier: TokenVerifier | None = None,
+    job_runtime: JobRuntime | None = None,
 ) -> FastMCP:
     """Construct a :class:`FastMCP` instance with all FEAT-010/011 tools.
 
@@ -839,6 +847,13 @@ def build_server(
             verifier accepts (no anonymous access), and remote calls are
             capped below INTIMATE. ``None`` (the default) is the local stdio
             server, unauthenticated as before.
+        job_runtime: The process's job runtime (#1966) — the worker id and the
+            one-active-job-per-consumer admission state ``creek.draft`` and
+            ``creek.author`` run under. ``None`` builds a fresh one; a server
+            mounted beside the ``/v1`` app passes that app's
+            ``state.pipeline_jobs`` so one consumer holds one slot across both
+            surfaces. The synchronous deadline is read from
+            ``CREEK_MCP_SYNC_DEADLINE_SECONDS`` here, at build time.
 
     Raises:
         ValueError: When a ``token_verifier`` is supplied for a non-network
@@ -906,6 +921,11 @@ def build_server(
         consumer=consumer,
         draft_factory=factory,
         author_factory=author_factory,
+        jobs=CompositionJobs(
+            vault=vault,
+            runtime=job_runtime if job_runtime is not None else JobRuntime(),
+            deadline_seconds=sync_deadline_seconds(),
+        ),
     )
     _register_pipeline_tools(
         server,
@@ -1049,12 +1069,18 @@ def _register_authoring_tools(
     consumer: str,
     draft_factory: DraftLLMFactory,
     author_factory: AuthorLLMFactory,
+    jobs: CompositionJobs,
 ) -> None:
-    """Register the seven state-and-authoring tools on *server*.
+    """Register the eight state-and-authoring tools on *server*.
 
     ``creek.state.read``, ``creek.state.render``, ``creek.lint``,
-    ``creek.mine``, ``creek.draft``, ``creek.author`` and ``creek.save`` --
-    the Writing Desk's read side and the two verbs that call a model.
+    ``creek.mine``, ``creek.draft``, ``creek.author``, ``creek.save`` and
+    ``creek.jobs.read`` -- the Writing Desk's read side, the two verbs that
+    call a model, and the handle reader for those two verbs (#1966).
+
+    **This registrar is now at the nested-def ceiling** of
+    ``tests/test_mcp_tool_registration_surface.py`` (eight). The next
+    authoring tool splits this function.
 
     Args:
         server: The :class:`FastMCP` instance to register on.
@@ -1066,6 +1092,10 @@ def _register_authoring_tools(
         author_factory: Tier-keyed factory for the Writing Desk's voice
             client, invoked lazily by ``creek.author`` inside the run and
             not at all on the ``dry_run`` path.
+        jobs: The server's :class:`~creek_mcp.composition_jobs.CompositionJobs`:
+            ``creek.draft`` and a non-dry-run ``creek.author`` run through it
+            for admission, progress and the synchronous deadline, and
+            ``creek.jobs.read`` resolves the handles it hands out.
     """
     # Aliased rather than renamed in the 119 moved lines below, so the move
     # is provably byte-identical while the public parameter name still reads
@@ -1128,34 +1158,45 @@ def _register_authoring_tools(
         )
 
     @server.tool(name="creek.draft")
-    def _draft(
+    async def _draft(
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
         phase: str = "unclassified",
         index: int = 0,
+        *,
+        ctx: Context,
     ) -> dict[str, Any]:
         """Generate an essay draft from a mined idea."""
-        return draft_tool(
+        caller = _effective_consumer(consumer)
+        work = partial(
+            draft_tool,
             vault_path=vault,
             llm_factory=factory,
             privacy_tier_ceiling=privacy_tier_ceiling,
             phase=phase,
             index=index,
-            consumer=_effective_consumer(consumer),
+            consumer=caller,
+        )
+        return await jobs.run(
+            draft_call(work, consumer=caller, ceiling=privacy_tier_ceiling), ctx
         )
 
     @server.tool(name="creek.author")
-    def _author(
+    async def _author(
         query: str,
         medium: str = "research",
         max_rounds: int | None = None,
         dry_run: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+        *,
+        ctx: Context,
     ) -> dict[str, Any]:
         """Author a draft for a query via the Writing Desk.
 
         ``max_rounds`` defaults to the vault's ``author.max_author_rounds`` (3).
         """
-        return author_tool(
+        caller = _effective_consumer(consumer)
+        work = partial(
+            author_tool,
             vault_path=vault,
             query=query,
             llm_factory=author_factory,
@@ -1163,8 +1204,16 @@ def _register_authoring_tools(
             max_rounds=max_rounds,
             dry_run=dry_run,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=_effective_consumer(consumer),
+            consumer=caller,
         )
+        if dry_run:
+            # The plan composes nothing, so it neither reports progress nor
+            # takes a job slot; it answers synchronously, as it always has.
+            return work()
+        call = author_call(
+            work, vault=vault, consumer=caller, ceiling=privacy_tier_ceiling
+        )
+        return await jobs.run(call, ctx)
 
     @server.tool(name="creek.save")
     def _save(
@@ -1192,6 +1241,18 @@ def _register_authoring_tools(
             saved_by=saved_by,
             full_body=full_body,
             privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+    @server.tool(name="creek.jobs.read")
+    async def _jobs_read(
+        job_id: str,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Resolve a creek.draft / creek.author job handle to its state."""
+        return await jobs.read(
+            job_id=job_id,
+            ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
 

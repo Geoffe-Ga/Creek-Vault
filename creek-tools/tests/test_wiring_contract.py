@@ -1870,6 +1870,15 @@ EXEMPTIONS: Final[Mapping[str, Exemption]] = {
         ),
         delegate="tests/test_mcp_server.py:creek.handshake",
     ),
+    "creek.jobs.read": Exemption(
+        reason=(
+            "#1966: a job handle only exists once a composition outlived the "
+            "server deadline, so its effect needs a held-open model and a live "
+            "event loop across two calls; the composition-jobs suite drives "
+            "exactly that through the registered tools."
+        ),
+        delegate="tests/test_mcp_composition_jobs.py:creek.jobs.read",
+    ),
     "creek.compile": Exemption(
         reason=(
             "#1024: `build_server` does expose compile_llm_factory, but the "

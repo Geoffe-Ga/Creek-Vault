@@ -883,6 +883,30 @@ def _next_available_draft_path(
         counter += 1
 
 
+def reserve_draft_path(vault_path: Path, title: str, generated: datetime) -> Path:
+    """Return the non-colliding ``07-Voice/Drafts/`` path for a draft of *title*.
+
+    The one naming rule every draft writer shares —
+    ``YYYY-MM-DD-{slug}.md``, de-duplicated with ``-2``, ``-3``, … — and the
+    directory is created if it is missing. Public so a writer outside this
+    module (the MCP Writing Desk's detached path, #1966) lands its draft beside
+    ``creek draft``'s rather than inventing a second layout.
+
+    Args:
+        vault_path: Vault root under which ``07-Voice/Drafts`` lives.
+        title: The draft's title; slugified into the filename.
+        generated: When the draft was generated; its date prefixes the name.
+
+    Returns:
+        An absolute path that does not exist yet.
+    """
+    drafts_dir = vault_path / DRAFTS_SUBDIR
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    return _next_available_draft_path(
+        drafts_dir, generated.strftime("%Y-%m-%d"), _slugify(title)
+    )
+
+
 class DraftGenerator:
     """Generate an essay draft from an :class:`IdeaSeed` via a skill stack.
 
@@ -2638,11 +2662,7 @@ class DraftGenerator:
         Returns:
             The absolute path of the written markdown file.
         """
-        drafts_dir = vault_path / DRAFTS_SUBDIR
-        drafts_dir.mkdir(parents=True, exist_ok=True)
-        slug = _slugify(draft.title)
-        date_prefix = draft.generated_date.strftime("%Y-%m-%d")
-        target = _next_available_draft_path(drafts_dir, date_prefix, slug)
+        target = reserve_draft_path(vault_path, draft.title, draft.generated_date)
         body, voice_fields = self._apply_voice_fidelity(
             draft.body,
             vault_path=vault_path,
@@ -2678,11 +2698,7 @@ class DraftGenerator:
         Returns:
             The absolute path of the written markdown file.
         """
-        drafts_dir = vault_path / DRAFTS_SUBDIR
-        drafts_dir.mkdir(parents=True, exist_ok=True)
-        slug = _slugify(draft.title)
-        date_prefix = draft.generated_date.strftime("%Y-%m-%d")
-        target = _next_available_draft_path(drafts_dir, date_prefix, slug)
+        target = reserve_draft_path(vault_path, draft.title, draft.generated_date)
         body, voice_fields = self._apply_voice_fidelity(
             draft.body,
             vault_path=vault_path,

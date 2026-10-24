@@ -48,6 +48,7 @@ EXPECTED_TOOLS = {
     "creek.draft",
     "creek.author",
     "creek.save",
+    "creek.jobs.read",
     "creek.ingest",
     "creek.redact.scan",
     "creek.classify",
