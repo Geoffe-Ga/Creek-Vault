@@ -7,6 +7,7 @@ credential.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from collections import defaultdict
@@ -23,7 +24,12 @@ from creek_mcp.provisioning.fly import (
     FlyProviderPolicy,
     FlyRuntimeSecrets,
 )
-from creek_mcp.provisioning.models import JobOperation, JobState, ProvisioningJob
+from creek_mcp.provisioning.models import (
+    JobOperation,
+    JobState,
+    McpOAuthSettings,
+    ProvisioningJob,
+)
 from creek_mcp.provisioning.pool_bundle import (
     PoolCredential,
     PoolCredentialInventory,
@@ -41,6 +47,8 @@ ORGANIZATION = "creek-vaults"
 IMAGE = "registry.example/creek@sha256:" + "a" * 64
 API_BASE_URL = "https://fly.test"
 ROUTING_PUBLIC_URL = "https://vault-router.example.com"
+MCP_ISSUER = "https://adepthood.example"
+MCP_RESOURCE_URL = f"{ROUTING_PUBLIC_URL}/mcp"
 _FLY_VOLUME_NAME = re.compile(r"[a-z0-9_]{1,30}")
 
 
@@ -88,12 +96,15 @@ class FakeSecretManager:
     With an *issuer* the first issuance for an activation mints that
     activation's pool bundle and every later issuance returns the stored one,
     which is what makes ``_verify_machine`` per-activation (ADR-0016 D1.1).
+    *mcp_oauth* is stored the same way (#1974): an activation first issued
+    without it keeps none until :meth:`roll_mcp_oauth` writes it.
     """
 
     revoked: set[str]
     issuer: Any | None = None
     issued: dict[str, FlyRuntimeSecrets] = field(default_factory=dict)
     call_log: list[tuple[str, str]] | None = None
+    mcp_oauth: McpOAuthSettings | None = None
 
     def issue(
         self,
@@ -115,9 +126,20 @@ class FakeSecretManager:
             tls_certificate=b"test-certificate",
             tls_private_key=TLS_KEY.encode(),
             pool=pool,
+            mcp_oauth=self.mcp_oauth,
         )
         self.issued[activation_id] = bundle
         return bundle
+
+    def roll_mcp_oauth(self, activation_id: str) -> McpOAuthSettings:
+        """Write the configured MCP OAuth settings into one stored activation."""
+        if self.mcp_oauth is None:
+            raise ValueError("no MCP OAuth settings are configured")
+        stored = self.issued[activation_id]
+        self.issued[activation_id] = dataclasses.replace(
+            stored, mcp_oauth=self.mcp_oauth
+        )
+        return self.mcp_oauth
 
     def revoke(self, activation_id: str) -> None:
         """Record an idempotent revocation, confirming the pool refusal first.
@@ -151,6 +173,7 @@ class FakeFlyAPI:
         self.volume_loses_encryption_on_wait = False
         self.start_stays_stopped = False
         self.deleted_volume_state: str | None = None
+        self.updates: list[dict[str, Any]] = []
 
     def fail_once(self, method: str, path_suffix: str, *, status: int = 503) -> None:
         """Return *status* once for a matching method and path suffix."""
@@ -339,7 +362,22 @@ class FakeFlyAPI:
         if len(segments) == 1 and request.method == "DELETE":
             self.machines[app_name].remove(matched_machine)
             return httpx.Response(200, request=request)
+        if len(segments) == 1 and request.method == "POST":
+            return self._update_machine(request, matched_machine)
         return httpx.Response(404, request=request)
+
+    def _update_machine(
+        self,
+        request: httpx.Request,
+        machine: dict[str, Any],
+    ) -> httpx.Response:
+        """Replace one Machine's config the way Fly's update endpoint does."""
+        body = self._json(request)
+        self.updates.append(body)
+        machine["config"] = body["config"]
+        if not body["skip_launch"]:
+            machine["state"] = "started"
+        return httpx.Response(200, json=machine, request=request)
 
     @staticmethod
     def _json(request: httpx.Request) -> dict[str, Any]:
@@ -400,6 +438,11 @@ def fly_client(api: FakeFlyAPI) -> httpx.Client:
     return httpx.Client(
         base_url=API_BASE_URL, transport=httpx.MockTransport(api.handle)
     )
+
+
+def mcp_oauth_settings() -> McpOAuthSettings:
+    """Return the synthetic settings a router at ``ROUTING_PUBLIC_URL`` writes."""
+    return McpOAuthSettings(MCP_RESOURCE_URL, MCP_ISSUER)
 
 
 def fly_driver(

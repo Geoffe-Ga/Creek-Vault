@@ -20,6 +20,7 @@ import uvicorn
 from creek_mcp.httpapi.app import ROUTING_MISS_STATUS
 from creek_mcp.provisioning import cli as control_cli
 from creek_mcp.provisioning import fleet_cli, routing_cli, worker_cli
+from creek_mcp.provisioning.models import mcp_resource_url, public_vault_url
 from creek_mcp.provisioning.pilot_alerts import HttpFleetAlertSink
 from creek_mcp.provisioning.pilot_control import (
     ASGIApp,
@@ -230,6 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--oauth-jwks-url",
         default=os.environ.get("CREEK_PILOT_OAUTH_JWKS_URL"),
     )
+    worker_cli.add_mcp_oauth_roll_argument(parser)
     parser.set_defaults(
         routing_public_url=None,
         oauth_resource_url=None,
@@ -269,8 +271,9 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
     )
     expected_origin = f"https://{args.fly_app_name}.fly.dev"
     args.routing_public_url = expected_origin
-    # The edge's MCP URL is what an agent's token is issued for (#1963).
-    args.oauth_resource_url = f"{expected_origin}/mcp"
+    # The edge's MCP URL is what an agent's token is issued for (#1963), and
+    # what every vault Machine names as its resource (#1974): one derivation.
+    args.oauth_resource_url = mcp_resource_url(public_vault_url(expected_origin))
     if args.max_body_bytes != _REPLAY_BODY_CEILING:
         parser.error("--max-body-bytes must equal Fly replay's one MiB ceiling")
     if args.maximum_live_allocations != _MAX_LIVE_ALLOCATIONS:
@@ -475,6 +478,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     bundle = compose(args, parser)
+    if args.roll_mcp_oauth is not None:
+        try:
+            status = worker_cli.run_mcp_oauth_roll(
+                args, bundle.worker.driver, bundle.worker.secrets
+            )
+        finally:
+            bundle.close()
+        raise SystemExit(status)
 
     def request_stop(signum: int, frame: object) -> None:
         del signum, frame

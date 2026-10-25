@@ -241,14 +241,21 @@ capability table above, which records the tools Adepthood's backend calls.
 
 ### Per-agent attribution
 
-The consumer an OAuth call is audited under is the token's `sub`, which names the
-**person**, not the agent: on a self-hosted vault `adepthood-account-` plus 32
-hex digits, on a managed vault the vault's consumer identity. Every agent one
-person connects is therefore one consumer on the audit chain, in the job slot,
-and in `GET /v1/agent-activity` (`0.22.0`). Adepthood already mints the RFC 9068
-`client_id` claim in every access token; auditing per agent from it is
-[#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976). A static-token
-agent is audited under its own consumer name.
+The consumer an OAuth call is audited under is the RFC 9068 `client_id` claim
+verbatim (#1976). Adepthood already mints it in every access token
+(adepthood#3533), and joins the activity row directly to `agent_grant.client_id`,
+including CIMD metadata URLs. Each agent has its own audit stamp and job owner
+even when two tokens share a managed vault's pinned `sub`. The verified `sub`
+continues to select the person's vault at the edge and satisfy the managed
+vault's subject pin; it never grants a tool. Grants still come only from `scope`.
+A static-token agent retains its configured consumer name.
+
+The claim must be a non-blank string of 1–256 characters, with no ASCII control
+character (`U+0000`–`U+001F` or `U+007F`), and is never trimmed or truncated.
+Missing or invalid means refused, without a legacy subject fallback; obtain a
+fresh issuer token by refreshing or signing in again. Historical audit entries
+retain their original subject-only stamp. This stays within `GET /v1/agent-activity`'s existing
+`consumer` pattern and bound at `0.22.0`, so no contract minor changes.
 
 ## Privacy gate and care gate — who enforces what
 

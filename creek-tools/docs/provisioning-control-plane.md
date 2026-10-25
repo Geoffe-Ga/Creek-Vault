@@ -124,7 +124,9 @@ The non-secret options are `--database`, `--fly-organization`, `--fly-image`,
 `--fly-rootfs-size-gb`, `--fly-volume-size-gb`, `--vault-port`,
 `--secret-state-directory`, `--handoff-url`, `--poll-interval-seconds`,
 `--lease-seconds`, `--provider-timeout-seconds`,
-`--callback-timeout-seconds`, and the diagnostic one-shot `--max-jobs`. The
+`--callback-timeout-seconds`, `--oauth-authorization-server`, the diagnostic
+one-shot `--max-jobs`, and the one-shot `--roll-mcp-oauth REQUESTER CONSUMER`
+(see [MCP OAuth settings per activation](#mcp-oauth-settings-per-activation-1974)). The
 mounted-secret path options are `--fly-token-file`,
 `--secret-master-key-file`, `--tls-ca-certificate-file`,
 `--tls-ca-private-key-file`, and `--handoff-token-file`; their values are file
@@ -222,6 +224,49 @@ every live bundle under an explicit migration procedure; replacing either file
 alone makes durable retries fail closed. Back up the encrypted state directory
 and SQLite database atomically; the mounted keys stay in the secret manager,
 never in that backup.
+
+### MCP OAuth settings per activation (#1974)
+
+With `--oauth-authorization-server <issuer>` (the pilot reads the same option,
+or `CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER`), every activation issued from then
+on stores two non-secret values in its encrypted bundle beside the pool
+bundle, and its Machine environment carries them as `CREEK_MCP_RESOURCE_URL`
+and `CREEK_MCP_AUTHORIZATION_SERVER` on both runtimes:
+
+| Value | Derivation |
+|---|---|
+| Resource URL | The handed-off vault URL (`--routing-public-url` plus `/v1`) with `/v1` replaced by `/mcp` — the same rule Adepthood applies to the URL it is handed. |
+| Issuer | `--oauth-authorization-server`, verbatim. Must be `https`. |
+
+Neither is a secret, but both are stored encrypted, kept out of every `repr`,
+and never logged. Machine verification stays exact and per activation: a
+record with the values verifies only the environment carrying exactly them; a
+record without them — every activation issued before #1974, whose stored
+document has no `mcp_oauth` member and reads as none — verifies only the
+legacy environment. Configuring the issuer therefore re-verifies no existing
+Machine, and an existing vault keeps routing.
+
+To move an existing vault across, wait for it to scale to zero (or stop it),
+then run the worker's composition once with the selector:
+
+```console
+creek-provisioning-worker <the worker's usual options> \
+  --oauth-authorization-server https://adepthood.example \
+  --roll-mcp-oauth <requester> <consumer>
+# on the pilot: creek-managed-vault-pilot --roll-mcp-oauth <requester> <consumer>
+```
+
+The roll accepts only a Machine that is exactly its legacy shape and stopped,
+writes the values into the record, updates the Machine in place (still
+stopped; the next route starts it), and re-verifies it. A Machine already
+carrying its record's values is left alone, so the command is safe to repeat,
+including after an interrupted update. It exits `0` rolled or already current,
+`1` when no ready allocation is owned by that pair, `2` on drift, a record
+holding other values, or no configured issuer, and `75` while the Machine is
+still running — record and Machine untouched, so it keeps routing. Between the
+record write and the Machine update a route to that one vault is refused;
+re-run the roll to finish. A change of issuer or address for a record that
+already holds values is not this transition and is refused.
 
 ## Fly Machines driver (#1770)
 
