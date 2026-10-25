@@ -11,6 +11,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **`docs/Ontology/creek_ontology_agent_prompt.md`** — Master specification for the Creek Ontology: a personal knowledge organization system built around Obsidian, the APTITUDE frequency framework, and the Archetypal Wavelength mapping.
 - **No user vault content lives in this repo** (FEAT-019). The vault is scaffolded by `creek init --vault <path>` into a user-chosen location outside the repository.
 
+## Fly Managed-Vault Organization
+
+Managed-vault deployments use the dedicated Fly organization
+`adepthood-managed-vault-pilot` (display name: **Adepthood Managed Vault Pilot**).
+Select it explicitly; the account's **Personal** organization is not the
+managed-vault deployment target. An unscoped CLI call can select Personal and
+return its trial or billing error, which does not establish the pilot's status.
+
+Start discovery with `fly apps list --org adepthood-managed-vault-pilot`.
+For app-scoped commands, pass `--app <app>` and verify that the app belongs to
+that organization before making changes. Keep using the scoped credentials,
+authorization, and deployment checks in the
+[managed-vault Fly pilot runbook](creek-tools/docs/managed-vault-fly-pilot.md).
+
 ## creek-tools Development
 
 All commands run from the `creek-tools/` directory.
