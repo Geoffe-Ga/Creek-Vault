@@ -1899,7 +1899,7 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.22 widened the compatibility window rather than shifting it.
+    """0.23 widened the compatibility window rather than shifting it.
 
     A ``0.21`` client has no ``agent-activity`` capability, route or model in
     its vendored contract, and the since-minor gate both withholds and refuses
@@ -1919,6 +1919,7 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.22" in SUPPORTED_CONTRACT_MINORS
     assert "0.21" in SUPPORTED_CONTRACT_MINORS
     assert "0.20" in SUPPORTED_CONTRACT_MINORS
     assert "0.19" in SUPPORTED_CONTRACT_MINORS
@@ -1933,7 +1934,7 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.22"
+    assert CONTRACT_MINOR == "0.23"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

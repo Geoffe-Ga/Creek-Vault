@@ -9,6 +9,17 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Add `creek.revoice` at contract `0.23.0` (#1981). It rewrites caller-supplied
+  text through the owner's voice skills with an explicit meaning-preservation
+  prompt, routes by the declared ceiling through the existing model factory,
+  and requires `vault:desk`. It retrieves no fragments and saves no draft.
+  Native cached skills are projected onto exemplar-free signatures before
+  inference, and local Ollama retains the care and voice prompt prefix.
+  Only input/output character counts enter the audit chain. Detached results
+  are readable through `creek.jobs.read` for ten minutes in bounded memory,
+  bound to the initiating agent and an adequate ceiling; restart/expiry/eviction
+  return unavailable. The `/v1` surface is unchanged and `0.22` remains served.
+
 - Attribute OAuth agents by the RFC 9068 `client_id` claim (#1976), preserving
   the verified `sub` separately for managed-vault routing and its subject pin.
   The activity card can join each audit consumer directly to Adepthood's

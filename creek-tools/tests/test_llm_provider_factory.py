@@ -389,11 +389,29 @@ class TestOllamaProvider:
         assert result.stop_reason == "end_turn"
         assert result.usage is None
 
+    @pytest.mark.parametrize(
+        ("system", "expected_prompt"),
+        [
+            ("Owner voice\nCare guidance", "Owner voice\nCare guidance\n\n  Draft\n  "),
+            (None, "  Draft\n  "),
+            ("", "  Draft\n  "),
+        ],
+        ids=["static-prefix", "no-system", "empty-system"],
+    )
     @patch("creek.classify.llm.httpx.Client")
-    def test_complete_threads_max_tokens_to_num_predict(
-        self, mock_client_cls: MagicMock
+    def test_complete_preserves_system_and_threads_max_tokens(
+        self,
+        mock_client_cls: MagicMock,
+        system: str | None,
+        expected_prompt: str,
     ) -> None:
-        """The provider's output ceiling reaches Ollama's ``num_predict``."""
+        """Owner voice and care reach Ollama alongside the dynamic draft and ceiling.
+
+        Args:
+            mock_client_cls: The local HTTP client factory.
+            system: A static prefix, or an absent/empty prefix.
+            expected_prompt: Exact combined prompt sent to the local model.
+        """
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.return_value = {"response": "ok"}
         ctx = MagicMock()
@@ -401,9 +419,12 @@ class TestOllamaProvider:
         mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
         mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
 
-        result = OllamaProvider(LLMConfig()).complete("p", max_tokens=99, system="sys")
+        result = OllamaProvider(LLMConfig()).complete(
+            "  Draft\n  ", max_tokens=99, system=system
+        )
         assert result.text == "ok"
         payload = ctx.post.call_args.kwargs["json"]
+        assert payload["prompt"] == expected_prompt
         assert payload["options"] == {"num_predict": 99}
         assert payload["think"] is False
 

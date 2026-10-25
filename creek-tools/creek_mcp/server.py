@@ -36,6 +36,7 @@ from creek_mcp.composition_jobs import (
     CompositionJobs,
     author_call,
     draft_call,
+    revoice_call,
     sync_deadline_seconds,
 )
 from creek_mcp.httpapi import mcp_request_key
@@ -113,6 +114,7 @@ from creek_mcp.tools import (
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.handshake import AuthMode
 from creek_mcp.tools.reflect import GroundingSession
+from creek_mcp.tools.revoice import revoice_tool
 from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
 if TYPE_CHECKING:
@@ -139,6 +141,7 @@ if TYPE_CHECKING:
     from creek_mcp.tools.compile import CompileLLMFactory
     from creek_mcp.tools.draft import DraftLLMFactory
     from creek_mcp.tools.reflect import _LLM, _LLMFactory
+    from creek_mcp.tools.revoice import RevoiceLLMFactory
 
     _FactoryT = TypeVar("_FactoryT")
 
@@ -990,6 +993,7 @@ def build_server(
     transport: Transport,
     vault_path: Path | None = None,
     author_llm_factory: AuthorLLMFactory | None = None,
+    revoice_llm_factory: RevoiceLLMFactory | None = None,
     draft_llm_factory: DraftLLMFactory | None = None,
     compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
@@ -1016,6 +1020,9 @@ def build_server(
             at all on the ``dry_run`` path), so only ``creek.author`` needs an
             LLM provider. Added by #1254: without it the verb's stubbed and
             live bodies were indistinguishable from outside.
+        revoice_llm_factory: Optional tier-keyed voice client builder for revoice.
+            The default shares the author voice routing path without its
+            deterministic fallback.
         draft_llm_factory: Optional tier-keyed factory for the draft LLM —
             ``factory(tier)``. Passed straight to ``creek.draft``, which
             invokes it lazily (and only once it knows which seed it is
@@ -1107,8 +1114,9 @@ def build_server(
     # routed one vault's text with another vault's model routing. The three
     # model-calling tools get theirs per call (#1967), so each call's
     # request-scoped key and route recorder reach the factory it builds.
-    factory = partial(_draft_factory_for, vault, draft_llm_factory)
+    draft_factory = partial(_draft_factory_for, vault, draft_llm_factory)
     author_factory = partial(_author_factory_for, vault, author_llm_factory)
+    revoice_factory = partial(_author_factory_for, vault, revoice_llm_factory)
     compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
     reflect_factory = partial(_reflect_factory_for, vault, reflect_llm_factory)
 
@@ -1129,8 +1137,9 @@ def build_server(
         server,
         vault=vault,
         consumer=consumer,
-        draft_factory=factory,
+        draft_factory=draft_factory,
         author_factory=author_factory,
+        revoice_factory=revoice_factory,
         jobs=CompositionJobs(
             vault=vault,
             runtime=job_runtime if job_runtime is not None else JobRuntime(),
@@ -1417,18 +1426,18 @@ def _register_authoring_tools(
     consumer: str,
     draft_factory: _ScopedFactory[DraftLLMFactory],
     author_factory: _ScopedFactory[AuthorLLMFactory],
+    revoice_factory: _ScopedFactory[RevoiceLLMFactory],
     jobs: CompositionJobs,
 ) -> None:
-    """Register the eight state-and-authoring tools on *server*.
+    """Register state/authoring tools, delegating model compositions separately.
 
     ``creek.state.read``, ``creek.state.render``, ``creek.lint``,
-    ``creek.mine``, ``creek.draft``, ``creek.author``, ``creek.save`` and
-    ``creek.jobs.read`` -- the Writing Desk's read side, the two verbs that
-    call a model, and the handle reader for those two verbs (#1966).
+    ``creek.mine``, ``creek.draft``, ``creek.author``, ``creek.revoice``,
+    ``creek.save`` and ``creek.jobs.read`` -- state operations, three model-backed
+    compositions, and their job-handle reader.
 
-    **This registrar is now at the nested-def ceiling** of
-    ``tests/test_mcp_tool_registration_surface.py`` (eight). The next
-    authoring tool splits this function.
+    The three model-backed composition closures live in a separate registrar
+    so each registrar stays below the nested-definition ceiling.
 
     Args:
         server: The :class:`FastMCP` instance to register on.
@@ -1438,21 +1447,15 @@ def _register_authoring_tools(
         draft_factory: Builds one ``creek.draft`` call's tier-keyed factory
             from its request-scoped key and route recorder (#1967); the
             factory is invoked lazily, once the seed is known.
+        revoice_factory: Builds one request-scoped revoice voice factory.
         author_factory: Builds one ``creek.author`` call's tier-keyed voice
             factory the same way; invoked lazily inside the run and not at
             all on the ``dry_run`` path.
         jobs: The server's :class:`~creek_mcp.composition_jobs.CompositionJobs`:
-            ``creek.draft`` and a non-dry-run ``creek.author`` run through it
-            for admission, progress and the synchronous deadline, and
+            ``creek.draft``, ``creek.revoice`` and a non-dry-run ``creek.author``
+            run through it for admission, progress and the deadline, and
             ``creek.jobs.read`` resolves the handles it hands out.
     """
-    # Aliased rather than renamed in the 119 moved lines below, so the move
-    # is provably byte-identical while the public parameter name still reads
-    # as one of a family beside ``author_factory``. A bare ``factory`` at
-    # module level next to ``author_factory`` and ``compile_factory`` would
-    # be a genuine readability defect. Ruff F841 guarantees the alias cannot
-    # go dead unnoticed.
-    factory = draft_factory
 
     @server.tool(name="creek.state.read")
     def _state_read(
@@ -1505,6 +1508,81 @@ def _register_authoring_tools(
             limit=limit,
             consumer=_effective_consumer(consumer),
         )
+
+    _register_composition_tools(
+        server,
+        vault=vault,
+        consumer=consumer,
+        draft_factory=draft_factory,
+        author_factory=author_factory,
+        revoice_factory=revoice_factory,
+        jobs=jobs,
+    )
+
+    @server.tool(name="creek.save")
+    def _save(
+        target: str,
+        body: str,
+        title: str | None = None,
+        tier: str | None = None,
+        provenance: list[str] | None = None,
+        source_kind: str = "mcp",
+        source_id: str | None = None,
+        saved_by: str = "mcp",
+        full_body: bool = False,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Save a Discord/Claude answer back into the vault; ``tier`` required."""
+        return save_tool(
+            vault_path=vault,
+            target=target,
+            body=body,
+            title=title,
+            tier=tier,
+            provenance=provenance,
+            source_kind=source_kind,
+            source_id=source_id,
+            saved_by=saved_by,
+            full_body=full_body,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+    @server.tool(name="creek.jobs.read")
+    async def _jobs_read(
+        job_id: str,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Resolve a creek.draft / creek.author job handle to its state."""
+        return await jobs.read(
+            job_id=job_id,
+            ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+
+def _register_composition_tools(
+    server: FastMCP,
+    *,
+    vault: Path,
+    consumer: str,
+    draft_factory: _ScopedFactory[DraftLLMFactory],
+    author_factory: _ScopedFactory[AuthorLLMFactory],
+    revoice_factory: _ScopedFactory[RevoiceLLMFactory],
+    jobs: CompositionJobs,
+) -> None:
+    """Register the three model-backed desk compositions in their existing order.
+
+    Args:
+        server: The server being assembled.
+        vault: The served vault.
+        consumer: Fallback audit identity for stdio.
+        draft_factory: Request-scoped drafting factory builder.
+        author_factory: Request-scoped authoring voice factory builder.
+        revoice_factory: Request-scoped revoice factory builder.
+        jobs: Shared composition admission, progress and deadline wrapper.
+    """
+    factory = draft_factory
 
     @server.tool(name="creek.draft")
     async def _draft(
@@ -1568,45 +1646,31 @@ def _register_authoring_tools(
         )
         return await jobs.run(call, ctx)
 
-    @server.tool(name="creek.save")
-    def _save(
-        target: str,
-        body: str,
-        title: str | None = None,
-        tier: str | None = None,
-        provenance: list[str] | None = None,
-        source_kind: str = "mcp",
-        source_id: str | None = None,
-        saved_by: str = "mcp",
-        full_body: bool = False,
+    @server.tool(name="creek.revoice")
+    async def _revoice(
+        text: str,
+        register: str | None = None,
+        phase: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+        *,
+        ctx: Context,
     ) -> dict[str, Any]:
-        """Save a Discord/Claude answer back into the vault; ``tier`` required."""
-        return save_tool(
+        """Rewrite supplied text in the owner's voice without saving."""
+        caller = _effective_consumer(consumer)
+        provenance = InferenceProvenance()
+        work = partial(
+            revoice_tool,
             vault_path=vault,
-            target=target,
-            body=body,
-            title=title,
-            tier=tier,
-            provenance=provenance,
-            source_kind=source_kind,
-            source_id=source_id,
-            saved_by=saved_by,
-            full_body=full_body,
+            text=text,
+            register=register,
+            phase=phase,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=_effective_consumer(consumer),
+            consumer=caller,
+            llm_factory=revoice_factory(bound_request_key(), provenance),
+            provenance=provenance,
         )
-
-    @server.tool(name="creek.jobs.read")
-    async def _jobs_read(
-        job_id: str,
-        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
-    ) -> dict[str, Any]:
-        """Resolve a creek.draft / creek.author job handle to its state."""
-        return await jobs.read(
-            job_id=job_id,
-            ceiling=privacy_tier_ceiling,
-            consumer=_effective_consumer(consumer),
+        return await jobs.run(
+            revoice_call(work, consumer=caller, ceiling=privacy_tier_ceiling), ctx
         )
 
 

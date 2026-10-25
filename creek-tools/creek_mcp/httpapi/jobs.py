@@ -46,13 +46,13 @@ Written when a reader finds a queued or running record this process is not
 executing — the server restarted, or the machine was autostopped, mid-job.
 """
 
-JobKind: TypeAlias = Literal["classification", "link", "draft", "author"]
+JobKind: TypeAlias = Literal["classification", "link", "draft", "author", "revoice"]
 """What a job runs: a ``/v1`` pipeline pass or an MCP composition."""
 
 PIPELINE_KINDS: Final[frozenset[str]] = frozenset({"classification", "link"})
 """The kinds ``GET /v1/jobs/{job_id}`` projects through its counts-only models."""
 
-COMPOSITION_KINDS: Final[frozenset[str]] = frozenset({"draft", "author"})
+COMPOSITION_KINDS: Final[frozenset[str]] = frozenset({"draft", "author", "revoice"})
 """The kinds ``creek.jobs.read`` resolves (#1966)."""
 
 

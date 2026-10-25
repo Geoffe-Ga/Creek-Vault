@@ -20,8 +20,15 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.22.0"
+CONTRACT_VERSION: Final[str] = "0.23.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.23.0 (#1981): MCP adds ``creek.revoice``, a DESK-granted transformation
+of caller-supplied text through the owner's voice skills. Detached output is
+available through ``creek.jobs.read`` only in bounded process memory, to its
+initiating agent at an adequate ceiling; no body is saved to drafts or durable
+job records. No ``/v1`` route or payload shape changes. Handshake metadata
+advertises the new version; ``0.22`` and earlier supported minors remain served.
 
 0.22.0 (#1968): ``/v1`` publishes an eleventh capability, ``agent-activity``,
 served by ``GET /v1/agent-activity?limit=&since=``: a content-free projection
