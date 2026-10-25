@@ -38,6 +38,7 @@ from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV, remote_auth_settings
 from creek_mcp.server import build_server
 from creek_mcp.tools.handshake import AuthMode
 from tests.agent_token_support import (
+    AGENT_CLIENT_ID,
     AGENT_SUBJECT,
     ISSUER,
     OTHER_VAULT_URL,
@@ -293,7 +294,7 @@ def test_a_bearer_only_challenge_names_no_placeholder(vault: Path) -> None:
 
 
 def test_a_jwt_for_this_vault_is_dispatched_as_its_consumer(vault: Path) -> None:
-    """Dispatched as ``sub``, remote, and audited under it.
+    """Dispatched as the registered OAuth client, remote, and audited under it.
 
     Args:
         vault: A seeded vault.
@@ -305,7 +306,7 @@ def test_a_jwt_for_this_vault_is_dispatched_as_its_consumer(vault: Path) -> None
     assert handshake["status"] == "ok"
     assert handshake["transport"] == Transport.NETWORK.value
     assert handshake["auth"] == AuthMode.OAUTH.value == "oauth"
-    assert _audited_consumers(vault, "creek.handshake") == [AGENT_SUBJECT]
+    assert _audited_consumers(vault, "creek.handshake") == [AGENT_CLIENT_ID]
 
 
 def test_a_jwt_caller_sees_and_reaches_only_its_grants(vault: Path) -> None:

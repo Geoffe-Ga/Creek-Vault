@@ -429,28 +429,32 @@ def test_a_dispatched_mcp_call_shows_as_admitted(
     ]
 
 
-def test_a_jwt_agent_is_shown_under_its_subject(
+def test_jwt_agents_with_one_pinned_subject_have_distinct_activity(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An OAuth agent (#1963) is on the card under its ``sub``, admitted and refused.
-
-    The token is minted and verified by the real resource-server verifier, so
-    the stamp is whatever that verifier hands the audit log: the ``sub``, never
-    the registered OAuth ``client_id``, and never any other claim.
-    """
-    verified = asyncio.run(agent_verifier().verify_token(mint()))
+    """Each agent joins directly to its grant's client id despite a shared subject."""
+    verifier = agent_verifier(expected_subject=AGENT_SUBJECT)
+    verified = asyncio.run(verifier.verify_token(mint()))
     assert verified is not None
     server = _remote_server(vault, monkeypatch, verified)
     asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}))
     asyncio.run(server.call_tool("creek.link", {"stage": "temporal"}))
+    cimd_client = "https://claude.ai/oauth/claude-code-client-metadata"
+    second = asyncio.run(verifier.verify_token(mint(client_id=cimd_client)))
+    assert second is not None
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: second)
+    asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}))
     response = _get(vault)
     assert [
         (row["consumer"], row["tool"], row["outcome"]) for row in _rows(response)
     ] == [
-        (AGENT_SUBJECT, "creek.link", "refused"),
-        (AGENT_SUBJECT, "creek.wheel", "admitted"),
+        (cimd_client, "creek.wheel", "admitted"),
+        (AGENT_CLIENT_ID, "creek.link", "refused"),
+        (AGENT_CLIENT_ID, "creek.wheel", "admitted"),
     ]
-    assert AGENT_CLIENT_ID not in response.text
+    assert AGENT_SUBJECT not in response.text
+    assert envelope(response)["skipped"] == 0
+    verify_mcp_audit_chain(vault)
 
 
 # --------------------------------------------------------------------------- #
