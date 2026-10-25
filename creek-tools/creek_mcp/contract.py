@@ -20,8 +20,18 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.23.0"
+CONTRACT_VERSION: Final[str] = "0.24.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.24.0 (adepthood#3545): authenticated ``GET /v1/capabilities`` gains optional
+``agent_mcp`` discovery metadata. Its resource and authorization-server issuer
+come from this allocation's mounted OAuth MCP configuration, and it is null
+when MCP, OAuth or public routing is unavailable. Managed private TLS remains
+unavailable because its outer router proxies only ``/v1``; Fly replay can
+advertise its real public resource. A shared edge's unauthenticated RFC 9728
+metadata is never used as allocation readiness evidence. The field is omitted
+for callers declaring a minor below 0.24, while unversioned discovery publishes
+the current shape. Every earlier content minor, including 0.22, stays served.
 
 0.23.0 (#1981): MCP adds ``creek.revoice``, a DESK-granted transformation
 of caller-supplied text through the owner's voice skills. Detached output is

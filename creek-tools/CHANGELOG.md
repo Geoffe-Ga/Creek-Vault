@@ -9,6 +9,14 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Publish allocation-specific `agent_mcp` metadata at contract `0.24.0`
+  (adepthood#3545). Authenticated capability discovery names the actual mounted
+  OAuth MCP resource and issuer, or null for an allocation that cannot serve
+  agents. Managed private TLS remains unavailable even with OAuth settings;
+  Fly replay advertises its routed endpoint. Earlier declared minors omit the
+  field, and unversioned discovery sees it while content calls can retain their
+  existing pin. No credentials or corpus content enter the metadata.
+
 - Add `creek.revoice` at contract `0.23.0` (#1981). It rewrites caller-supplied
   text through the owner's voice skills with an explicit meaning-preservation
   prompt, routes by the declared ceiling through the existing model factory,

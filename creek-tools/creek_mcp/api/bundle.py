@@ -228,6 +228,10 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "request_key_providers": [provider.value for provider in RequestKeyProvider],
     "inference_pool": True,
     "keyless_inference": True,
+    "agent_mcp": {
+        "resource": "https://v-7q2k.creek.example/mcp",
+        "authorization_server": "https://api.adepthood.example",
+    },
 }
 """A ready managed server: vault present, all eleven capabilities served, a
 writer's own Anthropic or OpenAI key accepted per request (#1873), and model
@@ -238,6 +242,7 @@ _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     "status": CapabilitiesStatus.UNINITIALIZED.value,
     "vault": {"available": False},
     "capabilities": [],
+    "agent_mcp": None,
 }
 """An uninitialised vault — and still both version strings.
 
@@ -1000,6 +1005,29 @@ def _retry_policy_file() -> _BundleFile:
     )
 
 
+def _agent_discovery_files() -> list[_BundleFile]:
+    """Render both allocation states without adding capability-matrix cells.
+
+    Returns:
+        Current unversioned handshakes with ready and unavailable agent MCP
+        metadata. Both retain a usable vault, isolating this optional feature.
+    """
+    payloads = {
+        "agent-mcp-ready": _CAPABILITIES_SUCCESS,
+        "agent-mcp-unavailable": {**_CAPABILITIES_SUCCESS, "agent_mcp": None},
+    }
+    return [
+        _BundleFile(
+            path=f"discovery/{name}.json",
+            text=_serialise(payload),
+            model="CapabilitiesResponse",
+            capability=None,
+            state=None,
+        )
+        for name, payload in payloads.items()
+    ]
+
+
 def _manifest_entry(generated: _BundleFile) -> dict[str, Any]:
     """Return the manifest record describing one generated file.
 
@@ -1052,11 +1080,17 @@ def build_bundle() -> dict[str, str]:
     Returns:
         Every generated file: ``schemas/<Model>.schema.json`` for each
         published model, ``examples/<capability>/<state>.json`` for all 77
-        matrix cells, ``retry-policy.json``, and ``manifest.json``. The
+        matrix cells, the two optional-agent discovery states under
+        ``discovery/``, ``retry-policy.json``, and ``manifest.json``. The
         committed bundle must equal this exactly, minus the docs-owned
         ``README.md``.
     """
-    generated = [*_schema_files(), *_example_files(), _retry_policy_file()]
+    generated = [
+        *_schema_files(),
+        *_example_files(),
+        *_agent_discovery_files(),
+        _retry_policy_file(),
+    ]
     manifest = _manifest_file(generated)
     return {item.path: item.text for item in [*generated, manifest]}
 
