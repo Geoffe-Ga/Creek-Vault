@@ -100,6 +100,7 @@ from creek_mcp.api.models import (
 )
 from creek_mcp.api.routes import CONTRACT_VERSION_HEADER, ROUTE_BODY_CAPS, ROUTES
 from creek_mcp.httpapi import handlers
+from creek_mcp.httpapi.agent_mcp import mounted_agent_mcp
 from creek_mcp.httpapi.auth import BearerAuthMiddleware, build_verifier
 from creek_mcp.httpapi.context import SCOPE_KEY, bind_context, context_of
 from creek_mcp.httpapi.errors import error_response
@@ -691,6 +692,11 @@ def create_app(
     # metadata, #1967's request-scoped keys) reach the server they extend
     # rather than building a second one.
     app.state.mcp_server = mcp_server
+    app.state.agent_mcp = mounted_agent_mcp(
+        mounted=mcp_server is not None,
+        verifier=agent_verifier,
+        fly_replay_state=fly_replay_state,
+    )
     # The withdrawal adapter uses only the cardinality of this authenticated
     # registry when deciding whether a pre-0.16, unscoped staged entry has one
     # unambiguous owner. The token values are never retained on app state.

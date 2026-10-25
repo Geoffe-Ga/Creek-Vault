@@ -1627,6 +1627,26 @@ vault provisioned earlier is moved across by
 `--roll-mcp-oauth REQUESTER CONSUMER` once its Machine is stopped; see
 [provisioning-control-plane.md](provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974).
 
+### Allocation-specific agent discovery
+
+Contract `0.24` adds `agent_mcp` to authenticated `GET /v1/capabilities`. It is
+either the configured `{resource, authorization_server}` of this allocation's
+mounted, publicly routed OAuth MCP endpoint, or `null` when agents cannot use
+one. Managed private TLS remains unavailable even with OAuth environment
+settings because its outer router proxies only `/v1`. Fly replay can advertise
+the actual public resource once this allocation has OAuth configured.
+
+This signal differs from the shared edge's RFC 9728 document: that document is
+answered before routing authentication and cannot attest to an allocation's
+configuration. Legacy allocations report null until rolled; a fresh handshake
+then sees their new setup without storing readiness in the application.
+
+Earlier declared minors omit the extension entirely. Unversioned discovery can
+read it while subsequent content calls keep their existing supported minor.
+Addresses and issuers are clean, bounded HTTPS identifiers, never credentials
+or corpus content, and consumers must match them to their own expected resource
+and issuer before showing an agent address (adepthood#3545).
+
 ### Rotating a consumer's secret (no downtime)
 
 Rotation widens a consumer's token set so the old and new secrets both work,

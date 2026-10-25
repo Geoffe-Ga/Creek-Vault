@@ -55,8 +55,9 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+from ipaddress import ip_address
 from typing import Final, Literal, Self, TypeAlias
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 from uuid import UUID
 
 from pydantic import (
@@ -90,6 +91,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.23",
     "0.22",
     "0.21",
     "0.20",
@@ -488,6 +490,59 @@ own contract change: a ``0.19`` consumer vendored a closed
 :class:`CapabilitiesResponse` without it. It is a literal for the reason
 :data:`_UPLOAD_MINOR` is.
 """
+
+AGENT_MCP_SINCE_MINOR: Final[str] = "0.24"
+"""First minor with allocation-specific ``agent_mcp`` handshake metadata.
+
+Older declared minors omit the field entirely. Unversioned discovery exposes
+the current contract, so an application can learn this optional connection
+without changing the minor it already speaks on the content routes.
+"""
+
+AGENT_MCP_URL_MAX_CHARS: Final[int] = 2048
+"""Inclusive bound on the two public, non-secret OAuth endpoint identifiers."""
+
+_AGENT_MCP_URL_PATTERN: Final[str] = r"^https://[\x21\x23-\x5b\x5d-\x7e]+$"
+"""HTTPS with printable ASCII only, excluding quotes and backslashes."""
+
+_AGENT_MCP_LOCAL_SUFFIXES: Final[tuple[str, ...]] = (
+    ".localhost",
+    ".localdomain",
+    ".local",
+    ".internal",
+    ".lan",
+    ".home",
+    ".home.arpa",
+)
+
+
+def _public_agent_host(host: str) -> bool:
+    """Reject local address forms without resolving or dereferencing a hostname.
+
+    Args:
+        host: The parsed hostname from a configured endpoint.
+
+    Returns:
+        Whether the hostname is public-shaped: a global literal IP or a dotted
+        DNS name outside reserved local forms. This is not a reachability probe.
+    """
+    canonical = host.rstrip(".").lower()
+    if "%" in canonical:
+        return False
+    try:
+        return ip_address(canonical).is_global
+    except ValueError:
+        pass
+    numeric = all(
+        part.isdecimal() or part.startswith("0x") for part in canonical.split(".")
+    )
+    return (
+        "." in canonical
+        and canonical != "localhost"
+        and not canonical.endswith(_AGENT_MCP_LOCAL_SUFFIXES)
+        and not numeric
+    )
+
 
 LETTER_RATE_LIMITED_SINCE_MINOR: Final[str] = "0.21"
 """First contract minor that may meet ``rate_limited`` on the letter route.
@@ -1236,6 +1291,86 @@ class RequestKeyProvider(StrEnum):
     OPENAI = "openai"
 
 
+class AgentMcpDiscovery(_WireModel):
+    """The public MCP resource and issuer this allocation actually serves.
+
+    These are endpoint identifiers, never credentials, paths or vault content.
+    Strings stay verbatim because OAuth audience and issuer checks use exact
+    equality rather than URL normalization. Literal IPs must be global, and
+    reserved local hostnames are refused without performing DNS lookups.
+
+    Attributes:
+        resource: The configured public HTTPS MCP resource, ending in ``/mcp``.
+        authorization_server: The configured HTTPS token issuer.
+    """
+
+    resource: str = Field(
+        min_length=1,
+        max_length=AGENT_MCP_URL_MAX_CHARS,
+        pattern=_AGENT_MCP_URL_PATTERN,
+        description="Verbatim public HTTPS MCP resource URL, ending in /mcp.",
+    )
+    authorization_server: str = Field(
+        min_length=1,
+        max_length=AGENT_MCP_URL_MAX_CHARS,
+        pattern=_AGENT_MCP_URL_PATTERN,
+        description="Verbatim public HTTPS OAuth authorization-server issuer.",
+    )
+
+    @field_validator("resource", "authorization_server")
+    @classmethod
+    def _clean_https_url(cls, value: str) -> str:
+        """Keep a clean absolute HTTPS URL without normalizing its spelling.
+
+        Args:
+            value: The configured endpoint identifier.
+
+        Returns:
+            The original value.
+
+        Raises:
+            ValueError: For a local host, invalid port, credentials, query or
+                fragment. The static message never echoes the configured URL.
+        """
+        try:
+            parsed = urlsplit(value)
+            valid = (
+                parsed.scheme == "https"
+                and parsed.hostname is not None
+                and _public_agent_host(parsed.hostname)
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and parsed.port != 0
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            msg = "agent MCP endpoints must be clean absolute HTTPS URLs"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("resource")
+    @classmethod
+    def _mcp_path(cls, value: str) -> str:
+        """Require the one MCP path the server actually mounts.
+
+        Args:
+            value: The validated resource URL.
+
+        Returns:
+            The original value.
+
+        Raises:
+            ValueError: Unless the resource path is exactly ``/mcp``.
+        """
+        if urlsplit(value).path != "/mcp":
+            msg = "agent MCP resource must end in /mcp"
+            raise ValueError(msg)
+        return value
+
+
 class CapabilitiesResponse(_WireModel):
     """The handshake: versions, vault readiness and the capability list.
 
@@ -1274,6 +1409,9 @@ class CapabilitiesResponse(_WireModel):
             the writer for their key instead of charging for a pass that
             cannot run. Since contract 0.20, and omitted for a caller
             declaring an earlier minor.
+        agent_mcp: The OAuth MCP connection this allocation actually serves,
+            or ``None`` for a legacy, unmounted or unrouted allocation. Since
+            contract 0.24, and omitted for an earlier declared minor.
     """
 
     status: CapabilitiesStatus = Field(description="Overall server readiness.")
@@ -1311,6 +1449,13 @@ class CapabilitiesResponse(_WireModel):
             "False when a model call without a writer's request key is "
             "refused before any model is dialled; true when one may be "
             "attempted. Since contract 0.20."
+        ),
+    )
+    agent_mcp: AgentMcpDiscovery | None = Field(
+        default=None,
+        description=(
+            "The public OAuth MCP resource and issuer actually served by this "
+            "allocation, or null when unavailable. Since contract 0.24."
         ),
     )
 
@@ -2885,6 +3030,7 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "AgentActivityQuery": AgentActivityQuery,
     "AgentActivityResponse": AgentActivityResponse,
     "AgentActivityRow": AgentActivityRow,
+    "AgentMcpDiscovery": AgentMcpDiscovery,
     "CapabilitiesResponse": CapabilitiesResponse,
     "CareEscalationResponse": CareEscalationResponse,
     "CareResource": CareResource,

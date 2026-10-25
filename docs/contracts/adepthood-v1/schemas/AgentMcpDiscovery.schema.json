@@ -1,0 +1,28 @@
+{
+  "additionalProperties": false,
+  "description": "The public MCP resource and issuer this allocation actually serves.\n\nThese are endpoint identifiers, never credentials, paths or vault content.\nStrings stay verbatim because OAuth audience and issuer checks use exact\nequality rather than URL normalization. Literal IPs must be global, and\nreserved local hostnames are refused without performing DNS lookups.\n\nAttributes:\n    resource: The configured public HTTPS MCP resource, ending in ``/mcp``.\n    authorization_server: The configured HTTPS token issuer.",
+  "properties": {
+    "authorization_server": {
+      "description": "Verbatim public HTTPS OAuth authorization-server issuer.",
+      "maxLength": 2048,
+      "minLength": 1,
+      "pattern": "^https://[\\x21\\x23-\\x5b\\x5d-\\x7e]+$",
+      "title": "Authorization Server",
+      "type": "string"
+    },
+    "resource": {
+      "description": "Verbatim public HTTPS MCP resource URL, ending in /mcp.",
+      "maxLength": 2048,
+      "minLength": 1,
+      "pattern": "^https://[\\x21\\x23-\\x5b\\x5d-\\x7e]+$",
+      "title": "Resource",
+      "type": "string"
+    }
+  },
+  "required": [
+    "resource",
+    "authorization_server"
+  ],
+  "title": "AgentMcpDiscovery",
+  "type": "object"
+}

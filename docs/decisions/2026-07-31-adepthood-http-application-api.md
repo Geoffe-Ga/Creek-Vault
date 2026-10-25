@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.23.0`
+- **Contract version**: `0.24.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -263,6 +263,38 @@ so this ADR records the collapse as deliberate, not as an oversight to file.
 **Client rule: an all-zero wheel means "nothing admitted at your declared
 ceiling," never "you have no entries."** It must not be rendered as an empty
 state. The operator remedy is `creek classify` (or `creek process`).
+
+### Agent MCP discovery (contract `0.24`)
+
+The authenticated handshake carries `agent_mcp`, independently of the ordinary
+vault's availability and content capabilities:
+
+```json
+{"resource": "https://v-7q2k.creek.example/mcp", "authorization_server": "https://api.adepthood.example"}
+```
+
+This object comes from the MCP server and JWT verifier actually mounted in
+this allocation. Managed Fly replay can advertise it; managed private TLS
+cannot, because its outer router serves `/v1` alone even when OAuth settings
+were written to the Machine. A legacy allocation without OAuth, an unmounted
+MCP server or an unavailable vault reports `null`. Rolling a legacy allocation
+to the configured replay runtime changes this observation on its next startup.
+The shared edge's unauthenticated RFC 9728 document cannot establish this
+allocation-specific fact and is not consulted.
+
+The object is closed to exactly those two fields. Each is a verbatim HTTPS
+identifier of at most 2048 characters, without credentials, query, fragment or
+control characters; `resource` ends in `/mcp`. Literal IPs must be global and
+reserved local hostnames are rejected without resolving DNS. This validation
+describes the configured endpoint, not a network reachability probe.
+
+Callers declaring a minor below `0.24` receive no `agent_mcp` field. Unversioned
+discovery receives the current metadata while content calls may keep their
+existing supported pin. A consumer shows an address only after checking both
+the resource and issuer against its own account binding and authorization
+server. A missing or unusable extension does not make other vault features
+unavailable. The generated `discovery/agent-mcp-{ready,unavailable}.json`
+fixtures demonstrate both states with an otherwise usable vault.
 
 ## Journal upsert
 
@@ -1000,6 +1032,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.24.0` | 2026-10-24 | **Authenticated agent MCP discovery (adepthood#3545).** `GET /v1/capabilities` adds `agent_mcp: {resource, authorization_server} \| null` from this allocation's actual mounted OAuth MCP configuration and public routing. Managed private TLS, legacy OAuth-free allocations, missing mounts and unavailable vaults report null. Earlier declared minors omit the field; unversioned discovery publishes it without changing the content minor a client already speaks. `0.23`, `0.22` and every earlier supported minor remain served. |
 | `0.23.0` | 2026-10-24 | **MCP-only: `creek.revoice` (#1981).** Adds a `vault:desk` tool that rewrites caller-supplied text through the owner's voice skills without corpus retrieval or saving. Its prompt preserves meaning and claims; routing keys on the declared ceiling. A detached body's `creek.jobs.read` result is bounded, process-local, agent-bound and ceiling-checked; durable records remain counts-only. No `/v1` route, capability or wire model moves. `0.22` and all earlier supported minors stay served. |
 | `0.22.0` | 2026-10-24 | #1968 publishes the **eleventh capability**, `agent-activity`, as `GET /v1/agent-activity?limit=&since=`: a content-free projection of the MCP audit chain, so the vault's owner can see what each connected agent asked for and when (epic #1961). Rows are `{consumer, tool, at, outcome}` with `outcome` closed at `admitted \| refused`; no argument summary, fragment id, path, hash or prose crosses, and nothing is hidden by consumer — the app's own `adepthood` calls are listed under their stamp. `limit` defaults to 50 and is clamped to 200; malformed lines are counted in `skipped`; the chain is read, never rewritten, and not re-verified per request, so no `chain_verified_at` is published. Three wire models (`AgentActivityQuery`, `AgentActivityRow`, `AgentActivityResponse`) and the contract's first query parameters (`RouteSpec.query_model`) widen the HTTP contract, and the fixture matrix grows to 11 x 7 with `agent-activity/refusal` unreachable. The MCP adapter now audits a remote call refused for a ceiling above `personal` as `"outcome": "refused"` under the tool name only, so that attempt shows on the card. `0.21` remains served without seeing or reaching the route; the OpenAPI golden advances deliberately. |
 | `0.21.0` | 2026-10-21 | #1903 step 6 ([ADR-0016](../../creek-tools/docs/architecture/ADR/0016-shared-confidential-warm-inference-pool.md)) serves the admission refusal on the **letter** route as well: `rate_limited` / HTTP **429** is now reachable on `POST /v1/letters/{external_id}`, documented there in the OpenAPI document, and identical in every published respect to the reflection route's — same code, same static message, same envelope, same advisory `Retry-After`. The owner's ratification (2026-10-21) is the reason: *if the cap is per-account, the surface should be per-account too.* It already was per-account — `_build_reflect_llm_factory` and `_build_letter_llm_factory` are both `_bounded_generation_factory` over the one `generation` stage, so the refusal is the shared pool's admission decision or the writer's own key's 429 and no per-route counter exists — and only the reporting was split, because `ProviderRateLimitError` subclasses `RuntimeError` and `creek_mcp.tools.letter._generate`'s broad catch reported a cap as `provider_unavailable`. The refusal stores nothing: it is raised before `create_voice_draft_if_absent`, so a capped request leaves the caller-owned slot unwritten and a retry still answers `created`. No `CONTRACT_MODELS` entry, field, status or route is added — `429` was already published — and the refusal is withheld from callers below `0.21` by `LETTER_RATE_LIMITED_SINCE_MINOR`, which keeps every `0.20` letter response exactly as that minor published it. It is `0.21` and not `0.20` because `0.20` had already shipped for `keyless_inference` (#1938): a consumer that negotiated `0.20` for that field never agreed to a `429` on a letter, and reusing a published minor to move a route's behaviour is the break this window exists to prevent; the OpenAPI golden advances deliberately. |

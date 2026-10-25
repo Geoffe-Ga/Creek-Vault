@@ -33,16 +33,35 @@ adepthood-v1/
 ├── manifest.json                      # contract_version, ontology_version, and a sha256 per generated file
 ├── retry-policy.json                  # {code: disposition} — the whole answer to "should I retry this error?"
 ├── schemas/
-│   └── <ModelName>.schema.json        # one JSON Schema per CONTRACT_MODELS entry (16 files)
+│   └── <ModelName>.schema.json        # one JSON Schema per CONTRACT_MODELS entry
+├── discovery/
+│   ├── agent-mcp-ready.json           # ready vault with its public OAuth MCP resource and issuer
+│   └── agent-mcp-unavailable.json     # ready vault with agent_mcp: null
 └── examples/
     └── <capability>/
-        └── <state>.json               # one fixture per (capability, state) cell (5 × 7 = 35 files)
+        └── <state>.json               # one fixture per (capability, state) cell
 ```
+
+## Optional agent MCP discovery
+
+Contract `0.24` publishes `agent_mcp` on authenticated capability discovery.
+The object carries exactly `resource` and `authorization_server`, verbatim
+HTTPS identifiers of at most 2048 characters; `resource` ends in `/mcp`.
+`null` means this allocation cannot currently serve OAuth agents. It says
+nothing about the availability of its ordinary vault features.
+
+The files under `discovery/` demonstrate both states with `vault.available:
+true`. They are generated and hashed by the same manifest, outside the fixed
+capability/state matrix. The standalone shape is
+[`AgentMcpDiscovery.schema.json`](schemas/AgentMcpDiscovery.schema.json).
+Earlier declared minors omit the field. An unversioned handshake can discover
+it while subsequent content requests retain their existing supported minor.
 
 ## The two axes of the example matrix
 
-**Capabilities** (five): `capabilities`, `journal-upsert`, `reflections`,
-`wheel`, `upload` — read directly off the `Capability` enum, so this
+**Capabilities**: `capabilities`, `journal-upsert`, `reflections`,
+`wheel`, `upload`, `drive-connector`, `pipeline`, `voice-drafts`,
+`journal-withdraw`, `letters`, `agent-activity` — read directly off the `Capability` enum, so this
 directory's subdirectory names can never name a different set of capabilities
 than the server actually advertises through `GET /v1/capabilities`.
 

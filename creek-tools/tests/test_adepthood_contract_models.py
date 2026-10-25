@@ -81,6 +81,7 @@ from creek_mcp.api.models import (
     AgentActivityQuery,
     AgentActivityResponse,
     AgentActivityRow,
+    AgentMcpDiscovery,
     CapabilitiesResponse,
     CapabilitiesStatus,
     CareEscalationResponse,
@@ -510,6 +511,10 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     AgentActivityQuery.__name__: AGENT_ACTIVITY_QUERY_PAYLOAD,
     AgentActivityResponse.__name__: AGENT_ACTIVITY_RESPONSE_PAYLOAD,
     AgentActivityRow.__name__: AGENT_ACTIVITY_ROW_PAYLOAD,
+    AgentMcpDiscovery.__name__: {
+        "resource": "https://v-7q2k.creek.example/mcp",
+        "authorization_server": "https://api.adepthood.example",
+    },
     CapabilitiesResponse.__name__: CAPABILITIES_RESPONSE_PAYLOAD,
     CareEscalationResponse.__name__: CARE_ESCALATION_RESPONSE_PAYLOAD,
     CareResource.__name__: CARE_RESOURCE_PAYLOAD,
@@ -1899,7 +1904,7 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.23 widened the compatibility window rather than shifting it.
+    """0.24 widened the compatibility window rather than shifting it.
 
     A ``0.21`` client has no ``agent-activity`` capability, route or model in
     its vendored contract, and the since-minor gate both withholds and refuses
@@ -1919,6 +1924,7 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.23" in SUPPORTED_CONTRACT_MINORS
     assert "0.22" in SUPPORTED_CONTRACT_MINORS
     assert "0.21" in SUPPORTED_CONTRACT_MINORS
     assert "0.20" in SUPPORTED_CONTRACT_MINORS
@@ -1934,7 +1940,7 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.23"
+    assert CONTRACT_MINOR == "0.24"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

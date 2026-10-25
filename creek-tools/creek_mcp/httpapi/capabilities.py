@@ -49,12 +49,14 @@ from typing import TYPE_CHECKING
 from creek.classify.llm.consent import is_managed_vault
 from creek.classify.llm.pool_boundary import pool_url_configured
 from creek_mcp.api.models import (
+    AGENT_MCP_SINCE_MINOR,
     CAPABILITY_SINCE_MINOR,
     CONTRACT_MINOR,
     KEYLESS_INFERENCE_SINCE_MINOR,
     PROVENANCE_SINCE_MINOR,
     REQUEST_KEYS_SINCE_MINOR,
     SUPPORTED_CONTRACT_MINORS,
+    AgentMcpDiscovery,
     CapabilitiesResponse,
     CapabilitiesStatus,
     Capability,
@@ -397,6 +399,8 @@ def _render(
     request_keys: list[RequestKeyProvider] | None = None,
     inference_pool: bool | None = None,
     keyless_inference: bool | None = None,
+    agent_mcp: AgentMcpDiscovery | None = None,
+    agent_mcp_supported: bool = False,
 ) -> Response:
     """Return the handshake body for *status*.
 
@@ -414,6 +418,9 @@ def _render(
             omit the field for a caller whose minor predates it.
         keyless_inference: Whether a keyless model call may run here, or
             ``None`` to omit the field for a caller whose minor predates it.
+        agent_mcp: This allocation's actual public OAuth MCP connection, or
+            ``None`` when it is unavailable.
+        agent_mcp_supported: Whether the caller's minor includes this field.
 
     Returns:
         A ``200`` carrying the published response model and nothing else.
@@ -430,6 +437,7 @@ def _render(
         request_key_providers=request_keys,
         inference_pool=inference_pool,
         keyless_inference=keyless_inference,
+        agent_mcp=agent_mcp,
     )
     body = payload.model_dump(mode="json")
     if request_keys is None:
@@ -438,6 +446,8 @@ def _render(
         body.pop("inference_pool")
     if keyless_inference is None:
         body.pop("keyless_inference")
+    if not agent_mcp_supported:
+        body.pop("agent_mcp")
     return json_response(body, HTTP_OK)
 
 
@@ -534,4 +544,12 @@ async def handle_capabilities(request: Request) -> Response:
         request_keys=advertised_request_key_providers(declared),
         inference_pool=advertised_inference_pool(declared),
         keyless_inference=advertised_keyless_inference(declared),
+        agent_mcp=(
+            getattr(request.app.state, "agent_mcp", None)
+            if available and negotiable
+            else None
+        ),
+        agent_mcp_supported=(
+            declared is None or minor_at_least(declared, AGENT_MCP_SINCE_MINOR)
+        ),
     )
