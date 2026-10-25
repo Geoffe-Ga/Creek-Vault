@@ -44,7 +44,7 @@ from creek.compile.provenance import ProvenanceEntry
 from creek.config import load_config
 from creek.generate.drafts import DraftGenerator
 from creek.generate.mining import IdeaSeed, MiningStrategy
-from creek.models import CompiledPage, PrivacyTier, Thread
+from creek.models import CompiledPage, Eddy, PrivacyTier, Thread
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.draft import _source_routing_tier
 from tests.helpers import write_raw_fragment_file
@@ -69,6 +69,10 @@ _EDDY_ID = "eddy-confession"
 
 _COMPILED_SENTINEL = "SENTINEL-the-compiled-distillation-of-an-intimate-life"
 _THREAD_DESCRIPTION = "SENTINEL-the-thread-frontmatter-description"
+_EDDY_DESCRIPTION = "SENTINEL-the-eddy-frontmatter-description"
+
+_MESSAGES_EDDY_ID = "eddy-messages"
+_MESSAGES_LINK = "[[Messages]]"
 
 _VAULT_LOCAL_MODEL = "vault-local-model"
 _VAULT_CLOUD_MODEL = "vault-cloud-model"
@@ -178,6 +182,26 @@ def _write_thread_note(vault: Path, thread_id: str) -> None:
     post = frontmatter.Post(content=_THREAD_DESCRIPTION)
     post.metadata.update(thread.model_dump(mode="json"))
     path = vault / _THREAD_DIR / f"{thread_id}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+def _write_eddy_note(vault: Path, eddy_id: str, title: str) -> None:
+    """Write a plain, uncompiled ``Eddy`` note carrying the description sentinel.
+
+    The shape ``creek link`` leaves behind: an eddy note with an id and a
+    title, referenced from member fragments as ``[[title]]`` rather than by
+    id, and never compiled.
+
+    Args:
+        vault: Vault root.
+        eddy_id: The eddy's stable id.
+        title: The title member fragments link to.
+    """
+    eddy = Eddy(id=eddy_id, title=title, description=_EDDY_DESCRIPTION)
+    post = frontmatter.Post(content=_EDDY_DESCRIPTION)
+    post.metadata.update(eddy.model_dump(mode="json"))
+    path = vault / _EDDY_DIR / f"{eddy_id}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
@@ -585,6 +609,155 @@ def test_generator_fails_closed_under_bypass_compiled(tmp_path: Path) -> None:
     assert _THREAD_DESCRIPTION in factory.prompts[0]
 
 
+# A named thread or eddy that renders NO text contributes no tier. The missing
+# page is still opaque — but opacity only matters for text that reaches the
+# prompt, the same rule ``_rendered_source_tiers`` applies to a fragment the
+# privacy filter removed. ``creek link`` names eddies as ``[[title]]``, which
+# the compiled lookup normalises (#881) but the id-keyed description fallback
+# does not, so an uncompiled eddy reached that way renders nothing at all.
+# Before this rule, that empty section pinned every such draft to the local
+# model: 87% of one real 35k-fragment vault named ``[[Messages]]``.
+
+
+def test_generator_routes_by_fragments_when_a_wikilinked_eddy_renders_nothing(
+    tmp_path: Path,
+) -> None:
+    """An uncompiled eddy named by ``[[title]]`` adds no text, so no tier.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+    """
+    vault = _seed_vault(tmp_path)
+    _write_eddy_note(vault, _MESSAGES_EDDY_ID, "Messages")
+
+    tier, prompt = _bound_tier(tmp_path, vault, _seed(eddies=(_MESSAGES_LINK,)))
+
+    assert tier == PrivacyTier.OPEN
+    # ANTI-VACUITY: the eddy really contributed nothing to the prompt — had
+    # its description rendered, OPEN would be a leak, not a fix.
+    assert _EDDY_DESCRIPTION not in prompt
+    assert "## Eddies" not in prompt
+
+
+def test_generator_routes_by_fragments_when_a_wikilinked_thread_renders_nothing(
+    tmp_path: Path,
+) -> None:
+    """Threads follow the same rule as eddies.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+    """
+    vault = _seed_vault(tmp_path)
+    _write_thread_note(vault, _THREAD_ID)
+
+    tier, prompt = _bound_tier(
+        tmp_path,
+        vault,
+        _seed(threads=("[[A thread with no compiled page]]",)),
+    )
+
+    assert tier == PrivacyTier.OPEN
+    assert _THREAD_DESCRIPTION not in prompt
+    assert "## Threads" not in prompt
+
+
+def test_generator_ignores_a_named_target_that_exists_nowhere(tmp_path: Path) -> None:
+    """No page and no note: nothing renders, so nothing is surveyed.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+    """
+    vault = _seed_vault(tmp_path)
+
+    tier, prompt = _bound_tier(
+        tmp_path,
+        vault,
+        _seed(threads=("thread-nowhere",), eddies=("eddy-nowhere",)),
+    )
+
+    assert tier == PrivacyTier.OPEN
+    assert "## Threads" not in prompt
+    assert "## Eddies" not in prompt
+
+
+def test_generator_ignores_a_wikilinked_eddy_under_bypass_compiled(
+    tmp_path: Path,
+) -> None:
+    """Bypass changes nothing for a target that renders no text.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+    """
+    vault = _seed_vault(tmp_path)
+    _write_eddy_note(vault, _MESSAGES_EDDY_ID, "Messages")
+    factory = _TierRecordingFactory()
+
+    _generator(factory, tmp_path / "skills", bypass_compiled=True).generate_draft(
+        _seed(eddies=(_MESSAGES_LINK,)),
+        vault_path=vault,
+    )
+
+    assert factory.tiers == [PrivacyTier.OPEN]
+    assert _EDDY_DESCRIPTION not in factory.prompts[0]
+
+
+def test_generator_still_fails_closed_on_the_rendered_half_of_a_mixed_seed(
+    tmp_path: Path,
+) -> None:
+    """Dropping the empty target must not drop the one that renders.
+
+    A seed naming a wikilinked eddy (renders nothing) and an uncompiled thread
+    by id (renders its description) still routes ``INTIMATE`` — the rule
+    narrows the survey to rendered text, it never skips rendered text.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+    """
+    vault = _seed_vault(tmp_path)
+    _write_eddy_note(vault, _MESSAGES_EDDY_ID, "Messages")
+    _write_thread_note(vault, _THREAD_ID)
+
+    tier, prompt = _bound_tier(
+        tmp_path,
+        vault,
+        _seed(threads=(_THREAD_ID,), eddies=(_MESSAGES_LINK,)),
+    )
+
+    assert tier == PrivacyTier.INTIMATE
+    assert _THREAD_DESCRIPTION in prompt
+    assert _EDDY_DESCRIPTION not in prompt
+
+
+def test_cli_draft_keeps_a_wikilinked_eddy_seed_on_the_cloud_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: type[_RecordingClassifier],
+) -> None:
+    """The reported failure, on the **default** ``creek draft`` invocation.
+
+    An ``open`` source fragment whose seed names its eddy as ``[[Messages]]``,
+    with no compiled page, used to route to the local model and time out.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+        monkeypatch: Pytest's patcher.
+        recorder: The classifier recorder fixture.
+    """
+    vault = _seed_vault(tmp_path)
+    _write_eddy_note(vault, _MESSAGES_EDDY_ID, "Messages")
+    _stub_miner(monkeypatch, _seed(eddies=(_MESSAGES_LINK,)))
+    _assert_unrouted_resolution_is_cloud(vault)
+
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert recorder.providers() == ["anthropic"]
+    assert recorder.models() == [_VAULT_CLOUD_MODEL]
+    prompts = recorder.all_prompts()
+    assert prompts, "the draft never reached a provider at all"
+    assert not any(_EDDY_DESCRIPTION in prompt for prompt in prompts)
+
+
 def test_generator_still_routes_a_thread_less_seed_by_its_fragments(
     tmp_path: Path,
 ) -> None:
@@ -623,6 +796,20 @@ _EQUIVALENCE_SHAPES: list[_Shape] = [
         PrivacyTier.INTIMATE,
     ),
     ("compiled-sources-only", (), (_THREAD_ID,), (), PrivacyTier.INTIMATE),
+    (
+        "wikilinked-eddy-renders-nothing",
+        (_OPEN_ID,),
+        (),
+        (_MESSAGES_LINK,),
+        PrivacyTier.OPEN,
+    ),
+    (
+        "wikilinked-eddy-beside-an-uncompiled-thread",
+        (_OPEN_ID,),
+        ("thread-uncompiled",),
+        (_MESSAGES_LINK,),
+        PrivacyTier.INTIMATE,
+    ),
 ]
 
 
@@ -681,6 +868,7 @@ def test_cli_and_mcp_derive_the_same_tier_shape_for_shape(
         fragment_ids=None,
     )
     _write_thread_note(vault, "thread-uncompiled")
+    _write_eddy_note(vault, _MESSAGES_EDDY_ID, "Messages")
     idea = _seed(source_fragments=sources, threads=threads, eddies=eddies)
 
     cli_tier, _prompt = _bound_tier(tmp_path, vault, idea)
