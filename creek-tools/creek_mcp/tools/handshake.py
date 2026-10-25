@@ -201,7 +201,8 @@ def handshake_tool(
             in the audit log.
         request_key_providers: The vendors whose writer-supplied key
             (ADR-0015, ``X-Creek-Provider`` + ``X-Creek-Provider-Key``) this
-            server would spend on ``creek.draft``, ``creek.author`` and
+            server would spend on ``creek.draft``, ``creek.author``,
+            ``creek.revoice`` and
             ``creek.reflect`` (#1967) — both on a managed vault served over
             the network, none on a self-connected vault or over stdio. It
             mirrors ``GET /v1/capabilities``. Defaults to none, the

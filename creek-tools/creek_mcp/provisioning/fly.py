@@ -10,6 +10,7 @@ plane managed to persist the provider result.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import ipaddress
 import os
@@ -28,9 +29,11 @@ from creek_mcp.provisioning.inventory import ProviderResource
 from creek_mcp.provisioning.models import (
     DeletionOutcome,
     FailureReason,
+    McpOAuthSettings,
     ResourceClass,
     ResourceState,
     RoutableAllocation,
+    public_vault_url,
 )
 from creek_mcp.provisioning.pool_bundle import (
     PoolCredentialInventory,
@@ -167,6 +170,12 @@ class FlyRuntimeSecrets:
     activation's stored version and a fleet re-pin rejects nothing until that
     activation is rolled.  ``None`` is the pool-free path: a self-hosted-shaped
     allocation, and the standing O3 fallback, both unchanged.
+
+    ``mcp_oauth`` is the activation's stored MCP resource-server settings
+    (#1974), read the same way: present, the Machine environment carries
+    ``CREEK_MCP_RESOURCE_URL`` and ``CREEK_MCP_AUTHORIZATION_SERVER`` exactly;
+    ``None`` — every activation issued before #1974 — it carries neither, so
+    an existing vault keeps verifying until it is rolled.
     """
 
     consumer_credential: str = field(repr=False)
@@ -175,6 +184,7 @@ class FlyRuntimeSecrets:
     tls_certificate: bytes = field(repr=False)
     tls_private_key: bytes = field(repr=False)
     pool: PoolRuntimeBundle | None = field(default=None, repr=False)
+    mcp_oauth: McpOAuthSettings | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Refuse incomplete bundles before creating a billable resource."""
@@ -205,6 +215,13 @@ class FlySecretManager(Protocol):
 
     def revoke(self, activation_id: str) -> None:
         """Idempotently make the activation's consumer credential unusable."""
+
+
+class McpOAuthRecords(Protocol):
+    """The record half of a legacy allocation's MCP OAuth roll (#1974)."""
+
+    def roll_mcp_oauth(self, activation_id: str) -> McpOAuthSettings:
+        """Write the configured settings into one activation's stored record."""
 
 
 class RefusingSecretManager:
@@ -410,6 +427,73 @@ class FlyProviderDriver:
         if str(ready.get("state")) != "started":
             self._unavailable("Fly Machine readiness did not converge")
         return reference, ready
+
+    def roll_mcp_oauth(
+        self,
+        allocation: RoutableAllocation,
+        records: McpOAuthRecords,
+    ) -> bool:
+        """Move one legacy allocation onto its stored MCP OAuth settings.
+
+        The documented transition of #1974, and the only one: a Machine that
+        is exactly the legacy shape (its record's environment without the two
+        settings) and stopped has *records* write the settings into its
+        encrypted record, then is updated in place — still stopped, so the
+        next route starts it — to exactly that record's environment.  A
+        Machine already exactly matching a record that has settings is left
+        alone, so a retry after an interrupted update completes it.  Anything
+        else is drift and refused before either half is written; a running
+        Machine is refused retryably, with record and Machine untouched, so it
+        keeps routing until it scales to zero.
+
+        Args:
+            allocation: The store-owned allocation to roll.
+            records: The writer of its encrypted record.
+
+        Returns:
+            ``True`` when the Machine was updated, ``False`` when it already
+            carried its record's settings.
+        """
+        reference = self._reference(allocation.activation_id)
+        if allocation.provider_allocation_id != reference.allocation_id:
+            self._rejected("provider allocation identity does not match activation")
+        self._require_app(reference)
+        machine = self._require_machine(reference)
+        volume_id = self._identifier(self._require_volume(reference), "volume")
+        stored = self._stored_secrets(allocation)
+        if stored.mcp_oauth is not None and self._machine_is_exact(
+            machine, reference, volume_id, stored
+        ):
+            return False
+        legacy = dataclasses.replace(stored, mcp_oauth=None)
+        self._verify_machine(machine, reference, volume_id, legacy)
+        if str(machine.get("state")) != "stopped":
+            self._unavailable("Fly Machine must be stopped before it is rolled")
+        records.roll_mcp_oauth(allocation.activation_id)
+        rolled = self._stored_secrets(allocation)
+        if rolled.mcp_oauth is None:
+            self._rejected("activation record carries no MCP OAuth settings")
+        self._request(
+            "POST",
+            f"/v1/apps/{reference.app_name}/machines/"
+            f"{self._identifier(machine, 'Machine')}",
+            expected=(200,),
+            payload=self._machine_request(
+                reference, volume_id=volume_id, runtime_secrets=rolled
+            ),
+        )
+        self._verify_machine(
+            self._require_machine(reference), reference, volume_id, rolled
+        )
+        return True
+
+    def _stored_secrets(self, allocation: RoutableAllocation) -> FlyRuntimeSecrets:
+        """Return the activation's stored runtime bundle for *allocation*."""
+        return self._secrets.issue(
+            allocation.activation_id,
+            allocation.consumer_identity,
+            requester_identity=allocation.requester_identity,
+        )
 
     def start(self, activation_id: str) -> None:
         """Idempotently start one allocation after caller authentication."""
@@ -851,7 +935,7 @@ class FlyProviderDriver:
         reference: _AllocationRef,
         runtime_secrets: FlyRuntimeSecrets,
     ) -> dict[str, object]:
-        """Return the managed marker, pool bundle fields and bootstrap fields.
+        """Return the managed marker, stored per-activation and bootstrap fields.
 
         Every managed Machine carries :data:`MANAGED_VAULT_ENV` (#1863). The
         non-replay path runs the image's default entry point, which
@@ -861,14 +945,19 @@ class FlyProviderDriver:
 
         The pool entries come from *runtime_secrets*, never from the fleet
         policy, so this stays a function of the activation (Decision 1 item 1).
+        The MCP resource-server settings (#1974) are read the same way, on
+        both runtimes, so ``_verify_machine`` expects them exactly when the
+        activation's record has them and never otherwise.
         """
-        pool = (
+        stored = (
             {}
             if runtime_secrets.pool is None
             else pool_runtime_env(runtime_secrets.pool)
         )
+        if runtime_secrets.mcp_oauth is not None:
+            stored = {**stored, **runtime_secrets.mcp_oauth.runtime_env()}
         if not self._policy.fly_replay_enabled:
-            return {"env": {MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER, **pool}}
+            return {"env": {MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER, **stored}}
         return {
             # Fly ignores config.user; process overrides need both the user
             # and command rather than inheriting config.init.exec.
@@ -889,7 +978,7 @@ class FlyProviderDriver:
                 "CREEK_CONTAINER_EXPECTED_FLY_APP": reference.app_name,
                 "CREEK_CONTAINER_EXPECTED_FLY_REGION": self._policy.region,
                 MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER,
-                **pool,
+                **stored,
             },
             "init": {},
         }
@@ -916,9 +1005,22 @@ class FlyProviderDriver:
         volume_id: str,
         runtime_secrets: FlyRuntimeSecrets,
     ) -> None:
+        if not isinstance(machine.get("config"), dict):
+            self._rejected("Fly Machine has no inspectable config")
+        if not self._machine_is_exact(machine, reference, volume_id, runtime_secrets):
+            self._rejected("Fly Machine does not match allocation policy")
+
+    def _machine_is_exact(
+        self,
+        machine: Mapping[str, Any],
+        reference: _AllocationRef,
+        volume_id: str,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> bool:
+        """Return whether *machine* is exactly *runtime_secrets*' allocation."""
         config = machine.get("config")
         if not isinstance(config, dict):
-            self._rejected("Fly Machine has no inspectable config")
+            return False
         metadata = config.get("metadata")
         files = config.get("files")
         expected_files = [
@@ -940,7 +1042,7 @@ class FlyProviderDriver:
             "services",
             *runtime,
         }
-        if (
+        return not (
             machine.get("name") != reference.machine_name
             or machine.get("region") != self._policy.region
             or set(config) != expected_config_keys
@@ -966,8 +1068,7 @@ class FlyProviderDriver:
             or any(key in config for key in {"env", "init", "user"} - runtime.keys())
             or not self._machine_service_is_exact(config.get("services"))
             or files != expected_files
-        ):
-            self._rejected("Fly Machine does not match allocation policy")
+        )
 
     def _machine_mount_is_exact(
         self,
@@ -1030,7 +1131,7 @@ class FlyProviderDriver:
         public = self._policy.routing_public_url
         if public is None:
             self._rejected("public routing URL is not configured")
-        return f"{public.rstrip('/')}/v1"
+        return public_vault_url(public)
 
     def _delete_machine(
         self,

@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.22.0",
+  "contract_version": "0.23.0",
   "files": [
     {
       "capability": "agent-activity",
@@ -62,7 +62,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "edb786df8a4d0938a2abac9645cd9e3b5cf593c918df1efafcd46fa167cdd6f9",
+      "sha256": "533ef8d23b5b00389a76c99bad6e9b10c805f423ed4f8adc0ad96f246456edae",
       "state": "empty"
     },
     {
@@ -90,7 +90,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "0c6b072663dfce10f84c426c71e6a16f35791835d04c0e281b571d9387395fc9",
+      "sha256": "9b59fb2ad4a7870c250bfeacbfd7b1a94cfc0857e5a0065c3ea740ad7172d175",
       "state": "success"
     },
     {

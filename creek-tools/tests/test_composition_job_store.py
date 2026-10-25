@@ -37,7 +37,7 @@ _CONSUMER = "agent-one"
 
 def _running(
     vault: Path,
-    kind: Literal["classification", "link", "draft", "author"],
+    kind: Literal["classification", "link", "draft", "author", "revoice"],
     *,
     consumer: str = _CONSUMER,
 ) -> StoredJob:
@@ -56,9 +56,9 @@ def _running(
     return claimed
 
 
-@pytest.mark.parametrize("kind", ["draft", "author"])
+@pytest.mark.parametrize("kind", ["draft", "author", "revoice"])
 def test_a_composition_job_round_trips_its_content_free_result(
-    tmp_path: Path, kind: Literal["draft", "author"]
+    tmp_path: Path, kind: Literal["draft", "author", "revoice"]
 ) -> None:
     """A finished composition job reads back with the dict it was given."""
     record = _running(tmp_path, kind)
@@ -158,15 +158,17 @@ def test_another_consumers_composition_job_reads_none(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("kind", ["draft", "author", "revoice"])
 def test_the_v1_projection_refuses_a_composition_job_without_failing_it(
     tmp_path: Path,
+    kind: Literal["draft", "author", "revoice"],
 ) -> None:
     """``GET /v1/jobs`` has no draft shape, and must not recover the record.
 
     It is asked under a *different* worker id with an empty active set — the
     exact conditions under which recovery would rewrite the record as failed.
     """
-    record = _running(tmp_path, "draft")
+    record = _running(tmp_path, kind)
     assert (
         status_for(
             tmp_path,

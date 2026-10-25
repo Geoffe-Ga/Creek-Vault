@@ -854,6 +854,7 @@ class Bench:
                 lambda _tier, *, max_tokens: lambda _prompt: _REFLECT_CANARY
             ),
             author_llm_factory=_author_llm_double,
+            revoice_llm_factory=_author_llm_double,
         )
         args = {
             key: value.format(**slots) if isinstance(value, str) else value
@@ -1652,6 +1653,24 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
                 "must be absent from it"
             ),
             kwargs={"query": "creek and stone", "dry_run": True, **_ALL},
+            seeded=True,
+        ),
+    ),
+    "creek.revoice": Surface(
+        shape=Shape.REPORTS,
+        why="Transforms caller-supplied text in the owner's voice (#1981)",
+        derived_from=(
+            "creek_mcp.server:build_server",
+            "creek.author.voice:split_revoice_prompt",
+        ),
+        kwargs={"text": "creek and stone", **_ALL},
+        effect=Effect(prints=(_AUTHOR_CANARY,)),
+        contrast=Contrast(
+            why=(
+                "blank supplied text is rejected before constructing a model, "
+                "so the model's voice canary must be absent"
+            ),
+            kwargs={"text": "", **_ALL},
             seeded=True,
         ),
     ),

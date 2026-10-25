@@ -94,7 +94,8 @@ _ROW_KEYS: Final[frozenset[str]] = frozenset({"consumer", "tool", "at", "outcome
 _ENVELOPE_KEYS: Final[frozenset[str]] = frozenset(
     {"status", "tier_ceiling", "skipped", "rows"}
 )
-_PREVIOUS_MINOR: Final[str] = "0.21"
+_ACTIVITY_MINOR: Final[str] = "0.22"
+_BEFORE_ACTIVITY_MINOR: Final[str] = "0.21"
 _BASE_INSTANT: Final[datetime] = datetime(2026, 10, 24, 17, 0, 0, tzinfo=UTC)
 _LONG_STRING: Final[str] = "a body the activity card must never show " * 4
 
@@ -429,28 +430,32 @@ def test_a_dispatched_mcp_call_shows_as_admitted(
     ]
 
 
-def test_a_jwt_agent_is_shown_under_its_subject(
+def test_jwt_agents_with_one_pinned_subject_have_distinct_activity(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An OAuth agent (#1963) is on the card under its ``sub``, admitted and refused.
-
-    The token is minted and verified by the real resource-server verifier, so
-    the stamp is whatever that verifier hands the audit log: the ``sub``, never
-    the registered OAuth ``client_id``, and never any other claim.
-    """
-    verified = asyncio.run(agent_verifier().verify_token(mint()))
+    """Each agent joins directly to its grant's client id despite a shared subject."""
+    verifier = agent_verifier(expected_subject=AGENT_SUBJECT)
+    verified = asyncio.run(verifier.verify_token(mint()))
     assert verified is not None
     server = _remote_server(vault, monkeypatch, verified)
     asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}))
     asyncio.run(server.call_tool("creek.link", {"stage": "temporal"}))
+    cimd_client = "https://claude.ai/oauth/claude-code-client-metadata"
+    second = asyncio.run(verifier.verify_token(mint(client_id=cimd_client)))
+    assert second is not None
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: second)
+    asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}))
     response = _get(vault)
     assert [
         (row["consumer"], row["tool"], row["outcome"]) for row in _rows(response)
     ] == [
-        (AGENT_SUBJECT, "creek.link", "refused"),
-        (AGENT_SUBJECT, "creek.wheel", "admitted"),
+        (cimd_client, "creek.wheel", "admitted"),
+        (AGENT_CLIENT_ID, "creek.link", "refused"),
+        (AGENT_CLIENT_ID, "creek.wheel", "admitted"),
     ]
-    assert AGENT_CLIENT_ID not in response.text
+    assert AGENT_SUBJECT not in response.text
+    assert envelope(response)["skipped"] == 0
+    verify_mcp_audit_chain(vault)
 
 
 # --------------------------------------------------------------------------- #
@@ -765,23 +770,23 @@ def test_an_unconfigured_vault_is_unavailable(
     assert response.status_code == _UNAVAILABLE
 
 
-def test_the_capability_is_published_at_the_new_minor() -> None:
-    """``agent-activity`` is a contract-minor addition, not a silent widening."""
-    assert CAPABILITY_SINCE_MINOR[Capability.AGENT_ACTIVITY] == CONTRACT_MINOR
+def test_the_capability_keeps_its_published_introduction_minor() -> None:
+    """Later MCP-only bumps cannot move when HTTP activity becomes reachable."""
+    assert CAPABILITY_SINCE_MINOR[Capability.AGENT_ACTIVITY] == _ACTIVITY_MINOR
     assert Capability.AGENT_ACTIVITY.value == "agent-activity"
 
 
 def test_a_caller_below_the_minor_is_refused(vault: Path) -> None:
     """A ``0.21`` consumer never negotiated the route and cannot reach it."""
-    response = _get(vault, minor=_PREVIOUS_MINOR)
+    response = _get(vault, minor=_BEFORE_ACTIVITY_MINOR)
     assert response.status_code == _INCOMPATIBLE_VERSION
     assert envelope(response)["code"] == ErrorCode.INCOMPATIBLE_VERSION.value
 
 
 @pytest.mark.parametrize(
     ("minor", "advertised"),
-    [(_PREVIOUS_MINOR, False), (CONTRACT_MINOR, True)],
-    ids=["previous-minor", "current-minor"],
+    [(_BEFORE_ACTIVITY_MINOR, False), (_ACTIVITY_MINOR, True), (CONTRACT_MINOR, True)],
+    ids=["before-introduction", "introduction-minor", "current-minor"],
 )
 def test_the_handshake_advertises_it_only_from_the_minor(
     vault: Path, minor: str, advertised: bool

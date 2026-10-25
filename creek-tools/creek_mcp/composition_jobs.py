@@ -1,18 +1,19 @@
 """Progress, a server deadline and a job-handle fallback for compositions (#1966).
 
-``creek.draft`` and ``creek.author`` compose on the vault's own model stack,
+``creek.draft``, ``creek.author`` and ``creek.revoice`` compose on the vault's
+own model stack,
 and on a pinned local model that can take minutes. MCP clients own their own
 request timeouts — OpenClaw's documented example is 20 s, the Fly edge drops an
 idle connection well before a cold model finishes — so a synchronous tool call
 that simply runs to completion dies to somebody else's clock. This module is
-the one place those two tools run through instead:
+the one place these compositions run through instead:
 
 1. **Admission.** One active composition per consumer, the #1605 rule ``/v1``
    already applies to its detached pipeline jobs, decided on the same
    :class:`~creek_mcp.httpapi.job_runtime.JobRuntime`. A second long call
    while one runs gets :func:`~creek_mcp.tools.jobs.unavailable_refusal`.
 2. **A durable record from the first moment.** The call is written as a
-   ``draft`` / ``author`` :class:`~creek_mcp.httpapi.jobs.StoredJob` — the
+   ``draft`` / ``author`` / ``revoice`` :class:`~creek_mcp.httpapi.jobs.StoredJob` — the
    ``/v1`` record type, in the ``/v1`` job directory — and claimed
    ``running`` before any composing starts, so a server that dies mid-call
    leaves a record the restart rule marks ``failed`` rather than nothing.
@@ -26,6 +27,11 @@ the one place those two tools run through instead:
    answers ``{status: "accepted", job_id, state: "running"}`` and the same
    worker keeps composing, writing the draft to ``07-Voice/Drafts/`` and then
    the job's content-free result, which ``creek.jobs.read`` serves.
+
+Revoice is the exception to draft persistence: its durable result carries only
+counts. Successful detached bodies live in a bounded process-local cache, and
+``read`` adds them only after checking the original agent and declared ceiling.
+They are never written to the vault and are unavailable after restart.
 
 **Who wins a near-tie is decided once, under one lock.** The worker finishing
 and the deadline firing can race. :class:`_Handoff` settles it: whichever
@@ -43,7 +49,7 @@ import logging
 import math
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeAlias
 
@@ -54,11 +60,14 @@ from creek_mcp.audit import (
     MCPAuditLog,
 )
 from creek_mcp.httpapi.jobs import claim_job, create_job, finish_job
+from creek_mcp.revoice_results import RevoiceResults
 from creek_mcp.tools.author import AUTHOR_STAGES, author_job_result, save_authored_draft
 from creek_mcp.tools.author import TOOL_NAME as AUTHOR_TOOL_NAME
 from creek_mcp.tools.draft import DRAFT_STAGES, draft_job_result
 from creek_mcp.tools.draft import TOOL_NAME as DRAFT_TOOL_NAME
 from creek_mcp.tools.jobs import jobs_read_tool, unavailable_refusal
+from creek_mcp.tools.revoice import REVOICE_STAGES
+from creek_mcp.tools.revoice import TOOL_NAME as REVOICE_TOOL_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -85,8 +94,8 @@ model's draft comes back in one call, short enough that the call itself is
 never the thing that times out.
 """
 
-CompositionKind: TypeAlias = Literal["draft", "author"]
-"""The two :class:`~creek_mcp.httpapi.jobs.StoredJob` kinds this module writes."""
+CompositionKind: TypeAlias = Literal["draft", "author", "revoice"]
+"""The three :class:`~creek_mcp.httpapi.jobs.StoredJob` kinds this module writes."""
 
 
 class _Work(Protocol):
@@ -113,7 +122,7 @@ _ProgressSink: TypeAlias = (
 
 @dataclass(frozen=True)
 class CompositionCall:
-    """One ``creek.draft`` / ``creek.author`` call, ready to run.
+    """One model-backed desk composition, ready to run.
 
     Attributes:
         tool: The tool's MCP name.
@@ -220,6 +229,44 @@ def author_call(
         work=work,
         settle=partial(_settle_author, vault),
     )
+
+
+def revoice_call(
+    work: _Work, *, consumer: str, ceiling: TierCeiling
+) -> CompositionCall:
+    """Wrap a rewrite in composition admission/progress without saving its body.
+
+    Args:
+        work: The revoice adapter with everything but its progress sink bound.
+        consumer: The authenticated initiating agent.
+        ceiling: The caller's declared ceiling.
+
+    Returns:
+        A revoice-kind call whose durable result carries only character counts.
+    """
+    return CompositionCall(
+        tool=REVOICE_TOOL_NAME,
+        kind="revoice",
+        consumer=consumer,
+        ceiling=ceiling,
+        stages=REVOICE_STAGES,
+        work=work,
+        settle=_settle_revoice,
+    )
+
+
+def _settle_revoice(
+    response: dict[str, Any], *, detached: bool
+) -> dict[str, Any] | None:
+    """Project only counts; detached text is retained separately in memory."""
+    del detached
+    if response.get("status") != "ok":
+        return None
+    return {
+        "status": "ok",
+        "tool": REVOICE_TOOL_NAME,
+        "output_chars": len(response["text"]),
+    }
 
 
 def _settle_draft(response: dict[str, Any], *, detached: bool) -> dict[str, Any] | None:
@@ -351,11 +398,13 @@ class CompositionJobs:
         runtime: The process's job runtime — shareable with a ``/v1`` app in
             the same process, so one consumer holds one slot across both.
         deadline_seconds: How long a call may compose synchronously.
+        revoice_results: Bounded process-local detached rewrites; never persisted.
     """
 
     vault: Path
     runtime: JobRuntime
     deadline_seconds: float
+    revoice_results: RevoiceResults = field(default_factory=RevoiceResults)
 
     async def run(self, call: CompositionCall, ctx: Context) -> dict[str, Any]:
         """Run *call*, answering synchronously or with a job handle.
@@ -414,7 +463,7 @@ class CompositionJobs:
         # Snapshot on the loop: the worker thread reading the record gets an
         # immutable value, never the loop-owned set.
         active = frozenset(self.runtime.active_job_ids)
-        return await asyncio.to_thread(
+        response = await asyncio.to_thread(
             partial(
                 jobs_read_tool,
                 vault_path=self.vault,
@@ -425,6 +474,13 @@ class CompositionJobs:
                 consumer=consumer,
             )
         )
+        result = response.get("result")
+        if isinstance(result, dict) and result.get("tool") == REVOICE_TOOL_NAME:
+            body = self.revoice_results.get(job_id, consumer=consumer, ceiling=ceiling)
+            if body is None:
+                return unavailable_refusal("creek.jobs.read", ceiling)
+            response["result"] = body
+        return response
 
     def _open(self, call: CompositionCall) -> StoredJob | None:
         """Durably create *call*'s job record and claim it ``running``."""
@@ -454,6 +510,17 @@ class CompositionJobs:
             self._close(call, record, None, detached=handoff.finish())
             raise
         detached = handoff.finish()
+        if (
+            call.tool == REVOICE_TOOL_NAME
+            and detached
+            and response.get("status") == "ok"
+        ):
+            self.revoice_results.put(
+                record.job_id,
+                consumer=call.consumer,
+                ceiling=call.ceiling,
+                response=response,
+            )
         self._close(call, record, self._settled(call, response, detached), detached)
         return response
 

@@ -272,7 +272,38 @@ confinement boundary.
 | Tool           | Inputs                                                                  | Purpose                                                                       |
 |----------------|------------------------------------------------------------------------|-------------------------------------------------------------------------------|
 | `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). |
-| `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` job handle to `{status, job_id, state, result?}`. |
+| `creek.revoice` | `text`, `register?`, `phase?` | Rewrite supplied text in the owner's voice, preserving meaning and claims without saving. Requires `vault:desk`. |
+| `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` / `creek.revoice` job handle to `{status, job_id, state, result?}`. |
+
+### Revoice supplied text
+
+`creek.revoice(text, register?, phase?, privacy_tier_ceiling?)` transforms the
+caller's draft rather than composing from vault evidence. It reads only the
+voice-core and requested canonical phase/register skills. Its cached system
+prefix contains the care policy and skills; its dynamic prompt marks the text
+as untrusted data and requires meaning, claims, qualifications, attribution and
+biographical facts to stay unchanged. No fragments are retrieved and no draft
+is written. Missing voice-core is allowed: the call uses the care policy alone
+and reports `voice_skills: []` rather than claiming a learned voice.
+
+Input is limited to 16,000 characters. Empty text and unknown canonical slugs
+return `status: "error"` before a model is built. The tier-keyed factory routes
+from the declared ceiling, so `intimate`/`all` is local-only or refused; remote
+callers retain their existing cap below intimate. A success returns
+`{status, tool, tier_ceiling, text, voice_skills, usage}` and an optional
+`inference_source`. Incomplete, empty or oversized model output is an error.
+Only input/output character counts enter this tool's audit entry.
+
+The composition wrapper reports `skills` then `composed`, with the same deadline
+and one-active-composition-per-agent rule as draft/author. A detached rewrite
+returns a job handle. `creek.jobs.read` returns its text only to the original
+agent at a ceiling at least as sensitive as the original call. Results are
+readable for ten minutes in a per-server cache holding at most 32 successful
+rewrites; expired entries are removed on the next cache operation. Expiry,
+eviction and process restart return the same unavailable refusal. Durable job
+records retain only status and output character count, never either passage.
+
+### Author from vault evidence
 
 Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
 `medium`, `query`, `body`, `provenance` (a list of provenance entries),
@@ -349,7 +380,7 @@ excludes the offending fragment, or re-tier the fragment.
 A draft on the vault's pinned local model can take minutes, and MCP clients
 own their own request timeouts (OpenClaw's documented example is 20 s; the Fly
 edge drops an idle connection long before a cold model finishes). So
-`creek.draft` and `creek.author` run through `creek_mcp/composition_jobs.py`:
+`creek.draft`, `creek.author` and `creek.revoice` run through `creek_mcp/composition_jobs.py`:
 
 - **Progress.** A client that sends a `progressToken` receives one
   `notifications/progress` per stage boundary the pipeline crosses. The
@@ -1096,7 +1127,7 @@ either.
 
 ### Slow tools: set the client timeout above the deadline
 
-`creek.draft` and `creek.author` answer within `CREEK_MCP_SYNC_DEADLINE_SECONDS`
+`creek.draft`, `creek.author` and `creek.revoice` answer within `CREEK_MCP_SYNC_DEADLINE_SECONDS`
 (default `90`) or hand back a job handle — `{status: "accepted", job_id, state:
 "running"}` — while the draft keeps composing on the vault; the agent then calls
 `creek.jobs.read(job_id)` until `state` is `succeeded` or `failed`. See
@@ -1119,7 +1150,7 @@ which, for agents signed in through Adepthood, means one per *person* until
 
 ### A writer's own model key
 
-`creek.draft`, `creek.author` and `creek.reflect` honour the
+`creek.draft`, `creek.author`, `creek.revoice` and `creek.reflect` honour the
 `X-Creek-Provider` / `X-Creek-Provider-Key` pair on a managed vault, and
 `creek.handshake` reports which vendors this vault would spend a key on
 (`request_key_providers`). Only a client that can set custom headers can send
@@ -1134,12 +1165,11 @@ its grants in plain words, when it was last used (stamped at sign-in and at each
 refresh, not on each call), and **Stop**. A content-free list of what each agent
 asked the vault for is the vault's `GET /v1/agent-activity` (contract `0.22.0`,
 see [`api.md`](api.md)); the Settings card that shows it is Adepthood's, and is
-forthcoming (adepthood#3535, not yet merged). One limit applies: the vault's audit log names
-the token's subject, which is the *person*, so until
-[#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976) lands every agent
-one person connects through Adepthood is recorded under the same consumer, and
-the activity rows cannot yet say which agent made a call. A static-token agent is
-recorded under its own consumer name.
+implemented in adepthood#3542. An OAuth agent's audit stamp is its RFC 9068
+`client_id` verbatim (#1976), so the card joins it directly to the agent's grant,
+including a CIMD client identified by its metadata URL. Its `sub` still names
+the person for vault routing and the managed-vault subject pin. A static-token
+agent is recorded under its configured consumer name.
 
 ### Client-support matrix (verified 2026-10-24)
 
@@ -1170,13 +1200,15 @@ clients from a primary source on this date.
 
 ### Known gaps on 2026-10-24
 
-- **Managed vaults cannot take agent tokens yet.** The edge routes an agent's
-  token by subject (`--oauth-authorization-server` on the replay router), but the
-  vault Machine is not yet handed `CREEK_MCP_RESOURCE_URL` and
-  `CREEK_MCP_AUTHORIZATION_SERVER`, so it refuses the token
-  ([#1974](https://github.com/Geoffe-Ga/Creek-Vault/issues/1974)). Adepthood also
-  shows no address for a managed vault. Until both land, the recipes work against
-  a self-hosted vault only.
+- **Managed vaults provisioned before #1974 cannot take agent tokens until
+  rolled.** A pilot started with `--oauth-authorization-server` now writes
+  `CREEK_MCP_RESOURCE_URL` and `CREEK_MCP_AUTHORIZATION_SERVER` into every vault
+  Machine it provisions
+  ([#1974](https://github.com/Geoffe-Ga/Creek-Vault/issues/1974)); a vault
+  provisioned earlier keeps refusing the token until the operator rolls it
+  ([provisioning-control-plane.md](provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974)).
+  Adepthood also shows no address for a managed vault yet, so the recipes are
+  verified against a self-hosted vault only.
 - **OpenClaw's OAuth sign-in stops after registration.** Adepthood's
   registration response carries `"logo_uri": null` when the client sent no logo,
   and the MCP TypeScript SDK that OpenClaw 2026.10.7 ships (1.32.0) rejects a
@@ -1185,8 +1217,6 @@ clients from a primary source on this date.
   response in transit; it needs a fix on Adepthood's side. Claude Code is not
   affected, because it registers by metadata document rather than by
   registration.
-- **Per-agent attribution** waits on
-  [#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976), as above.
 
 ## Network transport (authenticated, epic #757 / #759 / #837)
 
@@ -1422,7 +1452,7 @@ claude mcp add --transport http creek https://<vault-host>/mcp \
 
 ### A writer's own model key on `/mcp` (#1967)
 
-`creek.draft`, `creek.author` and `creek.reflect` honour the two
+`creek.draft`, `creek.author`, `creek.revoice` and `creek.reflect` honour the two
 [ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)
 headers `/v1` already takes on its model-calling routes, on any call that
 arrives over the network transport (stdio never reads them):
@@ -1541,11 +1571,22 @@ An access token is accepted only when **all** of these hold
   `CREEK_MCP_RESOURCE_URL` **exactly** — one string, not a list, so a token
   for another vault is refused;
 - `exp`, `nbf` and `iat` hold within 30 s of skew, and `iss`, `sub`, `aud`,
-  `exp`, `iat` are all present;
+  `exp`, `iat`, `client_id` are all present;
+- RFC 9068 `client_id` is a non-blank string of 1–256 characters with no ASCII
+  control character (`U+0000`–`U+001F` or `U+007F`), exactly the existing
+  `agent-activity` consumer bound. It is never trimmed or truncated. A missing
+  or invalid id is refused; there is no legacy fallback to `sub`. Obtain a
+  fresh token from an issuer that supplies the claim (refresh or sign in again);
 - on a managed vault, `sub` is the vault's own consumer identity.
 
-The token's `sub` becomes the consumer (on the audit log, the access log and
-the tier cap) and its `scope` claim the grants, read exactly as a static
+The token's `client_id` becomes the consumer on the audit and access logs,
+the job owner and the per-consumer job slot. Adepthood already issues this
+claim (adepthood#3533), and its activity card joins it exactly to
+`agent_grant.client_id`. The verified `sub` stays separate: it alone selects
+the person's vault at the shared edge and satisfies the managed subject pin.
+Historical audit rows keep their original subject-only stamp; no agent is guessed
+for an older entry, and the existing `0.22.0` consumer pattern and bound do not move.
+The `scope` claim still supplies the grants, read exactly as a static
 token's grant suffix is. `creek:ungated` in a token is ignored. The remote tier
 cap applies unchanged, so a JWT caller asking for `intimate` is refused with
 the same reason any remote caller gets. Static consumer tokens keep working on
@@ -1559,6 +1600,21 @@ On the managed-vault Fly edge the replay router answers the metadata itself,
 challenges a refused `/mcp` call toward it, and — given
 `--oauth-authorization-server` (`CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER`) —
 routes an agent's token on `/mcp` by its verified `sub` to that person's vault.
+
+**Managed vaults (#1974).** The same issuer setting makes the provisioning
+worker write both settings into every vault Machine it provisions, from the
+activation's own encrypted record. `CREEK_MCP_RESOURCE_URL` is the vault URL
+handed to Adepthood with `/v1` replaced by `/mcp` — exactly the derivation
+Adepthood applies to that URL, so the audience it mints is the resource the
+vault verifies (`creek_mcp/provisioning/models.py::mcp_resource_url`). On the
+pilot every vault shares `https://<pilot>.fly.dev/mcp`, so each vault keeps
+pinning `sub` to its own consumer identity, and per-agent identity rides the
+token's `client_id` claim. The Machine is verified against its record exactly:
+with settings, only the environment that carries both values routes; without
+(any vault provisioned before #1974), only the legacy environment does. A
+vault provisioned earlier is moved across by
+`--roll-mcp-oauth REQUESTER CONSUMER` once its Machine is stopped; see
+[provisioning-control-plane.md](provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974).
 
 ### Rotating a consumer's secret (no downtime)
 

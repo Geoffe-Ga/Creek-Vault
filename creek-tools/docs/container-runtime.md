@@ -212,6 +212,22 @@ even if a consent variable, or the removal of the marker, appears after boot.
 A self-connected container never carries the marker, so its owner's
 `CREEK_CLOUD_CONSENT` opt-in keeps working exactly as before.
 
+**An OAuth resource server for Adepthood-authorized agents (#1974).** When
+the control plane is configured with Adepthood's issuer, every vault it
+provisions also carries `CREEK_MCP_RESOURCE_URL` and
+`CREEK_MCP_AUTHORIZATION_SERVER` in its Machine config, so its `/mcp` accepts
+an agent's access token and its
+`/.well-known/oauth-protected-resource/mcp` names its own resource URL and
+Adepthood's issuer ([mcp.md](mcp.md#signing-in-through-adepthood-oauth-on-mcp-1963)).
+The resource URL is the vault URL handed to Adepthood with `/v1` replaced by
+`/mcp` — on the pilot, `https://<pilot>.fly.dev/mcp`, shared by every pilot
+vault — so the marker's subject pin is what keeps one person's token off
+another's vault: a managed vault accepts only a token whose `sub` is the
+consumer identity its mounted secret names. Both values come from the
+activation's own encrypted record, not fleet policy, and a vault provisioned
+before #1974 carries neither until it is rolled
+([provisioning-control-plane.md](provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974)).
+
 **Amended 2026-10-16 ([ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)):
 a writer's request-scoped key.** The latch above governs the *operator's*
 cloud key and still holds. A `/v1` request that carries the writer's own key

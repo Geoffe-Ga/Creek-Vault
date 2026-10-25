@@ -48,6 +48,7 @@ from creek_mcp.api.routes import PROVIDER_HEADER, PROVIDER_KEY_HEADER
 from creek_mcp.tools.author import TOOL_NAME as AUTHOR_TOOL_NAME
 from creek_mcp.tools.draft import TOOL_NAME as DRAFT_TOOL_NAME
 from creek_mcp.tools.reflect import TOOL_NAME as REFLECT_TOOL_NAME
+from creek_mcp.tools.revoice import TOOL_NAME as REVOICE_TOOL_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -55,11 +56,11 @@ if TYPE_CHECKING:
     from creek.classify.llm.request_key import RequestKey
 
 REQUEST_KEY_TOOLS: Final[frozenset[str]] = frozenset(
-    {DRAFT_TOOL_NAME, AUTHOR_TOOL_NAME, REFLECT_TOOL_NAME}
+    {DRAFT_TOOL_NAME, AUTHOR_TOOL_NAME, REFLECT_TOOL_NAME, REVOICE_TOOL_NAME}
 )
 """The MCP tools that honour a writer's request-scoped key.
 
-The three that call the vault's ``generation`` model on a writer's behalf,
+The four that call the vault's ``generation`` model on a writer's behalf,
 mirroring ``/v1``'s :attr:`~creek_mcp.api.routes.RouteSpec.accepts_request_key`
 opt-in. ``creek.compile`` and ``creek.classify`` are corpus-pipeline verbs no
 default agent profile reaches, and they are not opted in.

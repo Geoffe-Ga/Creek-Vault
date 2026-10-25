@@ -9,6 +9,37 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Add `creek.revoice` at contract `0.23.0` (#1981). It rewrites caller-supplied
+  text through the owner's voice skills with an explicit meaning-preservation
+  prompt, routes by the declared ceiling through the existing model factory,
+  and requires `vault:desk`. It retrieves no fragments and saves no draft.
+  Only input/output character counts enter the audit chain. Detached results
+  are readable through `creek.jobs.read` for ten minutes in bounded memory,
+  bound to the initiating agent and an adequate ceiling; restart/expiry/eviction
+  return unavailable. The `/v1` surface is unchanged and `0.22` remains served.
+
+- Attribute OAuth agents by the RFC 9068 `client_id` claim (#1976), preserving
+  the verified `sub` separately for managed-vault routing and its subject pin.
+  The activity card can join each audit consumer directly to Adepthood's
+  `agent_grant.client_id`, including CIMD URLs. Require a non-blank client id
+  within the existing one-line, 256-character activity bound; missing or invalid
+  means refused with no subject fallback. Static consumers, scope grants and
+  the `0.22.0` wire schema are unchanged.
+
+- Write `CREEK_MCP_RESOURCE_URL` and `CREEK_MCP_AUTHORIZATION_SERVER` per
+  managed allocation (#1974). Given `--oauth-authorization-server` (the
+  pilot's `CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER`), the provisioning worker
+  stores both values in each new activation's encrypted bundle and the Fly
+  driver writes them into the Machine environment on both runtimes, so a
+  managed vault's `/mcp` serves Adepthood-authorized agents and its
+  protected-resource metadata names its own resource and Adepthood's issuer.
+  The resource is the handed-off `/v1` URL with `/v1` replaced by `/mcp`, the
+  derivation Adepthood applies (`mcp_resource_url`). Verification stays exact
+  per activation: a record without the values — every allocation provisioned
+  earlier — verifies only its legacy environment and keeps routing, and
+  `--roll-mcp-oauth REQUESTER CONSUMER` moves one stopped legacy Machine across
+  (record, then an in-place Machine update). The `sub` pin is unchanged.
+
 - Document connecting an agent to a vault (#1969). `docs/mcp.md` gains an
   "Agents" section for the vault's owner: what the default `vault:read
   vault:desk` profile reaches and never reaches, the address to paste, signing

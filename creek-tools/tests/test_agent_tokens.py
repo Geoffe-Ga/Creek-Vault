@@ -44,6 +44,7 @@ from creek_mcp.oauth_resource import AUTHORIZATION_SERVER_ENV, RESOURCE_URL_ENV
 from creek_mcp.policy import UNGATED, UNGATED_SCOPE, Grant, granted_by_scopes
 from creek_mcp.remote_auth import REMOTE_SCOPE, ConsumerTokenVerifier
 from tests.agent_token_support import (
+    AGENT_CLIENT_ID,
     AGENT_SUBJECT,
     EC_KID,
     ISSUER,
@@ -108,7 +109,7 @@ def test_a_token_for_this_vault_is_accepted(key: Any) -> None:
     access = _verify(mint(key()))
 
     assert access is not None
-    assert access.client_id == AGENT_SUBJECT
+    assert access.client_id == AGENT_CLIENT_ID
     assert access.subject == AGENT_SUBJECT
     assert access.resource == RESOURCE_URL
     assert access.scopes == [REMOTE_SCOPE, "vault:read", "vault:desk"]
@@ -258,7 +259,7 @@ def test_a_token_issued_in_the_future_is_refused() -> None:
     assert _verify(mint(iat=int(time.time()) + 600)) is None
 
 
-@pytest.mark.parametrize("claim", ["iss", "sub", "aud", "exp", "iat"])
+@pytest.mark.parametrize("claim", ["iss", "sub", "aud", "exp", "iat", "client_id"])
 def test_a_token_missing_a_required_claim_is_refused(claim: str) -> None:
     """Every claim the verifier relies on is required.
 
@@ -276,6 +277,49 @@ def test_a_subject_that_names_nobody_is_refused(sub: object) -> None:
         sub: A blank or non-string subject.
     """
     assert _verify(mint(sub=sub)) is None
+
+
+@pytest.mark.parametrize(
+    "client_id",
+    [
+        "",
+        "   ",
+        91,
+        True,
+        [],
+        "a\nb",
+        "a\rb",
+        "a\tb",
+        "a\x00b",
+        "a\x1fb",
+        "a\x7fb",
+        "c" * 257,
+    ],
+)
+def test_an_invalid_agent_client_id_is_refused(client_id: object) -> None:
+    """An agent stamp obeys the activity contract's one-line, 256-character bound.
+
+    Args:
+        client_id: An identity that cannot be rendered as an activity consumer.
+    """
+    assert _verify(mint(client_id=client_id)) is None
+
+
+@pytest.mark.parametrize(
+    "client_id",
+    ["c" * 256, " cl_8a ", "https://claude.ai/oauth/claude-code-client-metadata"],
+)
+def test_an_agent_client_id_is_preserved_verbatim(client_id: str) -> None:
+    """The stamp joins to the issuer's client id, including CIMD URLs, without trimming.
+
+    Args:
+        client_id: A valid identity inside the published consumer bound.
+    """
+    access = _verify(mint(client_id=client_id), expected_subject=AGENT_SUBJECT)
+
+    assert access is not None
+    assert access.client_id == client_id
+    assert access.subject == AGENT_SUBJECT
 
 
 def test_a_non_string_scope_is_refused() -> None:
@@ -710,7 +754,7 @@ def test_a_jwt_authenticates_through_the_composition() -> None:
     access = asyncio.run(_composed().verify_token(mint()))
 
     assert access is not None
-    assert access.client_id == AGENT_SUBJECT
+    assert access.client_id == AGENT_CLIENT_ID
 
 
 def test_a_refused_jwt_is_not_rescued_by_the_static_registry() -> None:
