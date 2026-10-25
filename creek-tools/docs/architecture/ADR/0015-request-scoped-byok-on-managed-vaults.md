@@ -83,7 +83,13 @@ an upload, which does.
 - **Self-connected vaults are unchanged.** Without `CREEK_MANAGED_VAULT` a
   request key is parsed (and refused if malformed) but never used.
 - **Without a key, nothing changes**: the pinned local model, or the existing
-  fail-closed refusal.
+  fail-closed refusal. *Amended 2026-10-24:* for an `llm` **classification
+  job** with no key and no pinned model, a managed vault now runs the
+  model-free `rules` pass instead of failing, and reports `method: rules`.
+  Nothing is sent to any vendor, so the fail-closed property this clause
+  protects — no egress without the writer's key — is unchanged. Reflections
+  and letters still refuse. The refusal had left a production managed vault
+  with 64 failed jobs and every fragment unclassified.
 
 ### The key is held for one request and kept nowhere
 
