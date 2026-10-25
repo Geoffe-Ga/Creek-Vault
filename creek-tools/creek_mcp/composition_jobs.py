@@ -1,10 +1,9 @@
 """Progress, a server deadline and a job-handle fallback for compositions (#1966).
 
 ``creek.draft``, ``creek.author`` and ``creek.revoice`` compose on the vault's
-own model stack,
-and on a pinned local model that can take minutes. MCP clients own their own
-request timeouts — OpenClaw's documented example is 20 s, the Fly edge drops an
-idle connection well before a cold model finishes — so a synchronous tool call
+own model stack, which can take minutes with a pinned local model. MCP clients
+own their request timeouts — OpenClaw's documented example is 20 s, the Fly edge
+drops an idle connection well before a cold model finishes — so a synchronous tool call
 that simply runs to completion dies to somebody else's clock. This module is
 the one place these compositions run through instead:
 

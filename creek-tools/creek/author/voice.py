@@ -17,8 +17,11 @@ owner's voice. Two paths share one public :meth:`VoiceAgent.render`:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+import frontmatter
 
 from creek.author.skills import (
     find_phase_skill,
@@ -28,8 +31,11 @@ from creek.author.skills import (
 )
 from creek.care.guardrail import CARE_POLICY
 from creek.generate.ontology_glossary import GLOSS_STEER
+from creek.generate.skills import render_voice_signature
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from creek.author.client import AuthorLLMClient
@@ -43,6 +49,12 @@ _LIGHT_TOUCH_NOTE: str = (
     "This is a research medium: voice with a light touch — clarity over "
     "flourish. Tighten and connect the evidence; do not embellish."
 )
+
+_EXEMPLAR_BOUNDARY: re.Pattern[str] = re.compile(
+    r"^[ \t]*(?:(?:#{1,6}[ \t]*|\*\*|__)[^\n]*\bexemplars?\b|exemplars?\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+"""A custom style file stops before any recognized exemplar heading, through EOF."""
 
 
 class VoiceAgent:
@@ -215,12 +227,47 @@ class RevoicePrompt:
     voice_skills: tuple[str, ...]
 
 
+def _native_voice_signature(name: str, metadata: Mapping[str, object]) -> str:
+    """Project a recognized native cache onto canonical source-free style."""
+    category, key = ("meta", name) if name == "voice-core" else name.split("-", 1)
+    expected = {"type": "skill", "category": category, "key": key}
+    if not all(metadata.get(field) == value for field, value in expected.items()):
+        return ""
+    if metadata.get("variant") not in ("skill", "signature"):
+        return ""
+    return render_voice_signature(name)
+
+
+def _revoice_style(name: str, text: str) -> str:
+    """Keep native source bytes out, and trust only source-free custom style.
+
+    Generated caches are reconstructed, never delimiter-parsed. A malformed
+    native-like file is withheld instead of falling back to raw content.
+    Custom owner-authored style is the trusted customization surface; any
+    recognized exemplar boundary discards everything following it, including
+    later headings that could have come from the exemplar itself.
+    """
+    try:
+        post = frontmatter.loads(text)
+    except FRONTMATTER_LOAD_ERRORS:
+        return ""
+    native = any(
+        field in post.metadata for field in ("category", "variant", "generated_date")
+    ) or re.search(r"\*\*Variant:\s*(?:SKILL|SIGNATURE)", text, re.IGNORECASE)
+    if native:
+        return _native_voice_signature(name, post.metadata)
+    boundary = _EXEMPLAR_BOUNDARY.search(text)
+    return text[: boundary.start()].strip() if boundary is not None else text
+
+
 def split_revoice_prompt(
     text: str, vault: Path, *, phase: str | None, register: str | None
 ) -> RevoicePrompt:
     """Build an owner's-voice transformation prompt without retrieving evidence.
 
-    Skills condition style alone, never facts. Without a readable voice core,
+    Native generated skills are projected onto source-free signatures, never
+    their cached corpus exemplars. Source-free custom owner style remains the
+    trusted customization surface. Without a readable voice core,
     use only the care policy: a phase/register skill on its own must not imply
     the owner's voice has been learned. Text is untrusted material to transform,
     and never enters the cacheable static prefix.
@@ -234,7 +281,11 @@ def split_revoice_prompt(
     Returns:
         The prompt halves and the exact skill names used by this snapshot.
     """
-    skills = _skill_sections(vault, phase, register)
+    skills = [
+        (name, style)
+        for name, content in _skill_sections(vault, phase, register)
+        if (style := _revoice_style(name, content))
+    ]
     if not skills or skills[0][0] != "voice-core":
         skills = []
     static = "\n\n".join([CARE_POLICY, *(content for _name, content in skills)])

@@ -286,6 +286,17 @@ biographical facts to stay unchanged. No fragments are retrieved and no draft
 is written. Missing voice-core is allowed: the call uses the care policy alone
 and reports `voice_skills: []` rather than claiming a learned voice.
 
+Native generated skills can contain private source exemplars from an earlier
+refresh. Revoice reconstructs their abstract signature in memory, retaining
+style instructions and anti-patterns while excluding every cached source title,
+id and passage at every ceiling. Malformed native metadata is withheld rather
+than sent raw. Source-free owner-authored style files are the trusted
+customization surface: reserve native `category`, `variant` and `generated_date`
+metadata for generated files, and keep source passages out of custom styles.
+A recognized exemplar heading in a custom file ends its usable style; later
+headings never resume it. Local Ollama calls receive the care/voice prefix
+alongside the dynamic passage, while supported cloud providers retain caching.
+
 Input is limited to 16,000 characters. Empty text and unknown canonical slugs
 return `status: "error"` before a model is built. The tier-keyed factory routes
 from the declared ceiling, so `intimate`/`all` is local-only or refused; remote

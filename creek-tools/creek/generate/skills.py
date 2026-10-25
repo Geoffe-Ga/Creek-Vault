@@ -1171,6 +1171,30 @@ def _skill_filename(stem: str, *, signature_only: bool) -> str:
     return f"{stem}{suffix}"
 
 
+def render_voice_signature(name: str) -> str:
+    """Render one native voice skill's abstract style without corpus or I/O.
+
+    Native phase/register caches can contain source titles, ids and passages.
+    Reconstruct their style using the signature-only renderer rather than
+    parsing boundaries an exemplar's own Markdown could imitate.
+
+    Args:
+        name: ``voice-core``, ``phase-<slug>`` or ``register-<slug>``.
+
+    Returns:
+        Canonical source-free style, or empty text for an unknown skill name.
+    """
+    generator = SkillTreeGenerator(signature_only=True)
+    if name == "voice-core":
+        return generator._render_voice_core_body()
+    category, _, key = name.partition("-")
+    if category == "phase" and key in PHASE_KEYS:
+        return generator._render_phase_body(key, [])
+    if category == "register" and key in REGISTER_KEYS:
+        return generator._render_register_body(key, [])
+    return ""
+
+
 # ---- Generator ----
 
 

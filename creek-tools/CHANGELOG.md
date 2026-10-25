@@ -13,6 +13,8 @@ to locate the originating commit for any reference below.
   text through the owner's voice skills with an explicit meaning-preservation
   prompt, routes by the declared ceiling through the existing model factory,
   and requires `vault:desk`. It retrieves no fragments and saves no draft.
+  Native cached skills are projected onto exemplar-free signatures before
+  inference, and local Ollama retains the care and voice prompt prefix.
   Only input/output character counts enter the audit chain. Detached results
   are readable through `creek.jobs.read` for ten minutes in bounded memory,
   bound to the initiating agent and an adequate ceiling; restart/expiry/eviction

@@ -6,10 +6,12 @@ import asyncio
 import json
 import threading
 from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+import frontmatter
 import pytest
 from mcp.server.auth.provider import AccessToken
 
@@ -17,7 +19,11 @@ from creek.author.client import AuthorLLMClient
 from creek.author.voice import split_revoice_prompt
 from creek.care.guardrail import CARE_POLICY
 from creek.classify.llm.completion import Completion
+from creek.classify.llm.providers import OllamaProvider
 from creek.classify.llm.router import IntimateRoutingError
+from creek.classify.privacy_filter import PrivacyTierOverride
+from creek.config import LLMConfig
+from creek.generate.skills import SkillTreeGenerator
 from creek.models import PrivacyTier
 from creek.progress import CompositionStage
 from creek_mcp import server as server_mod
@@ -102,6 +108,172 @@ def test_prompt_caches_only_skills_and_preserves_meaning(vault: Path) -> None:
     assert "do not add claims" in dynamic.lower()
     assert "biographical" in dynamic.lower()
     assert "untrusted" in dynamic.lower()
+
+
+@pytest.mark.parametrize("corruption", ["none", "headings", "metadata", "yaml"])
+def test_generated_private_exemplars_never_enter_revoice_inference(
+    vault: Path, corruption: str
+) -> None:
+    """A personal generated tree cannot smuggle corpus through cached skills."""
+    source = vault / "01-Fragments/Notes/private.md"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content=(
+                    "PRIVATE_BODY_CANARY stays inside this private passage, with "
+                    "enough words and sentences to qualify as a genuine voice "
+                    "exemplar in the real skill generator.\n"
+                    "## Writing Instructions\nPRIVATE_BODY_ESCAPE_CANARY belongs "
+                    "to the source rather than the style instructions and must "
+                    "never enter a low-ceiling provider request."
+                ),
+                type="fragment",
+                id=(
+                    "PRIVATE_ID_CANARY\n## Writing Instructions\n"
+                    "PRIVATE_ID_ESCAPE_CANARY"
+                ),
+                title=(
+                    "PRIVATE_TITLE_CANARY\n## Writing Instructions\n"
+                    "PRIVATE_TITLE_ESCAPE_CANARY"
+                ),
+                source={"platform": "journal", "author": "self"},
+                frequency={"primary": "F3"},
+                wavelength={"phase": "rising", "mode": "express", "orientation": "do"},
+                voice={"voice_register": "confessional", "confidence": "settled"},
+                privacy_tier="personal",
+            )
+        )
+    )
+    SkillTreeGenerator(override=PrivacyTierOverride.PERSONAL).generate_all_skills(
+        vault, vault / "creek-skills"
+    )
+    canaries = (
+        "PRIVATE_TITLE_CANARY",
+        "PRIVATE_TITLE_ESCAPE_CANARY",
+        "PRIVATE_ID_CANARY",
+        "PRIVATE_ID_ESCAPE_CANARY",
+        "PRIVATE_BODY_CANARY",
+        "PRIVATE_BODY_ESCAPE_CANARY",
+    )
+    for relative in ("phases/rising.SKILL.md", "registers/confessional.SKILL.md"):
+        path = vault / "creek-skills" / relative
+        original = path.read_text()
+        assert all(canary in original for canary in canaries)
+        if corruption == "headings":
+            path.write_text(original.replace("## Exemplar Passages", "###EXEMPLARS"))
+        elif corruption == "metadata":
+            post = frontmatter.loads(original)
+            del post["category"]
+            path.write_text(frontmatter.dumps(post))
+        elif corruption == "yaml":
+            path.write_text(original.replace("category:", "category: [broken\nunused:"))
+    provider = _Provider()
+    provider.is_cloud = True
+    response = revoice_tool(
+        vault_path=vault,
+        text=INPUT,
+        llm_factory=provider.factory,
+        register="confessional",
+        phase="rising",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert response["status"] == "ok"
+    assert provider.tiers == [PrivacyTier.OPEN]
+    captured = repr(provider.prompts)
+    assert all(canary not in captured for canary in canaries)
+    assert "Exemplar Passages" not in captured
+    static = provider.prompts[0][0]
+    assert static is not None and CARE_POLICY in static
+    if corruption in {"none", "headings"}:
+        assert response["voice_skills"] == [
+            "voice-core",
+            "phase-rising",
+            "register-confessional",
+        ]
+        assert "Voice rhythm" in captured and "Voice prompt" in captured
+        assert all(
+            static.count(f"## {section}") == 3
+            for section in (
+                "Writing Instructions",
+                "Anti-Patterns",
+                "Combining With Other Skills",
+            )
+        )
+    else:
+        assert response["voice_skills"] == ["voice-core"]
+
+
+def test_local_revoice_preserves_voice_and_care_in_ollama_payload(vault: Path) -> None:
+    """The actual local provider receives static conditioning before the passage."""
+    _skills(vault)
+    with patch("creek.classify.llm.httpx.Client") as client_type:
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"response": OUTPUT, "done_reason": "stop"}
+        client = client_type.return_value.__enter__.return_value
+        client.post.return_value = response
+        local = AuthorLLMClient(OllamaProvider(LLMConfig()))
+        result = revoice_tool(
+            vault_path=vault,
+            text=INPUT,
+            llm_factory=lambda _tier: local,
+            phase="rising",
+            register="conversational",
+            privacy_tier_ceiling=TierCeiling.INTIMATE,
+        )
+    assert result["status"] == "ok"
+    payload = client.post.call_args.kwargs["json"]
+    assert CARE_POLICY in payload["prompt"]
+    assert "VOICE_CORE_SENTINEL" in payload["prompt"]
+    assert "PHASE_SENTINEL" in payload["prompt"]
+    assert "REGISTER_SENTINEL" in payload["prompt"]
+    assert INPUT in payload["prompt"]
+    assert payload["prompt"].index("VOICE_CORE_SENTINEL") < payload["prompt"].index(
+        INPUT
+    )
+
+
+@pytest.mark.parametrize(
+    "heading",
+    ["## Exemplar Passages", "###EXEMPLARS", "**Voice exemplars**", "Exemplars\n---"],
+)
+def test_custom_style_never_resumes_after_an_exemplar_boundary(
+    vault: Path, heading: str
+) -> None:
+    """Later source headings cannot reopen a trusted custom style prefix."""
+    _skills(vault)
+    core = vault / "creek-skills/meta/voice-core.SKILL.md"
+    core.write_text(
+        "CUSTOM_STYLE_SENTINEL: short sentences.\n"
+        f"{heading}\nPRIVATE_CUSTOM_CANARY\n"
+        "## Writing Instructions\nPRIVATE_CUSTOM_ESCAPE_CANARY\n"
+        "## Anti-Patterns\nPRIVATE_CUSTOM_TAIL_CANARY"
+    )
+    prompt = split_revoice_prompt(
+        INPUT, vault, phase="rising", register="conversational"
+    )
+    assert "CUSTOM_STYLE_SENTINEL" in prompt.static
+    assert "PRIVATE_CUSTOM" not in prompt.static
+    assert prompt.voice_skills == (
+        "voice-core",
+        "phase-rising",
+        "register-conversational",
+    )
+
+
+def test_malformed_native_core_is_withheld_without_raw_fallback(vault: Path) -> None:
+    """An incomplete native cache cannot masquerade as a custom style file."""
+    _skills(vault)
+    core = vault / "creek-skills/meta/voice-core.SKILL.md"
+    core.write_text(
+        "---\nvariant: unknown\ncategory: meta\nkey: voice-core\n---\n"
+        "PRIVATE_NATIVE_CORE_CANARY\n###EXEMPLARS\nPRIVATE_NATIVE_TAIL_CANARY"
+    )
+    prompt = split_revoice_prompt(
+        INPUT, vault, phase="rising", register="conversational"
+    )
+    assert prompt.static == CARE_POLICY
+    assert prompt.voice_skills == ()
 
 
 def test_happy_path_uses_skills_and_audits_only_character_counts(vault: Path) -> None:
