@@ -162,9 +162,10 @@ class RoutingAuthMiddleware:
         ):
             return await self._verifier.verify_credential(token)
         access = await self._agent.verifier.verify_token(token)
-        if access is None:
+        if access is None or access.subject is None:
             return None
-        return await self._agent.principals.principal_for_consumer(access.client_id)
+        # The agent's client id is its audit stamp, never its vault owner.
+        return await self._agent.principals.principal_for_consumer(access.subject)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Bind verified ownership while logging only the requester identity."""

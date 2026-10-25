@@ -808,17 +808,23 @@ def _agent_token(**claims: object) -> str:
     return mint(**{"aud": _EDGE_MCP_URL, "sub": "user-001", **claims})
 
 
-def test_an_agent_token_is_replayed_to_its_subjects_vault(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "client_id", ["cl_8a", "https://claude.ai/oauth/claude-code-client-metadata"]
+)
+def test_an_agent_token_is_replayed_to_its_subjects_vault(
+    tmp_path: Path, client_id: str
+) -> None:
     """A verified JWT routes by ``sub`` to the owner's vault, with its state.
 
     Args:
         tmp_path: Pytest's per-test directory.
+        client_id: Distinct agent identities sharing one pinned owner.
     """
     client, provider, principals = _agent_client(tmp_path)
 
     response = client.post(
         "/mcp",
-        headers={"Authorization": f"Bearer {_agent_token()}"},
+        headers={"Authorization": f"Bearer {_agent_token(client_id=client_id)}"},
         content=b"{}",
     )
 
@@ -837,6 +843,8 @@ def test_an_agent_token_is_replayed_to_its_subjects_vault(tmp_path: Path) -> Non
         {"exp": 1_000},
         {"iss": "https://evil.example"},
         {"sub": "user-unknown"},
+        {"sub": "user-unknown", "client_id": "user-001"},
+        {"client_id": None},
     ],
 )
 def test_a_refused_agent_token_never_wakes_a_vault(

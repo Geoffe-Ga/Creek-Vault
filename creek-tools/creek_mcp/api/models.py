@@ -2705,7 +2705,7 @@ route is an activity card, not a log viewer, and a larger page would only make
 the read behind it longer for a person who cannot use that many rows anyway.
 """
 
-_MAX_ACTIVITY_CONSUMER_CHARS: Final[int] = 256
+AGENT_ACTIVITY_MAX_CONSUMER_CHARS: Final[int] = 256
 """Upper bound on a row's ``consumer``: an identity stamp, never a sentence."""
 
 _MAX_ACTIVITY_TOOL_CHARS: Final[int] = 128
@@ -2803,7 +2803,7 @@ class AgentActivityRow(_WireModel):
 
     consumer: str = Field(
         min_length=1,
-        max_length=_MAX_ACTIVITY_CONSUMER_CHARS,
+        max_length=AGENT_ACTIVITY_MAX_CONSUMER_CHARS,
         pattern=AGENT_ACTIVITY_CONSUMER_PATTERN,
         description="The audit stamp of the caller.",
     )

@@ -425,6 +425,14 @@ The rules, each pinned by `tests/test_v1_api_agent_activity.py`:
    consumer.** The app's own `adepthood` calls through `/v1` are in the same
    log and are listed beside every agent's. There is no consumer filter, and
    an unknown query parameter is `422 invalid_request`.
+   From #1976, an OAuth caller's stamp is its RFC 9068 `client_id` verbatim,
+   directly joinable to Adepthood's `agent_grant.client_id`, including CIMD
+   URLs. The verifier requires a non-blank string of 1–256 characters without
+   ASCII controls (`U+0000`–`U+001F` or `U+007F`), never trimming or truncating
+   it and refusing missing or invalid ids. Static-token stamps are unchanged.
+   The published `consumer` pattern and bound are unchanged, so this attribution
+   correction needs no minor bump. Historical rows keep their original stamp;
+   the projection does not guess an agent for an older subject-only entry.
 2. **`outcome` is closed at `admitted | refused`.** `refused` is an entry the
    MCP adapter wrote for a pre-dispatch refusal — an out-of-profile tool
    (#1964) or, from this minor, a remote ceiling above `personal`, which the

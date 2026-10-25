@@ -30,9 +30,15 @@ specification makes mandatory or that the threat model needs:
   identity Adepthood puts in ``sub``. Pinned to it, the vault refuses any other
   person's token even if one were ever routed to it.
 
-The verified token becomes an :class:`~mcp.server.auth.provider.AccessToken`
-whose ``client_id`` is ``sub`` (the stable consumer identity that the audit
-log, the access log and the tier cap key on) and whose ``scopes`` are
+The RFC 9068 ``client_id`` claim is required: a non-blank string of at most
+256 characters, with no ASCII control character, exactly the published activity
+consumer bound. It becomes the :class:`~mcp.server.auth.provider.AccessToken`'s
+``client_id`` verbatim, so each agent has its own audit stamp and Adepthood can
+join it directly to ``agent_grant.client_id``, including CIMD URLs. There is no
+fallback for old tokens without it; the agent must obtain a fresh issuer token.
+``sub`` stays separate as ``AccessToken.subject``: only it may select the
+person's vault at the shared edge or satisfy a managed vault's subject pin.
+The token's ``scopes`` are
 :data:`~creek_mcp.remote_auth.REMOTE_SCOPE` plus the grants named in the
 ``scope`` claim, read through the same :class:`~creek_mcp.policy.Grant` values
 :func:`creek_mcp.policy.granted_by_scopes` matches. The ungated marker is
@@ -69,6 +75,10 @@ import jwt
 from jwt import PyJWK
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
+from creek_mcp.api.models import (
+    AGENT_ACTIVITY_CONSUMER_PATTERN,
+    AGENT_ACTIVITY_MAX_CONSUMER_CHARS,
+)
 from creek_mcp.oauth_resource import load_resource_server_config
 from creek_mcp.policy import Grant
 from creek_mcp.remote_auth import REMOTE_SCOPE, names_a_consumer
@@ -106,11 +116,19 @@ JWKS_MAX_BYTES: Final[int] = 64 * 1024
 MAX_TOKEN_LENGTH: Final[int] = 8 * 1024
 """The longest bearer treated as a JWT at all."""
 
-REQUIRED_CLAIMS: Final[tuple[str, ...]] = ("iss", "sub", "aud", "exp", "iat")
+REQUIRED_CLAIMS: Final[tuple[str, ...]] = (
+    "iss",
+    "sub",
+    "aud",
+    "exp",
+    "iat",
+    "client_id",
+)
 """Every claim the verifier relies on; a token without one is refused."""
 
 _SCOPE_CLAIM: Final[str] = "scope"
 _SUBJECT_CLAIM: Final[str] = "sub"
+_CLIENT_ID_CLAIM: Final[str] = "client_id"
 _EXPIRY_CLAIM: Final[str] = "exp"
 _ISSUER_CLAIM: Final[str] = "iss"
 _ALG_HEADER: Final[str] = "alg"
@@ -525,6 +543,26 @@ def _accepted_until(exp: object) -> int | None:
         return None
 
 
+def _agent_client_id(claim: object) -> str | None:
+    """Return a claim the activity contract can carry verbatim as its consumer.
+
+    Args:
+        claim: The verified RFC 9068 ``client_id`` claim.
+
+    Returns:
+        The unchanged identity, or ``None`` for an invalid stamp. In particular,
+        there is no truncation or subject fallback that could merge two agents.
+    """
+    if (
+        not isinstance(claim, str)
+        or not names_a_consumer(claim)
+        or len(claim) > AGENT_ACTIVITY_MAX_CONSUMER_CHARS
+        or re.fullmatch(AGENT_ACTIVITY_CONSUMER_PATTERN, claim) is None
+    ):
+        return None
+    return claim
+
+
 class JwtAgentTokenVerifier(TokenVerifier):
     """Accept exactly the agent tokens the pinned issuer signed for this vault."""
 
@@ -625,14 +663,17 @@ class JwtAgentTokenVerifier(TokenVerifier):
 
         Returns:
             The access token, or ``None`` when the subject names nobody or is
-            not the pinned one, the scope claim is not a string, or the expiry
-            is not a number.
+            not the pinned one, the client id cannot be shown as an activity
+            consumer, the scope claim is not a string, or the expiry is not a number.
         """
         subject = claims.get(_SUBJECT_CLAIM)
         if not isinstance(subject, str) or not names_a_consumer(subject):
             return _refused("subject")
         if self._expected_subject is not None and subject != self._expected_subject:
             return _refused("subject")
+        client_id = _agent_client_id(claims.get(_CLIENT_ID_CLAIM))
+        if client_id is None:
+            return _refused("client id")
         scopes = _granted_scopes(claims.get(_SCOPE_CLAIM))
         if scopes is None:
             return _refused("scope")
@@ -641,7 +682,7 @@ class JwtAgentTokenVerifier(TokenVerifier):
             return _refused("expiry")
         return AccessToken(
             token=token,
-            client_id=subject,
+            client_id=client_id,
             scopes=scopes,
             expires_at=expires_at,
             resource=self._config.resource_url,

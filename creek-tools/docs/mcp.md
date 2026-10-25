@@ -1134,12 +1134,11 @@ its grants in plain words, when it was last used (stamped at sign-in and at each
 refresh, not on each call), and **Stop**. A content-free list of what each agent
 asked the vault for is the vault's `GET /v1/agent-activity` (contract `0.22.0`,
 see [`api.md`](api.md)); the Settings card that shows it is Adepthood's, and is
-forthcoming (adepthood#3535, not yet merged). One limit applies: the vault's audit log names
-the token's subject, which is the *person*, so until
-[#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976) lands every agent
-one person connects through Adepthood is recorded under the same consumer, and
-the activity rows cannot yet say which agent made a call. A static-token agent is
-recorded under its own consumer name.
+implemented in adepthood#3542. An OAuth agent's audit stamp is its RFC 9068
+`client_id` verbatim (#1976), so the card joins it directly to the agent's grant,
+including a CIMD client identified by its metadata URL. Its `sub` still names
+the person for vault routing and the managed-vault subject pin. A static-token
+agent is recorded under its configured consumer name.
 
 ### Client-support matrix (verified 2026-10-24)
 
@@ -1185,8 +1184,6 @@ clients from a primary source on this date.
   response in transit; it needs a fix on Adepthood's side. Claude Code is not
   affected, because it registers by metadata document rather than by
   registration.
-- **Per-agent attribution** waits on
-  [#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976), as above.
 
 ## Network transport (authenticated, epic #757 / #759 / #837)
 
@@ -1541,11 +1538,22 @@ An access token is accepted only when **all** of these hold
   `CREEK_MCP_RESOURCE_URL` **exactly** — one string, not a list, so a token
   for another vault is refused;
 - `exp`, `nbf` and `iat` hold within 30 s of skew, and `iss`, `sub`, `aud`,
-  `exp`, `iat` are all present;
+  `exp`, `iat`, `client_id` are all present;
+- RFC 9068 `client_id` is a non-blank string of 1–256 characters with no ASCII
+  control character (`U+0000`–`U+001F` or `U+007F`), exactly the existing
+  `agent-activity` consumer bound. It is never trimmed or truncated. A missing
+  or invalid id is refused; there is no legacy fallback to `sub`. Obtain a
+  fresh token from an issuer that supplies the claim (refresh or sign in again);
 - on a managed vault, `sub` is the vault's own consumer identity.
 
-The token's `sub` becomes the consumer (on the audit log, the access log and
-the tier cap) and its `scope` claim the grants, read exactly as a static
+The token's `client_id` becomes the consumer on the audit and access logs,
+the job owner and the per-consumer job slot. Adepthood already issues this
+claim (adepthood#3533), and its activity card joins it exactly to
+`agent_grant.client_id`. The verified `sub` stays separate: it alone selects
+the person's vault at the shared edge and satisfies the managed subject pin.
+Historical audit rows keep their original subject-only stamp; no agent is guessed
+for an older entry, and the existing `0.22.0` consumer pattern and bound do not move.
+The `scope` claim still supplies the grants, read exactly as a static
 token's grant suffix is. `creek:ungated` in a token is ignored. The remote tier
 cap applies unchanged, so a JWT caller asking for `intimate` is refused with
 the same reason any remote caller gets. Static consumer tokens keep working on

@@ -9,6 +9,14 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Attribute OAuth agents by the RFC 9068 `client_id` claim (#1976), preserving
+  the verified `sub` separately for managed-vault routing and its subject pin.
+  The activity card can join each audit consumer directly to Adepthood's
+  `agent_grant.client_id`, including CIMD URLs. Require a non-blank client id
+  within the existing one-line, 256-character activity bound; missing or invalid
+  means refused with no subject fallback. Static consumers, scope grants and
+  the `0.22.0` wire schema are unchanged.
+
 - Document connecting an agent to a vault (#1969). `docs/mcp.md` gains an
   "Agents" section for the vault's owner: what the default `vault:read
   vault:desk` profile reaches and never reaches, the address to paste, signing
