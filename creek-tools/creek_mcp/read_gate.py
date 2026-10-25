@@ -717,20 +717,26 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "whole-or-nothing decision creek state did."
         ),
     ),
-    "creek.jobs.read": ToolPosture(
-        posture=ReadPosture.METADATA_ONLY,
+    "creek.revoice": ToolPosture(
+        posture=ReadPosture.NO_UNSUPPLIED_READ,
         grant=Grant.DESK,
         rationale=(
-            "Reads one job record the caller itself started and returns its "
-            "state plus the result that record stores. That result is not read "
-            "from the corpus at all: it is the projection draft_job_result / "
-            "author_job_result made of the composing tool's own success "
-            "envelope when the job finished -- a draft path, provenance counts "
-            "and status words, with the body, title, query, claims and "
-            "fragment ids dropped -- so nothing above any ceiling can be in it, "
-            "and the ceiling is audited for the trail, not enforced (#1966). "
-            "composition_job_for refuses another consumer's id, a /v1 pipeline "
-            "id, and an unknown or malformed id with one identical refusal."
+            "Transforms only caller-supplied text, without retrieving fragments. "
+            "Voice skills condition diction rather than supplying claims. The "
+            "declared ceiling still keys the model router, including local-only "
+            "Intimate routing. No rewrite is saved (#1981)."
+        ),
+    ),
+    "creek.jobs.read": ToolPosture(
+        posture=ReadPosture.NO_UNSUPPLIED_READ,
+        grant=Grant.DESK,
+        rationale=(
+            "Resolves only this caller's composition handle. Durable draft/author "
+            "results remain counts and paths only. Detached revoice text is the "
+            "caller's own supplied-text transformation, held only in bounded "
+            "process memory and returned only to the original agent at a ceiling "
+            "that admits its original declared sensitivity. Expiry, eviction and "
+            "restart return unavailable; no corpus is retrieved (#1981)."
         ),
     ),
     "creek.link": ToolPosture(

@@ -1043,13 +1043,14 @@ class OllamaProvider:
         ``options.num_predict``; this adapter maps the provider-neutral
         ``max_tokens`` value to that field, disables hidden reasoning for that
         bounded call, and normalizes a ``length`` finish to
-        ``stop_reason="max_tokens"``. Ollama has no cached ``system`` prefix on
-        this path, so that argument remains ignored. Token usage is absent.
+        ``stop_reason="max_tokens"``. A static ``system`` prefix is prepended
+        with two newlines so local author calls retain owner voice and care
+        guidance without requiring provider-side caching. Token usage is absent.
 
         Args:
             prompt: The fully-formatted prompt.
             max_tokens: Optional output-token ceiling.
-            system: Ignored (Ollama has no cached system block).
+            system: Optional static prefix to prepend to the dynamic prompt.
 
         Returns:
             A :class:`Completion` wrapping the raw Ollama response text.
@@ -1058,6 +1059,8 @@ class OllamaProvider:
             httpx.HTTPStatusError: On HTTP error responses.
             httpx.HTTPError: On connection or transport errors.
         """
+        if system:
+            prompt = f"{system}\n\n{prompt}"
         return call_ollama(
             self.config,
             prompt,

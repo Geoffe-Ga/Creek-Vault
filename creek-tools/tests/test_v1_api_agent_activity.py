@@ -94,7 +94,8 @@ _ROW_KEYS: Final[frozenset[str]] = frozenset({"consumer", "tool", "at", "outcome
 _ENVELOPE_KEYS: Final[frozenset[str]] = frozenset(
     {"status", "tier_ceiling", "skipped", "rows"}
 )
-_PREVIOUS_MINOR: Final[str] = "0.21"
+_ACTIVITY_MINOR: Final[str] = "0.22"
+_BEFORE_ACTIVITY_MINOR: Final[str] = "0.21"
 _BASE_INSTANT: Final[datetime] = datetime(2026, 10, 24, 17, 0, 0, tzinfo=UTC)
 _LONG_STRING: Final[str] = "a body the activity card must never show " * 4
 
@@ -769,23 +770,23 @@ def test_an_unconfigured_vault_is_unavailable(
     assert response.status_code == _UNAVAILABLE
 
 
-def test_the_capability_is_published_at_the_new_minor() -> None:
-    """``agent-activity`` is a contract-minor addition, not a silent widening."""
-    assert CAPABILITY_SINCE_MINOR[Capability.AGENT_ACTIVITY] == CONTRACT_MINOR
+def test_the_capability_keeps_its_published_introduction_minor() -> None:
+    """Later MCP-only bumps cannot move when HTTP activity becomes reachable."""
+    assert CAPABILITY_SINCE_MINOR[Capability.AGENT_ACTIVITY] == _ACTIVITY_MINOR
     assert Capability.AGENT_ACTIVITY.value == "agent-activity"
 
 
 def test_a_caller_below_the_minor_is_refused(vault: Path) -> None:
     """A ``0.21`` consumer never negotiated the route and cannot reach it."""
-    response = _get(vault, minor=_PREVIOUS_MINOR)
+    response = _get(vault, minor=_BEFORE_ACTIVITY_MINOR)
     assert response.status_code == _INCOMPATIBLE_VERSION
     assert envelope(response)["code"] == ErrorCode.INCOMPATIBLE_VERSION.value
 
 
 @pytest.mark.parametrize(
     ("minor", "advertised"),
-    [(_PREVIOUS_MINOR, False), (CONTRACT_MINOR, True)],
-    ids=["previous-minor", "current-minor"],
+    [(_BEFORE_ACTIVITY_MINOR, False), (_ACTIVITY_MINOR, True), (CONTRACT_MINOR, True)],
+    ids=["before-introduction", "introduction-minor", "current-minor"],
 )
 def test_the_handshake_advertises_it_only_from_the_minor(
     vault: Path, minor: str, advertised: bool

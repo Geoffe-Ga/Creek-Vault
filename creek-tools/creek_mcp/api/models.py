@@ -90,6 +90,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.22",
     "0.21",
     "0.20",
     "0.19",
@@ -250,6 +251,10 @@ It is a *list* on the wire because the compatibility window is expected to
 widen before it ever narrows, and the client needs to see the whole window
 without a second round trip. Drop an entry only when a ``/v1`` shape actually
 stops being served.
+
+Contract 0.23 (#1981) is MCP-only: ``creek.revoice`` and its process-local
+``creek.jobs.read`` result add no HTTP route, capability or model. ``0.22``
+therefore stays in this tuple alongside every earlier served minor.
 """
 
 OK_STATUS: Final[Literal["ok"]] = "ok"

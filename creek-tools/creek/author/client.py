@@ -215,7 +215,7 @@ class AuthorLLMClient:
         for existing callers), this exposes the SDK's token usage so the desk
         can surface a run's cost and cache-hit rate. A static *system* prefix is
         sent as an ephemeral cached block by a cloud provider that supports it
-        (#474); local providers ignore it.
+        (#474); Ollama prepends it to the dynamic prompt without caching.
 
         Args:
             prompt: The dynamic user prompt.

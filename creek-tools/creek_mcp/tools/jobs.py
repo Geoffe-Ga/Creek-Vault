@@ -1,16 +1,22 @@
 """``creek.jobs.read`` MCP tool — resolve a composition job handle (#1966).
 
-``creek.draft`` and ``creek.author`` answer ``{status: "accepted", job_id,
+``creek.draft``, ``creek.author`` and ``creek.revoice`` answer
+``{status: "accepted", job_id,
 state: "running"}`` when a composition outlives the server's synchronous
 deadline (:mod:`creek_mcp.composition_jobs`). This tool turns that handle back
 into a state and, once the job has finished, its result.
 
-**What it can return is fixed by what was stored.** The record holds only the
+**The durable record is content-free.** The record holds only the
 content-free projection the composing tool made of its own success envelope —
 :func:`creek_mcp.tools.draft.draft_job_result` /
 :func:`creek_mcp.tools.author.author_job_result`: a draft path, counts and
-status words, never a body, title or fragment id. So the read needs no tier
-gate of its own; the caller's ceiling is audited for the trail and echoed.
+status words, never a body, title or fragment id. These durable projections
+need no tier gate; the caller's ceiling is audited for the trail and echoed.
+
+For a successful detached revoice, :class:`creek_mcp.composition_jobs.CompositionJobs`
+adds the text from its bounded process-local cache after this reader resolves
+ownership. The cache also checks the original declared ceiling. No revoice body
+is persisted, and expiry, eviction or restart returns unavailable.
 
 **Every unresolvable id is one refusal.** Malformed, unknown, another
 consumer's, and another surface's (``/v1`` pipeline) ids all answer

@@ -272,7 +272,49 @@ confinement boundary.
 | Tool           | Inputs                                                                  | Purpose                                                                       |
 |----------------|------------------------------------------------------------------------|-------------------------------------------------------------------------------|
 | `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). |
-| `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` job handle to `{status, job_id, state, result?}`. |
+| `creek.revoice` | `text`, `register?`, `phase?` | Rewrite supplied text in the owner's voice, preserving meaning and claims without saving. Requires `vault:desk`. |
+| `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` / `creek.revoice` job handle to `{status, job_id, state, result?}`. |
+
+### Revoice supplied text
+
+`creek.revoice(text, register?, phase?, privacy_tier_ceiling?)` transforms the
+caller's draft rather than composing from vault evidence. It reads only the
+voice-core and requested canonical phase/register skills. Its cached system
+prefix contains the care policy and skills; its dynamic prompt marks the text
+as untrusted data and requires meaning, claims, qualifications, attribution and
+biographical facts to stay unchanged. No fragments are retrieved and no draft
+is written. Missing voice-core is allowed: the call uses the care policy alone
+and reports `voice_skills: []` rather than claiming a learned voice.
+
+Native generated skills can contain private source exemplars from an earlier
+refresh. Revoice reconstructs their abstract signature in memory, retaining
+style instructions and anti-patterns while excluding every cached source title,
+id and passage at every ceiling. Malformed native metadata is withheld rather
+than sent raw. Source-free owner-authored style files are the trusted
+customization surface: reserve native `category`, `variant` and `generated_date`
+metadata for generated files, and keep source passages out of custom styles.
+A recognized exemplar heading in a custom file ends its usable style; later
+headings never resume it. Local Ollama calls receive the care/voice prefix
+alongside the dynamic passage, while supported cloud providers retain caching.
+
+Input is limited to 16,000 characters. Empty text and unknown canonical slugs
+return `status: "error"` before a model is built. The tier-keyed factory routes
+from the declared ceiling, so `intimate`/`all` is local-only or refused; remote
+callers retain their existing cap below intimate. A success returns
+`{status, tool, tier_ceiling, text, voice_skills, usage}` and an optional
+`inference_source`. Incomplete, empty or oversized model output is an error.
+Only input/output character counts enter this tool's audit entry.
+
+The composition wrapper reports `skills` then `composed`, with the same deadline
+and one-active-composition-per-agent rule as draft/author. A detached rewrite
+returns a job handle. `creek.jobs.read` returns its text only to the original
+agent at a ceiling at least as sensitive as the original call. Results are
+readable for ten minutes in a per-server cache holding at most 32 successful
+rewrites; expired entries are removed on the next cache operation. Expiry,
+eviction and process restart return the same unavailable refusal. Durable job
+records retain only status and output character count, never either passage.
+
+### Author from vault evidence
 
 Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
 `medium`, `query`, `body`, `provenance` (a list of provenance entries),
@@ -349,7 +391,7 @@ excludes the offending fragment, or re-tier the fragment.
 A draft on the vault's pinned local model can take minutes, and MCP clients
 own their own request timeouts (OpenClaw's documented example is 20 s; the Fly
 edge drops an idle connection long before a cold model finishes). So
-`creek.draft` and `creek.author` run through `creek_mcp/composition_jobs.py`:
+`creek.draft`, `creek.author` and `creek.revoice` run through `creek_mcp/composition_jobs.py`:
 
 - **Progress.** A client that sends a `progressToken` receives one
   `notifications/progress` per stage boundary the pipeline crosses. The
@@ -1096,7 +1138,7 @@ either.
 
 ### Slow tools: set the client timeout above the deadline
 
-`creek.draft` and `creek.author` answer within `CREEK_MCP_SYNC_DEADLINE_SECONDS`
+`creek.draft`, `creek.author` and `creek.revoice` answer within `CREEK_MCP_SYNC_DEADLINE_SECONDS`
 (default `90`) or hand back a job handle — `{status: "accepted", job_id, state:
 "running"}` — while the draft keeps composing on the vault; the agent then calls
 `creek.jobs.read(job_id)` until `state` is `succeeded` or `failed`. See
@@ -1119,7 +1161,7 @@ which, for agents signed in through Adepthood, means one per *person* until
 
 ### A writer's own model key
 
-`creek.draft`, `creek.author` and `creek.reflect` honour the
+`creek.draft`, `creek.author`, `creek.revoice` and `creek.reflect` honour the
 `X-Creek-Provider` / `X-Creek-Provider-Key` pair on a managed vault, and
 `creek.handshake` reports which vendors this vault would spend a key on
 (`request_key_providers`). Only a client that can set custom headers can send
@@ -1421,7 +1463,7 @@ claude mcp add --transport http creek https://<vault-host>/mcp \
 
 ### A writer's own model key on `/mcp` (#1967)
 
-`creek.draft`, `creek.author` and `creek.reflect` honour the two
+`creek.draft`, `creek.author`, `creek.revoice` and `creek.reflect` honour the two
 [ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)
 headers `/v1` already takes on its model-calling routes, on any call that
 arrives over the network transport (stdio never reads them):

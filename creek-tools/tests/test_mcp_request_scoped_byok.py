@@ -2,9 +2,9 @@
 
 ``tests/test_request_scoped_byok.py`` proves the key machinery on ``/v1``.
 This module proves the same two headers on the MCP streamable-HTTP transport
-served inside the ``/v1`` process (#1962), for the three tools that call the
-vault's model on a writer's behalf — ``creek.draft``, ``creek.author`` and
-``creek.reflect``:
+served inside the ``/v1`` process (#1962), for the four tools that call the
+vault's model on a writer's behalf — ``creek.draft``, ``creek.author``,
+``creek.revoice`` and ``creek.reflect``:
 
 1. **It works.** A managed vault with no local model drafts, authors and
    reflects with the writer's key, and names the route it took —
@@ -226,6 +226,28 @@ def test_an_authored_draft_over_mcp_uses_the_writers_key(
     _assert_canary_absent(tmp_path, every_log, result)
 
 
+def test_revoice_over_mcp_uses_the_writers_key_without_saving(
+    tmp_path: Path,
+    managed: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    every_log: pytest.LogCaptureFixture,
+) -> None:
+    """Revoice inherits the request-key route without persisting either passage."""
+    vendor = _Vendor(monkeypatch)
+    passage = "Please send the report on Friday."
+    result = _call(
+        managed, "creek.revoice", {"text": passage}, _keyed("openai", OPENAI_CANARY)
+    )
+    assert result["status"] == "ok", result
+    assert result["inference_source"] == "request_key:openai"
+    assert result["text"]
+    assert set(vendor.keys_sent()) == {OPENAI_CANARY}
+    assert not list(managed.joinpath(*_DRAFTS).glob("*.md"))
+    assert _swept(managed, passage) == []
+    assert _swept(managed, str(result["text"])) == []
+    _assert_canary_absent(tmp_path, every_log, result)
+
+
 def test_a_reflection_over_mcp_uses_the_writers_key(
     tmp_path: Path,
     managed: Path,
@@ -335,9 +357,10 @@ def test_a_vendor_401_quoting_the_key_never_reaches_the_agent_or_the_vault(
     [
         ("creek.draft", {}),
         ("creek.author", {"query": "garden"}),
+        ("creek.revoice", {"text": "Please send the report on Friday."}),
         ("creek.reflect", {"content": ENTRY}),
     ],
-    ids=["draft", "author", "reflect"],
+    ids=["draft", "author", "revoice", "reflect"],
 )
 def test_a_malformed_pair_is_refused_with_the_v1_message_and_never_echoed(
     tmp_path: Path,
