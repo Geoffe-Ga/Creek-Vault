@@ -27,7 +27,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.fly import FlyRuntimeSecrets
-from creek_mcp.provisioning.models import FailureReason
+from creek_mcp.provisioning.models import FailureReason, McpOAuthSettings
 from creek_mcp.provisioning.pool_bundle import (
     PoolBundleIssuer,
     PoolCredential,
@@ -88,6 +88,7 @@ class _BundleDocument:
     tls_certificate: bytes = field(repr=False)
     tls_private_key: bytes = field(repr=False)
     pool: PoolRuntimeBundle | None = field(default=None, repr=False)
+    mcp_oauth: McpOAuthSettings | None = field(default=None, repr=False)
 
     def encode(self) -> bytes:
         """Encode the in-memory bundle for authenticated encryption."""
@@ -101,6 +102,7 @@ class _BundleDocument:
             "tls_certificate": _b64(self.tls_certificate),
             "tls_private_key": _b64(self.tls_private_key),
             "pool": None if self.pool is None else _encode_pool(self.pool),
+            "mcp_oauth": None if self.mcp_oauth is None else self.mcp_oauth.encode(),
         }
         return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
@@ -144,6 +146,7 @@ class _BundleDocument:
                 _unb64(document["tls_certificate"]),
                 _unb64(document["tls_private_key"]),
                 _decode_pool(document.get("pool")),
+                McpOAuthSettings.decode(document.get("mcp_oauth")),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             raise ValueError("runtime secret state is invalid") from None
@@ -157,6 +160,7 @@ class _BundleDocument:
             self.tls_certificate,
             self.tls_private_key,
             self.pool,
+            self.mcp_oauth,
         )
 
 
@@ -178,14 +182,21 @@ class EncryptedFileFlySecretManager:
         app_prefix: str,
         clock: Callable[[], datetime] | None = None,
         pool_bundles: PoolBundleIssuer | None = None,
+        mcp_oauth: McpOAuthSettings | None = None,
     ) -> None:
         """Load mounted key material and validate the owner-only state root.
 
         *pool_bundles* mints and revokes the per-activation pool bundle of
         ADR-0016 Decision 1 items 1 to 3.  Absent, activations are issued with
         no pool, which is the pool-free path and the standing O3 fallback.
+
+        *mcp_oauth* is written into every activation issued from now on
+        (#1974) and, through :meth:`roll_mcp_oauth`, into an existing one on
+        request.  An activation already issued keeps what its record holds, so
+        configuring it re-verifies no existing Machine.
         """
         self._pool_bundles = pool_bundles
+        self._mcp_oauth = mcp_oauth
         self._state_directory = state_directory.resolve()
         self._clock = clock or _utc_now
         _require_owner_only_directory(self._state_directory)
@@ -368,6 +379,45 @@ class EncryptedFileFlySecretManager:
             self._pool_bundles.revoke(previous)
         return rolled
 
+    def roll_mcp_oauth(self, activation_id: str) -> McpOAuthSettings:
+        """Write the configured MCP OAuth settings into one existing record.
+
+        The record half of #1974's rollout for an activation issued before the
+        settings existed; :meth:`FlyProviderDriver.roll_mcp_oauth` calls it only
+        once the Machine is proven exactly legacy and stopped, then updates the
+        Machine to match.  Writing the settings an activation already holds is
+        a no-op, so an interrupted roll can be retried.  The replacement is
+        atomic, so a concurrent router reads the old record or the new one,
+        never a torn one.
+
+        Args:
+            activation_id: The activation to roll.
+
+        Returns:
+            The settings the record now holds.
+
+        Raises:
+            ValueError: When no settings are configured, the activation has no
+                stored record or has been revoked, or its record already holds
+                other settings — a change of issuer or address is not this
+                transition.
+        """
+        configured = self._mcp_oauth
+        if configured is None:
+            raise ValueError("no MCP OAuth settings are configured")
+        digest = _activation_digest(activation_id)
+        bundle_path, revoked_path = self._paths(digest)
+        self._refuse_revoked(bundle_path, revoked_path)
+        document = _load_document(self._cipher, bundle_path, digest)
+        if document.mcp_oauth == configured:
+            return configured
+        if document.mcp_oauth is not None:
+            raise ValueError("activation already holds other MCP OAuth settings")
+        updated = dataclasses.replace(document, mcp_oauth=configured)
+        _replace_durably(bundle_path, self._encrypt(updated.encode(), _aad(digest)))
+        self._refuse_revoked(bundle_path, revoked_path)
+        return configured
+
     def _paths(self, digest: str) -> tuple[Path, Path]:
         return (
             self._state_directory / f"{digest}.bundle",
@@ -439,6 +489,7 @@ class EncryptedFileFlySecretManager:
             certificate.public_bytes(serialization.Encoding.PEM),
             private_pem,
             pool,
+            self._mcp_oauth,
         )
 
     def _certificate(
@@ -726,6 +777,28 @@ def _exclusive_write(path: Path, value: bytes) -> None:
         os.link(temporary, path)
     finally:
         os.close(descriptor)
+        with suppress(FileNotFoundError):
+            temporary.unlink()
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _replace_durably(path: Path, value: bytes) -> None:
+    """Atomically replace one existing owner-only file, durably."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
         with suppress(FileNotFoundError):
             temporary.unlink()
     directory = os.open(path.parent, os.O_RDONLY)

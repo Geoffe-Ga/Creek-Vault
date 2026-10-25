@@ -22,6 +22,8 @@ from creek_mcp.provisioning.fly import (
     FlyProviderPolicy,
 )
 from creek_mcp.provisioning.handoff import HttpOneTimeCredentialHandoff
+from creek_mcp.provisioning.mcp_oauth_rollout import roll_owned_allocation
+from creek_mcp.provisioning.models import McpOAuthSettings, public_vault_url
 from creek_mcp.provisioning.production_secrets import EncryptedFileFlySecretManager
 from creek_mcp.provisioning.store import ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
@@ -107,7 +109,79 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_CALLBACK_TIMEOUT_SECONDS,
     )
     parser.add_argument("--max-jobs", type=_positive_int)
+    add_mcp_oauth_roll_argument(parser)
+    parser.add_argument("--oauth-authorization-server", default=None)
     return parser
+
+
+def add_mcp_oauth_roll_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the one-shot MCP OAuth rollout selector (#1974).
+
+    Given ``--roll-mcp-oauth REQUESTER CONSUMER`` the process composes as
+    usual, rolls that one allocation onto the configured settings, and exits
+    with the status :mod:`creek_mcp.provisioning.mcp_oauth_rollout` names
+    instead of claiming jobs.
+
+    Args:
+        parser: The parser to extend.
+    """
+    parser.add_argument(
+        "--roll-mcp-oauth",
+        nargs=2,
+        metavar=("REQUESTER", "CONSUMER"),
+        default=None,
+    )
+
+
+def mcp_oauth_settings(args: argparse.Namespace) -> McpOAuthSettings | None:
+    """Return the settings every new allocation is written with, if any (#1974).
+
+    The resource is derived from the same public route the handed-off vault
+    URL is, by the one derivation Adepthood also applies, so the audience it
+    mints for is the resource the vault verifies.
+
+    Args:
+        args: Parsed arguments carrying ``--routing-public-url`` and
+            ``--oauth-authorization-server``.
+
+    Returns:
+        ``None`` without an issuer — allocations are then written without
+        either setting, exactly as before — otherwise the settings.
+
+    Raises:
+        ValueError: When the issuer or derived resource is unsafe.
+    """
+    issuer = args.oauth_authorization_server
+    if not issuer:
+        return None
+    return McpOAuthSettings.for_vault_url(
+        public_vault_url(args.routing_public_url), issuer
+    )
+
+
+def run_mcp_oauth_roll(
+    args: argparse.Namespace,
+    driver: FlyProviderDriver,
+    secrets: EncryptedFileFlySecretManager,
+) -> int:
+    """Roll the one allocation ``--roll-mcp-oauth`` names, returning its status.
+
+    Args:
+        args: Parsed arguments carrying ``--database`` and the selector.
+        driver: The composed Fly driver.
+        secrets: The composed encrypted record writer.
+
+    Returns:
+        The rollout's exit status.
+    """
+    requester, consumer = args.roll_mcp_oauth
+    return roll_owned_allocation(
+        ProvisioningStore(args.database),
+        driver,
+        secrets,
+        requester_identity=requester,
+        consumer_identity=consumer,
+    )
 
 
 def compose(
@@ -167,6 +241,7 @@ def compose(
                 ca_private_key_file=args.tls_ca_private_key_file,
                 app_prefix=args.fly_app_prefix,
                 clock=observe,
+                mcp_oauth=mcp_oauth_settings(args),
             )
             provider_client = resources.enter_context(
                 httpx.Client(
@@ -253,6 +328,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     bundle = compose(args, parser)
+    if args.roll_mcp_oauth is not None:
+        try:
+            status = run_mcp_oauth_roll(args, bundle.driver, bundle.secrets)
+        finally:
+            bundle.close()
+        raise SystemExit(status)
     stop = Event()
 
     def request_stop(signum: int, frame: object) -> None:
