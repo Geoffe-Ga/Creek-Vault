@@ -70,11 +70,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from functools import partial
-from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeAlias, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
+from creek.classify.llm.consent import is_managed_vault
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek_mcp.api.models import (
     OK_STATUS,
@@ -422,12 +423,79 @@ def _finish_pipeline_job(
     vault: Path,
     claimed: StoredJob,
     result: ClassificationResponse | LinkResponse | None,
+    failure_reason: str | None = None,
 ) -> None:
     """Persist one terminal result without letting a disk fault escape a worker."""
     try:
-        finish_job(vault, claimed.job_id, claimed.worker_id, result)
+        finish_job(vault, claimed.job_id, claimed.worker_id, result, failure_reason)
     except Exception:
         logger.exception("pipeline job %s could not record its result", claimed.job_id)
+
+
+_PipelineOutcome: TypeAlias = tuple[
+    ClassificationResponse | LinkResponse | None, str | None
+]
+"""A pass's public result, and why it failed when that result is ``None``."""
+
+
+def _classification_outcome(
+    vault: Path, claimed: StoredJob, request_key: RequestKey | None
+) -> _PipelineOutcome:
+    """Run one classification job and project its outcome.
+
+    On a managed vault an ``llm`` pass with no available classifier falls back
+    to ``rules`` rather than failing: that vault ships no local model and
+    refuses cloud consent, so a keyless ``llm`` job could otherwise never
+    classify anything. The response then names ``rules``, the classifier that
+    ran. A self-hosted vault keeps the refusal, since its operator configured
+    the model and needs to hear that it is down.
+    """
+    raw = classify_tool(
+        vault_path=vault,
+        method=claimed.method,
+        retier=claimed.retier,
+        privacy_tier_ceiling=TierCeiling(claimed.ceiling),
+        consumer=claimed.consumer,
+        request_key=request_key,
+        fallback_to_rules=is_managed_vault(),
+    )
+    if raw.get("status") != OK_STATUS:
+        return None, _refusal_reason(raw)
+    if "fallback_from" in raw:
+        logger.warning(
+            "pipeline job %s fell back to rules: %s",
+            claimed.job_id,
+            raw.get("fallback_reason"),
+        )
+        method = ClassificationMethod.RULES
+    else:
+        method = ClassificationMethod(claimed.method)
+    return _classification_model(raw, method=method), None
+
+
+def _link_outcome(vault: Path, claimed: StoredJob) -> _PipelineOutcome:
+    """Run one link job and project its outcome."""
+    raw = link_tool(
+        vault_path=vault,
+        method=claimed.method,
+        privacy_tier_ceiling=TierCeiling(claimed.ceiling),
+        consumer=claimed.consumer,
+    )
+    if raw.get("status") != OK_STATUS:
+        return None, _refusal_reason(raw)
+    return _link_model(raw), None
+
+
+def _refusal_reason(raw: dict[str, Any]) -> str:
+    """Return the private ``failure_reason`` for a tool's non-ok result.
+
+    A refusal's ``reason`` is fixed text that names no fragment, so it is kept
+    verbatim; anything else is recorded only by its status.
+    """
+    reason = raw.get("reason")
+    if raw.get("status") == "refused" and isinstance(reason, str):
+        return f"refused: {reason}"
+    return f"status: {raw.get('status')}"
 
 
 def _execute_pipeline_job(
@@ -439,42 +507,28 @@ def _execute_pipeline_job(
     It rides to the worker in memory, as an argument, and is never part of the
     persisted :class:`~creek_mcp.httpapi.jobs.StoredJob`: a job reclaimed after
     a restart has no key and runs, or refuses, exactly as a keyless one.
+
+    A failed job records why on its private record (``failure_reason``) and in
+    the log; the public ``/v1/jobs`` body stays ``failed`` with a null result.
     """
     claimed = _claimed_job(vault, record)
     if claimed is None:
         return
     try:
-        ceiling = TierCeiling(claimed.ceiling)
-        result: ClassificationResponse | LinkResponse | None
         if claimed.kind == "classification":
-            raw = classify_tool(
-                vault_path=vault,
-                method=claimed.method,
-                retier=claimed.retier,
-                privacy_tier_ceiling=ceiling,
-                consumer=claimed.consumer,
-                request_key=request_key,
-            )
-            result = (
-                _classification_model(raw, method=ClassificationMethod(claimed.method))
-                if raw.get("status") == OK_STATUS
-                else None
-            )
+            result, reason = _classification_outcome(vault, claimed, request_key)
         else:
-            raw = link_tool(
-                vault_path=vault,
-                method=claimed.method,
-                privacy_tier_ceiling=ceiling,
-                consumer=claimed.consumer,
-            )
-            result = _link_model(raw) if raw.get("status") == OK_STATUS else None
-    except Exception:
+            result, reason = _link_outcome(vault, claimed)
+    except Exception as exc:
         # The detached worker has no response boundary. Collapse every tool or
         # projection failure to the public terminal state and retain the
-        # diagnostic only in the operator's log.
+        # diagnostic only in the operator's log. The record keeps the type
+        # name alone: an exception's message can carry fragment text.
         logger.exception("pipeline job %s failed", claimed.job_id)
-        result = None
-    _finish_pipeline_job(vault, claimed, result)
+        result, reason = None, f"exception: {type(exc).__name__}"
+    if reason is not None:
+        logger.warning("pipeline job %s failed: %s", claimed.job_id, reason)
+    _finish_pipeline_job(vault, claimed, result, reason)
 
 
 async def _accepted_job(

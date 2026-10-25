@@ -39,6 +39,13 @@ if TYPE_CHECKING:
 _JOB_DIRECTORY: Final[tuple[str, ...]] = ("00-Creek-Meta", "State", "jobs")
 _JOB_LOCK_NAME: Final[str] = "jobs.lock"
 
+WORKER_LOST: Final[str] = "worker_lost"
+"""The ``failure_reason`` of a job its worker never finished.
+
+Written when a reader finds a queued or running record this process is not
+executing — the server restarted, or the machine was autostopped, mid-job.
+"""
+
 JobKind: TypeAlias = Literal["classification", "link", "draft", "author", "revoice"]
 """What a job runs: a ``/v1`` pipeline pass or an MCP composition."""
 
@@ -63,6 +70,14 @@ class StoredJob(BaseModel):
     state: JobState
     worker_id: str
     result: dict[str, Any] | None = None
+    failure_reason: str | None = None
+    """Why a ``failed`` job failed, for the operator only.
+
+    A tool refusal's fixed text, an exception's *type name* (never its
+    message, which can carry fragment text), or :data:`WORKER_LOST`. Never
+    projected onto ``/v1/jobs``, whose failed body stays ``result: null``.
+    Optional so records written before the field existed still load.
+    """
 
 
 def _directory(vault: Path) -> Path:
@@ -145,12 +160,13 @@ def finish_job(
     job_id: str,
     worker_id: str,
     result: ClassificationResponse | LinkResponse | Mapping[str, Any] | None,
+    failure_reason: str | None = None,
 ) -> None:
     """Atomically record a terminal state if this worker still owns the job.
 
     *result* is a pipeline response model, or — for a composition job — the
     already content-free envelope the MCP tool projected; ``None`` records the
-    failed state.
+    failed state, with *failure_reason* kept on the private record.
     """
     with vault_lock(_lock_path(vault)):
         record = _read(_path(vault, job_id))
@@ -164,6 +180,7 @@ def finish_job(
             update={
                 "state": JobState.SUCCEEDED if result is not None else JobState.FAILED,
                 "result": _dumped(result),
+                "failure_reason": None if result is not None else failure_reason,
             }
         )
         _write(vault, terminal)
@@ -209,7 +226,11 @@ def _recovered(
             record.worker_id != worker_id or record.job_id not in active_job_ids
         ):
             record = record.model_copy(
-                update={"state": JobState.FAILED, "result": None}
+                update={
+                    "state": JobState.FAILED,
+                    "result": None,
+                    "failure_reason": WORKER_LOST,
+                }
             )
             _write(vault, record)
     return record

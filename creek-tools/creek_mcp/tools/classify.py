@@ -188,6 +188,44 @@ def _pass_inference_source(
     )
 
 
+def _rules_fallback(
+    *,
+    vault_path: Path,
+    force: bool,
+    retier: bool,
+    privacy_tier_ceiling: TierCeiling,
+    consumer: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Run the ``rules`` pass in place of an unavailable ``llm`` one.
+
+    Args:
+        vault_path: Vault root to classify.
+        force: Passed through to the rules pass.
+        retier: Passed through to the rules pass.
+        privacy_tier_ceiling: Passed through to the rules pass.
+        consumer: Passed through to the rules pass.
+        reason: Why the ``llm`` pass was unavailable — the refusal's text.
+
+    Returns:
+        The rules pass's result, marked with ``fallback_from`` and
+        ``fallback_reason`` on success; a rules refusal (a busy vault)
+        is returned unmarked, since nothing fell back.
+    """
+    result = classify_tool(
+        vault_path=vault_path,
+        method="rules",
+        force=force,
+        retier=retier,
+        privacy_tier_ceiling=privacy_tier_ceiling,
+        consumer=consumer,
+    )
+    if result.get("status") == "ok":
+        result["fallback_from"] = LLM_METHOD
+        result["fallback_reason"] = reason
+    return result
+
+
 def classify_tool(
     *,
     vault_path: Path,
@@ -197,6 +235,7 @@ def classify_tool(
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
     request_key: RequestKey | None = None,
+    fallback_to_rules: bool = False,
 ) -> dict[str, Any]:
     """Run the chosen classifier and return per-method counts.
 
@@ -241,6 +280,13 @@ def classify_tool(
             fragments with the writer's provider; INTIMATE fragments still
             take the router's local route or are left unclassified. Never
             written to the audit record.
+        fallback_to_rules: When an ``llm`` pass has no available classifier,
+            run the model-free ``rules`` pass instead of refusing. The result
+            then carries ``fallback_from: "llm"`` and ``fallback_reason`` (the
+            refusal's fixed text), so the caller can report the classifier
+            that actually ran. Set by the ``/v1`` job worker on a managed
+            vault, which ships no local model and refuses cloud consent: there
+            a keyless ``llm`` job could otherwise never classify anything.
 
     Returns:
         A structured result: per-method counts on success, or a
@@ -277,6 +323,15 @@ def classify_tool(
         # The engine refuses to iterate when the configured LLM provider is
         # unreachable. Translate the no-work-started condition to a stable
         # shape instead of an unhandled ``RuntimeError`` traceback.
+        if fallback_to_rules and method == LLM_METHOD:
+            return _rules_fallback(
+                vault_path=vault_path,
+                force=force,
+                retier=retier,
+                privacy_tier_ceiling=privacy_tier_ceiling,
+                consumer=consumer,
+                reason=str(exc),
+            )
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,

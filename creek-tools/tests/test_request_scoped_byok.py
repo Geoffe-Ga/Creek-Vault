@@ -919,10 +919,17 @@ def test_an_llm_classification_job_uses_the_key_for_open_and_never_intimate(
     _assert_canary_absent(tmp_path, every_log, accepted)
 
 
-def test_a_keyless_llm_classification_on_a_managed_vault_still_refuses(
+def test_a_keyless_llm_classification_on_a_managed_vault_dials_no_vendor(
     managed: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No key, no pinned model: the job fails closed, no vendor dialled."""
+    """No key, no pinned model: no vendor is dialled; the rules pass runs.
+
+    Until the 2026-10-24 amendment to ADR-0015 this job failed outright, which
+    left every keyless managed vault permanently unclassified. The invariant
+    that matters -- nothing leaves for a vendor without the writer's key -- is
+    unchanged: the fallback is the model-free ``rules`` pass, and the job says
+    so by naming ``rules`` as the method that ran.
+    """
     vendor = _Vendor(monkeypatch)
     _fragment(managed, "open-note", _OPEN_BODY, "open")
 
@@ -932,7 +939,8 @@ def test_a_keyless_llm_classification_on_a_managed_vault_still_refuses(
         )
         terminal = _await_job(http, accepted.json()["job_id"])
 
-    assert terminal["state"] == "failed"
+    assert terminal["state"] == "succeeded"
+    assert terminal["result"]["method"] == "rules"
     assert vendor.requests == []
 
 
