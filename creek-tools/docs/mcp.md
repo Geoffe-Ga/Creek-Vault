@@ -1169,13 +1169,15 @@ clients from a primary source on this date.
 
 ### Known gaps on 2026-10-24
 
-- **Managed vaults cannot take agent tokens yet.** The edge routes an agent's
-  token by subject (`--oauth-authorization-server` on the replay router), but the
-  vault Machine is not yet handed `CREEK_MCP_RESOURCE_URL` and
-  `CREEK_MCP_AUTHORIZATION_SERVER`, so it refuses the token
-  ([#1974](https://github.com/Geoffe-Ga/Creek-Vault/issues/1974)). Adepthood also
-  shows no address for a managed vault. Until both land, the recipes work against
-  a self-hosted vault only.
+- **Managed vaults provisioned before #1974 cannot take agent tokens until
+  rolled.** A pilot started with `--oauth-authorization-server` now writes
+  `CREEK_MCP_RESOURCE_URL` and `CREEK_MCP_AUTHORIZATION_SERVER` into every vault
+  Machine it provisions
+  ([#1974](https://github.com/Geoffe-Ga/Creek-Vault/issues/1974)); a vault
+  provisioned earlier keeps refusing the token until the operator rolls it
+  ([provisioning-control-plane.md](provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974)).
+  Adepthood also shows no address for a managed vault yet, so the recipes are
+  verified against a self-hosted vault only.
 - **OpenClaw's OAuth sign-in stops after registration.** Adepthood's
   registration response carries `"logo_uri": null` when the client sent no logo,
   and the MCP TypeScript SDK that OpenClaw 2026.10.7 ships (1.32.0) rejects a
@@ -1567,6 +1569,21 @@ On the managed-vault Fly edge the replay router answers the metadata itself,
 challenges a refused `/mcp` call toward it, and — given
 `--oauth-authorization-server` (`CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER`) —
 routes an agent's token on `/mcp` by its verified `sub` to that person's vault.
+
+**Managed vaults (#1974).** The same issuer setting makes the provisioning
+worker write both settings into every vault Machine it provisions, from the
+activation's own encrypted record. `CREEK_MCP_RESOURCE_URL` is the vault URL
+handed to Adepthood with `/v1` replaced by `/mcp` — exactly the derivation
+Adepthood applies to that URL, so the audience it mints is the resource the
+vault verifies (`creek_mcp/provisioning/models.py::mcp_resource_url`). On the
+pilot every vault shares `https://<pilot>.fly.dev/mcp`, so each vault keeps
+pinning `sub` to its own consumer identity, and per-agent identity rides the
+token's `client_id` claim. The Machine is verified against its record exactly:
+with settings, only the environment that carries both values routes; without
+(any vault provisioned before #1974), only the legacy environment does. A
+vault provisioned earlier is moved across by
+`--roll-mcp-oauth REQUESTER CONSUMER` once its Machine is stopped; see
+[provisioning-control-plane.md](provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974).
 
 ### Rotating a consumer's secret (no downtime)
 

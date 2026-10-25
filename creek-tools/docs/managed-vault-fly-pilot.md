@@ -156,6 +156,16 @@ separate Fly secret-backed files and are not part of that snapshot.
   either consent variable on a managed vault Machine. While a managed vault
   serves, cloud consent stays off even if a variable appears after boot.
   Self-connected vaults keep their opt-in.
+- With `CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER` set, the provisioner also
+  writes `CREEK_MCP_RESOURCE_URL=https://<pilot>.fly.dev/mcp` and
+  `CREEK_MCP_AUTHORIZATION_SERVER` into every vault Machine it provisions
+  (#1974), stored per activation in its encrypted bundle and verified exactly.
+  The resource URL is shared by every pilot vault, so each vault pins the
+  token's `sub` to its own consumer identity. A vault provisioned before that
+  keeps its legacy environment, and keeps routing, until rolled with
+  `creek-managed-vault-pilot --roll-mcp-oauth <requester> <consumer>` while
+  its Machine is stopped
+  ([provisioning-control-plane.md](provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974)).
 - Preserve the hard live-allocation cap of five and Fly replay's inclusive
   1 MiB body ceiling. The pilot journal lifecycle is supported; larger
   `/v1/uploads` requests are unavailable during the pilot and receive Creek's
