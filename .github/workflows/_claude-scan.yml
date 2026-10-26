@@ -178,7 +178,7 @@ jobs:
           fi
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
@@ -257,7 +257,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       - name: Run Claude scan
-        uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10  # v1.0.210
+        uses: anthropics/claude-code-action@16f9f71ab9c490faf367f94dd294897edc25be33  # v1.0.261
         env:
           # The scan-issue-writer skill files issues via gh; the action injects
           # GITHUB_TOKEN, but gh reads GH_TOKEN — bind it to the job token whose
