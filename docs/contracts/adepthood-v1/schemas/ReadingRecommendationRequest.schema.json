@@ -1,0 +1,101 @@
+{
+  "$defs": {
+    "ReadingCandidate": {
+      "additionalProperties": false,
+      "description": "One available chapter identified by the application's stable content ID.",
+      "properties": {
+        "content": {
+          "maxLength": 1500,
+          "minLength": 1,
+          "title": "Content",
+          "type": "string"
+        },
+        "content_id": {
+          "exclusiveMinimum": 0,
+          "title": "Content Id",
+          "type": "integer"
+        },
+        "title": {
+          "maxLength": 240,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content_id",
+        "title",
+        "content"
+      ],
+      "title": "ReadingCandidate",
+      "type": "object"
+    },
+    "ReadingSource": {
+      "additionalProperties": false,
+      "description": "Current caller-owned writing, structurally excluding the intimate tier.",
+      "properties": {
+        "content": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Content",
+          "type": "string"
+        },
+        "entry_id": {
+          "exclusiveMinimum": 0,
+          "title": "Entry Id",
+          "type": "integer"
+        },
+        "tier": {
+          "enum": [
+            "open",
+            "personal"
+          ],
+          "title": "Tier",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "tier",
+        "content"
+      ],
+      "title": "ReadingSource",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A small reading shortlist and the real writing a recommendation may cite.",
+  "properties": {
+    "catalog_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Catalog Version",
+      "type": "string"
+    },
+    "readings": {
+      "items": {
+        "$ref": "#/$defs/ReadingCandidate"
+      },
+      "maxItems": 6,
+      "minItems": 1,
+      "title": "Readings",
+      "type": "array"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/ReadingSource"
+      },
+      "maxItems": 3,
+      "minItems": 1,
+      "title": "Sources",
+      "type": "array"
+    }
+  },
+  "required": [
+    "catalog_version",
+    "readings",
+    "sources"
+  ],
+  "title": "ReadingRecommendationRequest",
+  "type": "object"
+}

@@ -73,6 +73,7 @@ from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
+from creek_mcp.reading_recommendations import RECOMMENDATION_CACHE
 from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
 from creek_mcp.tools.journal import (
     journal_ingest_tool,
@@ -262,17 +263,18 @@ def _upsert(
     vault = configured_vault(request)
     if vault is None:
         return None
-    return journal_ingest_tool(
-        vault_path=vault,
-        content=parsed.content,
-        external_id=external_id,
-        timestamp=parsed.timestamp,
-        tier=parsed.tier.value,
-        privacy_tier_ceiling=context.ceiling,
-        consumer=context.consumer,
-        storage_scope=context.consumer,
-        allow_legacy=len(request.app.state.consumer_ids) == 1,
-    )
+    with RECOMMENDATION_CACHE.mutating(vault):
+        return journal_ingest_tool(
+            vault_path=vault,
+            content=parsed.content,
+            external_id=external_id,
+            timestamp=parsed.timestamp,
+            tier=parsed.tier.value,
+            privacy_tier_ceiling=context.ceiling,
+            consumer=context.consumer,
+            storage_scope=context.consumer,
+            allow_legacy=len(request.app.state.consumer_ids) == 1,
+        )
 
 
 def _render(result: dict[str, Any], context: RequestContext) -> Response:
@@ -604,41 +606,44 @@ def _withdraw(
     vault = configured_vault(request)
     if vault is None:
         return None
-    _audit_withdrawal(vault, context)
-    marker = _pending_path(vault, context.consumer, external_id)
-    try:
-        with vault_lock(journal_mutation_lock_path(vault)):
-            pending = _read_pending(marker)
-            staged, legacy = _selected_withdrawal_source(
-                request,
-                vault,
-                external_id,
-                pending,
-            )
-            discovered, complete_scan = _fragment_ids_for_source(vault, staged)
-            if not complete_scan:
-                return ErrorCode.TEMPORARILY_UNAVAILABLE
-            fragment_ids = sorted(set(discovered) | set(pending[0] if pending else []))
-            if not fragment_ids and not staged.exists() and pending is None:
+    with RECOMMENDATION_CACHE.mutating(vault):
+        _audit_withdrawal(vault, context)
+        marker = _pending_path(vault, context.consumer, external_id)
+        try:
+            with vault_lock(journal_mutation_lock_path(vault)):
+                pending = _read_pending(marker)
+                staged, legacy = _selected_withdrawal_source(
+                    request,
+                    vault,
+                    external_id,
+                    pending,
+                )
+                discovered, complete_scan = _fragment_ids_for_source(vault, staged)
+                if not complete_scan:
+                    return ErrorCode.TEMPORARILY_UNAVAILABLE
+                fragment_ids = sorted(
+                    set(discovered) | set(pending[0] if pending else [])
+                )
+                if not fragment_ids and not staged.exists() and pending is None:
+                    return True
+                _write_pending(marker, fragment_ids, legacy=legacy)
+                if not _purge_ids(vault, fragment_ids):
+                    return ErrorCode.TEMPORARILY_UNAVAILABLE
+                staged.unlink(missing_ok=True)
+                _scrub_fragment_indexes(vault, fragment_ids)
+                # This tombstone precedes the final cache check deliberately. A
+                # linker holding a pre-withdraw snapshot consults the latest
+                # provenance event under the cache lock before saving, so once
+                # this append lands it cannot restore the withdrawn row. A crash
+                # or failed postcondition remains retryable through ``marker``;
+                # duplicate withdrawal events are content-free and idempotent.
+                _tomb_provenance(vault, fragment_ids)
+                if not _verified_absent(vault, staged, fragment_ids):
+                    return ErrorCode.TEMPORARILY_UNAVAILABLE
+                marker.unlink()
                 return True
-            _write_pending(marker, fragment_ids, legacy=legacy)
-            if not _purge_ids(vault, fragment_ids):
-                return ErrorCode.TEMPORARILY_UNAVAILABLE
-            staged.unlink(missing_ok=True)
-            _scrub_fragment_indexes(vault, fragment_ids)
-            # This tombstone precedes the final cache check deliberately. A
-            # linker holding a pre-withdraw snapshot consults the latest
-            # provenance event under the cache lock before saving, so once
-            # this append lands it cannot restore the withdrawn row. A crash
-            # or failed postcondition remains retryable through ``marker``;
-            # duplicate withdrawal events are content-free and idempotent.
-            _tomb_provenance(vault, fragment_ids)
-            if not _verified_absent(vault, staged, fragment_ids):
-                return ErrorCode.TEMPORARILY_UNAVAILABLE
-            marker.unlink()
-            return True
-    except (OSError, ValueError, VaultLockTimeoutError):
-        return ErrorCode.TEMPORARILY_UNAVAILABLE
+        except (OSError, ValueError, VaultLockTimeoutError):
+            return ErrorCode.TEMPORARILY_UNAVAILABLE
 
 
 async def handle_journal_withdraw(request: Request) -> Response:

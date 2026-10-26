@@ -71,6 +71,7 @@ from creek_mcp.api.routes import (
     OP_JOURNAL_WITHDRAW,
     OP_LETTERS,
     OP_LINK,
+    OP_READING_RECOMMENDATIONS,
     OP_REFLECTIONS,
     OP_UPLOAD,
     OP_VOICE_DRAFT_DELETE,
@@ -99,6 +100,7 @@ from creek_mcp.httpapi.pipeline import (
     handle_job_status,
     handle_link,
 )
+from creek_mcp.httpapi.reading_recommendations import handle_reading_recommendations
 from creek_mcp.httpapi.reflect import handle_reflection
 from creek_mcp.httpapi.upload import handle_upload
 from creek_mcp.httpapi.voice_drafts import (
@@ -221,6 +223,7 @@ _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
     OP_LETTERS: handle_letter,
     OP_LINK: handle_link,
     OP_REFLECTIONS: handle_reflection,
+    OP_READING_RECOMMENDATIONS: handle_reading_recommendations,
     OP_UPLOAD: handle_upload,
     OP_VOICE_DRAFT_DELETE: handle_voice_draft_delete,
     OP_VOICE_DRAFT_READ: handle_voice_draft_read,

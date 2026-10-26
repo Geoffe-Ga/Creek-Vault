@@ -3,7 +3,7 @@
 <!-- capability-set: contract-versions -->
 - **Status**: Draft — pending agreement
 - **Date**: 2026-06-30 (surface truthed-up 2026-08-21, #875/#1094)
-- **Contract version**: `0.24.0`
+- **Contract version**: `0.25.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23` (see [Ontology version](#ontology-version))
 <!-- /capability-set -->
 - **Driving issues**: [#748](https://github.com/Geoffe-Ga/Creek-Vault/issues/748) (epic), [#749](https://github.com/Geoffe-Ga/Creek-Vault/issues/749) (this doc), [#875](https://github.com/Geoffe-Ga/Creek-Vault/issues/875) (truth-up), [#1094](https://github.com/Geoffe-Ga/Creek-Vault/issues/1094) (cross-repo reconciliation)
@@ -354,7 +354,7 @@ which.
   "transport": "stdio",
   "auth": "none",
   "available": true,
-  "contract_version": "0.24.0",
+  "contract_version": "0.25.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "tiers": ["open", "personal", "intimate"],
   "tier_model": { "ceilings": ["open", "personal", "intimate", "all"],
@@ -924,6 +924,7 @@ not upgrade it to a semantic identity.
 | Contract version | Date | Change |
 |---|---|---|
 | *(no contract change)* | 2026-10-24 | **Documentation: the agent surface of epic #1961 is recorded (#1969).** Adds [Agents over `/mcp`](#agents-over-mcp-epic-1961) — `/mcp` inside every `/v1` process and behind the Fly edge (#1962), the RFC 9728 metadata, `401`/`403` challenges and JWT acceptance rules (#1963), the four grant names and their tool sets (#1964), `creek.jobs.read` and the `accepted` long-call envelope (#1966) and the per-person attribution limit (#1976) — adds the OAuth row to [Consumer identity & auth model](#consumer-identity--auth-model), corrects the `network` transport row (an issuer alone now satisfies its auth requirement), and moves this document's two "every minor up to …" notes from `0.18.0` to `0.22.0`. **No minor moved here, and none moved for #1962–#1967 either**: they changed the agent adapter's surface — a new tool (`creek.jobs.read`), a new `status` value and two new keys on `creek.draft`, a grant-filtered `tools/list`, two new handshake keys (`auth`, #1963; `request_key_providers`, #1967), the BYOK headers and `inference_source` on the three model-calling tools (#1967) — while `0.21` was current, and `0.22.0` (#1968) was cut after all of them, so every `0.22` server carries them and a `0.21` server may already. This row records that fact rather than a new contract event. `creek.jobs.read` has been in the shipped-surface test's `NON_ADEPTHOOD_TOOLS` since #1966: it is an agent tool, not one Adepthood's backend calls. |
+| `0.25.0` | 2026-10-26 | Adds opt-in `reading-recommendations`: a bounded accessible course shortlist and current open/personal journal excerpts go through the existing generation router. Responses choose supplied IDs, cite a verified verbatim quote, explain relevance and benefit, and retain inference provenance. No BYOK forwarding, no generic fallback; short-lived vault-scoped coalesced caching is invalidated around journal mutation. Older minors remain served. |
 | `0.24.0` | 2026-10-24 | **Authenticated agent MCP discovery (adepthood#3545).** `GET /v1/capabilities` adds `agent_mcp: {resource, authorization_server} \| null` from this allocation's actual mounted OAuth MCP configuration and public routing. Managed private TLS, legacy OAuth-free allocations, missing mounts and unavailable vaults report null. Earlier declared minors omit the field; unversioned discovery publishes it without changing the content minor a client already speaks. `0.23`, `0.22` and every earlier supported minor remain served. |
 | `0.23.0` | 2026-10-24 | **MCP-only: `creek.revoice` (#1981).** Adds a `vault:desk` tool that rewrites caller-supplied text through the owner's voice skills without corpus retrieval or saving. Its prompt preserves meaning and claims; routing keys on the declared ceiling. A detached body's `creek.jobs.read` result is bounded, process-local, agent-bound and ceiling-checked; durable records remain counts-only. No `/v1` route, capability or wire model moves. `0.22` and all earlier supported minors stay served. |
 | `0.22.0` | 2026-10-24 | **The HTTP adapter publishes `agent-activity` (#1968), and the MCP adapter audits one more refusal; no tool's arguments or return shape move.** `GET /v1/agent-activity` projects this adapter's audit chain onto content-free `{consumer, tool, at, outcome}` rows for the vault's owner, with `outcome` closed at `admitted \| refused` and every argument summary, path, fragment id and hash withheld. To make an agent's reach above `personal` visible there, `_BoundedFastMCP.call_tool` now audits a remote call refused by `admitted_ceiling` exactly as it audits an out-of-profile call (#1964): `"outcome": "refused"` under the tool name only, no argument summary, and the transport-default `open` ceiling rather than the one requested. The refusal itself is unchanged and still precedes dispatch. A detached composition's `accepted` / `completed` entries (#1966) are read as one call, not three. `0.21` remains served. |
@@ -951,7 +952,7 @@ not upgrade it to a semantic identity.
 | `0.2.0` | 2026-07-30 | `unclassified` (untiered) content now ranks with `personal`, not `open`, on the MCP ceiling — matching `creek.classify.privacy_filter` since #876 (#961). `open`-ceiling consumers no longer read untiered content; remedy is `creek classify`. See the amendment note under [Tier ceiling semantics](#tier-ceiling-semantics). |
 | `0.1.0` | 2026-06-30 | Initial draft, mirroring `adepthood#950`. Enumerates capabilities, maps to existing (`creek.ingest`, `creek.classify`) and planned (`creek.handshake`/`reflect`/`wheel`) tools, fixes tier/care/auth/transport semantics, pins ontology version. |
 
-> **Every minor from `0.1.0` to `0.24.0` has a row above**, including the four
+> **Every minor from `0.1.0` to `0.25.0` has a row above**, including the four
 > — `0.5.0`, `0.6.0`, `0.7.0`, `0.8.0` — that this document omitted until
 > 2026-08-21. Three of them moved the MCP surface and belonged here all along:
 > `0.5.0` changed `creek.link` / `creek.journal` / `creek.upload` return
@@ -961,4 +962,4 @@ not upgrade it to a semantic identity.
 > concerns the HTTP half, the fuller account is in the [sibling ADR's change
 > log](./2026-07-31-adepthood-http-application-api.md#change-log).
 > `SUPPORTED_CONTRACT_MINORS` (`creek_mcp/api/models.py`) is the authority on
-> which minors are served, and it currently spans `0.2`–`0.24`.
+> which minors are served, and it currently spans `0.2`–`0.25`.

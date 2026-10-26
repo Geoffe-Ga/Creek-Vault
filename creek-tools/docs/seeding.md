@@ -366,6 +366,7 @@ filesystem with. It publishes exactly twenty routes:
 | `POST` | `/v1/links` |
 | `GET` | `/v1/jobs/{job_id}` |
 | `GET` | `/v1/agent-activity` |
+| `POST` | `/v1/reading-recommendations` |
 | `GET` | `/v1/health` |
 
 <!-- /capability-set -->

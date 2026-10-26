@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.24.0`
+- **Contract version**: `0.25.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -223,6 +223,7 @@ every content route refuses an undeclared minor anyway.
 | `journal-withdraw` | `0.16` |
 | `letters` | `0.17` |
 | `agent-activity` | `0.22` |
+| `reading-recommendations` | `0.25` |
 <!-- /capability-set -->
 
 **The build-out divergence is closed (#1112).** While epic #1071 was being
@@ -1032,6 +1033,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.25.0` | 2026-10-26 | Adds opt-in `reading-recommendations`: a bounded accessible course shortlist and current open/personal journal excerpts go through the existing generation router. Responses choose supplied IDs, cite a verified verbatim quote, explain relevance and benefit, and retain inference provenance. No BYOK forwarding, no generic fallback; short-lived vault-scoped coalesced caching is invalidated around journal mutation. Older minors remain served. |
 | `0.24.0` | 2026-10-24 | **Authenticated agent MCP discovery (adepthood#3545).** `GET /v1/capabilities` adds `agent_mcp: {resource, authorization_server} \| null` from this allocation's actual mounted OAuth MCP configuration and public routing. Managed private TLS, legacy OAuth-free allocations, missing mounts and unavailable vaults report null. Earlier declared minors omit the field; unversioned discovery publishes it without changing the content minor a client already speaks. `0.23`, `0.22` and every earlier supported minor remain served. |
 | `0.23.0` | 2026-10-24 | **MCP-only: `creek.revoice` (#1981).** Adds a `vault:desk` tool that rewrites caller-supplied text through the owner's voice skills without corpus retrieval or saving. Its prompt preserves meaning and claims; routing keys on the declared ceiling. A detached body's `creek.jobs.read` result is bounded, process-local, agent-bound and ceiling-checked; durable records remain counts-only. No `/v1` route, capability or wire model moves. `0.22` and all earlier supported minors stay served. |
 | `0.22.0` | 2026-10-24 | #1968 publishes the **eleventh capability**, `agent-activity`, as `GET /v1/agent-activity?limit=&since=`: a content-free projection of the MCP audit chain, so the vault's owner can see what each connected agent asked for and when (epic #1961). Rows are `{consumer, tool, at, outcome}` with `outcome` closed at `admitted \| refused`; no argument summary, fragment id, path, hash or prose crosses, and nothing is hidden by consumer — the app's own `adepthood` calls are listed under their stamp. `limit` defaults to 50 and is clamped to 200; malformed lines are counted in `skipped`; the chain is read, never rewritten, and not re-verified per request, so no `chain_verified_at` is published. Three wire models (`AgentActivityQuery`, `AgentActivityRow`, `AgentActivityResponse`) and the contract's first query parameters (`RouteSpec.query_model`) widen the HTTP contract, and the fixture matrix grows to 11 x 7 with `agent-activity/refusal` unreachable. The MCP adapter now audits a remote call refused for a ceiling above `personal` as `"outcome": "refused"` under the tool name only, so that attempt shows on the card. `0.21` remains served without seeing or reaching the route; the OpenAPI golden advances deliberately. |

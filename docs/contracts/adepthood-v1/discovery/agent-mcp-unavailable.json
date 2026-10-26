@@ -11,10 +11,11 @@
     "voice-drafts",
     "journal-withdraw",
     "letters",
-    "agent-activity"
+    "agent-activity",
+    "reading-recommendations"
   ],
-  "contract_minor": "0.24",
-  "contract_version": "0.24.0",
+  "contract_minor": "0.25",
+  "contract_version": "0.25.0",
   "inference_pool": true,
   "keyless_inference": true,
   "ontology_version": "aptitude-wavelength/2026-05-23",
@@ -24,6 +25,7 @@
   ],
   "status": "ok",
   "supported_contract_minors": [
+    "0.25",
     "0.24",
     "0.23",
     "0.22",

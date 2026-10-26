@@ -1,0 +1,43 @@
+{
+  "additionalProperties": false,
+  "description": "A model choice accepted only after its IDs and quotation are verified.",
+  "properties": {
+    "benefit": {
+      "maxLength": 400,
+      "minLength": 1,
+      "title": "Benefit",
+      "type": "string"
+    },
+    "content_id": {
+      "exclusiveMinimum": 0,
+      "title": "Content Id",
+      "type": "integer"
+    },
+    "entry_id": {
+      "exclusiveMinimum": 0,
+      "title": "Entry Id",
+      "type": "integer"
+    },
+    "quote": {
+      "maxLength": 280,
+      "minLength": 1,
+      "title": "Quote",
+      "type": "string"
+    },
+    "reason": {
+      "maxLength": 400,
+      "minLength": 1,
+      "title": "Reason",
+      "type": "string"
+    }
+  },
+  "required": [
+    "content_id",
+    "entry_id",
+    "quote",
+    "reason",
+    "benefit"
+  ],
+  "title": "ReadingRecommendation",
+  "type": "object"
+}

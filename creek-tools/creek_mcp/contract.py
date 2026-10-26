@@ -20,8 +20,15 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.24.0"
+CONTRACT_VERSION: Final[str] = "0.25.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.25.0: ``reading-recommendations`` adds a bounded, evidence-backed selection
+of one caller-supplied available chapter through the configured generation
+router. IDs and quotations are independently validated. Results are cached
+only in bounded, vault-scoped process memory and invalidated on journal
+mutations. The operation never accepts a writer's request-scoped provider key.
+Every earlier minor remains served without seeing or reaching this operation.
 
 0.24.0 (adepthood#3545): authenticated ``GET /v1/capabilities`` gains optional
 ``agent_mcp`` discovery metadata. Its resource and authorization-server issuer

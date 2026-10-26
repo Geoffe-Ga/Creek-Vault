@@ -607,8 +607,8 @@ distress is handed here are exactly the ones the guardrail ships.
 _CARE_UNREACHABLE_PAYLOAD: Final[dict[str, Any]] = {
     "unreachable": True,
     "reason": (
-        "the acute-distress guard runs only on the reflection and letter "
-        "paths, so this capability has no care-escalation response shape"
+        "only the reflection and letter paths publish a care-escalation "
+        "response; this capability has no care-escalation response shape"
     ),
 }
 """Why a non-reflection capability cannot emit care escalation."""
@@ -726,6 +726,19 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 # --------------------------------------------------------------------------
 
 _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
+    Capability.READING_RECOMMENDATIONS.value: _Example(
+        model="ReadingRecommendationResponse",
+        payload={
+            "status": "ok",
+            "recommendation": {
+                "content_id": 24,
+                "entry_id": 8,
+                "quote": "Synthetic journal passage.",
+                "reason": "This passage names a question the offered reading explores.",
+                "benefit": "An exercise for considering that question.",
+            },
+        },
+    ),
     Capability.CAPABILITIES.value: _Example(
         model="CapabilitiesResponse",
         payload=_CAPABILITIES_SUCCESS,
@@ -782,6 +795,10 @@ empty link below — so both of its response models are shown somewhere.
 """
 
 _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
+    Capability.READING_RECOMMENDATIONS.value: _Example(
+        model="ReadingRecommendationResponse",
+        payload={"status": "empty", "recommendation": None},
+    ),
     Capability.CAPABILITIES.value: _Example(
         model="CapabilitiesResponse",
         payload=_CAPABILITIES_EMPTY,

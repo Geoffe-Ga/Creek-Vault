@@ -1,0 +1,32 @@
+{
+  "additionalProperties": false,
+  "description": "Current caller-owned writing, structurally excluding the intimate tier.",
+  "properties": {
+    "content": {
+      "maxLength": 2000,
+      "minLength": 1,
+      "title": "Content",
+      "type": "string"
+    },
+    "entry_id": {
+      "exclusiveMinimum": 0,
+      "title": "Entry Id",
+      "type": "integer"
+    },
+    "tier": {
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "Tier",
+      "type": "string"
+    }
+  },
+  "required": [
+    "entry_id",
+    "tier",
+    "content"
+  ],
+  "title": "ReadingSource",
+  "type": "object"
+}
