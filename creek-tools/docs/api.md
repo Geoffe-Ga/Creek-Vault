@@ -75,6 +75,7 @@ list of names:
 | `journal-withdraw` | `0.16` |
 | `letters` | `0.17` |
 | `agent-activity` | `0.22` |
+| `reading-recommendations` | `0.25` |
 <!-- /capability-set -->
 
 **The advertised list is caller-dependent, and the count above is the ceiling,
@@ -1043,3 +1044,26 @@ our Pydantic models alone.
 
 The Starlette adapter therefore lives beside it, in `creek_mcp/httpapi/`, rather
 than under it. The sweep stays whole.
+
+### Grounded reading recommendations (contract 0.25)
+
+`POST /v1/reading-recommendations` accepts `{catalog_version, readings,
+sources}`. Each reading is `{content_id, title, content}` (up to six, with a
+1,500-character excerpt); each source is `{entry_id, tier, content}` (up to
+three, at most 2,000 characters each, `open` or `personal`). The consumer owns
+source authorization and reading availability. IDs must be unique. The fully
+serialized prompt, including the shared care policy, must fit the pool cap.
+
+The configured generation router used by letters chooses at most one offered
+reading. A successful answer contains `{status: "ok", recommendation:
+{content_id, entry_id, quote, reason, benefit}, inference_source?}`; IDs and the
+verbatim source quote are independently validated. Weak evidence or a care
+signal returns `status: "empty"`. Rate limits return 429; generation outages
+return 503. No writer request key is forwarded for this background offer.
+
+The stable public reading prefix precedes personal context to permit the
+configured provider's prompt caching. Results are cached in memory for ten
+minutes, bounded to 128 entries, isolated by vault and complete request/model
+revision. Concurrent polling coalesces. Journal mutations invalidate before and
+after completion, and generation crossing an invalidation or request
+cancellation cannot restore an old result. No prompt is persisted by this cache.

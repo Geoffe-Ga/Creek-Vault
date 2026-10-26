@@ -533,6 +533,12 @@ class PoolRequestScope:
         self._cancelled = False
 
     @property
+    def cancelled(self) -> bool:
+        """Whether the owning request has already cancelled its model work."""
+        with self._lock:
+            return self._cancelled
+
+    @property
     def tier(self) -> str | None:
         """The declared wire tier, or ``None`` when none was declared."""
         with self._lock:

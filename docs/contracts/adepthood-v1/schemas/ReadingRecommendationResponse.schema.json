@@ -1,0 +1,88 @@
+{
+  "$defs": {
+    "ReadingRecommendation": {
+      "additionalProperties": false,
+      "description": "A model choice accepted only after its IDs and quotation are verified.",
+      "properties": {
+        "benefit": {
+          "maxLength": 400,
+          "minLength": 1,
+          "title": "Benefit",
+          "type": "string"
+        },
+        "content_id": {
+          "exclusiveMinimum": 0,
+          "title": "Content Id",
+          "type": "integer"
+        },
+        "entry_id": {
+          "exclusiveMinimum": 0,
+          "title": "Entry Id",
+          "type": "integer"
+        },
+        "quote": {
+          "maxLength": 280,
+          "minLength": 1,
+          "title": "Quote",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 400,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content_id",
+        "entry_id",
+        "quote",
+        "reason",
+        "benefit"
+      ],
+      "title": "ReadingRecommendation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A validated recommendation or an honest absence of supporting evidence.",
+  "properties": {
+    "inference_source": {
+      "anyOf": [
+        {
+          "pattern": "^(?:local|pool:creek|pool:attested:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|request_key:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Inference Source"
+    },
+    "recommendation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReadingRecommendation"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "empty"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status"
+  ],
+  "title": "ReadingRecommendationResponse",
+  "type": "object"
+}

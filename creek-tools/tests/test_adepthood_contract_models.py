@@ -203,6 +203,7 @@ CAPABILITIES_RESPONSE_PAYLOAD: dict[str, Any] = {
         "journal-withdraw",
         "letters",
         "agent-activity",
+        "reading-recommendations",
     ],
 }
 
@@ -507,7 +508,37 @@ NOT_APPLICABLE_EXAMPLE_PAYLOAD: dict[str, Any] = {
 
 # Keyed by ``__name__`` rather than by a literal, so the table cannot drift
 # from the classes it describes and every imported model is genuinely used.
+_READING = {
+    "content_id": 24,
+    "title": "A synthetic reading",
+    "content": "Notice physical sensations.",
+}
+_READING_SOURCE = {
+    "entry_id": 8,
+    "tier": "personal",
+    "content": "I noticed tension in my shoulders.",
+}
+_RECOMMENDATION = {
+    "content_id": 24,
+    "entry_id": 8,
+    "quote": "tension in my shoulders",
+    "reason": "You describe bodily tension.",
+    "benefit": "An attention practice.",
+}
+
 HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
+    "ReadingCandidate": _READING,
+    "ReadingSource": _READING_SOURCE,
+    "ReadingRecommendation": _RECOMMENDATION,
+    "ReadingRecommendationRequest": {
+        "catalog_version": "course-1",
+        "readings": [_READING],
+        "sources": [_READING_SOURCE],
+    },
+    "ReadingRecommendationResponse": {
+        "status": "ok",
+        "recommendation": _RECOMMENDATION,
+    },
     AgentActivityQuery.__name__: AGENT_ACTIVITY_QUERY_PAYLOAD,
     AgentActivityResponse.__name__: AGENT_ACTIVITY_RESPONSE_PAYLOAD,
     AgentActivityRow.__name__: AGENT_ACTIVITY_ROW_PAYLOAD,
@@ -645,6 +676,7 @@ EXPECTED_UNREACHABLE_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("journal-withdraw", "care-escalation"),
         ("journal-withdraw", "refusal"),
         ("agent-activity", "care-escalation"),
+        ("reading-recommendations", "care-escalation"),
         ("agent-activity", "refusal"),
     }
 )
@@ -1121,6 +1153,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "journal-withdraw",
         "letters",
         "agent-activity",
+        "reading-recommendations",
     )
     assert EXAMPLE_STATES == (
         "success",
@@ -1131,7 +1164,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 77
+    assert len(_matrix()) == 84
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
@@ -1940,7 +1973,8 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.24"
+    assert "0.24" in SUPPORTED_CONTRACT_MINORS
+    assert CONTRACT_MINOR == "0.25"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

@@ -1,0 +1,30 @@
+{
+  "additionalProperties": false,
+  "description": "One available chapter identified by the application's stable content ID.",
+  "properties": {
+    "content": {
+      "maxLength": 1500,
+      "minLength": 1,
+      "title": "Content",
+      "type": "string"
+    },
+    "content_id": {
+      "exclusiveMinimum": 0,
+      "title": "Content Id",
+      "type": "integer"
+    },
+    "title": {
+      "maxLength": 240,
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "content_id",
+    "title",
+    "content"
+  ],
+  "title": "ReadingCandidate",
+  "type": "object"
+}

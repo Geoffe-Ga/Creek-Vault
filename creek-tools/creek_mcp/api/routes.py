@@ -62,6 +62,10 @@ from creek_mcp.api.models import (
     VoiceDraftUpsertResponse,
     WheelResponse,
 )
+from creek_mcp.api.reading_recommendations import (
+    ReadingRecommendationRequest,
+    ReadingRecommendationResponse,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -149,6 +153,9 @@ OP_VOICE_DRAFT_DELETE: Final[str] = "deleteVoiceDraft"
 
 OP_LETTERS: Final[str] = "writeLetter"
 """``operation_id`` of ``POST /v1/letters/{external_id}``."""
+
+OP_READING_RECOMMENDATIONS: Final[str] = "recommendReading"
+"""``operation_id`` of ``POST /v1/reading-recommendations``."""
 
 OP_DRIVE_STATUS: Final[str] = "getDriveConnector"
 """``operation_id`` of ``GET /v1/connectors/drive``."""
@@ -636,6 +643,17 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         requires_contract_version=True,
         summary="Return the most recent MCP calls: who, which tool, when, outcome.",
         query_model=AgentActivityQuery,
+    ),
+    RouteSpec(
+        path="/v1/reading-recommendations",
+        method="POST",
+        operation_id=OP_READING_RECOMMENDATIONS,
+        capability=Capability.READING_RECOMMENDATIONS,
+        request_model=ReadingRecommendationRequest,
+        response_model=ReadingRecommendationResponse,
+        requires_contract_version=True,
+        summary="Suggest a reading with a verified journal quotation and benefit.",
+        max_body_bytes=64 * 1024,
     ),
     RouteSpec(
         path="/v1/health",

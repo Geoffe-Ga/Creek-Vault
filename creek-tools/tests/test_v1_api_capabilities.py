@@ -212,6 +212,7 @@ def test_a_present_vault_advertises_only_the_built_capabilities(
         "journal-withdraw",
         "letters",
         "agent-activity",
+        "reading-recommendations",
     ]
 
 

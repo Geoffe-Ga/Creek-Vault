@@ -63,12 +63,20 @@ from uuid import UUID
 from pydantic import (
     AwareDatetime,
     BaseModel,
-    ConfigDict,
     Field,
     field_validator,
     model_validator,
 )
 
+from creek_mcp.api.base import WireModel as _WireModel
+from creek_mcp.api.inference import INFERENCE_SOURCE_PATTERN
+from creek_mcp.api.reading_recommendations import (
+    ReadingCandidate,
+    ReadingRecommendation,
+    ReadingRecommendationRequest,
+    ReadingRecommendationResponse,
+    ReadingSource,
+)
 from creek_mcp.contract import CONTRACT_VERSION
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 
@@ -91,6 +99,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.24",
     "0.23",
     "0.22",
     "0.21",
@@ -310,7 +319,7 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The eleven capabilities ``/v1`` publishes.
+    """The capabilities ``/v1`` publishes.
 
     The list was identical for every minor in
     :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
@@ -383,6 +392,7 @@ class Capability(StrEnum):
     JOURNAL_WITHDRAW = "journal-withdraw"
     LETTERS = "letters"
     AGENT_ACTIVITY = "agent-activity"
+    READING_RECOMMENDATIONS = "reading-recommendations"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -600,19 +610,6 @@ separated value a consumer splits. A slug cannot carry a colon, a space or a
 line break, so the value stays parseable and carries no prose.
 """
 
-INFERENCE_SOURCE_PATTERN: Final[str] = (
-    f"^(?:{INFERENCE_SOURCE_LOCAL}|{INFERENCE_SOURCE_POOL_CREEK}"
-    f"|{_ATTESTED_POOL_PREFIX}{_VENDOR_SLUG}|{_REQUEST_KEY_PREFIX}{_VENDOR_SLUG})$"
-)
-"""The closed provenance vocabulary, as the published schemas express it.
-
-A ``pattern`` rather than an enum because two of ADR-0016 Decision 1 item 11's
-four values are parameterised by vendor, and an enum would have to be rewritten
-— a contract change — every time a vendor is added or swapped. The constraint
-still reaches the committed schema, which is what stops the field from becoming
-a free-text channel.
-"""
-
 
 def attested_pool_source(vendor: str) -> str | None:
     """Return the provenance value for a vendor-attested pool, or ``None``.
@@ -672,6 +669,7 @@ CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.JOURNAL_WITHDRAW: _JOURNAL_WITHDRAW_MINOR,
     Capability.LETTERS: _LETTERS_MINOR,
     Capability.AGENT_ACTIVITY: _AGENT_ACTIVITY_MINOR,
+    Capability.READING_RECOMMENDATIONS: "0.25",
 }
 """The contract minor each capability was first published at.
 
@@ -1197,20 +1195,6 @@ credential; over plain ``http`` it would cross the network in the clear.
 # --------------------------------------------------------------------------
 # Models
 # --------------------------------------------------------------------------
-
-
-class _WireModel(BaseModel):
-    """Base for every published wire model: closed, no silent passthrough.
-
-    ``extra="forbid"`` across the whole surface is a contract property, not a
-    style preference. An open model lets a producer bolt a debug key onto a
-    response and a consumer start depending on it, at which point the field
-    exists without ever having been negotiated — and on an error path such a
-    key is, by construction, derived from material the caller may not be
-    entitled to.
-    """
-
-    model_config = ConfigDict(extra="forbid")
 
 
 class ErrorEnvelope(_WireModel):
@@ -3027,6 +3011,11 @@ class NotApplicableExample(_WireModel):
 
 
 CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
+    "ReadingCandidate": ReadingCandidate,
+    "ReadingRecommendation": ReadingRecommendation,
+    "ReadingRecommendationRequest": ReadingRecommendationRequest,
+    "ReadingRecommendationResponse": ReadingRecommendationResponse,
+    "ReadingSource": ReadingSource,
     "AgentActivityQuery": AgentActivityQuery,
     "AgentActivityResponse": AgentActivityResponse,
     "AgentActivityRow": AgentActivityRow,

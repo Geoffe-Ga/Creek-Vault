@@ -141,6 +141,7 @@ _CAPABILITY_ERROR_CODES: Final[dict[Capability, tuple[ErrorCode, ...]]] = {
     Capability.UPLOAD: (ErrorCode.UNSUPPORTED_SOURCE,),
     Capability.REFLECTIONS: (ErrorCode.RATE_LIMITED,),
     Capability.LETTERS: (ErrorCode.RATE_LIMITED,),
+    Capability.READING_RECOMMENDATIONS: (ErrorCode.RATE_LIMITED,),
 }
 """Refusals only one capability can produce, keyed by that capability.
 

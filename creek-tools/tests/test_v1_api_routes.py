@@ -60,6 +60,8 @@ from creek_mcp.api.models import (
     LetterResponse,
     LinkRequest,
     LinkResponse,
+    ReadingRecommendationRequest,
+    ReadingRecommendationResponse,
     ReflectionRequest,
     ReflectionResponse,
     UploadRequest,
@@ -265,6 +267,15 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/reading-recommendations",
+        "POST",
+        "recommendReading",
+        Capability.READING_RECOMMENDATIONS,
+        ReadingRecommendationRequest,
+        ReadingRecommendationResponse,
+        True,
+    ),
+    (
         "/v1/health",
         "GET",
         "getHealth",
@@ -295,10 +306,11 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "links",
     "job-status",
     "agent-activity",
+    "reading-recommendations",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 20
+_EXPECTED_ROUTE_COUNT: Final[int] = 21
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -652,6 +664,7 @@ def test_implemented_capabilities_is_exactly_the_published_eleven() -> None:
                 Capability.JOURNAL_WITHDRAW,
                 Capability.LETTERS,
                 Capability.AGENT_ACTIVITY,
+                Capability.READING_RECOMMENDATIONS,
             }
         )
         == IMPLEMENTED_CAPABILITIES
@@ -766,7 +779,10 @@ def test_only_the_upload_route_declares_its_own_body_cap() -> None:
     Derived from the table rather than listed beside the middleware, so a cap
     declared on a route cannot fail to be applied to it.
     """
-    assert ROUTE_BODY_CAPS == {"/v1/uploads": UPLOAD_MAX_BODY_BYTES}
+    assert ROUTE_BODY_CAPS == {
+        "/v1/uploads": UPLOAD_MAX_BODY_BYTES,
+        "/v1/reading-recommendations": 64 * 1024,
+    }
 
 
 def test_the_upload_body_cap_carries_the_tools_whole_document_cap() -> None:
