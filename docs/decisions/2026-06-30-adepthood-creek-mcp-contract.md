@@ -166,11 +166,24 @@ managed vault is therefore the edge's, `https://<pilot-app>.fly.dev/mcp`, shared
 by all of them; the Machine pins `sub` to its own consumer identity so it
 accepts no one else's token.
 
-**Not yet end to end.** The Machine reads `CREEK_MCP_RESOURCE_URL` and
-`CREEK_MCP_AUTHORIZATION_SERVER` from its environment, and provisioning does not
-write them yet ([#1974](https://github.com/Geoffe-Ga/Creek-Vault/issues/1974)),
-so a managed vault today refuses agent tokens on `/mcp`; only its static
-consumer credential is served there.
+**Provisioning writes the settings (#1974, closed by #1983).** The Machine
+reads `CREEK_MCP_RESOURCE_URL` and `CREEK_MCP_AUTHORIZATION_SERVER` from its
+environment. Given `--oauth-authorization-server`
+(`CREEK_PILOT_OAUTH_AUTHORIZATION_SERVER` on the pilot,
+`creek_mcp/provisioning/pilot_cli.py`), the control plane stores both per
+activation in its encrypted bundle and writes them into every vault Machine it
+provisions from then on (`creek_mcp/provisioning/worker_cli.py::mcp_oauth_settings`,
+`creek_mcp/provisioning/fly.py`). The resource is the handed-off `/v1` vault
+URL with `/v1` replaced by `/mcp`, the same derivation Adepthood applies
+(`creek_mcp/provisioning/models.py::mcp_resource_url`); the issuer is stored
+verbatim. Provisioning does not write `CREEK_MCP_JWKS_URL`, which stays an
+optional override (`creek_mcp/oauth_resource.py::JWKS_URL_ENV`). Machine
+verification stays exact per activation, so an allocation provisioned before
+#1974 keeps its legacy environment, keeps routing, and still refuses agent
+tokens on `/mcp` (serving only its static consumer credential there) until an
+operator rolls it with `--roll-mcp-oauth REQUESTER CONSUMER` while its Machine
+is stopped (`creek_mcp/provisioning/mcp_oauth_rollout.py`). The procedure is in
+[`creek-tools/docs/provisioning-control-plane.md`](../../creek-tools/docs/provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974).
 
 ### OAuth resource metadata
 
@@ -923,6 +936,7 @@ not upgrade it to a semantic identity.
 
 | Contract version | Date | Change |
 |---|---|---|
+| *(no contract change)* | 2026-10-27 | **Documentation: `/mcp` on managed vaults truthed up after #1974.** The paragraph that said provisioning does not yet write `CREEK_MCP_RESOURCE_URL` / `CREEK_MCP_AUTHORIZATION_SERVER` now records what #1983 shipped: per-activation settings written by the control plane given `--oauth-authorization-server`, and `--roll-mcp-oauth` for allocations provisioned earlier. No tool, shape or version moves. |
 | *(no contract change)* | 2026-10-24 | **Documentation: the agent surface of epic #1961 is recorded (#1969).** Adds [Agents over `/mcp`](#agents-over-mcp-epic-1961) — `/mcp` inside every `/v1` process and behind the Fly edge (#1962), the RFC 9728 metadata, `401`/`403` challenges and JWT acceptance rules (#1963), the four grant names and their tool sets (#1964), `creek.jobs.read` and the `accepted` long-call envelope (#1966) and the per-person attribution limit (#1976) — adds the OAuth row to [Consumer identity & auth model](#consumer-identity--auth-model), corrects the `network` transport row (an issuer alone now satisfies its auth requirement), and moves this document's two "every minor up to …" notes from `0.18.0` to `0.22.0`. **No minor moved here, and none moved for #1962–#1967 either**: they changed the agent adapter's surface — a new tool (`creek.jobs.read`), a new `status` value and two new keys on `creek.draft`, a grant-filtered `tools/list`, two new handshake keys (`auth`, #1963; `request_key_providers`, #1967), the BYOK headers and `inference_source` on the three model-calling tools (#1967) — while `0.21` was current, and `0.22.0` (#1968) was cut after all of them, so every `0.22` server carries them and a `0.21` server may already. This row records that fact rather than a new contract event. `creek.jobs.read` has been in the shipped-surface test's `NON_ADEPTHOOD_TOOLS` since #1966: it is an agent tool, not one Adepthood's backend calls. |
 | `0.25.0` | 2026-10-26 | Adds opt-in `reading-recommendations`: a bounded accessible course shortlist and current open/personal journal excerpts go through the existing generation router. Responses choose supplied IDs, cite a verified verbatim quote, explain relevance and benefit, and retain inference provenance. No BYOK forwarding, no generic fallback; short-lived vault-scoped coalesced caching is invalidated around journal mutation. Older minors remain served. |
 | `0.24.0` | 2026-10-24 | **Authenticated agent MCP discovery (adepthood#3545).** `GET /v1/capabilities` adds `agent_mcp: {resource, authorization_server} \| null` from this allocation's actual mounted OAuth MCP configuration and public routing. Managed private TLS, legacy OAuth-free allocations, missing mounts and unavailable vaults report null. Earlier declared minors omit the field; unversioned discovery publishes it without changing the content minor a client already speaks. `0.23`, `0.22` and every earlier supported minor remain served. |
