@@ -17,6 +17,7 @@ owner's voice. Two paths share one public :meth:`VoiceAgent.render`:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -41,6 +42,8 @@ if TYPE_CHECKING:
     from creek.author.client import AuthorLLMClient
     from creek.author.models import EvidenceBundle, EvidenceClaim, Medium
     from creek.models import MediumContract
+
+logger = logging.getLogger(__name__)
 
 #: Mediums voiced with a light touch (clarity over flourish).
 _LIGHT_VOICING_MEDIUMS: frozenset[str] = frozenset({"research", "research-piece"})
@@ -160,9 +163,15 @@ def _split_voice_prompt(
     Prompt caching (#474) bills the static prefix once and re-reads it cheaply
     on repeat runs. The ``creek-skills`` voice-skill sections are identical
     across queries for a given vault, so they form the cached *static* block;
-    the per-query evidence and ask form the *dynamic* user prompt. Splitting
-    here changes no content the model sees — the union of static + dynamic is
-    the same material the single-string prompt carried — only how it is billed.
+    the per-query evidence and ask form the *dynamic* user prompt.
+
+    The static block carries only **source-free** style (#1986). The run's
+    routing tier and admission ceiling are derived from the evidence alone, so
+    a cached skill must never add source bytes the evidence did not: native
+    caches are reconstructed through :func:`_source_free_style` instead of
+    inlined, which keeps harvested exemplar titles, ids and passages — written
+    under whatever ceiling the tree was last generated at — out of every
+    provider request.
 
     Returns:
         A ``(static, dynamic)`` pair. ``static`` is the joined skill sections
@@ -174,7 +183,7 @@ def _split_voice_prompt(
             CARE_POLICY,
             *(
                 text
-                for _name, text in _skill_sections(
+                for _name, text in _source_free_skill_sections(
                     vault, _dominant_phase(evidence), _dominant_register(evidence)
                 )
             ),
@@ -238,7 +247,7 @@ def _native_voice_signature(name: str, metadata: Mapping[str, object]) -> str:
     return render_voice_signature(name)
 
 
-def _revoice_style(name: str, text: str) -> str:
+def _source_free_style(name: str, text: str) -> str:
     """Keep native source bytes out, and trust only source-free custom style.
 
     Generated caches are reconstructed, never delimiter-parsed. A malformed
@@ -258,6 +267,47 @@ def _revoice_style(name: str, text: str) -> str:
         return _native_voice_signature(name, post.metadata)
     boundary = _EXEMPLAR_BOUNDARY.search(text)
     return text[: boundary.start()].strip() if boundary is not None else text
+
+
+def _source_free_skill_sections(
+    vault: Path, phase: str | None, register: str | None
+) -> list[tuple[str, str]]:
+    """Return each voice skill projected onto source-free style (#1986).
+
+    Every section passes through :func:`_source_free_style`, so no cached
+    exemplar can reach a provider whatever ceiling generated it — including
+    exemplars of unknown or unclassified tier, and stale or malformed caches,
+    which are withheld rather than read raw. A skill that loses content on the
+    way is logged by **name only** (``phase-rising``, never a path, title, id
+    or passage) so degraded voice conditioning stays observable.
+
+    Args:
+        vault: The vault holding the voice skill tree.
+        phase: The phase slug to condition on, or ``None``.
+        register: The voice-register slug to condition on, or ``None``.
+
+    Returns:
+        ``(name, style)`` pairs in voice-core, phase, register order, with
+        withheld skills omitted.
+    """
+    sections: list[tuple[str, str]] = []
+    for name, content in _skill_sections(vault, phase, register):
+        style = _source_free_style(name, content)
+        if not style:
+            logger.info(
+                "Voice skill %s withheld: its cache is not recognised source-free "
+                "style; regenerate the skill tree to restore it.",
+                name,
+            )
+            continue
+        if style != content:
+            logger.info(
+                "Voice skill %s conditioned on source-free style; cached "
+                "exemplar content was not sent.",
+                name,
+            )
+        sections.append((name, style))
+    return sections
 
 
 def split_revoice_prompt(
@@ -281,11 +331,7 @@ def split_revoice_prompt(
     Returns:
         The prompt halves and the exact skill names used by this snapshot.
     """
-    skills = [
-        (name, style)
-        for name, content in _skill_sections(vault, phase, register)
-        if (style := _revoice_style(name, content))
-    ]
+    skills = _source_free_skill_sections(vault, phase, register)
     if not skills or skills[0][0] != "voice-core":
         skills = []
     static = "\n\n".join([CARE_POLICY, *(content for _name, content in skills)])
