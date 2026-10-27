@@ -9,6 +9,15 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Keep cached voice-skill exemplars out of `creek.author` inference (#1986).
+  The voice call's routing tier and admission ceiling come from the evidence,
+  but the static prompt used to inline cached phase/register skills verbatim,
+  so an `open` caller's request could carry exemplar titles, ids and passages
+  harvested under a wider ceiling. Author prompts now use the same source-free
+  projection as `creek.revoice`: native caches are reconstructed as canonical
+  signatures, stale or malformed caches are withheld, and custom style stops at
+  any exemplar boundary. Withheld or reduced skills are logged by name only.
+
 - Publish allocation-specific `agent_mcp` metadata at contract `0.24.0`
   (adepthood#3545). Authenticated capability discovery names the actual mounted
   OAuth MCP resource and issuer, or null for an allocation that cannot serve

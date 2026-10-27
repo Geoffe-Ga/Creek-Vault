@@ -67,6 +67,11 @@ def _content_tier(
     highest ``privacy_tier`` actually cited. ``INTIMATE`` outranks ``PERSONAL``
     outranks ``OPEN``; ``None`` when the evidence cites no known fragment.
 
+    The evidence is the only corpus content the voice request carries: cached
+    voice skills enter it as source-free style only (#1986, see
+    :func:`creek.author.voice._source_free_skill_sections`), so they add no
+    tier for this reduction to cover.
+
     Args:
         evidence: The gathered evidence.
         vault: Vault root (to look up fragment tiers).
