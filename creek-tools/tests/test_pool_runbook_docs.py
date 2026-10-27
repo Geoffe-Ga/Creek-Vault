@@ -1,18 +1,18 @@
 """Guard the pool measurement-pin runbook against drift and overclaim.
 
 ``docs/pool-measurement-pin.md`` is an operator runbook for a design that is
-**conditionally** selected: ADR-0016 is ratified as O5 but `Accepted` takes
-effect only once the adepthood ADR 0009 amendment merges, the vendor is not
-chosen, condition (f) of Decision 3.3 is unverified for either candidate, and
-the owner has authorized no spend. A runbook that reads as though any of that
-were settled would be worse than no runbook, so the page's honesty is tested
-rather than trusted:
+selected but not built: ADR-0016 is ratified as O5, the owner chose the vendor
+and granted the three Decision 3.3 waivers on 2026-10-21 (recorded in adepthood
+ADR 0009's amendment), condition (f) is waived on vendor-asserted evidence but
+still unverified, and the only spend authorized is #1899's bounded pilot. A
+runbook that reads as though more were settled than that would be worse than no
+runbook, so the page's honesty is tested rather than trusted:
 
 * every Decision 3.3 condition (a)-(h) carries a verdict from a closed
   vocabulary, and none is silently absent;
 * condition (f) reads ``vendor-asserted``;
-* the two D05 conditions O5 cannot meet are recorded as waivers *required*,
-  never granted;
+* the three waived conditions, (c), (e) and (f), each record the owner's
+  2026-10-21 waiver, and (c) and (e) keep the substitute that justifies it;
 * the O3-only acceptance tests are named in the dormant section;
 * the constants the page quotes still match the code that defines them;
 * ``pool_min_below_one`` is described exactly as registered or not, whichever
@@ -22,8 +22,8 @@ rather than trusted:
 * every ``per_sweep`` JSON path the evidence procedure quotes resolves against
   the real report models, and the page does not call the harness
   pool-incapable once the bench's provider vocabulary admits ``pool``;
-* no vendor is named, because naming one would mean the status banner above it
-  went stale;
+* the chosen vendor is named with its operator and jurisdiction, and the
+  unchosen candidate is not named as chosen;
 * the forbidden custody claims appear only under a negation.
 
 The scans are heuristic tripwires, not proofs. Review remains the real check.
@@ -84,14 +84,21 @@ _VERDICTS: Final = (
 
 _CONDITIONS: Final = tuple("abcdefgh")
 
-# Conditions (c) and (e) cannot be met under O5. The record replaces each and
-# says an explicit owner waiver is needed; neither has been granted.
-_WAIVER_CONDITIONS: Final = ("(c)", "(e)")
+# The owner waived these three on 2026-10-21 (adepthood ADR 0009, "Confidential
+# compute (D05)"): (c) and (e), which O5 cannot meet by construction, and (f),
+# on vendor-asserted evidence. No other condition is waived.
+_WAIVED_CONDITIONS: Final = ("(c)", "(e)", "(f)")
 
-# Naming a vendor would contradict the page's own status banner, which records
-# the vendor choice as an open owner escalation. When a vendor IS chosen,
-# update the banner, the (a)-(h) verdicts and this tuple in the same change.
-_UNCHOSEN_VENDORS: Final = ("privatemode", "tinfoil", "edgeless")
+# (c) and (e) are waived only because a substitute replaces each; the substitute
+# is load-bearing, so the row must still say what replaced the condition.
+_SUBSTITUTED_CONDITIONS: Final = ("(c)", "(e)")
+
+# The vendor the owner chose on 2026-10-21, its operator, and its jurisdiction.
+_CHOSEN_VENDOR: Final = ("privatemode", "edgeless systems gmbh", "bochum")
+
+# The candidate that was not chosen. Any mention would have to be as the
+# alternative, and this page has no reason to mention it at all.
+_UNCHOSEN_VENDORS: Final = ("tinfoil",)
 
 # Custody claims this page may not make. Each is allowed only in a sentence
 # that negates it (the page's own standing bar is such a sentence).
@@ -181,8 +188,10 @@ def test_status_records_every_open_gate(runbook: str) -> None:
     for gate in (
         "adr 0009 amendment",
         "o3 remains",
-        "vendor is not chosen",
-        "no spend",
+        "vendor is chosen",
+        "bounded pilot budget",
+        "#1896",
+        "#1901",
     ):
         assert gate in lowered, f"status banner does not record: {gate}"
 
@@ -242,14 +251,44 @@ def test_condition_f_reads_vendor_asserted(runbook: str) -> None:
     assert "vendor-asserted" in runbook.split("### Condition (f)")[1]
 
 
-@pytest.mark.parametrize("condition", _WAIVER_CONDITIONS)
-def test_waivers_are_required_not_granted(runbook: str, condition: str) -> None:
-    """The two D05 substitutions are recorded as awaiting an owner waiver."""
+@pytest.mark.parametrize("condition", _WAIVED_CONDITIONS)
+def test_waived_conditions_record_the_owner_waiver(
+    runbook: str, condition: str
+) -> None:
+    """Each waived condition's verdict cell records the 2026-10-21 waiver."""
     rows = [line for line in runbook.splitlines() if line.startswith(f"| {condition}")]
     assert rows, f"condition {condition} has no verdict row"
-    assert "not granted" in rows[0].lower(), (
-        f"condition {condition} must record its waiver as not granted"
+    verdict = _cell(rows[0], 2)
+    assert "waived" in verdict, f"condition {condition} must record its waiver"
+    assert "2026-10-21" in verdict, f"condition {condition} must date its waiver"
+    assert "not granted" not in verdict, (
+        f"condition {condition} still says its waiver is not granted"
     )
+
+
+@pytest.mark.parametrize("condition", _SUBSTITUTED_CONDITIONS)
+def test_waivers_keep_their_substitute(runbook: str, condition: str) -> None:
+    """A waiver of (c) or (e) is cited with the substitute that justifies it."""
+    rows = [line for line in runbook.splitlines() if line.startswith(f"| {condition}")]
+    assert rows, f"condition {condition} has no verdict row"
+    assert "unmet-and-replaced" in _cell(rows[0], 2), (
+        f"condition {condition} dropped the substitute its waiver rests on"
+    )
+
+
+def test_no_other_condition_is_waived(runbook: str) -> None:
+    """Three conditions are waived and no others."""
+    for letter in _CONDITIONS:
+        condition = f"({letter})"
+        if condition in _WAIVED_CONDITIONS:
+            continue
+        rows = [
+            line for line in runbook.splitlines() if line.startswith(f"| {condition}")
+        ]
+        assert rows, f"condition {condition} has no verdict row"
+        assert "waived" not in _cell(rows[0], 2), (
+            f"condition {condition} is recorded as waived; only (c), (e), (f) are"
+        )
 
 
 def test_dormant_section_names_every_o3_only_test(runbook: str) -> None:
@@ -497,11 +536,17 @@ def test_runbook_quotes_pool_exit_codes(
     )
 
 
+@pytest.mark.parametrize("fact", _CHOSEN_VENDOR)
+def test_the_chosen_vendor_is_named(runbook: str, fact: str) -> None:
+    """The banner and (h) name the vendor, operator and city chosen 2026-10-21."""
+    assert fact in runbook.lower(), f"the runbook does not record {fact!r}"
+
+
 @pytest.mark.parametrize("vendor", _UNCHOSEN_VENDORS)
-def test_no_vendor_is_named(runbook: str, vendor: str) -> None:
-    """A vendor name here would contradict the page's own status banner."""
+def test_the_unchosen_vendor_is_not_named(runbook: str, vendor: str) -> None:
+    """The candidate the owner did not choose has no place on this page."""
     assert vendor not in runbook.lower(), (
-        f"{vendor} is named; the vendor choice is an open owner escalation"
+        f"{vendor} is named; the owner chose Privatemode on 2026-10-21"
     )
 
 
