@@ -7,27 +7,39 @@ warm — ADR-0016 acceptance test **T19**.
 ## Status: what is decided, and what is not
 
 Read this before you act on any step below. Every procedure here is written
-against a design that is **selected but not in force**.
+against a design that is **selected but not yet built**.
 
 - **ADR-0016 is ratified as O5**, the vendor-attested confidential pool (owner
   decision 2026-10-20, recorded on
   [#1849](https://github.com/Geoffe-Ga/Creek-Vault/issues/1849)). By the
   record's own Status clause, `Accepted` takes effect only once the **adepthood
-  ADR 0009 amendment** to items 3 and 4 merges. Until it does, **O3 remains the
-  standing fallback design**, which is why the dormant O3 runbook below is kept
-  rather than deleted.
-- **The vendor is not chosen.** It is an open owner escalation, together with
-  condition (f)'s evidence and the two D05 waivers
-  ([ADR-0016](architecture/ADR/0016-shared-confidential-warm-inference-pool.md),
-  Decision 3.3 and the escalation order at the end of that record). So this
-  page is vendor-neutral: it says how to pin and verify a measurement set and
-  what evidence to record, and it asserts nothing about any candidate's
-  properties. Where a value is the vendor's to supply, the table cell reads
-  `<to be recorded>`.
-- **No spend is authorized** (Decision 4, owner comment 2026-10-20: design and
-  measure only). Nothing on this page may be executed against a vendor until
-  the owner records a budget line. The procedures are written so they can be
-  reviewed now and run later.
+  ADR 0009 amendment** to items 3 and 4 merges. That amendment merged on
+  2026-10-21 ([adepthood#3485](https://github.com/Geoffe-Ga/adepthood/pull/3485));
+  ADR-0016's own Status line has not yet been updated to say so. The attesting
+  client that O5 needs is not built
+  ([#1896](https://github.com/Geoffe-Ga/Creek-Vault/issues/1896), open), so
+  **O3 remains documented as the fallback design**, which is why the dormant O3
+  runbook below is kept rather than deleted.
+- **The vendor is chosen: Privatemode, operated by Edgeless Systems GmbH from
+  Bochum, Germany** (owner decision 2026-10-21,
+  `owner:2026-10-21#attested-vendor-and-waivers`, on
+  [#1896](https://github.com/Geoffe-Ga/Creek-Vault/issues/1896); recorded in
+  the 2026-10-21 amendment to [adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md)). The same decision
+  waived Decision 3.3 conditions (c) and (e), each with a named substitute,
+  and waived (f) on vendor-asserted evidence (section 3). Where a value is
+  still the vendor's to supply, the table cell reads `<to be recorded>`.
+- **A bounded pilot budget is authorized** (owner decision 2026-10-21 on
+  [#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899), for that
+  issue's live measurement run only). It replaces the 2026-10-20 "design and
+  measure only" answer for that run. Agent work provisions nothing and spends
+  nothing; the first vendor key is a human action (adepthood ADR 0009, "Noted
+  2026-10-21").
+- **The owner created the pilot key on 2026-10-27** (section 4). It is capped at
+  €10/month and expires after one year.
+- **Still missing from this page:** procedures for model withdrawal, a vendor
+  outage, cap exhaustion and rollback. They are tracked under
+  [#1901](https://github.com/Geoffe-Ga/Creek-Vault/issues/1901) and are not
+  written yet.
 - **Nothing here is a public claim.** Every custody or privacy word on a
   user-facing surface waits for adepthood B24
   ([adepthood#3076](https://github.com/Geoffe-Ga/adepthood/issues/3076)).
@@ -171,19 +183,24 @@ vendor's own reference for it instead.
 
 D05 was written for a runtime we control. Decision 3.3 maps its five
 conditions onto a vendor and adds three. **Every row below is the record's
-verdict, not evidence.** Five of the eight carry an open owner gate: two
-waivers, (f)'s evidence, and the two that wait on the vendor choice.
+verdict, not evidence.** The owner settled the vendor and the waivers on
+2026-10-21 (`owner:2026-10-21#attested-vendor-and-waivers`); the wording below
+follows the "Confidential compute (D05)" section of
+[adepthood ADR 0009](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/adr/0009-privacy-custody-and-inference-architecture.md). Three conditions are waived and no others: (c) and
+(e), which O5 cannot meet by construction, and (f), whose evidence is the
+vendor's own. Each waiver is cited with its substitute, because the substitute
+is the reason the waiver is defensible.
 
 | Condition | Verdict | Owner gate, if open |
 |---|---|---|
 | (a) Real hardware | kept | — |
 | (b) A vendor attestation chain, not an operator-held key | kept — so ADR-0006's trust-root caveat does not apply | — |
-| (c) Nonce freshness | unmet-and-replaced by the vendor's binding of the attested measurement to the live session key; **waiver required and not granted** | Owner must waive D05 (c) explicitly; the substitute behaviour is T18's to exercise |
+| (c) Nonce freshness | unmet-and-replaced by the vendor's binding of the attested measurement to the live session key; **waived** by the owner on 2026-10-21 | None open. The substitute is load-bearing: the Creek build issue verifies it against the vendor's design, and T18 exercises it |
 | (d) User-authorized key release | not applicable — no key is released; the vault sends plaintext it already holds under ADR-0014 | — |
-| (e) A hostile-host lab | unmet-and-replaced by vendor negative tests (T18); **waiver required and not granted** | Owner must waive D05 (e) explicitly |
-| (f) The attested image is open-source and reproducibly built, and the pinned measurement is rebuilt from source before each re-pin | **unverified — vendor-asserted** | Owner escalation: (f)'s evidence. ADR-0016 states it has **not** verified (f) for either candidate |
-| (g) Written retention terms and rate limits reviewed | unverified here — to be recorded at vendor selection, under adepthood B11 | Owner escalation: the vendor choice |
-| (h) Jurisdiction chosen explicitly | unverified here — to be recorded at vendor selection | Owner escalation: the vendor choice |
+| (e) A hostile-host lab | unmet-and-replaced by vendor negative tests (T18), each of which must refuse with nothing sent; **waived** by the owner on 2026-10-21 | None open. The substitute is load-bearing on the same terms as (c)'s |
+| (f) The attested image is open-source and reproducibly built, and the pinned measurement is rebuilt from source before each re-pin | **waived** by the owner on 2026-10-21, accepting vendor-asserted evidence in place of independent verification; still **unverified — vendor-asserted** | None open. The waiver is granted for Privatemode and travels to no other vendor. ADR-0016 states it has **not** verified (f) |
+| (g) Written retention terms and rate limits reviewed | unverified here — reviewed under adepthood B11, and not yet captured in the table below | Capture Privatemode's terms in the table below |
+| (h) Jurisdiction chosen explicitly | kept — chosen on 2026-10-21: Edgeless Systems GmbH, Bochum, Germany, so the enclave and the party running it sit in the EU | — |
 
 ### Condition (f), stated plainly
 
@@ -193,6 +210,12 @@ Decision 3.3 and Decision 3.5 both say so: this record has not verified, for
 either candidate, that the attested image is open-source and reproducibly
 built, nor that anyone rebuilds the pinned measurement from source before a
 re-pin.
+
+On 2026-10-21 the owner **waived** (f) rather than hold the decision for
+evidence about another party's build pipeline: vendor-asserted evidence is
+accepted in place of independent verification, for Privatemode only. A waiver
+of independent verification is not a claim that verification happened, so the
+rules below stand unchanged.
 
 Until an independent rebuild is recorded in the pin table above:
 
@@ -204,13 +227,14 @@ Until an independent rebuild is recorded in the pin table above:
 
 ### (g) retention and rate limits, and (h) jurisdiction
 
-These are recorded **at vendor selection**, not before. ADR-0016 Decision 3.3
-records, for its two unchosen candidates, the shape of what must be captured:
+These are recorded **at vendor selection**, which happened on 2026-10-21.
+ADR-0016 Decision 3.3 records, for its two candidates, the shape of what must
+be captured:
 documented retention of request *metadata* (addresses, timestamps, API key,
 request path, method, status, latency) for a bounded period, per-key token
 usage kept permanently for billing, and a named operating company in a named
 jurisdiction. That is metadata and it is disclosed; it is not journal content,
-and it is not nothing. Capture, for whichever vendor is chosen:
+and it is not nothing. Capture, for Privatemode:
 
 | Item | Value |
 |---|---|
@@ -218,7 +242,7 @@ and it is not nothing. Capture, for whichever vendor is chosen:
 | Usage records kept for billing, and for how long | `<to be recorded>` |
 | Documented cache isolation per key (T5's vendor-side check) | `<to be recorded>` |
 | Rate limits, and the error shape when one is hit | `<to be recorded>` |
-| Operating company and jurisdiction | `<to be recorded>` |
+| Operating company and jurisdiction | Edgeless Systems GmbH, Bochum, Germany (owner decision 2026-10-21) |
 | Date the terms were read, and by whom | `<to be recorded>` |
 | Added to adepthood's recipient list (B11) | `<to be recorded>` |
 
@@ -242,9 +266,8 @@ from `pool_credential_orphan` (which is about a per-activation key, not this
 one): `pool_admin_key_unusable`, `pool_admin_key_rejected` and
 `pool_admin_key_near_expiry`.
 
-**Declared now, enforced on use.** No vendor is chosen and no admin key
-exists, so the rendered Fly pilot config declares which regime it is in and
-defaults to **not in use**: `CREEK_POOL_ADMIN_KEY_IN_USE = "0"`, no
+**Declared now, enforced on use.** The rendered Fly pilot config declares
+which regime it is in and defaults to **not in use**: `CREEK_POOL_ADMIN_KEY_IN_USE = "0"`, no
 `CREEK_POOL_ADMIN_KEY_B64` secret, nothing for the bootstrap to normalize and
 nothing that can refuse. Rendering with `--pool-admin-key-expires-at <instant>`
 switches the config into the in-use regime, which appends the
@@ -260,6 +283,12 @@ key — and a placeholder that satisfied the format check would make
 `pool-admin-key-ready` meaningless. The custody path is therefore in place
 *before* the first key exists, which is what was asked for, without making
 today's pilot undeployable.
+
+**The pilot key, created 2026-10-27.** The owner created the Privatemode
+account and one pilot key, capped at €10/month and expiring after one year.
+Privatemode keys are created and managed only in its web portal, so every human
+step of the key's life is the owner's: Geoff holds the key and does its
+creation, rotation, revocation and cleanup. Agent work never holds the value.
 
 **Why the control plane keeps the value in full, not a hash or a handle:** the
 vendor's Admin API identifies a key *by its own value*, so the `update` that
@@ -373,15 +402,16 @@ Status, clause by clause, at this commit:
 
 | Clause | Under O5 it means | Status |
 |---|---|---|
-| The scaling policy refuses a minimum of zero | There is no Creek-run engine host to scale. Residency is the vendor's property, asserted in its documentation and bounded by the contract's "a vendor outage is a refusal, never a fallback". The O3 policy that refuses a minimum of zero is dormant (section 7) | **Not met, and not implementable vault-side.** Owner gate: the vendor choice. What replaces it is the documented-residency row below plus the measured equivalence |
-| The first reflection after idle shows no load or download event | The attested channel gives the vault no engine-level telemetry, and no catalogue in ADR-0016's sources documents a load or download event, so unless the chosen vendor publishes one this clause has no observable signal under O5. The substitute is weaker and is recorded as such: latency equivalence below, plus the vendor's written residency terms | **Not met.** Owner gates: the vendor choice and a budget line (Decision 4) |
-| Its p95 equals the warm p95 within measurement noise | The harness's `idle` sweep (`--idle-cycles`, `--idle-seconds`) reports a `resume` phase in `per_sweep.idle.per_phase` — only `resume`, since `_idle` runs no warm trial — and the warm p95 comes from the `cold_warm` sweep, at `per_sweep.cold_warm.per_phase.warm.latency.p95_s`; the two are compared | **Not met, but no longer blocked on the harness.** Pool mode has landed ([#1892](https://github.com/Geoffe-Ga/Creek-Vault/issues/1892), closed): `--pool-url`, `--pool-identity` and `--pool-vendor` drive the real pool client through the same sweeps, hermetic against an in-process fake unless the run is live. What remains is the live run itself, which needs the owner's budget note ([#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899)) and the vendor choice |
+| The scaling policy refuses a minimum of zero | There is no Creek-run engine host to scale. Residency is the vendor's property, asserted in its documentation and bounded by the contract's "a vendor outage is a refusal, never a fallback". The O3 policy that refuses a minimum of zero is dormant (section 7) | **Not met, and not implementable vault-side.** The vendor is chosen; what replaces it is the documented-residency row below plus the measured equivalence |
+| The first reflection after idle shows no load or download event | The attested channel gives the vault no engine-level telemetry, and no catalogue in ADR-0016's sources documents a load or download event, so unless the chosen vendor publishes one this clause has no observable signal under O5. The substitute is weaker and is recorded as such: latency equivalence below, plus the vendor's written residency terms | **Not met.** Needs Privatemode's written residency terms and the live run ([#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899)) |
+| Its p95 equals the warm p95 within measurement noise | The harness's `idle` sweep (`--idle-cycles`, `--idle-seconds`) reports a `resume` phase in `per_sweep.idle.per_phase` — only `resume`, since `_idle` runs no warm trial — and the warm p95 comes from the `cold_warm` sweep, at `per_sweep.cold_warm.per_phase.warm.latency.p95_s`; the two are compared | **Not met, but no longer blocked on the harness.** Pool mode has landed ([#1892](https://github.com/Geoffe-Ga/Creek-Vault/issues/1892), closed): `--pool-url`, `--pool-identity` and `--pool-vendor` drive the real pool client through the same sweeps, hermetic against an in-process fake unless the run is live. What remains is the live run itself ([#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899)); its budget is authorized and the owner created the pilot key on 2026-10-27 |
 | The fleet report raises `pool_min_below_one` | Hermetic: the alert kind is in the closed `AlertKind` vocabulary and the report raises it when a warm minimum reads below one | **Not met:** `pool_min_below_one` is **not registered** in `AlertKind`, which registers the pool credential orphan and the admin-key kinds of [#1930](https://github.com/Geoffe-Ga/Creek-Vault/issues/1930) but no warm-minimum kind. [#1900](https://github.com/Geoffe-Ga/Creek-Vault/issues/1900) was expected to register it and merged without doing so, so no open issue owns it today. `tests/test_pool_runbook_docs.py` fails this page the moment it lands, so this row cannot go stale |
 
 ### The procedure, for when those gates clear
 
-Do not run this until the owner records a budget line. Then, from a
-vault-shaped allocation:
+Run this only under the bounded pilot budget the owner authorized on
+[#1899](https://github.com/Geoffe-Ga/Creek-Vault/issues/1899), with the key the
+owner holds. Then, from a vault-shaped allocation:
 
 1. Confirm the pin: `python -m creek_mcp.container_health --check pool`
    exits 0. (There is no `creek-container-health` console script; the name is

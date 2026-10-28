@@ -1156,8 +1156,9 @@ the client must wait longer than the deadline:
 A client that gives up before the deadline loses that call's answer, not the
 draft: a detached `creek.draft` still saves to `07-Voice/Drafts/`. Only one long
 call per consumer runs at a time, and a second is refused as `unavailable` —
-which, for agents signed in through Adepthood, means one per *person* until
-[#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976) (see below).
+which, for agents signed in through Adepthood, means one per *agent*: since
+[#1976](https://github.com/Geoffe-Ga/Creek-Vault/issues/1976) each OAuth agent
+is its own consumer, keyed by its `client_id` (see below).
 
 ### A writer's own model key
 
