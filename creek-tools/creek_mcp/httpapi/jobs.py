@@ -26,6 +26,7 @@ from creek._fsio import atomic_replace_path
 from creek._fslock import vault_lock
 from creek_mcp.api.models import (
     ClassificationResponse,
+    JobFailureCode,
     JobState,
     JobStatusResponse,
     LinkResponse,
@@ -77,6 +78,13 @@ class StoredJob(BaseModel):
     message, which can carry fragment text), or :data:`WORKER_LOST`. Never
     projected onto ``/v1/jobs``, whose failed body stays ``result: null``.
     Optional so records written before the field existed still load.
+    """
+    failure_code: JobFailureCode | None = None
+    """The caller-actionable reason a ``failed`` job failed, or ``None`` (#1877).
+
+    Unlike :attr:`failure_reason` this one *is* projected onto ``/v1/jobs``:
+    it is a closed code, never text, and names only a failure the caller can
+    remedy. Optional so records written before the field existed still load.
     """
 
 
@@ -161,12 +169,14 @@ def finish_job(
     worker_id: str,
     result: ClassificationResponse | LinkResponse | Mapping[str, Any] | None,
     failure_reason: str | None = None,
+    failure_code: JobFailureCode | None = None,
 ) -> None:
     """Atomically record a terminal state if this worker still owns the job.
 
     *result* is a pipeline response model, or — for a composition job — the
     already content-free envelope the MCP tool projected; ``None`` records the
-    failed state, with *failure_reason* kept on the private record.
+    failed state, with *failure_reason* kept on the private record and
+    *failure_code* published by :func:`status_for`.
     """
     with vault_lock(_lock_path(vault)):
         record = _read(_path(vault, job_id))
@@ -181,6 +191,7 @@ def finish_job(
                 "state": JobState.SUCCEEDED if result is not None else JobState.FAILED,
                 "result": _dumped(result),
                 "failure_reason": None if result is not None else failure_reason,
+                "failure_code": None if result is not None else failure_code,
             }
         )
         _write(vault, terminal)
@@ -230,6 +241,7 @@ def _recovered(
                     "state": JobState.FAILED,
                     "result": None,
                     "failure_reason": WORKER_LOST,
+                    "failure_code": None,
                 }
             )
             _write(vault, record)
@@ -302,5 +314,9 @@ def status_for(
         except ValidationError:
             return None
     return JobStatusResponse(
-        status="ok", job_id=UUID(record.job_id), state=record.state, result=result
+        status="ok",
+        job_id=UUID(record.job_id),
+        state=record.state,
+        result=result,
+        failure_code=record.failure_code if record.state is JobState.FAILED else None,
     )

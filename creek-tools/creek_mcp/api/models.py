@@ -99,6 +99,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.25",
     "0.24",
     "0.23",
     "0.22",
@@ -507,6 +508,14 @@ AGENT_MCP_SINCE_MINOR: Final[str] = "0.24"
 Older declared minors omit the field entirely. Unversioned discovery exposes
 the current contract, so an application can learn this optional connection
 without changing the minor it already speaks on the content routes.
+"""
+
+JOB_FAILURE_CODE_SINCE_MINOR: Final[str] = "0.26"
+"""First minor whose ``GET /v1/jobs/{job_id}`` body carries ``failure_code`` (#1877).
+
+Older declared minors vendored a closed :class:`JobStatusResponse` without it,
+so the key is omitted for them and their failed body is byte-identical. It is
+a literal for the reason :data:`_UPLOAD_MINOR` is.
 """
 
 AGENT_MCP_URL_MAX_CHARS: Final[int] = 2048
@@ -2426,6 +2435,24 @@ class JobState(StrEnum):
     FAILED = "failed"
 
 
+class JobFailureCode(StrEnum):
+    """Why a ``failed`` pipeline job failed, when the caller can act on it (#1877).
+
+    Closed and deliberately small: a code is published only for a failure the
+    *caller* can remedy, never for an operator-side fault, whose detail stays
+    in the server log. Any other failure is ``failure_code: null``.
+
+    Attributes:
+        REQUEST_KEY_REJECTED: The writer's request-scoped provider key
+            (ADR-0015) was refused by its vendor with ``401``/``403``. The
+            pass stopped at the first refusal, without retrying, and nothing
+            it had not yet started was sent. Retrying with the same key will
+            fail the same way; the writer must replace the key.
+    """
+
+    REQUEST_KEY_REJECTED = "request_key_rejected"
+
+
 JobId: TypeAlias = UUID
 """An opaque server-generated identifier for one durable pipeline job."""
 
@@ -2447,6 +2474,13 @@ class JobStatusResponse(_WireModel):
     result: ClassificationResponse | LinkResponse | None = Field(
         default=None,
         description="Counts-only result, present only after successful completion.",
+    )
+    failure_code: JobFailureCode | None = Field(
+        default=None,
+        description=(
+            "Why a failed job failed, when the caller can remedy it; null "
+            "otherwise. Since contract 0.26."
+        ),
     )
 
 

@@ -30,6 +30,7 @@ from creek.classify.llm.prompts import build_classification_prompt
 from creek.classify.llm.providers import (
     Completion,
     ProviderRateLimitError,
+    RequestKeyRejectedError,
     build_provider,
     cloud_warning,
     provider_display_name,
@@ -371,6 +372,11 @@ class LLMClassifier:
         empty reasoning trace if the provider is unavailable or all
         retries are exhausted.
 
+        A writer's request-scoped key refused by its vendor is the one
+        failure that is never retried (#1877): every further call would be
+        refused the same way, so the attempt is logged once and the typed
+        error propagates to end the run.
+
         Args:
             fragment: The fragment to classify.
             content: Optional content text for the fragment.
@@ -379,6 +385,10 @@ class LLMClassifier:
             :class:`LLMClassificationResult` carrying the updated
             fragment and the raw reasoning trace (empty when the call
             short-circuited or the model returned pure YAML).
+
+        Raises:
+            RequestKeyRejectedError: When the vendor refuses the writer's
+                request-scoped key (``401``/``403``).
         """
         if not self.available:
             logger.warning(
@@ -396,26 +406,16 @@ class LLMClassifier:
                 raw = self._invoke_llm(prompt)
                 reasoning, yaml_text = _split_reasoning_and_yaml(raw)
                 data = self.validate_response(yaml_text)
+            except RequestKeyRejectedError as exc:
+                self._log_failed_attempt(fragment, attempt, exc)
+                raise
             except (
                 httpx.HTTPError,
                 RuntimeError,
                 ValueError,
                 yaml.YAMLError,
             ) as exc:
-                # OPS-003: include fragment ID + source path so the
-                # operator can find the failing fragment quickly when
-                # scanning logs. Prefix tag matches OPS-003 convention.
-                logger.warning(
-                    "[fragment=%s path=%s provider=%s] "
-                    "Classify attempt %d/%d failed for '%s': %s",
-                    fragment.id,
-                    fragment.source.original_file or "<inline>",
-                    self.config.provider,
-                    attempt + 1,
-                    self.MAX_RETRIES,
-                    fragment.title,
-                    exc,
-                )
+                self._log_failed_attempt(fragment, attempt, exc)
                 if attempt < self.MAX_RETRIES - 1:
                     time.sleep(self._retry_delay_for(exc))
             else:
@@ -438,6 +438,34 @@ class LLMClassifier:
             fragment.title,
         )
         return LLMClassificationResult(fragment=fragment, reasoning="", succeeded=False)
+
+    def _log_failed_attempt(
+        self, fragment: Fragment, attempt: int, exc: Exception
+    ) -> None:
+        """Log one failed classify attempt (OPS-003).
+
+        Includes the fragment ID and source path so the operator can find the
+        failing fragment quickly when scanning logs; the prefix tag matches
+        the OPS-003 convention. *exc* is rendered with ``%s``: provider errors
+        reach here already redacted (``providers._error_detail``), which is
+        what keeps a request-scoped key's vendor message out of this record.
+
+        Args:
+            fragment: The fragment whose classification failed.
+            attempt: The zero-based attempt index.
+            exc: The exception that failed the attempt.
+        """
+        logger.warning(
+            "[fragment=%s path=%s provider=%s] "
+            "Classify attempt %d/%d failed for '%s': %s",
+            fragment.id,
+            fragment.source.original_file or "<inline>",
+            self.config.provider,
+            attempt + 1,
+            self.MAX_RETRIES,
+            fragment.title,
+            exc,
+        )
 
     def _retry_delay_for(self, exc: Exception) -> float:
         """Resolve the backoff before the next retry attempt.

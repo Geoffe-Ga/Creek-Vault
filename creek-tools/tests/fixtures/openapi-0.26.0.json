@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.25.0",
+    "version": "0.26.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -3070,6 +3070,14 @@
         "title": "ClassificationResponse",
         "type": "object"
       },
+      "JobFailureCode": {
+        "description": "Why a ``failed`` pipeline job failed, when the caller can act on it (#1877).\n\nClosed and deliberately small: a code is published only for a failure the\n*caller* can remedy, never for an operator-side fault, whose detail stays\nin the server log. Any other failure is ``failure_code: null``.\n\nAttributes:\n    REQUEST_KEY_REJECTED: The writer's request-scoped provider key\n        (ADR-0015) was refused by its vendor with ``401``/``403``. The\n        pass stopped at the first refusal, without retrying, and nothing\n        it had not yet started was sent. Retrying with the same key will\n        fail the same way; the writer must replace the key.",
+        "enum": [
+          "request_key_rejected"
+        ],
+        "title": "JobFailureCode",
+        "type": "string"
+      },
       "JobState": {
         "description": "The closed lifecycle vocabulary for a durable pipeline job.",
         "enum": [
@@ -4179,6 +4187,18 @@
             "default": null,
             "description": "Counts-only result, present only after successful completion.",
             "title": "Result"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobFailureCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Why a failed job failed, when the caller can remedy it; null otherwise. Since contract 0.26."
           }
         },
         "required": [

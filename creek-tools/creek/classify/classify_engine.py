@@ -1080,8 +1080,13 @@ def _dispatch_files(
 
     A thread pool sized by *workers* lets the network-bound per-fragment LLM
     calls overlap; ``workers == 1`` preserves the original strictly-serial loop.
-    The map is drained so every file completes (and any error surfaces) before
-    returning.
+    The results are drained in order so any error surfaces before returning.
+
+    **The first error stops the dispatch** of every file not yet started
+    (#1877): the run is about to raise anyway, and a pending file left to run
+    would cost one more provider call each — for a writer's revoked key, one
+    refused vendor call per fragment in the vault. Files already in flight
+    finish; their writes are as complete as on the serial path.
 
     Args:
         files: Fragment files to process, in order.
@@ -1090,7 +1095,14 @@ def _dispatch_files(
     """
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            list(executor.map(process_one, files))
+            pending = [executor.submit(process_one, md_file) for md_file in files]
+            try:
+                for future in pending:
+                    future.result()
+            except BaseException:
+                for future in pending:
+                    future.cancel()
+                raise
     else:
         for md_file in files:
             process_one(md_file)
@@ -1496,7 +1508,8 @@ def _process_file(
                 root_fragment=new_fragment,
                 body=body,
                 rules=rules,
-                llm=llm,
+                # #1877: the tier may have risen since ``llm`` was picked.
+                llm=_reatomize_classifier_for(tier_classifiers, new_fragment, llm),
                 classification_config=classification_config,
                 vault_writer=vault_writer,
                 counts=counts,
@@ -1519,6 +1532,39 @@ def _process_file(
             progress_path=progress_path,
             trace_log_path=trace_log_path,
         )
+
+
+def _reatomize_classifier_for(
+    tier_classifiers: TierClassifiers | None,
+    fragment: Fragment,
+    picked: LLMClassifier | None,
+) -> LLMClassifier | None:
+    """Re-resolve the classifier for re-atomizing *fragment* at its final tier.
+
+    ``picked`` was chosen from the tier the fragment had *before* it was
+    classified, and ``reassess`` may since have raised that tier to INTIMATE.
+    Splitting it and handing its children to the classifier that served it as
+    PERSONAL — the cloud one, on a request-scoped run — would send INTIMATE
+    content to a vendor (#1877). So the tier is read again here, through the
+    same :meth:`TierClassifiers.for_tier` gate. When the INTIMATE route does
+    not exist the children take the rules pass (``None``): raising the
+    deferred routing error mid-run would abort the whole pass over one
+    fragment the router would never have let reach the cloud anyway.
+
+    Args:
+        tier_classifiers: The run's per-tier classifiers, or ``None`` (rules).
+        fragment: The fragment as classified and reassessed.
+        picked: The classifier the fragment was classified with.
+
+    Returns:
+        The classifier for the fragment's final tier, or ``None`` for rules.
+    """
+    if tier_classifiers is None:
+        return picked
+    try:
+        return tier_classifiers.for_tier(tier_of(fragment))
+    except IntimateRoutingError:
+        return None
 
 
 def _load_classifiable_fragment(

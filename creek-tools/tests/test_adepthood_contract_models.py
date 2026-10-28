@@ -1974,7 +1974,8 @@ def test_the_previous_minor_is_still_served() -> None:
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
     assert "0.24" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.25"
+    assert "0.25" in SUPPORTED_CONTRACT_MINORS
+    assert CONTRACT_MINOR == "0.26"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:
