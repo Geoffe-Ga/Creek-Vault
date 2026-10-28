@@ -18,6 +18,7 @@ from creek.classify.classify_engine import (
     run_classify,
 )
 from creek.classify.constants import LLM_METHOD
+from creek.classify.llm.providers import RequestKeyRejectedError
 from creek.classify.llm.router import IntimateRoutingError
 from creek.config import load_vault_config
 from creek.models import PrivacyTier
@@ -49,6 +50,15 @@ _UNPINNED_DETAIL = (
     "configured or the server runs in container mode"
 )
 """Why a pinned-mode LLM pass refused. Fixed text: it never names the URL."""
+
+REQUEST_KEY_REJECTED_REASON = (
+    "the writer's request-scoped provider key was refused by its vendor"
+)
+"""Why a request-keyed LLM pass stopped (#1877). Fixed text: never the key.
+
+The ``/v1`` job worker matches this exact string to publish
+``failure_code: request_key_rejected``, so it is a constant, not prose.
+"""
 
 
 def _require_pinned_classifier(config: CreekConfig) -> None:
@@ -290,7 +300,9 @@ def classify_tool(
 
     Returns:
         A structured result: per-method counts on success, or a
-        refusal for an unknown method or an unreachable provider.
+        refusal for an unknown method, an unreachable provider, or a
+        request-scoped key its vendor refused
+        (:data:`REQUEST_KEY_REJECTED_REASON`, #1877).
     """
     if method not in _VALID_METHODS:
         return refusal_response(
@@ -342,6 +354,15 @@ def classify_tool(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason=CONTENT_MUTATION_BUSY_REASON,
+        )
+    except RequestKeyRejectedError:
+        # The writer's key was refused: the pass stopped at the first refusal
+        # rather than reporting a completed pass that classified nothing. The
+        # redacted error is already in the log; the reason here is fixed text.
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=REQUEST_KEY_REJECTED_REASON,
         )
     # Classify rewrites existing frontmatter in place; it does not
     # produce a new file, so ``created_path`` is omitted from the audit

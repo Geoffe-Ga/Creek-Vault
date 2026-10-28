@@ -165,3 +165,37 @@ what it may do:
 Clients that cannot set custom headers — hosted Claude connectors and ChatGPT
 developer-mode connectors — run pool-or-local only; `docs/mcp.md` lists which
 clients can send them.
+
+## Amendment (2026-10-28, #1877): the environment, a refused key, re-atomization
+
+An adversarial review of the shipped boundary found four gaps; none leaked a
+key or sent INTIMATE content, and each is now closed in code rather than
+accepted here.
+
+- **The operator's environment does not apply to the writer's key.** Both SDKs
+  read routing and decoration from the environment: `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_CUSTOM_HEADERS`, `OPENAI_BASE_URL`, `OPENAI_ORG_ID`,
+  `OPENAI_PROJECT_ID` and `OPENAI_CUSTOM_HEADERS`. With an operator org id set,
+  a writer's OpenAI key was sent with `OpenAI-Organization: org-<operator>`
+  and refused. A request-key client now passes the vendor's own base URL
+  explicitly and removes every environment-derived header from each request
+  (`providers._operator_header_overrides`). An operator-keyed, self-hosted
+  client still reads its environment as before.
+- **A refused key is fatal for the run.** A `401`/`403` on a request-scoped
+  call is `RequestKeyRejectedError` (a `RuntimeError`, still status-only and
+  unchained). The classification retry loop never retries it, the dispatcher
+  stops starting new fragments, `creek.classify` returns a refusal, and the
+  `/v1` job ends `failed` with the published `failure_code:
+  "request_key_rejected"` (contract `0.26.0`). Before, a revoked key cost three
+  delayed vendor calls per fragment and ended `succeeded` with nothing
+  classified. The operator's own key keeps the retried behaviour.
+- **The job-level canary.** `tests/test_request_scoped_byok.py` now runs a
+  `/v1/classifications` job against a vendor `401` that quotes the key and
+  sweeps every log record, the response and every file. Reverting the
+  status-only redaction in `providers._error_detail` fails it; the chain
+  suppression is pinned by the provider-level chain sweep, since no log on the
+  job path renders an exception chain.
+- **Re-atomization follows the final tier.** A fragment the classification
+  raised to INTIMATE is re-atomized through `TierClassifiers.for_tier` on its
+  new tier, so its children take the local INTIMATE route, or the rules pass
+  when no local route exists, never the writer's provider.

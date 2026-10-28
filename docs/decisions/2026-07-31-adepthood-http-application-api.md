@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.25.0`
+- **Contract version**: `0.26.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -1033,6 +1033,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.26.0` | 2026-10-28 | **A refused request key is fatal for an `llm` classification pass (#1877, [ADR-0015](../../creek-tools/docs/architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)).** When the vendor answers a writer's request-scoped key with `401`/`403`, the pass stops at the first refusal without retrying or dispatching the fragments not yet started, and `creek.classify` returns `{"status": "refused"}` with the fixed reason `the writer's request-scoped provider key was refused by its vendor` instead of an `ok` pass that classified nothing. On `/v1`, `GET /v1/jobs/{job_id}` gains `failure_code: "request_key_rejected" \| null` (closed enum `JobFailureCode`), so the consumer can ask the writer for a new key; every other outcome reports `null`. Callers below `0.26` see no `failure_code` and an unchanged `failed` body. `0.25` and every earlier supported minor remain served. |
 | `0.25.0` | 2026-10-26 | Adds opt-in `reading-recommendations`: a bounded accessible course shortlist and current open/personal journal excerpts go through the existing generation router. Responses choose supplied IDs, cite a verified verbatim quote, explain relevance and benefit, and retain inference provenance. No BYOK forwarding, no generic fallback; short-lived vault-scoped coalesced caching is invalidated around journal mutation. Older minors remain served. |
 | `0.24.0` | 2026-10-24 | **Authenticated agent MCP discovery (adepthood#3545).** `GET /v1/capabilities` adds `agent_mcp: {resource, authorization_server} \| null` from this allocation's actual mounted OAuth MCP configuration and public routing. Managed private TLS, legacy OAuth-free allocations, missing mounts and unavailable vaults report null. Earlier declared minors omit the field; unversioned discovery publishes it without changing the content minor a client already speaks. `0.23`, `0.22` and every earlier supported minor remain served. |
 | `0.23.0` | 2026-10-24 | **MCP-only: `creek.revoice` (#1981).** Adds a `vault:desk` tool that rewrites caller-supplied text through the owner's voice skills without corpus retrieval or saving. Its prompt preserves meaning and claims; routing keys on the declared ceiling. A detached body's `creek.jobs.read` result is bounded, process-local, agent-bound and ceiling-checked; durable records remain counts-only. No `/v1` route, capability or wire model moves. `0.22` and all earlier supported minors stay served. |

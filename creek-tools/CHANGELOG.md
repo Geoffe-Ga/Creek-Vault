@@ -9,6 +9,17 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Harden request-scoped BYOK (#1877, ADR-0015), contract `0.26.0`. A writer's
+  key is sent only to the vendor's own API host: `ANTHROPIC_BASE_URL`,
+  `OPENAI_BASE_URL`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` and both SDKs'
+  `*_CUSTOM_HEADERS` no longer apply to it. A `401`/`403` on that key is a
+  typed `RequestKeyRejectedError` the classification retry loop never
+  retries; the pass stops dispatching, `creek.classify` refuses, and the
+  `/v1` job ends `failed` with `failure_code: "request_key_rejected"`
+  (omitted below `0.26`). Re-atomization re-resolves the classifier from the
+  fragment's final tier, so a fragment raised to INTIMATE is never split
+  through the cloud classifier.
+
 - Keep cached voice-skill exemplars out of `creek.author` inference (#1986).
   The voice call's routing tier and admission ceiling come from the evidence,
   but the static prompt used to inline cached phase/register skills verbatim,

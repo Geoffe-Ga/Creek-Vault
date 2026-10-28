@@ -20,7 +20,7 @@ import hmac
 import logging
 import os
 import secrets
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TypeVar
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -82,6 +82,7 @@ __all__ = [
     "PoolIdentityError",
     "PoolProvider",
     "ProviderRateLimitError",
+    "RequestKeyRejectedError",
     "build_provider",
     "call_enclave",
     "call_pool",
@@ -194,6 +195,22 @@ class ProviderRateLimitError(RuntimeError):
         """
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class RequestKeyRejectedError(RuntimeError):
+    """The vendor refused a writer's request-scoped key (``401``/``403``, #1877).
+
+    A revoked or mistyped key fails every call it makes the same way, so
+    retrying it only multiplies vendor calls: the classification retry loop
+    treats this as fatal for the whole run rather than one fragment's bad luck.
+    Raised only for a call that carried a request key (ADR-0015); the
+    operator's own key keeps the historical retried :class:`RuntimeError`.
+
+    Subclasses :class:`RuntimeError` so every existing ``except RuntimeError``
+    path still catches it. The message is the same status-only redaction
+    :func:`_error_detail` gives any request-scoped failure, and the vendor
+    error is never chained.
+    """
 
 
 def _retry_after_seconds(exc: object) -> float | None:
@@ -331,6 +348,23 @@ def _safe_cause(exc: Exception, request_key: RequestKey | None) -> Exception | N
     return exc
 
 
+_KEY_REJECTED_STATUSES: Final[frozenset[int]] = frozenset({401, 403})
+"""Statuses with which a vendor refuses the credential itself."""
+
+
+def _request_key_rejected(exc: Exception, request_key: RequestKey | None) -> bool:
+    """Return whether *exc* is the vendor refusing a writer's request key.
+
+    Args:
+        exc: The vendor SDK exception.
+        request_key: The request-scoped key the call carried, or ``None``.
+
+    Returns:
+        ``True`` only for a ``401``/``403`` on a request-scoped call.
+    """
+    return request_key is not None and _error_status(exc) in _KEY_REJECTED_STATUSES
+
+
 def _wrapped_vendor_error(
     exc: Exception,
     vendor: str,
@@ -359,6 +393,8 @@ def _wrapped_vendor_error(
         return ProviderRateLimitError(msg, retry_after=_retry_after_seconds(exc)), None
     detail = _error_detail(exc, request_scoped=request_key is not None)
     msg = f"{vendor} API call failed: {name}{detail}"
+    if _request_key_rejected(exc, request_key):
+        return RequestKeyRejectedError(msg), None
     return RuntimeError(msg), _safe_cause(exc, request_key)
 
 
@@ -386,6 +422,85 @@ def _request_key_prerequisite(
     if request_key.reveal():
         return None
     return f"a request-scoped {provider_name} key is empty"
+
+
+ANTHROPIC_DEFAULT_BASE_URL: Final[str] = "https://api.anthropic.com"
+"""Anthropic's own API host; the only destination a writer's key is sent to."""
+
+OPENAI_DEFAULT_BASE_URL: Final[str] = "https://api.openai.com/v1"
+"""OpenAI's own API root; the only destination a writer's key is sent to."""
+
+_ANTHROPIC_AUTH_HEADER: Final[str] = "X-Api-Key"
+_OPENAI_AUTH_HEADER: Final[str] = "Authorization"
+_ANTHROPIC_CUSTOM_HEADERS_ENV: Final[str] = "ANTHROPIC_CUSTOM_HEADERS"
+_OPENAI_CUSTOM_HEADERS_ENV: Final[str] = "OPENAI_CUSTOM_HEADERS"
+_OPENAI_ACCOUNT_HEADERS: Final[tuple[str, str]] = (
+    "OpenAI-Organization",
+    "OpenAI-Project",
+)
+"""Headers the OpenAI SDK fills from ``OPENAI_ORG_ID`` / ``OPENAI_PROJECT_ID``."""
+
+_OmitT = TypeVar("_OmitT")
+
+
+def _operator_header_names(env_var: str) -> tuple[str, ...]:
+    """Return the header names a vendor SDK will read from *env_var*.
+
+    Both SDKs parse ``<VENDOR>_CUSTOM_HEADERS`` the same way — one
+    ``Name: value`` per line, split at the first colon, stripped — and merge the
+    result into every request. Only the names are returned; no value is read.
+
+    Args:
+        env_var: ``ANTHROPIC_CUSTOM_HEADERS`` or ``OPENAI_CUSTOM_HEADERS``.
+
+    Returns:
+        The header names, in the order the variable lists them.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return ()
+    return tuple(
+        line.split(":", 1)[0].strip() for line in raw.split("\n") if ":" in line
+    )
+
+
+def _operator_header_overrides(
+    env_var: str,
+    *,
+    auth_header: str,
+    auth_value: str,
+    omit: _OmitT,
+    account_headers: tuple[str, ...] = (),
+) -> tuple[dict[str, str], dict[str, _OmitT]]:
+    """Return the overrides that keep the operator's headers off a writer's key.
+
+    An operator's environment is the operator's, and a request key is the
+    writer's (ADR-0015, #1877): nothing the SDK would add from the environment
+    may ride along with it. Two maps, because the SDK offers two seams:
+
+    - **restored**, for the client constructor: a custom header spelled
+      exactly as the SDK's own auth header would replace the writer's
+      credential, so it is set back to the writer's value there. The
+      constructor is used because per-request options are logged at DEBUG by
+      the Anthropic SDK, and the credential must never be one of them.
+    - **removed**, for each request's ``extra_headers``: every other custom
+      header and every *account_headers* entry, mapped to the SDK's ``omit``
+      sentinel, which deletes it from the merged request headers.
+
+    Args:
+        env_var: The SDK's custom-headers environment variable.
+        auth_header: The SDK's auth header name, exactly as it spells it.
+        auth_value: That header's value for the writer's key.
+        omit: The SDK's ``omit`` sentinel.
+        account_headers: Further headers the SDK derives from the environment.
+
+    Returns:
+        ``(restored, removed)``.
+    """
+    names = _operator_header_names(env_var)
+    restored = {name: auth_value for name in names if name == auth_header}
+    removed = {name: omit for name in (*names, *account_headers) if name != auth_header}
+    return restored, removed
 
 
 # Per-provider default model IDs. This matrix is the ONLY place model literals
@@ -469,6 +584,8 @@ class AnthropicProvider:
         if unmet is not None:
             raise RuntimeError(unmet)
         self._client: anthropic.Anthropic | None = None
+        self._scrubbed_headers: Mapping[str, str | anthropic.Omit] | None = None
+        """Per-request header removals for a request-key client, else ``None``."""
 
     def _missing_prerequisite(self) -> str | None:
         """Return why the Anthropic prerequisites are unmet, or ``None``.
@@ -540,7 +657,7 @@ class AnthropicProvider:
             import anthropic
 
             if self._request_key is not None:
-                self._client = anthropic.Anthropic(api_key=self._request_key.reveal())
+                self._client = self._request_key_client()
             elif self.config.api_key_env:
                 self._client = anthropic.Anthropic(
                     api_key=_read_key_env(
@@ -550,6 +667,37 @@ class AnthropicProvider:
             else:
                 self._client = anthropic.Anthropic()
         return self._client
+
+    def _request_key_client(self) -> anthropic.Anthropic:
+        """Build the client for a writer's key, deaf to the operator's environment.
+
+        The vendor's own base URL is passed explicitly, so
+        ``ANTHROPIC_BASE_URL`` cannot send the writer's key to another host,
+        and every ``ANTHROPIC_CUSTOM_HEADERS`` entry is removed from each
+        request (see :func:`_operator_header_overrides`). The explicit
+        ``api_key`` already stops the SDK reading ``ANTHROPIC_AUTH_TOKEN`` or a
+        credentials profile.
+
+        Returns:
+            An ``anthropic.Anthropic`` client bound to the writer's key.
+        """
+        import anthropic
+
+        if self._request_key is None:  # pragma: no cover  # no issue: invariant
+            msg = "a request-key client needs a request key"
+            raise RuntimeError(msg)
+        key = self._request_key.reveal()
+        restored, self._scrubbed_headers = _operator_header_overrides(
+            _ANTHROPIC_CUSTOM_HEADERS_ENV,
+            auth_header=_ANTHROPIC_AUTH_HEADER,
+            auth_value=key,
+            omit=anthropic.omit,
+        )
+        return anthropic.Anthropic(
+            api_key=key,
+            base_url=ANTHROPIC_DEFAULT_BASE_URL,
+            default_headers=restored or None,
+        )
 
     def call(self, prompt: str) -> str:
         """Send a classification prompt to the Anthropic API.
@@ -685,18 +833,22 @@ class AnthropicProvider:
         Returns:
             The raw ``messages.create`` response object.
         """
+        # Resolved first: building a request-key client sets the scrub.
+        client = self.client
         if system is None:
-            return self.client.messages.create(
+            return client.messages.create(
                 model=self.model,
                 max_tokens=ceiling,
                 messages=[{"role": "user", "content": prompt}],
+                extra_headers=self._scrubbed_headers,
             )
         cache: anthropic.types.CacheControlEphemeralParam = {"type": "ephemeral"}
-        return self.client.messages.create(
+        return client.messages.create(
             model=self.model,
             max_tokens=ceiling,
             messages=[{"role": "user", "content": prompt}],
             system=[{"type": "text", "text": system, "cache_control": cache}],
+            extra_headers=self._scrubbed_headers,
         )
 
 
@@ -1477,6 +1629,8 @@ class OpenAIProvider:
         if unmet is not None:
             raise RuntimeError(unmet)
         self._client: openai.OpenAI | None = None
+        self._scrubbed_headers: Mapping[str, str | openai.Omit] | None = None
+        """Per-request header removals for a request-key client, else ``None``."""
 
     def _missing_prerequisite(self) -> str | None:
         """Return why the OpenAI prerequisites are unmet, or ``None``.
@@ -1540,9 +1694,7 @@ class OpenAIProvider:
             import openai
 
             if self._request_key is not None:
-                # Never the config's ``api_base``: the vault config is writable
-                # and must not be able to redirect a writer's key elsewhere.
-                self._client = openai.OpenAI(api_key=self._request_key.reveal())
+                self._client = self._request_key_client()
                 return self._client
             base_url = self.config.api_base
             byok_key = (
@@ -1559,6 +1711,39 @@ class OpenAIProvider:
             else:
                 self._client = openai.OpenAI()
         return self._client
+
+    def _request_key_client(self) -> openai.OpenAI:
+        """Build the client for a writer's key, deaf to the operator's environment.
+
+        Never the config's ``api_base`` either: the vault config is writable and
+        must not be able to redirect a writer's key elsewhere. OpenAI's own base
+        URL is passed explicitly against ``OPENAI_BASE_URL``, and the
+        ``OpenAI-Organization`` / ``OpenAI-Project`` headers the SDK fills from
+        ``OPENAI_ORG_ID`` / ``OPENAI_PROJECT_ID`` are removed with every
+        ``OPENAI_CUSTOM_HEADERS`` entry: an operator's org id on a writer's key
+        is a vendor ``401`` (#1877).
+
+        Returns:
+            An ``openai.OpenAI`` client bound to the writer's key.
+        """
+        import openai
+
+        if self._request_key is None:  # pragma: no cover  # no issue: invariant
+            msg = "a request-key client needs a request key"
+            raise RuntimeError(msg)
+        key = self._request_key.reveal()
+        restored, self._scrubbed_headers = _operator_header_overrides(
+            _OPENAI_CUSTOM_HEADERS_ENV,
+            auth_header=_OPENAI_AUTH_HEADER,
+            auth_value=f"Bearer {key}",
+            omit=openai.omit,
+            account_headers=_OPENAI_ACCOUNT_HEADERS,
+        )
+        return openai.OpenAI(
+            api_key=key,
+            base_url=OPENAI_DEFAULT_BASE_URL,
+            default_headers=restored or None,
+        )
 
     def complete(
         self,
@@ -1627,19 +1812,23 @@ class OpenAIProvider:
         Returns:
             The raw ``chat.completions.create`` response object.
         """
+        # Resolved first: building a request-key client sets the scrub.
+        client = self.client
         if system is None:
-            return self.client.chat.completions.create(
+            return client.chat.completions.create(
                 model=self.model,
                 max_tokens=ceiling,
                 messages=[{"role": "user", "content": prompt}],
+                extra_headers=self._scrubbed_headers,
             )
-        return self.client.chat.completions.create(
+        return client.chat.completions.create(
             model=self.model,
             max_tokens=ceiling,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
+            extra_headers=self._scrubbed_headers,
         )
 
 

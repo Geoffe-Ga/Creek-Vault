@@ -50,7 +50,7 @@ from creek.classify.llm.request_key import (
 from creek.classify.llm.router import IntimateRoutingError
 from creek.config import CreekConfig, LLMConfig
 from creek.models import PrivacyTier
-from creek_mcp.api.models import RequestKeyProvider
+from creek_mcp.api.models import CONTRACT_MINOR, RequestKeyProvider
 from creek_mcp.api.openapi import build_openapi
 from creek_mcp.api.routes import PROVIDER_HEADER, PROVIDER_KEY_HEADER, ROUTES
 from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV
@@ -97,6 +97,8 @@ HTTP_ACCEPTED: Final[int] = 202
 HTTP_UNPROCESSABLE: Final[int] = 422
 HTTP_SERVICE_UNAVAILABLE: Final[int] = 503
 HTTP_UNAUTHORIZED: Final[int] = 401
+HTTP_FORBIDDEN: Final[int] = 403
+_REJECTED_FRAGMENTS: Final[int] = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -1024,3 +1026,176 @@ def test_capabilities_report_request_key_support(
     assert current["request_key_providers"] == expected
     assert silent["request_key_providers"] == expected
     assert "request_key_providers" not in prior
+
+
+# --------------------------------------------------------------------------- #
+# Hardening (#1877): the environment, a rejected key, and its job outcome
+# --------------------------------------------------------------------------- #
+
+_OPERATOR_ROUTING_ENV: Final[dict[str, str]] = {
+    "ANTHROPIC_BASE_URL": "https://anthropic-gateway.operator.invalid",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Operator-Tag: anthropic-op\nX-Api-Key: op-key",
+    "OPENAI_BASE_URL": "https://openai-gateway.operator.invalid/v1",
+    "OPENAI_ORG_ID": "org-OPERATOR",
+    "OPENAI_PROJECT_ID": "proj_OPERATOR",
+    "OPENAI_CUSTOM_HEADERS": "X-Operator-Tag: openai-op\nauthorization: Bearer op",
+}
+"""Every SDK environment setting that could redirect or decorate a request."""
+
+_VENDOR_HOSTS: Final[dict[str, str]] = {
+    "anthropic": "api.anthropic.com",
+    "openai": "api.openai.com",
+}
+
+
+@pytest.mark.parametrize(
+    ("cls", "provider", "secret"),
+    [
+        (AnthropicProvider, "anthropic", CANARY_KEY),
+        (OpenAIProvider, "openai", OPENAI_CANARY),
+    ],
+    ids=["anthropic", "openai"],
+)
+def test_the_operators_environment_never_redirects_or_decorates_a_request_key(
+    managed: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cls: type[AnthropicProvider] | type[OpenAIProvider],
+    provider: str,
+    secret: str,
+) -> None:
+    """The writer's key goes to the vendor's own host, carrying no operator header.
+
+    With ``OPENAI_ORG_ID`` set the SDK used to send the writer's key with the
+    operator's ``OpenAI-Organization``, which the vendor answers with ``401``;
+    a base URL in the environment would have sent the key somewhere else.
+    """
+    del managed
+    for name, value in _OPERATOR_ROUTING_ENV.items():
+        monkeypatch.setenv(name, value)
+    vendor = _Vendor(monkeypatch)
+
+    built = cls(LLMConfig(provider=provider), request_key=RequestKey(provider, secret))
+    built.complete("hello")
+
+    (request,) = vendor.requests
+    assert request.url.host == _VENDOR_HOSTS[provider]
+    for name in ("openai-organization", "openai-project", "x-operator-tag"):
+        assert name not in request.headers
+    assert vendor.keys_sent() == [secret]
+    assert len(request.headers.get_list("authorization")) <= 1
+    assert len(request.headers.get_list("x-api-key")) <= 1
+
+
+def test_an_operator_keyed_client_still_reads_its_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Self-hosted, operator-keyed routing is the operator's to configure."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(MANAGED_VAULT_ENV, raising=False)
+    monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
+    monkeypatch.setenv("OPENAI_API_KEY", OPERATOR_KEY)
+    monkeypatch.setenv("OPENAI_ORG_ID", "org-OPERATOR")
+    vendor = _Vendor(monkeypatch)
+
+    OpenAIProvider(LLMConfig(provider="openai")).complete("hello")
+
+    (request,) = vendor.requests
+    assert request.headers["openai-organization"] == "org-OPERATOR"
+
+
+@pytest.mark.parametrize("status", [HTTP_UNAUTHORIZED, HTTP_FORBIDDEN])
+def test_a_rejected_request_key_is_typed(
+    managed: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """``401`` and ``403`` under a request key are the typed, redacted refusal."""
+    from creek.classify.llm.providers import RequestKeyRejectedError
+
+    del managed
+    _Vendor(monkeypatch, status=status)
+    built = AnthropicProvider(
+        LLMConfig(provider="anthropic"),
+        request_key=RequestKey("anthropic", CANARY_KEY),
+    )
+
+    with pytest.raises(RequestKeyRejectedError) as caught:
+        built.complete("hello")
+
+    assert str(caught.value).endswith(f"(HTTP {status})")
+    assert _chain_leaks(caught.value, CANARY_KEY, CANARY_TAIL) == []
+
+
+def test_an_operator_keys_401_is_not_a_request_key_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the writer's key is the run's to lose; the operator's 401 retries."""
+    from creek.classify.llm.providers import RequestKeyRejectedError
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(MANAGED_VAULT_ENV, raising=False)
+    monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", OPERATOR_KEY)
+    _Vendor(monkeypatch, status=HTTP_UNAUTHORIZED)
+
+    with pytest.raises(RuntimeError) as caught:
+        AnthropicProvider(LLMConfig(provider="anthropic")).complete("hello")
+
+    assert not isinstance(caught.value, RequestKeyRejectedError)
+
+
+def _rejected_job(
+    managed: Path, monkeypatch: pytest.MonkeyPatch, *, minor: str
+) -> tuple[_Vendor, httpx.Response, dict[str, Any]]:
+    """Run one keyed ``llm`` classification job against a vendor answering 401."""
+    vendor = _Vendor(monkeypatch, status=HTTP_UNAUTHORIZED)
+    for index in range(_REJECTED_FRAGMENTS):
+        _fragment(managed, f"open-note-{index}", f"{_OPEN_BODY} {index}", "open")
+
+    with _client(managed) as http:
+        accepted = http.post(
+            CLASSIFICATIONS_PATH,
+            json={"method": "llm"},
+            headers=_key_headers(ceiling="personal", minor=minor),
+        )
+        assert accepted.status_code == HTTP_ACCEPTED, accepted.text
+        job_id = accepted.json()["job_id"]
+        terminal = _await_job(http, job_id)
+        polled = http.get(f"/v1/jobs/{job_id}", headers=headers(minor=minor))
+    del accepted
+    return vendor, polled, terminal
+
+
+def test_a_rejected_key_fails_the_classification_job_with_a_machine_reason(
+    tmp_path: Path,
+    managed: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    every_log: pytest.LogCaptureFixture,
+) -> None:
+    """A revoked key ends the job ``failed``, named, after no retry -- and unseen.
+
+    This is also the canary on the path that actually logs the provider error:
+    the orchestrator logs the failing attempt, and every record the SDKs,
+    ``httpx`` and both packages emit at DEBUG is swept for the key. Reverting
+    the request-scoped redaction in ``_error_detail`` fails this test.
+    """
+    from creek.classify.llm.orchestrator import LLMClassifier
+
+    vendor, polled, terminal = _rejected_job(managed, monkeypatch, minor=CONTRACT_MINOR)
+
+    assert terminal["state"] == "failed", terminal
+    assert terminal["result"] is None
+    assert terminal["failure_code"] == "request_key_rejected"
+    sent = [request.content.decode() for request in vendor.requests]
+    assert len(sent) == len(set(sent)), "a rejected fragment was retried"
+    assert len(sent) < _REJECTED_FRAGMENTS * LLMClassifier.MAX_RETRIES
+    assert "AuthenticationError (HTTP 401)" in every_log.text
+    _assert_canary_absent(tmp_path, every_log, polled)
+
+
+def test_a_caller_below_the_failure_code_minor_is_not_shown_it(
+    managed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``0.25`` consumer validating closed sees exactly the ``0.25`` shape."""
+    _, polled, _ = _rejected_job(managed, monkeypatch, minor="0.25")
+
+    assert polled.json()["state"] == "failed"
+    assert "failure_code" not in polled.json()

@@ -256,7 +256,13 @@ def test_a_self_hosted_vault_llm_job_fails_and_records_the_refusal(
     job_id = accepted.json()["job_id"]
     body = _await_terminal(api, job_id)
 
-    assert body == {"status": "ok", "job_id": job_id, "state": "failed", "result": None}
+    assert body == {
+        "status": "ok",
+        "job_id": job_id,
+        "state": "failed",
+        "result": None,
+        "failure_code": None,
+    }
     record = _stored_job(vault, job_id)
     assert record["state"] == "failed"
     assert record["failure_reason"].startswith("refused: ")

@@ -78,6 +78,7 @@ from pydantic import BaseModel, ValidationError
 from creek.classify.llm.consent import is_managed_vault
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek_mcp.api.models import (
+    JOB_FAILURE_CODE_SINCE_MINOR,
     OK_STATUS,
     PROVENANCE_SINCE_MINOR,
     ClassificationMethod,
@@ -85,6 +86,7 @@ from creek_mcp.api.models import (
     ClassificationResponse,
     ErrorCode,
     JobAcceptedResponse,
+    JobFailureCode,
     JobState,
     JobStatusResponse,
     LinkMethod,
@@ -108,7 +110,7 @@ from creek_mcp.httpapi.jobs import (
 )
 from creek_mcp.httpapi.vault import configured_vault, request_key_of
 from creek_mcp.tier_ceiling import TierCeiling
-from creek_mcp.tools.classify import classify_tool
+from creek_mcp.tools.classify import REQUEST_KEY_REJECTED_REASON, classify_tool
 from creek_mcp.tools.handshake import vault_available
 from creek_mcp.tools.link import link_tool
 
@@ -424,18 +426,27 @@ def _finish_pipeline_job(
     claimed: StoredJob,
     result: ClassificationResponse | LinkResponse | None,
     failure_reason: str | None = None,
+    failure_code: JobFailureCode | None = None,
 ) -> None:
     """Persist one terminal result without letting a disk fault escape a worker."""
     try:
-        finish_job(vault, claimed.job_id, claimed.worker_id, result, failure_reason)
+        finish_job(
+            vault,
+            claimed.job_id,
+            claimed.worker_id,
+            result,
+            failure_reason,
+            failure_code,
+        )
     except Exception:
         logger.exception("pipeline job %s could not record its result", claimed.job_id)
 
 
 _PipelineOutcome: TypeAlias = tuple[
-    ClassificationResponse | LinkResponse | None, str | None
+    ClassificationResponse | LinkResponse | None, str | None, JobFailureCode | None
 ]
-"""A pass's public result, and why it failed when that result is ``None``."""
+"""A pass's public result; why it failed when that result is ``None``, for the
+operator; and the closed code a caller is shown for a failure it can remedy."""
 
 
 def _classification_outcome(
@@ -460,7 +471,7 @@ def _classification_outcome(
         fallback_to_rules=is_managed_vault(),
     )
     if raw.get("status") != OK_STATUS:
-        return None, _refusal_reason(raw)
+        return None, _refusal_reason(raw), _failure_code(raw)
     if "fallback_from" in raw:
         logger.warning(
             "pipeline job %s fell back to rules: %s",
@@ -470,7 +481,7 @@ def _classification_outcome(
         method = ClassificationMethod.RULES
     else:
         method = ClassificationMethod(claimed.method)
-    return _classification_model(raw, method=method), None
+    return _classification_model(raw, method=method), None, None
 
 
 def _link_outcome(vault: Path, claimed: StoredJob) -> _PipelineOutcome:
@@ -482,8 +493,28 @@ def _link_outcome(vault: Path, claimed: StoredJob) -> _PipelineOutcome:
         consumer=claimed.consumer,
     )
     if raw.get("status") != OK_STATUS:
-        return None, _refusal_reason(raw)
-    return _link_model(raw), None
+        return None, _refusal_reason(raw), None
+    return _link_model(raw), None, None
+
+
+def _failure_code(raw: dict[str, Any]) -> JobFailureCode | None:
+    """Return the published code for a tool's non-ok result, or ``None``.
+
+    Only a refusal the caller can remedy earns one (#1877): today that is the
+    writer's request key being refused by its vendor, matched on the tool's
+    fixed reason constant rather than on any text the vendor wrote.
+
+    Args:
+        raw: The tool's non-ok result.
+
+    Returns:
+        :attr:`JobFailureCode.REQUEST_KEY_REJECTED`, or ``None``.
+    """
+    if raw.get("status") == "refused" and raw.get("reason") == (
+        REQUEST_KEY_REJECTED_REASON
+    ):
+        return JobFailureCode.REQUEST_KEY_REJECTED
+    return None
 
 
 def _refusal_reason(raw: dict[str, Any]) -> str:
@@ -509,16 +540,18 @@ def _execute_pipeline_job(
     a restart has no key and runs, or refuses, exactly as a keyless one.
 
     A failed job records why on its private record (``failure_reason``) and in
-    the log; the public ``/v1/jobs`` body stays ``failed`` with a null result.
+    the log; the public ``/v1/jobs`` body stays ``failed`` with a null result,
+    plus ``failure_code`` when the caller can remedy the failure (#1877).
     """
     claimed = _claimed_job(vault, record)
     if claimed is None:
         return
+    code: JobFailureCode | None = None
     try:
         if claimed.kind == "classification":
-            result, reason = _classification_outcome(vault, claimed, request_key)
+            result, reason, code = _classification_outcome(vault, claimed, request_key)
         else:
-            result, reason = _link_outcome(vault, claimed)
+            result, reason, code = _link_outcome(vault, claimed)
     except Exception as exc:
         # The detached worker has no response boundary. Collapse every tool or
         # projection failure to the public terminal state and retain the
@@ -528,7 +561,7 @@ def _execute_pipeline_job(
         result, reason = None, f"exception: {type(exc).__name__}"
     if reason is not None:
         logger.warning("pipeline job %s failed: %s", claimed.job_id, reason)
-    _finish_pipeline_job(vault, claimed, result, reason)
+    _finish_pipeline_job(vault, claimed, result, reason, code)
 
 
 async def _accepted_job(
@@ -662,10 +695,13 @@ async def handle_job_status(request: Request) -> Response:
     status = await write_off_loop(_job_status, request, context, active_job_ids)
     if status is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
+    body = status.model_dump(mode="json")
+    if not declared_minor_at_least(request, JOB_FAILURE_CODE_SINCE_MINOR):
+        # A caller below 0.26 vendored a closed body without the key (#1877).
+        body.pop("failure_code")
     return json_response(
         withheld_provenance_dropped(
-            status.model_dump(mode="json"),
-            serve=declared_minor_at_least(request, PROVENANCE_SINCE_MINOR),
+            body, serve=declared_minor_at_least(request, PROVENANCE_SINCE_MINOR)
         ),
         HTTP_OK,
     )

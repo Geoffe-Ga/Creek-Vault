@@ -723,6 +723,7 @@ def test_an_accepted_job_is_pollable_to_its_counts_only_result(
             "tags_extracted": 2,
             "complete": True,
         },
+        "failure_code": None,
     }
 
 
@@ -855,6 +856,7 @@ def test_a_job_failure_never_narrates_the_tool_error(
         "job_id": accepted.json()["job_id"],
         "state": "failed",
         "result": None,
+        "failure_code": None,
     }
     assert intimate_marker not in json.dumps(body)
 
@@ -871,7 +873,7 @@ def test_job_status_is_consumer_bound(
     terminal = _await_terminal(api, job_id)
 
     assert refused.status_code == HTTP_UNAVAILABLE
-    assert set(terminal) == {"status", "job_id", "state", "result"}
+    assert set(terminal) == {"status", "job_id", "state", "result", "failure_code"}
 
 
 def test_a_restart_marks_an_inflight_job_failed_instead_of_running_forever(
@@ -905,6 +907,7 @@ def test_a_restart_marks_an_inflight_job_failed_instead_of_running_forever(
         "job_id": job_id,
         "state": "failed",
         "result": None,
+        "failure_code": None,
     }
 
 

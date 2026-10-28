@@ -20,8 +20,18 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.25.0"
+CONTRACT_VERSION: Final[str] = "0.26.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.26.0 (#1877, ADR-0015): a writer's request-scoped key refused by its vendor
+(``401``/``403``) is fatal for an ``llm`` classification pass. The pass stops
+at the first refusal without retrying, ``creek.classify`` returns a refusal
+rather than a completed pass, and the ``/v1`` job ends ``failed``.
+``GET /v1/jobs/{job_id}`` gains ``failure_code``, a closed vocabulary whose one
+value, ``request_key_rejected``, tells the consumer to ask the writer for a new
+key; every other outcome reports ``null``. The field is omitted for callers
+declaring a minor below 0.26, whose failed body is unchanged, and ``0.25``
+stays served.
 
 0.25.0: ``reading-recommendations`` adds a bounded, evidence-backed selection
 of one caller-supplied available chapter through the configured generation
