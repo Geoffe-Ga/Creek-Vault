@@ -198,8 +198,9 @@ constraint-dependencies = [
     # Security: pin pyasn1 above CVE-2026-59885 (quadratic OID-arc
     # decode DoS) and CVE-2026-59886 (REAL-exponent big-int DoS) —
     # transitive via google-genai → google-auth → pyasn1-modules.
-    # Both fixed in 0.6.4 (#867).
-    "pyasn1>=0.6.4",
+    # Both fixed in 0.6.4 (#867); floored to
+    # 0.6.5 for CVE-2026-119194..119197 (pip-audit, 2026-10-31).
+    "pyasn1>=0.6.5",
     # Security: pin cryptography above PYSEC-2026-3552 (CVE-2026-69247,
     # GHSA-g6cj-pr64-35w5) — PKCS#7 EnvelopedData decryption exposed a
     # Bleichenbacher oracle via distinguishable errors and timing;
