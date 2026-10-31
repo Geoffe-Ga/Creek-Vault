@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _NOW = datetime(2026, 9, 7, 4, tzinfo=UTC)
+_REJECTED = FailureReason.PROVIDER_REJECTED
+_AWAITS_CONVERGE = FailureReason.PROVIDER_UNAVAILABLE
 _RUNBOOK = (
     Path(__file__).resolve().parents[1] / "docs" / "provisioning-control-plane.md"
 )
@@ -172,6 +174,33 @@ def test_provision_accepts_exact_live_provider_normalization() -> None:
             lambda machine: machine["config"]["mounts"][0].update(size_gb=6),
         ),
         (
+            "config-field",
+            lambda machine: machine["config"].update(unreviewed=True),
+        ),
+    ],
+)
+def test_provision_rejects_identity_drift_inside_provider_normalization(
+    _label: str,
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    """Known enrichment never permits identity drift or unknown provider fields."""
+    api = ProviderNormalizedFlyAPI()
+    driver = fly_driver(api, fly_replay_enabled=True)
+    job = fly_job()
+    driver.provision(job)
+    mutate(_only_machine(api))
+
+    with pytest.raises(ProviderError) as raised:
+        driver.provision(job)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert api.updates == []
+
+
+@pytest.mark.parametrize(
+    ("_label", "mutate"),
+    [
+        (
             "autostop",
             lambda machine: machine["config"]["services"][0].update(autostop=False),
         ),
@@ -184,10 +213,6 @@ def test_provision_accepts_exact_live_provider_normalization() -> None:
         (
             "service-field",
             lambda machine: machine["config"]["services"][0].update(unreviewed=True),
-        ),
-        (
-            "config-field",
-            lambda machine: machine["config"].update(unreviewed=True),
         ),
         (
             "process-user",
@@ -209,21 +234,22 @@ def test_provision_accepts_exact_live_provider_normalization() -> None:
         ),
     ],
 )
-def test_provision_rejects_drift_inside_provider_normalization(
+def test_provision_converges_policy_drift_inside_provider_normalization(
     _label: str,
     mutate: Callable[[dict[str, Any]], None],
 ) -> None:
-    """Known enrichment never permits policy drift or unknown provider fields."""
+    """A retry never adopts policy drift: it rewrites the stopped Machine (#1869)."""
     api = ProviderNormalizedFlyAPI()
     driver = fly_driver(api, fly_replay_enabled=True)
     job = fly_job()
     driver.provision(job)
     mutate(_only_machine(api))
 
-    with pytest.raises(ProviderError) as raised:
-        driver.provision(job)
+    driver.provision(job)
 
-    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    (update,) = api.updates
+    assert _only_machine(api)["config"] == update["config"]
+    assert _only_machine(api)["state"] == "stopped"
 
 
 @pytest.mark.parametrize("fly_replay_enabled", [False, True])
@@ -254,21 +280,25 @@ def test_every_managed_machine_carries_the_local_only_marker(
     ],
     ids=["removed", "rewritten"],
 )
-def test_provision_rejects_a_machine_missing_the_managed_marker(
+def test_provision_restores_a_drifted_managed_marker(
     fly_replay_enabled: bool,
     mutate: Callable[[dict[str, str]], object],
 ) -> None:
-    """A Machine whose marker drifted is never accepted as a managed vault."""
+    """A Machine whose marker drifted is never accepted as it is.
+
+    The environment is policy-owned, so a retry meeting the stopped Machine
+    rewrites it with the marker rather than adopting it (#1869).
+    """
     api = FakeFlyAPI()
     driver = fly_driver(api, fly_replay_enabled=fly_replay_enabled)
     job = fly_job()
     driver.provision(job)
     mutate(_only_machine(api)["config"]["env"])
 
-    with pytest.raises(ProviderError) as raised:
-        driver.provision(job)
+    driver.provision(job)
 
-    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert len(api.updates) == 1
+    assert _only_machine(api)["config"]["env"][MANAGED_VAULT_ENV] == "1"
 
 
 def test_volume_names_meet_fly_runtime_contract_and_remain_deterministic() -> None:
@@ -386,58 +416,79 @@ def test_replay_rechecks_allocation_network_after_machine_readiness() -> None:
 
 
 @pytest.mark.parametrize(
-    ("_label", "mutate"),
+    ("_label", "mutate", "reason"),
     [
-        ("name", lambda machine: machine.update(name="wrong-machine")),
-        ("region", lambda machine: machine.update(region="ord")),
+        ("name", lambda machine: machine.update(name="wrong-machine"), _REJECTED),
+        ("region", lambda machine: machine.update(region="ord"), _REJECTED),
         (
             "image",
             lambda machine: machine["config"].update(
                 image="registry.example/other@sha256:" + "b" * 64
             ),
+            _AWAITS_CONVERGE,
         ),
         (
             "rootfs",
             lambda machine: machine["config"].update(
                 rootfs={"size_gb": 2, "persist": "never"}
             ),
+            _REJECTED,
         ),
         (
             "guest",
             lambda machine: machine["config"].update(
                 guest={"cpu_kind": "shared", "cpus": 2, "memory_mb": 1024}
             ),
+            _AWAITS_CONVERGE,
         ),
-        ("mount", lambda machine: machine["config"].update(mounts=[])),
+        ("mount", lambda machine: machine["config"].update(mounts=[]), _REJECTED),
         (
             "restart",
             lambda machine: machine["config"].update(restart={"policy": "always"}),
+            _AWAITS_CONVERGE,
         ),
-        ("environment", lambda machine: machine["config"].update(env={})),
+        (
+            "environment",
+            lambda machine: machine["config"].update(env={}),
+            _AWAITS_CONVERGE,
+        ),
         (
             "init",
             lambda machine: machine["config"].update(init={"exec": ["unreviewed"]}),
+            _AWAITS_CONVERGE,
         ),
-        ("service", lambda machine: machine["config"].update(services=[])),
+        (
+            "service",
+            lambda machine: machine["config"].update(services=[]),
+            _AWAITS_CONVERGE,
+        ),
         (
             "replay-secret",
             lambda machine: machine["config"].update(
                 files=machine["config"]["files"][:1]
             ),
+            _AWAITS_CONVERGE,
         ),
         (
             "unexpected-secret",
             lambda machine: machine["config"]["files"].append(
                 {"guest_path": "/run/secrets/tls.key", "raw_value": "YQ=="}
             ),
+            _REJECTED,
         ),
     ],
 )
 def test_replay_refuses_every_machine_policy_drift_before_emitting_target(
     _label: str,
     mutate: Callable[[dict[str, Any]], None],
+    reason: FailureReason,
 ) -> None:
-    """Replay is issued only for the exact reviewed immutable Machine shape."""
+    """Replay is issued only for the exact reviewed immutable Machine shape.
+
+    Identity drift is a permanent rejection.  Drift confined to policy-owned
+    fields is refused retryably and left for the operator's converge: routing
+    never mutates a Machine (#1869).
+    """
     api = FakeFlyAPI()
     driver = fly_driver(api, fly_replay_enabled=True)
     job = fly_job()
@@ -454,7 +505,8 @@ def test_replay_refuses_every_machine_policy_drift_before_emitting_target(
     with pytest.raises(ProviderError) as raised:
         driver.prepare_replay(routed)
 
-    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert raised.value.reason is reason
+    assert api.updates == []
     assert not any(path.endswith("/start") for _, path in api.requests)
 
 

@@ -13,6 +13,7 @@ import base64
 import dataclasses
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import stat
@@ -84,6 +85,35 @@ Matches superfly/fly-go's flaps/flaps_volumes.go destroyedVolumeStates, plus
 the terminal state. App absence still gates a confirmed deletion receipt.
 """
 _IMMUTABLE_IMAGE_RE: Final[re.Pattern[str]] = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
+_CONSUMER_TOKENS_PATH: Final[str] = "/run/secrets/creek_consumer_tokens"
+_REPLAY_STATE_PATH: Final[str] = "/run/secrets/creek_replay_state"
+_TLS_CERTIFICATE_PATH: Final[str] = "/run/secrets/tls.crt"
+_TLS_PRIVATE_KEY_PATH: Final[str] = "/run/secrets/tls.key"
+_POLICY_OWNED_CONFIG_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "image",
+        "env",
+        "processes",
+        "init",
+        "user",
+        "guest",
+        "services",
+        "restart",
+        "files",
+    }
+)
+"""Machine config the control plane derives from policy and may converge (#1869)."""
+_IDENTITY_CONFIG_KEYS: Final[frozenset[str]] = frozenset(
+    {"rootfs", "mounts", "metadata"}
+)
+"""Machine config that binds it to one allocation; never converged (#1869)."""
+_RUNTIME_CONFIG_KEYS: Final[tuple[str, ...]] = ("env", "processes", "init", "user")
+_FILE_KEYS: Final[frozenset[str]] = frozenset({"guest_path", "raw_value"})
+_RECORDED_FILE_KEYS: Final[frozenset[str]] = frozenset(
+    {"guest_path", "raw_value_sha256"}
+)
+_ENV_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_ABSENT: Final[object] = object()
 _FLY_PROVIDER: Final[str] = "fly"
 _FLY_DELETED_CLASSES: Final[tuple[ResourceClass, ...]] = (
     ResourceClass.CREDENTIAL,
@@ -323,6 +353,79 @@ class _AllocationRef:
     machine_name: str
 
 
+@dataclass(frozen=True, slots=True)
+class VaultMachinePlan:
+    """One vault Machine's convergence classification, free of secret values.
+
+    Attributes:
+        machine_id: The Fly Machine id.
+        stopped: Whether the Machine is ``stopped``, the only state updated.
+        identity_exact: Whether name, region, metadata, root filesystem, the
+            single mount on the allocation's own volume, an immutable image
+            and secret files its own record reproduces all hold (#1869).
+        drift: Sorted names of the policy-owned fields that differ from the
+            current policy (``env.<NAME>`` per environment entry); empty when
+            the Machine is current or its identity is not exact.
+        config: The observed config with every secret file value replaced by
+            its SHA-256 digest (see :func:`content_free_config`).
+        fingerprint: :func:`config_fingerprint` of *config*.
+    """
+
+    machine_id: str
+    stopped: bool
+    identity_exact: bool
+    drift: tuple[str, ...]
+    config: Mapping[str, Any] = field(repr=False)
+    fingerprint: str
+
+
+def content_free_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return *config* with each file's ``raw_value`` replaced by its digest.
+
+    The result can be written to an operator journal and printed in tests:
+    every secret the Machine carries travels as a file, so no secret value
+    survives.  A digest of a high-entropy credential does not reveal it.
+
+    Args:
+        config: One Machine config as Fly returns it.
+
+    Returns:
+        A copy whose ``files`` entries carry ``raw_value_sha256`` instead.
+    """
+    free = dict(config)
+    files = config.get("files")
+    if isinstance(files, list):
+        free["files"] = [_content_free_file(item) for item in files]
+    return free
+
+
+def config_fingerprint(config: Mapping[str, Any]) -> str:
+    """Return the SHA-256 of *config*'s canonical JSON form.
+
+    Args:
+        config: A content-free Machine config.
+
+    Returns:
+        The lowercase hex digest.
+    """
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _content_free_file(item: object) -> object:
+    """Return one Machine file entry with its value replaced by a digest."""
+    if not isinstance(item, dict) or "raw_value" not in item:
+        return item
+    free = {key: value for key, value in item.items() if key != "raw_value"}
+    free["raw_value_sha256"] = _raw_value_digest(item["raw_value"])
+    return free
+
+
+def _raw_value_digest(value: object) -> str:
+    """Return the digest a content-free file entry records for *value*."""
+    return hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
+
 class FlyProviderDriver:
     """Idempotent Fly app, Machine, encrypted-volume, and shutdown lifecycle."""
 
@@ -350,6 +453,26 @@ class FlyProviderDriver:
         self._client = client or httpx.Client(
             base_url=policy.api_base_url,
             timeout=httpx.Timeout(30),
+        )
+
+    def with_secret_manager(self, secrets: FlySecretManager) -> FlyProviderDriver:
+        """Return a driver over the same policy and transport with *secrets*.
+
+        The vault converge (#1869) runs over read-only records, so it can
+        never issue, rotate or revoke the consumer credential.
+
+        Args:
+            secrets: The record reader to use instead.
+
+        Returns:
+            The new driver; it shares this driver's provider transport.
+        """
+        return FlyProviderDriver(
+            self._policy,
+            self._credential,
+            secrets,
+            self._client,
+            pool_credentials=self._pool_credentials,
         )
 
     def provision(self, job: ProvisioningJob) -> ProviderAllocation:
@@ -411,7 +534,7 @@ class FlyProviderDriver:
             allocation.consumer_identity,
             requester_identity=allocation.requester_identity,
         )
-        self._verify_machine(
+        self._verify_routable(
             machine,
             reference,
             self._identifier(volume, "volume"),
@@ -423,7 +546,7 @@ class FlyProviderDriver:
         self._require_app(reference)
         ready = self._require_machine(reference)
         ready_volume = self._require_volume(reference)
-        self._verify_machine(
+        self._verify_routable(
             ready,
             reference,
             self._identifier(ready_volume, "volume"),
@@ -485,12 +608,10 @@ class FlyProviderDriver:
         rolled = self._stored_secrets(allocation)
         if rolled.mcp_oauth is None:
             self._rejected("activation record carries no MCP OAuth settings")
-        self._request(
-            "POST",
-            f"/v1/apps/{reference.app_name}/machines/"
-            f"{self._identifier(machine, 'Machine')}",
-            expected=(200,),
-            payload=self._machine_request(
+        self._update_machine(
+            reference,
+            machine,
+            self._machine_request(
                 reference, volume_id=volume_id, runtime_secrets=rolled
             ),
         )
@@ -498,6 +619,198 @@ class FlyProviderDriver:
             self._require_machine(reference), reference, volume_id, rolled
         )
         return True
+
+    def plan_vault_machine(self, allocation: RoutableAllocation) -> VaultMachinePlan:
+        """Classify one store-owned allocation's Machine against policy (#1869).
+
+        Read-only: lists the app, Machine and volume and reads the record.
+
+        Args:
+            allocation: The store-owned allocation to inspect.
+
+        Returns:
+            The Machine's content-free plan.
+        """
+        reference = self._owned_reference(allocation)
+        machine, volume_id, secrets = self._inspect(reference, allocation)
+        return self._plan(machine, reference, volume_id, secrets)
+
+    def converge_vault_machine(
+        self,
+        allocation: RoutableAllocation,
+        plan: VaultMachinePlan,
+    ) -> VaultMachinePlan:
+        """Update one stopped, identity-exact Machine to policy, then verify it.
+
+        The Machine is re-read first and must still be exactly *plan*: a
+        Machine that changed, started or was replaced since it was planned is
+        refused retryably.  The update keeps the Machine stopped, keeps its
+        mount on the same volume, and writes secret files only from the
+        allocation's existing record.
+
+        Args:
+            allocation: The store-owned allocation.
+            plan: The plan the operator saw, from :meth:`plan_vault_machine`.
+
+        Returns:
+            The converged Machine's plan, whose fingerprint a rollback needs.
+        """
+        reference = self._owned_reference(allocation)
+        machine, volume_id, secrets = self._inspect(reference, allocation)
+        current = self._plan(machine, reference, volume_id, secrets)
+        if (current.machine_id, current.fingerprint) != (
+            plan.machine_id,
+            plan.fingerprint,
+        ):
+            self._unavailable("Fly Machine changed since it was planned")
+        converged = self._converge(reference, machine, current, volume_id, secrets)
+        return self._plan(converged, reference, volume_id, secrets)
+
+    def verify_vault_machine_ready(self, allocation: RoutableAllocation) -> None:
+        """Start one converged Machine and prove it exact and ``started``.
+
+        The same verification and bounded readiness wait a route performs.
+        The Machine is left running; its proxy autostop scales it to zero.
+
+        Args:
+            allocation: The store-owned allocation.
+        """
+        self._prepare_machine(allocation)
+
+    def restore_vault_machine(
+        self,
+        allocation: RoutableAllocation,
+        prior: Mapping[str, Any],
+        *,
+        prior_fingerprint: str,
+        converged_fingerprint: str,
+    ) -> bool:
+        """Put one converged, stopped Machine back to its recorded prior config.
+
+        Secret files are rebuilt from the allocation's record and must match
+        the recorded digests, and the result must still be this allocation's
+        exact identity, so a rollback can neither rotate a credential nor
+        move the mount.
+
+        Args:
+            allocation: The store-owned allocation.
+            prior: The content-free config recorded before the converge.
+            prior_fingerprint: :func:`config_fingerprint` of *prior*.
+            converged_fingerprint: The fingerprint recorded after the converge.
+
+        Returns:
+            ``True`` when restored now, ``False`` when already the prior.
+        """
+        reference = self._owned_reference(allocation)
+        machine, volume_id, secrets = self._inspect(reference, allocation)
+        current = self._plan(machine, reference, volume_id, secrets)
+        if current.fingerprint == prior_fingerprint:
+            return False
+        if current.fingerprint != converged_fingerprint:
+            self._rejected("Fly Machine changed since it was converged")
+        if not current.stopped:
+            self._unavailable("Fly Machine must be stopped before it is restored")
+        candidate = {
+            "name": reference.machine_name,
+            "region": self._policy.region,
+            "config": self._restorable_config(prior, secrets),
+        }
+        if not self._machine_identity_is_exact(
+            candidate, reference, volume_id, secrets
+        ):
+            self._rejected("recorded Fly Machine config is not this allocation")
+        self._update_machine(reference, machine, {**candidate, "skip_launch": True})
+        restored = self._plan(
+            self._require_machine(reference), reference, volume_id, secrets
+        )
+        if restored.fingerprint != prior_fingerprint:
+            self._rejected("Fly Machine did not restore exactly")
+        return True
+
+    def _owned_reference(self, allocation: RoutableAllocation) -> _AllocationRef:
+        """Return *allocation*'s names, refusing a foreign provider allocation."""
+        reference = self._reference(allocation.activation_id)
+        if allocation.provider_allocation_id != reference.allocation_id:
+            self._rejected("provider allocation identity does not match activation")
+        return reference
+
+    def _inspect(
+        self,
+        reference: _AllocationRef,
+        allocation: RoutableAllocation,
+    ) -> tuple[Mapping[str, Any], str, FlyRuntimeSecrets]:
+        """Return the allocation's one Machine, its volume id and its record."""
+        self._require_app(reference)
+        machine = self._require_machine(reference)
+        volume_id = self._identifier(self._require_volume(reference), "volume")
+        return machine, volume_id, self._stored_secrets(allocation)
+
+    def _plan(
+        self,
+        machine: Mapping[str, Any],
+        reference: _AllocationRef,
+        volume_id: str,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> VaultMachinePlan:
+        """Classify *machine* without changing anything."""
+        config = machine.get("config")
+        if not isinstance(config, dict):
+            self._rejected("Fly Machine has no inspectable config")
+        free = content_free_config(config)
+        identity = self._machine_identity_is_exact(
+            machine, reference, volume_id, runtime_secrets
+        )
+        return VaultMachinePlan(
+            machine_id=self._identifier(machine, "Machine"),
+            stopped=machine.get("state") == "stopped",
+            identity_exact=identity,
+            drift=(
+                self._policy_drift(config, reference, volume_id, runtime_secrets)
+                if identity
+                else ()
+            ),
+            config=free,
+            fingerprint=config_fingerprint(free),
+        )
+
+    def _converge(
+        self,
+        reference: _AllocationRef,
+        machine: Mapping[str, Any],
+        plan: VaultMachinePlan,
+        volume_id: str,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> Mapping[str, Any]:
+        """Update one planned Machine in place to policy; return it verified."""
+        if not plan.identity_exact:
+            self._rejected("Fly Machine does not match allocation identity")
+        if not plan.stopped:
+            self._unavailable("Fly Machine must be stopped before it is converged")
+        self._update_machine(
+            reference,
+            machine,
+            self._machine_request(
+                reference, volume_id=volume_id, runtime_secrets=runtime_secrets
+            ),
+        )
+        converged = self._require_machine(reference)
+        self._verify_machine(converged, reference, volume_id, runtime_secrets)
+        return converged
+
+    def _update_machine(
+        self,
+        reference: _AllocationRef,
+        machine: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Replace one Machine's config through Fly's update endpoint."""
+        self._request(
+            "POST",
+            f"/v1/apps/{reference.app_name}/machines/"
+            f"{self._identifier(machine, 'Machine')}",
+            expected=(200,),
+            payload=payload,
+        )
 
     def _verify_pre_roll(
         self,
@@ -880,8 +1193,12 @@ class FlyProviderDriver:
                 else [self._object(response, "Fly Machine")]
             )
         machine = self._only(matches, "Fly Machine")
-        self._verify_machine(machine, reference, volume_id, runtime_secrets)
-        return machine
+        if self._machine_is_exact(machine, reference, volume_id, runtime_secrets):
+            return machine
+        # A retry meeting the stopped Machine it created under an older policy
+        # converges it: it was never handed off, and no route reaches it (#1869).
+        plan = self._plan(machine, reference, volume_id, runtime_secrets)
+        return self._converge(reference, machine, plan, volume_id, runtime_secrets)
 
     def _machine_request(
         self,
@@ -937,10 +1254,7 @@ class FlyProviderDriver:
         **both** runtimes: the manifest and the credential's own files, in the
         bundle's declared order (Decision 6, T12).
         """
-        consumer = (
-            "/run/secrets/creek_consumer_tokens",
-            runtime_secrets.consumer_registry,
-        )
+        consumer = (_CONSUMER_TOKENS_PATH, runtime_secrets.consumer_registry)
         pool = (
             ()
             if runtime_secrets.pool is None
@@ -949,18 +1263,35 @@ class FlyProviderDriver:
         if self._policy.fly_replay_enabled:
             return (
                 consumer,
-                (
-                    "/run/secrets/creek_replay_state",
-                    runtime_secrets.replay_state.encode(),
-                ),
+                (_REPLAY_STATE_PATH, runtime_secrets.replay_state.encode()),
                 *pool,
             )
         return (
             consumer,
-            ("/run/secrets/tls.crt", runtime_secrets.tls_certificate),
-            ("/run/secrets/tls.key", runtime_secrets.tls_private_key),
+            (_TLS_CERTIFICATE_PATH, runtime_secrets.tls_certificate),
+            (_TLS_PRIVATE_KEY_PATH, runtime_secrets.tls_private_key),
             *pool,
         )
+
+    @staticmethod
+    def _record_file_values(runtime_secrets: FlyRuntimeSecrets) -> dict[str, str]:
+        """Return every file value the record can produce, on either runtime.
+
+        Keyed by guest path; values are Fly's base64 ``raw_value`` form.
+        """
+        pool = (
+            ()
+            if runtime_secrets.pool is None
+            else pool_machine_files(runtime_secrets.pool)
+        )
+        values = (
+            (_CONSUMER_TOKENS_PATH, runtime_secrets.consumer_registry),
+            (_REPLAY_STATE_PATH, runtime_secrets.replay_state.encode()),
+            (_TLS_CERTIFICATE_PATH, runtime_secrets.tls_certificate),
+            (_TLS_PRIVATE_KEY_PATH, runtime_secrets.tls_private_key),
+            *pool,
+        )
+        return {path: base64.b64encode(value).decode("ascii") for path, value in values}
 
     def _runtime_config(
         self,
@@ -1041,6 +1372,134 @@ class FlyProviderDriver:
             self._rejected("Fly Machine has no inspectable config")
         if not self._machine_is_exact(machine, reference, volume_id, runtime_secrets):
             self._rejected("Fly Machine does not match allocation policy")
+
+    def _verify_routable(
+        self,
+        machine: Mapping[str, Any],
+        reference: _AllocationRef,
+        volume_id: str,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> None:
+        """Admit only the exact Machine to a route; a stale one waits (#1869).
+
+        A Machine whose identity is exact but whose policy-owned fields are
+        behind is refused retryably and left untouched: routing never mutates
+        it, the operator's converge does.  Any identity mismatch is rejected.
+        """
+        if not isinstance(machine.get("config"), dict):
+            self._rejected("Fly Machine has no inspectable config")
+        if self._machine_is_exact(machine, reference, volume_id, runtime_secrets):
+            return
+        if self._machine_identity_is_exact(
+            machine, reference, volume_id, runtime_secrets
+        ):
+            self._unavailable("Fly Machine awaits operator convergence")
+        self._rejected("Fly Machine does not match allocation policy")
+
+    def _machine_identity_is_exact(
+        self,
+        machine: Mapping[str, Any],
+        reference: _AllocationRef,
+        volume_id: str,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> bool:
+        """Return whether *machine* is this allocation's, whatever its policy.
+
+        Identity is the name, region, metadata, root filesystem, the single
+        mount on the allocation's own volume, an immutable image, and secret
+        files every one of which the record reproduces at its path; no field
+        outside the policy-owned and identity sets may appear.
+        """
+        config = machine.get("config")
+        if not isinstance(config, dict):
+            return False
+        image = config.get("image")
+        return (
+            machine.get("name") == reference.machine_name
+            and machine.get("region") == self._policy.region
+            and _IDENTITY_CONFIG_KEYS
+            <= set(config)
+            <= _IDENTITY_CONFIG_KEYS | _POLICY_OWNED_CONFIG_KEYS
+            and config.get("metadata")
+            == {
+                "creek_allocation_id": reference.allocation_id,
+                "creek_activation_id": reference.activation_id,
+            }
+            and config.get("rootfs")
+            == {"size_gb": self._policy.rootfs_size_gb, "persist": "never"}
+            and self._machine_mount_is_exact(config.get("mounts"), reference, volume_id)
+            and isinstance(image, str)
+            and _IMMUTABLE_IMAGE_RE.fullmatch(image) is not None
+            and self._files_are_own(config.get("files"), runtime_secrets)
+        )
+
+    def _files_are_own(
+        self,
+        files: object,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> bool:
+        """Return whether every file is one the record reproduces, once each."""
+        if files is None:
+            return True
+        if not isinstance(files, list):
+            return False
+        known = self._record_file_values(runtime_secrets)
+        paths = [
+            item.get("guest_path")
+            for item in files
+            if isinstance(item, dict)
+            and set(item) == _FILE_KEYS
+            and isinstance(item.get("guest_path"), str)
+            and known.get(item["guest_path"]) == item.get("raw_value")
+        ]
+        return len(paths) == len(files) == len(set(paths))
+
+    def _policy_drift(
+        self,
+        config: Mapping[str, Any],
+        reference: _AllocationRef,
+        volume_id: str,
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> tuple[str, ...]:
+        """Return the sorted names of policy-owned fields behind policy."""
+        expected = self._machine_request(
+            reference, volume_id=volume_id, runtime_secrets=runtime_secrets
+        )["config"]
+        drift = [
+            key
+            for key in ("image", "guest", "restart", "files")
+            if config.get(key) != expected[key]
+        ]
+        if not self._machine_service_is_exact(config.get("services")):
+            drift.append("services")
+        drift.extend(_runtime_drift(config, expected))
+        return tuple(sorted(drift))
+
+    def _restorable_config(
+        self,
+        prior: Mapping[str, Any],
+        runtime_secrets: FlyRuntimeSecrets,
+    ) -> dict[str, Any]:
+        """Rebuild a recorded config's secret files from the record."""
+        config = dict(prior)
+        files = prior.get("files")
+        if files is None:
+            return config
+        if not isinstance(files, list):
+            self._rejected("recorded Fly Machine files are invalid")
+        known = self._record_file_values(runtime_secrets)
+        config["files"] = [self._restored_file(item, known) for item in files]
+        return config
+
+    def _restored_file(self, item: object, known: Mapping[str, str]) -> dict[str, str]:
+        """Return one recorded file with its value rebuilt from the record."""
+        if not isinstance(item, dict) or set(item) != _RECORDED_FILE_KEYS:
+            self._rejected("recorded Fly Machine file is invalid")
+        path = item["guest_path"]
+        value = known.get(path) if isinstance(path, str) else None
+        if value is None or _raw_value_digest(value) != item["raw_value_sha256"]:
+            self._rejected("recorded Fly Machine file is not reproducible")
+        return {"guest_path": path, "raw_value": value}
 
     def _machine_is_exact(
         self,
@@ -1371,6 +1830,36 @@ def _resource_key(resource: ProviderResource) -> tuple[str, str, str]:
         resource.resource_class.value,
         resource.provider_ref,
     )
+
+
+def _runtime_drift(
+    config: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> list[str]:
+    """Return the runtime keys behind policy, naming environment entries."""
+    drift: list[str] = []
+    for key in _RUNTIME_CONFIG_KEYS:
+        observed = config.get(key, _ABSENT)
+        wanted = expected.get(key, _ABSENT)
+        if observed == wanted:
+            continue
+        if key == "env" and isinstance(observed, dict) and isinstance(wanted, dict):
+            drift.extend(_env_drift(observed, wanted))
+        else:
+            drift.append(key)
+    return drift
+
+
+def _env_drift(observed: Mapping[str, Any], wanted: Mapping[str, Any]) -> list[str]:
+    """Return ``env.<NAME>`` per differing entry; values are never named."""
+    names = {
+        name
+        for name in set(observed) | set(wanted)
+        if observed.get(name, _ABSENT) != wanted.get(name, _ABSENT)
+    }
+    if any(_ENV_NAME_RE.fullmatch(str(name)) is None for name in names):
+        return ["env"]
+    return [f"env.{name}" for name in sorted(names)]
 
 
 def _validate_public_route_url(value: str) -> None:
