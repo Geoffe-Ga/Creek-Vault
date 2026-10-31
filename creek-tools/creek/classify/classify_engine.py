@@ -203,11 +203,12 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
+from itertools import islice
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
 
@@ -1080,13 +1081,13 @@ def _dispatch_files(
 
     A thread pool sized by *workers* lets the network-bound per-fragment LLM
     calls overlap; ``workers == 1`` preserves the original strictly-serial loop.
-    The results are drained in order so any error surfaces before returning.
 
-    **The first error stops the dispatch** of every file not yet started
-    (#1877): the run is about to raise anyway, and a pending file left to run
-    would cost one more provider call each — for a writer's revoked key, one
-    refused vendor call per fragment in the vault. Files already in flight
-    finish; their writes are as complete as on the serial path.
+    **No file starts after the first failure is observed** (#1877, #2010): the
+    run is about to raise anyway, and every further file would cost one more
+    provider call — for a writer's revoked key, one refused vendor call per
+    fragment in the vault. See :func:`_dispatch_concurrently` for how that is
+    made exact rather than best-effort. Files already running finish before the
+    error propagates; their writes are as complete as on the serial path.
 
     Args:
         files: Fragment files to process, in order.
@@ -1094,18 +1095,51 @@ def _dispatch_files(
         workers: Thread-pool width (1 = serial).
     """
     if workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            pending = [executor.submit(process_one, md_file) for md_file in files]
-            try:
-                for future in pending:
-                    future.result()
-            except BaseException:
-                for future in pending:
-                    future.cancel()
-                raise
+        _dispatch_concurrently(files, process_one, workers=workers)
     else:
         for md_file in files:
             process_one(md_file)
+
+
+def _dispatch_concurrently(
+    files: list[Path],
+    process_one: Callable[[Path], None],
+    *,
+    workers: int,
+) -> None:
+    """Feed *files* to a pool through a window of at most *workers* (#2010).
+
+    Submitting every file up front let a worker that had just failed pull the
+    next queued file before the main thread could cancel it — and draining
+    results in submission order kept the main thread parked on a slow early
+    file while a later one had already failed. Here a file is submitted only
+    when a slot frees *successfully*: the main thread reacts to whichever file
+    completes first, and once a failure is among the completed nothing more is
+    submitted. Only the files already running when the failure is observed (at
+    most ``workers - 1``) finish after it; of failures that complete together,
+    the earliest-submitted one is re-raised as it was raised.
+
+    Args:
+        files: Fragment files to process, in order (started in this order).
+        process_one: Callback classifying and writing one file.
+        workers: Thread-pool width (> 1).
+    """
+    queued = iter(enumerate(files))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        in_flight: dict[Future[None], int] = {}
+
+        def _submit(count: int) -> None:
+            for index, md_file in islice(queued, count):
+                in_flight[executor.submit(process_one, md_file)] = index
+
+        _submit(workers)
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in sorted(done, key=in_flight.__getitem__):
+                future.result()
+            for future in done:
+                del in_flight[future]
+            _submit(len(done))
 
 
 @dataclass(frozen=True)
