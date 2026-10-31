@@ -53,6 +53,15 @@ PINNED_RUNTIME_VERSION: Final[str] = "0.0.1"
 PINNED_MODEL: Final[str] = "creek-test-model:q4"
 """The pinned model reference; always an exact, non-floating tag."""
 
+PINNED_EMBED_MODEL: Final[str] = "creek-test-embed"
+"""The pinned embedding model id (#1904); vendor ids carry no tag."""
+
+PINNED_EMBED_DIMENSIONS: Final[int] = 4
+"""The pinned embedding dimensionality the fake pool answers with."""
+
+PINNED_EMBED_THRESHOLD: Final[float] = 0.5
+"""The pinned similarity threshold for the embedding space."""
+
 _SEPARATOR: Final[bytes] = b"\r\n\r\n"
 _CHUNK_BYTES: Final[int] = 65536
 _DRAIN_TIMEOUT: Final[float] = 5.0
@@ -121,6 +130,39 @@ def identity_listing(
         "runtime": {"name": runtime_name, "version": runtime_version},
         "models": [{"name": model_name}],
     }
+
+
+def pool_listing(*models: str) -> dict[str, object]:
+    """Return an identity listing offering every model in *models*.
+
+    Args:
+        models: The model ids the pinned runtime claims to serve.
+
+    Returns:
+        The decoded listing shape.
+    """
+    return {
+        "runtime": {"name": PINNED_RUNTIME_NAME, "version": PINNED_RUNTIME_VERSION},
+        "models": [{"name": name} for name in models],
+    }
+
+
+def fake_vector(text: str, dimensions: int = PINNED_EMBED_DIMENSIONS) -> list[float]:
+    """Return a deterministic, non-degenerate vector for *text*.
+
+    Stable across processes (no ``hash``), so a test may compare vectors.
+
+    Args:
+        text: The text the fake pool embeds.
+        dimensions: The vector length.
+
+    Returns:
+        *dimensions* floats derived from the text's characters.
+    """
+    return [
+        float(sum(ord(char) for char in text[i::dimensions]) % 97 + 1)
+        for i in range(dimensions)
+    ]
 
 
 def generation(
@@ -373,6 +415,104 @@ class FakePool:
             conn.close()
 
 
+class EmbeddingPool(FakePool):
+    """A fake pool that answers ``/v1/embeddings`` with one vector per input.
+
+    Every other path answers its canned payload as :meth:`FakePool.routing`
+    does. ``fail_embeddings_after`` makes every embeddings request after that
+    many successes answer HTTP 503, so a test can interrupt a pass mid-way.
+
+    Attributes:
+        embed_model: The model the answer echoes.
+        dimensions: The vector length answered.
+    """
+
+    def __init__(
+        self,
+        payloads: dict[str, object],
+        *,
+        embed_model: str = PINNED_EMBED_MODEL,
+        dimensions: int = PINNED_EMBED_DIMENSIONS,
+        fail_embeddings_after: int | None = None,
+    ) -> None:
+        """Serve *payloads* by path and compute embeddings answers.
+
+        Args:
+            payloads: Pool path to the decoded body served for it.
+            embed_model: The model the embeddings answer names.
+            dimensions: The vector length answered.
+            fail_embeddings_after: Successful embeddings answers before every
+                later one answers 503, or ``None`` to never fail.
+        """
+        self.embed_model = embed_model
+        self.dimensions = dimensions
+        self._fail_after = fail_embeddings_after
+        self._embeds_answered = 0
+        super().__init__()
+        self._by_path = {
+            path: json.dumps(body).encode("utf-8") for path, body in payloads.items()
+        }
+
+    def embedding_bodies(self) -> list[dict[str, Any]]:
+        """Return the decoded body of every embeddings request, in order."""
+        return [
+            body
+            for (_method, path), body in zip(
+                self.requests, self._bodies_by_request(), strict=True
+            )
+            if path == "/v1/embeddings" and isinstance(body, dict)
+        ]
+
+    def _bodies_by_request(self) -> list[object]:
+        """Return one body (or ``None``) per recorded request, aligned."""
+        bodies = iter(self.bodies)
+        return [
+            next(bodies, None) if method == "POST" else None
+            for method, _path in self.requests
+        ]
+
+    def _answer(self, conn: socket.socket) -> None:
+        """Answer embeddings requests from their own inputs; others as canned."""
+        self._record(self._drain(conn))
+        path = self.requests[-1][1] if self.requests else ""
+        status = self._status
+        if path == "/v1/embeddings":
+            payload, status = self._embeddings_answer()
+        else:
+            payload = self._by_path.get(path, self._body)
+        try:
+            conn.sendall(self._raw_response(payload, status))
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
+        conn.close()
+
+    def _embeddings_answer(self) -> tuple[bytes, int]:
+        """Return the answer for the embeddings request just recorded."""
+        if self._fail_after is not None and self._embeds_answered >= self._fail_after:
+            return b"{}", 503
+        self._embeds_answered += 1
+        body = self.bodies[-1] if self.bodies else {}
+        inputs = body.get("input", []) if isinstance(body, dict) else []
+        data = [
+            {"index": index, "embedding": fake_vector(text, self.dimensions)}
+            for index, text in enumerate(inputs)
+        ]
+        answer = {"model": self.embed_model, "data": data}
+        return json.dumps(answer).encode("utf-8"), _HTTP_OK_STATUS
+
+    @staticmethod
+    def _raw_response(payload: bytes, status: int) -> bytes:
+        """Return a whole HTTP/1.1 response for *payload* at *status*."""
+        head = (
+            f"HTTP/1.1 {status} X\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        return head.encode("ascii") + payload
+
+
 class SocketSpy:
     """Record every TCP destination a dial attempts, and refuse all of them.
 
@@ -413,12 +553,31 @@ class SocketSpy:
         raise OSError(msg)
 
 
+def embedding_pin(**overrides: object) -> dict[str, object]:
+    """Return a manifest ``embedding`` block matching :class:`EmbeddingPool`.
+
+    Args:
+        overrides: Fields to replace, to pin a mismatching identity.
+
+    Returns:
+        The JSON-ready block.
+    """
+    return {
+        "model_name": PINNED_EMBED_MODEL,
+        "dimensions": PINNED_EMBED_DIMENSIONS,
+        "similarity_threshold": PINNED_EMBED_THRESHOLD,
+        "runtime_inventory_digest": pinned_identity_digest(PINNED_EMBED_MODEL),
+        **overrides,
+    }
+
+
 def pin_pool_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     inventory_digest: str | None = None,
     model_name: str = PINNED_MODEL,
+    embedding: dict[str, object] | None = None,
 ) -> ModelPackageManifest:
     """Configure an approved model-package manifest pinning the pool's identity.
 
@@ -434,6 +593,8 @@ def pin_pool_manifest(
         inventory_digest: The digest to pin, or ``None`` for the one a
             matching pool implies.
         model_name: The model reference to pin.
+        embedding: The optional embedding pin (#1904), or ``None`` for a
+            manifest that pins no attested embedding model.
 
     Returns:
         The parsed manifest.
@@ -453,6 +614,8 @@ def pin_pool_manifest(
         "license_spdx": "Apache-2.0",
         "license_url": "https://example.test/LICENSE",
     }
+    if embedding is not None:
+        fields["embedding"] = embedding
     path = tmp_path / "model-package" / "manifest.json"
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps(fields), encoding="utf-8")

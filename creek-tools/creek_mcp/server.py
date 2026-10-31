@@ -141,7 +141,7 @@ if TYPE_CHECKING:
     from creek_mcp.tools.author import AuthorLLMFactory
     from creek_mcp.tools.compile import CompileLLMFactory
     from creek_mcp.tools.draft import DraftLLMFactory
-    from creek_mcp.tools.reflect import _LLM, _LLMFactory
+    from creek_mcp.tools.reflect import _LLM, GroundingRoute, _LLMFactory
     from creek_mcp.tools.revoice import RevoiceLLMFactory
 
     _FactoryT = TypeVar("_FactoryT")
@@ -634,6 +634,30 @@ def _build_reflect_llm_factory(
         A tier → LLM-callable factory bound to *vault*'s router.
     """
     return _bounded_generation_factory(vault, "reflection", request_key, provenance)
+
+
+def _build_reflect_grounding_route(
+    vault: Path, request_key: RequestKey | None = None
+) -> GroundingRoute:
+    """Return the per-tier embedding-route decision for one reflection (#1904).
+
+    Bound to *vault*'s own router and to the request's key, so the decision
+    agrees with :func:`_generation_provider` about whether this request is
+    answered by the pool: pool embeddings are spent only on a request the
+    pool also answers (see :mod:`creek_mcp.grounding_route`).
+
+    Args:
+        vault: The served vault, whose config owns the routing.
+        request_key: The writer's request-scoped key, or ``None``.
+
+    Returns:
+        ``route(tier) -> embedder | None`` for
+        :func:`~creek_mcp.tools.reflect.reflect_tool`'s ``grounding_route``.
+    """
+    from creek_mcp.grounding_route import grounding_embedder
+
+    router = load_vault_config(vault).model_router
+    return partial(grounding_embedder, router, request_key=request_key)
 
 
 def _build_letter_llm_factory(
@@ -1366,15 +1390,17 @@ def _register_conversation_tools(
     ) -> dict[str, Any]:
         """Return anchored Higher-Self margin notes on a single journal entry."""
         provenance = InferenceProvenance()
+        request_key = bound_request_key()
         response = reflect_tool(
             vault_path=vault,
-            llm_factory=reflect_factory(bound_request_key(), provenance),
+            llm_factory=reflect_factory(request_key, provenance),
             content=content,
             entry_ref=entry_ref,
             care_guard=acute_distress_guard,
             session=grounding_session,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
+            grounding_route=_build_reflect_grounding_route(vault, request_key),
         )
         return _labelled(response, provenance)
 
