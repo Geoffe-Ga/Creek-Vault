@@ -349,6 +349,71 @@ Do the cut-over in this order:
    check over its encrypted records is non-empty or unreadable, naming only
    the count.
 
+### Converging vault Machines after an upgrade (#1869)
+
+`--converge-vault-machines` is the third one-shot selector on the worker and
+the pilot, exclusive with the two above. It composes exactly like them, so
+`--fly-organization` and the credential scope the run to one organization,
+and `--fly-image` with the runtime settings is the policy it converges to.
+It walks the store's ownership-bound allocation set (every ready,
+provider-managed, undeleted allocation, in provider allocation id order) and
+reads each activation record through `ReadOnlyFlySecretManager`. It never
+issues, rotates or revokes a credential, and never writes a record.
+
+```console
+creek-provisioning-worker <the worker's usual options> \
+  --converge-vault-machines \
+  [--converge-apply] [--converge-rollback] \
+  [--converge-journal <owner-only file>] [--converge-limit <n>]
+# on the pilot: creek-managed-vault-pilot --converge-vault-machines ...
+```
+
+| Option | Meaning |
+|---|---|
+| (none) | Dry run: plan every allocation and print the document; nothing is written. |
+| `--converge-apply` | Update stopped Machines. Requires `--converge-journal`. |
+| `--converge-rollback` | Restore journaled priors instead (a dry run unless `--converge-apply`). Requires `--converge-journal`. |
+| `--converge-limit <n>` | The most Machine updates one run makes. Default `1`. |
+| `--converge-journal <file>` | This upgrade's write-ahead journal: created owner-only, refused unless owner-only, regular and integrity-checked. |
+
+A Machine is converged only when `FlyProviderDriver.plan_vault_machine` finds
+its identity exact and only policy-owned fields drifted (the rule is stated in
+the [pilot runbook](managed-vault-fly-pilot.md#upgrade-existing-vault-machines-1869)).
+The prior config is journaled before the update, with file values only as
+digests. `converge_vault_machine` re-reads the Machine, refuses it retryably
+if it changed since it was planned, updates it in place to the
+provision-time request (`skip_launch`, so still stopped), and re-verifies it
+with `_verify_machine`. `verify_vault_machine_ready` then runs the route's
+start-and-wait readiness proof. The batch halts at the first failure after an
+update.
+
+The run prints one JSON document — mode, whether it applied, whether it hit
+its bound, outcome counts, and one entry per allocation with its provider
+allocation id, outcome, and for a failure the public reason. Drifted field
+names are listed too. It never names an identity, image, address or secret.
+
+| Outcome | Meaning | Exit |
+|---|---|---|
+| `already-current` | Already on policy (or, in a rollback, already the prior). | `0` |
+| `converged` | Updated, re-verified, and proven ready. | `0` |
+| `restored` | Rolled back to its exact prior config. | `0` |
+| `would-converge` / `would-restore` | Dry run: an apply would update it. | `3` |
+| `skipped-running` | Not stopped; untouched. Re-run after it scales to zero. | `75` |
+| `failed-retryable` | A retryable provider failure; the batch halted. Re-run. | `75` |
+| `refused-identity` | Identity mismatch, or (rollback) changed since its converge; untouched. | `2` |
+| `failed` | A non-retryable failure, or `journal`: its entry belongs to another Machine or upgrade, or (rollback) its converge never finished. | `2` |
+
+When the bound stops a run with work left, `limit_reached` is `true` and the
+run exits `3`. The highest-priority status wins: `2`, then `75`, then `3`.
+
+Routing does not converge. `prepare_replay` and `prepare_route` refuse a Machine
+whose identity is exact but whose policy-owned fields are behind as
+`provider_unavailable`, retryably and untouched; identity drift stays
+`provider_rejected`. A provisioning retry is different. Its Machine was never
+handed off and the batch never sees a non-ready job, so `_ensure_machine`
+converges its own stopped Machine in place under the same identity rule and
+refuses a running one retryably.
+
 ## Fly Machines driver (#1770)
 
 Compose `FlyProviderDriver` only in the separate worker process. The API
