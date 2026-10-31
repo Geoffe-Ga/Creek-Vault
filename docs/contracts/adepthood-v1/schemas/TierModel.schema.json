@@ -11,7 +11,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "What the server promises about privacy tiers, advertised up front.\n\nAttributes:\n    ceilings: Every ceiling this surface admits \u2014 the two members of\n        :class:`WireTierCeiling`, in ascending breadth.\n    default: The ceiling applied when a caller declares none. Pinned to\n        ``open``, the most restrictive value, so an omitted ceiling can\n        only ever fail closed.\n    intimate_never_egresses: ``Literal[True]``. A promise, not a flag: the\n        schema admits no other value, so a server cannot advertise the\n        opposite and a client need not branch on it.",
+  "description": "What the server promises about privacy tiers, advertised up front.\n\nAttributes:\n    ceilings: Every ceiling this surface admits \u2014 the two members of\n        :class:`WireTierCeiling`, in ascending breadth.\n    default: The ceiling applied when a caller declares none. Pinned to\n        ``open``, the most restrictive value, so an omitted ceiling can\n        only ever fail closed.\n    intimate_never_egresses: ``Literal[True]``. A promise, not a flag: the\n        schema admits no other value, so a server cannot advertise the\n        opposite and a client need not branch on it. Its scope is every\n        ceiling-governed read. Since contract 0.27 (#2033) it has one\n        stated exception: ``GET /v1/export``, which is not\n        ceiling-governed and is served only to the vault's sole\n        configured consumer \u2014 the owner taking their own content back.",
   "properties": {
     "ceilings": {
       "description": "Tier ceilings this surface admits.",
@@ -29,7 +29,7 @@
     },
     "intimate_never_egresses": {
       "const": true,
-      "description": "Standing promise that intimate content never egresses.",
+      "description": "Standing promise that intimate content never egresses through a ceiling-governed read. The one exception is the owner-only export, GET /v1/export, since contract 0.27.",
       "title": "Intimate Never Egresses",
       "type": "boolean"
     }

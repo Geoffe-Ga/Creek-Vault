@@ -42,6 +42,21 @@ adepthood-v1/
         └── <state>.json               # one fixture per (capability, state) cell
 ```
 
+## The owner's export (`export`, contract `0.27`)
+
+`GET /v1/export?cursor=&limit=` pages through the owner's own vault-held
+content: `documents` (each staged upload or attachment as its original bytes,
+`content_base64` plus `sha256`) and then `fragments` (each fragment file
+verbatim as `markdown`, with `tier`, `frequency`, `phase`, `source_platform`
+and the `document_id` it was ingested from). Pages hold at most `limit` items
+(default 50, clamped to 200) and 10 MiB of raw content; an item larger than
+that is listed with `content_included: false` and null content. Follow
+`next_cursor` until it is `null`. The cursor is `d-` or `f-` plus a SHA-256
+order key: opaque, restart-stable, and it names no file, so it is safe in a
+logged URL. Any caller but the vault's sole configured consumer gets
+`403 privacy_refused`; a vault that cannot be read is `503 unavailable` —
+treat that as "vault unavailable", never as an empty export.
+
 ## Optional agent MCP discovery
 
 Contract `0.24` publishes `agent_mcp` on authenticated capability discovery.
@@ -61,7 +76,8 @@ it while subsequent content requests retain their existing supported minor.
 
 **Capabilities**: `capabilities`, `journal-upsert`, `reflections`,
 `wheel`, `upload`, `drive-connector`, `pipeline`, `voice-drafts`,
-`journal-withdraw`, `letters`, `agent-activity` — read directly off the `Capability` enum, so this
+`journal-withdraw`, `letters`, `agent-activity`, `reading-recommendations`,
+`export` — read directly off the `Capability` enum, so this
 directory's subdirectory names can never name a different set of capabilities
 than the server actually advertises through `GET /v1/capabilities`.
 
@@ -213,9 +229,15 @@ it cannot go stale at a bump.
 
 - No fixture contains a real journal body, a credential, or a token.
 - No fixture contains `"tier": "intimate"` or `"routed_tier": "intimate"`
-  anywhere — this is not merely a convention: `WireTierCeiling` has exactly
-  two members (`open`, `personal`), so `intimate` is not a constructible
-  value on this wire at all.
+  anywhere. On every ceiling-governed position this is not merely a
+  convention: `WireTierCeiling` has exactly two members (`open`,
+  `personal`), so `intimate` is not a constructible value there at all.
+- The one position where `intimate` *is* constructible is the owner's export
+  (`GET /v1/export`, contract `0.27`, `ExportTier`): it is not
+  ceiling-governed and is served only to the vault's sole configured
+  consumer, the owner taking their own content back. Its
+  `examples/export/success.json` deliberately shows a `personal` fragment,
+  so the sweep above still holds over every file here.
 - Every `examples/*/refusal.json` fixture is the **intimate example** for
   its capability: the closest this bundle comes to showing you above-ceiling
   content is showing you the refusal it produces instead. That is the point

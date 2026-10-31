@@ -1,0 +1,26 @@
+{
+  "documents": [
+    {
+      "content_base64": "c3ludGhldGljIGRvYwo=",
+      "content_included": true,
+      "document_id": "adepthood-doc-example-0a1b2c3d4e5f.txt",
+      "sha256": "af08aaf28d66958378755981de236b21e9da7bd844474ba0e339c29e3371d41b",
+      "size_bytes": 14
+    }
+  ],
+  "fragments": [
+    {
+      "content_included": true,
+      "document_id": "adepthood-doc-example-0a1b2c3d4e5f.txt",
+      "fragment_id": "frag-example-0001",
+      "frequency": "F3",
+      "markdown": "---\ntype: fragment\nid: frag-example-0001\nprivacy_tier: personal\n---\nsynthetic doc\n",
+      "phase": "rising",
+      "source_platform": "document",
+      "tier": "personal"
+    }
+  ],
+  "next_cursor": "f-e317dac90ddec59e988b617c8142a41f743c1d596d67368922bcae7f4b01820c",
+  "skipped": 0,
+  "status": "ok"
+}

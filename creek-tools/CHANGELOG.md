@@ -9,6 +9,24 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Publish `GET /v1/export`, the owner's paged export of their own vault-held
+  content (contract `0.27.0`, #2033; the Creek half of adepthood#3579). It
+  returns every staged upload and attachment as its original bytes (with a
+  SHA-256) and every fragment under `01-Fragments`, `09-Reference` and
+  `11-Other-Authors` verbatim, with its tier, primary frequency, phase, source
+  platform and originating document. It is the one `/v1` read that is not
+  ceiling-governed — `intimate` content crosses, under the new closed enum
+  `ExportTier` — so it is served only to the vault's sole configured consumer
+  (what a managed vault mounts); any other configuration is
+  `403 privacy_refused` before the vault is read. Pages hold at most 200 items
+  (default 50) and 10 MiB of raw content, a larger item is listed with
+  `content_included: false`, and the `d-`/`f-<sha256>` cursor is
+  restart-stable and names no file. An absent or unlistable vault is
+  `503 unavailable`, never a short `200`; the route logs nothing and audits
+  each page as a content-free `creek.export` entry. `TierModel`'s
+  `intimate_never_egresses` description now states its scope and this one
+  exception. `0.26` and every earlier minor stay served without seeing the
+  route.
 - Free the admission slot of a failed create (#2019, owner decision R2-3).
   Reconcile now reports every failed create that still owns provider
   resources as `incomplete_create` (a handoff failure after `provision()`

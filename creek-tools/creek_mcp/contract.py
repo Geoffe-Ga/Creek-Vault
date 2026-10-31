@@ -20,8 +20,23 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.26.0"
+CONTRACT_VERSION: Final[str] = "0.27.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.27.0 (#2033, adepthood#3579): ``/v1`` publishes a thirteenth capability,
+``export``, served by ``GET /v1/export?cursor=&limit=``: the owner's own
+vault-held content — every staged upload and attachment as its original bytes,
+and every fragment file verbatim with its tier, primary frequency, phase,
+source platform and originating document. It is the one ``/v1`` read that is
+not ceiling-governed, so ``intimate`` content crosses, and for that reason it
+is served only to the vault's **sole** configured consumer (a managed vault
+mounts exactly one); any other configuration is ``403 privacy_refused``. Pages
+are bounded by count (default 50, clamped to 200) and by 10 MiB of raw
+content; the opaque cursor encodes an on-disk key, so it survives a restart.
+Five wire models (``ExportQuery``, ``ExportDocument``, ``ExportFragment``,
+``ExportResponse``, ``ExportTier``) widen the contract, and ``TierModel``'s
+``intimate_never_egresses`` description now states its scope and this one
+exception. ``0.26`` remains served without seeing or reaching the route.
 
 0.26.0 (#1877, ADR-0015): a writer's request-scoped key refused by its vendor
 (``401``/``403``) is fatal for an ``llm`` classification pass. The pass stops
