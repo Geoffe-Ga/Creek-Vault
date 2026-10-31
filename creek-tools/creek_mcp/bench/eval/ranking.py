@@ -124,21 +124,19 @@ class ModelRow:
     invented_citations: int
 
     def to_json_dict(self, rank: int) -> dict[str, Any]:
-        """Return this row's JSON form at *rank*."""
+        """Return this row's JSON form at *rank*.
+
+        The dimension block is the record's own ``per_dimension``, so the row
+        and its record cannot disagree about a score.
+        """
+        record = self.record.to_json_dict()
         return {
             "rank": rank,
             "model_tag": self.model_tag,
             "verdict": self.quality.verdict.value,
-            "dimensions": {
-                dimension.value: {
-                    "basis": score.basis.value,
-                    "score": score.score,
-                    "probes": score.probes,
-                }
-                for dimension, score in self.quality.per_dimension.items()
-            },
+            "dimensions": record["per_dimension"],
             "invented_citations": self.invented_citations,
-            "record": self.record.to_json_dict(),
+            "record": record,
         }
 
 
