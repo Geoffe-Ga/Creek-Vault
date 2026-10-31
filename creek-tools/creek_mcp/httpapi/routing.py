@@ -13,6 +13,22 @@ vault verifies the token again, pinned to its own consumer. ``/v1`` stays the
 static route's alone. The router also answers the RFC 9728 metadata itself,
 before authentication, and gives a refused ``/mcp`` call the challenge that
 points at it.
+
+**Each allocation's own audience (#2003, R3-1).** With
+:attr:`AgentRouting.allocations` set, the router also routes ``/a/<slug>/mcp``,
+the per-allocation resource #2002 writes into each new record. The token is
+verified for the audience **the path names** — the edge origin plus that exact
+path — before any record is read; then the one record naming that resource
+(and the same issuer) is found, and its consumer must be the token's ``sub``.
+A token for another vault fails the first check, an unknown slug the second, a
+token for the right slug but another person the third; all three, a
+shared-audience token and the static routing credential on a slug path get the
+one ``401`` an anonymous call gets, and nothing is woken. The slug's RFC 9728
+metadata is answered from the path alone
+(:class:`~creek_mcp.oauth_resource.AllocationResourceMiddleware`), so no
+response says whether a slug exists. :attr:`AgentRouting.shared_audience`
+keeps the shared ``/mcp`` audience accepted until every allocation is rolled
+(#2004 switches it off).
 """
 
 from __future__ import annotations
@@ -50,8 +66,9 @@ from creek_mcp.httpapi.middleware.limits import (
     ConcurrencyLimitMiddleware,
     RequestTimeoutMiddleware,
 )
-from creek_mcp.mcp_path import MCP_PATH
+from creek_mcp.mcp_path import ALLOCATION_ROOT, MCP_PATH, is_allocation_mcp_path
 from creek_mcp.oauth_resource import (
+    AllocationResourceMiddleware,
     ProtectedResourceMetadataMiddleware,
     ResourceChallengeMiddleware,
 )
@@ -68,6 +85,7 @@ if TYPE_CHECKING:
     from creek_mcp.provisioning.models import RoutableAllocation
     from creek_mcp.provisioning.routing import (
         AgentPrincipalResolver,
+        AllocationResourceResolver,
         FlyReplayTarget,
         PrivateVaultTarget,
         ReplayRoutingProvider,
@@ -103,6 +121,12 @@ _REQUEST_ONLY_HEADERS: Final[frozenset[bytes]] = frozenset(
 _MCP_METHODS: Final[tuple[str, ...]] = ("POST", "GET", "DELETE")
 """The three verbs MCP streamable-HTTP uses: messages, the stream, session end."""
 
+_ALLOCATION_PREFIX: Final[str] = f"{ALLOCATION_ROOT}/"
+"""Every path beneath the per-allocation root (#2003)."""
+
+_ALLOCATION_MCP_ROUTE: Final[str] = f"{ALLOCATION_ROOT}/{{slug}}{MCP_PATH}"
+"""The per-allocation route template, which is all the access log records."""
+
 _IMPLICIT_HEAD: Final[str] = "HEAD"
 """The verb Starlette adds beside ``GET`` and neither surface publishes."""
 
@@ -118,10 +142,36 @@ class AgentRouting:
     Attributes:
         verifier: Verifies the token for this edge's MCP URL.
         principals: Resolves its verified subject to the vault's owner.
+        allocations: Resolves a per-allocation resource to its owner, or
+            ``None`` to route no ``/a/<slug>/mcp`` at all (#2003).
+        shared_audience: Whether an agent token for the shared edge resource
+            is still accepted on ``/mcp``; #2004 turns it off once every
+            allocation has its own audience.
     """
 
     verifier: JwtAgentTokenVerifier
     principals: AgentPrincipalResolver
+    allocations: AllocationResourceResolver | None = None
+    shared_audience: bool = True
+
+    def __post_init__(self) -> None:
+        """Refuse a combination that would route nobody or the wrong origin.
+
+        Raises:
+            ValueError: When the shared audience is refused with no
+                per-allocation route in its place, or per-allocation routing
+                is set on a verifier that is not the shared edge resource.
+        """
+        if not self.shared_audience and self.allocations is None:
+            raise ValueError(
+                "the shared MCP audience is refused only beside per-allocation routing"
+            )
+        config = self.verifier.config
+        if (
+            self.allocations is not None
+            and config.resource_url != f"{config.origin}{MCP_PATH}"
+        ):
+            raise ValueError("per-allocation routing needs the shared edge resource")
 
 
 class RoutingAuthMiddleware:
@@ -155,17 +205,28 @@ class RoutingAuthMiddleware:
         Returns:
             The principal, or ``None``.
         """
+        path = scope.get("path")
+        agent = self._agent
         if (
-            self._agent is None
-            or scope.get("path") != MCP_PATH
-            or not looks_like_jwt(token)
+            agent is not None
+            and agent.allocations is not None
+            and isinstance(path, str)
+            and path.startswith(_ALLOCATION_PREFIX)
         ):
+            # The whole /a/ prefix is the per-allocation rule's: an off-grammar
+            # path is refused here rather than left to the static credential.
+            if not is_allocation_mcp_path(path):
+                return None
+            return await _allocation_principal(agent, agent.allocations, path, token)
+        if agent is None or path != MCP_PATH or not looks_like_jwt(token):
             return await self._verifier.verify_credential(token)
-        access = await self._agent.verifier.verify_token(token)
+        if not agent.shared_audience:
+            return None
+        access = await agent.verifier.verify_token(token)
         if access is None or access.subject is None:
             return None
         # The agent's client id is its audit stamp, never its vault owner.
-        return await self._agent.principals.principal_for_consumer(access.subject)
+        return await agent.principals.principal_for_consumer(access.subject)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Bind verified ownership while logging only the requester identity."""
@@ -181,6 +242,43 @@ class RoutingAuthMiddleware:
         context_of(scope).consumer = principal.requester_identity
         scope[_ROUTING_PRINCIPAL] = principal
         await self.app(scope, receive, send)
+
+
+async def _allocation_principal(
+    agent: AgentRouting,
+    allocations: AllocationResourceResolver,
+    path: str,
+    token: str,
+) -> RoutingPrincipal | None:
+    """Return the owner of the allocation at *path* that *token* is for (#2003).
+
+    The audience comes from the path, never from the token: the edge origin
+    plus the exact ``/a/<slug>/mcp``. The token is verified for it first, so a
+    token for another vault is refused before any record is read; then the one
+    record naming that resource must belong to the token's ``sub``. Only an
+    agent JWT can pass: the static routing credential names an owner, not a
+    resource, so it never selects a slug.
+
+    Args:
+        agent: The configured agent route.
+        allocations: Its per-allocation resolver.
+        path: The exact per-allocation request path.
+        token: The presented bearer.
+
+    Returns:
+        The owner, or ``None`` — one answer for every refusal.
+    """
+    if not looks_like_jwt(token):
+        return None
+    scoped = agent.verifier.for_resource(f"{agent.verifier.config.origin}{path}")
+    access = await scoped.verify_token(token)
+    if access is None or access.subject is None:
+        return None
+    return await allocations.principal_for_resource(
+        scoped.config.resource_url,
+        authorization_server=scoped.config.authorization_server,
+        consumer_identity=access.subject,
+    )
 
 
 class AllocationRouter:
@@ -446,7 +544,11 @@ def _route_for(
     return route
 
 
-def _mcp_replay_route(router: AllocationReplayRouter) -> Route:
+def _mcp_replay_route(
+    router: AllocationReplayRouter,
+    path: str = MCP_PATH,
+    name: str = "mcp",
+) -> Route:
     """Replay ``/mcp`` to the caller's own vault, as every ``/v1`` route is (#1962).
 
     The same owner resolution, deletion fences and replay state as ``/v1``:
@@ -455,6 +557,10 @@ def _mcp_replay_route(router: AllocationReplayRouter) -> Route:
 
     Args:
         router: The replay router the ``/v1`` routes share.
+        path: The route template: ``/mcp``, or the per-allocation
+            ``/a/{slug}/mcp`` (#2003), whose slug the auth layer has already
+            matched to the minted grammar and bound to the token's audience.
+        name: The route's name.
 
     Returns:
         The mounted route, serving the streamable-HTTP verbs and no ``HEAD``.
@@ -469,10 +575,10 @@ def _mcp_replay_route(router: AllocationReplayRouter) -> Route:
         Returns:
             The replay, or the router's refusal.
         """
-        context_of(request.scope).route = MCP_PATH
+        context_of(request.scope).route = path
         return await router.proxy(request)
 
-    route = Route(MCP_PATH, endpoint, methods=list(_MCP_METHODS), name="mcp")
+    route = Route(path, endpoint, methods=list(_MCP_METHODS), name=name)
     if route.methods is not None:
         route.methods.discard(_IMPLICIT_HEAD)
     return route
@@ -528,12 +634,15 @@ def _oauth_layers(agent: AgentRouting | None) -> list[Middleware]:
     if agent is None:
         return []
     config = agent.verifier.config
-    return [
+    layers = [
         Middleware(ProtectedResourceMetadataMiddleware, config=config),
         Middleware(
             ResourceChallengeMiddleware, config=config, paths=frozenset({MCP_PATH})
         ),
     ]
+    if agent.allocations is not None:
+        layers.append(Middleware(AllocationResourceMiddleware, edge=config))
+    return layers
 
 
 def build_fly_replay_routing_app(
@@ -556,6 +665,10 @@ def build_fly_replay_routing_app(
     router = AllocationReplayRouter(store, provider)
     routes = [_route_for(spec, router) for spec in ROUTES]
     routes.append(_mcp_replay_route(router))
+    if agent is not None and agent.allocations is not None:
+        routes.append(
+            _mcp_replay_route(router, _ALLOCATION_MCP_ROUTE, "allocation_mcp")
+        )
     replay_caps = {**ROUTE_BODY_CAPS, "/v1/uploads": DEFAULT_MAX_BODY_BYTES}
     app = Starlette(
         routes=routes,

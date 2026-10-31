@@ -87,7 +87,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from creek_mcp.httpapi.context import HTTP_SCOPE, context_of, pass_through
 from creek_mcp.httpapi.middleware.fly_replay import FlyReplayStateMiddleware
 from creek_mcp.httpapi.middleware.limits import ConcurrencyLimitMiddleware
-from creek_mcp.mcp_path import MCP_PATH
+from creek_mcp.mcp_path import MCP_PATH, is_allocation_mcp_path
 from creek_mcp.policy import Transport
 
 if TYPE_CHECKING:
@@ -280,6 +280,7 @@ class McpMountMiddleware:
         mcp_app: ASGIApp,
         max_concurrency: int,
         fly_replay_state: str | None,
+        allocation_path: str | None = None,
     ) -> None:
         """Compose the MCP branch once.
 
@@ -290,7 +291,21 @@ class McpMountMiddleware:
                 separate from ``/v1``'s.
             fly_replay_state: Exact mounted Fly replay state, or ``None`` off
                 Fly.
+            allocation_path: This vault's own ``/a/<slug>/mcp`` (#2003), or
+                ``None``. The edge's Fly replay carries the client's path, so
+                a managed vault whose resource is per-allocation is reached
+                there; it is served as :data:`MCP_PATH`. No other slug is.
+
+        Raises:
+            ValueError: When *allocation_path* is not one minted
+                ``/a/<slug>/mcp``.
         """
+        if allocation_path is not None and not is_allocation_mcp_path(allocation_path):
+            raise ValueError("allocation path must be one minted /a/<slug>/mcp")
+        paths = {MCP_PATH}
+        if allocation_path is not None:
+            paths.add(allocation_path)
+        self._paths = frozenset(paths)
         self.app = app
         branch: ASGIApp = _McpSurface(mcp_app)
         if fly_replay_state is not None:
@@ -310,7 +325,11 @@ class McpMountMiddleware:
         if scope["type"] != HTTP_SCOPE:
             await pass_through(self.app, scope, receive, send)
             return
-        if scope.get("path") == MCP_PATH:
+        if scope.get("path") in self._paths:
+            # The SDK routes only MCP_PATH; this vault's own resource path is
+            # the same surface under the name its token audience carries.
+            scope["path"] = MCP_PATH
+            scope["raw_path"] = MCP_PATH.encode("ascii")
             await self.surface(scope, receive, send)
             return
         await self.app(scope, receive, send)
