@@ -31,6 +31,7 @@ from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.fly import FlyRuntimeSecrets
 from creek_mcp.provisioning.models import FailureReason, McpOAuthSettings
 from creek_mcp.provisioning.pool_bundle import (
+    PendingPoolRevocation,
     PoolBundleIssuer,
     PoolCredential,
     PoolCredentialKind,
@@ -78,6 +79,41 @@ def read_owner_only_file(path: Path, *, maximum: int = _MAX_SECRET_FILE_BYTES) -
 
 
 @dataclass(frozen=True, slots=True)
+class _SupersededPool:
+    """One rolled-away pool bundle the vendor has not yet confirmed dead (#1918).
+
+    It lives only inside the encrypted document, because the vendor's delete
+    needs the credential's full value; :class:`PendingPoolRevocation` is the
+    content-free form that leaves it.
+    """
+
+    bundle: PoolRuntimeBundle = field(repr=False)
+    superseded_at: datetime
+
+    def encode(self) -> dict[str, object]:
+        """Return the JSON-ready form stored inside the encrypted document."""
+        return {
+            "pool": _encode_pool(self.bundle),
+            "superseded_at": self.superseded_at.isoformat(),
+        }
+
+    @classmethod
+    def decode(cls, value: object) -> _SupersededPool:
+        """Decode one stored obligation, refusing anything malformed.
+
+        Raises:
+            ValueError: When *value* is not a stored obligation.
+        """
+        if not isinstance(value, dict):
+            raise ValueError("stored pending revocation is invalid")
+        bundle = _decode_pool(value["pool"])
+        superseded_at = datetime.fromisoformat(str(value["superseded_at"]))
+        if bundle is None or superseded_at.tzinfo is None:
+            raise ValueError("stored pending revocation is invalid")
+        return cls(bundle, superseded_at)
+
+
+@dataclass(frozen=True, slots=True)
 class _BundleDocument:
     """Serializable plaintext that exists only while issuing one bundle."""
 
@@ -91,6 +127,7 @@ class _BundleDocument:
     tls_private_key: bytes = field(repr=False)
     pool: PoolRuntimeBundle | None = field(default=None, repr=False)
     mcp_oauth: McpOAuthSettings | None = field(default=None, repr=False)
+    pending_revocations: tuple[_SupersededPool, ...] = field(default=(), repr=False)
 
     def encode(self) -> bytes:
         """Encode the in-memory bundle for authenticated encryption."""
@@ -105,6 +142,9 @@ class _BundleDocument:
             "tls_private_key": _b64(self.tls_private_key),
             "pool": None if self.pool is None else _encode_pool(self.pool),
             "mcp_oauth": None if self.mcp_oauth is None else self.mcp_oauth.encode(),
+            "pending_revocations": [
+                pending.encode() for pending in self.pending_revocations
+            ],
         }
         return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
@@ -149,6 +189,7 @@ class _BundleDocument:
                 _unb64(document["tls_private_key"]),
                 _decode_pool(document.get("pool")),
                 McpOAuthSettings.decode(document.get("mcp_oauth")),
+                _decode_pending(document.get("pending_revocations")),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             raise ValueError("runtime secret state is invalid") from None
@@ -319,6 +360,8 @@ class EncryptedFileFlySecretManager:
         follows (ADR-0016 Decision 1 item 3, T11).  The local tombstone is
         written only afterwards, so a retry re-attempts the vendor call rather
         than losing the credential's value and leaving a spendable key behind.
+        Every credential a roll left owed (#1918) is revoked first, under the
+        same rule: none unconfirmed, no tombstone.
         """
         digest = _activation_digest(activation_id)
         bundle_path, revoked_path = self._paths(digest)
@@ -329,7 +372,7 @@ class EncryptedFileFlySecretManager:
             bundle_path.unlink()
 
     def _revoke_pool_credential(self, bundle_path: Path, digest: str) -> None:
-        """Revoke this activation's pool credential, confirming the refusal.
+        """Revoke this activation's owed and current pool credentials.
 
         Args:
             bundle_path: The activation's encrypted bundle.
@@ -337,9 +380,76 @@ class EncryptedFileFlySecretManager:
         """
         if self._pool_bundles is None or not bundle_path.exists():
             return
-        document = _load_document(self._cipher, bundle_path, digest)
+        document = self._drain_pending(self._pool_bundles, bundle_path, digest)
         if document.pool is not None:
             self._pool_bundles.revoke(document.pool)
+
+    def _drain_pending(
+        self,
+        issuer: PoolBundleIssuer,
+        bundle_path: Path,
+        digest: str,
+    ) -> _BundleDocument:
+        """Revoke every owed credential, clearing each once it is confirmed.
+
+        Each confirmation is made durable before the next vendor call, so an
+        outage part-way leaves exactly the unconfirmed ones owed.  A failure
+        propagates: a silently skipped revocation is the bug this prevents.
+
+        Args:
+            issuer: The pool issuer holding revocation authority.
+            bundle_path: The activation's encrypted bundle.
+            digest: Its activation digest, the document's AAD.
+
+        Returns:
+            The document as stored, owing nothing.
+        """
+        document = _load_document(self._cipher, bundle_path, digest)
+        while document.pending_revocations:
+            owed, *rest = document.pending_revocations
+            issuer.revoke(owed.bundle)
+            document = dataclasses.replace(document, pending_revocations=tuple(rest))
+            self._store(bundle_path, digest, document)
+        return document
+
+    def _store(self, bundle_path: Path, digest: str, document: _BundleDocument) -> None:
+        """Atomically and durably replace one activation's encrypted record."""
+        _replace_durably(bundle_path, self._encrypt(document.encode(), _aad(digest)))
+
+    def retry_pending_revocations(self, activation_id: str) -> None:
+        """Retry every revocation a roll left owed for one activation (#1918).
+
+        The recovery path after a vendor outage or a crash inside
+        :meth:`roll_pool_bundle`; :meth:`revoke` and the next roll retry the
+        same obligations on their own.
+
+        Args:
+            activation_id: The activation whose owed revocations to retry.
+
+        A tombstone does not stop it: a record that survived beside one still
+        owes what it owes, so it is drained, never discarded.
+
+        Raises:
+            ValueError: When no pool issuer is configured, or the activation
+                has no stored record.
+        """
+        if self._pool_bundles is None:
+            raise ValueError("no pool bundle issuer is configured")
+        digest = _activation_digest(activation_id)
+        bundle_path, _ = self._paths(digest)
+        self._drain_pending(self._pool_bundles, bundle_path, digest)
+
+    def pending_pool_revocations(self) -> tuple[PendingPoolRevocation, ...]:
+        """List every owed pool revocation, content-free (#1918).
+
+        Returns:
+            One record per owed credential, ordered by activation then age.
+
+        Raises:
+            ValueError: When any record is unreadable — one it cannot read
+                cannot be proven to owe nothing.
+        """
+        return _pending_pool_revocations(self._state_directory, self._cipher)
 
     def roll_pool_bundle(self, activation_id: str) -> PoolRuntimeBundle:
         """Write this activation's next pool bundle version, and return it.
@@ -355,10 +465,21 @@ class EncryptedFileFlySecretManager:
         version and is unaffected.  That window is a refusal, never a fallback
         to another model or destination (Decision 1 item 10).
 
-        The previous credential is revoked only when the issuer actually
-        replaced it: a re-pin that changes the manifest alone keeps the vendor
-        key, and Decision 3.4 re-issues (create then delete) on compromise
-        only.
+        A roll is Decision 3.4's re-issue, create-then-delete, so the previous
+        credential is always revoked (#1917): :meth:`PoolBundleIssuer.issue`
+        always mints, and an issuer that hands the old credential back is
+        refused before anything is written, since revoking it would revoke the
+        live key and keeping it would make this a roll in name only.
+
+        The revocation is crash-safe (#1918).  The replaced credential is
+        recorded as a pending revocation in the **same atomic write** that
+        stores the new bundle, and cleared only once the vendor confirms it
+        dead; a vendor outage or a crash after that write leaves it owed and
+        reachable, never stranded, and :meth:`revoke`,
+        :meth:`retry_pending_revocations` or the next roll retries it.  A roll
+        retries any earlier obligation *before* minting, so at most one
+        superseded credential is ever live, and an unconfirmed revocation still
+        raises: it is never made non-fatal.
 
         Args:
             activation_id: The activation to roll.
@@ -368,27 +489,34 @@ class EncryptedFileFlySecretManager:
 
         Raises:
             ValueError: When no pool issuer is configured, the activation has
-                no stored bundle, or it has been revoked.
+                no stored bundle or has been revoked, or the issuer returned
+                the credential it was asked to replace.
         """
-        if self._pool_bundles is None:
+        issuer = self._pool_bundles
+        if issuer is None:
             raise ValueError("no pool bundle issuer is configured")
         digest = _activation_digest(activation_id)
         bundle_path, revoked_path = self._paths(digest)
         self._refuse_revoked(bundle_path, revoked_path)
-        document = _load_document(self._cipher, bundle_path, digest)
+        document = self._drain_pending(issuer, bundle_path, digest)
         previous = document.pool
         if previous is None:
             raise ValueError("activation carries no pool bundle to roll")
-        issued = self._pool_bundles.issue(f"fly-{digest}")
+        issued = issuer.issue(f"fly-{digest}")
+        if issued.credential == previous.credential:
+            raise ValueError("pool issuer returned the credential it replaces")
         rolled = dataclasses.replace(
             issued,
             bundle_version=max(issued.bundle_version, previous.bundle_version + 1),
         )
-        updated = dataclasses.replace(document, pool=rolled)
-        bundle_path.write_bytes(self._encrypt(updated.encode(), _aad(digest)))
+        owed = _SupersededPool(previous, self._clock().astimezone(UTC))
+        self._store(
+            bundle_path,
+            digest,
+            dataclasses.replace(document, pool=rolled, pending_revocations=(owed,)),
+        )
         self._refuse_revoked(bundle_path, revoked_path)
-        if rolled.credential != previous.credential:
-            self._pool_bundles.revoke(previous)
+        self._drain_pending(issuer, bundle_path, digest)
         return rolled
 
     def roll_mcp_oauth(self, activation_id: str) -> McpOAuthSettings:
@@ -647,6 +775,14 @@ class ReadOnlyFlySecretManager:
         del activation_id
         raise ProviderError(FailureReason.PROVIDER_REJECTED, retryable=False)
 
+    def pending_pool_revocations(self) -> tuple[PendingPoolRevocation, ...]:
+        """List owed pool revocations it can see but never discharge (#1918).
+
+        Returns:
+            One content-free record per owed credential.
+        """
+        return _pending_pool_revocations(self._state_directory, self._cipher)
+
 
 def _encode_pool(bundle: PoolRuntimeBundle) -> dict[str, object]:
     """Serialize one activation's stored pool bundle for encryption at rest.
@@ -699,6 +835,65 @@ def _decode_pool(value: object) -> PoolRuntimeBundle | None:
             PoolCredentialKind(str(value["credential_kind"])),
             tuple((str(entry[0]), _unb64(entry[1])) for entry in files),
         ),
+    )
+
+
+def _decode_pending(value: object) -> tuple[_SupersededPool, ...]:
+    """Decode a record's owed revocations; a pre-#1918 record owes none.
+
+    Args:
+        value: The ``pending_revocations`` member of a decoded document.
+
+    Returns:
+        The obligations, in the order they were recorded.
+
+    Raises:
+        ValueError: When the member is present but not a list of obligations.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("stored pending revocations are invalid")
+    return tuple(_SupersededPool.decode(entry) for entry in value)
+
+
+def _pending_pool_revocations(
+    state_directory: Path, cipher: AESGCM
+) -> tuple[PendingPoolRevocation, ...]:
+    """Return every owed revocation in *state_directory*, content-free.
+
+    A tombstoned record is still read while its file survives: a revocation it
+    owes is owed whatever happened to the allocation.  A record that vanishes
+    mid-listing (a concurrent deletion) is skipped; anything else unreadable
+    fails closed.
+
+    Args:
+        state_directory: The encrypted record directory.
+        cipher: Its decryption key.
+
+    Returns:
+        The records, ordered by activation id and then supersession time.
+
+    Raises:
+        ValueError: On a stray file name or an unreadable record.
+    """
+    owed: list[PendingPoolRevocation] = []
+    for bundle_path in sorted(state_directory.glob("*.bundle")):
+        digest = bundle_path.stem
+        if _BUNDLE_NAME_RE.fullmatch(digest) is None:
+            raise ValueError("runtime secret state is invalid")
+        try:
+            document = _load_document(cipher, bundle_path, digest)
+        except ValueError:
+            if bundle_path.exists():
+                raise
+            continue
+        owed.extend(
+            PendingPoolRevocation(document.activation_id, pending.superseded_at)
+            for pending in document.pending_revocations
+        )
+    return tuple(
+        sorted(owed, key=lambda record: (record.activation_id, record.superseded_at))
     )
 
 

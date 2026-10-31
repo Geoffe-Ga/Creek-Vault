@@ -382,6 +382,8 @@ def test_alert_vocabulary_is_exactly_seven_kinds_and_each_condition_maps_to_one(
         "stuck_deletion",
         "continuous_running",
         "incomplete_create",
+        # #1918: a rolled-away pool credential still owed its vendor revocation.
+        "pending_revocation",
     }
     assert set(Disposition) == {"reported", "repaired"}
 

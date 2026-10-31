@@ -537,6 +537,37 @@ def _narrowed(kind: AlertKind, divergence: Divergence) -> AlertKind:
     return kind
 
 
+def _pending_revocation_alert(
+    divergence: Divergence, policy: FleetPolicy
+) -> Alert | None:
+    """Alert on a rolled-away credential still owed revocation past the bound.
+
+    The key is spendable up to its cap until the vendor confirms it dead —
+    exactly what ``pool_credential_orphan`` names — so it reuses that kind
+    rather than widening the closed vocabulary (#1918).  Younger than the
+    policy's ``stuck_deletion_after`` it is the normal window a retry closes,
+    and is reported without an alert, as an unconfirmed deletion is.
+
+    Args:
+        divergence: A ``pending_revocation`` divergence.
+        policy: The dated operator policy.
+
+    Returns:
+        The alert, or ``None`` while the obligation is inside the bound.
+    """
+    threshold = int(policy.stuck_deletion_after.total_seconds())
+    age = divergence.age_seconds
+    if age is None or age < threshold:
+        return None
+    return Alert(
+        AlertKind.POOL_CREDENTIAL_ORPHAN,
+        divergence.provider_allocation_id or FLEET_SUBJECT,
+        age,
+        str(age),
+        str(threshold),
+    )
+
+
 def _alert_for(divergence: Divergence, policy: FleetPolicy) -> Alert | None:
     """Map one divergence to its alert, or None for report-only kinds."""
     if (
@@ -544,6 +575,8 @@ def _alert_for(divergence: Divergence, policy: FleetPolicy) -> Alert | None:
         and divergence.disposition is Disposition.REPAIRED
     ):
         return None
+    if divergence.kind is DivergenceKind.PENDING_REVOCATION:
+        return _pending_revocation_alert(divergence, policy)
     resource_kind = _PER_RESOURCE_ALERTS.get(divergence.kind)
     if resource_kind is not None:
         subject = divergence.provider_allocation_id or FLEET_SUBJECT
