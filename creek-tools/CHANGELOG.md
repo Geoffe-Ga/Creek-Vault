@@ -9,6 +9,42 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Build the vault side of the attesting Privatemode pool (#1896, ADR-0016 O5).
+  Not live yet: no fleet policy enables it until the owner finishes the steps
+  in `docs/pool-measurement-pin.md` section 4a. With
+  `CREEK_POOL_VENDOR=privatemode` the vault dials only a loopback sidecar (and
+  refuses any other `CREEK_POOL_URL`, `localhost` included). Before every
+  content dial it validates the closed request shape (content-free 4xx reasons
+  for `intimate` or unknown tiers, a client-chosen model, sampling, cache and
+  adapter fields, unknown fields, a prompt over 4,096 tokens, a body over
+  1 MiB, and a `deadline_ms` over 12,000). It then applies its own admission
+  (2 in flight, 60 an hour by default via `CREEK_POOL_RATE_PER_HOUR`, refused
+  at once as `rate_limited`) and requires the sidecar's attestation report at
+  `/creek/v1/attestation` to match the Machine's pin (signing identity,
+  minimum version, one or two measurements, a transparency-log entry, an
+  attested channel and the single egress). Anything else sends nothing. The
+  closed shape is translated to an OpenAI-compatible chat completion with no
+  cache-control or sampling field. A vendor 401/403 is a refusal; a 429
+  `insufficient_quota` is non-transient and answers `temporarily_unavailable`;
+  any other 429 is `rate_limited`. On the control-plane side, the new
+  `FlyProviderPolicy.pool_sidecar` (`PoolSidecarPolicy`) holds the
+  operator-filled pin. The vendor image is accepted in digest form only, the
+  policy requires the replay runtime, and the pin reaches the Machine `env` of
+  every pool-bundle activation, so `_verify_machine` refuses a Machine without
+  the sidecar or with a different pin and the converge batch can roll vaults
+  onto it. The replay bootstrap starts the proxy only when its binary hash
+  matches the pin, as uid `10002`, with the key in its environment, never in
+  its argv. In this mode it keeps the key file root-only, so the vault user
+  has no read access to it. `--check pool` gains `pool-attestation-failed`
+  (exit 34), and the identity listing in sidecar mode is the verified report.
+  Five alert kinds are registered for adepthood's `_FleetAlertKind` and named
+  in the content-free `creek.pool` records: `pool_attestation_failed`,
+  `pool_credential_rejected`, `pool_admission_refused`,
+  `pool_vendor_rate_limited` and `pool_quota_exhausted`. No delivery path
+  sends them yet. That the attestation report is true is vendor-asserted:
+  condition (f) is waived, not verified. T4 and T24 are not applicable under
+  O5.
+
 - Give existing managed-vault Machines an upgrade path (#1869, owner decision
   R2-1). A new vault image or runtime config no longer strands every older
   vault. `--converge-vault-machines` on the worker and the pilot is an

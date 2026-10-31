@@ -39,6 +39,8 @@ from creek_mcp.provisioning.pool_bundle import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek_mcp.provisioning.pool_sidecar import PoolSidecarPolicy
+
 NOW = datetime(2026, 9, 7, 4, tzinfo=UTC)
 PROVIDER_TOKEN = "fly-provider-secret-canary"
 CONSUMER_TOKEN = "creek-consumer-secret-canary"
@@ -465,6 +467,7 @@ def fly_driver(
     fly_replay_enabled: bool = False,
     credentials: PoolCredentialInventory | None = None,
     image: str = IMAGE,
+    pool_sidecar: PoolSidecarPolicy | None = None,
 ) -> FlyProviderDriver:
     """Return a driver over *api* with the synthetic org-scoped credential.
 
@@ -484,6 +487,7 @@ def fly_driver(
         api_base_url=API_BASE_URL,
         discover_organization_apps=discover_organization_apps,
         fly_replay_enabled=fly_replay_enabled,
+        pool_sidecar=pool_sidecar,
     )
     return FlyProviderDriver(
         policy,

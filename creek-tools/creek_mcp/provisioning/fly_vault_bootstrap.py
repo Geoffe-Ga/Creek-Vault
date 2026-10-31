@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from creek_mcp.container_runtime import ContainerConfigurationError, is_mounted_volume
-from creek_mcp.provisioning.pool_bundle import pool_secret_files
+from creek_mcp.provisioning.pool_bundle import (
+    POOL_VENDOR_KEY_GUEST_PATH,
+    pool_secret_files,
+)
+from creek_mcp.provisioning.pool_sidecar import key_file_owner, start_pool_sidecar
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,8 +61,14 @@ def prepare_runtime_paths(
     secret_files: tuple[Path, ...] | None = None,
     uid: int = _SERVICE_UID,
     gid: int = _SERVICE_GID,
+    vendor_key_file: Path = Path(POOL_VENDOR_KEY_GUEST_PATH),
 ) -> None:
-    """Validate and narrowly normalize the encrypted mount and injected files."""
+    """Validate and narrowly normalize the encrypted mount and injected files.
+
+    In sidecar mode (#1896) *vendor_key_file* is normalized to root rather
+    than to the service user, so the vault process can never read the key the
+    sidecar holds.
+    """
     if os.geteuid() != 0:
         raise ContainerConfigurationError("Fly vault bootstrap requires root")
     expected = _expected_secret_files() if secret_files is None else secret_files
@@ -74,7 +84,13 @@ def prepare_runtime_paths(
         raise ContainerConfigurationError("Fly vault path must be an exact volume")
     os.chown(vault_root, uid, gid, follow_symlinks=False)
     os.chmod(vault_root, 0o700, follow_symlinks=False)
+    sidecar_key = key_file_owner(os.environ)
     for path in expected:
+        if sidecar_key is not None and path == vendor_key_file:
+            # Sidecar mode (#1896): the vendor key is the sidecar's, so it
+            # stays root-owned and the vault's own user can never read it.
+            _normalize_secret(path, uid=sidecar_key[0], gid=sidecar_key[1])
+            continue
         _normalize_secret(path, uid=uid, gid=gid)
     _remove_empty_recovery_directory(vault_root)
 
@@ -143,6 +159,9 @@ def main() -> None:
     """Prepare exact Fly paths and enter the replay runtime unprivileged."""
     try:
         prepare_runtime_paths()
+        # Before the drop: only root can read the sidecar's key. A sidecar that
+        # cannot start is recorded and leaves the pool failing closed (#1896).
+        start_pool_sidecar(os.environ)
         drop_privileges_and_run()
     except ContainerConfigurationError as exc:
         print(f"creek-fly-vault: startup refused: {exc}", file=sys.stderr)
