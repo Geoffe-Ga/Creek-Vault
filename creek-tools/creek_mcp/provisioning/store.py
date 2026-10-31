@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import secrets
 import sqlite3
@@ -34,7 +35,7 @@ from creek_mcp.provisioning.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
     from decimal import Decimal
     from pathlib import Path
 
@@ -186,11 +187,19 @@ class ActivationAdmissionPolicy:
 
     new_activations_enabled: bool = True
     maximum_live_allocations: int = 5
+    # A runtime switch consulted beside the static fields above, inside the
+    # same fence: the pilot closes it while fleet alerts cannot be delivered
+    # (owner decision R2-4, #1999). ``None`` means no runtime switch.
+    runtime_gate: Callable[[], bool] | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         """Refuse ambiguous or non-positive limits before serving requests."""
         if not isinstance(self.new_activations_enabled, bool):
             raise ValueError("new_activations_enabled must be boolean")
+        if self.runtime_gate is not None and not callable(self.runtime_gate):
+            raise ValueError("runtime_gate must be callable")
         if (
             not isinstance(self.maximum_live_allocations, int)
             or isinstance(self.maximum_live_allocations, bool)
@@ -444,7 +453,8 @@ class ProvisioningStore:
         admission: ActivationAdmissionPolicy,
     ) -> None:
         """Refuse new ids before any alias or job mutation can cross the cap."""
-        if not admission.new_activations_enabled:
+        gate = admission.runtime_gate
+        if not admission.new_activations_enabled or (gate is not None and not gate()):
             raise ActivationAdmissionError("new activation unavailable")
         row = connection.execute(
             _ADMISSION_COUNT_SQL, _ADMISSION_COUNT_PARAMETERS
@@ -910,6 +920,33 @@ class ProvisioningStore:
             return fleet_schema.counter_value(
                 connection, fleet_schema.DUPLICATE_ALLOCATION_ATTEMPTS
             )
+
+    def alert_delivery_failures(self) -> int:
+        """Return how many fleet-alert deliveries have failed, lifetime (R2-4)."""
+        with self._connect() as connection:
+            return fleet_schema.counter_value(
+                connection, fleet_schema.ALERT_DELIVERY_FAILED
+            )
+
+    def record_alert_delivery_failure(
+        self,
+        pending: Mapping[str, int],
+        *,
+        now: datetime,
+    ) -> None:
+        """Durably record one failed delivery and the alert counts still owed."""
+        with self._connect(write=True) as connection:
+            fleet_schema.record_alert_delivery_failure(connection, pending, now)
+
+    def close_alert_delivery_gap(self, *, now: datetime) -> None:
+        """Close the open alert-channel gap after a successful delivery."""
+        with self._connect(write=True) as connection:
+            fleet_schema.close_alert_delivery_gap(connection, now)
+
+    def open_alert_delivery_gap(self) -> fleet_schema.AlertDeliveryGap | None:
+        """Return the open alert-channel gap, if delivery is currently failing."""
+        with self._connect() as connection:
+            return fleet_schema.open_alert_delivery_gap(connection)
 
     def record_machine_state(
         self,

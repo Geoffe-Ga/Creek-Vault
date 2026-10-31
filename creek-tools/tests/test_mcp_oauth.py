@@ -43,9 +43,11 @@ from tests.agent_token_support import (
     ISSUER,
     OTHER_VAULT_URL,
     RESOURCE_URL,
+    FakeTokenStatus,
     agent_verifier,
     mint,
     resource_config,
+    revocation_cache,
 )
 from tests.mcp_http_support import (
     call_handshake,
@@ -367,6 +369,74 @@ def test_a_pinned_vault_refuses_another_persons_token(vault: Path) -> None:
 
     assert mine.status_code == _OK
     assert theirs.status_code == _UNAUTHENTICATED
+
+
+# --------------------------------------------------------------------------- #
+# Revocation, checked on every call (#2005, R3-2)
+# --------------------------------------------------------------------------- #
+
+
+def _post_rpc(client: TestClient, session_headers: dict[str, str], method: str) -> Any:
+    """Send one JSON-RPC request and return the raw response.
+
+    Args:
+        client: A client whose lifespan is running.
+        session_headers: An open session's headers.
+        method: The JSON-RPC method.
+
+    Returns:
+        The response, whatever its status.
+    """
+    params = (
+        {"name": "creek.handshake", "arguments": {}} if method == "tools/call" else {}
+    )
+    return client.post(
+        MCP_PATH,
+        json={"jsonrpc": "2.0", "id": 7, "method": method, "params": params},
+        headers=session_headers,
+    )
+
+
+def test_a_revoked_agent_is_refused_on_its_next_call(vault: Path) -> None:
+    """Stop in Settings: the next call is the generic ``401``; nothing runs.
+
+    Args:
+        vault: A seeded vault.
+    """
+    status = FakeTokenStatus()
+    app = _oauth_app(vault, revocation=revocation_cache(status, ttl_seconds=0))
+    with TestClient(app) as client:
+        session = open_session(client, mint())
+        assert "creek.handshake" in listed_tools(client, session["headers"])
+        status.revoke()
+        listed = _post_rpc(client, session["headers"], "tools/list")
+        called = _post_rpc(client, session["headers"], "tools/call")
+
+    for response in (listed, called):
+        assert response.status_code == _UNAUTHENTICATED
+        assert _challenges(response) == [resource_config().challenge(_UNAUTHENTICATED)]
+        assert "creek.handshake" not in response.text
+    audit = vault / MCP_AUDIT_RELPATH
+    assert not audit.exists() or _audited_consumers(vault, "creek.handshake") == []
+
+
+def test_an_unreachable_issuer_refuses_with_the_generic_challenge(vault: Path) -> None:
+    """Fail closed: no answer and no fresh ``active`` is an invalid token.
+
+    Args:
+        vault: A seeded vault.
+    """
+    status = FakeTokenStatus()
+    status.failing = True
+    app = _oauth_app(vault, revocation=revocation_cache(status))
+    with TestClient(app) as client:
+        response = client.post(
+            MCP_PATH, json=initialize_body(), headers=mcp_headers(mint())
+        )
+
+    assert response.status_code == _UNAUTHENTICATED
+    assert _challenges(response) == [resource_config().challenge(_UNAUTHENTICATED)]
+    assert "mcp-session-id" not in response.headers
 
 
 # --------------------------------------------------------------------------- #

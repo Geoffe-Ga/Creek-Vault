@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import math
 import ssl
 from dataclasses import dataclass, field
@@ -13,7 +14,12 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
-from creek_mcp.agent_tokens import JwtAgentTokenVerifier
+from creek_mcp.agent_revocation import HttpRevocationChecker, RevocationCache
+from creek_mcp.agent_tokens import (
+    AGENT_TOKEN_LOGGER_NAME,
+    REVOCATION_NOT_ENFORCED,
+    JwtAgentTokenVerifier,
+)
 from creek_mcp.httpapi.cli import serve
 from creek_mcp.httpapi.middleware.limits import (
     DEFAULT_MAX_BODY_BYTES,
@@ -187,13 +193,21 @@ def _add_oauth_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the optional agent-token routing settings (#1963).
 
     Without ``--oauth-authorization-server`` the replay router routes static
-    routing credentials only, exactly as before.
+    routing credentials only, exactly as before. The two
+    ``--oauth-agent-token-status-*`` flags turn on the per-call revocation
+    check (#2005, R3-2) against Adepthood's status route, authenticated by the
+    mounted handoff bearer; without them the edge verifies agent tokens
+    offline only and warns at startup.
 
     Args:
         parser: The parser to extend.
     """
     parser.add_argument("--oauth-authorization-server", default=None)
     parser.add_argument("--oauth-jwks-url", default=None)
+    parser.add_argument("--oauth-agent-token-status-url", default=None)
+    parser.add_argument(
+        "--oauth-agent-token-status-bearer-file", type=Path, default=None
+    )
     add_mcp_audience_arguments(parser)
 
 
@@ -227,6 +241,32 @@ def add_mcp_audience_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _revocation(args: argparse.Namespace) -> RevocationCache | None:
+    """Return the edge's revocation check, or ``None`` when not configured.
+
+    Args:
+        args: Parsed arguments carrying the status flags.
+
+    Returns:
+        The cache over Adepthood's status route.
+
+    Raises:
+        ValueError: When only one of the two flags is given, or either is
+            invalid.
+    """
+    url = args.oauth_agent_token_status_url
+    bearer_file = args.oauth_agent_token_status_bearer_file
+    if url is None and bearer_file is None:
+        return None
+    if url is None or bearer_file is None:
+        msg = (
+            "--oauth-agent-token-status-url and "
+            "--oauth-agent-token-status-bearer-file must be set together"
+        )
+        raise ValueError(msg)
+    return RevocationCache(HttpRevocationChecker(url, bearer_file))
+
+
 def agent_routing(
     args: argparse.Namespace,
     principals: EncryptedFileRoutingCredentialVerifier,
@@ -243,11 +283,13 @@ def agent_routing(
 
     Raises:
         ValueError: When an issuer is set but the resource URL is missing or
-            any URL is unsafe, an audience switch is set without the
-            issuer or the per-allocation route it depends on, or the shared
-            audience is refused while any allocation remains on it (#2004).
+            any URL is unsafe, the revocation flags are half-set or set
+            without an issuer, an audience switch is set without the issuer
+            or the per-allocation route it depends on, or the shared audience
+            is refused while any allocation remains on it (#2004).
     """
     issuer = args.oauth_authorization_server
+    revocation = _revocation(args)
     per_allocation = args.per_allocation_mcp_resource
     refuse_shared = args.refuse_shared_mcp_audience
     if (per_allocation or refuse_shared) and not issuer:
@@ -255,14 +297,19 @@ def agent_routing(
             "per-allocation MCP audiences need --oauth-authorization-server"
         )
     if not issuer:
+        if revocation is not None:
+            msg = "--oauth-agent-token-status-url needs --oauth-authorization-server"
+            raise ValueError(msg)
         return None
     config = ResourceServerConfig.build(
         resource_url=args.oauth_resource_url or "",
         authorization_server=issuer,
         jwks_url=args.oauth_jwks_url,
     )
+    if revocation is None:
+        logging.getLogger(AGENT_TOKEN_LOGGER_NAME).warning(REVOCATION_NOT_ENFORCED)
     routing = AgentRouting(
-        JwtAgentTokenVerifier(config),
+        JwtAgentTokenVerifier(config, revocation=revocation),
         principals,
         allocations=principals if per_allocation else None,
         shared_audience=not refuse_shared,

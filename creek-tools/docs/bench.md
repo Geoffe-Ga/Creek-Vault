@@ -459,7 +459,7 @@ What the estimate reports:
 | `shape` | `metered_tokens`. |
 | `token_basis` | The measured block's basis — always `provider_reported`, because nothing else is constructible. |
 | `prompt_tokens_per_reflection` / `output_tokens_per_reflection` | The worst measured counts the figures rest on. |
-| `per_volume[]` | One row per monthly fleet volume: `reflections_per_month`, `tokens_per_month`, `cost_per_1000_reflections` (R6's figure), `cost_per_month`. Defaults are ADR-0016's two volumes, 100/month (the pilot ceiling) and 10,000/month (500 accounts at the default allowance). |
+| `per_volume[]` | One row per monthly fleet volume: `reflections_per_month`, `tokens_per_month`, `cost_per_1000_reflections` (R6's figure), `cost_per_month`. Defaults are the release pilot ceiling, 300/month (ADR-0017: 15 live allocations at the default allowance; ADR-0016 used 100), and 10,000/month (500 accounts at the default allowance). |
 | `monthly_reflection_cap` / `cost_per_account_month` | The per-account allowance priced (default 20, mirroring adepthood's `DEFAULT_MONTHLY_CAP`) and one account's bill at it. |
 | `vendor_key_input_token_cap` / `vendor_key_output_token_cap` | ADR-0016 Decision 3 item 4's independent per-activation caps: `tokens spent so far + monthly cap x measured tokens per reflection x 2`, computed by `creek_mcp/provisioning/pool_bundle.py`'s `pool_cap_tokens` — the same function that sizes the real vendor key, so the reported number is the number set. Pass `--tokens-spent-input` / `--tokens-spent-output` to roll a key forward. |
 

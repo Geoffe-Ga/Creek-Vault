@@ -185,9 +185,14 @@ separate Fly secret-backed files and are not part of that snapshot.
   writing raw report bodies or alert subjects to platform logs. An alert pass
   posts only the closed alert-kind counts to the configured authenticated
   HTTPS sink; only `204` after at most three bounded attempts is delivery.
-  Exit `0` is clean and exit `3` means alerts were delivered; both refresh
-  health. Exit `1`, alert-delivery failure, or a report older than two scheduled
-  intervals makes the Machine unhealthy. The reviewed Fly config also enables
+  Exit `0` is clean and exit `3` means the report raised alerts; both refresh
+  health. Exit `1` or a report older than two scheduled intervals makes the
+  Machine unhealthy. An alert-delivery failure does not: under owner decision
+  R2-4 ("when the alert channel fails: keep routing, retry alerts, refuse new
+  activations") the pilot keeps routing every existing vault, retries the
+  undelivered alerts, and refuses new activations until an alert is delivered
+  again; see [section 4](#4-configure-reporting-and-alert-delivery). The
+  reviewed Fly config also enables
   serialized `reconcile` passes every 3,600 seconds with a 120-second accepted
   interruption window. Report and reconcile never overlap, and an over-window
   reconcile makes health fail closed. Omitting both schedule values disables
@@ -288,8 +293,40 @@ exactly `{"schema":"creek_fleet_alert_v1","counts":{...}}`; every key is one
 closed alert kind and every value is a positive aggregate count. It never
 sends an alert subject, allocation/job/provider identifier, URL, or response
 body. The sink must return `204`; transport failures and transient statuses are
-retried within the fixed three-attempt, five-second-per-attempt budget, and any
-remaining failure makes the supervised schedule unhealthy.
+retried within the fixed three-attempt, five-second-per-attempt budget.
+
+When that budget is exhausted, the pilot follows owner decision R2-4: *keep
+routing, retry alerts, refuse new activations* (#1999). The failure no longer
+stops the supervisor and no longer makes the Machine unhealthy:
+
+- The edge, worker, and scheduler keep running, so existing vaults keep
+  routing and their status, retry, and delete requests keep working. The pass
+  still counts as a completed provider report for health freshness.
+- The undelivered alert-kind counts are retained and re-sent, folded together
+  with any newer alerts, at most once per scheduled pass. Retries back off:
+  the next attempt waits one fleet interval after the first failure, two after
+  the second, then four after every later failure (5, 10, then 20 minutes at
+  the default 300-second interval). Each attempt keeps the three-attempt
+  budget above.
+- While any alert is undelivered, `POST /control/v1/activations` refuses every
+  new activation with the existing `503 activation_unavailable` response, the
+  same one as `--disable-new-activations` or a full cap. The first successful
+  delivery reopens admission.
+- The gap is recorded through a second channel that does not depend on the
+  sink. Each failed delivery adds one to the `alert_delivery_failed` counter in
+  the SQLite `provisioning_counters` table and writes one content-free `ERROR`
+  log line, `fleet alert delivery failed; new activations refused`, which
+  carries only the consecutive-failure count, the number of pending alerts,
+  and the retry delay. The open gap's start time, failure count, and owed
+  alert-kind counts sit in `provisioning_alert_delivery_gaps` and
+  `provisioning_pending_alerts`. Recovery closes the gap row and logs
+  `fleet alert delivery recovered; new activations admitted`. A restarted
+  pilot reloads an open gap, keeps admission closed, and re-sends the owed
+  alerts on its first pass.
+
+Watch the Machine log stream for that `ERROR` line: it is the only signal an
+alert-channel outage produces while the Machine stays healthy. Provider failure
+(exit `1`) and stale reports still make the Machine unhealthy, unchanged.
 Exercise alert delivery before admitting a user: temporarily set a test budget
 below the observed non-zero estimate, confirm `monthly_budget_departure` exits
 3 and reaches the recipient, then restore USD 60.00 and confirm the next scheduled

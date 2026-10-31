@@ -21,6 +21,11 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 
+from creek_mcp.agent_revocation import (
+    REVOCATION_CACHE_SECONDS,
+    RevocationCache,
+    TokenStatusQuery,
+)
 from creek_mcp.agent_tokens import JwksCache, JwtAgentTokenVerifier
 from creek_mcp.oauth_resource import ResourceServerConfig
 
@@ -189,6 +194,7 @@ def agent_verifier(
     *,
     expected_subject: str | None = None,
     resource_url: str = RESOURCE_URL,
+    revocation: RevocationCache | None = None,
 ) -> JwtAgentTokenVerifier:
     """Return a JWT verifier over the local JWKS fixture.
 
@@ -196,6 +202,7 @@ def agent_verifier(
         fetcher: The JWKS source, or a fresh :class:`StaticJwks`.
         expected_subject: The ``sub`` this vault is pinned to, if any.
         resource_url: The audience the verifier requires.
+        revocation: The revocation check (#2005), or ``None`` for none.
 
     Returns:
         The verifier.
@@ -205,6 +212,7 @@ def agent_verifier(
         resource_config(resource_url),
         keys=JwksCache(source),
         expected_subject=expected_subject,
+        revocation=revocation,
     )
 
 
@@ -258,4 +266,71 @@ def mint(
         signer.private_key,
         algorithm=signer.algorithm,
         headers=header,
+    )
+
+
+class FakeTokenStatus:
+    """Adepthood's agent-token status endpoint, in memory (adepthood#3630).
+
+    Answers ``active`` unless the queried ``(sub, client_id)`` pair was
+    :meth:`revoke`-d, or raises like an unreachable issuer while
+    :attr:`failing` is set. Every query is recorded, so a test can assert the
+    check ran (or did not) before anything else.
+    """
+
+    def __init__(self) -> None:
+        """Start with every grant standing and the issuer reachable."""
+        self.revoked: set[tuple[str, str]] = set()
+        self.failing = False
+        self.queries: list[TokenStatusQuery] = []
+
+    def revoke(
+        self, subject: str = AGENT_SUBJECT, client_id: str = AGENT_CLIENT_ID
+    ) -> None:
+        """Withdraw one agent grant, as Settings' **Stop** does.
+
+        Args:
+            subject: The person.
+            client_id: The agent.
+        """
+        self.revoked.add((subject, client_id))
+
+    async def is_active(self, query: TokenStatusQuery) -> bool:
+        """Return whether *query*'s grant still stands.
+
+        Args:
+            query: The verified claims.
+
+        Returns:
+            ``False`` for a revoked pair, else ``True``.
+
+        Raises:
+            OSError: While :attr:`failing` is set.
+        """
+        self.queries.append(query)
+        if self.failing:
+            raise OSError("issuer unreachable")
+        return (query.subject, query.client_id) not in self.revoked
+
+
+def revocation_cache(
+    status: FakeTokenStatus,
+    clock: FakeClock | None = None,
+    *,
+    ttl_seconds: float = REVOCATION_CACHE_SECONDS,
+) -> RevocationCache:
+    """Return a revocation cache over *status*.
+
+    Args:
+        status: The fake endpoint.
+        clock: The wall clock, or a fresh :class:`FakeClock` at the real time.
+        ttl_seconds: How long an ``active`` answer is reused.
+
+    Returns:
+        The cache.
+    """
+    return RevocationCache(
+        status,
+        ttl_seconds=ttl_seconds,
+        clock=FakeClock(time.time()) if clock is None else clock,
     )

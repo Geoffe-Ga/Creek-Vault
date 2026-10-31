@@ -671,7 +671,7 @@ def test_the_pilot_edge_and_its_vaults_name_one_resource(
         written.append(worker_cli.mcp_oauth_settings(namespace))
         return _WorkerBundle(object(), datetime.now(tz=UTC), timedelta(seconds=1))
 
-    monkeypatch.setattr(pilot_cli.control_cli, "compose", lambda *_: _app("c"))
+    monkeypatch.setattr(pilot_cli.control_cli, "compose", lambda *_, **__: _app("c"))
     monkeypatch.setattr(pilot_cli.worker_cli, "compose", fake_worker)
     monkeypatch.setattr(
         pilot_cli.routing_cli, "compose_replay", lambda *_: _RouterBundle(_app("r"))
