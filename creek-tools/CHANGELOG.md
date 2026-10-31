@@ -9,6 +9,19 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Check agent-token revocation on every call (#2005, owner decision R3-2).
+  `JwtAgentTokenVerifier` asks Adepthood's
+  `/internal/vault-provisioning/agent-token-status` (adepthood#3630) with the
+  token's verified `sub`, `client_id` and `iat` after every offline rule passes
+  and before any tool is listed, dispatched or replayed. `active` answers are
+  cached for `REVOCATION_CACHE_SECONDS = 30`, `revoked` until the token expires,
+  per `(sub, client_id, iat)` and bounded to 4096 entries. Any other outcome
+  (401, 400, 429, 5xx, timeout, malformed body) fails closed. Off by default:
+  `CREEK_MCP_AGENT_TOKEN_STATUS_URL` + `CREEK_MCP_AGENT_TOKEN_STATUS_BEARER_FILE`
+  on a vault, `--oauth-agent-token-status-url` +
+  `--oauth-agent-token-status-bearer-file` on the edge router; without them
+  startup warns that revocation is not enforced.
+
 - Bound the managed-vault fleet to owner decision R2-3 (#1998): cap 15
   vaults, alert at USD 60/month. The admission count now uses reconcile's
   live predicate, so `deleting`, failed-delete and `deleted` jobs free their

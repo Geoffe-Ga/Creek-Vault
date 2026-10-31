@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
@@ -368,3 +369,79 @@ def test_an_issuer_without_a_resource_url_refuses_to_start(tmp_path: Path) -> No
         _replay_bundle(
             tmp_path, "--oauth-authorization-server", "https://api.adepthood.example"
         )
+
+
+_STATUS_URL = (
+    "https://api.adepthood.example/internal/vault-provisioning/agent-token-status"
+)
+_OAUTH = (
+    "--oauth-authorization-server",
+    "https://api.adepthood.example",
+    "--oauth-resource-url",
+    "https://creek-control-pilot.fly.dev/mcp",
+)
+
+
+def _status_flags(tmp_path: Path) -> tuple[str, ...]:
+    """Return the edge's revocation-check flags over a mounted bearer (#2005).
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+
+    Returns:
+        The two flags and their values.
+    """
+    bearer = _owner_file(tmp_path / "handoff-bearer", b"unit-test-handoff-" + b"h" * 20)
+    return (
+        "--oauth-agent-token-status-url",
+        _STATUS_URL,
+        "--oauth-agent-token-status-bearer-file",
+        str(bearer),
+    )
+
+
+def test_the_edge_enforces_revocation_once_the_status_flags_are_set(
+    tmp_path: Path,
+) -> None:
+    """Both status flags turn the per-call check on at the edge."""
+    parser = routing_cli.build_parser()
+    args = parser.parse_args([*_arguments(tmp_path), *_OAUTH, *_status_flags(tmp_path)])
+
+    agent = routing_cli.agent_routing(
+        args, cast("EncryptedFileRoutingCredentialVerifier", object())
+    )
+
+    assert agent is not None
+    assert agent.verifier.revocation_enforced is True
+
+
+def test_the_edge_without_status_flags_warns_revocation_is_not_enforced(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Default off, and said so at startup, never silent."""
+    parser = routing_cli.build_parser()
+    args = parser.parse_args([*_arguments(tmp_path), *_OAUTH])
+
+    with caplog.at_level(logging.WARNING):
+        agent = routing_cli.agent_routing(
+            args, cast("EncryptedFileRoutingCredentialVerifier", object())
+        )
+
+    assert agent is not None
+    assert agent.verifier.revocation_enforced is False
+    assert "revocation is not enforced" in caplog.text
+
+
+@pytest.mark.parametrize("keep", [0, 2])
+def test_half_the_edge_status_flags_refuse_to_start(tmp_path: Path, keep: int) -> None:
+    """A status URL without its bearer (or the reverse) is a startup refusal."""
+    flags = _status_flags(tmp_path)[keep : keep + 2]
+
+    with pytest.raises(SystemExit):
+        _replay_bundle(tmp_path, *_OAUTH, *flags)
+
+
+def test_status_flags_without_an_issuer_refuse_to_start(tmp_path: Path) -> None:
+    """A revocation check with no agent route to guard is a misconfiguration."""
+    with pytest.raises(SystemExit):
+        _replay_bundle(tmp_path, *_status_flags(tmp_path))

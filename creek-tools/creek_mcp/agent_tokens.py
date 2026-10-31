@@ -29,6 +29,14 @@ specification makes mandatory or that the threat model needs:
   static registry already names that person's consumer identity — the same
   identity Adepthood puts in ``sub``. Pinned to it, the vault refuses any other
   person's token even if one were ever routed to it.
+* **Revocation, on every call** (#2005, owner decision R3-2), when a
+  :class:`~creek_mcp.agent_revocation.RevocationCache` is configured: after
+  every offline rule passes and before any access token is returned, the
+  issuer is asked whether the agent's grant still covers the token's
+  ``(sub, client_id, iat)``. ``active`` is reused for
+  :data:`~creek_mcp.agent_revocation.REVOCATION_CACHE_SECONDS`; no answer
+  refuses (fail closed). Without one, startup warns that revocation is not
+  enforced and a stopped agent's token works until it expires.
 
 The RFC 9068 ``client_id`` claim is required: a non-blank string of at most
 256 characters, with no ASCII control character, exactly the published activity
@@ -75,6 +83,12 @@ import jwt
 from jwt import PyJWK
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
+from creek_mcp.agent_revocation import (
+    STATUS_URL_ENV,
+    Revocation,
+    TokenStatusQuery,
+    load_revocation_cache,
+)
 from creek_mcp.api.models import (
     AGENT_ACTIVITY_CONSUMER_PATTERN,
     AGENT_ACTIVITY_MAX_CONSUMER_CHARS,
@@ -86,6 +100,7 @@ from creek_mcp.remote_auth import REMOTE_SCOPE, names_a_consumer
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
+    from creek_mcp.agent_revocation import RevocationCache
     from creek_mcp.oauth_resource import ResourceServerConfig
     from creek_mcp.remote_auth import ConsumerTokenVerifier
 
@@ -131,6 +146,7 @@ _SUBJECT_CLAIM: Final[str] = "sub"
 _CLIENT_ID_CLAIM: Final[str] = "client_id"
 _EXPIRY_CLAIM: Final[str] = "exp"
 _ISSUER_CLAIM: Final[str] = "iss"
+_ISSUED_AT_CLAIM: Final[str] = "iat"
 _ALG_HEADER: Final[str] = "alg"
 _KID_HEADER: Final[str] = "kid"
 _CRIT_HEADER: Final[str] = "crit"
@@ -155,6 +171,12 @@ _REFUSAL_CATEGORIES: Final[tuple[tuple[type[jwt.PyJWTError], str], ...]] = (
 """Fixed log categories, most specific first. Never an exception's message."""
 
 _KEY_SET_UNAVAILABLE: Final[str] = "issuer key set is unavailable"
+
+REVOCATION_NOT_ENFORCED: Final[str] = (
+    "agent-token revocation is not enforced: no status endpoint is configured, "
+    "so a stopped agent keeps working until its access token expires"
+)
+"""The startup warning for an OAuth vault or edge with no revocation check."""
 
 
 class JwksUnavailableError(OSError):
@@ -572,6 +594,7 @@ class JwtAgentTokenVerifier(TokenVerifier):
         *,
         keys: JwksCache | None = None,
         expected_subject: str | None = None,
+        revocation: RevocationCache | None = None,
     ) -> None:
         """Bind the resource, the issuer's keys and the optional subject pin.
 
@@ -581,10 +604,13 @@ class JwtAgentTokenVerifier(TokenVerifier):
                 :attr:`~creek_mcp.oauth_resource.ResourceServerConfig.jwks_url`.
             expected_subject: The one ``sub`` this vault accepts, or ``None``
                 to accept any subject the issuer signed for this audience.
+            revocation: The per-call revocation check (#2005, R3-2), or
+                ``None`` to verify offline only.
         """
         self._config = config
         self._keys = keys or JwksCache(HttpJwksFetcher(config.jwks_url))
         self._expected_subject = expected_subject
+        self._revocation = revocation
 
     @property
     def config(self) -> ResourceServerConfig:
@@ -604,6 +630,15 @@ class JwtAgentTokenVerifier(TokenVerifier):
             The pinned ``sub``, or ``None``.
         """
         return self._expected_subject
+
+    @property
+    def revocation_enforced(self) -> bool:
+        """Return whether every acceptance asks whether the grant was revoked.
+
+        Returns:
+            ``True`` when a revocation check is configured.
+        """
+        return self._revocation is not None
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Return the caller's access token for a valid agent JWT, else ``None``.
@@ -650,7 +685,42 @@ class JwtAgentTokenVerifier(TokenVerifier):
             )
         except jwt.PyJWTError as error:
             return _refused(_category(error))
-        return self._access_token(token, claims)
+        access = self._access_token(token, claims)
+        if access is None or self._revocation is None:
+            return access
+        return await self._unrevoked(access, claims, self._revocation)
+
+    @staticmethod
+    async def _unrevoked(
+        access: AccessToken,
+        claims: Mapping[str, object],
+        revocation: RevocationCache,
+    ) -> AccessToken | None:
+        """Return *access* only while its agent grant still stands (#2005).
+
+        Runs after every offline rule has passed, so only a token this vault
+        would otherwise accept is ever asked about, and before any caller sees
+        an access token — so nothing is listed, dispatched or replayed for a
+        revoked agent. Fail closed: no answer is a refusal.
+
+        Args:
+            access: The offline-verified access token.
+            claims: Its verified claims.
+            revocation: The revocation check.
+
+        Returns:
+            *access*, or ``None`` when the grant was revoked, the issuer gave
+            no answer, or the claims cannot be put to it.
+        """
+        query = TokenStatusQuery.from_claims(
+            access.subject, access.client_id, claims.get(_ISSUED_AT_CLAIM)
+        )
+        if query is None:
+            return _refused("issued at")
+        status = await revocation.status(query, expires_at=access.expires_at)
+        if status is not Revocation.ACTIVE:
+            return _refused(status.value)
+        return access
 
     def _access_token(
         self, token: str, claims: Mapping[str, object]
@@ -765,9 +835,22 @@ def build_agent_verifier(
 
     Raises:
         ValueError: From
-            :func:`~creek_mcp.oauth_resource.load_resource_server_config`.
+            :func:`~creek_mcp.oauth_resource.load_resource_server_config` or
+            :func:`~creek_mcp.agent_revocation.load_revocation_cache`, or when
+            a revocation check is configured without a resource server.
     """
     config = load_resource_server_config(environ)
+    revocation = load_revocation_cache(environ)
     if config is None:
+        if revocation is not None:
+            msg = (
+                f"{STATUS_URL_ENV} needs a resource server: there are no agent "
+                "tokens to check without one"
+            )
+            raise ValueError(msg)
         return None
-    return JwtAgentTokenVerifier(config, expected_subject=expected_subject)
+    if revocation is None:
+        _LOGGER.warning(REVOCATION_NOT_ENFORCED)
+    return JwtAgentTokenVerifier(
+        config, expected_subject=expected_subject, revocation=revocation
+    )
