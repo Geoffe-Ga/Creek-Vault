@@ -627,6 +627,8 @@ def build_parser() -> argparse.ArgumentParser:
     # refusal binding.  Required would mean inventing an expiry for a key that
     # does not exist yet.
     parser.add_argument("--pool-admin-key-expires-at")
+    # #1867: the Fly token's non-secret ID, rendered for the expiry alert.
+    parser.add_argument("--token-id")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--authorization-file", type=Path)
     parser.add_argument("--authorization-sha256")
@@ -649,6 +651,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.alert_url,
         args.volume,
         args.pool_admin_key_expires_at,
+        args.token_id,
     )
     if args.command == "render":
         if args.output is None:

@@ -489,6 +489,9 @@ class AlertKind(StrEnum):
     POOL_ADMIN_KEY_UNUSABLE = "pool_admin_key_unusable"
     POOL_ADMIN_KEY_REJECTED = "pool_admin_key_rejected"
     POOL_ADMIN_KEY_NEAR_EXPIRY = "pool_admin_key_near_expiry"
+    # The Fly org token's operator-recorded expiry (#1867, ADR-0013 amendment):
+    # within the warning window, already expired, or never recorded.
+    PROVIDER_CREDENTIAL_EXPIRING = "provider_credential_expiring"
 
 
 @dataclass(frozen=True, slots=True)
