@@ -82,12 +82,25 @@ def compose(
     """
     verifier = _load_verifier(args.consumer_tokens_file, parser)
     store = ProvisioningStore(args.database)
-    admission = ActivationAdmissionPolicy(
+    admission = admission_policy(args, admission_gate)
+    return build_provisioning_app(store, verifier, admission=admission)
+
+
+def admission_policy(
+    args: argparse.Namespace,
+    admission_gate: Callable[[], bool] | None = None,
+) -> ActivationAdmissionPolicy:
+    """Return the create fence named by *args* and the optional runtime gate.
+
+    The control app and the pilot's reconcile pass both build it here, so a
+    requeued failed create is re-admitted under the same fence as a new
+    activation (#2019).
+    """
+    return ActivationAdmissionPolicy(
         new_activations_enabled=not args.disable_new_activations,
         maximum_live_allocations=args.maximum_live_allocations,
         runtime_gate=admission_gate,
     )
-    return build_provisioning_app(store, verifier, admission=admission)
 
 
 def _positive_int(value: str) -> int:

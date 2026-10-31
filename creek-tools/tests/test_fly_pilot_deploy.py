@@ -419,6 +419,9 @@ def test_rendered_config_has_one_machine_volume_and_secret_contract() -> None:
         ("token_expires_at", "2026-09-28T12:00:00"),
         ("pool_admin_key_expires_at", "2026-12-28T12:00:00"),
         ("pool_admin_key_expires_at", "not-a-date"),
+        # #1867: a pasted token, or a TOML escape, is never a token ID.
+        ("token_id", _TOKEN),
+        ("token_id", 'creek"\n[env]'),
     ],
 )
 def test_renderer_refuses_mutable_or_injectable_coordinates(
@@ -562,13 +565,13 @@ def test_deploy_refuses_disabled_cross_network_replay_before_any_command(
 
 @pytest.mark.parametrize(
     "expiry",
-    ["2026-09-27T11:59:59+00:00", "2026-10-04T12:00:01+00:00"],
+    ["2026-09-27T11:59:59+00:00", "2026-12-26T12:00:01+00:00"],
 )
 def test_deploy_refuses_inactive_or_overlong_runtime_token_before_provider(
     tmp_path: Path,
     expiry: str,
 ) -> None:
-    """A deploy cannot begin outside the reviewed org-token lifetime."""
+    """A deploy cannot begin outside the 90-day org-token lifetime (R2-2)."""
     authorization, digest = _authorization(tmp_path)
     token_file = _token_file(tmp_path)
     commands: list[list[str]] = []
@@ -1242,3 +1245,17 @@ def test_cli_render_is_offline_and_deploy_requires_all_private_inputs(
     )
     with pytest.raises(SystemExit):
         fly_pilot_deploy.main(["deploy", *common])
+
+
+def test_renderer_records_the_token_id_beside_its_expiry() -> None:
+    """The non-secret ID reaches the pilot env; unrecorded renders empty (#1867)."""
+    recorded = replace(_coordinates(), token_id="creek-pilot-2026-10-31")
+
+    with_id = tomllib.loads(render_fly_toml(_TEMPLATE, recorded))["env"]
+    without_id = tomllib.loads(render_fly_toml(_TEMPLATE, _coordinates()))["env"]
+
+    assert with_id["CREEK_PILOT_FLY_TOKEN_ID"] == "creek-pilot-2026-10-31"
+    assert with_id["CREEK_PILOT_FLY_TOKEN_EXPIRES_AT"] == (
+        _coordinates().token_expires_at
+    )
+    assert without_id["CREEK_PILOT_FLY_TOKEN_ID"] == ""

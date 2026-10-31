@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     from creek_mcp.provisioning.worker import ProvisioningWorker
 
 _NOW = datetime(2026, 9, 25, 12, tzinfo=UTC)
+_TOKEN_LIFETIME = timedelta(days=30)
+"""A recorded token expiry far from #1867's warning window."""
 _REJECTED = AlertKind.PROVIDER_CREDENTIAL_REJECTED.value
 _POLICY_TOML = """
 [budget]
@@ -97,7 +99,9 @@ def _pilot_arguments(tmp_path: Path) -> list[str]:
         "--fly-image",
         "registry.example/creek@sha256:" + "a" * 64,
         "--fly-token-expires-at",
-        (_NOW + timedelta(days=3)).isoformat(),
+        # The real fleet pass reads the wall clock, so the token must be well
+        # outside #1867's 72h warning window or an expiry alert joins the 401.
+        (datetime.now(tz=UTC) + _TOKEN_LIFETIME).isoformat(),
         "--fleet-policy-file",
         str(policy),
         "--fleet-interval-seconds",

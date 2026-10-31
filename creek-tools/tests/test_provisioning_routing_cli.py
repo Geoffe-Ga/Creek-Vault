@@ -214,7 +214,7 @@ def test_replay_expiry_fence_refuses_before_any_provider_call() -> None:
     [
         "not-a-timestamp",
         "2026-09-15T12:00:00",
-        "2026-09-21T12:00:01+00:00",
+        "2026-12-13T12:00:01+00:00",
     ],
 )
 def test_router_refuses_unbounded_or_malformed_token_expiry(

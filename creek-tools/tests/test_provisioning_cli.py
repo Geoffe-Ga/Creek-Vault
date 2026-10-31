@@ -189,3 +189,28 @@ def test_cli_disable_switch_refuses_before_creating_queue_state(
 
     assert response.status_code == 503
     assert ProvisioningStore(database).count_jobs() == 0
+
+
+def test_admission_policy_reads_the_cap_switch_and_runtime_gate() -> None:
+    """One builder serves the control app and the pilot's reconcile pass (#2019)."""
+    args = cli.build_parser().parse_args(
+        [
+            "--database",
+            "jobs.sqlite3",
+            "--consumer-tokens-file",
+            "tokens",
+            "--maximum-live-allocations",
+            "3",
+            "--disable-new-activations",
+        ]
+    )
+
+    def gate() -> bool:
+        return True
+
+    policy = cli.admission_policy(args, gate)
+
+    assert policy.maximum_live_allocations == 3
+    assert policy.new_activations_enabled is False
+    assert policy.runtime_gate is gate
+    assert cli.admission_policy(args).runtime_gate is None

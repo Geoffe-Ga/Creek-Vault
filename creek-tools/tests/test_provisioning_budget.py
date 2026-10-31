@@ -360,6 +360,9 @@ def test_alert_vocabulary_is_exactly_seven_kinds_and_each_condition_maps_to_one(
         "pool_admin_key_unusable",
         "pool_admin_key_rejected",
         "pool_admin_key_near_expiry",
+        # ADR-0013 amendment (#1867): the Fly org token's recorded expiry is
+        # near, past, or unrecorded.  Raised by the report, not the reconciler.
+        "provider_credential_expiring",
         # #1866 (owner decision R2-4 extended): the Fly provider refused the
         # pilot's credential, so the pilot degrades and alerts once.
         "provider_credential_rejected",

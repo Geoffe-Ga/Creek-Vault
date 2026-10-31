@@ -40,7 +40,9 @@ _DEFAULT_POLL_SECONDS: Final[float] = 1.0
 _DEFAULT_LEASE_SECONDS: Final[float] = 60.0
 _DEFAULT_PROVIDER_TIMEOUT_SECONDS: Final[float] = 30.0
 _DEFAULT_CALLBACK_TIMEOUT_SECONDS: Final[float] = 10.0
-_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=7)
+# Owner decision R2-2: org tokens live at most 90 days; the scheduled report
+# warns 72 hours before the recorded expiry (#1867, #1868).
+_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=90)
 _MAX_PROVIDER_BOUNDARIES_PER_CLAIM: Final[int] = 10
 
 
@@ -252,7 +254,7 @@ def compose(
             "--fly-token-expires-at is too near for one bounded provisioning claim"
         )
     if expires_at > observed_at + _MAX_FLY_TOKEN_LIFETIME:
-        parser.error("--fly-token-expires-at must be no more than seven days away")
+        parser.error("--fly-token-expires-at must be no more than 90 days away")
     try:
         with ExitStack() as resources:
             credential = FlyCredential.from_file(

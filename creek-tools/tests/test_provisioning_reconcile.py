@@ -53,6 +53,8 @@ from creek_mcp.provisioning.reconcile import (
     ReconcileUnavailableError,
 )
 from creek_mcp.provisioning.store import (
+    ActivationAdmissionError,
+    ActivationAdmissionPolicy,
     InvalidJobTransitionError,
     ProvisioningStore,
 )
@@ -85,6 +87,7 @@ _POLICY: dict[str, Any] = {
     "review_months_over_budget": 2,
 }
 _GIB = 1024**3
+_ADMISSION = ActivationAdmissionPolicy(maximum_live_allocations=15)
 
 
 @pytest.fixture
@@ -154,6 +157,7 @@ def _reconciler(
     **kwargs: Any,
 ) -> FleetReconciler:
     """Return a reconciler whose inventory and stopper are the same fake."""
+    kwargs.setdefault("admission", _ADMISSION)
     return FleetReconciler(store, driver, driver, _policy(), **kwargs)
 
 
@@ -394,7 +398,8 @@ def test_reconciler_never_deletes_by_construction() -> None:
 
 
 def test_in_flight_create_is_not_an_orphan(store: ProvisioningStore) -> None:
-    """Pending, provisioning and failed-create jobs are never orphan or missing."""
+    """Pending and provisioning jobs are never divergent; a failed create's
+    leftover Machine is reported as ``incomplete_create``, never as an orphan."""
     driver = FakeProviderDriver()
     failed = store.submit(
         "activation-failed", "user-r", requester_identity="a", now=_NOW
@@ -444,7 +449,16 @@ def test_in_flight_create_is_not_an_orphan(store: ProvisioningStore) -> None:
         now=_NOW + timedelta(seconds=3), repair=True
     )
 
-    assert report.divergences == ()
+    assert report.divergences == (
+        Divergence(
+            DivergenceKind.INCOMPLETE_CREATE,
+            Disposition.REPORTED,
+            driver.expected_allocation_id("activation-failed"),
+            None,
+            failed.job_id,
+            None,
+        ),
+    )
     assert report.telemetry.allocations_by_state == {
         "failed": 1,
         "pending": 1,
@@ -1042,9 +1056,10 @@ def test_a_concurrent_create_transition_stays_reported_and_alerted(
             self,
             job_id: str,
             *,
+            admission: ActivationAdmissionPolicy,
             now: datetime | None = None,
         ) -> ProvisioningJob:
-            del job_id, now
+            del job_id, admission, now
             raise InvalidJobTransitionError("job is not a recoverable create")
 
     driver = FakeProviderDriver()
@@ -1067,9 +1082,9 @@ def test_a_concurrent_create_transition_stays_reported_and_alerted(
     refusing = RefusingStore(tmp_path / "provisioning.sqlite3")
 
     with caplog.at_level(logging.INFO):
-        report = FleetReconciler(refusing, driver, driver, _policy()).run_once(
-            now=_NOW + timedelta(seconds=10), repair=True
-        )
+        report = FleetReconciler(
+            refusing, driver, driver, _policy(), admission=_ADMISSION
+        ).run_once(now=_NOW + timedelta(seconds=10), repair=True)
 
     assert report.divergences == (
         Divergence(
@@ -1119,3 +1134,194 @@ def test_a_stopped_duplicate_machine_does_not_mask_its_running_twin(
     assert hot.job_id == job_id
     assert report.telemetry.running_machine_seconds_by_allocation == {pid: 3600}
     assert _machine_rows(tmp_path) == 1
+
+
+def _rejected_create_with_empty_app(
+    store: ProvisioningStore,
+    driver: FakeProviderDriver,
+    activation_id: str,
+) -> tuple[str, str]:
+    """Leave one first-attempt provider rejection whose app alone was created."""
+    job = store.submit(
+        activation_id, activation_id, requester_identity="adepthood", now=_NOW
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+    allocation_id = driver.expected_allocation_id(job.activation_id)
+    driver.seed_resource(
+        ProviderResource(
+            allocation_id,
+            ResourceClass.APP,
+            ResourceState.OTHER,
+            None,
+            None,
+            f"{allocation_id}-app",
+        )
+    )
+    return job.job_id, allocation_id
+
+
+def test_a_failed_handoff_reports_the_machine_it_left_running(
+    store: ProvisioningStore,
+) -> None:
+    """#2019: a create that failed after provisioning is never invisible.
+
+    The handoff fails once ``driver.provision()`` has built the Machine and
+    volume, so the job settles ``failed`` with no allocation row.  Reconcile
+    reports that leftover as ``incomplete_create`` and alerts on it, and never
+    requeues it, since only an empty first-attempt rejection is recoverable.
+    """
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-handoff-leftover",
+        "subject",
+        requester_identity="adepthood",
+        now=_NOW,
+    )
+    handoff = FakeOneTimeHandoff()
+    handoff.deliver(job.job_id, "subject", "https://conflict.invalid/v1", "x")
+    assert ProvisioningWorker(store, driver, handoff).run_once(now=_NOW)
+    failed = store.get(job.job_id, "adepthood")
+    assert failed is not None
+    assert failed.state is JobState.FAILED
+    assert failed.failure_reason is FailureReason.HANDOFF_FAILED
+    assert store.count_allocations() == 0
+    allocation_id = driver.expected_allocation_id(job.activation_id)
+    assert any(
+        resource.resource_class is ResourceClass.MACHINE
+        and resource.provider_allocation_id == allocation_id
+        for resource in driver.list_resources([job.activation_id])
+    )
+    reconciler = _reconciler(store, driver)
+
+    for repair in (False, True):
+        report = reconciler.run_once(now=_NOW + timedelta(minutes=1), repair=repair)
+
+        assert report.divergences == (
+            Divergence(
+                DivergenceKind.INCOMPLETE_CREATE,
+                Disposition.REPORTED,
+                allocation_id,
+                None,
+                job.job_id,
+                None,
+            ),
+        )
+        assert report.alerts == (
+            Alert(AlertKind.INCOMPLETE_CREATE, allocation_id, None, None, None),
+        )
+    still_failed = store.get(job.job_id, "adepthood")
+    assert still_failed is not None and still_failed.state is JobState.FAILED
+    assert driver.delete_count == 0
+
+
+def test_a_failed_create_with_no_leftover_is_not_reported(
+    store: ProvisioningStore,
+) -> None:
+    """A transient failure before any provider write leaves nothing to repair."""
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-clean-failure", "subject", requester_identity="adepthood", now=_NOW
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_UNAVAILABLE,
+        retryable=True,
+        now=_NOW,
+    )
+
+    report = _reconciler(store, driver).run_once(
+        now=_NOW + timedelta(minutes=1), repair=True
+    )
+
+    assert report.divergences == ()
+    assert report.alerts == ()
+
+
+@pytest.mark.parametrize(
+    "admission",
+    [
+        ActivationAdmissionPolicy(maximum_live_allocations=1),
+        ActivationAdmissionPolicy(
+            maximum_live_allocations=15, runtime_gate=lambda: False
+        ),
+        None,
+    ],
+    ids=["at-cap", "gate-closed", "no-admission-policy"],
+)
+def test_reconcile_requeues_a_failed_create_only_through_admission(
+    store: ProvisioningStore,
+    caplog: pytest.LogCaptureFixture,
+    admission: ActivationAdmissionPolicy | None,
+) -> None:
+    """At the cap, behind a closed R2-4 gate, or with no policy: report only."""
+    driver = FakeProviderDriver()
+    _activate(store, driver, "activation-live")
+    job_id, allocation_id = _rejected_create_with_empty_app(
+        store, driver, "activation-refused-requeue"
+    )
+    reconciler = FleetReconciler(store, driver, driver, _policy(), admission=admission)
+
+    with caplog.at_level(logging.INFO):
+        report = reconciler.run_once(now=_NOW + timedelta(minutes=1), repair=True)
+
+    assert report.divergences == (
+        Divergence(
+            DivergenceKind.INCOMPLETE_CREATE,
+            Disposition.REPORTED,
+            allocation_id,
+            ResourceClass.APP,
+            job_id,
+            None,
+        ),
+    )
+    assert report.alerts == (
+        Alert(AlertKind.INCOMPLETE_CREATE, allocation_id, None, None, None),
+    )
+    failed = store.get(job_id, "adepthood")
+    assert failed is not None and failed.state is JobState.FAILED
+    assert f"fleet repair skipped kind=incomplete_create subject={job_id}" in (
+        caplog.text
+    )
+
+
+def test_a_store_admission_refusal_never_escapes_run_once(
+    store: ProvisioningStore,
+    tmp_path: Path,
+) -> None:
+    """Belt and braces: ActivationAdmissionError leaves the divergence reported."""
+
+    class FullStore(ProvisioningStore):
+        """Refuse every requeue as a fleet that filled up mid-pass would."""
+
+        def requeue_failed_create(
+            self,
+            job_id: str,
+            *,
+            admission: ActivationAdmissionPolicy,
+            now: datetime | None = None,
+        ) -> ProvisioningJob:
+            del job_id, admission, now
+            raise ActivationAdmissionError("new activation unavailable")
+
+    driver = FakeProviderDriver()
+    job_id, _ = _rejected_create_with_empty_app(store, driver, "activation-full")
+    full = FullStore(tmp_path / "provisioning.sqlite3")
+
+    report = FleetReconciler(
+        full, driver, driver, _policy(), admission=_ADMISSION
+    ).run_once(now=_NOW + timedelta(minutes=1), repair=True)
+
+    assert [d.disposition for d in report.divergences] == [Disposition.REPORTED]
+    failed = store.get(job_id, "adepthood")
+    assert failed is not None and failed.state is JobState.FAILED

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import math
 import os
@@ -37,6 +38,8 @@ from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from creek_mcp.provisioning.store import ActivationAdmissionPolicy
 
 _LOGGER = logging.getLogger(__name__)
 # The generic CLIs keep their non-loopback TLS refusal. This dedicated Fly-only
@@ -140,6 +143,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fly-token-expires-at",
         default=os.environ.get("CREEK_PILOT_FLY_TOKEN_EXPIRES_AT"),
+    )
+    # #1867: the token's non-secret ID and the expiry warning window, passed
+    # through to every scheduled report.
+    parser.add_argument(
+        "--fly-token-id",
+        default=os.environ.get("CREEK_PILOT_FLY_TOKEN_ID") or None,
+    )
+    parser.add_argument(
+        "--fly-token-warning-hours",
+        type=_positive_int,
+        default=os.environ.get("CREEK_PILOT_FLY_TOKEN_WARNING_HOURS", "72"),
     )
     parser.add_argument("--fly-api-base-url", default="https://api.machines.dev")
     parser.add_argument(
@@ -314,9 +328,10 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
     # #1866 extends R2-4 to a provider 401/403: while the provider refuses the
     # credential, new activations and worker claims stop and health fails.
     provider_auth = ProviderAuthState()
-    control = control_cli.compose(
-        args, parser, admission_gate=_all_admit(admission_gate, provider_auth)
-    )
+    activation_gate = _all_admit(admission_gate, provider_auth)
+    control = control_cli.compose(args, parser, admission_gate=activation_gate)
+    # #2019: reconcile resumes a failed create only through this same fence.
+    admission = control_cli.admission_policy(args, activation_gate)
     worker: worker_cli.WorkerBundle | None = None
     router: routing_cli.ReplayRoutingBundle | None = None
     alerts: HttpFleetAlertSink | None = None
@@ -383,6 +398,7 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
                         fleet_fresh,
                         relay,
                         provider_auth,
+                        admission=admission,
                     ),
                     ready=_all_admit(fleet_fresh, provider_auth),
                 ),
@@ -449,11 +465,14 @@ def _run_scheduler(
     freshness: _FleetFreshness | None = None,
     alerts: AlertRelay | None = None,
     provider: ProviderAuthState | None = None,
+    *,
+    admission: ActivationAdmissionPolicy | None = None,
 ) -> None:
     """Serialize reports and optional repairs on explicit bounded cadences.
 
     A report the provider refused for its credential is not fresh: it skips
     the repair and leaves health failed, but the loop keeps running (#1866).
+    Only the reconcile pass repairs, so only it receives *admission* (#2019).
     """
     next_reconcile = (
         monotonic() + args.reconcile_interval_seconds
@@ -462,7 +481,9 @@ def _run_scheduler(
     )
     while not stop.is_set():
         if _run_fleet_pass(args, "report", alerts, provider):
-            next_reconcile = _reconcile_when_due(args, next_reconcile, alerts, provider)
+            next_reconcile = _reconcile_when_due(
+                args, next_reconcile, alerts, provider, admission
+            )
             if freshness is not None:
                 freshness.mark()
         stop.wait(args.fleet_interval_seconds)
@@ -473,13 +494,14 @@ def _reconcile_when_due(
     next_reconcile: float | None,
     alerts: AlertRelay | None,
     provider: ProviderAuthState | None,
+    admission: ActivationAdmissionPolicy | None = None,
 ) -> float | None:
     """Run one repair pass when its cadence is due; return the next due time."""
     now = monotonic()
     if next_reconcile is None or now < next_reconcile:
         return next_reconcile
     started = monotonic()
-    _run_fleet_pass(args, "reconcile", alerts, provider)
+    _run_fleet_pass(args, "reconcile", alerts, provider, admission)
     elapsed = monotonic() - started
     if elapsed > args.reconcile_interruption_window_seconds:
         raise RuntimeError("scheduled reconcile exceeded its accepted window")
@@ -491,6 +513,7 @@ def _run_fleet_pass(
     command: str,
     alerts: AlertRelay | None,
     provider: ProviderAuthState | None = None,
+    admission: ActivationAdmissionPolicy | None = None,
 ) -> bool:
     """Run one provider pass and hand its alerts to the retaining relay.
 
@@ -501,13 +524,18 @@ def _run_fleet_pass(
     *provider* state are composed (#1866), and returns false; without them it
     stays a scheduler failure.
     """
+    run = (
+        fleet_cli.main
+        if admission is None
+        else functools.partial(fleet_cli.main, admission=admission)
+    )
     if alerts is None:
-        exit_code = fleet_cli.main(
+        exit_code = run(
             _fleet_arguments(args, command),
             emit_output=False,
         )
     else:
-        exit_code = fleet_cli.main(
+        exit_code = run(
             _fleet_arguments(args, command),
             emit_output=False,
             alert_sink=alerts.collect,
@@ -556,6 +584,9 @@ def _fleet_arguments(args: argparse.Namespace, command: str = "report") -> list[
         args.fly_token_expires_at,
         "--policy-file",
         str(args.fleet_policy_file),
+        "--fly-token-warning-hours",
+        str(args.fly_token_warning_hours),
+        *(() if args.fly_token_id is None else ("--fly-token-id", args.fly_token_id)),
     ]
 
 

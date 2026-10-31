@@ -28,6 +28,12 @@ from typing import TYPE_CHECKING, Final
 import httpx
 
 from creek_mcp.provisioning.budget import estimate_monthly_cost, load_policy_file
+from creek_mcp.provisioning.credential_expiry import (
+    PROVIDER_CREDENTIAL_WARN_WITHIN,
+    check_provider_credential,
+    parse_declared_expiry,
+    validate_token_id,
+)
 from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.fleet_schema import month_range
 from creek_mcp.provisioning.fly import (
@@ -47,9 +53,10 @@ from creek_mcp.provisioning.store import ProvisioningStore
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from creek_mcp.provisioning.budget import PolicyFile
+    from creek_mcp.provisioning.budget import Alert, PolicyFile
     from creek_mcp.provisioning.inventory import FleetInventorySource, FleetStopper
     from creek_mcp.provisioning.models import FleetJob, FleetTelemetry
+    from creek_mcp.provisioning.store import ActivationAdmissionPolicy
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_API_BASE_URL: Final[str] = "https://api.machines.dev"
@@ -65,7 +72,10 @@ _INVENTORY_ERROR: Final[str] = (
 )
 _APP_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[a-z0-9-]+")
 _MONTH_RE: Final[re.Pattern[str]] = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
-_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=7)
+# Owner decision R2-2: org tokens live at most 90 days; the scheduled report
+# warns 72 hours before the recorded expiry (#1867, #1868).
+_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=90)
+_SECONDS_PER_HOUR: Final[int] = 3600
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +129,23 @@ def _add_report_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--inventory-file", type=Path)
     command.add_argument("--record-month", metavar="YYYY-MM")
     command.add_argument("--confidential-compute-changed", action="store_true")
+    # #1867: the non-secret ID of the Fly token, and how far ahead of its
+    # recorded expiry the report starts raising provider_credential_expiring.
+    command.add_argument("--fly-token-id")
+    command.add_argument(
+        "--fly-token-warning-hours",
+        type=_positive_hours,
+        default=int(PROVIDER_CREDENTIAL_WARN_WITHIN.total_seconds())
+        // _SECONDS_PER_HOUR,
+    )
+
+
+def _positive_hours(value: str) -> int:
+    """Parse a whole number of hours greater than zero."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def _utc_now() -> datetime:
@@ -153,7 +180,7 @@ def compose_fly(
     if expires_at <= observed_at:
         parser.error("--fly-token-expires-at must be in the future")
     if expires_at > observed_at + _MAX_FLY_TOKEN_LIFETIME:
-        parser.error("--fly-token-expires-at must be no more than seven days away")
+        parser.error("--fly-token-expires-at must be no more than 90 days away")
     try:
         credential = FlyCredential.from_file(
             args.fly_token_file,
@@ -244,11 +271,17 @@ def main(
     compose: Callable[
         [argparse.Namespace, argparse.ArgumentParser], FleetDriverBundle
     ] = compose_fly,
-    clock: Callable[[], datetime] = _utc_now,
+    clock: Callable[[], datetime] | None = None,
     emit_output: bool = True,
     alert_sink: Callable[[tuple[str, ...]], None] | None = None,
+    admission: ActivationAdmissionPolicy | None = None,
 ) -> int:
-    """Run one fleet command; the supervised pilot suppresses private output."""
+    """Run one fleet command; the supervised pilot suppresses private output.
+
+    *admission* is the control plane's create fence.  ``reconcile`` resumes a
+    recoverable failed create only through it, so without one (the standalone
+    operator CLI) such a create is reported but never resumed (#2019).
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     store = ProvisioningStore(args.database)
@@ -258,10 +291,13 @@ def main(
             return _run_emergency_stop(store, bundle.stopper)
         finally:
             bundle.close()
-    now = clock()
+    now = (clock or _utc_now)()
     policy_file = _load_policy(args.policy_file, parser, now=now)
     app_names = _load_inventory_names(args.inventory_file, parser)
     month = _record_month_target(args, parser, now)
+    credential_alert = _provider_credential_alert(
+        args, parser, now=now, alert_sink=alert_sink
+    )
     bundle = compose(args, parser)
     try:
         return _run_report(
@@ -274,9 +310,54 @@ def main(
             month=month,
             emit_output=emit_output,
             alert_sink=alert_sink,
+            admission=admission,
+            extra_alerts=() if credential_alert is None else (credential_alert,),
         )
     finally:
         bundle.close()
+
+
+def _provider_credential_alert(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    now: datetime,
+    alert_sink: Callable[[tuple[str, ...]], None] | None,
+) -> Alert | None:
+    """Judge the recorded Fly token expiry before any provider call (#1867).
+
+    Only a pass that holds a Fly token has a provider credential to date.  An
+    expired or unrecorded expiry is announced first and then refused, so the
+    operator hears about it before the report stops; a merely expiring one is
+    returned for the report to carry beside the reconciler's alerts.  Nothing
+    here opens the token file, and no refusal repeats a configured value.
+    """
+    if args.fly_token_file is None:
+        return None
+    try:
+        token_id = (
+            None if args.fly_token_id is None else validate_token_id(args.fly_token_id)
+        )
+    except ValueError:
+        parser.error("--fly-token-id must be a short non-secret token ID")
+    try:
+        expires_at = parse_declared_expiry(args.fly_token_expires_at)
+    except ValueError:
+        parser.error("--fly-token-expires-at must be a timezone-aware ISO-8601 instant")
+    check = check_provider_credential(
+        token_id,
+        expires_at,
+        now=now,
+        warn_within=timedelta(hours=args.fly_token_warning_hours),
+    )
+    alert = check.alert()
+    if alert is not None:
+        _LOGGER.warning("provider credential alert: %s", alert.measured)
+    if check.refused:
+        if alert_sink is not None and alert is not None:
+            alert_sink((alert.kind.value,))
+        parser.error("--fly-token-expires-at has passed or was never recorded")
+    return alert
 
 
 def _run_report(
@@ -290,6 +371,8 @@ def _run_report(
     month: str | None,
     emit_output: bool,
     alert_sink: Callable[[tuple[str, ...]], None] | None,
+    admission: ActivationAdmissionPolicy | None,
+    extra_alerts: tuple[Alert, ...] = (),
 ) -> int:
     """Run one pass, optionally emitting the private operator report."""
     reconciler = FleetReconciler(
@@ -299,6 +382,7 @@ def _run_report(
         policy_file.policy,
         extra_app_names=app_names,
         usage=policy_file.usage,
+        admission=admission,
     )
     try:
         report = reconciler.run_once(
@@ -317,6 +401,8 @@ def _run_report(
         if emit_output:
             print(json.dumps({"error": "provider_unavailable"}), file=sys.stderr)
         return _EXIT_UNAVAILABLE
+    if extra_alerts:
+        report = dataclasses.replace(report, alerts=(*report.alerts, *extra_alerts))
     if month is not None:
         _record_closed_month(store, report.telemetry, policy_file, month, now)
     for alert in report.alerts:

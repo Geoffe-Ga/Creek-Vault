@@ -27,7 +27,7 @@ from creek_mcp.provisioning.models import (
     ResourceClass,
     ResourceState,
 )
-from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.store import ActivationAdmissionPolicy, ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
 from tests.fly_support import (
     IMAGE,
@@ -700,14 +700,14 @@ def test_fly_composition_uses_a_refusing_secret_manager_and_fails_closed_on_prov
     "expires_at",
     [
         "2026-09-11T07:00:00+00:00",
-        "2026-09-18T07:00:01+00:00",
+        "2026-12-10T07:00:01+00:00",
     ],
 )
 def test_fly_composition_refuses_expired_or_long_lived_org_tokens(
     tmp_path: Path,
     expires_at: str,
 ) -> None:
-    """Every provider process enforces the pilot's seven-day token ceiling."""
+    """Every provider process enforces the pilot's 90-day token ceiling (R2-2)."""
     parser = build_parser()
     arguments = _fly_args(tmp_path)
     arguments[-1] = expires_at
@@ -800,3 +800,55 @@ def test_emergency_stop_needs_neither_a_policy_nor_an_inventory_file(
     with pytest.raises(SystemExit) as caught:
         main(["emergency-stop", "--database", str(database), "--policy-file", "x"])
     assert caught.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("admission", "expected"),
+    [
+        (None, JobState.FAILED),
+        (ActivationAdmissionPolicy(maximum_live_allocations=1), JobState.PENDING),
+    ],
+    ids=["no-admission-policy", "admitted"],
+)
+def test_reconcile_requeues_a_failed_create_only_under_an_admission_policy(
+    tmp_path: Path,
+    admission: ActivationAdmissionPolicy | None,
+    expected: JobState,
+) -> None:
+    """#2019: the CLI hands its caller's admission policy to the reconciler.
+
+    Without one, a recoverable failed create is reported but never requeued,
+    since a requeue that bypassed the fence could push the fleet past its cap.
+    """
+    database = tmp_path / "jobs.sqlite3"
+    store = ProvisioningStore(database)
+    driver = FakeProviderDriver()
+    job = store.submit(
+        "activation-requeue", "subject", requester_identity="a", now=_NOW
+    )
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.PROVIDER_REJECTED,
+        retryable=False,
+        now=_NOW,
+    )
+
+    main(
+        [
+            "reconcile",
+            "--database",
+            str(database),
+            "--policy-file",
+            _policy_file(tmp_path),
+        ],
+        compose=_compose(driver),
+        clock=lambda: _NOW + timedelta(minutes=1),
+        emit_output=False,
+        admission=admission,
+    )
+
+    requeued = store.get(job.job_id, "a")
+    assert requeued is not None and requeued.state is expected

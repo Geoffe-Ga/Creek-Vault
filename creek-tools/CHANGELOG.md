@@ -9,6 +9,20 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Free the admission slot of a failed create (#2019, owner decision R2-3).
+  Reconcile now reports every failed create that still owns provider
+  resources as `incomplete_create` (a handoff failure after `provision()`
+  left its Machine invisible before), and `ProvisioningStore.retry` and
+  `requeue_failed_create` take a required `admission` policy and re-admit a
+  failed create inside the SQLite write fence, refusing with
+  `ActivationAdmissionError` and writing nothing at the cap, under
+  `--disable-new-activations`, or behind a closed R2-4 runtime gate.
+  `POST /control/v1/jobs/{id}/retry` maps that refusal to
+  `503 activation_unavailable`. With both in place, `failed` +
+  `operation='create'` leaves the admission count. The pilot's scheduled
+  reconcile receives the control plane's policy through the new
+  `cli.admission_policy`; the standalone fleet CLI has none, so it reports a
+  recoverable failed create but no longer resumes it.
 - Degrade instead of exiting when Fly refuses the pilot's credential (#1866,
   extending owner decision R2-4). A `401` or `403` from the Fly Machines API
   now sets `ProviderError.authentication_failed`, raises
