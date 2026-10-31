@@ -9,6 +9,10 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Price the bench's pilot volume at the release ceiling (ADR-0017, owner
+  decision R2-3): `PILOT_REFLECTIONS_PER_MONTH` is now 300 (15 live
+  allocations at the default allowance of 20), up from ADR-0016's 100.
+
 - Check agent-token revocation on every call (#2005, owner decision R3-2).
   `JwtAgentTokenVerifier` asks Adepthood's
   `/internal/vault-provisioning/agent-token-status` (adepthood#3630) with the

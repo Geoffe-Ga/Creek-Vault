@@ -389,7 +389,7 @@ def test_metered_cost_per_1000_and_per_account_month_exact(tmp_path: Path) -> No
     per reflection = 1000*1.00/1e6 + 100*4.00/1e6 = 0.001 + 0.0004 = 0.0014
     per 1,000      = 0.0014 * 1000               = 1.400000
     per account-mo = 0.0014 * 20                 = 0.028000
-    pilot month    = 0.0014 * 100                = 0.140000
+    pilot month    = 0.0014 * 300                = 0.420000
     10k month      = 0.0014 * 10000              = 14.000000
     """
     sheet = load_price_sheet(_metered_sheet_file(tmp_path), today=_TODAY)
@@ -407,6 +407,7 @@ def test_metered_cost_per_1000_and_per_account_month_exact(tmp_path: Path) -> No
     assert estimate.cost_per_account_month == Decimal("0.028000")
     assert estimate.monthly_reflection_cap == 20
     volumes = {one.reflections_per_month: one for one in estimate.per_volume}
+    assert PILOT_REFLECTIONS_PER_MONTH == 300  # ADR-0017: 15 allocations x 20
     assert set(volumes) == {
         PILOT_REFLECTIONS_PER_MONTH,
         PRODUCTION_REFLECTIONS_PER_MONTH,
@@ -414,8 +415,8 @@ def test_metered_cost_per_1000_and_per_account_month_exact(tmp_path: Path) -> No
     pilot = volumes[PILOT_REFLECTIONS_PER_MONTH]
     production = volumes[PRODUCTION_REFLECTIONS_PER_MONTH]
     assert pilot.cost_per_1000_reflections == Decimal("1.400000")
-    assert pilot.cost_per_month == Decimal("0.140000")
-    assert pilot.tokens_per_month == 110_000
+    assert pilot.cost_per_month == Decimal("0.420000")
+    assert pilot.tokens_per_month == 330_000
     assert production.cost_per_month == Decimal("14.000000")
     assert production.tokens_per_month == 11_000_000
     # Metering has no fixed component, so volume buys no discount. That

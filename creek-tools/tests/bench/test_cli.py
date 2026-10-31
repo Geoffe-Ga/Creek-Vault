@@ -816,7 +816,7 @@ def _metered_argv(tmp_path: Path, report: Path, out: Path, *extra: str) -> list[
 def test_metered_cost_reports_per_1000_and_per_account_month(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """AC1: ``cost`` prices a metered sheet at 100/mo, 10,000/mo and 20/account."""
+    """AC1: ``cost`` prices a metered sheet at 300/mo, 10,000/mo and 20/account."""
     report = _token_report(tmp_path, basis="provider_reported")
     out = tmp_path / "metered-cost.json"
     assert cli.main(_metered_argv(tmp_path, report, out)) == 0
@@ -825,7 +825,7 @@ def test_metered_cost_reports_per_1000_and_per_account_month(
     assert estimate["shape"] == "metered_tokens"
     assert estimate["token_basis"] == "provider_reported"
     volumes = {one["reflections_per_month"]: one for one in estimate["per_volume"]}
-    assert set(volumes) == {100, 10_000}
+    assert set(volumes) == {300, 10_000}
     assert estimate["monthly_reflection_cap"] == 20
     assert Decimal(estimate["cost_per_account_month"]) > 0
     assert estimate["vendor_key_input_token_cap"] > 0

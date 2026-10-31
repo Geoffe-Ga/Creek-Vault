@@ -89,8 +89,12 @@ figure priced at the worst measured surface is the honest one. It is a default
 here, overridable by flag, never a value this repo owns.
 """
 
-PILOT_REFLECTIONS_PER_MONTH: Final[int] = 100
-"""ADR-0016's pilot ceiling: five live allocations at the default allowance."""
+PILOT_REFLECTIONS_PER_MONTH: Final[int] = 300
+"""The release pilot ceiling: 15 live allocations at the default allowance.
+
+ADR-0017 (owner decision R2-3) raised the cap from ADR-0016's five
+allocations (100 reflections) to 15.
+"""
 
 PRODUCTION_REFLECTIONS_PER_MONTH: Final[int] = 10_000
 """ADR-0016's production volume: 500 accounts at the default allowance."""
