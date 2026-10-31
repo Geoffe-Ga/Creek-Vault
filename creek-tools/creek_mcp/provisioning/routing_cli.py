@@ -208,6 +208,37 @@ def _add_oauth_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--oauth-agent-token-status-bearer-file", type=Path, default=None
     )
+    add_mcp_audience_arguments(parser)
+
+
+def add_mcp_audience_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the per-allocation MCP audience switches (#2003, R3-1).
+
+    Both default off. ``--per-allocation-mcp-resource`` routes each
+    allocation's own ``/a/<slug>/mcp`` at the edge (and, in the pilot, makes
+    its worker mint one per new allocation). ``--refuse-shared-mcp-audience``
+    stops accepting agent tokens for the shared edge resource on ``/mcp``; it
+    is #2004's switch, flipped once every allocation is rolled.
+
+    Args:
+        parser: The parser to extend.
+    """
+    parser.add_argument(
+        "--per-allocation-mcp-resource",
+        action="store_true",
+        help=(
+            "route each allocation's own <edge>/a/<slug>/mcp resource (#2003); "
+            "enable only once Adepthood mints per-vault tokens (adepthood#3584)"
+        ),
+    )
+    parser.add_argument(
+        "--refuse-shared-mcp-audience",
+        action="store_true",
+        help=(
+            "refuse agent tokens for the shared <edge>/mcp audience (#2004); "
+            "requires --per-allocation-mcp-resource"
+        ),
+    )
 
 
 def _revocation(args: argparse.Namespace) -> RevocationCache | None:
@@ -247,15 +278,23 @@ def agent_routing(
         principals: The bundle store that resolves a verified subject.
 
     Returns:
-        The route, verifying tokens for ``--oauth-resource-url``.
+        The route, verifying tokens for ``--oauth-resource-url`` and, with
+        ``--per-allocation-mcp-resource``, for each allocation's own resource.
 
     Raises:
         ValueError: When an issuer is set but the resource URL is missing or
-            any URL is unsafe, or the revocation flags are half-set or set
-            without an issuer.
+            any URL is unsafe, the revocation flags are half-set or set
+            without an issuer, or an audience switch is set without the
+            issuer or the per-allocation route it depends on.
     """
     issuer = args.oauth_authorization_server
     revocation = _revocation(args)
+    per_allocation = args.per_allocation_mcp_resource
+    refuse_shared = args.refuse_shared_mcp_audience
+    if (per_allocation or refuse_shared) and not issuer:
+        raise ValueError(
+            "per-allocation MCP audiences need --oauth-authorization-server"
+        )
     if not issuer:
         if revocation is not None:
             msg = "--oauth-agent-token-status-url needs --oauth-authorization-server"
@@ -269,7 +308,10 @@ def agent_routing(
     if revocation is None:
         logging.getLogger(AGENT_TOKEN_LOGGER_NAME).warning(REVOCATION_NOT_ENFORCED)
     return AgentRouting(
-        JwtAgentTokenVerifier(config, revocation=revocation), principals
+        JwtAgentTokenVerifier(config, revocation=revocation),
+        principals,
+        allocations=principals if per_allocation else None,
+        shared_audience=not refuse_shared,
     )
 
 

@@ -143,3 +143,47 @@ def is_resource_path(path: object) -> bool:
         edge — and for one allocation's :func:`allocation_mcp_path`.
     """
     return path == MCP_PATH or is_allocation_mcp_path(path)
+
+
+def allocation_metadata_path(slug: str) -> str:
+    """Return where one allocation's RFC 9728 metadata is published (#2003).
+
+    Args:
+        slug: The allocation's minted, URL-safe slug.
+
+    Returns:
+        :data:`PROTECTED_RESOURCE_ROOT` then :func:`allocation_mcp_path` — the
+        RFC 9728 section 3.1 insertion for a path-scoped resource.
+
+    Raises:
+        ValueError: When *slug* is not the exact minted grammar.
+    """
+    return f"{PROTECTED_RESOURCE_ROOT}{allocation_mcp_path(slug)}"
+
+
+def allocation_path_of_metadata(path: object) -> str | None:
+    """Return the ``/a/<slug>/mcp`` a per-allocation metadata *path* describes.
+
+    Args:
+        path: The candidate request path, unvalidated.
+
+    Returns:
+        The allocation's resource path, or ``None`` unless *path* is exactly
+        :func:`allocation_metadata_path` of a minted slug.
+    """
+    if not isinstance(path, str) or not path.startswith(PROTECTED_RESOURCE_ROOT):
+        return None
+    resource_path = path.removeprefix(PROTECTED_RESOURCE_ROOT)
+    return resource_path if is_allocation_mcp_path(resource_path) else None
+
+
+def is_allocation_metadata_path(path: object) -> bool:
+    """Return whether *path* is exactly one allocation's metadata path.
+
+    Args:
+        path: The candidate request path, unvalidated.
+
+    Returns:
+        ``True`` only for :func:`allocation_metadata_path` of a minted slug.
+    """
+    return allocation_path_of_metadata(path) is not None

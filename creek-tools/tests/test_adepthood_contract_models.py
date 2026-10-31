@@ -1779,9 +1779,8 @@ def test_the_compatibility_window_only_ever_widens() -> None:
 
     ``0.7`` joins at the 0.12 bump (#1292), and it is here as a **repair**
     rather than as that bump's own pin: it was retired at 0.8 and named by
-    neither this test nor
-    :func:`test_the_previous_minor_is_still_served`, which asserted only
-    ``0.10``/``0.9``/``0.8``. Four bumps passed with nothing checking it.
+    neither this test nor the hand-typed per-bump guard of the time, which
+    asserted only ``0.10``/``0.9``/``0.8``. Four bumps passed with nothing checking it.
     That gap is the reason
     :func:`test_every_minor_below_the_current_one_is_still_served` now
     derives the whole range instead of trusting either hand-typed list.
@@ -1936,46 +1935,99 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
     ReflectionResponse.model_validate(fixture)
 
 
-def test_the_previous_minor_is_still_served() -> None:
-    """0.24 widened the compatibility window rather than shifting it.
+OVERLAP_POLICY_HEADING = "## Version overlap policy (R2-5)"
+"""The contract README heading that publishes owner decision R2-5."""
 
-    A ``0.21`` client has no ``agent-activity`` capability, route or model in
-    its vendored contract, and the since-minor gate both withholds and refuses
-    it (#1968) while every response it already knows stays byte-identical. A
-    ``0.20`` client has ``rate_limited`` in its vendored vocabulary but no
-    ``429`` documented on ``POST /v1/letters/{external_id}``, and every
-    response it can receive keeps its byte-identical shape under #1903 step 6:
-    an admission refusal on that route reaches it as the
-    ``temporarily_unavailable`` that minor served. A ``0.19`` client has no
-    ``keyless_inference`` in its vendored handshake either, and #1938 omits the
-    field for it. Earlier minors are checked alongside them because the window
-    only ever widens.
 
-    The head entry of :data:`SUPPORTED_CONTRACT_MINORS` is *derived* from
-    :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the version
-    without adding the outgoing minor by hand evicts it silently — which is
-    what this test's first line is for, and why it is added at every bump
-    rather than only when somebody suspects a problem.
+def _minor_parts(minor: str) -> tuple[int, int]:
+    """Split a ``major.minor`` string into integers, so ``0.10`` sorts above ``0.9``."""
+    major, number = minor.split(".")
+    return int(major), int(number)
+
+
+def _previous_minor(current: str, served: tuple[str, ...]) -> str | None:
+    """Return the minor R2-5 calls "the one before" *current*, or ``None``.
+
+    Within a major that is ``major.(minor - 1)``, a pure function of
+    *current*. Across a major boundary (``1.0``) there is no arithmetic
+    predecessor, so it is the highest previous-major minor in *served* --
+    and ``None`` when none is, which is itself the R2-5 violation.
     """
-    assert "0.23" in SUPPORTED_CONTRACT_MINORS
-    assert "0.22" in SUPPORTED_CONTRACT_MINORS
-    assert "0.21" in SUPPORTED_CONTRACT_MINORS
-    assert "0.20" in SUPPORTED_CONTRACT_MINORS
-    assert "0.19" in SUPPORTED_CONTRACT_MINORS
-    assert "0.18" in SUPPORTED_CONTRACT_MINORS
-    assert "0.17" in SUPPORTED_CONTRACT_MINORS
-    assert "0.16" in SUPPORTED_CONTRACT_MINORS
-    assert "0.15" in SUPPORTED_CONTRACT_MINORS
-    assert "0.14" in SUPPORTED_CONTRACT_MINORS
-    assert "0.13" in SUPPORTED_CONTRACT_MINORS
-    assert "0.12" in SUPPORTED_CONTRACT_MINORS
-    assert "0.11" in SUPPORTED_CONTRACT_MINORS
-    assert "0.10" in SUPPORTED_CONTRACT_MINORS
-    assert "0.9" in SUPPORTED_CONTRACT_MINORS
-    assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert "0.24" in SUPPORTED_CONTRACT_MINORS
-    assert "0.25" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.26"
+    major, number = _minor_parts(current)
+    if number > 0:
+        return f"{major}.{number - 1}"
+    previous_major = [m for m in served if _minor_parts(m)[0] == major - 1]
+    return max(previous_major, key=_minor_parts, default=None)
+
+
+@pytest.mark.parametrize(
+    ("current", "served", "expected"),
+    [
+        ("0.26", ("0.26", "0.25"), "0.25"),
+        ("0.10", ("0.10",), "0.9"),
+        ("1.0", ("1.0", "0.9", "0.31", "0.4"), "0.31"),
+        ("1.0", ("1.0",), None),
+    ],
+)
+def test_previous_minor_rule(
+    current: str, served: tuple[str, ...], expected: str | None
+) -> None:
+    """The derivation the R2-5 guard leans on is itself pinned.
+
+    Integer comparison matters at the major boundary for the same reason it
+    does in :func:`minor_at_least`: read as text, ``"0.31"`` sorts below
+    ``"0.4"``.
+    """
+    assert _previous_minor(current, served) == expected
+
+
+def test_the_immediately_previous_minor_is_always_served() -> None:
+    """R2-5: Creek serves its pinned minor and the one before, at least.
+
+    Owner decision R2-5 (adepthood
+    ``prompts/claude-comms/2026-10-27-release-decisions.md``) is the floor the
+    contract promises: Adepthood moves its pin only after every vault reports
+    the new minor, so a vault on minor N must still answer a client pinned to
+    N-1 or the pin-advance window breaks.
+
+    Both sides are *derived* -- the current minor from
+    :data:`~creek_mcp.contract.CONTRACT_VERSION` via :data:`CONTRACT_MINOR`,
+    the previous one from :func:`_previous_minor` -- so no bump can leave this
+    guard asserting a stale literal. Its hand-typed predecessor did exactly
+    that: written at 0.24 it asserted ``"0.23"``, and when the window head
+    moved on the minor immediately before it was guarded by nothing derived.
+    The wider widen-only practice is pinned separately by
+    :func:`test_every_minor_below_the_current_one_is_still_served`; this test
+    is the published policy's own guard and holds even if that practice ever
+    changes deliberately.
+    """
+    assert SUPPORTED_CONTRACT_MINORS[0] == CONTRACT_MINOR
+    previous = _previous_minor(CONTRACT_MINOR, SUPPORTED_CONTRACT_MINORS)
+    assert previous is not None, (
+        f"R2-5: no minor before {CONTRACT_MINOR} is served at all"
+    )
+    assert previous in SUPPORTED_CONTRACT_MINORS, (
+        f"R2-5: contract {CONTRACT_MINOR} must still serve the previous minor "
+        f"{previous}, or every Adepthood still pinned to it is refused "
+        "incompatible_version before the fleet has converged.\n"
+        f"served: {list(SUPPORTED_CONTRACT_MINORS)}"
+    )
+
+
+def test_bundle_readme_publishes_the_version_overlap_policy() -> None:
+    """The contract README carries the R2-5 overlap policy a consumer reads.
+
+    The same pin style as :func:`test_adr_publishes_the_runtime_contract_version`:
+    the policy is only a promise if the published bundle states it, and the
+    README is excluded from the bundle round-trip, so nothing else would notice
+    the section being deleted. It must also point at the ADR, whose
+    exact-minor sentence predates ``supported_contract_minors`` negotiation.
+    """
+    text = (BUNDLE_ROOT / "README.md").read_text(encoding="utf-8")
+    assert OVERLAP_POLICY_HEADING in text
+    section = text.split(OVERLAP_POLICY_HEADING, 1)[1].split("\n## ", 1)[0]
+    assert "supported_contract_minors" in section
+    assert ADR_PATH.name in section
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

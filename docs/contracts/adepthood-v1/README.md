@@ -166,6 +166,49 @@ asset (the existing rolling `knowledge-graph` release is the precedent) is
 the natural next step and is deliberately not done as part of this bundle's
 first publication.
 
+## Version overlap policy (R2-5)
+
+Owner decision **R2-5** (adepthood
+`prompts/claude-comms/2026-10-27-release-decisions.md`): *Creek supports the
+pinned contract version and the one before; Adepthood moves its pin only
+after every vault reports the new version.* Compatibility is negotiated at
+**minor** granularity, so "version" here means `major.minor` — a patch bump
+is invisible to the consumer.
+
+1. **Creek serves its current minor and the previous minor, at least.** A
+   vault whose `contract_version` is `0.N.x` lists both `0.N` and `0.(N-1)`
+   in the handshake's `supported_contract_minors`. This is a floor, not the
+   current breadth: in practice the window only widens, and today it still
+   holds every minor back to `0.2`. R2-5 does not authorize pruning it;
+   dropping a minor remains a deliberate breaking change.
+2. **Adepthood advances its pin only after every vault reports the new
+   minor.** "Every vault" means every managed vault and every self-hosted
+   vault on the rollout list, each reporting a `contract_version` /
+   `supported_contract_minors` that includes the new minor. The check that
+   enforces this (a CI or ops gate over the fleet's handshakes) belongs in
+   Adepthood, not here.
+3. **The order of a bump is fixed.** Creek ships minor N while still serving
+   N-1; the fleet converges on the new image (#1869, rolled out per #1888);
+   only then does Adepthood move its pin from N-1 to N. Adepthood never pins
+   a minor that its oldest vault does not serve.
+4. **A vault that has not converged keeps working.** Until the pin moves,
+   Adepthood sends N-1, which both the old and the new vault images serve, so
+   a lagging vault answers exactly as before. Nothing breaks during the
+   window; a client pinned to a minor the vault does not list gets a typed
+   `409 incompatible_version`, never a silently mismatched shape.
+5. **The ADR's compatibility sentence predates negotiation.** The
+   [Versioning](../../decisions/2026-07-31-adepthood-http-application-api.md#versioning)
+   section of `2026-07-31-adepthood-http-application-api.md` still states
+   an exact-minor match (`client_minor == server_minor`). That was written
+   before `supported_contract_minors` existed; the server now accepts any
+   minor in that set. The accepted ADR is left as written and this section
+   is the current policy.
+
+`test_the_immediately_previous_minor_is_always_served` in
+`creek-tools/tests/test_adepthood_contract_models.py` guards point 1. It
+derives the previous minor from `CONTRACT_VERSION` rather than naming it, so
+it cannot go stale at a bump.
+
 ## Security invariants held across every fixture in this bundle
 
 - No fixture contains a real journal body, a credential, or a token.

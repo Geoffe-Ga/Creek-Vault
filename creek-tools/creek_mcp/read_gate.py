@@ -310,6 +310,11 @@ class ToolPosture:
             ``UNGATED_KNOWN_GAP`` entry, and set on nothing else. It was also
             carried by ``creek.journal`` until #970 gated its update-in-place
             path; that entry is now ``GATED`` and names its gate instead.
+        served_remotely: Whether a gated remote agent holding :attr:`grant`
+            is served the tool (#2006). ``False`` only for the tools in
+            :data:`creek_mcp.policy.REMOTE_UNSERVED_TOOLS`, which is the
+            authority; ``tests/test_mcp_oauth_grant_profiles.py`` asserts this
+            column equals it.
     """
 
     posture: ReadPosture
@@ -318,6 +323,7 @@ class ToolPosture:
     gate_module: str | None = None
     gate_symbol: str | None = None
     gap_issue: int | None = None
+    served_remotely: bool = True
 
 
 CANONICAL_GATE_PRIMITIVES: frozenset[str] = frozenset(
@@ -869,8 +875,19 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         grant=Grant.PIPELINE,
         rationale=(
             "The content is the caller's own — a source path they supplied — "
-            "and write_tier_allowed gates the tier the call would create."
+            "and write_tier_allowed gates the tier the call would create. "
+            "That holds for a local operator and for an ungated static "
+            "consumer only. Never served to a gated remote agent (#2006, "
+            "R3-5): input_path names a VAULT path, so over the network the "
+            "'input path not found' answer is an existence oracle over every "
+            "slugified fragment filename and a successful run re-ingests "
+            "content the agent's ceiling never admitted. The tool stays in "
+            "vault:pipeline and is listed, but policy.served_remotely "
+            "refuses it before dispatch with the constant "
+            "TOOL_NOT_SERVED_REMOTELY_REASON, naming no path and no tier; a "
+            "remote agent stages and ingests through creek.upload instead."
         ),
+        served_remotely=False,
     ),
     "creek.purge.fragment": ToolPosture(
         posture=ReadPosture.AUTH_TOKEN,

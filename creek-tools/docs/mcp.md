@@ -453,7 +453,7 @@ Jobs reuse the `/v1` durable job store (`creek_mcp/httpapi/jobs.py`, kinds
 | Tool                    | Inputs                                                      | Write-side tier rule                                              |
 |-------------------------|-------------------------------------------------------------|-------------------------------------------------------------------|
 | `creek.save`            | `target`, `body`, `title?`, `tier`, `provenance?`           | `tier` is **required** on every call and is never inferred from `provenance` or the source fragments; an omitted `tier` is refused outright (`status: refused`), not defaulted. Caller's `ceiling` must admit the supplied `tier` — intimate via open refused. |
-| `creek.ingest`          | `source_type`, `input_path`                                 | Default ingest tier is `personal`; `ceiling=open` is refused.     |
+| `creek.ingest`          | `source_type`, `input_path`                                 | Default ingest tier is `personal`; `ceiling=open` is refused. **Never served to a gated remote agent** (#2006): refused before dispatch with `this tool is not served to a remote agent` — see [Opting an agent into journal and pipeline](#opting-an-agent-into-journal-and-pipeline-r3-5-2006). |
 | `creek.classify`        | `method` (`rules`\|`llm`), `force`, `retier`                | **Any ceiling permitted — and with `method="llm"` that is a whole-corpus prompt-channel egress** ([#1274](https://github.com/Geoffe-Ga/Creek-Vault/issues/1274)). Every fragment's **title and body** under `01-Fragments` is handed to the configured classification provider whatever ceiling was declared, `open` included (both are interpolated by `build_classification_prompt`, each capped at 8192 chars by `_sanitise_for_prompt`); the ceiling reaches only the audit line and the response envelope. The familiar justification — rewrites in place, no new tier produced — is about the response and the frontmatter, and it does not extend to this channel. The controls on that walk are `ModelRouter._enforce_local_for_intimate` (#647/#666), which redirects `intimate` to a local provider and leaves `personal` alone — the tier split is binary and made in the engine, so `personal` is never presented to the router at all — plus two **host-operator** gates (`has_cloud_consent`, `_assert_classifiers_available`) that answer "may this machine reach a cloud" rather than "may this caller, at this ceiling". Gating the walk on the ceiling is deliberately not done: `unclassified` ranks equal to `personal`, so refusing to classify above the ceiling would preserve an exposure rather than prevent one. See the Model-prompt row below and `read_gate._CLASSIFY_PROMPT_CHANNEL_RATIONALE`. `retier` re-derives an already-recorded privacy tier and persists it only when the new verdict is **stricter** (#1106), so it can tighten a tier a write verb's caller declared wrongly and can never loosen one (#1570). |
 | `creek.link`            | `method` (`embeddings`\|`temporal`\|`eddies`\|`threads`), `rebuild` | Links existing artefacts in place — any ceiling permitted. The method list is `creek.surface_modes.LINK_METHODS`, the same declaration `creek link` reads; until [#1252](https://github.com/Geoffe-Ga/Creek-Vault/issues/1252) this tool carried a retyped copy that had lost `threads`, putting the whole thread half of #880 out of an MCP caller's reach. The response also carries `largest_cluster_fragments`, `clusters_split` and `oversized_discarded` — the cluster-health counts `creek link` has always printed to its console (`creek.cli._format_cluster_stats`), while the MCP caller was told only `link_count` and so read a `status: ok` degenerate pass as a clean one ([#1372](https://github.com/Geoffe-Ga/Creek-Vault/issues/1372)). `oversized_discarded` in particular is data loss — those fragments carry no wiki-link at all. All three are plain ints on `LinkSummary`, a frozen dataclass of counts; none can ever name a fragment, so unlike the ingest advisories below they need no ceiling gate. |
 | `creek.report`          | `report_type` (all eleven of `creek.surface_modes.REPORT_TYPES`), `period` (`wavelength` only) | The accepted types are the CLI's, derived not retyped ([#1253](https://github.com/Geoffe-Ga/Creek-Vault/issues/1253)); this tool used to advertise six of eleven, so `unnamed`, `fingerprint`, `paradox`, `synchronicity` and `wavelength` read to a caller as though they were not report types at all. Reachable is not the same as served: the four generators behind `unnamed`, `fingerprint`, `paradox` and `synchronicity` accept no `PrivacyTierOverride`, so they are served **only at `ceiling=all`** — the ceiling `creek report` itself runs them under — and refused below it by name, naming the generator to widen. `wavelength` takes a `period` (`weekly`\|`monthly`\|`YYYY-Www`\|`YYYY-MM`) and shares `creek.generate.wavelength.generate_phase_map` with the CLI. Ceiling is enforced on the *inputs* of every filterable generator (#968): a note enters the artifact only if its raw front matter is within `ceiling`, and a missing `privacy_tier` fails closed to `intimate`. Consequence for `tags`: the Tag Garden scans five directories, and the four beyond `01-Fragments` hold note types with no `privacy_tier` field at all, so **a ceiling-filtered tag garden is fragment-derived only**. `tag-history.json` entries record the `tier_ceiling` they were taken under, and growth is only ever compared between entries at the same ceiling. |
@@ -904,7 +904,8 @@ challenge asks for:
   `creek.classify`, `creek.link`, `creek.compile`, `creek.report`,
   `creek.skills.refresh`, `creek.redact.scan`, `creek.state.render`) unless it
   also holds `vault:pipeline`. Such a call is refused before it runs and is
-  recorded as refused.
+  recorded as refused. Both grants are yours to give: see
+  [Opting an agent into journal and pipeline](#opting-an-agent-into-journal-and-pipeline-r3-5-2006).
 - **Never, whatever it holds:** your Intimate writing (every remote caller is
   capped at `personal`; a request for `intimate` or `all` is refused before
   dispatch — see "INTIMATE is never reachable remotely" under Network transport),
@@ -914,6 +915,70 @@ What a person reads on Adepthood's consent page and Settings list for each grant
 is Adepthood's copy, owned there: see
 [Agent grants in plain words, and the Settings list](https://github.com/Geoffe-Ga/adepthood/blob/main/docs/creek-vault-mcp-contract.md#agent-grants-in-plain-words-and-the-settings-list-adepthood-owned)
 in Adepthood's contract document. This page does not restate it.
+
+### Opting an agent into journal and pipeline (R3-5, #2006)
+
+The default grants are where an agent starts, not the ceiling of what you may
+let it do. `vault:journal` and `vault:pipeline` are advertised by every vault
+(`scopes_supported`) and offered, unchecked, on Adepthood's consent page as "Add
+journal entries" and "Re-sort your vault". This is owner decision **R3-5**
+(adepthood `prompts/claude-comms/2026-10-27-release-decisions.md`): keep both
+advertised, and make them grantable rather than remove them.
+
+To opt an agent in, ask for the extra grants in the client's pinned scope and
+sign in again, then tick them on the consent page. Approving the same agent
+again replaces its grants. With every grant, the pinned scope is:
+
+```text
+vault:read vault:desk vault:journal vault:pipeline
+```
+
+- **OpenClaw:** set `"oauth":{"scope":"vault:read vault:desk vault:journal vault:pipeline offline_access"}`
+  in the [OpenClaw recipe](#openclaw-recipe), then `openclaw mcp login creek`.
+- **Claude Code:** set `"oauth":{"scopes":"vault:read vault:desk vault:journal vault:pipeline"}`
+  in the [Claude Code recipe](#claude-code-recipe), then `claude mcp login creek`.
+- **ChatGPT and the hosted Claude apps:** neither recipe below has a scope
+  setting. The hosted Claude apps ask for the scope the vault's `401`
+  challenge names, which is the default pair, so this page has no tested way
+  to opt them in yet.
+- **A static token:** add the grants to its suffix, for example
+  `openclaw=<token>@vault:read+vault:desk+vault:journal+vault:pipeline`.
+
+Ask only for the one you want: `vault:read vault:desk vault:journal` lets an
+agent file journal entries without re-sorting the vault. A granted agent's
+`tools/list` then includes that profile. The cap is unchanged by any grant:
+every remote caller still stops at `personal`, and a request for `intimate` or
+`all` is refused before the tool runs.
+
+What a granted agent gets from each tool, as pinned by
+`tests/test_mcp_oauth_grant_profiles.py` on a managed-vault-shaped runtime:
+
+| Tool | Grant | For a remote agent |
+|---|---|---|
+| `creek.journal` | `vault:journal` | Served. Files an entry at the `tier` it names, which may not exceed `personal`. |
+| `creek.upload` | `vault:journal` | Served. Stages a document and ingests it. This is how a remote agent puts a source into the vault. |
+| `creek.classify` | `vault:pipeline` | Served. `method="rules"` runs in the vault. `method="llm"` uses the vault's model; a managed vault never reaches a cloud vendor, and the call is refused with the provider's reason when no local model is available. |
+| `creek.link` | `vault:pipeline` | Served. `method="temporal"` runs in the vault; `embeddings` (the default) uses the vault's own embedding backend. |
+| `creek.compile` | `vault:pipeline` | Served. Its own source-tier gate refuses an id above the agent's ceiling, so an intimate fragment never reaches the summary. |
+| `creek.report` | `vault:pipeline` | Served, at the agent's ceiling. |
+| `creek.skills.refresh` | `vault:pipeline` | Served, at the agent's ceiling. |
+| `creek.redact.scan` | `vault:pipeline` | Served for `00-Creek-Meta/Inbound/`; any other vault path needs `intimate`, which a remote agent cannot ask for. |
+| `creek.state.render` | `vault:pipeline` | Served, at the agent's ceiling. |
+| `creek.ingest` | `vault:pipeline` | **Listed, never served.** Refused before it reads anything. |
+
+**Why `creek.ingest` is refused.** Its `input_path` names a path inside the
+vault. Over the network, its `input path not found` answer would tell an agent
+which fragment filenames exist (they are slugified titles), and a successful run
+would re-ingest writing the agent's ceiling never admitted. A remote agent has
+no source of its own to ingest except through `creek.upload`, which already
+ingests what it stages. So the tool stays in `vault:pipeline` (moving it would
+change the grant table, which is the owner's call) and every call from a gated
+remote agent gets the same answer, whatever path it named:
+`this tool is not served to a remote agent`. The refusal is recorded in the
+audit log as refused. Rule:
+`creek_mcp/policy.py::served_remotely` (`REMOTE_UNSERVED_TOOLS`); posture:
+`creek_mcp/read_gate.py::TOOL_POSTURES["creek.ingest"]`. A local `stdio`
+caller and an ungated static consumer still run it as before.
 
 ### The address to paste
 
@@ -1354,6 +1419,10 @@ routable by design and requires TLS.
   | `vault:journal`  | `creek.journal`, `creek.upload` |
   | `vault:pipeline` | `creek.classify`, `creek.link`, `creek.compile`, `creek.report`, `creek.skills.refresh`, `creek.ingest`, `creek.redact.scan`, `creek.state.render` |
 
+  `creek.ingest` is in `vault:pipeline` and listed to a consumer holding it,
+  but a gated remote consumer is refused it at dispatch with
+  `this tool is not served to a remote agent`
+  (`creek_mcp/policy.py::served_remotely`, #2006).
   The `creek.purge.*` tools are in **no** profile, so a gated consumer never
   reaches them whatever it holds. The default profile for a new agent is
   `vault:read vault:desk`: it can draft and reflect, but cannot journal, and

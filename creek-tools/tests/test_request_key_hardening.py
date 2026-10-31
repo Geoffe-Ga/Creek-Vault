@@ -36,7 +36,8 @@ _REJECTED: Final[str] = "Anthropic API call failed: AuthenticationError (HTTP 40
 
 _FILE_COUNT: Final[int] = 10
 _WORKERS: Final[int] = 2
-_UNBLOCK_SECONDS: Final[float] = 0.2
+_DEADLOCK_GUARD_SECONDS: Final[float] = 10.0
+"""Upper bound on a blocked test worker — a hang guard, never the synchronisation."""
 
 
 class _RejectingProvider:
@@ -128,26 +129,90 @@ def test_an_ordinary_provider_failure_is_still_retried() -> None:
 def test_a_failing_file_stops_the_dispatch_of_every_file_not_yet_started(
     tmp_path: Path,
 ) -> None:
-    """The concurrent dispatcher cancels pending work once one file raises.
+    """A fast failure behind a slow file starts nothing more (#2010).
 
-    ``executor.map`` alone would surface the error only after its executor's
-    ``shutdown(wait=True)`` had run every queued file, so a rejected key would
-    still cost one vendor call per fragment in the vault.
+    File 0 blocks; file 1 fails at once. Draining results in submission order
+    left the main thread parked on file 0 while the free worker took every
+    queued file. The dispatcher must instead act on the first *completed*
+    failure: no file beyond the two already running is ever started.
+
+    The order is forced, never slept into being: file 0 is released only by a
+    spy on the dispatcher's ``wait`` once it has handed back the failed future,
+    i.e. after the decision to stop has been made. (Under the old drain, the
+    last file starting releases it instead, so the RED run cannot hang.)
     """
     files = [tmp_path / f"{index:02d}.md" for index in range(_FILE_COUNT)]
     started: list[Path] = []
     release = threading.Event()
+    real_wait = classify_engine.wait
 
     def _process(md_file: Path) -> None:
         started.append(md_file)
         if md_file == files[0]:
+            release.wait(_DEADLOCK_GUARD_SECONDS)
+        elif md_file == files[1]:
             raise RequestKeyRejectedError(_REJECTED)
-        release.wait(_UNBLOCK_SECONDS)
+        elif md_file == files[-1]:
+            release.set()
 
-    with pytest.raises(RequestKeyRejectedError):
+    def _spy_wait(fs: Any, **kwargs: Any) -> Any:
+        outcome = real_wait(fs, **kwargs)
+        if any(future.exception() is not None for future in outcome.done):
+            release.set()
+        return outcome
+
+    with (
+        patch.object(classify_engine, "wait", side_effect=_spy_wait),
+        pytest.raises(RequestKeyRejectedError),
+    ):
         classify_engine._dispatch_files(files, _process, workers=_WORKERS)
 
-    assert len(started) < _FILE_COUNT
+    assert sorted(started) == files[:_WORKERS]
+
+
+def test_the_concurrent_dispatcher_still_processes_every_file(tmp_path: Path) -> None:
+    """With no failure, every file runs once and never more than *workers* at a time."""
+    files = [tmp_path / f"{index:02d}.md" for index in range(_FILE_COUNT)]
+    started: list[Path] = []
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+
+    def _process(md_file: Path) -> None:
+        nonlocal running, peak
+        with lock:
+            started.append(md_file)
+            running += 1
+            peak = max(peak, running)
+        with lock:
+            running -= 1
+
+    classify_engine._dispatch_files(files, _process, workers=_WORKERS)
+
+    assert sorted(started) == files
+    assert peak <= _WORKERS
+
+
+def test_simultaneous_failures_raise_the_earliest_submitted(tmp_path: Path) -> None:
+    """Two failures completing together surface the first file's error."""
+    files = [tmp_path / f"{index:02d}.md" for index in range(_WORKERS)]
+    both_running = threading.Barrier(_WORKERS)
+
+    def _process(md_file: Path) -> None:
+        both_running.wait(_DEADLOCK_GUARD_SECONDS)
+        raise RuntimeError(md_file.name)
+
+    real_wait = classify_engine.wait
+
+    def _wait_for_both(fs: Any, **kwargs: Any) -> Any:
+        del kwargs
+        return real_wait(fs)
+
+    with (
+        patch.object(classify_engine, "wait", side_effect=_wait_for_both),
+        pytest.raises(RuntimeError, match=files[0].name),
+    ):
+        classify_engine._dispatch_files(files, _process, workers=_WORKERS)
 
 
 def test_a_request_scoped_run_ends_at_the_first_rejection(tmp_path: Path) -> None:

@@ -67,6 +67,7 @@ from creek_mcp.policy import (
     admitted_tool,
     effective_consumer,
     granted_by_scopes,
+    served_remotely,
 )
 from creek_mcp.provenance import (
     InferenceProvenance,
@@ -353,7 +354,12 @@ class _BoundedFastMCP(FastMCP):
 
         The tool verdict is asked first: a tool the caller was not granted is
         refused whatever ceiling it named, and audited as refused under the
-        tool name only (:meth:`_refuse_audited`). Then the ceiling verdict,
+        tool name only (:meth:`_refuse_audited`). Then whether a granted tool
+        is served to this caller at all (#2006,
+        :func:`creek_mcp.policy.served_remotely`): ``creek.ingest`` stays in
+        ``vault:pipeline`` but is never served to a gated remote agent, and is
+        refused, audited the same way, before it reads any path. Then the
+        ceiling verdict,
         whose refusal is audited the same way (#1968): the owner's activity
         card (``GET /v1/agent-activity``) shows an agent reaching above
         ``personal`` as a refused call. The entry is content-free by
@@ -388,6 +394,9 @@ class _BoundedFastMCP(FastMCP):
         # than leaving the regression to be noticed at runtime.
         if not isinstance(granted, Admission):
             return await self._refuse_audited(name, identity, granted.reason)
+        served = served_remotely(identity, name)
+        if not isinstance(served, Admission):
+            return await self._refuse_audited(name, identity, served.reason)
         raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
         verdict = admitted_ceiling(identity, raw)
         if isinstance(verdict, Admission):
