@@ -54,6 +54,7 @@ from creek_mcp.provisioning.models import (
     FleetTelemetry,
     ResourceClass,
     ResourceState,
+    RoutableAllocation,
 )
 from creek_mcp.provisioning.pool_bundle import (
     POOL_BUNDLE_VERSION_ENV,
@@ -91,6 +92,8 @@ from tests.test_provisioning_production_adapters import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from creek_mcp.provisioning.models import ProvisioningJob
 
 _TODAY = date(2026, 10, 21)
 
@@ -201,6 +204,21 @@ def _machine(api: FakeFlyAPI) -> dict[str, Any]:
     return machines[0]
 
 
+def _route(driver: FlyProviderDriver, job: ProvisioningJob, *, replay: bool) -> None:
+    """Route *job*'s allocation the way the edge does on its runtime."""
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        driver.expected_allocation_id(job.activation_id),
+    )
+    if replay:
+        driver.prepare_replay(routed)
+    else:
+        driver.prepare_route(routed)
+
+
 @pytest.mark.parametrize("fly_replay_enabled", [False, True])
 def test_pool_bundle_reaches_the_machine_on_both_runtimes(
     *,
@@ -220,25 +238,36 @@ def test_pool_bundle_reaches_the_machine_on_both_runtimes(
     assert POOL_VENDOR_KEY_GUEST_PATH in paths
 
 
+_STALE = FailureReason.PROVIDER_UNAVAILABLE
+_FOREIGN = FailureReason.PROVIDER_REJECTED
+
+
 @pytest.mark.parametrize("fly_replay_enabled", [False, True])
 @pytest.mark.parametrize(
-    "mutate",
+    ("mutate", "reason"),
     [
         pytest.param(
             lambda c: c["env"].__setitem__("CREEK_POOL_URL", "https://x.test"),
+            _STALE,
             id="pool-url",
         ),
-        pytest.param(lambda c: c["env"].pop("CREEK_POOL_URL"), id="pool-url-absent"),
         pytest.param(
-            lambda c: c["env"].pop("CREEK_MODEL_PACKAGE_FILE"), id="manifest-env-absent"
+            lambda c: c["env"].pop("CREEK_POOL_URL"), _STALE, id="pool-url-absent"
+        ),
+        pytest.param(
+            lambda c: c["env"].pop("CREEK_MODEL_PACKAGE_FILE"),
+            _STALE,
+            id="manifest-env-absent",
         ),
         pytest.param(
             lambda c: c["env"].__setitem__(POOL_BUNDLE_VERSION_ENV, "2"),
+            _STALE,
             id="bundle-version",
         ),
-        pytest.param(lambda c: c["files"].pop(), id="secret-file-missing"),
+        pytest.param(lambda c: c["files"].pop(), _STALE, id="secret-file-missing"),
         pytest.param(
             lambda c: c["files"][-1].__setitem__("raw_value", "dGFtcGVyZWQ="),
+            _FOREIGN,
             id="secret-file-tampered",
         ),
     ],
@@ -247,13 +276,37 @@ def test_verify_machine_rejects_a_machine_that_drifts_from_its_bundle(
     *,
     fly_replay_enabled: bool,
     mutate: Any,
+    reason: FailureReason,
 ) -> None:
-    """T12: env or files differing from the activation's bundle are refused."""
+    """T12: env or files differing from the activation's bundle are refused.
+
+    A route never adopts or rewrites the drift.  Drift the bundle itself can
+    repair is refused retryably for the operator's converge; a secret value
+    the bundle does not hold is a permanent rejection (#1869).
+    """
     api, driver, _ = _provisioned(fly_replay_enabled=fly_replay_enabled)
     mutate(_machine(api)["config"])
     with pytest.raises(ProviderError) as caught:
-        driver.provision(fly_job())
-    assert caught.value.reason is FailureReason.PROVIDER_REJECTED
+        _route(driver, fly_job(), replay=fly_replay_enabled)
+    assert caught.value.reason is reason
+    assert api.updates == []
+
+
+@pytest.mark.parametrize("fly_replay_enabled", [False, True])
+def test_a_provisioning_retry_rewrites_pool_drift_to_its_bundle(
+    *,
+    fly_replay_enabled: bool,
+) -> None:
+    """T12 on the worker: a stopped Machine is put back to exactly its bundle."""
+    api, driver, secrets = _provisioned(fly_replay_enabled=fly_replay_enabled)
+    _machine(api)["config"]["env"]["CREEK_POOL_URL"] = "https://x.test"
+
+    driver.provision(fly_job())
+
+    bundle = secrets.issued["activation-fly-001"].pool
+    assert bundle is not None
+    assert _machine(api)["config"]["env"]["CREEK_POOL_URL"] == bundle.pool_url
+    assert len(api.updates) == 1
 
 
 def test_policy_flip_without_a_roll_rejects_nothing() -> None:
@@ -303,8 +356,8 @@ def test_tampering_one_machine_rejects_exactly_that_machine() -> None:
     )
     api.machines[bad_app][0]["config"]["env"]["CREEK_POOL_URL"] = "https://other.test"
     with pytest.raises(ProviderError):
-        driver.provision(bad)
-    driver.provision(good)
+        _route(driver, bad, replay=False)
+    _route(driver, good, replay=False)
 
 
 def test_a_bundle_without_a_pool_installs_no_pool_fields() -> None:

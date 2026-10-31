@@ -595,8 +595,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     parser = build_parser()
     args = parser.parse_args(argv)
+    one_shot = worker_cli.selects_one_shot(args, parser)
     bundle = compose(args, parser)
-    if args.roll_mcp_oauth is not None or args.check_mcp_audience:
+    if one_shot:
         try:
             status = worker_cli.run_one_shot(
                 args, bundle.worker.driver, bundle.worker.secrets

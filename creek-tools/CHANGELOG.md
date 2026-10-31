@@ -31,6 +31,26 @@ to locate the originating commit for any reference below.
   `duplicate_resource`. Reports and alerts carry allocation ids, ages and
   counts only, never a key value.
 
+- Give existing managed-vault Machines an upgrade path (#1869, owner decision
+  R2-1). A new vault image or runtime config no longer strands every older
+  vault. `--converge-vault-machines` on the worker and the pilot is an
+  operator-run batch: a dry run by default that lists each allocation's
+  drifted field names; `--converge-apply` updates at most `--converge-limit`
+  (default 1) stopped Machines per run. Each update writes a write-ahead,
+  owner-only `--converge-journal` entry (secret file values as digests only),
+  then verifies the Machine exactly and proves readiness. The batch halts at
+  the first failure, a re-run resumes safely, and `--converge-rollback`
+  restores the recorded prior config. A Machine is converged only when its
+  identity is exact (name, region, metadata, root filesystem, the single
+  mount on its own volume, an immutable image, and secret files its record
+  reproduces) and only policy-owned fields differ. Records are read through
+  the read-only reader, so no credential is ever rotated; the volume is never
+  touched. Routing still never mutates: a stale Machine with an exact
+  identity is now refused retryably (`provider_unavailable`) instead of
+  rejected, and identity drift stays `provider_rejected`. A provisioning
+  retry converges its own never-handed-off stopped Machine in place. New
+  `ProvisioningStore.list_routable_allocations()` and
+  `creek_mcp.provisioning.vault_converge`.
 - Free the admission slot of a failed create (#2019, owner decision R2-3).
   Reconcile now reports every failed create that still owns provider
   resources as `incomplete_create` (a handoff failure after `provision()`
