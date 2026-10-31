@@ -22,7 +22,10 @@ from creek_mcp.provisioning.fly import (
     FlyProviderPolicy,
 )
 from creek_mcp.provisioning.handoff import HttpOneTimeCredentialHandoff
-from creek_mcp.provisioning.mcp_oauth_rollout import roll_owned_allocation
+from creek_mcp.provisioning.mcp_oauth_rollout import (
+    check_shared_audience,
+    roll_owned_allocation,
+)
 from creek_mcp.provisioning.models import McpOAuthSettings, public_vault_url
 from creek_mcp.provisioning.production_secrets import EncryptedFileFlySecretManager
 from creek_mcp.provisioning.store import ProvisioningStore
@@ -37,7 +40,9 @@ _DEFAULT_POLL_SECONDS: Final[float] = 1.0
 _DEFAULT_LEASE_SECONDS: Final[float] = 60.0
 _DEFAULT_PROVIDER_TIMEOUT_SECONDS: Final[float] = 30.0
 _DEFAULT_CALLBACK_TIMEOUT_SECONDS: Final[float] = 10.0
-_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=7)
+# Owner decision R2-2: org tokens live at most 90 days; the scheduled report
+# warns 72 hours before the recorded expiry (#1867, #1868).
+_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=90)
 _MAX_PROVIDER_BOUNDARIES_PER_CLAIM: Final[int] = 10
 
 
@@ -123,21 +128,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_mcp_oauth_roll_argument(parser: argparse.ArgumentParser) -> None:
-    """Add the one-shot MCP OAuth rollout selector (#1974).
+    """Add the one-shot MCP OAuth rollout selectors (#1974, #2004).
 
     Given ``--roll-mcp-oauth REQUESTER CONSUMER`` the process composes as
     usual, rolls that one allocation onto the configured settings, and exits
     with the status :mod:`creek_mcp.provisioning.mcp_oauth_rollout` names
-    instead of claiming jobs.
+    instead of claiming jobs.  ``--check-mcp-audience`` instead runs the fleet
+    check and exits ``0`` only when no allocation remains on the shared
+    audience.  The two are alternatives.
 
     Args:
         parser: The parser to extend.
     """
-    parser.add_argument(
+    one_shot = parser.add_mutually_exclusive_group()
+    one_shot.add_argument(
         "--roll-mcp-oauth",
         nargs=2,
         metavar=("REQUESTER", "CONSUMER"),
         default=None,
+    )
+    one_shot.add_argument(
+        "--check-mcp-audience",
+        action="store_true",
+        help=(
+            "exit 0 only when every allocation is on its own MCP resource "
+            "(#2004); run before --refuse-shared-mcp-audience"
+        ),
     )
 
 
@@ -192,6 +208,27 @@ def run_mcp_oauth_roll(
     )
 
 
+def run_one_shot(
+    args: argparse.Namespace,
+    driver: FlyProviderDriver,
+    secrets: EncryptedFileFlySecretManager,
+) -> int:
+    """Run the one-shot rollout operation *args* selects.
+
+    Args:
+        args: Parsed arguments selecting ``--roll-mcp-oauth`` or, failing
+            that, ``--check-mcp-audience``.
+        driver: The composed Fly driver.
+        secrets: The composed encrypted record writer.
+
+    Returns:
+        The operation's exit status.
+    """
+    if args.roll_mcp_oauth is not None:
+        return run_mcp_oauth_roll(args, driver, secrets)
+    return check_shared_audience(secrets)
+
+
 def compose(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -217,7 +254,7 @@ def compose(
             "--fly-token-expires-at is too near for one bounded provisioning claim"
         )
     if expires_at > observed_at + _MAX_FLY_TOKEN_LIFETIME:
-        parser.error("--fly-token-expires-at must be no more than seven days away")
+        parser.error("--fly-token-expires-at must be no more than 90 days away")
     try:
         with ExitStack() as resources:
             credential = FlyCredential.from_file(
@@ -337,9 +374,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     bundle = compose(args, parser)
-    if args.roll_mcp_oauth is not None:
+    if args.roll_mcp_oauth is not None or args.check_mcp_audience:
         try:
-            status = run_mcp_oauth_roll(args, bundle.driver, bundle.secrets)
+            status = run_one_shot(args, bundle.driver, bundle.secrets)
         finally:
             bundle.close()
         raise SystemExit(status)

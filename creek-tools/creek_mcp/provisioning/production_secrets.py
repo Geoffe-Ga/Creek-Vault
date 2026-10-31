@@ -392,14 +392,17 @@ class EncryptedFileFlySecretManager:
         return rolled
 
     def roll_mcp_oauth(self, activation_id: str) -> McpOAuthSettings:
-        """Write the configured MCP OAuth settings into one existing record.
+        """Write the rolled MCP OAuth settings into one existing record.
 
-        The record half of #1974's rollout for an activation issued before the
-        settings existed; :meth:`FlyProviderDriver.roll_mcp_oauth` calls it only
-        once the Machine is proven exactly legacy and stopped, then updates the
-        Machine to match.  Writing the settings an activation already holds is
-        a no-op, so an interrupted roll can be retried.  The replacement is
-        atomic, so a concurrent router reads the old record or the new one,
+        The record half of the roll; :meth:`FlyProviderDriver.roll_mcp_oauth`
+        calls it only once the Machine is proven exactly its pre-roll shape and
+        stopped, then updates the Machine to match.  Without the
+        per-allocation flag a legacy record takes the configured shared
+        settings (#1974).  With it (#2004) a legacy or shared record takes its
+        own ``<edge>/a/<slug>/mcp``, the slug minted here once: a record
+        already scoped under the configured edge is left as it is, so an
+        interrupted roll is retried with the slug it minted.  The replacement
+        is atomic, so a concurrent router reads the old record or the new one,
         never a torn one.
 
         Args:
@@ -411,7 +414,7 @@ class EncryptedFileFlySecretManager:
         Raises:
             ValueError: When no settings are configured, the activation has no
                 stored record or has been revoked, or its record already holds
-                other settings — a change of issuer or address is not this
+                other settings — a change of issuer or edge is not this
                 transition.
         """
         configured = self._mcp_oauth
@@ -421,14 +424,53 @@ class EncryptedFileFlySecretManager:
         bundle_path, revoked_path = self._paths(digest)
         self._refuse_revoked(bundle_path, revoked_path)
         document = _load_document(self._cipher, bundle_path, digest)
-        if document.mcp_oauth == configured:
-            return configured
-        if document.mcp_oauth is not None:
-            raise ValueError("activation already holds other MCP OAuth settings")
-        updated = dataclasses.replace(document, mcp_oauth=configured)
+        target = configured.roll_target(
+            document.mcp_oauth, per_allocation=self._per_allocation_mcp_resource
+        )
+        if target == document.mcp_oauth:
+            return target
+        updated = dataclasses.replace(document, mcp_oauth=target)
         _replace_durably(bundle_path, self._encrypt(updated.encode(), _aad(digest)))
         self._refuse_revoked(bundle_path, revoked_path)
-        return configured
+        return target
+
+    def mcp_oauth_is_current(self, settings: McpOAuthSettings) -> bool:
+        """Return whether a record holding *settings* needs no roll (#2004).
+
+        Args:
+            settings: The settings one record holds.
+
+        Returns:
+            ``True`` with nothing configured to roll toward, else whether the
+            record is where :meth:`roll_mcp_oauth` would leave it.
+
+        Raises:
+            ValueError: When *settings* are no shape the roll recognizes.
+        """
+        if self._mcp_oauth is None:
+            return True
+        return self._mcp_oauth.is_rolled(
+            settings, per_allocation=self._per_allocation_mcp_resource
+        )
+
+    def shared_audience_activations(self) -> tuple[str, ...]:
+        """List every live activation not yet on its own resource (#2004).
+
+        The fleet check an operator runs before refusing the shared audience
+        at the edge, and that a batch converge (#1869) can reuse.
+
+        Returns:
+            The activation ids, sorted; empty once every record is rolled.
+
+        Raises:
+            ValueError: When no settings are configured, or any record is
+                unreadable — a record it cannot read cannot be proven rolled.
+        """
+        if self._mcp_oauth is None:
+            raise ValueError("no MCP OAuth settings are configured")
+        return _shared_audience_activations(
+            self._state_directory, self._cipher, self._mcp_oauth
+        )
 
     def _paths(self, digest: str) -> tuple[Path, Path]:
         return (
@@ -731,6 +773,23 @@ class EncryptedFileRoutingCredentialVerifier:
             consumer_identity,
         )
 
+    def shared_audience_activations(self, shared: McpOAuthSettings) -> tuple[str, ...]:
+        """List every live activation not yet on its own resource (#2004).
+
+        The edge refuses ``--refuse-shared-mcp-audience`` while this is
+        non-empty.
+
+        Args:
+            shared: The edge's shared resource and issuer.
+
+        Returns:
+            The activation ids, sorted.
+
+        Raises:
+            ValueError: When any record is unreadable.
+        """
+        return _shared_audience_activations(self._state_directory, self._cipher, shared)
+
     def _principal_for_resource(
         self, resource_url: str, authorization_server: str, consumer_identity: str
     ) -> RoutingPrincipal | None:
@@ -810,6 +869,40 @@ class EncryptedFileRoutingCredentialVerifier:
                 )
                 matched = principal
         return None if conflicting else matched
+
+
+def _shared_audience_activations(
+    state_directory: Path, cipher: AESGCM, shared: McpOAuthSettings
+) -> tuple[str, ...]:
+    """Return every live record not scoped to its own resource under *shared*.
+
+    A record holding the shared resource, or none at all (legacy), is listed;
+    so is one naming another edge or issuer, which no roll clears.  A revoked
+    record is no allocation and is skipped.  Anything unreadable fails closed.
+
+    Args:
+        state_directory: The encrypted record directory.
+        cipher: Its decryption key.
+        shared: The configured shared edge settings.
+
+    Returns:
+        The listed activation ids, sorted.
+
+    Raises:
+        ValueError: On a stray file name or an unreadable record.
+    """
+    pending: list[str] = []
+    for bundle_path in sorted(state_directory.glob("*.bundle")):
+        digest = bundle_path.stem
+        if _BUNDLE_NAME_RE.fullmatch(digest) is None:
+            raise ValueError("runtime secret state is invalid")
+        if bundle_path.with_suffix(".revoked").exists():
+            continue
+        document = _load_document(cipher, bundle_path, digest)
+        held = document.mcp_oauth
+        if held is None or held.shared_edge() != shared:
+            pending.append(document.activation_id)
+    return tuple(sorted(pending))
 
 
 def _private_key_matches_certificate(

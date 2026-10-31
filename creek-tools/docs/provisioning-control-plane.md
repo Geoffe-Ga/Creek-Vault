@@ -282,6 +282,73 @@ record write and the Machine update a route to that one vault is refused;
 re-run the roll to finish. A change of issuer or address for a record that
 already holds values is not this transition and is refused.
 
+### Rolling every allocation off the shared audience (#2004)
+
+Before #2002 every allocation's record named the shared edge resource,
+`<edge>/mcp`, so one agent token was valid at every vault. #2002 gives each
+*new* allocation its own `<edge>/a/<slug>/mcp` behind
+`--per-allocation-mcp-resource`, and #2003 routes it at the edge. Existing
+allocations move through the same `--roll-mcp-oauth` selector: with
+`--per-allocation-mcp-resource` set, the roll has a second transition, shared
+resource to per-allocation resource.
+
+It is recognized exactly: the record holds the configured shared edge resource
+and issuer, and the Machine is exactly that record and stopped. The roll mints
+the slug once, writes it into the record, then updates the Machine in place,
+still stopped. A record that holds no settings yet (legacy) goes straight to
+its own resource. If the roll is interrupted between the record and the
+Machine, the record already names its slug and the Machine still names
+`<edge>/mcp`. That one shape is also recognized, and a re-run finishes with
+the same slug. Any other issuer, edge or Machine shape is drift and refused,
+with record and Machine untouched.
+
+Each roll logs one content-free line, `mcp oauth roll: <report>`:
+
+| Report | Meaning | Exit |
+|---|---|---|
+| `rolled` | Record and Machine moved together; the Machine is stopped. | `0` |
+| `already-current` | Already on its own resource; nothing written, even while running. | `0` |
+| `refused(provider_unavailable, retryable)` | The Machine is running; untouched, it keeps routing. Retry after it scales to zero. | `75` |
+| `refused(provider_rejected)` | Drift; untouched. | `2` |
+| `refused(record)` | The record holds other settings, or no issuer is configured. | `2` |
+
+Without `--per-allocation-mcp-resource` the roll behaves exactly as in #1974,
+and a shared allocation reports `already-current`.
+
+An agent holding a token or refresh family for the old `<edge>/mcp` audience
+must reconnect after its vault is rolled. This is accepted before release.
+
+The fleet check lists every live allocation whose record is not its own
+resource under the configured edge: shared, legacy, or naming another edge or
+issuer. Revoked records are skipped, and an unreadable record fails the check
+rather than passing it. Run it with the worker's composition (the pilot takes
+the same selector):
+
+```console
+creek-provisioning-worker <the worker's usual options> \
+  --oauth-authorization-server https://adepthood.example \
+  --check-mcp-audience
+```
+
+It logs only a count and exits `0` when none remain, `3` when any do, and `2`
+when the records cannot be read or no issuer is configured. It cannot be
+combined with `--roll-mcp-oauth`.
+
+Do the cut-over in this order:
+
+1. Confirm Geoffe-Ga/adepthood#3584 is live, so Adepthood mints each token
+   for the per-allocation URL it was handed.
+2. Enable `--per-allocation-mcp-resource` on the worker and the edge (the
+   pilot's one switch drives both), so new allocations get their own resource
+   and the edge routes `/a/<slug>/mcp`.
+3. Roll every allocation with `--roll-mcp-oauth <requester> <consumer>`,
+   re-running each `75` once its Machine has stopped.
+4. Run `--check-mcp-audience` until it exits `0`.
+5. Only then add `--refuse-shared-mcp-audience` to the edge. The edge enforces
+   the order itself: with that switch it refuses to start while the fleet
+   check over its encrypted records is non-empty or unreadable, naming only
+   the count.
+
 ## Fly Machines driver (#1770)
 
 Compose `FlyProviderDriver` only in the separate worker process. The API

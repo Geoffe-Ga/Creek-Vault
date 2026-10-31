@@ -39,7 +39,7 @@ from creek_mcp.provisioning.fly import (
     FlyProviderDriver,
     FlyProviderPolicy,
 )
-from creek_mcp.provisioning.models import FailureReason
+from creek_mcp.provisioning.models import FailureReason, McpOAuthSettings
 from creek_mcp.provisioning.production_secrets import (
     EncryptedFileRoutingCredentialVerifier,
     ReadOnlyFlySecretManager,
@@ -63,7 +63,9 @@ if TYPE_CHECKING:
 _DEFAULT_FLY_API: Final[str] = "https://api.machines.dev"
 _DEFAULT_PROVIDER_TIMEOUT_SECONDS: Final[float] = 30.0
 _DEFAULT_READINESS_TIMEOUT_SECONDS: Final[int] = 20
-_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=7)
+# Owner decision R2-2: org tokens live at most 90 days; the scheduled report
+# warns 72 hours before the recorded expiry (#1867, #1868).
+_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=90)
 _MAX_PROVIDER_BOUNDARIES_PER_ROUTE: Final[int] = 8
 
 
@@ -284,8 +286,9 @@ def agent_routing(
     Raises:
         ValueError: When an issuer is set but the resource URL is missing or
             any URL is unsafe, the revocation flags are half-set or set
-            without an issuer, or an audience switch is set without the
-            issuer or the per-allocation route it depends on.
+            without an issuer, an audience switch is set without the issuer
+            or the per-allocation route it depends on, or the shared audience
+            is refused while any allocation remains on it (#2004).
     """
     issuer = args.oauth_authorization_server
     revocation = _revocation(args)
@@ -307,12 +310,43 @@ def agent_routing(
     )
     if revocation is None:
         logging.getLogger(AGENT_TOKEN_LOGGER_NAME).warning(REVOCATION_NOT_ENFORCED)
-    return AgentRouting(
+    routing = AgentRouting(
         JwtAgentTokenVerifier(config, revocation=revocation),
         principals,
         allocations=principals if per_allocation else None,
         shared_audience=not refuse_shared,
     )
+    if refuse_shared:
+        _require_no_shared_audience(principals, config)
+    return routing
+
+
+def _require_no_shared_audience(
+    principals: EncryptedFileRoutingCredentialVerifier,
+    config: ResourceServerConfig,
+) -> None:
+    """Refuse to stop accepting ``/mcp``'s audience while anyone still needs it.
+
+    #2004's guard: ``--refuse-shared-mcp-audience`` is enforceable only once
+    the fleet check over the encrypted records is empty, so an allocation
+    that was never rolled is not cut off from its agents.
+
+    Args:
+        principals: The encrypted records.
+        config: The edge's shared resource and issuer.
+
+    Raises:
+        ValueError: Naming only how many allocations remain, or when the
+            records cannot be read and so cannot be proven rolled.
+    """
+    pending = principals.shared_audience_activations(
+        McpOAuthSettings(config.resource_url, config.authorization_server)
+    )
+    if pending:
+        raise ValueError(
+            f"{len(pending)} allocation(s) remain on the shared MCP audience; "
+            "roll every allocation before --refuse-shared-mcp-audience"
+        )
 
 
 def compose(
@@ -331,7 +365,7 @@ def compose(
     if expires_at <= observed_at + minimum_validity:
         parser.error("--fly-token-expires-at is too near for one bounded route")
     if expires_at > observed_at + _MAX_FLY_TOKEN_LIFETIME:
-        parser.error("--fly-token-expires-at must be no more than seven days away")
+        parser.error("--fly-token-expires-at must be no more than 90 days away")
     provider_client: httpx.Client | None = None
     private_client: httpx.AsyncClient | None = None
     try:
@@ -425,7 +459,7 @@ def compose_replay(
     if expires_at <= observed_at + minimum_validity:
         parser.error("--fly-token-expires-at is too near for one bounded route")
     if expires_at > observed_at + _MAX_FLY_TOKEN_LIFETIME:
-        parser.error("--fly-token-expires-at must be no more than seven days away")
+        parser.error("--fly-token-expires-at must be no more than 90 days away")
     provider_client: httpx.Client | None = None
     try:
         credential = FlyCredential.from_file(

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
+from creek_mcp.provisioning.credential_expiry import validate_token_id
 from creek_mcp.provisioning.pool_admin_key import (
     POOL_ADMIN_KEY_EXPIRES_AT_ENV,
     POOL_ADMIN_KEY_GUEST_PATH,
@@ -34,6 +35,7 @@ _TOKENS: Final[tuple[str, ...]] = (
     "VAULT_IMAGE",
     "CONTROL_IMAGE",
     "TOKEN_EXPIRES_AT",
+    "TOKEN_ID",
     "HANDOFF_URL",
     "ALERT_URL",
     "VOLUME",
@@ -108,6 +110,13 @@ class FlyPilotCoordinates:
     config into the in-use regime, which declares the secret and makes every
     custody refusal in :mod:`creek_mcp.provisioning.pool_admin_key` binding.
     """
+    token_id: str | None = None
+    """The Fly token's non-secret ID, named by the expiry alert (#1867).
+
+    Optional so an existing render keeps working; an unrecorded ID renders
+    empty and the alert says "ID unrecorded".  It is shape-checked so a pasted
+    token cannot be rendered into ``fly.toml``.
+    """
 
     def __post_init__(self) -> None:
         """Reject placeholders, mutable images, and TOML/shell injection."""
@@ -125,6 +134,8 @@ class FlyPilotCoordinates:
         ):
             raise ValueError("Fly pilot images must use immutable sha256 digests")
         _require_aware_instant(self.token_expires_at, field="token expiry")
+        if self.token_id is not None:
+            validate_token_id(self.token_id)
         if self.pool_admin_key_expires_at is not None:
             _require_aware_instant(
                 self.pool_admin_key_expires_at, field="pool admin key expiry"
@@ -185,6 +196,7 @@ def render_fly_toml(template: Path, coordinates: FlyPilotCoordinates) -> str:
         "VAULT_IMAGE": coordinates.vault_image,
         "CONTROL_IMAGE": coordinates.control_image,
         "TOKEN_EXPIRES_AT": coordinates.token_expires_at,
+        "TOKEN_ID": coordinates.token_id or "",
         "HANDOFF_URL": coordinates.handoff_url,
         "ALERT_URL": coordinates.alert_url,
         "VOLUME": coordinates.volume,
@@ -254,6 +266,7 @@ def _validate_document(
             "CREEK_PILOT_VAULT_IMAGE": coordinates.vault_image,
             "CREEK_PILOT_CONTROL_IMAGE": coordinates.control_image,
             "CREEK_PILOT_FLY_TOKEN_EXPIRES_AT": coordinates.token_expires_at,
+            "CREEK_PILOT_FLY_TOKEN_ID": coordinates.token_id or "",
             "CREEK_PILOT_HANDOFF_URL": coordinates.handoff_url,
             "CREEK_PILOT_ALERT_URL": coordinates.alert_url,
             "CREEK_PILOT_RECONCILE_INTERVAL_SECONDS": "3600",

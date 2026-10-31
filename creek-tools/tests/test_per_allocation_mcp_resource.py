@@ -418,7 +418,11 @@ def test_a_record_issued_before_the_flag_keeps_its_shared_resource(
 
 
 def test_a_legacy_roll_still_writes_the_shared_resource(tmp_path: Path) -> None:
-    """The #1974 roll is unchanged: legacy records move to the shared settings."""
+    """Without the flag the #1974 roll is unchanged: legacy records go shared.
+
+    With it, #2004 rolls a legacy record straight to its own resource
+    (``tests/test_shared_audience_roll.py``).
+    """
     state = tmp_path / "runtime-secrets"
     state.mkdir(mode=0o700)
     _owner_file(tmp_path / "master-key", b"m" * 32)
@@ -433,7 +437,7 @@ def test_a_legacy_roll_still_writes_the_shared_resource(tmp_path: Path) -> None:
     )
     legacy.issue(_ACTIVATION, _CONSUMER, requester_identity=_REQUESTER)
 
-    rolled = _manager(tmp_path, per_allocation=True).roll_mcp_oauth(_ACTIVATION)
+    rolled = _manager(tmp_path, per_allocation=False).roll_mcp_oauth(_ACTIVATION)
 
     assert rolled == mcp_oauth_settings()
 
