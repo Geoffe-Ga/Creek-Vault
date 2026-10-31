@@ -16,6 +16,7 @@ from creek.classify.llm.providers import OllamaProvider, build_provider
 from creek.classify.llm.router import ModelRouter
 from creek.compile.engine import default_llm
 from creek.config import CreekConfig, LLMConfig
+from creek.models import PrivacyTier
 
 
 class TestCreekConfigRouting:
@@ -41,8 +42,8 @@ class TestCreekConfigRouting:
             },
         )
         router = config.model_router
-        assert router.resolve("classification").provider == "ollama"
-        assert router.resolve("generation").provider == "anthropic"
+        assert router.resolve("classification", PrivacyTier.OPEN).provider == "ollama"
+        assert router.resolve("generation", PrivacyTier.OPEN).provider == "anthropic"
 
     def test_legacy_flat_block_feeds_every_stage(self) -> None:
         """A pre-#642 flat ``llm`` block resolves identically for all stages."""
@@ -50,14 +51,19 @@ class TestCreekConfigRouting:
             {"llm": {"provider": "anthropic", "model": "claude-sonnet-4-6"}},
         )
         router = config.model_router
-        assert router.resolve("classification").provider == "anthropic"
-        assert router.resolve("generation").provider == "anthropic"
+        assert (
+            router.resolve("classification", PrivacyTier.OPEN).provider == "anthropic"
+        )
+        assert router.resolve("generation", PrivacyTier.OPEN).provider == "anthropic"
         assert config.llm.default.model == "claude-sonnet-4-6"
 
     def test_llmconfig_instance_still_accepted(self) -> None:
         """``CreekConfig(llm=LLMConfig(...))`` keeps working (promoted to default)."""
         config = CreekConfig(llm=LLMConfig(provider="anthropic"))
-        assert config.model_router.resolve("generation").provider == "anthropic"
+        assert (
+            config.model_router.resolve("generation", PrivacyTier.OPEN).provider
+            == "anthropic"
+        )
 
 
 class TestPreflightEnumeratesStages:

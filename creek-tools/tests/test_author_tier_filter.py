@@ -17,6 +17,8 @@ from creek.classify.privacy_filter import PrivacyTierOverride
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
     from creek.author.models import EvidenceBundle
 
 
@@ -197,3 +199,61 @@ def test_content_tier_open_when_no_sensitive_evidence(tmp_path: Path) -> None:
         vault=tmp_path,
     )
     assert seen["tier"] != PrivacyTier.INTIMATE
+
+
+def test_content_tier_is_open_when_the_evidence_has_no_claims(tmp_path: Path) -> None:
+    """No claims means no corpus content in the prompt, so it routes as OPEN.
+
+    Since #1948 the router gates ``None`` as INTIMATE, so an empty bundle must
+    say ``OPEN`` explicitly rather than ``None`` — the voice prompt carries
+    only the caller's query, exactly as a draft naming no source does.
+    """
+    from creek.author.conductor import build_default_conductor
+    from creek.models import PrivacyTier
+
+    (tmp_path / "01-Fragments").mkdir()
+    seen: dict[str, object] = {}
+
+    def _factory(tier: object) -> None:
+        seen["tier"] = tier
+        return None
+
+    build_default_conductor(max_rounds=1, voice_client_factory=_factory).run(
+        medium="research",
+        query="q",
+        vault=tmp_path,
+    )
+    assert seen["tier"] is PrivacyTier.OPEN
+
+
+def test_content_tier_is_none_when_no_cited_tier_is_known(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evidence citing only an untraceable id stays ``None`` — gated as INTIMATE.
+
+    The router fails closed on ``None`` (#1948), so this is the voice route
+    for content whose sensitivity nobody can name.
+    """
+    from creek.author.conductor import build_default_conductor
+    from creek.author.models import EvidenceBundle, EvidenceClaim
+    from creek.classify.llm.router import gated_as_intimate
+
+    (tmp_path / "01-Fragments").mkdir()
+    seen: dict[str, object] = {}
+
+    def _factory(tier: object) -> None:
+        seen["tier"] = tier
+        return None
+
+    conductor = build_default_conductor(max_rounds=1, voice_client_factory=_factory)
+    monkeypatch.setattr(
+        conductor,
+        "gather_evidence",
+        lambda _query, _vault, *, override=None: EvidenceBundle(
+            claims=[EvidenceClaim(claim="q", source_fragments=["frag-missing"])]
+        ),
+    )
+    conductor.run(medium="research", query="q", vault=tmp_path)
+
+    assert seen["tier"] is None
+    assert gated_as_intimate(seen["tier"])

@@ -228,7 +228,7 @@ from creek.classify.constants import (
 )
 from creek.classify.llm import LLMClassifier
 from creek.classify.llm.pool_boundary import declared_pool_request, pool_wire_tier
-from creek.classify.llm.router import IntimateRoutingError
+from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
 from creek.classify.praxis_pass import apply_praxis
 from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
@@ -580,7 +580,9 @@ def build_tier_classifiers(
 ) -> TierClassifiers:
     """Build the per-tier classifiers via the ModelRouter chokepoint (#666).
 
-    Resolves ``classification`` tier-less for non-Intimate fragments and with
+    Resolves ``classification`` with
+    :data:`~creek.classify.llm.router.NON_INTIMATE_ROUTE` for non-Intimate
+    fragments (the router requires a tier, #1948) and with
     ``PrivacyTier.INTIMATE`` for Intimate ones, so the Intimate route is
     redirected to a local provider. When both resolve to the same config (a local
     ``classification`` stage), a single classifier instance is shared — identical
@@ -604,7 +606,9 @@ def build_tier_classifiers(
     if request_scoped is not None:
         return _request_scoped_tier_classifiers(config, request_scoped)
     router = config.model_router
-    non_intimate = LLMClassifier(config=router.resolve("classification"))
+    non_intimate = LLMClassifier(
+        config=router.resolve("classification", NON_INTIMATE_ROUTE)
+    )
     try:
         intimate_cfg = router.resolve("classification", PrivacyTier.INTIMATE)
     except IntimateRoutingError as exc:

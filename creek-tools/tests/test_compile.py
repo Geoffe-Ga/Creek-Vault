@@ -1794,7 +1794,10 @@ def test_cli_compile_routes_intimate_source_to_the_local_provider(
 
     # (a) ANTI-VACUITY: with no tier, this config resolves to the CLOUD.
     config = load_config(config_path)
-    assert config.model_router.resolve("generation").provider == "anthropic"
+    assert (
+        config.model_router.resolve("generation", PrivacyTier.OPEN).provider
+        == "anthropic"
+    )
 
     result = CliRunner().invoke(
         app,
@@ -2168,7 +2171,7 @@ def test_compile_to_vault_refuses_an_unnamed_intimate_ancestor_with_no_local_bac
         ),
     )
     # ANTI-VACUITY: with no tier this config resolves happily, to the CLOUD.
-    assert router.resolve("generation").provider == "anthropic"
+    assert router.resolve("generation", PrivacyTier.OPEN).provider == "anthropic"
 
     with pytest.raises(IntimateRoutingError, match="cannot route to cloud provider"):
         compile_to_vault(
@@ -2254,7 +2257,7 @@ def test_compile_to_vault_propagates_the_intimate_routing_refusal(
         ),
     )
     # ANTI-VACUITY: with no tier this config resolves happily, to the CLOUD.
-    assert router.resolve("generation").provider == "anthropic"
+    assert router.resolve("generation", PrivacyTier.OPEN).provider == "anthropic"
 
     with pytest.raises(IntimateRoutingError, match="cannot route to cloud provider"):
         compile_to_vault(
@@ -2312,7 +2315,10 @@ def test_cli_compile_refuses_intimate_when_no_local_backend_exists(
 
     # ANTI-VACUITY: with no tier this config resolves happily, to the CLOUD.
     config = load_config(config_path)
-    assert config.model_router.resolve("generation").provider == "anthropic"
+    assert (
+        config.model_router.resolve("generation", PrivacyTier.OPEN).provider
+        == "anthropic"
+    )
 
     result = CliRunner().invoke(
         app,

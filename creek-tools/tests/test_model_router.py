@@ -90,8 +90,8 @@ class TestModelRouter:
     def test_from_flat_llmconfig_every_stage_is_default(self) -> None:
         """Constructed from a single LLMConfig, every stage resolves to it."""
         router = ModelRouter(LLMConfig(provider="ollama", model="qwen3:8b"))
-        assert router.resolve("classification").provider == "ollama"
-        assert router.resolve("generation").model == "qwen3:8b"
+        assert router.resolve("classification", PrivacyTier.OPEN).provider == "ollama"
+        assert router.resolve("generation", PrivacyTier.OPEN).model == "qwen3:8b"
 
     def test_from_routing_config_resolves_per_stage(self) -> None:
         """Constructed from a routing config, stages resolve independently."""
@@ -102,8 +102,8 @@ class TestModelRouter:
             },
         )
         router = ModelRouter(routing)
-        assert router.resolve("generation").provider == "anthropic"
-        assert router.resolve("classification").provider == "ollama"
+        assert router.resolve("generation", PrivacyTier.OPEN).provider == "anthropic"
+        assert router.resolve("classification", PrivacyTier.OPEN).provider == "ollama"
 
     def test_tier_gates_intimate_off_cloud(self) -> None:
         """The tier arg now enforces Intimate-never-cloud (#647).
@@ -120,10 +120,10 @@ class TestModelRouter:
             ),
         )
         # Non-intimate keeps the cloud provider; Intimate redirects to local.
-        assert router.resolve("generation").provider == "anthropic"
+        assert router.resolve("generation", PrivacyTier.OPEN).provider == "anthropic"
         assert router.resolve("generation", PrivacyTier.INTIMATE).provider == "ollama"
 
     def test_resolve_returns_an_llmconfig(self) -> None:
         """The resolved value is an ``LLMConfig`` ready for ``build_provider``."""
         router = ModelRouter(LLMConfig(provider="ollama"))
-        assert isinstance(router.resolve("default"), LLMConfig)
+        assert isinstance(router.resolve("default", PrivacyTier.OPEN), LLMConfig)

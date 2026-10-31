@@ -226,7 +226,7 @@ def _assert_unrouted_resolution_is_cloud(vault: Path) -> None:
         vault: Vault whose ``creek_config.yaml`` is under test.
     """
     config = load_config(vault / "00-Creek-Meta" / "creek_config.yaml")
-    unrouted = config.model_router.resolve("classification")
+    unrouted = config.model_router.resolve("classification", PrivacyTier.OPEN)
     assert unrouted.provider == "anthropic"
     assert unrouted.model == _VAULT_CLOUD_MODEL
 
@@ -239,7 +239,7 @@ def _stub_ontology_detector(monkeypatch: pytest.MonkeyPatch) -> list[LLMConfig]:
 
     Returns:
         The list the stub appends each resolved :class:`LLMConfig` to, so a
-        test can pin that this deliberately tier-less site stayed tier-less.
+        test can pin that this site kept its explicit non-INTIMATE tier.
     """
     from creek import cli as cli_module
     from creek.classify.prompt import PromptOntology
@@ -252,7 +252,9 @@ def _stub_ontology_detector(monkeypatch: pytest.MonkeyPatch) -> list[LLMConfig]:
 
         def _detect(prompt: str) -> PromptOntology:
             """Record the config this detection would have used."""
-            seen.append(config.model_router.resolve("classification"))
+            seen.append(
+                config.model_router.resolve("classification", PrivacyTier.PERSONAL)
+            )
             return PromptOntology(prompt=prompt)
 
         return _detect
@@ -487,18 +489,19 @@ def test_cli_draft_refuses_intimate_when_no_local_backend_exists(
     assert recorder.built == []
 
 
-def test_cli_draft_leaves_the_ontology_detector_tier_less(
+def test_cli_draft_keeps_the_ontology_detector_on_the_configured_stage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     recorder: type[_RecordingClassifier],
 ) -> None:
-    """``_build_ontology_detector`` keeps resolving with no tier, on purpose.
+    """``_build_ontology_detector`` keeps the configured stage, on purpose.
 
     It is fed only ``--seed-outline-text`` — the operator's own copy — so no
-    classified fragment reaches that provider and there is no tier for the
-    router to enforce. Sweeping it up alongside the real fix would send
-    outline detection to the local model for no privacy gain, so the
-    deliberate no-tier site is pinned here rather than left to a comment.
+    classified fragment reaches that provider. Since #1948 the router requires
+    a tier and gates ``None`` as INTIMATE, so the site states
+    ``PrivacyTier.PERSONAL`` explicitly; sweeping it up alongside the draft
+    fix would send outline detection to the local model for no privacy gain,
+    so the deliberate choice is pinned here rather than left to a comment.
 
     Args:
         tmp_path: Pytest tmp dir.

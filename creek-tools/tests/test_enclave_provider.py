@@ -387,7 +387,7 @@ def test_intimate_routes_to_enclave_unredirected() -> None:
             },
         )
     )
-    assert router.resolve("generation").provider == "enclave"
+    assert router.resolve("generation", PrivacyTier.OPEN).provider == "enclave"
     assert router.resolve("generation", PrivacyTier.INTIMATE).provider == "enclave"
 
 

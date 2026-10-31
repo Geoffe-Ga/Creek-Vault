@@ -19,7 +19,7 @@ from creek.classify.classify_engine import (
 )
 from creek.classify.constants import LLM_METHOD
 from creek.classify.llm.providers import RequestKeyRejectedError
-from creek.classify.llm.router import IntimateRoutingError
+from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
 from creek.config import load_vault_config
 from creek.models import PrivacyTier
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
@@ -65,7 +65,8 @@ def _require_pinned_classifier(config: CreekConfig) -> None:
     """Refuse an LLM pass whose classification stage is not the pinned model.
 
     The model-pin rule of :mod:`creek_mcp.model_pin` (#1849), applied before
-    any fragment is read. Only the tier-less ``classification`` stage is
+    any fragment is read. Only the non-Intimate ``classification`` stage
+    (resolved for :data:`~creek.classify.llm.router.NON_INTIMATE_ROUTE`) is
     checked: the router redirects only a *cloud* stage for INTIMATE
     fragments, so when this stage is the pinned local model the INTIMATE
     route resolves to the same one, and when it is not, the pass is refused
@@ -89,7 +90,7 @@ def _require_pinned_classifier(config: CreekConfig) -> None:
 
     if not model_pin_enforced():
         return
-    cfg = config.model_router.resolve("classification")
+    cfg = config.model_router.resolve("classification", NON_INTIMATE_ROUTE)
     unpinned = LLMProviderUnavailableError(
         provider=cfg.provider, detail=_UNPINNED_DETAIL
     )
@@ -194,7 +195,7 @@ def _pass_inference_source(
     if request_scoped is not None and request_key is not None:
         return request_key_inference_source(request_key)
     return stage_inference_source(
-        config.model_router.resolve("classification").provider
+        config.model_router.resolve("classification", NON_INTIMATE_ROUTE).provider
     )
 
 

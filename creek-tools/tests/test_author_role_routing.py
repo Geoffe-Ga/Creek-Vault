@@ -56,7 +56,7 @@ class TestForRoleResolution:
         captured_config: dict[str, LLMConfig],
     ) -> None:
         """A configured role uses its own provider+model."""
-        AuthorLLMClient.for_role(_router(), "voice_drafter")
+        AuthorLLMClient.for_role(_router(), "voice_drafter", tier=PrivacyTier.OPEN)
         assert captured_config["cfg"].provider == "openai"
         assert captured_config["cfg"].model == "gpt-5.4"
 
@@ -65,7 +65,7 @@ class TestForRoleResolution:
         captured_config: dict[str, LLMConfig],
     ) -> None:
         """A role with no entry uses the generation stage."""
-        AuthorLLMClient.for_role(_router(), "fact_checker")
+        AuthorLLMClient.for_role(_router(), "fact_checker", tier=PrivacyTier.OPEN)
         assert captured_config["cfg"].provider == "anthropic"
 
     def test_voice_model_fills_unset_voice_role(
@@ -79,7 +79,9 @@ class TestForRoleResolution:
             ),
         )
         author = AuthorConfig(voice_model="claude-opus-4-8")
-        AuthorLLMClient.for_role(router, "voice_line_editor", author=author)
+        AuthorLLMClient.for_role(
+            router, "voice_line_editor", author=author, tier=PrivacyTier.OPEN
+        )
         assert captured_config["cfg"].provider == "anthropic"
         assert captured_config["cfg"].model == "claude-opus-4-8"
 
@@ -89,7 +91,9 @@ class TestForRoleResolution:
     ) -> None:
         """An explicit writing_desk.voice_drafter wins over voice_model."""
         author = AuthorConfig(voice_model="claude-opus-4-8")
-        AuthorLLMClient.for_role(_router(), "voice_drafter", author=author)
+        AuthorLLMClient.for_role(
+            _router(), "voice_drafter", author=author, tier=PrivacyTier.OPEN
+        )
         assert captured_config["cfg"].model == "gpt-5.4"  # role map, not voice_model
 
     def test_voice_model_not_applied_to_non_voice_role(
@@ -103,7 +107,9 @@ class TestForRoleResolution:
             ),
         )
         author = AuthorConfig(voice_model="claude-opus-4-8")
-        AuthorLLMClient.for_role(router, "researcher", author=author)
+        AuthorLLMClient.for_role(
+            router, "researcher", author=author, tier=PrivacyTier.OPEN
+        )
         assert captured_config["cfg"].model == "claude-sonnet-4-6"  # not voice_model
 
 

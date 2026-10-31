@@ -65,7 +65,15 @@ def _content_tier(
 
     The voice call sends the evidence to the LLM, so its routing tier is the
     highest ``privacy_tier`` actually cited. ``INTIMATE`` outranks ``PERSONAL``
-    outranks ``OPEN``; ``None`` when the evidence cites no known fragment.
+    outranks ``OPEN``.
+
+    Evidence with **no claims** carries no corpus content at all — the prompt
+    holds only the caller's own query — so it routes as ``OPEN``,
+    exactly as a draft prompt naming no source does
+    (:meth:`creek.generate.drafts.DraftGenerator._bind_routing_tier`).
+    Claims none of whose cited tiers is known (untraceable or uncited
+    sources, or only ``unclassified`` ones) return ``None``, which the router
+    gates as ``Intimate`` (#1948): an unknown tier is not evidence of safety.
 
     The evidence is the only corpus content the voice request carries: cached
     voice skills enter it as source-free style only (#1986, see
@@ -78,8 +86,11 @@ def _content_tier(
         override: The admission ceiling used when gathering (same corpus view).
 
     Returns:
-        The content tier, or ``None`` for empty/untraceable evidence.
+        The content tier; ``OPEN`` for evidence with no claims; ``None`` for
+        claims whose cited tiers are all unknown.
     """
+    if not evidence.claims:
+        return PrivacyTier.OPEN
     tier_map = fragment_tier_map(vault, override)
     tiers = {
         tier_map[fid] for fid in evidence.all_source_fragments() if fid in tier_map

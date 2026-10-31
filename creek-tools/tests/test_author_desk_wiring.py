@@ -17,6 +17,7 @@ from creek.author.client import AuthorLLMClient
 from creek.author.conductor import build_default_conductor, run_author
 from creek.classify.llm.router import ModelRouter
 from creek.config import AuthorConfig, LLMRoutingConfig
+from creek.models import PrivacyTier
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -124,7 +125,7 @@ def test_for_voice_or_none_returns_client_when_available(
     router = ModelRouter(
         LLMRoutingConfig.model_validate({"generation": {"provider": "anthropic"}}),
     )
-    client = AuthorLLMClient.for_voice_or_none(router)
+    client = AuthorLLMClient.for_voice_or_none(router, tier=PrivacyTier.OPEN)
     assert client is not None
     assert client.available
 
@@ -137,7 +138,7 @@ def test_for_voice_or_none_returns_none_when_unavailable(
     router = ModelRouter(
         LLMRoutingConfig.model_validate({"generation": {"provider": "anthropic"}}),
     )
-    assert AuthorLLMClient.for_voice_or_none(router) is None
+    assert AuthorLLMClient.for_voice_or_none(router, tier=PrivacyTier.OPEN) is None
 
 
 @patch("creek.classify.llm.providers.httpx.Client")
@@ -161,7 +162,7 @@ def test_missing_ollama_model_keeps_author_desk_deterministic(
         ),
     )
 
-    assert AuthorLLMClient.for_voice_or_none(router) is None
+    assert AuthorLLMClient.for_voice_or_none(router, tier=PrivacyTier.OPEN) is None
     http.post.assert_not_called()
 
 
@@ -178,7 +179,9 @@ def test_for_voice_or_none_uses_writing_desk_role_provider(
             },
         ),
     )
-    AuthorLLMClient.for_voice_or_none(router, author=AuthorConfig())
+    AuthorLLMClient.for_voice_or_none(
+        router, author=AuthorConfig(), tier=PrivacyTier.OPEN
+    )
     assert captured["cfg"].provider == "anthropic"
 
 

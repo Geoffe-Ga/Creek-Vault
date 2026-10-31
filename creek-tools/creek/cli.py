@@ -2942,12 +2942,15 @@ def _run_calibration_cli(
         raise typer.Exit(code=2)
 
     config = _load_config_for_vault(vault)
-    # No tier argument, and none exists to pass: the classifier only ever sees
+    # `PrivacyTier.OPEN`, stated explicitly because the router requires a tier
+    # (#1948): the classifier only ever sees
     # `creek.classify.calibration.load_fixture(...)` output — a labelled fixture
-    # (default `tests/fixtures/classification/calibration_set.yaml`) that carries
-    # no `privacy_tier` and is not vault content. Unlike `creek compile` (#962),
-    # there is no fragment here whose tier the router could enforce.
-    classifier = LLMClassifier(config=config.model_router.resolve("classification"))
+    # (default `tests/fixtures/classification/calibration_set.yaml`) shipped in
+    # the repository, carrying no `privacy_tier` and no vault content. Unlike
+    # `creek compile` (#962), there is no fragment here whose tier to thread.
+    classifier = LLMClassifier(
+        config=config.model_router.resolve("classification", PrivacyTier.OPEN)
+    )
     report = run_calibration(classifier, load_fixture(resolved))
     console.print(report.render())
 
@@ -3328,13 +3331,13 @@ class _ClassifyUpgradeOffer:
 
 def _classification_route_label(config: CreekConfig, *, intimate: bool) -> str:
     """Return a ``provider/model`` label for the classification route."""
-    from creek.classify.llm.router import IntimateRoutingError
-    from creek.models import PrivacyTier
+    from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
 
     router = config.model_router
     try:
         cfg = router.resolve(
-            "classification", PrivacyTier.INTIMATE if intimate else None
+            "classification",
+            PrivacyTier.INTIMATE if intimate else NON_INTIMATE_ROUTE,
         )
     except IntimateRoutingError:
         return "rules (no local backend)"
@@ -5933,13 +5936,17 @@ def _build_ontology_detector(vault: Path | None) -> OntologyDetector:
     config = _load_config_for_vault(vault)
 
     def _detect(prompt: str) -> PromptOntology:
-        # No tier argument, and none exists to pass: `prompt` is only ever an
-        # `OutlineSection.seed_text`, i.e. operator-supplied `--seed-outline` /
-        # `--seed-outline-text` copy. No fragment content reaches this provider,
-        # so there is no classified tier for the router to enforce. Contrast
-        # `_build_draft_llm_factory` above, which does see fragment bodies and
-        # is therefore keyed by their tier (#1031).
-        return detect_ontology(prompt, config.model_router.resolve("classification"))
+        # `PrivacyTier.PERSONAL`, stated explicitly because the router requires
+        # a tier (#1948): `prompt` is only ever an `OutlineSection.seed_text`,
+        # i.e. operator-supplied `--seed-outline` / `--seed-outline-text` copy —
+        # the operator's own words, not a classified fragment, so the most
+        # sensitive non-Intimate tier. No fragment content reaches this
+        # provider. Contrast `_build_draft_llm_factory` above, which does see
+        # fragment bodies and is therefore keyed by their tier (#1031).
+        return detect_ontology(
+            prompt,
+            config.model_router.resolve("classification", PrivacyTier.PERSONAL),
+        )
 
     return _detect
 
@@ -7820,7 +7827,8 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     # configured model is not installed — both fall back to embedding-only
     # scoring.
     #
-    # No tier argument, and this is *not* the same class of site as the
+    # `PrivacyTier.OPEN`, stated explicitly because the router requires a tier
+    # (#1948), and this is *not* the same class of site as the
     # `creek compile` bug (#962). The only call site is
     # `_run_compost_calibration` above, reached only from `creek compost
     # calibrate`, and the verifier this builds only ever sees
@@ -7829,10 +7837,13 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     #
     # Durable caveat: `creek.generate.compost.CompostDetector` accepts a
     # `verifier`, so if a vault-scanning compost path ever wires this builder
-    # in, its input becomes fragment content and this call MUST resolve with a
-    # tier. Re-derive it there rather than assuming this comment still holds.
+    # in, its input becomes fragment content and this call MUST resolve with
+    # that content's tier. Re-derive it there rather than assuming this comment
+    # still holds.
     try:
-        provider = build_provider(config.model_router.resolve("generation"))
+        provider = build_provider(
+            config.model_router.resolve("generation", PrivacyTier.OPEN)
+        )
     except RuntimeError as exc:
         console.print(
             f"[yellow]Skipping LLM verifier — provider unavailable: {exc}[/yellow]",

@@ -110,7 +110,7 @@ def _assert_unrouted_resolution_is_cloud(vault: Path) -> None:
         vault: Vault whose ``creek_config.yaml`` is under test.
     """
     config = load_config(vault / "00-Creek-Meta" / "creek_config.yaml")
-    unrouted = config.model_router.resolve("classification")
+    unrouted = config.model_router.resolve("classification", PrivacyTier.OPEN)
     assert unrouted.provider == "anthropic"
     assert unrouted.model == _VAULT_CLOUD_MODEL
 

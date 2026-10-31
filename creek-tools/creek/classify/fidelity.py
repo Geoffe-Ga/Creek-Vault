@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from creek.classify.constants import LLM_METHOD, MANUAL_METHOD, RULES_METHOD
 from creek.classify.llm.providers import build_provider
-from creek.classify.llm.router import IntimateRoutingError
+from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
 from creek.models import PrivacyTier
 
 if TYPE_CHECKING:
@@ -115,7 +115,7 @@ def best_available(config: CreekConfig) -> BestAvailable:
         The :class:`BestAvailable` ranks for non-Intimate and Intimate tiers.
     """
     router = config.model_router
-    non_intimate = _available_rank(router.resolve("classification"))
+    non_intimate = _available_rank(router.resolve("classification", NON_INTIMATE_ROUTE))
     try:
         intimate_cfg = router.resolve("classification", PrivacyTier.INTIMATE)
     except IntimateRoutingError:

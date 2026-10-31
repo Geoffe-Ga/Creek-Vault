@@ -103,7 +103,7 @@ def test_a_writing_desk_role_on_the_pool_is_gated_the_same_way(
         LLMRoutingConfig(default=_local(), writing_desk={"voice_drafter": _pool()}),
     )
 
-    assert router.resolve_role("voice_drafter").provider == "pool"
+    assert router.resolve_role("voice_drafter", PrivacyTier.OPEN).provider == "pool"
     assert (
         router.resolve_role("voice_drafter", PrivacyTier.INTIMATE).provider == "ollama"
     )
@@ -111,12 +111,16 @@ def test_a_writing_desk_role_on_the_pool_is_gated_the_same_way(
 
 
 @pytest.mark.parametrize(
-    "tier", [PrivacyTier.OPEN, PrivacyTier.PERSONAL, PrivacyTier.UNCLASSIFIED, None]
+    "tier", [PrivacyTier.OPEN, PrivacyTier.PERSONAL, PrivacyTier.UNCLASSIFIED]
 )
 def test_every_other_tier_still_routes_to_the_pool(
-    tier: PrivacyTier | None,
+    tier: PrivacyTier,
 ) -> None:
-    """The gate is INTIMATE-only; OPEN and PERSONAL are what the pool is for."""
+    """Every explicit non-INTIMATE tier routes; OPEN and PERSONAL are its purpose.
+
+    ``None`` is deliberately absent: since #1948 an untiered call is gated as
+    INTIMATE (see ``tests/test_pool_intimate_matrix.py``).
+    """
     router = ModelRouter(LLMRoutingConfig(default=_local(), generation=_pool()))
 
     resolved = router.resolve("generation", tier)

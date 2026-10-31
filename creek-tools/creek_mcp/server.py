@@ -784,7 +784,8 @@ def _resolve_generation_stage(
     Args:
         router: The served vault's model router.
         tier: The request's routing tier, or ``None`` for a Writing Desk run
-            whose evidence carries no classification.
+            whose evidence carries no classification — which the router gates
+            as ``Intimate`` (#1948), so it is never admitted for a key.
         request_key: The writer's request-scoped key, or ``None``.
 
     Returns:
@@ -909,7 +910,8 @@ def _build_author_llm(
             process cwd took both the routing and the desk's persona from
             whichever vault the server's directory happened to name (#1409).
         tier: The run's content tier, or ``None`` when the evidence carries no
-            classification to route on.
+            classification to route on — gated as ``Intimate`` by the router
+            (#1948): redirected to the local ``default`` or refused.
         request_key: The writer's request-scoped key (ADR-0015, #1967), or
             ``None``. Tried first, through :func:`_request_keyed_voice`; when
             it is not admitted for this tier the voice role resolves exactly
@@ -965,7 +967,7 @@ def _request_keyed_voice(
 
     Args:
         router: The served vault's model router.
-        tier: The run's content tier, or ``None``.
+        tier: The run's content tier, or ``None`` (gated as ``Intimate``).
         request_key: The writer's request-scoped key, or ``None``.
         provenance: The call's route recorder, or ``None``.
 
