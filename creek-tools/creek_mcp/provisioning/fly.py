@@ -218,10 +218,13 @@ class FlySecretManager(Protocol):
 
 
 class McpOAuthRecords(Protocol):
-    """The record half of a legacy allocation's MCP OAuth roll (#1974)."""
+    """The record half of an allocation's MCP OAuth roll (#1974, #2004)."""
 
     def roll_mcp_oauth(self, activation_id: str) -> McpOAuthSettings:
-        """Write the configured settings into one activation's stored record."""
+        """Write the rolled settings into one activation's stored record."""
+
+    def mcp_oauth_is_current(self, settings: McpOAuthSettings) -> bool:
+        """Return whether a record holding *settings* needs no roll."""
 
 
 class RefusingSecretManager:
@@ -433,15 +436,19 @@ class FlyProviderDriver:
         allocation: RoutableAllocation,
         records: McpOAuthRecords,
     ) -> bool:
-        """Move one legacy allocation onto its stored MCP OAuth settings.
+        """Move one allocation onto the MCP OAuth settings its record rolls to.
 
-        The documented transition of #1974, and the only one: a Machine that
-        is exactly the legacy shape (its record's environment without the two
-        settings) and stopped has *records* write the settings into its
-        encrypted record, then is updated in place — still stopped, so the
-        next route starts it — to exactly that record's environment.  A
-        Machine already exactly matching a record that has settings is left
-        alone, so a retry after an interrupted update completes it.  Anything
+        Two transitions, each recognized exactly.  #1974's: a Machine that is
+        exactly the legacy shape (its record's environment without the two
+        settings).  #2004's: a Machine exactly its record while that record
+        holds the shared edge resource and *records* moves shared records to
+        their own ``<edge>/a/<slug>/mcp`` — or exactly that shared resource
+        while its record already names the per-allocation one, which is the
+        roll interrupted between record and Machine.  A stopped Machine in one
+        of those shapes has *records* write its record, then is updated in
+        place — still stopped, so the next route starts it — to exactly that
+        record's environment.  A Machine already exactly matching a record
+        *records* calls current is left alone, even while running.  Anything
         else is drift and refused before either half is written; a running
         Machine is refused retryably, with record and Machine untouched, so it
         keeps routing until it scales to zero.
@@ -452,7 +459,7 @@ class FlyProviderDriver:
 
         Returns:
             ``True`` when the Machine was updated, ``False`` when it already
-            carried its record's settings.
+            carried its record's current settings.
         """
         reference = self._reference(allocation.activation_id)
         if allocation.provider_allocation_id != reference.allocation_id:
@@ -461,12 +468,15 @@ class FlyProviderDriver:
         machine = self._require_machine(reference)
         volume_id = self._identifier(self._require_volume(reference), "volume")
         stored = self._stored_secrets(allocation)
-        if stored.mcp_oauth is not None and self._machine_is_exact(
-            machine, reference, volume_id, stored
+        exact = self._machine_is_exact(machine, reference, volume_id, stored)
+        if (
+            exact
+            and stored.mcp_oauth is not None
+            and records.mcp_oauth_is_current(stored.mcp_oauth)
         ):
             return False
-        legacy = dataclasses.replace(stored, mcp_oauth=None)
-        self._verify_machine(machine, reference, volume_id, legacy)
+        if not exact:
+            self._verify_pre_roll(machine, reference, volume_id, stored)
         if str(machine.get("state")) != "stopped":
             self._unavailable("Fly Machine must be stopped before it is rolled")
         records.roll_mcp_oauth(allocation.activation_id)
@@ -486,6 +496,26 @@ class FlyProviderDriver:
             self._require_machine(reference), reference, volume_id, rolled
         )
         return True
+
+    def _verify_pre_roll(
+        self,
+        machine: Mapping[str, Any],
+        reference: _AllocationRef,
+        volume_id: str,
+        stored: FlyRuntimeSecrets,
+    ) -> None:
+        """Refuse a Machine in neither pre-roll shape of its record.
+
+        The shapes are the legacy one (no settings) and, for a record already
+        scoped to one allocation, the shared edge resource it was scoped from.
+        """
+        shared = None if stored.mcp_oauth is None else stored.mcp_oauth.shared_edge()
+        if shared is not None and self._machine_is_exact(
+            machine, reference, volume_id, dataclasses.replace(stored, mcp_oauth=shared)
+        ):
+            return
+        legacy = dataclasses.replace(stored, mcp_oauth=None)
+        self._verify_machine(machine, reference, volume_id, legacy)
 
     def _stored_secrets(self, allocation: RoutableAllocation) -> FlyRuntimeSecrets:
         """Return the activation's stored runtime bundle for *allocation*."""

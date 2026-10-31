@@ -505,9 +505,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     bundle = compose(args, parser)
-    if args.roll_mcp_oauth is not None:
+    if args.roll_mcp_oauth is not None or args.check_mcp_audience:
         try:
-            status = worker_cli.run_mcp_oauth_roll(
+            status = worker_cli.run_one_shot(
                 args, bundle.worker.driver, bundle.worker.secrets
             )
         finally:

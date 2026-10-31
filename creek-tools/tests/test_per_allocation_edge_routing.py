@@ -178,6 +178,18 @@ class _FakeAllocations:
         self.records = records
         self.lookups: list[str] = []
 
+    def shared_audience_activations(self, shared: McpOAuthSettings) -> tuple[str, ...]:
+        """Answer #2004's fleet check: every record here is per-allocation.
+
+        Args:
+            shared: The edge's shared settings.
+
+        Returns:
+            No activation.
+        """
+        del shared
+        return ()
+
     async def principal_for_resource(
         self,
         resource_url: str,
