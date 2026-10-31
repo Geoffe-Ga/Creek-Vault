@@ -9,6 +9,22 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Carry out owner decision R2-4 (#1999): when the fleet alert channel fails,
+  keep routing, retry alerts, refuse new activations. An `AlertDeliveryError`
+  no longer escapes the pilot scheduler or trips the supervisor's shared stop,
+  so the edge, worker and scheduler keep running and the Machine stays
+  healthy. The new `AlertRelay` keeps the undelivered alert-kind counts,
+  durably, and re-sends them with capped doubling backoff (one, two, then four
+  fleet intervals). While an alert is owed, an `AdmissionGate` consulted
+  beside the static admission policy refuses new activations with the
+  existing `503 activation_unavailable`, and the first delivery that succeeds
+  reopens it. Each failed delivery bumps the SQLite counter
+  `alert_delivery_failed` and writes one content-free `ERROR` log line; the
+  gap's start, failure count and owed kinds live in
+  `provisioning_alert_delivery_gaps` and `provisioning_pending_alerts`, so a
+  restart keeps admission closed. Provider failure (exit `1`) and stale
+  reports still fail health.
+
 - Bound the managed-vault fleet to owner decision R2-3 (#1998): cap 15
   vaults, alert at USD 60/month. The admission count now uses reconcile's
   live predicate, so `deleting`, failed-delete and `deleted` jobs free their

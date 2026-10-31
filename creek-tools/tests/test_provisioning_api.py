@@ -10,6 +10,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from creek_mcp.httpapi.provisioning import build_provisioning_app
+from creek_mcp.provisioning.alert_relay import AdmissionGate
 from creek_mcp.provisioning.api import CONTRACT_VERSION
 from creek_mcp.provisioning.models import FailureReason, JobState
 from creek_mcp.provisioning.store import (
@@ -336,6 +337,44 @@ def test_live_allocation_cap_is_atomic_across_concurrent_api_instances(
     assert sorted(results) == [(202, "accepted"), (503, "activation_unavailable")]
     assert store.count_jobs() == 1
     assert store.count_activation_ids() == 1
+
+
+def test_closed_runtime_gate_refuses_only_new_activations(
+    store: ProvisioningStore,
+) -> None:
+    """R2-4: an alert-channel gap refuses new ids; existing jobs keep working."""
+    verifier = ConsumerTokenVerifier({"adepthood": (_TOKEN,)})
+    gate = AdmissionGate()
+    client = TestClient(
+        build_provisioning_app(
+            store,
+            verifier,
+            admission=ActivationAdmissionPolicy(runtime_gate=gate),
+        )
+    )
+    created = _submit(client, "activation-before-gap", consumer_identity="user-one")
+    gate.close()
+
+    replay = _submit(client, "activation-before-gap", consumer_identity="user-one")
+    refused = _submit(client, "activation-during-gap", consumer_identity="user-two")
+    status = client.get(created.json()["status_url"], headers=_headers())
+    deletion = client.delete(created.json()["status_url"], headers=_headers())
+    gate.open()
+    reopened = _submit(client, "activation-after-gap", consumer_identity="user-two")
+
+    assert replay.status_code == 202
+    assert refused.status_code == 503
+    assert refused.json()["code"] == "activation_unavailable"
+    assert refused.json()["message"] == "new activation unavailable"
+    assert status.status_code == 200
+    assert deletion.status_code == 202
+    assert reopened.status_code == 202
+
+
+def test_activation_admission_policy_rejects_a_non_callable_gate() -> None:
+    """The runtime gate is a ``() -> bool`` probe or absent, nothing else."""
+    with pytest.raises(ValueError, match="runtime_gate"):
+        ActivationAdmissionPolicy(runtime_gate=cast("AdmissionGate", True))
 
 
 @pytest.mark.parametrize(

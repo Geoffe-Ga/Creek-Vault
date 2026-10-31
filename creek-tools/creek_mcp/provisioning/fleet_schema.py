@@ -9,7 +9,9 @@ introducing a second writer.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, cast
 
 from creek_mcp.provisioning.models import (
@@ -24,12 +26,14 @@ from creek_mcp.provisioning.models import (
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
     from decimal import Decimal
 
     from creek_mcp.provisioning.models import DeletionOutcome, ProvisioningJob
 
 DUPLICATE_ALLOCATION_ATTEMPTS: Final[str] = "duplicate_allocation_attempts"
+# Owner decision R2-4 (#1999): every failed fleet-alert delivery, lifetime.
+ALERT_DELIVERY_FAILED: Final[str] = "alert_delivery_failed"
 _MONTH_ROLLOVER: Final[timedelta] = timedelta(days=32)
 
 FLEET_SCHEMA: Final[str] = """
@@ -67,6 +71,21 @@ CREATE TABLE IF NOT EXISTS provisioning_machine_running_months (
     month TEXT NOT NULL,
     running_seconds INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (provider_allocation_id, month)
+);
+
+CREATE TABLE IF NOT EXISTS provisioning_alert_delivery_gaps (
+    gap_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    opened_at TEXT NOT NULL,
+    closed_at TEXT,
+    failed_deliveries INTEGER NOT NULL CHECK (failed_deliveries > 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_provisioning_alert_gap_open
+ON provisioning_alert_delivery_gaps((closed_at IS NULL)) WHERE closed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS provisioning_pending_alerts (
+    kind TEXT PRIMARY KEY,
+    count INTEGER NOT NULL CHECK (count > 0)
 );
 
 CREATE TABLE IF NOT EXISTS provisioning_budget_months (
@@ -263,6 +282,71 @@ def counter_value(connection: sqlite3.Connection, name: str) -> int:
         (name,),
     ).fetchone()
     return 0 if row is None else int(row[0])
+
+
+@dataclass(frozen=True, slots=True)
+class AlertDeliveryGap:
+    """One open alert-channel outage: when it began and what is still owed.
+
+    ``pending`` holds closed alert-kind counts only (``creek_fleet_alert_v1``
+    vocabulary) - never a subject, requester, or provider identifier.
+    """
+
+    opened_at: datetime
+    failed_deliveries: int
+    pending: Mapping[str, int]
+
+
+def record_alert_delivery_failure(
+    connection: sqlite3.Connection,
+    pending: Mapping[str, int],
+    now: datetime,
+) -> None:
+    """Count one failed delivery, open or extend the gap, and retain *pending*."""
+    bump_counter(connection, ALERT_DELIVERY_FAILED)
+    extended = connection.execute(
+        "UPDATE provisioning_alert_delivery_gaps "
+        "SET failed_deliveries = failed_deliveries + 1 WHERE closed_at IS NULL"
+    )
+    if extended.rowcount == 0:
+        connection.execute(
+            "INSERT INTO provisioning_alert_delivery_gaps "
+            "(opened_at, failed_deliveries) VALUES (?, 1)",
+            (timestamp(now),),
+        )
+    connection.execute("DELETE FROM provisioning_pending_alerts")
+    connection.executemany(
+        "INSERT INTO provisioning_pending_alerts (kind, count) VALUES (?, ?)",
+        sorted(pending.items()),
+    )
+
+
+def close_alert_delivery_gap(connection: sqlite3.Connection, now: datetime) -> None:
+    """Close the open gap at *now* and forget the alerts it was owed."""
+    connection.execute(
+        "UPDATE provisioning_alert_delivery_gaps SET closed_at = ? "
+        "WHERE closed_at IS NULL",
+        (timestamp(now),),
+    )
+    connection.execute("DELETE FROM provisioning_pending_alerts")
+
+
+def open_alert_delivery_gap(connection: sqlite3.Connection) -> AlertDeliveryGap | None:
+    """Return the open alert-channel gap, or ``None`` while delivery is healthy."""
+    row = connection.execute(
+        "SELECT opened_at, failed_deliveries FROM provisioning_alert_delivery_gaps "
+        "WHERE closed_at IS NULL"
+    ).fetchone()
+    if row is None:
+        return None
+    pending = connection.execute(
+        "SELECT kind, count FROM provisioning_pending_alerts ORDER BY kind"
+    ).fetchall()
+    return AlertDeliveryGap(
+        opened_at=datetime.fromisoformat(str(row["opened_at"])),
+        failed_deliveries=int(row["failed_deliveries"]),
+        pending=MappingProxyType({str(kind): int(count) for kind, count in pending}),
+    )
 
 
 def receipt_from_row(row: sqlite3.Row) -> DeletionReceipt:
