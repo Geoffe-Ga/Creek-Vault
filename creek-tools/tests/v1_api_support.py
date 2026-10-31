@@ -254,6 +254,9 @@ JOB_PATH: Final[str] = "/v1/jobs/00000000-0000-4000-8000-000000000000"
 AGENT_ACTIVITY_PATH: Final[str] = "/v1/agent-activity"
 """The owner's content-free activity projection (#1968)."""
 
+EXPORT_PATH: Final[str] = "/v1/export"
+"""``GET /v1/export``: the owner-only paged export (#2033)."""
+
 HEALTH_PATH: Final[str] = "/v1/health"
 """The liveness probe."""
 
@@ -312,6 +315,7 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("POST", LINKS_PATH),
     ("GET", JOB_PATH),
     ("GET", AGENT_ACTIVITY_PATH),
+    ("GET", EXPORT_PATH),
     ("GET", HEALTH_PATH),
 )
 """Every ``(method, concrete path)`` pair a client can actually reach."""
@@ -332,6 +336,7 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
     "links",
     "job-status",
     "agent-activity",
+    "export",
     "health",
 )
 """Stable parametrize ids for :data:`MOUNTED`, in the same order."""
@@ -351,6 +356,7 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("POST", LINKS_PATH),
     ("GET", JOB_PATH),
     ("GET", AGENT_ACTIVITY_PATH),
+    ("GET", EXPORT_PATH),
 )
 """The concrete-path routes the contract-version gate applies to."""
 
@@ -369,6 +375,7 @@ VERSIONED_IDS: Final[tuple[str, ...]] = (
     "links",
     "job-status",
     "agent-activity",
+    "export",
 )
 """Stable parametrize ids for :data:`VERSIONED`."""
 

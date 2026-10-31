@@ -95,6 +95,7 @@ from tests.v1_api_support import (
     DRIVE_AUTHORIZATION_TEMPLATE,
     DRIVE_CONNECTOR_PATH,
     DRIVE_SYNC_PATH,
+    EXPORT_PATH,
     HEALTH_PATH,
     JOB_TEMPLATE,
     JOURNAL_TEMPLATE,
@@ -116,9 +117,9 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.26.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.27.0.json"
 )
-"""The published document at contract 0.26.0, adding ``JobStatusResponse.failure_code``.
+"""The published document at contract 0.27.0, adding ``GET /v1/export`` (#2033).
 
 Regenerate it **only** with a deliberate contract change, and say in that
 change's ADR row what moved:
@@ -442,9 +443,9 @@ def test_documented_paths_equal_the_mounted_routes(vault: Path) -> None:
 
 
 def test_every_published_route_is_documented() -> None:
-    """All sixteen paths appear, named explicitly so a silent drop is visible.
+    """All eighteen paths appear, named explicitly so a silent drop is visible.
 
-    Sixteen paths over twenty operations since #1968: two resource paths
+    Eighteen paths over twenty-two operations since #2033: two resource paths
     serve multiple methods, which is why this is a set of paths
     while ``test_documented_routes_are_the_mounted_ones`` above compares
     ``(method, path)`` pairs.
@@ -467,6 +468,7 @@ def test_every_published_route_is_documented() -> None:
         AGENT_ACTIVITY_PATH,
         HEALTH_PATH,
         "/v1/reading-recommendations",
+        EXPORT_PATH,
     }
 
 

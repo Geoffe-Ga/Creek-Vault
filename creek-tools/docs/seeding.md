@@ -341,7 +341,7 @@ here:
 ## Seeding over the network
 
 The `/v1` API is how an application seeds a vault it does not share a
-filesystem with. It publishes exactly twenty routes:
+filesystem with. It publishes exactly twenty-two routes:
 
 <!-- capability-set: v1-routes -->
 
@@ -367,11 +367,12 @@ filesystem with. It publishes exactly twenty routes:
 | `GET` | `/v1/jobs/{job_id}` |
 | `GET` | `/v1/agent-activity` |
 | `POST` | `/v1/reading-recommendations` |
+| `GET` | `/v1/export` |
 | `GET` | `/v1/health` |
 
 <!-- /capability-set -->
 
-Two of those twenty were observed writing a fragment into `01-Fragments/`
+Two of those twenty-two were observed writing a fragment into `01-Fragments/`
 here — `POST /v1/uploads` and `PUT /v1/journal-entries/{external_id}`:
 
 ```console

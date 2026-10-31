@@ -51,6 +51,8 @@ from creek_mcp.api.models import (
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
+    ExportQuery,
+    ExportResponse,
     JobAcceptedResponse,
     JobStatusResponse,
     JournalUpsertRequest,
@@ -276,6 +278,15 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/export",
+        "GET",
+        "exportVault",
+        Capability.EXPORT,
+        None,
+        ExportResponse,
+        True,
+    ),
+    (
         "/v1/health",
         "GET",
         "getHealth",
@@ -307,10 +318,11 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "job-status",
     "agent-activity",
     "reading-recommendations",
+    "export",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 21
+_EXPECTED_ROUTE_COUNT: Final[int] = 22
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -346,9 +358,9 @@ def _by_operation(operation_id: str) -> RouteSpec:
 
 
 def test_routes_declares_exactly_nineteen_specs() -> None:
-    """``/v1`` publishes nineteen endpoints and no twentieth.
+    """``/v1`` publishes exactly :data:`_EXPECTED_ROUTE_COUNT` endpoints.
 
-    A twentieth would be an endpoint no fixture, no OpenAPI response set and
+    One more would be an endpoint no fixture, no OpenAPI response set and
     no capability entry describes — reachable, undocumented surface.
     """
     assert len(ROUTES) == _EXPECTED_ROUTE_COUNT
@@ -665,6 +677,7 @@ def test_implemented_capabilities_is_exactly_the_published_eleven() -> None:
                 Capability.LETTERS,
                 Capability.AGENT_ACTIVITY,
                 Capability.READING_RECOMMENDATIONS,
+                Capability.EXPORT,
             }
         )
         == IMPLEMENTED_CAPABILITIES
@@ -846,7 +859,7 @@ def test_route_spec_uses_slots() -> None:
 
 
 def test_only_the_agent_activity_route_declares_a_query_model() -> None:
-    """The first published query string is agent activity's, and only it (#1968).
+    """Agent activity (#1968) and the export (#2033) take query strings; no other.
 
     Every other route still takes no query parameters, so a client generator
     that sees ``in: query`` anywhere else is reading a regression.
@@ -855,4 +868,4 @@ def test_only_the_agent_activity_route_declares_a_query_model() -> None:
         spec.operation_id: spec.query_model
         for spec in ROUTES
         if spec.query_model is not None
-    } == {"getAgentActivity": AgentActivityQuery}
+    } == {"getAgentActivity": AgentActivityQuery, "exportVault": ExportQuery}

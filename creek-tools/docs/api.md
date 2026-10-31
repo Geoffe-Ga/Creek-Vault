@@ -39,6 +39,7 @@ does and does not yet do.
 | `GET /v1/jobs/{job_id}` | **Implemented.** Poll one durable pipeline job. The opaque UUID is bound to the authenticated consumer: another consumer and an unknown id both receive the same `503 unavailable`, preventing enumeration. The response contains only `status`, `job_id`, `state`, and a nullable counts-only `result`; state is one of `queued`, `running`, `succeeded`, or `failed`. No fragment id, path, title, prose, or tool error crosses this boundary. Records live under the vault's private state directory and are atomically replaced. If the server restarts while a job is active, the next poll marks it `failed` rather than claiming it is still running. Admission is limited to one active detached pipeline job per authenticated consumer; another long-method request receives the same static `503 unavailable` until that worker completes, so inexpensive `202` requests cannot fan out unbounded full-vault work. Published at contract `0.14.0` (#1605). Since contract `0.26.0` (#1877) the body also carries `failure_code`: `"request_key_rejected"` when the writer's request-scoped key (ADR-0015) was refused by its vendor with `401`/`403` — the pass stopped at the first refusal without retrying, and the writer must supply a new key — and `null` for every other outcome. Callers declaring a minor below `0.26` receive no `failure_code`. |
 | `GET /v1/wheel` | **Implemented.** The **frequency distribution over the classified corpus** — how many ceiling-admitted fragments sit at each APTITUDE frequency F1–F10, and each frequency's share of the classified total. **This is not a curriculum-progress or fullness measure.** Adepthood's Map validates a ten-member `{aspects: [{stage_number, aspect, fullness}]}` shape from its own 36-week curriculum; that projection is Adepthood's and is owned there (Geoffe-Ga/adepthood#1937). Ten members on both sides is a coincidence of cardinality, not a shared meaning — reading one as the other renders confidently wrong numbers. An empty or missing corpus is `200` with all ten entries at `count: 0`, never `404` and never an error (#1076). |
 | `GET /v1/agent-activity` | **Implemented.** What each connected agent asked your vault for, and when — never what it read. Reads `00-Creek-Meta/audit/mcp.jsonl` and returns `{status, tier_ceiling, skipped, rows: [{consumer, tool, at, outcome}]}`, newest first. `consumer` is the audit stamp, so the app's own `adepthood` calls are listed beside every agent's; nothing is hidden by consumer. `outcome` is `admitted` (the call reached its tool) or `refused` (refused before dispatch: an out-of-profile tool, or a remote ceiling above `personal`). No argument summary, fragment id, path, hash or prose crosses. `?limit=` defaults to 50 and is clamped to 200; `?since=` is an inclusive, offset-bearing lower bound on `at`, and one older than the log returns from the start. A detached composition's `accepted`/`completed` job entries are not separate calls and are not listed. A line the projection cannot read is counted in `skipped` rather than failing the route, and an absent log is `200` with `rows: []`. The chain is read, never rewritten, and not re-verified per request, so the response carries no `chain_verified_at`. Published at contract `0.22.0` (#1968). |
+| `GET /v1/export` | **Implemented.** The owner takes their own vault-held content back — the Creek half of adepthood's "Export my data" for a managed vault, where the vault holds the only copy of every imported document. Returns `{status, documents, fragments, skipped, next_cursor}`: each staged upload or attachment as `{document_id, size_bytes, sha256, content_base64, content_included}` (original bytes), then each fragment file under `01-Fragments`, `09-Reference` and `11-Other-Authors` as `{fragment_id, tier, frequency, phase, source_platform, document_id, markdown, content_included}` (the file verbatim). **Every tier crosses, `intimate` included** — this is the one `/v1` read that is not ceiling-governed — so the route answers only the vault's **sole** configured consumer (what a managed vault mounts); any other configuration is `403 privacy_refused` before the vault is read. `?limit=` defaults to 50 and is clamped to 200; a page also carries at most 10 MiB of raw content, and an item larger than that is listed with `content_included: false` rather than dropped. Order is documents then fragments, each by the SHA-256 of its on-disk key; `?cursor=` is the previous page's `next_cursor` (`d-<digest>` or `f-<digest>`), restart-stable and naming no file; `next_cursor: null` marks the last page. A file that claims to be a fragment but cannot be read is counted in `skipped`; plain notes are not fragments and are passed over; symlinks are never followed out of the vault. An absent vault, or a tree that cannot be listed, is `503 unavailable` — never a short `200`. The route logs nothing, and each page appends one content-free `creek.export` audit entry (`has_cursor`, `limit`). Published at contract `0.27.0` (#2033). |
 
 **Every published route is now built, and none of them was ever allowed to
 fake it on the way here.** While a route was unbuilt it answered `501
@@ -76,6 +77,7 @@ list of names:
 | `letters` | `0.17` |
 | `agent-activity` | `0.22` |
 | `reading-recommendations` | `0.25` |
+| `export` | `0.27` |
 <!-- /capability-set -->
 
 **The advertised list is caller-dependent, and the count above is the ceiling,
@@ -357,17 +359,26 @@ typo'd or hostile value ends up admitted at *some* ceiling rather than at none.
 
 `intimate` is additionally unreachable *in the type*: `WireTierCeiling` has
 exactly two members, so there is no admissible value a producer or consumer
-could put on any wire position that names it.
+could put on any ceiling or tier position that names it.
+
+**The one exception is the owner's export** (contract `0.27.0`, #2033).
+`GET /v1/export` is not ceiling-governed: it returns the owner's content at
+every tier, under its own closed enum `ExportTier`, because an export that
+withheld `intimate` writing would strand exactly what a person most needs to
+take with them. What stands in for the ceiling is *who* may call it: only the
+vault's sole configured consumer. `TierModel.intimate_never_egresses` keeps
+its `true` and states this scope — no ceiling-governed read returns
+`intimate` content.
 
 ## Versioning
 
 `/v1` is the HTTP major. Below it, one `contract_version` covers both this
 surface and MCP.
 
-The eighteen capability routes — `PUT` and `DELETE /v1/journal-entries/{external_id}`,
+Every capability route — `PUT` and `DELETE /v1/journal-entries/{external_id}`,
 `POST /v1/reflections`, `GET /v1/wheel`, `POST /v1/uploads`, the five
 `/v1/connectors/drive` verbs, `POST /v1/classifications`, `POST /v1/links`,
-`GET /v1/jobs/{job_id}` and `GET /v1/agent-activity`, plus the three verbs on
+`GET /v1/jobs/{job_id}`, `GET /v1/agent-activity`, `POST /v1/reading-recommendations` and `GET /v1/export`, plus the three verbs on
 `/v1/voice-drafts/{external_id}` and `POST /v1/letters/{external_id}` —
 require `X-Creek-Contract-Version: <major.minor>`, for example `0.11`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
@@ -490,6 +501,16 @@ an out-of-profile call, so an agent reaching for `intimate` shows on the card;
 no tool's return shape moves. A `0.21` client knows neither the route nor its
 three closed models, so the since-minor gate withholds and refuses it while its
 known routes remain byte-identical, and `0.21` stays in the window.
+
+`0.27.0` (#2033) adds the `export` capability and `GET /v1/export`, the
+owner's paged export of their own vault-held documents and fragments at every
+tier, served only to the vault's sole configured consumer. Five closed models
+(`ExportQuery`, `ExportDocument`, `ExportFragment`, `ExportResponse`,
+`ExportTier`) widen the contract, and `TierModel.intimate_never_egresses`'s
+description now names its scope and this exception. A `0.26` client is
+neither told about the route nor served it, and `0.26` stays in the window.
+Adepthood can use the route only once its pin reaches `0.27`, which R2-5 lets
+it do after every vault reports `0.27`.
 
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE

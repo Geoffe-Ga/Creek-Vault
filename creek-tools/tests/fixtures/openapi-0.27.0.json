@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.26.0",
+    "version": "0.27.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -2496,6 +2496,135 @@
         }
       }
     },
+    "/v1/export": {
+      "get": {
+        "operationId": "exportVault",
+        "summary": "Page through the owner's own documents and fragments, every tier.",
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "The previous page's next_cursor, verbatim; absent first.",
+            "schema": {
+              "pattern": "^[df]-[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Most items to return; values above 200 are clamped to 200.",
+            "schema": {
+              "default": 50,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page through the owner's own documents and fragments, every tier.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "getHealth",
@@ -2789,7 +2918,7 @@
         "type": "string"
       },
       "Capability": {
-        "description": "The capabilities ``/v1`` publishes.\n\nThe list was identical for every minor in\n:data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3\ngrew the *MCP* tool surface (``creek.upload``, #1023) and added no ``/v1``\nroute, so a ``0.2`` client and a ``0.7`` client were answered from the same\nfour names. Contract 0.8 (#1524) ends that by publishing ``UPLOAD``, and\nthe list is therefore **no longer minor-independent**: what a caller is\ntold, and what it is served, are both keyed on\n:data:`CAPABILITY_SINCE_MINOR`.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.\n    UPLOAD: Idempotent document upload — base64 bytes plus a filename,\n        dispatched to an ingestor by extension. Since contract 0.8.\n    DRIVE_CONNECTOR: The read-only Google Drive connector's *state* and\n        its two verbs — one incremental sync, and disconnection. Since\n        contract 0.9 (#1527). Three routes rather than one, and one\n        capability rather than three, because a client cannot usefully\n        negotiate \"may I read the connector's state\" separately from \"may\n        I sync it\": they are one feature, and splitting them would let a\n        server advertise half a connector.\n\n        **It does not include authorisation.** No route begins, completes\n        or carries an OAuth flow; the credential is minted locally by\n        ``creek gdrive --download`` and never leaves the host.\n    PIPELINE: Whole-vault classification and linking — the two passes that\n        turn ingested bytes into a *usable* corpus. Since contract 0.10\n        (#1570). Two routes and one capability, for the\n        ``drive-connector`` reason: a consumer cannot usefully negotiate\n        \"may I classify\" apart from \"may I link\", because a classified\n        corpus with no resonances is as inert as an unclassified one, and\n        a server advertising half the pipeline would be advertising a\n        vault it cannot finish.\n\n        **It is the tightening half of the surface, not a widening one.**\n        :data:`creek_mcp.tier_ceiling._TIER_RANK` admits ``unclassified``\n        at ceiling ``personal``, so a network-seeded corpus is *already*\n        readable by a remote consumer; classification is what can move a\n        fragment up to ``intimate`` and out of that reach. Neither\n        response carries a fragment id, a path or a byte of prose, which\n        is what makes running the whole vault under a remote ceiling\n        disclose nothing.\n    VOICE_DRAFTS: AI-attributed draft upsert, recall, and retraction by a\n        caller-owned external id. Since contract 0.15 (#1727).\n    JOURNAL_WITHDRAW: Consumer-scoped, idempotent journal erasure. Since\n        contract 0.16 (#1799).\n    LETTERS: The vault writes one margin note's Voice Draft letter and\n        stores it at a caller-owned external id. Since contract 0.17\n        (#1862).\n    AGENT_ACTIVITY: A content-free projection of the MCP audit chain —\n        who asked the vault for what, when, and whether it was admitted.\n        Since contract 0.22 (#1968).",
+        "description": "The capabilities ``/v1`` publishes.\n\nThe list was identical for every minor in\n:data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3\ngrew the *MCP* tool surface (``creek.upload``, #1023) and added no ``/v1``\nroute, so a ``0.2`` client and a ``0.7`` client were answered from the same\nfour names. Contract 0.8 (#1524) ends that by publishing ``UPLOAD``, and\nthe list is therefore **no longer minor-independent**: what a caller is\ntold, and what it is served, are both keyed on\n:data:`CAPABILITY_SINCE_MINOR`.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.\n    UPLOAD: Idempotent document upload — base64 bytes plus a filename,\n        dispatched to an ingestor by extension. Since contract 0.8.\n    DRIVE_CONNECTOR: The read-only Google Drive connector's *state* and\n        its two verbs — one incremental sync, and disconnection. Since\n        contract 0.9 (#1527). Three routes rather than one, and one\n        capability rather than three, because a client cannot usefully\n        negotiate \"may I read the connector's state\" separately from \"may\n        I sync it\": they are one feature, and splitting them would let a\n        server advertise half a connector.\n\n        **It does not include authorisation.** No route begins, completes\n        or carries an OAuth flow; the credential is minted locally by\n        ``creek gdrive --download`` and never leaves the host.\n    PIPELINE: Whole-vault classification and linking — the two passes that\n        turn ingested bytes into a *usable* corpus. Since contract 0.10\n        (#1570). Two routes and one capability, for the\n        ``drive-connector`` reason: a consumer cannot usefully negotiate\n        \"may I classify\" apart from \"may I link\", because a classified\n        corpus with no resonances is as inert as an unclassified one, and\n        a server advertising half the pipeline would be advertising a\n        vault it cannot finish.\n\n        **It is the tightening half of the surface, not a widening one.**\n        :data:`creek_mcp.tier_ceiling._TIER_RANK` admits ``unclassified``\n        at ceiling ``personal``, so a network-seeded corpus is *already*\n        readable by a remote consumer; classification is what can move a\n        fragment up to ``intimate`` and out of that reach. Neither\n        response carries a fragment id, a path or a byte of prose, which\n        is what makes running the whole vault under a remote ceiling\n        disclose nothing.\n    VOICE_DRAFTS: AI-attributed draft upsert, recall, and retraction by a\n        caller-owned external id. Since contract 0.15 (#1727).\n    JOURNAL_WITHDRAW: Consumer-scoped, idempotent journal erasure. Since\n        contract 0.16 (#1799).\n    LETTERS: The vault writes one margin note's Voice Draft letter and\n        stores it at a caller-owned external id. Since contract 0.17\n        (#1862).\n    AGENT_ACTIVITY: A content-free projection of the MCP audit chain —\n        who asked the vault for what, when, and whether it was admitted.\n        Since contract 0.22 (#1968).\n    READING_RECOMMENDATIONS: A grounded reading suggestion. Since 0.25.\n    EXPORT: The owner's own vault-held content — staged documents and\n        every fragment, at every tier — paged by an opaque cursor. Since\n        contract 0.27 (#2033). Served only to the vault's sole configured\n        consumer, because uploads are not consumer-scoped on disk and\n        nothing else can prove the caller owns them.",
         "enum": [
           "capabilities",
           "journal-upsert",
@@ -2802,7 +2931,8 @@
           "journal-withdraw",
           "letters",
           "agent-activity",
-          "reading-recommendations"
+          "reading-recommendations",
+          "export"
         ],
         "title": "Capability",
         "type": "string"
@@ -2818,7 +2948,7 @@
       },
       "TierModel": {
         "additionalProperties": false,
-        "description": "What the server promises about privacy tiers, advertised up front.\n\nAttributes:\n    ceilings: Every ceiling this surface admits — the two members of\n        :class:`WireTierCeiling`, in ascending breadth.\n    default: The ceiling applied when a caller declares none. Pinned to\n        ``open``, the most restrictive value, so an omitted ceiling can\n        only ever fail closed.\n    intimate_never_egresses: ``Literal[True]``. A promise, not a flag: the\n        schema admits no other value, so a server cannot advertise the\n        opposite and a client need not branch on it.",
+        "description": "What the server promises about privacy tiers, advertised up front.\n\nAttributes:\n    ceilings: Every ceiling this surface admits — the two members of\n        :class:`WireTierCeiling`, in ascending breadth.\n    default: The ceiling applied when a caller declares none. Pinned to\n        ``open``, the most restrictive value, so an omitted ceiling can\n        only ever fail closed.\n    intimate_never_egresses: ``Literal[True]``. A promise, not a flag: the\n        schema admits no other value, so a server cannot advertise the\n        opposite and a client need not branch on it. Its scope is every\n        ceiling-governed read. Since contract 0.27 (#2033) it has one\n        stated exception: ``GET /v1/export``, which is not\n        ceiling-governed and is served only to the vault's sole\n        configured consumer — the owner taking their own content back.",
         "properties": {
           "ceilings": {
             "description": "Tier ceilings this surface admits.",
@@ -2836,7 +2966,7 @@
           },
           "intimate_never_egresses": {
             "const": true,
-            "description": "Standing promise that intimate content never egresses.",
+            "description": "Standing promise that intimate content never egresses through a ceiling-governed read. The one exception is the owner-only export, GET /v1/export, since contract 0.27.",
             "title": "Intimate Never Egresses",
             "type": "boolean"
           }
@@ -2956,6 +3086,151 @@
         ],
         "title": "ErrorCode",
         "type": "string"
+      },
+      "ExportTier": {
+        "description": "The privacy tier an exported fragment carries — every tier there is.\n\nThe one place on ``/v1`` where ``intimate`` is a constructible value, and\ndeliberately a separate enum from :class:`WireTierCeiling` rather than a\nwidening of it: every other position keeps its two-member vocabulary, so a\nceiling, a journal tier or a ``routed_tier`` still cannot say ``intimate``.\nThis enum is reachable only on the owner-only export.\n\nAttributes:\n    OPEN: Openly publishable content.\n    PERSONAL: Personal content.\n    INTIMATE: The owner's most private content, exported to the owner.\n    UNCLASSIFIED: Not yet classified.",
+        "enum": [
+          "open",
+          "personal",
+          "intimate",
+          "unclassified"
+        ],
+        "title": "ExportTier",
+        "type": "string"
+      },
+      "ExportDocument": {
+        "additionalProperties": false,
+        "description": "One staged document — an upload or an attachment — as the vault holds it.\n\nAttributes:\n    document_id: The staged name, ``safe_stem(external_id)`` plus suffix.\n    size_bytes: The staged file's size.\n    sha256: The digest of ``content_base64``'s bytes, or ``None`` when the\n        content is not included.\n    content_base64: The original bytes, base64-encoded, or ``None`` when\n        the document is larger than :data:`EXPORT_PAGE_CONTENT_BYTES`.\n    content_included: Whether ``content_base64`` carries the document.",
+        "properties": {
+          "document_id": {
+            "description": "The staged document name.",
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "title": "Document Id",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "The staged file size.",
+            "minimum": 0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "SHA-256 of the included bytes; null when not included.",
+            "title": "Sha256"
+          },
+          "content_base64": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The original bytes, base64; null when not included.",
+            "title": "Content Base64"
+          },
+          "content_included": {
+            "description": "False only when the document exceeds the page budget.",
+            "title": "Content Included",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "document_id",
+          "size_bytes",
+          "sha256",
+          "content_base64",
+          "content_included"
+        ],
+        "title": "ExportDocument",
+        "type": "object"
+      },
+      "ExportFragment": {
+        "additionalProperties": false,
+        "description": "One classified fragment, with its tier, labels and stored file.\n\nAttributes:\n    fragment_id: The fragment's id.\n    tier: Its privacy tier — any tier, ``intimate`` included.\n    frequency: Its primary APTITUDE frequency code.\n    phase: Its Archetypal Wavelength phase.\n    source_platform: The platform its source came from.\n    document_id: The staged document it was ingested from, or ``None``\n        when it came from anywhere else.\n    markdown: The fragment file verbatim — frontmatter and body — or\n        ``None`` when it exceeds :data:`EXPORT_PAGE_CONTENT_BYTES`.\n    content_included: Whether ``markdown`` carries the file.",
+        "properties": {
+          "fragment_id": {
+            "description": "The fragment id.",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Fragment Id",
+            "type": "string"
+          },
+          "tier": {
+            "$ref": "#/components/schemas/ExportTier",
+            "description": "The fragment's privacy tier."
+          },
+          "frequency": {
+            "description": "Primary APTITUDE frequency code.",
+            "pattern": "^(?:F(?:[1-9]|10)|unclassified)$",
+            "title": "Frequency",
+            "type": "string"
+          },
+          "phase": {
+            "description": "Archetypal Wavelength phase.",
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "title": "Phase",
+            "type": "string"
+          },
+          "source_platform": {
+            "description": "The platform the fragment's source came from.",
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "title": "Source Platform",
+            "type": "string"
+          },
+          "document_id": {
+            "anyOf": [
+              {
+                "pattern": "^[A-Za-z0-9._-]{1,128}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The staged document it came from, or null.",
+            "title": "Document Id"
+          },
+          "markdown": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The fragment file verbatim; null when not included.",
+            "title": "Markdown"
+          },
+          "content_included": {
+            "description": "False only when the fragment exceeds the page budget.",
+            "title": "Content Included",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "fragment_id",
+          "tier",
+          "frequency",
+          "phase",
+          "source_platform",
+          "document_id",
+          "markdown",
+          "content_included"
+        ],
+        "title": "ExportFragment",
+        "type": "object"
       },
       "JournalAction": {
         "description": "What an idempotent write actually did — journal upsert or upload.\n\n``UNCHANGED`` is a success, not an error: re-sending an unmodified entry is\nthe steady state of a continuous sync, and a client must be able to tell it\napart from a write without diffing content itself.\n\nShared by :class:`JournalUpsertResponse` and :class:`UploadResponse` rather\nthan duplicated under a second name. The three words are the same three\n:func:`creek_mcp.tools.upload._action_of` collapses an ingest tally into,\nand the ledger that decides them is one ledger. The name kept its\n``Journal`` prefix through contract 0.8 because it is a **published schema\ncomponent name**: Adepthood has vendored ``$defs/JournalAction`` since 0.2,\nand renaming it would break every consumer's schema validation to buy\nnothing a docstring cannot say.\n\nAttributes:\n    CREATED: A new fragment was written.\n    UPDATED: An existing fragment was updated in place.\n    UNCHANGED: The content hash matched; nothing was written.",
@@ -3996,6 +4271,93 @@
           "request_id"
         ],
         "title": "ErrorEnvelope",
+        "type": "object"
+      },
+      "ExportQuery": {
+        "additionalProperties": false,
+        "description": "The query string ``GET /v1/export`` accepts, and nothing else.\n\nAttributes:\n    cursor: The ``next_cursor`` of the previous page, verbatim, or absent\n        for the first page. Opaque: it is derived from the disk alone, so\n        it is stable across restarts, and a client must never build one.\n    limit: The most items wanted on this page. Values above\n        :data:`EXPORT_MAX_LIMIT` are clamped to it.",
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "pattern": "^[df]-[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The previous page's next_cursor, verbatim; absent first.",
+            "title": "Cursor"
+          },
+          "limit": {
+            "default": 50,
+            "description": "Most items to return; values above 200 are clamped to 200.",
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "ExportQuery",
+        "type": "object"
+      },
+      "ExportResponse": {
+        "additionalProperties": false,
+        "description": "One page of the owner's vault-held content.\n\nDocuments come first, then fragments, each ordered by the SHA-256 of its\non-disk key (a document's ``document_id``, a fragment's vault-relative\npath) — deterministic and restart-stable, but deliberately not\nalphabetical, so the cursor need not spell a name. A page may hold both\nkinds at the boundary.\n\nAttributes:\n    status: Always ``\"ok\"``. An empty vault is two empty lists.\n    documents: Staged documents on this page.\n    fragments: Fragments on this page.\n    skipped: Files on this page that claimed to be fragments, or might\n        have been, but could not be read or validated. Counted rather\n        than dropped silently.\n    next_cursor: Where the next page starts, or ``None`` on the last page.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "documents": {
+            "description": "Staged documents on this page, in export order.",
+            "items": {
+              "$ref": "#/components/schemas/ExportDocument"
+            },
+            "maxItems": 200,
+            "title": "Documents",
+            "type": "array"
+          },
+          "fragments": {
+            "description": "Fragments on this page, in export order.",
+            "items": {
+              "$ref": "#/components/schemas/ExportFragment"
+            },
+            "maxItems": 200,
+            "title": "Fragments",
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Unreadable fragment files on this page.",
+            "minimum": 0,
+            "title": "Skipped",
+            "type": "integer"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "pattern": "^[df]-[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cursor for the next page; null on the last page.",
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "status",
+          "documents",
+          "fragments",
+          "skipped",
+          "next_cursor"
+        ],
+        "title": "ExportResponse",
         "type": "object"
       },
       "JournalUpsertRequest": {
