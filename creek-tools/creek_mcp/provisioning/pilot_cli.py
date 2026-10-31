@@ -138,6 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--fly-token-expires-at",
         default=os.environ.get("CREEK_PILOT_FLY_TOKEN_EXPIRES_AT"),
     )
+    # #1867: the token's non-secret ID and the expiry warning window, passed
+    # through to every scheduled report.
+    parser.add_argument(
+        "--fly-token-id",
+        default=os.environ.get("CREEK_PILOT_FLY_TOKEN_ID") or None,
+    )
+    parser.add_argument(
+        "--fly-token-warning-hours",
+        type=_positive_int,
+        default=os.environ.get("CREEK_PILOT_FLY_TOKEN_WARNING_HOURS", "72"),
+    )
     parser.add_argument("--fly-api-base-url", default="https://api.machines.dev")
     parser.add_argument(
         "--fly-region",
@@ -496,6 +507,9 @@ def _fleet_arguments(args: argparse.Namespace, command: str = "report") -> list[
         args.fly_token_expires_at,
         "--policy-file",
         str(args.fleet_policy_file),
+        "--fly-token-warning-hours",
+        str(args.fly_token_warning_hours),
+        *(() if args.fly_token_id is None else ("--fly-token-id", args.fly_token_id)),
     ]
 
 

@@ -360,6 +360,9 @@ def test_alert_vocabulary_is_exactly_seven_kinds_and_each_condition_maps_to_one(
         "pool_admin_key_unusable",
         "pool_admin_key_rejected",
         "pool_admin_key_near_expiry",
+        # ADR-0013 amendment (#1867): the Fly org token's recorded expiry is
+        # near, past, or unrecorded.  Raised by the report, not the reconciler.
+        "provider_credential_expiring",
     }
     assert alerts == (
         Alert(AlertKind.CONTINUOUS_RUNNING, "fly-hot", 7200, "7200", "7200"),

@@ -35,18 +35,38 @@ the USD 60.00 alert and the `stuck_deletion` report, not by the cap.
    control app, image-carrier app, and managed-vault apps. A personal
    organization is not a dedicated Fly organization.
 4. Bootstrap a named, org-scoped deploy token with an expiry of no more than
-   seven days. The service and every pilot automation use that scoped token,
-   never a personal token. Store it in an owner-only mounted file; never put it
-   in a checked-in file, command argument, log, evidence bundle, or long-lived
+   90 days (owner decision R2-2, #1868). Record its ID and expiry in the pilot
+   config (`--token-id` and `--token-expires-at` when rendering, which become
+   `CREEK_PILOT_FLY_TOKEN_ID` and `CREEK_PILOT_FLY_TOKEN_EXPIRES_AT`); the
+   scheduled report alerts 72 hours before expiry
+   (`provider_credential_expiring`, #1867). The service and every pilot
+   automation use that scoped token, never a personal token; personal tokens
+   remain forbidden. Store it in an owner-only mounted file; never put it in a
+   checked-in file, command argument, log, evidence bundle, or long-lived
    environment value. Record only its non-secret token ID and expiry so the
-   owner can rotate or revoke it with `fly tokens revoke <token-id>`.
+   owner can rotate or revoke it with `fly tokens revoke <token-id>`. The
+   7-day bridge token rotated on 2026-10-27 predates this policy: replace it
+   with a 90-day token at its next rotation, recording the new ID and expiry.
 5. Use a separately scoped read-only org token for evidence collection when a
    mutation is not required. Revoke both tokens when the pilot window closes.
 
 Fly's current token commands and scope definitions are documented in
 [Access tokens](https://fly.io/docs/security/tokens/). A typical owner-driven
-bootstrap is `fly tokens create org --name <name> --expiry 168h`; the token is
+bootstrap is `fly tokens create org --name <name> --expiry 2160h`; the token is
 written directly to a mode-0400 file rather than copied into a transcript.
+Every provider process (worker, router, fleet report, deploy helper) refuses a
+recorded expiry more than 90 days away, so a longer-lived token cannot be
+recorded by mistake.
+
+The expiry warning is computed from the recorded value only; Creek never
+calls Fly's token API to discover it and never reads the token for it. The
+default 72-hour window is configurable with `--fly-token-warning-hours` (or
+`CREEK_PILOT_FLY_TOKEN_WARNING_HOURS`). The report re-raises the alert on every
+scheduled pass until the recorded expiry changes. An expiry that has already
+passed raises the same kind with "expired" wording and then refuses the pass,
+as does a missing expiry, which is a configuration gap and never treated as
+fine. The alert's private wording names only the token ID and expiry; the
+delivered payload carries only the kind's count.
 
 ## 2. Publish immutable images
 
@@ -285,7 +305,15 @@ Each scheduled report captures provider inventory and fails visibly for:
 - `incomplete_create` when a failed create remains terminal after bounded
   reconciliation;
 - `monthly_budget_departure`;
+- `provider_credential_expiring` when the recorded Fly token expiry is within
+  the warning window (72 hours by default), has passed, or was never recorded
+  (#1867);
 - unknown and unpriced cost inputs.
+
+**Deploy order for `provider_credential_expiring`.** Adepthood's alert receiver
+validates the closed kind list, and an unknown kind is refused, which Creek
+treats as an alert-delivery failure. Deploy a Creek build that can raise this
+kind only after the Adepthood receiver admits `provider_credential_expiring`.
 
 Configure `/internal/vault-provisioning/alerts` on the approved Adepthood HTTPS
 origin with the existing mounted handoff bearer. The supervised process sends
