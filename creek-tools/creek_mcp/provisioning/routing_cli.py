@@ -33,7 +33,7 @@ from creek_mcp.provisioning.fly import (
     FlyProviderDriver,
     FlyProviderPolicy,
 )
-from creek_mcp.provisioning.models import FailureReason
+from creek_mcp.provisioning.models import FailureReason, McpOAuthSettings
 from creek_mcp.provisioning.production_secrets import (
     EncryptedFileRoutingCredentialVerifier,
     ReadOnlyFlySecretManager,
@@ -243,8 +243,9 @@ def agent_routing(
 
     Raises:
         ValueError: When an issuer is set but the resource URL is missing or
-            any URL is unsafe, or an audience switch is set without the
-            issuer or the per-allocation route it depends on.
+            any URL is unsafe, an audience switch is set without the
+            issuer or the per-allocation route it depends on, or the shared
+            audience is refused while any allocation remains on it (#2004).
     """
     issuer = args.oauth_authorization_server
     per_allocation = args.per_allocation_mcp_resource
@@ -260,12 +261,43 @@ def agent_routing(
         authorization_server=issuer,
         jwks_url=args.oauth_jwks_url,
     )
-    return AgentRouting(
+    routing = AgentRouting(
         JwtAgentTokenVerifier(config),
         principals,
         allocations=principals if per_allocation else None,
         shared_audience=not refuse_shared,
     )
+    if refuse_shared:
+        _require_no_shared_audience(principals, config)
+    return routing
+
+
+def _require_no_shared_audience(
+    principals: EncryptedFileRoutingCredentialVerifier,
+    config: ResourceServerConfig,
+) -> None:
+    """Refuse to stop accepting ``/mcp``'s audience while anyone still needs it.
+
+    #2004's guard: ``--refuse-shared-mcp-audience`` is enforceable only once
+    the fleet check over the encrypted records is empty, so an allocation
+    that was never rolled is not cut off from its agents.
+
+    Args:
+        principals: The encrypted records.
+        config: The edge's shared resource and issuer.
+
+    Raises:
+        ValueError: Naming only how many allocations remain, or when the
+            records cannot be read and so cannot be proven rolled.
+    """
+    pending = principals.shared_audience_activations(
+        McpOAuthSettings(config.resource_url, config.authorization_server)
+    )
+    if pending:
+        raise ValueError(
+            f"{len(pending)} allocation(s) remain on the shared MCP audience; "
+            "roll every allocation before --refuse-shared-mcp-audience"
+        )
 
 
 def compose(

@@ -97,7 +97,9 @@ class FakeSecretManager:
     activation's pool bundle and every later issuance returns the stored one,
     which is what makes ``_verify_machine`` per-activation (ADR-0016 D1.1).
     *mcp_oauth* is stored the same way (#1974): an activation first issued
-    without it keeps none until :meth:`roll_mcp_oauth` writes it.
+    without it keeps none until :meth:`roll_mcp_oauth` writes it.  With
+    *per_allocation_mcp_resource* the roll moves a legacy or shared record to
+    its own per-allocation resource (#2004), exactly as the encrypted manager.
     """
 
     revoked: set[str]
@@ -105,6 +107,7 @@ class FakeSecretManager:
     issued: dict[str, FlyRuntimeSecrets] = field(default_factory=dict)
     call_log: list[tuple[str, str]] | None = None
     mcp_oauth: McpOAuthSettings | None = None
+    per_allocation_mcp_resource: bool = False
 
     def issue(
         self,
@@ -132,14 +135,23 @@ class FakeSecretManager:
         return bundle
 
     def roll_mcp_oauth(self, activation_id: str) -> McpOAuthSettings:
-        """Write the configured MCP OAuth settings into one stored activation."""
+        """Write the rolled MCP OAuth settings into one stored activation."""
         if self.mcp_oauth is None:
             raise ValueError("no MCP OAuth settings are configured")
         stored = self.issued[activation_id]
-        self.issued[activation_id] = dataclasses.replace(
-            stored, mcp_oauth=self.mcp_oauth
+        target = self.mcp_oauth.roll_target(
+            stored.mcp_oauth, per_allocation=self.per_allocation_mcp_resource
         )
-        return self.mcp_oauth
+        self.issued[activation_id] = dataclasses.replace(stored, mcp_oauth=target)
+        return target
+
+    def mcp_oauth_is_current(self, settings: McpOAuthSettings) -> bool:
+        """Return whether a record holding *settings* needs no roll."""
+        if self.mcp_oauth is None:
+            return True
+        return self.mcp_oauth.is_rolled(
+            settings, per_allocation=self.per_allocation_mcp_resource
+        )
 
     def revoke(self, activation_id: str) -> None:
         """Record an idempotent revocation, confirming the pool refusal first.

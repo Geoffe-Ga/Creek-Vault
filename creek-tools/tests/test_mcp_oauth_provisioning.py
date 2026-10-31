@@ -466,6 +466,10 @@ def test_a_roll_whose_record_stays_empty_is_refused() -> None:
             del activation_id
             return mcp_oauth_settings()
 
+        def mcp_oauth_is_current(self, settings: McpOAuthSettings) -> bool:
+            del settings
+            return False
+
     api = FakeFlyAPI()
     _secrets, driver, allocation_id = _legacy_allocation(api)
 
@@ -728,7 +732,7 @@ def test_the_one_shot_roll_maps_every_outcome_to_an_exit_status(
 
     logged = caplog.text
     assert "rolled" in logged
-    assert "already current" in logged
+    assert "already-current" in logged
     assert _CONSUMER not in logged
     assert MCP_ISSUER not in logged
     assert ROUTING_PUBLIC_URL not in logged

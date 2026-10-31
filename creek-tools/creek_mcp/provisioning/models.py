@@ -8,7 +8,7 @@ from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Final
 from urllib.parse import urlsplit
 
-from creek_mcp.mcp_path import MCP_PATH, allocation_mcp_path
+from creek_mcp.mcp_path import MCP_PATH, allocation_mcp_path, is_allocation_mcp_path
 from creek_mcp.oauth_resource import (
     AUTHORIZATION_SERVER_ENV,
     RESOURCE_URL_ENV,
@@ -424,6 +424,77 @@ class McpOAuthSettings:
             new_allocation_slug(),
             self.authorization_server,
         )
+
+    def shared_edge(self) -> McpOAuthSettings | None:
+        """Return the shared edge settings these per-allocation ones scope (#2004).
+
+        The inverse of :meth:`for_new_allocation`: the same origin and issuer
+        with the shared ``/mcp`` resource.  It names the shape a Machine had
+        before its allocation was rolled from the shared audience, so a roll
+        interrupted after its record was written can be recognized exactly.
+
+        Returns:
+            The shared edge settings, or ``None`` when these settings are not
+            exactly one allocation's ``<origin>/a/<slug>/mcp``.
+        """
+        parts = urlsplit(self.resource_url)
+        if not is_allocation_mcp_path(parts.path):
+            return None
+        return McpOAuthSettings(
+            f"{parts.scheme}://{parts.netloc}{MCP_PATH}", self.authorization_server
+        )
+
+    def is_rolled(self, current: McpOAuthSettings, *, per_allocation: bool) -> bool:
+        """Return whether a record holding *current* needs no roll (#2004).
+
+        ``self`` is the shared edge settings the control plane is configured
+        with.  A record already scoped to one allocation under them is rolled;
+        a record holding exactly them is rolled only while the per-allocation
+        transition is off.
+
+        Args:
+            current: The settings one record holds.
+            per_allocation: Whether shared records move to their own resource.
+
+        Returns:
+            ``True`` when the record is where the roll would leave it.
+
+        Raises:
+            ValueError: When *current* is neither of those shapes — another
+                issuer or edge is drift, never a transition this roll makes.
+        """
+        if current.shared_edge() == self:
+            return True
+        if current != self:
+            raise ValueError("activation already holds other MCP OAuth settings")
+        return not per_allocation
+
+    def roll_target(
+        self, current: McpOAuthSettings | None, *, per_allocation: bool
+    ) -> McpOAuthSettings:
+        """Return the settings a record holding *current* is rolled to (#2004).
+
+        ``self`` is the shared edge settings.  Without the per-allocation
+        transition a legacy record takes them (#1974).  With it, a legacy or
+        shared record takes a freshly minted ``<edge>/a/<slug>/mcp``.  A
+        record already scoped under them keeps its own resource, so a roll
+        interrupted after its record was written resumes with the same slug.
+
+        Args:
+            current: The settings the record holds, ``None`` when legacy.
+            per_allocation: Whether shared records move to their own resource.
+
+        Returns:
+            The settings to write; *current* itself when nothing changes.
+
+        Raises:
+            ValueError: Via :meth:`is_rolled`, for a record in no roll shape.
+        """
+        if current is not None and self.is_rolled(
+            current, per_allocation=per_allocation
+        ):
+            return current
+        return self.for_new_allocation() if per_allocation else self
 
     def runtime_env(self) -> dict[str, str]:
         """Return the two Machine environment entries these settings write.
