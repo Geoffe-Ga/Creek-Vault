@@ -579,14 +579,18 @@ def test_the_worker_flag_mints_a_per_allocation_resource(tmp_path: Path) -> None
     assert is_resource_path(allocation_mcp_path(_slug_of(resource)))
 
 
-def test_the_pilot_cannot_turn_the_flag_on_before_its_edge_routes_slugs(
+def test_the_pilot_keeps_the_flag_off_unless_it_is_asked_for(
     tmp_path: Path,
 ) -> None:
-    """The deployed pilot composes the worker with the flag off (#2003 flips)."""
+    """The pilot defaults off; #2003 exposes the switch now its edge routes slugs."""
     from tests.test_provisioning_pilot_cli import _arguments
 
     parser = pilot_cli.build_parser()
 
     assert parser.parse_args(_arguments(tmp_path)).per_allocation_mcp_resource is False
-    with pytest.raises(SystemExit):
-        parser.parse_args([*_arguments(tmp_path), "--per-allocation-mcp-resource"])
+    assert (
+        parser.parse_args(
+            [*_arguments(tmp_path), "--per-allocation-mcp-resource"]
+        ).per_allocation_mcp_resource
+        is True
+    )

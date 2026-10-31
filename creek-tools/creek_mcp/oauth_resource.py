@@ -51,6 +51,8 @@ from creek_mcp.mcp_path import (
     MCP_PATH,
     PROTECTED_RESOURCE_PATHS,
     PROTECTED_RESOURCE_ROOT,
+    allocation_path_of_metadata,
+    is_allocation_mcp_path,
     is_resource_path,
 )
 from creek_mcp.policy import DEFAULT_GRANTS, Grant
@@ -251,6 +253,38 @@ class ResourceServerConfig:
         )
         return cls(resource_url=resource, authorization_server=issuer, jwks_url=keys)
 
+    def with_resource(self, resource_url: str) -> ResourceServerConfig:
+        """Return this configuration naming *resource_url* instead (#2003).
+
+        The issuer and key-set URL stay this configuration's own, so a
+        per-allocation resource on the shared edge is verified against
+        exactly the issuer the edge is pinned to.
+
+        Args:
+            resource_url: Another resource on the same issuer.
+
+        Returns:
+            The validated configuration.
+
+        Raises:
+            ValueError: When *resource_url* fails resource validation.
+        """
+        return ResourceServerConfig.build(
+            resource_url=resource_url,
+            authorization_server=self.authorization_server,
+            jwks_url=self.jwks_url,
+        )
+
+    @property
+    def origin(self) -> str:
+        """Return the resource's scheme and authority, with no path.
+
+        Returns:
+            ``scheme://netloc``, verbatim.
+        """
+        parts = urlsplit(self.resource_url)
+        return f"{parts.scheme}://{parts.netloc}"
+
     @property
     def metadata_url(self) -> str:
         """Return this resource's RFC 9728 metadata URL.
@@ -366,18 +400,7 @@ class ProtectedResourceMetadataMiddleware:
         ):
             await self.app(scope, receive, send)
             return
-        await send(
-            {
-                "type": _RESPONSE_START,
-                "status": 200,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(self._body)).encode("ascii")),
-                    (b"access-control-allow-origin", b"*"),
-                ],
-            }
-        )
-        await send({"type": "http.response.body", "body": self._body})
+        await _send_json(send, self._body)
 
 
 class ResourceChallengeMiddleware:
@@ -441,3 +464,90 @@ class ResourceChallengeMiddleware:
             await send(message)
 
         await self.app(scope, receive, rewriting)
+
+
+async def _send_json(send: Send, body: bytes) -> None:
+    """Send *body* as a public ``200`` JSON document.
+
+    Args:
+        send: The ASGI send channel.
+        body: The encoded document.
+    """
+    await send(
+        {
+            "type": _RESPONSE_START,
+            "status": 200,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"access-control-allow-origin", b"*"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+class AllocationResourceMiddleware:
+    """Publish and challenge toward each allocation's own resource at the edge (#2003).
+
+    The shared edge serves every managed allocation's path-scoped resource,
+    ``<edge>/a/<slug>/mcp`` (#2002). For a request on that exact grammar this
+    layer builds the resource from the **path alone** — the edge's origin plus
+    the path, under the edge's pinned issuer — and
+
+    * answers ``GET`` on its RFC 9728 metadata path with that document;
+    * rewrites a ``401``/``403`` challenge on the resource path to point at it.
+
+    Nothing here reads a record, so a slug no allocation holds is answered
+    exactly as a live one is: neither response is an existence oracle. For a
+    live allocation the document is the one its vault publishes, because its
+    record's resource *is* that origin plus that path under that issuer.
+    """
+
+    def __init__(self, app: ASGIApp, *, edge: ResourceServerConfig) -> None:
+        """Wrap *app*.
+
+        Args:
+            app: The edge router below.
+            edge: The edge's shared resource, ``<origin>/mcp``.
+
+        Raises:
+            ValueError: When *edge* is not the shared edge resource.
+        """
+        if urlsplit(edge.resource_url).path != MCP_PATH:
+            raise ValueError("per-allocation resources need the shared edge resource")
+        self.app = app
+        self._edge = edge
+
+    def _resource(self, path: str) -> ResourceServerConfig:
+        """Return the resource *path* names on this edge.
+
+        Args:
+            path: An exact ``/a/<slug>/mcp``.
+
+        Returns:
+            Its configuration, under the edge's issuer and keys.
+        """
+        return self._edge.with_resource(f"{self._edge.origin}{path}")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Serve the document, rewrite the challenge, or pass through.
+
+        Args:
+            scope: The ASGI scope.
+            receive: The ASGI receive channel.
+            send: The ASGI send channel.
+        """
+        path = scope.get("path") if scope["type"] == _HTTP_SCOPE else None
+        described = allocation_path_of_metadata(path)
+        if described is not None and scope.get("method") == _GET:
+            document = self._resource(described).metadata_document()
+            await _send_json(send, json.dumps(document).encode("utf-8"))
+            return
+        if not isinstance(path, str) or not is_allocation_mcp_path(path):
+            await self.app(scope, receive, send)
+            return
+        challenge = ResourceChallengeMiddleware(
+            self.app, config=self._resource(path), paths=frozenset({path})
+        )
+        await challenge(scope, receive, send)

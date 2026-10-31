@@ -95,6 +95,30 @@ class AgentPrincipalResolver(Protocol):
         """Return the one live owner for *consumer_identity*, or ``None``."""
 
 
+class AllocationResourceResolver(Protocol):
+    """Resolve a per-allocation MCP resource to its one owner (#2003, R3-1)."""
+
+    async def principal_for_resource(
+        self,
+        resource_url: str,
+        *,
+        authorization_server: str,
+        consumer_identity: str,
+    ) -> RoutingPrincipal | None:
+        """Return the owner whose record names *resource_url*, or ``None``.
+
+        Args:
+            resource_url: The exact resource a verified token's ``aud`` names.
+            authorization_server: The issuer the token was verified against;
+                the record must name the same one.
+            consumer_identity: The verified token's ``sub``; the record's
+                owner must be exactly this consumer.
+
+        Returns:
+            The owner only when all three agree with one live record.
+        """
+
+
 class RoutingProvider(Protocol):
     """Wake and locate one store-resolved allocation on the private network."""
 

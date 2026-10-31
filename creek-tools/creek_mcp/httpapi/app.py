@@ -85,6 +85,7 @@ from __future__ import annotations
 
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Final, NoReturn
+from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
@@ -129,6 +130,7 @@ from creek_mcp.httpapi.middleware.limits import (
     RequestTimeoutMiddleware,
 )
 from creek_mcp.httpapi.vault import resolve_vault
+from creek_mcp.mcp_path import is_allocation_mcp_path
 from creek_mcp.oauth_resource import ProtectedResourceMetadataMiddleware
 
 if TYPE_CHECKING:
@@ -527,6 +529,7 @@ def _middleware(
                 mcp_app=mcp_app,
                 max_concurrency=max_concurrency,
                 fly_replay_state=fly_replay_state,
+                allocation_path=_allocation_path(agent_verifier),
             )
         )
     layers += [
@@ -554,6 +557,22 @@ def _middleware(
         ]
     )
     return layers
+
+
+def _allocation_path(agent_verifier: JwtAgentTokenVerifier | None) -> str | None:
+    """Return this vault's own ``/a/<slug>/mcp``, when its resource is one (#2003).
+
+    Args:
+        agent_verifier: The OAuth agent-token verifier, or ``None``.
+
+    Returns:
+        The per-allocation resource path the edge's replay carries, or ``None``
+        for a bearer-only vault or one whose resource is ``/mcp``.
+    """
+    if agent_verifier is None:
+        return None
+    path = urlsplit(agent_verifier.config.resource_url).path
+    return path if is_allocation_mcp_path(path) else None
 
 
 def _mcp_server_for(

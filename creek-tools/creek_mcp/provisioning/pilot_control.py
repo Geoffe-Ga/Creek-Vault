@@ -8,7 +8,12 @@ from http import HTTPStatus
 from ipaddress import IPv6Address, IPv6Network, ip_address
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
-from creek_mcp.mcp_path import in_mcp_realm, in_metadata_realm
+from creek_mcp.mcp_path import (
+    in_mcp_realm,
+    in_metadata_realm,
+    is_allocation_mcp_path,
+    is_allocation_metadata_path,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, MutableMapping
@@ -68,8 +73,9 @@ class FlyEdgeApplication:
 
     ``/control/`` is the control plane's realm; ``/v1/``, the ``/mcp`` subtree
     and the two RFC 9728 protected-resource metadata paths (#1963) are the
-    vault realm, handed to the replay router. Anything else is the
-    content-free routing miss.
+    vault realm, handed to the replay router. With *per_allocation_mcp*
+    (#2003) so are each allocation's exact ``/a/<slug>/mcp`` and its metadata
+    path. Anything else is the content-free routing miss.
     """
 
     control: ASGIApp = field(repr=False)
@@ -77,6 +83,7 @@ class FlyEdgeApplication:
     expected_host: bytes
     routing_miss_status: int
     healthy: Callable[[], bool] = field(repr=False)
+    per_allocation_mcp: bool = False
 
     async def __call__(
         self,
@@ -103,7 +110,9 @@ class FlyEdgeApplication:
             return
         if isinstance(path, str) and path.startswith("/control/"):
             selected = self.control
-        elif _in_vault_realm(path):
+        elif _in_vault_realm(path) or (
+            self.per_allocation_mcp and _in_allocation_realm(path)
+        ):
             selected = self.router
         else:
             await _empty_response(send, self.routing_miss_status)
@@ -152,6 +161,21 @@ def _in_vault_realm(path: object) -> bool:
     )
 
 
+def _in_allocation_realm(path: object) -> bool:
+    """Return whether *path* is one allocation's resource or its metadata (#2003).
+
+    Exact minted grammar only: no subtree, no other slug length. What the
+    router answers there is its own decision, never an existence check here.
+
+    Args:
+        path: The request's ASGI path, unvalidated.
+
+    Returns:
+        ``True`` for ``/a/<slug>/mcp`` and its RFC 9728 metadata path.
+    """
+    return is_allocation_mcp_path(path) or is_allocation_metadata_path(path)
+
+
 async def _empty_response(send: Send, status: int | HTTPStatus) -> None:
     """Send one content-free ASGI response without importing a web adapter."""
     await send({"type": "http.response.start", "status": int(status), "headers": []})
@@ -167,8 +191,13 @@ def build_edge_application(
     fly_machine_id: str,
     routing_miss_status: int,
     healthy: Callable[[], bool] | None = None,
+    per_allocation_mcp: bool = False,
 ) -> FlyEdgeApplication:
-    """Validate immutable Fly runtime coordinates and build one listener."""
+    """Validate immutable Fly runtime coordinates and build one listener.
+
+    *per_allocation_mcp* admits each allocation's ``/a/<slug>/mcp`` and its
+    metadata into the vault realm (#2003); off, they stay the routing miss.
+    """
     validate_fly_runtime(fly_app_name, fly_machine_id)
     if expected_host != f"{fly_app_name}.fly.dev":
         raise ValueError("Fly edge runtime attestation is invalid")
@@ -178,6 +207,7 @@ def build_edge_application(
         expected_host.encode("ascii"),
         routing_miss_status,
         healthy or (lambda: True),
+        per_allocation_mcp,
     )
 
 

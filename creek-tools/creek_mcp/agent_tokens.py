@@ -597,6 +597,39 @@ class JwtAgentTokenVerifier(TokenVerifier):
         return self._config
 
     @property
+    def keys(self) -> JwksCache:
+        """Return the issuer's key cache this verifier selects keys from.
+
+        Returns:
+            The cache, shared by every :meth:`for_resource` scope.
+        """
+        return self._keys
+
+    def for_resource(self, resource_url: str) -> JwtAgentTokenVerifier:
+        """Return a verifier for another resource of the same issuer (#2003).
+
+        The shared edge verifies a token on ``/a/<slug>/mcp`` against that
+        allocation's own resource. The scope keeps this verifier's issuer,
+        key-set URL, key cache and subject pin, so one JWKS fetch serves every
+        allocation and only the required audience differs.
+
+        Args:
+            resource_url: The resource whose exact URL every accepted token
+                must name as its ``aud``.
+
+        Returns:
+            The scoped verifier.
+
+        Raises:
+            ValueError: When *resource_url* fails resource validation.
+        """
+        return JwtAgentTokenVerifier(
+            self._config.with_resource(resource_url),
+            keys=self._keys,
+            expected_subject=self._expected_subject,
+        )
+
+    @property
     def expected_subject(self) -> str | None:
         """Return the subject pin, if any.
 

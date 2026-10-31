@@ -194,6 +194,37 @@ def _add_oauth_arguments(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument("--oauth-authorization-server", default=None)
     parser.add_argument("--oauth-jwks-url", default=None)
+    add_mcp_audience_arguments(parser)
+
+
+def add_mcp_audience_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the per-allocation MCP audience switches (#2003, R3-1).
+
+    Both default off. ``--per-allocation-mcp-resource`` routes each
+    allocation's own ``/a/<slug>/mcp`` at the edge (and, in the pilot, makes
+    its worker mint one per new allocation). ``--refuse-shared-mcp-audience``
+    stops accepting agent tokens for the shared edge resource on ``/mcp``; it
+    is #2004's switch, flipped once every allocation is rolled.
+
+    Args:
+        parser: The parser to extend.
+    """
+    parser.add_argument(
+        "--per-allocation-mcp-resource",
+        action="store_true",
+        help=(
+            "route each allocation's own <edge>/a/<slug>/mcp resource (#2003); "
+            "enable only once Adepthood mints per-vault tokens (adepthood#3584)"
+        ),
+    )
+    parser.add_argument(
+        "--refuse-shared-mcp-audience",
+        action="store_true",
+        help=(
+            "refuse agent tokens for the shared <edge>/mcp audience (#2004); "
+            "requires --per-allocation-mcp-resource"
+        ),
+    )
 
 
 def agent_routing(
@@ -207,13 +238,21 @@ def agent_routing(
         principals: The bundle store that resolves a verified subject.
 
     Returns:
-        The route, verifying tokens for ``--oauth-resource-url``.
+        The route, verifying tokens for ``--oauth-resource-url`` and, with
+        ``--per-allocation-mcp-resource``, for each allocation's own resource.
 
     Raises:
         ValueError: When an issuer is set but the resource URL is missing or
-            any URL is unsafe.
+            any URL is unsafe, or an audience switch is set without the
+            issuer or the per-allocation route it depends on.
     """
     issuer = args.oauth_authorization_server
+    per_allocation = args.per_allocation_mcp_resource
+    refuse_shared = args.refuse_shared_mcp_audience
+    if (per_allocation or refuse_shared) and not issuer:
+        raise ValueError(
+            "per-allocation MCP audiences need --oauth-authorization-server"
+        )
     if not issuer:
         return None
     config = ResourceServerConfig.build(
@@ -221,7 +260,12 @@ def agent_routing(
         authorization_server=issuer,
         jwks_url=args.oauth_jwks_url,
     )
-    return AgentRouting(JwtAgentTokenVerifier(config), principals)
+    return AgentRouting(
+        JwtAgentTokenVerifier(config),
+        principals,
+        allocations=principals if per_allocation else None,
+        shared_audience=not refuse_shared,
+    )
 
 
 def compose(
