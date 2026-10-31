@@ -13,9 +13,10 @@ with their ``source_fragments`` (and an ``author_slug`` for borrowed evidence).
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections import Counter
-from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Final, Protocol, TypeVar, runtime_checkable
 
 from creek.author.models import (
     EvidenceBundle,
@@ -30,8 +31,10 @@ from creek.classify.weighted import WeightedDimension
 from creek.generate.indexes import FREQUENCY_COLORS
 from creek.generate.paradox import OPPOSITE_CONFIDENCE_PAIRS, OPPOSITE_PHASE_PAIRS
 from creek.link.embeddings import (
+    LOCAL_EMBEDDING_ROUTE,
     EmbeddingLinker,
     EmbeddingModelUnavailableError,
+    EmbeddingRefusedError,
     content_hash_for_text,
     embeddings_cache_path,
     fragment_embedding_text,
@@ -53,7 +56,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.config import CreekConfig
-    from creek.link.embeddings import CachedEmbedding
+    from creek.link.embeddings import CachedEmbedding, TextEmbedder
     from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
@@ -189,20 +192,44 @@ def _fragment_claim(fragment: Fragment) -> EvidenceClaim:
     )
 
 
+_QUERY_NOT_EMBEDDED: Final[str] = "the grounding query was not embedded"
+
+_POOL_SESSIONLESS_LIVE_EMBEDS: Final[int] = 256
+"""Live-embed bound for a pool-routed gather that was given no session cache.
+
+A non-local route is metered and every dial is a request to a vendor, so it is
+never unbounded even when a caller passes no budget; the figure is the
+reflection path's own (#1034) and one pool batch.
+"""
+
+
 def _cosine(left: list[float], right: list[float]) -> float:
     """Return the cosine similarity of two vectors (``0.0`` if degenerate).
 
-    NumPy is imported here rather than at module level because it lives in the
-    ``[embeddings]`` extra, which the vault image does not install, and this
-    module is on ``POST /v1/reflections``'s import path. Only embedding ranking
-    reaches this function, and that needs the same extra to produce a vector.
+    NumPy is used when it is installed and pure Python otherwise. It lives in
+    the ``[embeddings]`` extra, which the managed vault image does not install,
+    and since #1904 that image can still rank: its vectors come from the
+    attested pool, not from a local model that would have needed the extra.
     """
-    import numpy as np  # lazy: numpy lives in the [embeddings] extra
+    try:
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+    except ImportError:
+        return _cosine_pure(left, right)
 
     a = np.asarray(left, dtype=float)
     b = np.asarray(right, dtype=float)
     denom = float(np.linalg.norm(a) * np.linalg.norm(b))
     return float(a @ b / denom) if denom else 0.0
+
+
+def _cosine_pure(left: list[float], right: list[float]) -> float:
+    """Return :func:`_cosine` without NumPy (``0.0`` if degenerate)."""
+    denom = math.sqrt(math.fsum(x * x for x in left)) * math.sqrt(
+        math.fsum(y * y for y in right)
+    )
+    if not denom:
+        return 0.0
+    return math.fsum(x * y for x, y in zip(left, right, strict=True)) / denom
 
 
 def _cached_vector(
@@ -278,8 +305,20 @@ def _fragment_vector(
         return vector, False
 
     embedding_text = fragment_embedding_text(fragment)
-    vector = linker.generate_embedding(embedding_text)
+    vector = _embed_one(linker, embedding_text, fragment.privacy_tier)
     return vector, True
+
+
+def _embed_one(linker: EmbeddingLinker, text: str, tier: object) -> list[float]:
+    """Embed one text, handing *tier* to the route only when it is not local.
+
+    The local call is byte-for-byte the pre-#1904 one — no tier argument —
+    because the local route sends nothing anywhere and every caller that
+    observes it keeps seeing the call it always saw.
+    """
+    if linker.space.route == LOCAL_EMBEDDING_ROUTE:
+        return linker.generate_embedding(text)
+    return linker.generate_embedding(text, tier=tier)
 
 
 def _live_cache_targets(
@@ -310,7 +349,8 @@ def _refresh_live_cache(
     *,
     max_entries: int,
     max_live_embeds: int | None,
-) -> set[str]:
+    query: tuple[str, object] | None = None,
+) -> tuple[set[str], list[float] | None]:
     """Reconcile the bounded shared cache from the unfiltered corpus.
 
     Membership is the first *max_entries* persisted-cache misses in fragment-id
@@ -319,31 +359,79 @@ def _refresh_live_cache(
     checked before the embed budget, so a stale target frees and refills its own
     deterministic slot in the same call rather than letting a later id take it.
 
+    Every live embed goes through :meth:`EmbeddingLinker.embed_texts` as one
+    call, each fragment with its **own** tier (#1904): on the pool route that is
+    one batched request whose chokepoint refuses INTIMATE titles per item, and
+    on the local route it is the same per-text encode as before. When *query*
+    is given it rides at the front of that same call, so a warm pool-routed
+    vault spends exactly one short vector per reflection.
+
     Returns:
-        Fragment ids embedded during this refresh.
+        Fragment ids embedded during this refresh, and the query's vector when
+        *query* was given (``None`` otherwise).
+
+    Raises:
+        EmbeddingRefusedError: When *query* was given and no vector came back
+            for it; the fragment vectors that did come back are kept.
     """
     targets = _live_cache_targets(corpus, persisted_cache, max_entries)
+    _evict_non_targets(live_cache, targets)
+
+    pending = _pending_live_embeds(targets, live_cache, max_live_embeds)
+    texts = [fragment_embedding_text(fragment) for fragment in pending]
+    items: list[tuple[str, object]] = [] if query is None else [query]
+    items.extend(
+        (text, fragment.privacy_tier)
+        for text, fragment in zip(texts, pending, strict=True)
+    )
+    vectors = linker.embed_texts(items) if items else []
+    query_vector = vectors.pop(0) if query is not None else None
+    embedded = _store_live_vectors(live_cache, pending, texts, vectors)
+    if query is not None and query_vector is None:
+        raise EmbeddingRefusedError(_QUERY_NOT_EMBEDDED)
+    return embedded, query_vector
+
+
+def _evict_non_targets(
+    live_cache: dict[str, tuple[str, list[float]]], targets: list[Fragment]
+) -> None:
+    """Drop every live row whose fragment is no longer a refresh target."""
     target_ids = {fragment.id for fragment in targets}
     for fragment_id in tuple(live_cache):
         if fragment_id not in target_ids:
             del live_cache[fragment_id]
 
-    remaining = max_live_embeds
+
+def _store_live_vectors(
+    live_cache: dict[str, tuple[str, list[float]]],
+    fragments: list[Fragment],
+    texts: list[str],
+    vectors: list[list[float] | None],
+) -> set[str]:
+    """Store every vector that came back, keyed by content hash; return their ids."""
     embedded: set[str] = set()
+    for fragment, text, vector in zip(fragments, texts, vectors, strict=True):
+        if vector is None:
+            continue
+        live_cache[fragment.id] = (content_hash_for_text(text), vector)
+        embedded.add(fragment.id)
+    return embedded
+
+
+def _pending_live_embeds(
+    targets: list[Fragment],
+    live_cache: dict[str, tuple[str, list[float]]],
+    max_live_embeds: int | None,
+) -> list[Fragment]:
+    """Return the targets this call will embed, in order, within the budget."""
+    pending: list[Fragment] = []
     for fragment in targets:
         if _live_cached_vector(fragment, live_cache) is not None:
             continue
-        if remaining is not None and remaining <= 0:
+        if max_live_embeds is not None and len(pending) >= max_live_embeds:
             continue
-        embedding_text = fragment_embedding_text(fragment)
-        live_cache[fragment.id] = (
-            content_hash_for_text(embedding_text),
-            linker.generate_embedding(embedding_text),
-        )
-        embedded.add(fragment.id)
-        if remaining is not None:
-            remaining -= 1
-    return embedded
+        pending.append(fragment)
+    return pending
 
 
 def _embedded_for_ranking(
@@ -365,6 +453,9 @@ def _rank_fragments(
     max_live_embeds: int | None = None,
     live_cache: dict[str, tuple[str, list[float]]] | None = None,
     live_embedded_ids: set[str] | None = None,
+    *,
+    query_vec: list[float] | None = None,
+    query_tier: object = None,
 ) -> list[Fragment]:
     """Rank *corpus* fragments by semantic similarity to *query* (descending).
 
@@ -418,11 +509,16 @@ def _rank_fragments(
         live_cache: Optional owner-scoped, already-refreshed vector cache.
         live_embedded_ids: Ids the owner embedded while refreshing this call,
             used only for the content-free budget diagnostic.
+        query_vec: The query's vector, when the refresh already embedded it
+            in its own batch; otherwise it is embedded here.
+        query_tier: The query's tier, handed to a non-local route's
+            chokepoint (ignored by the local route).
 
     Returns:
         Fragments ordered by cosine similarity descending, id tie-break.
     """
-    query_vec = linker.generate_embedding(query)
+    if query_vec is None:
+        query_vec = _embed_one(linker, query, query_tier)
     remaining = max_live_embeds
     embedded = 0
     skipped = 0
@@ -518,6 +614,7 @@ class RetrievalSpecialist:
         *,
         linker: EmbeddingLinker | None = None,
         max_live_embeds: int | None = None,
+        embedder: TextEmbedder | None = None,
     ) -> None:
         """Initialise the specialist with an optional pre-built linker.
 
@@ -531,7 +628,12 @@ class RetrievalSpecialist:
                 is a fixed ceiling, not a counter: the counter is a local of
                 :func:`_rank_fragments`, so one call's spend never bounds the
                 next one's.
+            embedder: A non-local embedding route (#1904) — the attested pool
+                — or ``None`` for the local sentence-transformer. Fixed for
+                the instance's life, because it fixes the vector space of
+                every vector the instance reads or produces.
         """
+        self._embedder = embedder
         self._linker = linker
         self._cache: dict[str, CachedEmbedding] | None = None
         self._cache_vault: Path | None = None
@@ -547,7 +649,7 @@ class RetrievalSpecialist:
             The reused :class:`EmbeddingLinker` for this specialist instance.
         """
         if self._linker is None:
-            self._linker = EmbeddingLinker(config.embeddings)
+            self._linker = EmbeddingLinker(config.embeddings, embedder=self._embedder)
         return self._linker
 
     def _get_cache(
@@ -612,6 +714,53 @@ class RetrievalSpecialist:
         """
         self._get_cache(self._get_linker(_load_config(vault)), vault)
 
+    def _bounded_route_cache(
+        self,
+        live_cache: dict[str, tuple[str, list[float]]] | None,
+        max_entries: int | None,
+    ) -> tuple[dict[str, tuple[str, list[float]]] | None, int | None]:
+        """Return the live cache to use, minting a bounded one for a non-local route.
+
+        The local route keeps whatever the caller passed, exactly as before
+        #1904. A non-local route is metered, so it always takes the batched
+        refresh path — with the caller's cache when there is one, and
+        otherwise with a call-local cache under
+        :data:`_POOL_SESSIONLESS_LIVE_EMBEDS`.
+        """
+        if self._embedder is None or live_cache is not None:
+            return live_cache, max_entries
+        return {}, self._max_live_embeds or _POOL_SESSIONLESS_LIVE_EMBEDS
+
+    def _refresh(
+        self,
+        raw_corpus: list[tuple[Fragment, str]],
+        linker: EmbeddingLinker,
+        cache: dict[str, CachedEmbedding],
+        live_cache: dict[str, tuple[str, list[float]]] | None,
+        max_entries: int | None,
+        query: tuple[str, object],
+    ) -> tuple[set[str] | None, list[float] | None]:
+        """Refresh the bounded live cache when there is one.
+
+        On a non-local route the query rides in the refresh's own batch; the
+        local route embeds it separately later, exactly as before #1904.
+
+        Returns:
+            The ids embedded live and the query's vector (``None`` when the
+            query was not batched), or ``(None, None)`` with no live cache.
+        """
+        if live_cache is None or max_entries is None:
+            return None, None
+        return _refresh_live_cache(
+            raw_corpus,
+            linker,
+            cache,
+            live_cache,
+            max_entries=max_entries,
+            max_live_embeds=self._max_live_embeds,
+            query=None if self._embedder is None else query,
+        )
+
     def gather(
         self,
         query: str,
@@ -621,6 +770,7 @@ class RetrievalSpecialist:
         corpus: Sequence[tuple[Fragment, str]] | None = None,
         live_cache: dict[str, tuple[str, list[float]]] | None = None,
         max_live_cache_entries: int | None = None,
+        query_tier: object = None,
     ) -> EvidenceBundle:
         """Return the top-``retrieval_top_k`` fragments most relevant to *query*.
 
@@ -644,10 +794,21 @@ class RetrievalSpecialist:
             corpus: Optional already-parsed, unfiltered fragment records.
             live_cache: Optional owner-scoped runtime vector cache.
             max_live_cache_entries: Hard row bound for *live_cache*.
+            query_tier: The query's privacy tier. Ignored on the local route.
+                On a non-local route (#1904) it is checked at the chokepoint
+                **first**: a query the route refuses — INTIMATE, or untiered,
+                the default — returns an empty bundle before any corpus vector
+                is embedded, so a reflection that cannot be grounded spends no
+                dial at all.
 
         Returns:
             The configured top-k evidence bundle, possibly empty.
         """
+        if self._embedder is not None and self._embedder.refuses(query_tier):
+            return EvidenceBundle()
+        live_cache, max_live_cache_entries = self._bounded_route_cache(
+            live_cache, max_live_cache_entries
+        )
         raw_corpus = _load_raw_corpus(vault, records=corpus)
         if not raw_corpus:
             return EvidenceBundle()
@@ -659,16 +820,14 @@ class RetrievalSpecialist:
         linker = self._get_linker(config)
         cache = self._get_cache(linker, vault)
         try:
-            live_embedded_ids: set[str] | None = None
-            if bounded_live_cache is not None and max_live_cache_entries is not None:
-                live_embedded_ids = _refresh_live_cache(
-                    raw_corpus,
-                    linker,
-                    cache,
-                    bounded_live_cache,
-                    max_entries=max_live_cache_entries,
-                    max_live_embeds=self._max_live_embeds,
-                )
+            live_embedded_ids, query_vec = self._refresh(
+                raw_corpus,
+                linker,
+                cache,
+                bounded_live_cache,
+                max_live_cache_entries,
+                (query, query_tier),
+            )
             if not admitted:
                 return EvidenceBundle()
             ranked = _rank_fragments(
@@ -679,6 +838,8 @@ class RetrievalSpecialist:
                 self._max_live_embeds,
                 bounded_live_cache,
                 live_embedded_ids,
+                query_vec=query_vec,
+                query_tier=query_tier,
             )
         except EmbeddingModelUnavailableError:
             return EvidenceBundle()

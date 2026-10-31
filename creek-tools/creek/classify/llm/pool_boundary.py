@@ -98,6 +98,50 @@ POOL_MODELS_PATH: Final[str] = "/v1/models"
 POOL_GENERATE_PATH: Final[str] = "/v1/generate"
 """The pool's single generation endpoint."""
 
+POOL_EMBEDDINGS_PATH: Final[str] = "/v1/embeddings"
+"""The pool's single embeddings endpoint (ADR-0016 Decision 1 item 13, #1904).
+
+Grounding embeddings ride the same one pinned destination as generation under
+Q2 option (i), so this path is owned here and nowhere else, exactly as the
+other two are.
+"""
+
+POOL_MAX_EMBED_BATCH: Final[int] = 256
+"""Most texts one embeddings request may carry (Decision 1 items 4 and 13).
+
+The same figure as the reflection path's live-embed cap (#1034), so a cold
+reflection's whole live pass fits one batch. Enforced here, before any socket
+opens; the batcher in :mod:`creek.classify.llm.pool_embeddings` never builds a
+larger one, so this refusal is the last line rather than the first.
+"""
+
+POOL_MAX_RESPONSE_BYTES: Final[int] = 1 << 20
+"""Ceiling on a generation or identity-listing answer, read incrementally (#1906).
+
+The mirror of :data:`POOL_MAX_REQUEST_BYTES`. A reflection answer is at most a
+few kilobytes and a listing smaller still, so a pool that streams more than a
+mebibyte is misbehaving, and the vault refuses rather than holding the body in
+memory for the rest of the twelve-second request timeout on a 1 GB Machine.
+"""
+
+POOL_MAX_EMBED_RESPONSE_BYTES: Final[int] = 8 << 20
+"""Ceiling on one embeddings answer, read incrementally (#1904, #1906).
+
+Larger than :data:`POOL_MAX_RESPONSE_BYTES` because a batch of vectors is
+legitimately larger than prose: each float costs up to
+:data:`POOL_EMBED_JSON_FLOAT_BYTES` on the wire. The batcher sizes each batch
+so its *expected* answer fits under this ceiling at the pinned dimensionality,
+so the cap binds only on a pool that answers more than it was asked for.
+"""
+
+POOL_EMBED_JSON_FLOAT_BYTES: Final[int] = 25
+"""Worst-case bytes one vector component costs in a JSON answer.
+
+A float64 ``repr`` is at most 24 characters (``-1.2345678901234567e-05``) plus
+one separator. Over-counting is the safe direction: it makes batches smaller,
+never answers larger than the cap.
+"""
+
 POOL_REQUEST_ID_HEADER: Final[str] = "X-Creek-Pool-Request-Id"
 """Header carrying the request id, the pool contract's only correlation key.
 
@@ -174,6 +218,10 @@ _FOREIGN_DESTINATION: Final[str] = (
 _TOO_LARGE: Final[str] = (
     "the pool request exceeds the boundary's size cap; refusing to dial"
 )
+_RESPONSE_TOO_LARGE: Final[str] = (
+    "the pool answer exceeds the boundary's size cap; discarding it"
+)
+_READ_CHUNK_BYTES: Final[int] = 64 * 1024
 _EXHAUSTED: Final[str] = (
     "the vault request's budget is already spent; refusing to dial the pool"
 )
@@ -226,6 +274,19 @@ class PoolDestinationError(PoolBoundaryError):
 
 class PoolRequestTooLargeError(PoolBoundaryError):
     """The encoded request body exceeds :data:`POOL_MAX_REQUEST_BYTES`."""
+
+
+class PoolResponseTooLargeError(PoolBoundaryError):
+    """The pool's answer exceeded its response cap, so it was discarded (#1906).
+
+    Its own type rather than a :class:`PoolUnreachableError`, so an operator
+    can tell three different failures apart from the refusal alone: a pool
+    that did not answer in time, one that answered something undecodable, and
+    one that answered too much. The read stops at the cap rather than reading
+    the whole body and then checking it, and the answer is refused rather
+    than truncated — a truncated body would reach the parser as malformed and
+    surface as the wrong one of those three.
+    """
 
 
 class PoolDialCancelledError(PoolBoundaryError):
@@ -768,6 +829,7 @@ class PoolDial:
         *,
         payload: Mapping[str, object] | None,
         headers: Mapping[str, str] | None = None,
+        max_response_bytes: int = POOL_MAX_RESPONSE_BYTES,
     ) -> PoolResponse:
         """Send one request to *path* and read its whole answer.
 
@@ -780,12 +842,16 @@ class PoolDial:
             headers: Extra request headers, such as the correlation id in
                 :data:`POOL_REQUEST_ID_HEADER`. No credential is added here or
                 accepted here.
+            max_response_bytes: The most answer bytes this dial will read;
+                one byte more is a refusal, never a truncation.
 
         Returns:
             The status and decoded body.
 
         Raises:
             PoolRequestTooLargeError: When the body exceeds the size cap.
+            PoolResponseTooLargeError: When the answer exceeds
+                *max_response_bytes*.
             PoolDialCancelledError: When the dial was cancelled, before or during.
             PoolUnreachableError: On a transport failure or an undecodable
                 body.
@@ -800,7 +866,7 @@ class PoolDial:
                 headers=self._headers(body, headers),
             )
             response = connection.getresponse()
-            raw = response.read()
+            raw = _read_capped(response, max_response_bytes)
             status = response.status
         except (OSError, http.client.HTTPException) as exc:
             raise self._failure() from exc
@@ -912,6 +978,37 @@ class PoolDial:
         return connection
 
 
+def _read_capped(response: http.client.HTTPResponse, cap: int) -> bytes:
+    """Return *response*'s body, refusing as soon as it exceeds *cap* bytes.
+
+    A declared ``Content-Length`` over the cap is refused before a byte of the
+    body is read; an undeclared or understated one is read in chunks and
+    refused the moment the running total passes the cap, so memory never
+    grows past ``cap`` plus one chunk whatever the pool sends.
+
+    Args:
+        response: The response whose headers have been read.
+        cap: The most body bytes admitted.
+
+    Returns:
+        The whole body, at most *cap* bytes.
+
+    Raises:
+        PoolResponseTooLargeError: When the body is larger than *cap*.
+    """
+    declared = response.length
+    if declared is not None and declared > cap:
+        raise PoolResponseTooLargeError(_RESPONSE_TOO_LARGE)
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := response.read(_READ_CHUNK_BYTES):
+        total += len(chunk)
+        if total > cap:
+            raise PoolResponseTooLargeError(_RESPONSE_TOO_LARGE)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _decode(raw: bytes) -> object:
     """Return *raw* decoded as JSON.
 
@@ -1006,6 +1103,46 @@ def pool_generate(
     """
     with open_pool_dial(budget=budget, environ=environ) as dial:
         return dial.request(POOL_GENERATE_PATH, payload=payload, headers=headers)
+
+
+def pool_embed(
+    payload: Mapping[str, object],
+    *,
+    budget: float | None = None,
+    environ: Mapping[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> PoolResponse:
+    """Send one embeddings request to the pinned destination (#1904).
+
+    The same single destination, transport, timeouts and request cap as
+    :func:`pool_generate`; the answer is capped at
+    :data:`POOL_MAX_EMBED_RESPONSE_BYTES` instead of the prose cap. A request
+    carrying more than :data:`POOL_MAX_EMBED_BATCH` inputs is refused before
+    any socket opens.
+
+    Args:
+        payload: The JSON request body; its ``input`` is the list of texts.
+        budget: Seconds left in the vault request.
+        environ: Environment to read; ``os.environ`` when omitted.
+        headers: Per-request headers, such as the correlation id.
+
+    Returns:
+        The embeddings response.
+
+    Raises:
+        PoolRequestTooLargeError: When the batch or the body is over its cap.
+        PoolBoundaryError: As :meth:`PoolDial.request`.
+    """
+    inputs = payload.get("input")
+    if isinstance(inputs, list) and len(inputs) > POOL_MAX_EMBED_BATCH:
+        raise PoolRequestTooLargeError(_TOO_LARGE)
+    with open_pool_dial(budget=budget, environ=environ) as dial:
+        return dial.request(
+            POOL_EMBEDDINGS_PATH,
+            payload=payload,
+            headers=headers,
+            max_response_bytes=POOL_MAX_EMBED_RESPONSE_BYTES,
+        )
 
 
 def pool_response_ok(response: PoolResponse) -> bool:

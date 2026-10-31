@@ -57,13 +57,17 @@ which of T19's clauses are satisfied — including the ones that are not.
 ## 1. What is pinned, and what actually verifies it
 
 A managed vault carries one `00-Creek-Meta`-external model package manifest
-(#1855 schema, version 1, **fields unchanged** by ADR-0016), read from the path
+(#1855 schema, version 1, **fields unchanged** by ADR-0016 except for the one
+optional `embedding` pin ADR-0018 adds), read from the path
 in `CREEK_MODEL_PACKAGE_FILE` and settable from no vault config
 (`creek_mcp/model_package.py`). Under O5 the operator fills it for a vendor
 runtime as follows.
 
-The schema is `extra="forbid"` with **no defaults**: all twelve fields below
-are required, and a manifest missing any one of them does not load at all. A
+The schema is `extra="forbid"`: the twelve fields below other than
+`embedding` are required with **no defaults**, and a manifest missing any one
+of them does not load at all. `embedding` is the one optional field (#1904,
+ADR-0018); leaving it out is how a manifest says the vendor offers no
+attested embedding model, and a managed vault then stays ungrounded. A
 manifest that fails to load is not a warning — `configured_manifest` raises
 `ModelPackageError`, `pinned_runtime_serves` returns `False`, and
 `--check pool` reports `pool-unconfigured` (**exit 30**, section 3), which
@@ -84,6 +88,7 @@ that exit appears.
 | `size_bytes` | Positive integer. **Hard to source:** a vendor-hosted model publishes no blob size. Use the upstream open-weights artefact the vendor names; it is not verified vault-side | The schema (positive only) |
 | `license_spdx` | An SPDX identifier, pattern-checked. **Hard to source:** the enclave image's licence and the model's licence may differ; this field is the model's | The schema (pattern only) |
 | `license_url` | Where that licence is published | — |
+| `embedding` | **Optional.** The attested embedding model, as an object of four fields: `model_name` (the vendor's catalogue id, e.g. `qwen3-embedding-4b`), `dimensions` (the vector length the vendor serves it at — take it from the vendor, not from the upstream model card, which may describe a different truncation), `similarity_threshold` (the resonance threshold calibrated for this model, strictly between 0 and 1; MiniLM's `0.75` does not transfer), and `runtime_inventory_digest` (`pool_identity_digest(runtime_name, runtime_version, <embedding model_name>)`). Omit it when the vendor has no attested embedding model | The identity listing must offer the model at that digest before any text is sent; every answer must name the model and have exactly `dimensions` floats per vector |
 
 ### The pool identity digest
 
