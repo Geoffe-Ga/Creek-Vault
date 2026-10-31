@@ -20,7 +20,9 @@ mcp is a direct dependency, so its floor lives in
 ``pyasn1`` (issue #867): pyasn1 0.6.3 carries CVE-2026-59885
 (quadratic-time OID-arc decoding — a DoS on hostile BER/DER input) and
 CVE-2026-59886 (unbounded big-int construction from REAL exponents —
-also a DoS). Both are fixed in pyasn1 0.6.4. pyasn1 is transitive-only:
+also a DoS). Both are fixed in pyasn1 0.6.4; 0.6.4 in turn carries
+CVE-2026-119194 through CVE-2026-119197, fixed in 0.6.5, which is the
+floor. pyasn1 is transitive-only:
 it enters this graph via the ``gdrive`` extra → google-auth →
 pyasn1-modules and is never imported directly, so its floor lives in
 ``[tool.uv].constraint-dependencies`` rather than
@@ -284,8 +286,8 @@ _CRAWDAD_UV_LOCK = _CRAWDAD_ROOT / "uv.lock"
 _PATCHED_VERSION = Version("1.30.0")
 
 #: First pyasn1 release containing the fixes for CVE-2026-59885 and
-#: CVE-2026-59886 (0.6.4) and CVE-2026-119194/-119195/-119196/-119197
-#: (0.6.5) — the later of the two.
+#: CVE-2026-59886 (0.6.4) and for CVE-2026-119194 through
+#: CVE-2026-119197 (0.6.5): the floor is the later of the two.
 _PYASN1_PATCHED_VERSION = Version("0.6.5")
 
 #: First setuptools release containing the fix for PYSEC-2026-3447
@@ -1296,26 +1298,24 @@ def test_every_unbounded_major_the_relock_crossed_is_bounded() -> None:
     )
 
 
-@pytest.mark.parametrize("vulnerable", ["0.6.3", "0.6.4"])
-def test_pyasn1_floor_rejects_last_vulnerable_release(vulnerable: str) -> None:
-    """The constraint excludes 0.6.3 and 0.6.4, both vulnerable.
+def test_pyasn1_floor_rejects_last_vulnerable_release() -> None:
+    """The constraint excludes 0.6.4, the last vulnerable release.
 
-    pyasn1 0.6.3 carries CVE-2026-59885 (quadratic OID-arc decode DoS)
-    and CVE-2026-59886 (REAL-exponent big-int DoS); 0.6.4 carries
-    CVE-2026-119194/-119195/-119196/-119197. The constraint must
-    genuinely be ``>=0.6.5`` so a relock cannot resolve back onto either.
+    pyasn1 0.6.4 carries CVE-2026-119194 through CVE-2026-119197 (and
+    0.6.3 additionally CVE-2026-59885 / CVE-2026-59886). The constraint
+    must genuinely be ``>=0.6.5`` so a relock cannot resolve back onto it.
     """
     specifier = _pyasn1_constraint_specifier()
-    assert vulnerable not in specifier, (
-        f"pyasn1 constraint {specifier!r} admits {vulnerable}, a vulnerable "
-        "release; the floor must be >=0.6.5"
+    assert "0.6.4" not in specifier, (
+        f"pyasn1 constraint {specifier!r} admits 0.6.4, the release "
+        "carrying CVE-2026-119194..119197; the floor must be >=0.6.5"
     )
 
 
 def test_pyasn1_floor_accepts_patched_release() -> None:
-    """The constraint accepts 0.6.5, the first CVE-patched release."""
+    """The constraint accepts 0.6.5, the first release clear of every advisory."""
     specifier = _pyasn1_constraint_specifier()
-    assert str(_PYASN1_PATCHED_VERSION) in specifier, (
+    assert "0.6.5" in specifier, (
         f"pyasn1 constraint {specifier!r} rejects 0.6.5; the patched "
         "release itself must satisfy the constraint"
     )
@@ -1326,13 +1326,12 @@ def test_locked_pyasn1_at_or_above_patched_release() -> None:
 
     The lockfile is what CI installs and what pip-audit inspects; a
     correct constraint floor with a stale lock still ships the
-    vulnerable 0.6.3.
+    vulnerable 0.6.4.
     """
     locked = _locked_pyasn1_version()
     assert locked >= _PYASN1_PATCHED_VERSION, (
         f"uv.lock pins pyasn1 {locked}, below the CVE-patched "
-        f"{_PYASN1_PATCHED_VERSION} (CVE-2026-59885 / CVE-2026-59886 / "
-        "CVE-2026-119194..119197); "
+        f"{_PYASN1_PATCHED_VERSION} (CVE-2026-119194..119197); "
         "pip-audit inspects the lock, so relock after adding the "
         "constraint"
     )

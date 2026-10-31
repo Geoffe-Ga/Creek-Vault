@@ -1,6 +1,6 @@
 """Command line for the capacity harness: ``python -m creek_mcp.bench``.
 
-Two subcommands:
+Three subcommands:
 
 - ``reflect`` runs the capacity sweeps and writes a :class:`BenchReport`.
   ``--mode fake`` (the default) is hermetic; ``--mode live`` drives an
@@ -11,6 +11,10 @@ Two subcommands:
   ADR-0016's metered per-token pool, priced from the *measured* token block in
   a benchmark report. A report whose basis is not ``provider_reported`` is
   refused: a fake run's byte bound and an absent measurement are not prices.
+- ``eval`` ranks candidate models on the voice-fidelity eval (#1989).
+  ``--mode fake --judge hermetic`` (the defaults) is hermetic; reaching a
+  provider takes ``--mode live`` or ``--judge routed`` plus named credentials.
+  Its flags and refusals live in :mod:`creek_mcp.bench.eval.command`.
 
 Exit codes: ``0`` success; ``2`` refusal — a fixed message naming the flag or
 field at fault, never the value; ``1`` any other failure, named by exception
@@ -42,6 +46,7 @@ from creek_mcp.bench.cost import (
     load_price_sheet,
     metered_estimate,
 )
+from creek_mcp.bench.eval.command import add_eval_arguments, run_eval_command
 from creek_mcp.bench.fake import FakePool, fake_factory
 from creek_mcp.bench.local_only import (
     LocalOnlyFactory,
@@ -223,6 +228,14 @@ def _add_cost(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -
     parser.add_argument("--out", type=Path, required=True)
 
 
+def _add_eval(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Register the ``eval`` subcommand."""
+    parser = subparsers.add_parser(
+        "eval", help="rank models on the voice-fidelity eval"
+    )
+    add_eval_arguments(parser)
+
+
 def _parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
@@ -231,6 +244,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_reflect(subparsers)
     _add_cost(subparsers)
+    _add_eval(subparsers)
     return parser
 
 
@@ -524,7 +538,11 @@ def _refusal_text(exc: ValueError) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the harness CLI and return its exit code."""
     args = _parser().parse_args(argv)
-    command = _run_reflect if args.command == "reflect" else _run_cost
+    command = {
+        "reflect": _run_reflect,
+        "cost": _run_cost,
+        "eval": run_eval_command,
+    }[args.command]
     try:
         line = command(args)
     except ValueError as exc:
