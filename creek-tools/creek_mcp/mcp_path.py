@@ -30,6 +30,7 @@ would version the same thing twice and let the two disagree.
 
 from __future__ import annotations
 
+import re
 from typing import Final
 
 MCP_PATH: Final[str] = "/mcp"
@@ -81,3 +82,64 @@ def in_metadata_realm(path: object) -> bool:
         ``True`` for a member of :data:`PROTECTED_RESOURCE_PATHS`.
     """
     return isinstance(path, str) and path in PROTECTED_RESOURCE_PATHS
+
+
+ALLOCATION_ROOT: Final[str] = "/a"
+"""The edge prefix under which each managed allocation's own resource lives (#2002).
+
+A managed allocation's resource is ``<edge>/a/<slug>/mcp`` (owner decision
+R3-1): a path on the shared edge origin, so no new certificate is needed, and a
+token audience no other vault names.
+"""
+
+ALLOCATION_SLUG_CHARS: Final[int] = 32
+"""The exact length of a minted slug: 24 random bytes in unpadded base64url."""
+
+_ALLOCATION_MCP_PATH_RE: Final[re.Pattern[str]] = re.compile(
+    rf"{ALLOCATION_ROOT}/[A-Za-z0-9_-]{{{ALLOCATION_SLUG_CHARS}}}{MCP_PATH}"
+)
+
+
+def is_allocation_mcp_path(path: object) -> bool:
+    """Return whether *path* is exactly one allocation's ``/a/<slug>/mcp``.
+
+    Args:
+        path: The candidate path; anything but a :class:`str` never matches.
+
+    Returns:
+        ``True`` only for the minted grammar: no subtree, no nesting, no
+        percent-encoding and no slug of any other length.
+    """
+    return isinstance(path, str) and _ALLOCATION_MCP_PATH_RE.fullmatch(path) is not None
+
+
+def allocation_mcp_path(slug: str) -> str:
+    """Return the per-allocation resource path for *slug*.
+
+    Args:
+        slug: The allocation's minted, URL-safe slug.
+
+    Returns:
+        :data:`ALLOCATION_ROOT`, the slug, then :data:`MCP_PATH`.
+
+    Raises:
+        ValueError: When *slug* is not the exact minted grammar. The message
+            never echoes the value.
+    """
+    path = f"{ALLOCATION_ROOT}/{slug}{MCP_PATH}"
+    if not is_allocation_mcp_path(path):
+        raise ValueError("allocation slug is invalid")
+    return path
+
+
+def is_resource_path(path: object) -> bool:
+    """Return whether *path* may be a vault's MCP resource path.
+
+    Args:
+        path: The candidate path.
+
+    Returns:
+        ``True`` for :data:`MCP_PATH` — a self-hosted vault and the shared
+        edge — and for one allocation's :func:`allocation_mcp_path`.
+    """
+    return path == MCP_PATH or is_allocation_mcp_path(path)

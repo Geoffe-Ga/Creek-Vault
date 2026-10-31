@@ -235,6 +235,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(
         routing_public_url=None,
         oauth_resource_url=None,
+        # The pilot's edge serves only the shared resource, so its worker
+        # writes no per-allocation one (#2002) until the edge routes them (#2003).
+        per_allocation_mcp_resource=False,
         private_tls_ca_certificate_file=None,
         tls_cert=None,
         tls_key=None,

@@ -111,6 +111,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-jobs", type=_positive_int)
     add_mcp_oauth_roll_argument(parser)
     parser.add_argument("--oauth-authorization-server", default=None)
+    parser.add_argument(
+        "--per-allocation-mcp-resource",
+        action="store_true",
+        help=(
+            "write each new allocation its own <edge>/a/<slug>/mcp resource "
+            "(#2002); off by default until the edge routes those paths (#2003)"
+        ),
+    )
     return parser
 
 
@@ -242,6 +250,7 @@ def compose(
                 app_prefix=args.fly_app_prefix,
                 clock=observe,
                 mcp_oauth=mcp_oauth_settings(args),
+                per_allocation_mcp_resource=args.per_allocation_mcp_resource,
             )
             provider_client = resources.enter_context(
                 httpx.Client(

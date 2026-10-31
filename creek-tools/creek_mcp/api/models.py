@@ -78,6 +78,7 @@ from creek_mcp.api.reading_recommendations import (
     ReadingSource,
 )
 from creek_mcp.contract import CONTRACT_VERSION
+from creek_mcp.mcp_path import is_resource_path
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 
 # --------------------------------------------------------------------------
@@ -1356,9 +1357,10 @@ class AgentMcpDiscovery(_WireModel):
             The original value.
 
         Raises:
-            ValueError: Unless the resource path is exactly ``/mcp``.
+            ValueError: Unless the resource path is exactly ``/mcp``, or one
+                managed allocation's ``/a/<slug>/mcp`` (#2002).
         """
-        if urlsplit(value).path != "/mcp":
+        if not is_resource_path(urlsplit(value).path):
             msg = "agent MCP resource must end in /mcp"
             raise ValueError(msg)
         return value

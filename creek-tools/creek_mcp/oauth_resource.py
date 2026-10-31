@@ -51,6 +51,7 @@ from creek_mcp.mcp_path import (
     MCP_PATH,
     PROTECTED_RESOURCE_PATHS,
     PROTECTED_RESOURCE_ROOT,
+    is_resource_path,
 )
 from creek_mcp.policy import DEFAULT_GRANTS, Grant
 from creek_mcp.transport_posture import is_loopback
@@ -186,11 +187,13 @@ def _validated_resource(value: str) -> str:
     Raises:
         ValueError: Unless it is a clean URL whose path is exactly
             :data:`~creek_mcp.mcp_path.MCP_PATH` — the one path a vault serves
-            MCP on, so the metadata path derived from it is one the vault
-            actually answers.
+            MCP on — or one managed allocation's
+            :func:`~creek_mcp.mcp_path.allocation_mcp_path` on the shared edge
+            (#2002). Either way the metadata path derived from it is one the
+            vault actually answers (:class:`ProtectedResourceMetadataMiddleware`).
     """
     resource = _validated_url(RESOURCE_URL_ENV, value, loopback_http=True)
-    if urlsplit(resource).path != MCP_PATH:
+    if not is_resource_path(urlsplit(resource).path):
         raise _refuse(RESOURCE_URL_ENV, f"this vault's URL ending in {MCP_PATH}")
     return resource
 
@@ -341,6 +344,9 @@ class ProtectedResourceMetadataMiddleware:
         """
         self.app = app
         self._body = json.dumps(config.metadata_document()).encode("utf-8")
+        # A per-allocation resource (#2002) derives its own path-inserted
+        # metadata path; answering it keeps the challenge's pointer honest.
+        self._paths = PROTECTED_RESOURCE_PATHS | {urlsplit(config.metadata_url).path}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Serve the document, or pass the request down unchanged.
@@ -356,7 +362,7 @@ class ProtectedResourceMetadataMiddleware:
         if (
             scope["type"] != _HTTP_SCOPE
             or scope.get("method") != _GET
-            or scope.get("path") not in PROTECTED_RESOURCE_PATHS
+            or scope.get("path") not in self._paths
         ):
             await self.app(scope, receive, send)
             return
