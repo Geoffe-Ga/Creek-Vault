@@ -76,7 +76,7 @@ class TestIntimateNeverRoutesToCloud:
         )
         # The contrapositive of the guard: WITHOUT the Intimate tier the cloud
         # provider IS returned — proving the redirect is tier-gated, not blanket.
-        assert router.resolve("generation").provider == "anthropic"
+        assert router.resolve("generation", PrivacyTier.OPEN).provider == "anthropic"
 
     def test_intimate_on_local_stage_is_unchanged(self) -> None:
         """Intimate + an already-local stage needs no redirect."""

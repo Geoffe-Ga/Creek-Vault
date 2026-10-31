@@ -211,7 +211,7 @@ and **none of them is the caller's ceiling**:
 which ``creek/classify/classify_engine.py`` reaches by resolving a second,
 intimate-only classifier config, and which is never even *asked* about
 ``personal``: the engine's split is binary (``build_tier_classifiers``
-resolves tier-less and ``INTIMATE`` only; ``TierClassifiers.for_tier`` is
+resolves ``NON_INTIMATE_ROUTE`` and ``INTIMATE`` only; ``TierClassifiers.for_tier`` is
 ``if tier is not PrivacyTier.INTIMATE``), so a redirect added to the router
 alone would be inert —
 plus two **host-operator** gates that answer "may this machine talk to a
@@ -361,10 +361,12 @@ _CLASSIFY_PROMPT_CHANNEL_RATIONALE = (
     "redirects an INTIMATE fragment to the local default or raises "
     "IntimateRoutingError. It is the only tier gate, and the split it sits "
     "behind is BINARY, decided in the engine rather than in the router: "
-    "build_tier_classifiers asks the router exactly twice -- once tier-less "
+    "build_tier_classifiers asks the router exactly twice -- once for "
+    "NON_INTIMATE_ROUTE (a fixed non-INTIMATE tier) "
     "and once for PrivacyTier.INTIMATE -- and TierClassifiers.for_tier is "
     "'if tier is not PrivacyTier.INTIMATE: return self.non_intimate'. So "
-    "PERSONAL is never presented to the router at all; it takes the tier-less "
+    "PERSONAL is never presented to the router at all; it takes the shared "
+    "non-INTIMATE "
     "classifier and reaches the configured cloud provider unchanged. Widening "
     "the router's redirect to cover PERSONAL would therefore be INERT -- "
     "verified by mutation, and the reason any real fix has to move for_tier "

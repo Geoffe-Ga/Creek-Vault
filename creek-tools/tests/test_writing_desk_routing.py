@@ -29,7 +29,9 @@ class TestResolveRoleFallback:
             generation={"provider": "anthropic"},
             writing_desk={"voice_drafter": {"provider": "openai", "model": "gpt-5.4"}},
         )
-        assert router.resolve_role("voice_drafter").provider == "openai"
+        assert (
+            router.resolve_role("voice_drafter", PrivacyTier.OPEN).provider == "openai"
+        )
 
     def test_unset_role_falls_back_to_generation(self) -> None:
         """A role with no entry uses the generation stage."""
@@ -38,12 +40,12 @@ class TestResolveRoleFallback:
             generation={"provider": "anthropic"},
             writing_desk={"voice_drafter": {"provider": "openai"}},
         )
-        assert router.resolve_role("outliner").provider == "anthropic"
+        assert router.resolve_role("outliner", PrivacyTier.OPEN).provider == "anthropic"
 
     def test_unset_role_no_generation_falls_back_to_default(self) -> None:
         """With neither a role entry nor a generation stage, default applies."""
         router = _router(default={"provider": "ollama"})
-        assert router.resolve_role("researcher").provider == "ollama"
+        assert router.resolve_role("researcher", PrivacyTier.OPEN).provider == "ollama"
 
 
 class TestRoleInheritsIntimateGate:
@@ -55,7 +57,10 @@ class TestRoleInheritsIntimateGate:
             default={"provider": "ollama"},
             writing_desk={"voice_drafter": {"provider": "anthropic"}},
         )
-        assert router.resolve_role("voice_drafter").provider == "anthropic"
+        assert (
+            router.resolve_role("voice_drafter", PrivacyTier.OPEN).provider
+            == "anthropic"
+        )
         assert (
             router.resolve_role(
                 "voice_drafter",

@@ -69,10 +69,11 @@ id list and nothing more. A production factory closes over
 :class:`creek.classify.llm.router.ModelRouter` and resolves the
 ``generation`` stage *with* the tier, which is what puts every compile
 through the ``Intimate``-never-cloud chokepoint (#647/#962); handed a
-pre-built client instead, the caller resolves with no tier and
-``ModelRouter._enforce_local_for_intimate`` degrades to a no-op — the
-invariant is then documented and unenforced, which is precisely the bug
-#962 fixes.
+pre-built client instead, the caller would have to invent a tier it has not
+seen — which is precisely the bug #962 fixes. (Since #1948 the router's
+``tier`` is required and a ``None`` tier is gated as ``Intimate``, so an
+omitted tier is a type error and an unknown one fails closed rather than
+degrading the gate to a no-op.)
 
 The engine deliberately knows nothing about ``ModelRouter``, tier
 ceilings, or the MCP layer: it derives a :class:`~creek.models.PrivacyTier`

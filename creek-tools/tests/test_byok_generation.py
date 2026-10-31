@@ -84,7 +84,9 @@ def test_anthropic_byok_reads_key_from_named_env_var(
     assert provider.available is True
     with patch("anthropic.Anthropic", return_value=MagicMock()) as ctor:
         _ = provider.client
-    assert ctor.call_args.kwargs == {"api_key": "sk-user-byok"}
+    assert ctor.call_args.kwargs == {
+        "api_key": "sk-user-byok",  # pragma: allowlist secret
+    }
 
 
 def test_anthropic_without_byok_is_behaviour_unchanged(
@@ -141,7 +143,7 @@ def test_openai_byok_reads_key_and_composes_with_api_base(
         _ = provider.client
     assert ctor.call_args.kwargs == {
         "base_url": "https://gateway.example/v1",
-        "api_key": "sk-openai-user",
+        "api_key": "sk-openai-user",  # pragma: allowlist secret
     }
 
 
@@ -153,7 +155,9 @@ def test_openai_byok_without_api_base_passes_only_the_key(
     provider = OpenAIProvider(LLMConfig(provider="openai", api_key_env=_BYOK_OPENAI))
     with patch("openai.OpenAI", return_value=MagicMock()) as ctor:
         _ = provider.client
-    assert ctor.call_args.kwargs == {"api_key": "sk-openai-user"}
+    assert ctor.call_args.kwargs == {
+        "api_key": "sk-openai-user",  # pragma: allowlist secret
+    }
 
 
 def test_openai_without_byok_is_behaviour_unchanged(
@@ -181,7 +185,9 @@ def test_gemini_byok_reads_key_from_named_env_var(
     assert provider.available is True
     with patch("google.genai.Client", return_value=MagicMock()) as ctor:
         _ = provider.client
-    assert ctor.call_args.kwargs == {"api_key": "g-user-byok"}
+    assert ctor.call_args.kwargs == {
+        "api_key": "g-user-byok",  # pragma: allowlist secret
+    }
 
 
 def test_gemini_byok_missing_key_refuses_naming_the_byok_var(
@@ -212,7 +218,7 @@ def test_byok_does_not_bypass_intimate_chokepoint() -> None:
         )
     )
     # OPEN/PERSONAL keep the BYOK cloud stage (with its key env preserved)...
-    open_cfg = router.resolve("generation")
+    open_cfg = router.resolve("generation", PrivacyTier.OPEN)
     assert open_cfg.provider == "anthropic"
     assert open_cfg.api_key_env == _BYOK_ANTHROPIC
     # ...but INTIMATE is still redirected to the local default — BYOK or not.
@@ -235,7 +241,7 @@ def test_byok_through_writing_desk_role() -> None:
         )
     )
     # Non-intimate keeps the role's BYOK cloud config...
-    role_cfg = router.resolve_role("voice_drafter")
+    role_cfg = router.resolve_role("voice_drafter", PrivacyTier.OPEN)
     assert role_cfg.provider == "anthropic"
     assert role_cfg.api_key_env == _BYOK_ANTHROPIC
     # ...INTIMATE is still redirected to the local default.

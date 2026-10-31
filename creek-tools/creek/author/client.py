@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final
 
 from creek.classify.llm.providers import Completion, build_provider
+from creek.classify.llm.router import NON_INTIMATE_ROUTE
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -98,7 +99,7 @@ class AuthorLLMClient:
         role: str,
         *,
         author: AuthorConfig | None = None,
-        tier: PrivacyTier | None = None,
+        tier: PrivacyTier | None,
     ) -> AuthorLLMClient:
         """Build a client for a Writing Desk *role* via the router (#649).
 
@@ -115,7 +116,8 @@ class AuthorLLMClient:
             role: The subagent role (e.g. ``outliner`` / ``voice_drafter``).
             author: Author-subsystem config carrying the legacy per-agent model
                 overrides; ``None`` skips the legacy fallback.
-            tier: The fragment's privacy tier (gated by the chokepoint).
+            tier: The fragment's privacy tier (gated by the chokepoint) —
+                required (#1948); ``None`` is gated as ``Intimate``.
 
         Returns:
             An :class:`AuthorLLMClient` wrapping the role's resolved provider.
@@ -130,7 +132,9 @@ class AuthorLLMClient:
         # local model — that would build an incoherent provider+model pair and
         # muddy the privacy redirect. Only apply voice_model when no redirect
         # happened (provider unchanged vs the ungated resolution).
-        redirected = cfg.provider != router.resolve_role(role).provider
+        redirected = (
+            cfg.provider != router.resolve_role(role, NON_INTIMATE_ROUTE).provider
+        )
         if (
             not redirected
             and author is not None
@@ -147,7 +151,7 @@ class AuthorLLMClient:
         router: ModelRouter,
         *,
         author: AuthorConfig | None = None,
-        tier: PrivacyTier | None = None,
+        tier: PrivacyTier | None,
         may_serve: Callable[[LLMProvider], bool] | None = None,
     ) -> AuthorLLMClient | None:
         """Build the voice-drafter client, or ``None`` when it is unusable.
@@ -164,7 +168,8 @@ class AuthorLLMClient:
         Args:
             router: The run's :class:`ModelRouter`.
             author: Author-subsystem config for the ``voice_model`` fallback.
-            tier: The fragment's privacy tier (gated by the chokepoint).
+            tier: The fragment's privacy tier (gated by the chokepoint) —
+                required (#1948); ``None`` is gated as ``Intimate``.
             may_serve: Optional stricter readiness check that replaces
                 :attr:`available`, such as the MCP server's pinned-model rule
                 (#1849). ``None`` keeps :attr:`available`.
