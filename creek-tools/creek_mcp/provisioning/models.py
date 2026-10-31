@@ -210,6 +210,9 @@ class DivergenceKind(StrEnum):
     STUCK_DELETION = "stuck_deletion"
     CONTINUOUS_RUNNING = "continuous_running"
     INCOMPLETE_CREATE = "incomplete_create"
+    # #1918: a rolled-away pool credential the vendor has not confirmed
+    # revoked.  Reported from the first pass; alerts past the deletion bound.
+    PENDING_REVOCATION = "pending_revocation"
 
 
 @unique

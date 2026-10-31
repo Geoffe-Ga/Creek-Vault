@@ -32,6 +32,28 @@ to locate the originating commit for any reference below.
   1 MiB, an embeddings batch at 8 MiB, read incrementally and refused one
   byte over with the new `PoolResponseTooLargeError`, which is distinct from
   an unreachable pool and from an undecodable answer.
+- Never strand a rolled-away pool credential (#1918, #1917). `roll_pool_bundle`
+  now records the replaced vendor credential as a pending revocation in the
+  same atomic, durable write that stores the new bundle (it used a plain
+  `write_bytes` before), and clears it only once the vendor confirms it dead.
+  A vendor 5xx or a crash between the write and the revoke leaves the old key
+  owed and reachable instead of overwritten: `revoke` drains every owed key
+  before the current one and writes no tombstone while any is unconfirmed,
+  the new `retry_pending_revocations` retries them, and a roll retries any
+  outstanding one before it mints again. The revoke stays fatal. Every roll
+  now revokes the credential it replaced: `PoolBundleIssuer.issue` is
+  documented to always mint, its `revoke` to be idempotent, and an issuer
+  that hands back the old credential is refused before anything is written,
+  replacing an unreachable `if rolled.credential != previous.credential`
+  branch. `FleetReconciler` takes an optional listing-only
+  `PendingRevocationSource` (both secret managers implement
+  `pending_pool_revocations`) and reports each owed key as the new
+  `pending_revocation` divergence, alerting `pool_credential_orphan` once it
+  is `stuck_deletion_seconds` old; it also reports more vendor-listed
+  credentials under one live allocation than one plus its owed keys as
+  `duplicate_resource`. Reports and alerts carry allocation ids, ages and
+  counts only, never a key value.
+
 - Give existing managed-vault Machines an upgrade path (#1869, owner decision
   R2-1). A new vault image or runtime config no longer strands every older
   vault. `--converge-vault-machines` on the worker and the pilot is an
