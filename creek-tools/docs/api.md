@@ -374,6 +374,12 @@ strict membership against the server's `supported_contract_minors`: a missing
 header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
+The floor of that set is owner decision **R2-5**: Creek always serves its
+current minor and the previous minor, at least, and Adepthood moves its pin
+only after every vault reports the new minor. The bump order and what a
+vault that has not converged sees are in the contract bundle's
+[Version overlap policy (R2-5)](../../docs/contracts/adepthood-v1/README.md#version-overlap-policy-r2-5).
+
 That set is a **window, and it widens before it narrows**. It currently holds
 `0.17`, `0.16`, `0.15`, `0.14`, `0.13`, `0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and
 `0.2`. The
