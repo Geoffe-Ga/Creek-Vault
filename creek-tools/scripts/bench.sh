@@ -7,6 +7,8 @@
 #            --metered-model MODEL_ID --token-report REPORT.json \
 #            [--metered-currency USD|EUR] [--monthly-cap N] \
 #            [--tokens-spent-input N] [--tokens-spent-output N] --out COST.json
+#        ./scripts/bench.sh eval --models MODEL[,MODEL...] [--mode fake|live] \
+#            [--judge hermetic|routed] [--seed N] [--entries N] --out EVAL.json
 #        ./scripts/bench.sh --help
 #
 # Hermetic by default (--mode fake), for both providers: --provider pool runs
@@ -19,6 +21,9 @@
 # Machine-month, from the *measured* token block in a benchmark report. Only a
 # `provider_reported` basis is citable: a fake run's byte bound and an absent
 # measurement are refused (exit 2) rather than estimated (#1897).
+# `eval` ranks models on the voice-fidelity eval (#1989); fake/hermetic by
+# default, and a provider is reached only with --mode live or --judge routed
+# plus named credentials.
 # Exit codes are the harness's own: 0 ok, 2 refused, 1 failed (issue #1850).
 # See docs/bench.md.
 
