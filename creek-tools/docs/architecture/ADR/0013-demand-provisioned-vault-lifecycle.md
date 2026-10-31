@@ -11,6 +11,8 @@
   [ADR-0014](0014-provider-managed-custody-for-ordinary-fly.md) replaces the
   ordinary-Fly ceremony below with an explicit provider-managed direct-ready
   transition. Historical ceremony states remain readable for migration only.
+- **Alert amendment**: [Amended by #1867](#amended-by-1867-2026-10-31) adds
+  `provider_credential_expiring` to the closed operator alert list.
 - **Consumer counterpart**: Adepthood ADR 0007, "Confidential vaults are
   provisioned on demand, not at signup"
 
@@ -183,3 +185,27 @@ this decision; it is a different architecture requiring a new ADR.
   auditability, reconciliation, quotas, and adversarial tests.
 - ADR-0007's target privacy posture remains explicit, while ADR-0014 prevents
   the ordinary Fly MVP from claiming it prematurely.
+
+## Amended by #1867 (2026-10-31)
+
+This record stays as written. Decision 4 closed the operator alert list
+(duplicate allocations, orphan resources, departure from the monthly budget,
+and the kinds later ADRs joined to it). #1867 adds one kind, approved by the
+owner with release decision R2-2 (Fly org tokens live at most 90 days):
+
+- **`provider_credential_expiring`.** The scheduled fleet report raises it on
+  the fleet when the operator-recorded expiry of the Fly org token is within
+  the warning window (72 hours by default, configurable), has already passed,
+  or was never recorded. A missing expiry is a configuration gap, never
+  "fine". It is re-raised on every report pass until the recorded expiry
+  changes.
+- **Recorded, not discovered.** The expiry and the token's non-secret ID are
+  operator-recorded configuration beside the token. Creek never calls the
+  provider's token API to learn them and never reads the token to compute the
+  warning.
+- **No token material.** The alert's private wording names only the token ID
+  and the expiry; the delivered payload stays the counts-only
+  `creek_fleet_alert_v1` document, so neither leaves the control plane.
+- **Receiver first.** The consumer's alert receiver validates the same closed
+  list, so it must admit the new kind before a Creek build that raises it is
+  deployed.
