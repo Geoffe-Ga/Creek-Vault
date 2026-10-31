@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 from mcp.server.auth.provider import AccessToken
 
@@ -816,15 +816,28 @@ _ARGS = st.dictionaries(
 )
 
 
+#: What a row legitimately says on its own: its field names, its outcome
+#: vocabulary, and the consumer and tool this property test always writes. A
+#: generated argument that happens to spell one of these (``admitted``,
+#: ``consumer``, ``openclaw``) is not a leak when the response carries it.
+_ROW_VOCABULARY: Final[frozenset[str]] = _ROW_KEYS | frozenset(
+    {*(outcome.value for outcome in AgentActivityOutcome), "openclaw", "creek.mine"}
+)
+
+
 def _forbidden_strings(args: dict[str, Any]) -> set[str]:
-    """Return every key and long string *args* could carry into a response."""
+    """Return every key and long string *args* could carry into a response.
+
+    Strings the row itself says (:data:`_ROW_VOCABULARY`) are left out: finding
+    one of those in the response proves nothing about the arguments.
+    """
     found: set[str] = set(args)
     for value in args.values():
         if isinstance(value, str):
             found.add(value)
         elif isinstance(value, dict):
             found.update(str(key) for key in value)
-    return {item for item in found if len(item) >= 8}
+    return {item for item in found if len(item) >= 8} - _ROW_VOCABULARY
 
 
 @settings(
@@ -833,6 +846,8 @@ def _forbidden_strings(args: dict[str, Any]) -> set[str]:
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 @given(calls=st.lists(_ARGS, min_size=1, max_size=5))
+# The case CI drew on 2026-10-31: an argument key spelling the row's own outcome.
+@example(calls=[{"admitted": "00000000"}])
 def test_no_argument_key_or_value_ever_leaks(
     tmp_path_factory: pytest.TempPathFactory, calls: list[dict[str, Any]]
 ) -> None:
