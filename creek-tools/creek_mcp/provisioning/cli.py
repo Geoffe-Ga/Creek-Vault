@@ -18,7 +18,7 @@ from creek_mcp.remote_auth import (
 from creek_mcp.transport_posture import require_transport_confidentiality
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,13 +69,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
 
-def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Any:
-    """Build the provider-free control app for direct or Fly-edge serving."""
+def compose(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    admission_gate: Callable[[], bool] | None = None,
+) -> Any:
+    """Build the provider-free control app for direct or Fly-edge serving.
+
+    *admission_gate* is an optional runtime switch consulted beside the static
+    policy; the Fly pilot closes it while fleet alerts are undeliverable (R2-4).
+    """
     verifier = _load_verifier(args.consumer_tokens_file, parser)
     store = ProvisioningStore(args.database)
     admission = ActivationAdmissionPolicy(
         new_activations_enabled=not args.disable_new_activations,
         maximum_live_allocations=args.maximum_live_allocations,
+        runtime_gate=admission_gate,
     )
     return build_provisioning_app(store, verifier, admission=admission)
 

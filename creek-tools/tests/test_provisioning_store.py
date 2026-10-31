@@ -69,6 +69,8 @@ _FLEET_TABLES = (
     "provisioning_machine_running",
     "provisioning_machine_running_months",
     "provisioning_budget_months",
+    "provisioning_alert_delivery_gaps",
+    "provisioning_pending_alerts",
 )
 
 

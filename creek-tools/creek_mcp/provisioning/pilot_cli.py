@@ -20,6 +20,7 @@ import uvicorn
 from creek_mcp.httpapi.app import ROUTING_MISS_STATUS
 from creek_mcp.provisioning import cli as control_cli
 from creek_mcp.provisioning import fleet_cli, routing_cli, worker_cli
+from creek_mcp.provisioning.alert_relay import AdmissionGate, AlertRelay
 from creek_mcp.provisioning.models import mcp_resource_url, public_vault_url
 from creek_mcp.provisioning.pilot_alerts import HttpFleetAlertSink
 from creek_mcp.provisioning.pilot_control import (
@@ -31,6 +32,7 @@ from creek_mcp.provisioning.pilot_supervisor import (
     PilotSupervisor,
     SupervisedComponent,
 )
+from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -101,6 +103,7 @@ class PilotBundle:
     worker: worker_cli.WorkerBundle = field(repr=False)
     router: routing_cli.ReplayRoutingBundle = field(repr=False)
     alerts: HttpFleetAlertSink = field(repr=False)
+    relay: AlertRelay = field(repr=False)
 
     def close(self) -> None:
         """Release provider, callback, and credential-state resources."""
@@ -302,7 +305,10 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
         and reconcile_values[1] >= reconcile_values[0]
     ):
         parser.error("reconcile interruption window must be shorter than its cadence")
-    control = control_cli.compose(args, parser)
+    # Owner decision R2-4: the alert relay closes this gate while fleet alerts
+    # cannot be delivered, and the control plane refuses new activations.
+    admission_gate = AdmissionGate()
+    control = control_cli.compose(args, parser, admission_gate=admission_gate)
     worker: worker_cli.WorkerBundle | None = None
     router: routing_cli.ReplayRoutingBundle | None = None
     alerts: HttpFleetAlertSink | None = None
@@ -310,6 +316,12 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
         worker = worker_cli.compose(args, parser, fly_replay_enabled=True)
         router = routing_cli.compose_replay(args, parser)
         alerts = HttpFleetAlertSink(args.alert_url, args.handoff_token_file)
+        relay = AlertRelay(
+            ProvisioningStore(args.database),
+            admission_gate,
+            alerts.deliver,
+            backoff_seconds=args.fleet_interval_seconds,
+        )
         if (
             args.shutdown_timeout_seconds >= _FLY_KILL_TIMEOUT_SECONDS
             or worker.minimum_claim_validity.total_seconds()
@@ -359,14 +371,14 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
                         args,
                         stop,
                         fleet_fresh,
-                        alerts,
+                        relay,
                     ),
                     ready=fleet_fresh,
                 ),
             )
         )
         health.bind(supervisor)
-        return PilotBundle(edge, supervisor, worker, router, alerts)
+        return PilotBundle(edge, supervisor, worker, router, alerts, relay)
     except BaseException:
         if alerts is not None:
             alerts.close()
@@ -415,7 +427,7 @@ def _run_scheduler(
     args: argparse.Namespace,
     stop: Event,
     freshness: _FleetFreshness | None = None,
-    alerts: HttpFleetAlertSink | None = None,
+    alerts: AlertRelay | None = None,
 ) -> None:
     """Serialize reports and optional repairs on explicit bounded cadences."""
     next_reconcile = (
@@ -441,15 +453,21 @@ def _run_scheduler(
 def _run_fleet_pass(
     args: argparse.Namespace,
     command: str,
-    alerts: HttpFleetAlertSink | None,
+    alerts: AlertRelay | None,
 ) -> None:
-    """Run one provider pass and require any alert result to be delivered."""
+    """Run one provider pass and hand its alerts to the retaining relay.
+
+    The relay contains a failed delivery (R2-4): it retries with backoff and
+    refuses new activations instead of stopping the scheduler, so the pass
+    still counts as a completed provider-authoritative report.
+    """
     if alerts is not None:
         exit_code = fleet_cli.main(
             _fleet_arguments(args, command),
             emit_output=False,
-            alert_sink=alerts.deliver,
+            alert_sink=alerts.collect,
         )
+        alerts.flush()
     else:
         exit_code = fleet_cli.main(
             _fleet_arguments(args, command),
