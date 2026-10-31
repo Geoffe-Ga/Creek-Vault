@@ -95,7 +95,15 @@ if TYPE_CHECKING:
     from creek.author.agents import RetrievalSpecialist
     from creek.author.models import EvidenceBundle
     from creek.classify.privacy_filter import PrivacyTierOverride
+    from creek.link.embeddings import EmbeddingSpace, TextEmbedder
     from creek.models import Fragment, PrivacyTier
+
+    GroundingRoute = Callable[[PrivacyTier], TextEmbedder | None]
+    """Decides, per routing tier, which embedding route grounds a reflection.
+
+    ``None`` keeps the local route; an embedder routes grounding through it;
+    raising means no route may ground this request, so it is ungrounded.
+    """
 
 logger = logging.getLogger(__name__)
 
@@ -313,9 +321,12 @@ class GroundingSession:
         self._lock = threading.RLock()
         self._specialist: RetrievalSpecialist | None = None
         self._vault: Path | None = None
+        self._space: EmbeddingSpace | None = None
         self._live_vectors: dict[str, tuple[str, list[float]]] = {}
 
-    def specialist(self, vault: Path) -> RetrievalSpecialist:
+    def specialist(
+        self, vault: Path, embedder: TextEmbedder | None = None
+    ) -> RetrievalSpecialist:
         """Return this session's warmed specialist for *vault*, building once.
 
         The import is deferred to here, not module scope, so importing this tool
@@ -337,22 +348,38 @@ class GroundingSession:
         means a test can monkeypatch it and exercise the real production path,
         and it is why this method takes no budget argument at all.
 
+        **Keyed on the vector space too (#1904).** A specialist built for the
+        local route and one built for the attested pool read different parquet
+        rows and produce incommensurable vectors, so switching route replaces
+        the slot and clears the live map exactly as switching vault does. The
+        live map never holds vectors from two spaces at once.
+
         Args:
             vault: The vault this grounding pass will read.
+            embedder: The non-local embedding route this pass uses, or
+                ``None`` for the local sentence-transformer.
 
         Returns:
             The warmed specialist, freshly built when this session held none or
-            held one for a different vault.
+            held one for a different vault or a different vector space.
         """
         from creek.author.agents import RetrievalSpecialist
 
+        space = None if embedder is None else embedder.space
         with self._lock:
-            if self._specialist is not None and self._vault == vault:
+            if (
+                self._specialist is not None
+                and self._vault == vault
+                and self._space == space
+            ):
                 return self._specialist
-            built = RetrievalSpecialist(max_live_embeds=_MAX_LIVE_EMBEDS)
+            built = RetrievalSpecialist(
+                max_live_embeds=_MAX_LIVE_EMBEDS, embedder=embedder
+            )
             built.warm(vault)
             self._specialist = built
             self._vault = vault
+            self._space = space
             self._live_vectors.clear()
             return built
 
@@ -363,6 +390,8 @@ class GroundingSession:
         override: PrivacyTierOverride,
         *,
         corpus: Sequence[tuple[Fragment, str]] | None = None,
+        query_tier: PrivacyTier | None = None,
+        embedder: TextEmbedder | None = None,
     ) -> EvidenceBundle:
         """Gather with one bounded live-vector cache under the session lock.
 
@@ -378,12 +407,15 @@ class GroundingSession:
             vault: Vault root owning the corpus and cache.
             override: This call's privacy admission override.
             corpus: Optional request snapshot, already parsed but unfiltered.
+            query_tier: The routing tier of the entry being reflected, handed
+                to a non-local route's chokepoint for the query vector.
+            embedder: The non-local embedding route, or ``None`` for local.
 
         Returns:
             The specialist's provenance-carrying evidence bundle.
         """
         with self._lock:
-            specialist = self.specialist(vault)
+            specialist = self.specialist(vault, embedder)
             return specialist.gather(
                 query,
                 vault,
@@ -391,6 +423,7 @@ class GroundingSession:
                 corpus=corpus,
                 live_cache=self._live_vectors,
                 max_live_cache_entries=_MAX_LIVE_EMBEDS,
+                query_tier=query_tier,
             )
 
 
@@ -414,6 +447,50 @@ class _Grounding(NamedTuple):
 
     lines: list[str]
     source_ids: list[str]
+
+
+class _RouteDecision(NamedTuple):
+    """Which embedding route grounds one reflection (#1904, ADR-0018).
+
+    Attributes:
+        embedder: The non-local route, or ``None`` for the local default.
+        query_tier: The tier the query is embedded at — the reflection's own
+            routing tier, never a looser one.
+        allowed: ``False`` when the route decision itself refused grounding
+            (the pool was chosen but no attested embedding pin can be met), in
+            which case the reflection is ungrounded and nothing is embedded.
+    """
+
+    embedder: TextEmbedder | None = None
+    query_tier: PrivacyTier | None = None
+    allowed: bool = True
+
+
+def _decide_route(
+    grounding_route: GroundingRoute | None, tier: PrivacyTier
+) -> _RouteDecision:
+    """Ask *grounding_route* which embedding route grounds a *tier* reflection.
+
+    Any failure to decide is a refusal to ground, never a fallback to some
+    other route: ADR-0016 Q2's fallback is option (iii), ungrounded, so an
+    embedding never leaves by a route nobody chose. Only the exception's type
+    name is logged.
+
+    Args:
+        grounding_route: The injected decision, or ``None`` for local.
+        tier: The reflection's routing tier.
+
+    Returns:
+        The decision.
+    """
+    if grounding_route is None:
+        return _RouteDecision(query_tier=tier)
+    try:
+        embedder = grounding_route(tier)
+    except Exception as exc:
+        logger.info("Grounding withheld: no admissible route (%s)", type(exc).__name__)
+        return _RouteDecision(query_tier=tier, allowed=False)
+    return _RouteDecision(embedder=embedder, query_tier=tier)
 
 
 class _LLM(Protocol):
@@ -844,6 +921,7 @@ def _gather_grounding(
     retrieve: Callable[[str, Path, PrivacyTierOverride], list[str]] | None,
     session: GroundingSession | None = None,
     corpus: _ReflectionCorpus | None = None,
+    route: _RouteDecision | None = None,
 ) -> _Grounding:
     """Run one grounding pass and compose the compiled-layer seed list.
 
@@ -865,17 +943,29 @@ def _gather_grounding(
             of the default grounder's retrieval specialist — not the grounder
             itself. Ignored when *retrieve* is injected, because an injected
             grounder replaces the default outright and owns its own retrieval.
+        route: Which embedding route the default grounder uses, and the tier
+            its query is embedded at (#1904). ``None`` is the local route.
+            A decision that forbids grounding yields no lines at all.
 
     Returns:
         The grounding lines for the prompt, and the seed ids that select
         candidate compiled pages.
     """
     override = to_privacy_override(ceiling)
+    decision = route or _RouteDecision()
     if retrieve is not None:
         grounding, retrieved_ids = _Grounding(retrieve(entry, vault_path, override), [])
+    elif not decision.allowed:
+        grounding, retrieved_ids = [], []
     else:
         grounding, retrieved_ids = _default_retrieve(
-            entry, vault_path, override, session=session, corpus=corpus
+            entry,
+            vault_path,
+            override,
+            session=session,
+            corpus=corpus,
+            query_tier=decision.query_tier,
+            embedder=decision.embedder,
         )
     # Seeds *select* candidate compiled pages; they never authorize one. An
     # ``entry_ref`` seed is admitted by the #846 gate above, and a retrieval
@@ -974,6 +1064,7 @@ def reflect_tool(
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
     max_notes: int = _DEFAULT_MAX_NOTES,
+    grounding_route: GroundingRoute | None = None,
 ) -> dict[str, Any]:
     """Return anchored Higher-Self margin notes for a single journal entry.
 
@@ -1017,6 +1108,16 @@ def reflect_tool(
             :func:`_routing_tier` — the local-vs-cloud routing tier.
         consumer: Free-form consumer id for the audit log.
         max_notes: Cap on returned notes.
+        grounding_route: ``(routing_tier) -> embedder | None`` — which
+            embedding route the default grounder uses (#1904, ADR-0018).
+            ``None`` (the default) and a ``None`` answer both keep the local
+            sentence-transformer, so every self-hosted vault is unchanged. On a
+            managed vault the production decision returns the attested pool's
+            embedder when, and only when, this request's generation is also
+            the pool, so the published ``inference_source`` names the one
+            destination every byte went to. A decision that raises leaves the
+            reflection ungrounded with nothing embedded — never grounded by a
+            route nobody chose.
 
     Returns:
         ``{status, tool, tier_ceiling, ...}`` — ``ok`` with ``notes`` (+ optional
@@ -1084,6 +1185,7 @@ def reflect_tool(
         retrieve=retrieve,
         session=session,
         corpus=corpus,
+        route=None if retrieve is not None else _decide_route(grounding_route, tier),
     )
 
     # Before the factory, not after: building it probes the provider, and a
@@ -1188,6 +1290,9 @@ def _default_retrieve(
     override: PrivacyTierOverride,
     session: GroundingSession | None = None,
     corpus: _ReflectionCorpus | None = None,
+    *,
+    query_tier: PrivacyTier | None = None,
+    embedder: TextEmbedder | None = None,
 ) -> _Grounding:
     """Production grounding: the *titles* of the corpus fragments nearest *query*.
 
@@ -1305,6 +1410,10 @@ def _default_retrieve(
         corpus: The request-scoped, unfiltered corpus snapshot. Production
             supplies one so entry resolution, retrieval, and compiled-page
             provenance parse each Markdown file at most once.
+        query_tier: The reflection's routing tier, at which the query is
+            embedded on a non-local route.
+        embedder: The non-local embedding route (#1904), or ``None`` for the
+            local sentence-transformer.
 
     Returns:
         Fragment titles, most relevant first, paired with the ids they came
@@ -1313,12 +1422,26 @@ def _default_retrieve(
     try:
         records = corpus.retrieval_records() if corpus is not None else None
         if session is not None:
-            bundle = session.gather(query, vault_path, override, corpus=records)
+            bundle = session.gather(
+                query,
+                vault_path,
+                override,
+                corpus=records,
+                query_tier=query_tier,
+                embedder=embedder,
+            )
         else:
             from creek.author.agents import RetrievalSpecialist
 
-            specialist = RetrievalSpecialist()
-            bundle = specialist.gather(query, vault_path, override=override)
+            if embedder is None:
+                # The local call is unchanged from before #1904.
+                bundle = RetrievalSpecialist().gather(
+                    query, vault_path, override=override
+                )
+            else:
+                bundle = RetrievalSpecialist(embedder=embedder).gather(
+                    query, vault_path, override=override, query_tier=query_tier
+                )
         return _Grounding(
             lines=[claim.claim for claim in bundle.claims],
             source_ids=[

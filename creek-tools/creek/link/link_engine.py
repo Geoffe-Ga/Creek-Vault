@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from creek.config import CreekConfig
+    from creek.link.embeddings import TextEmbedder
     from creek.models import Fragment
 
 
@@ -178,6 +179,7 @@ def run_link(
     config: CreekConfig,
     method: str,
     rebuild: bool,
+    embedder: TextEmbedder | None = None,
 ) -> LinkSummary:
     """Link a vault inside its shared load-to-write mutation boundary.
 
@@ -187,6 +189,10 @@ def run_link(
         method: ``"embeddings"``, ``"temporal"``, ``"eddies"``, or
             ``"threads"``.
         rebuild: Whether to invalidate the embeddings cache first.
+        embedder: A non-local embedding route (#1904) — the attested pool on
+            a managed vault with no writer's key — or ``None`` for the local
+            sentence-transformer. Each fragment's own tier reaches its
+            chokepoint, so an INTIMATE fragment gets no vector on that route.
 
     Returns:
         A :class:`LinkSummary` capturing per-method counts.
@@ -201,6 +207,7 @@ def run_link(
             config=config,
             method=method,
             rebuild=rebuild,
+            embedder=embedder,
         )
 
 
@@ -210,6 +217,7 @@ def _run_link_with_content_lock_held(
     config: CreekConfig,
     method: str,
     rebuild: bool,
+    embedder: TextEmbedder | None = None,
 ) -> LinkSummary:
     """Implement :func:`run_link` while its content lock is held.
 
@@ -220,6 +228,7 @@ def _run_link_with_content_lock_held(
             ``"threads"``.
         rebuild: When ``True`` and ``method == "embeddings"``, delete
             the cached embeddings parquet before recomputing.
+        embedder: The non-local embedding route, or ``None`` for local.
 
     Returns:
         A :class:`LinkSummary` capturing per-method counts.
@@ -244,6 +253,7 @@ def _run_link_with_content_lock_held(
             fragments=fragments,
             config=config,
             cache_path=cache_path,
+            embedder=embedder,
         )
         return LinkSummary(
             method=method,
@@ -269,6 +279,7 @@ def _run_link_with_content_lock_held(
             fragments=fragments,
             config=config,
             cache_path=cache_path,
+            embedder=embedder,
             vault_path=vault_path,
         )
 
@@ -277,6 +288,7 @@ def _run_link_with_content_lock_held(
         fragments=fragments,
         config=config,
         cache_path=cache_path,
+        embedder=embedder,
         vault_path=vault_path,
     )
 
@@ -286,6 +298,7 @@ def _run_threads(
     fragments: list[Fragment],
     config: CreekConfig,
     cache_path: Path,
+    embedder: TextEmbedder | None = None,
     vault_path: Path,
 ) -> LinkSummary:
     """Detect narrative threads and materialise one page per thread inline.
@@ -317,6 +330,7 @@ def _run_threads(
         fragments=fragments,
         config=config,
         cache_path=cache_path,
+        embedder=embedder,
     )
     detector = ThreadDetector.from_linking_config(
         embedding_pass.vectors,
@@ -377,6 +391,7 @@ def _run_eddies(
     fragments: list[Fragment],
     config: CreekConfig,
     cache_path: Path,
+    embedder: TextEmbedder | None = None,
     vault_path: Path,
 ) -> LinkSummary:
     """Detect eddies and materialise them inline.
@@ -416,6 +431,7 @@ def _run_eddies(
         fragments=fragments,
         config=config,
         cache_path=cache_path,
+        embedder=embedder,
     )
     detector = EddyDetector.from_linking_config(
         embedding_pass.vectors,
@@ -618,6 +634,7 @@ def _run_embeddings(
     fragments: list[Fragment],
     config: CreekConfig,
     cache_path: Path,
+    embedder: TextEmbedder | None = None,
 ) -> tuple[int, EmbeddingPass]:
     """Compute embeddings, optionally re-using the on-disk cache.
 
@@ -641,12 +658,15 @@ def _run_embeddings(
         fragments=fragments,
         config=config,
         cache_path=cache_path,
+        embedder=embedder,
     )
 
     # FEAT-024: hierarchy-aware filtering needs both the fragment map
     # (parent/child relations) and the configured sibling skip window.
     fragments_by_id = {f.id: f for f in fragments}
-    edges = EmbeddingLinker(config=config.embeddings).count_resonances(
+    edges = EmbeddingLinker(
+        config=config.embeddings, embedder=embedder
+    ).count_resonances(
         embedding_pass.vectors,
         fragments_by_id,
         sibling_skip_window=config.linking.hierarchy_sibling_skip_window,
@@ -659,6 +679,7 @@ def _load_or_compute_embeddings(
     fragments: list[Fragment],
     config: CreekConfig,
     cache_path: Path,
+    embedder: TextEmbedder | None = None,
 ) -> EmbeddingPass:
     """Return embeddings for *fragments*, hitting the cache when fresh.
 
@@ -679,7 +700,7 @@ def _load_or_compute_embeddings(
         freshly computed and cache-served entries, and the row count the
         cache write actually landed on disk.
     """
-    linker = EmbeddingLinker(config=config.embeddings)
+    linker = EmbeddingLinker(config=config.embeddings, embedder=embedder)
 
     cached = _safe_load_cache(linker, cache_path)
     fresh_ids = _ids_with_fresh_cache(fragments, cached)
