@@ -322,6 +322,91 @@ write fence as the live count, makes no provider request, and creates no alias,
 job, app, Machine, root filesystem, volume, or credential. Status, routing,
 export, retry, and deletion for existing allocations remain available.
 
+### Upgrade existing vault Machines (#1869)
+
+A vault Machine records the vault image and runtime config of the control
+plane that created it. Publishing a new vault image (section 2) or shipping a
+release that changes the runtime config leaves every existing vault behind
+policy. Routing verifies each Machine exactly and never changes one, so after
+the control Machine is redeployed with a new `CREEK_PILOT_VAULT_IMAGE` (or a
+runtime-config change), every older vault answers with the fast
+`503 temporarily_unavailable` until it is converged. The refusal is retryable,
+and Adepthood degrades the reflection meanwhile. A Machine whose identity
+differs is still a permanent rejection.
+
+Owner decision R2-1 (2026-10-27) makes an operator-run batch the single
+mutator. Its safety rule:
+
+- **Exact identity.** Convergence needs the exact name and region, the
+  `creek_allocation_id`/`creek_activation_id` metadata, the root filesystem,
+  and one encrypted `/vault` mount on the allocation's own volume. The image
+  must be an immutable digest. Every secret file must be one the
+  allocation's own record reproduces at that path. Anything else is
+  `refused-identity` and is never written.
+- **Policy-owned fields only.** Only `image`, the runtime `env`,
+  `processes`, `init` and `user`, `guest`, `services`, `restart` and `files`
+  may differ. The update writes exactly what a new provision would write.
+- **Stopped Machines only.** A running vault is `skipped-running`, untouched.
+  Re-run once it has scaled to zero.
+- **No volume or credential change.** The volume is never detached, replaced
+  or recreated. The run reads activation records through the read-only
+  reader the router uses, so it cannot issue, rotate or revoke the consumer
+  credential.
+
+Run it from the control Machine, after discovering the app in the dedicated
+organization and confirming the control app belongs to it:
+
+```console
+fly apps list --org adepthood-managed-vault-pilot
+fly ssh console --app <control-app> --command \
+  "creek-managed-vault-pilot --converge-vault-machines"
+```
+
+1. **Dry run (the default).** The command mutates nothing. It prints one
+   JSON document listing each allocation as `would-converge` with the
+   drifted field names (`image`, `env.<NAME>`, `processes` and so on),
+   `already-current`, `skipped-running` or `refused-identity`. Stop and
+   investigate any `refused-identity` before applying.
+2. **Apply in batches.** Add `--converge-apply`, a fresh journal on the data
+   volume for this upgrade, and a bound. The default bound is one Machine,
+   so the first apply is a canary:
+
+   ```console
+   creek-managed-vault-pilot --converge-vault-machines --converge-apply \
+     --converge-journal /data/vault-converge-<release>.json --converge-limit 1
+   ```
+
+   Before each update the run writes the Machine's prior config to the
+   owner-only journal, with secret file values recorded only as SHA-256
+   digests. It then updates the stopped Machine in place (still stopped),
+   re-verifies it exactly, and proves readiness the way a route does: start,
+   bounded wait, re-verify. The Machine is left running, and its proxy
+   autostop scales it back to zero. The batch halts at the first Machine
+   whose update or verification fails. Raise `--converge-limit` once the
+   canary routes, and re-run the same command with the same journal until it
+   exits `0`.
+3. **Verify.** A converged vault reports `converged`; a later run reports it
+   `already-current`. Confirm one real reflection routes, and that the
+   scheduled fleet report stays clean.
+4. **Roll back if the new image is bad.** Run the same command with
+   `--converge-rollback` (a dry run that lists `would-restore`), then add
+   `--converge-apply`. Rollback restores only a Machine that is still exactly
+   what this journal's converge left, and only while it is stopped. It
+   rebuilds the secret files from the record, which must match the recorded
+   digests, then verifies the restored config exactly. A restored vault is
+   behind the current policy again, so finish by redeploying the control
+   Machine with the prior `CREEK_PILOT_VAULT_IMAGE`; until then those vaults
+   answer `503`.
+
+Re-running after any interruption is safe. A Machine already converged is
+`already-current`; one updated but not yet proven ready is re-verified, not
+re-updated. The journal is never overwritten with a later prior, and one
+journal belongs to one upgrade. Exit statuses are `0` done, `3` work remains
+(a dry run found some, or the bound was reached), `75` retry later (a running
+Machine or a retryable provider failure) and `2` refused (identity, an
+unusable journal, or a non-retryable failure). The full outcome table is in
+[provisioning-control-plane.md](provisioning-control-plane.md#converging-vault-machines-after-an-upgrade-1869).
+
 ## 4. Configure reporting and alert delivery
 
 The pilot policy file uses `currency = "USD"` and

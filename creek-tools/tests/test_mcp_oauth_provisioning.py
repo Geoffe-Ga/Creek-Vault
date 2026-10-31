@@ -229,7 +229,11 @@ def test_a_new_allocation_boots_with_both_settings(replay: bool) -> None:
 
 
 def test_a_new_allocation_with_its_settings_stripped_is_refused() -> None:
-    """A record with settings verifies only the exact new environment."""
+    """A record with settings verifies only the exact new environment.
+
+    The environment is policy-owned, so the refusal is retryable and leaves
+    the Machine untouched for the operator's converge (#1869).
+    """
     api = FakeFlyAPI()
     secrets = FakeSecretManager(set(), mcp_oauth=mcp_oauth_settings())
     driver = fly_driver(api, secrets, fly_replay_enabled=True)
@@ -239,7 +243,8 @@ def test_a_new_allocation_with_its_settings_stripped_is_refused() -> None:
     with pytest.raises(ProviderError) as raised:
         driver.prepare_replay(_routable(allocation.allocation_id))
 
-    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert raised.value.reason is FailureReason.PROVIDER_UNAVAILABLE
+    assert api.updates == []
 
 
 def test_a_new_allocation_naming_another_issuer_is_refused() -> None:
@@ -340,7 +345,10 @@ def test_a_legacy_allocation_keeps_routing_on_its_exact_legacy_env() -> None:
 
 
 def test_a_legacy_allocation_carrying_the_settings_is_refused() -> None:
-    """No blanket relaxation: a record without settings refuses an env with them."""
+    """No blanket relaxation: a record without settings refuses an env with them.
+
+    Routing never adopts or rewrites it; the refusal is retryable (#1869).
+    """
     api = FakeFlyAPI()
     _secrets, driver, allocation_id = _legacy_allocation(api)
     _env(api).update(mcp_oauth_settings().runtime_env())
@@ -348,7 +356,8 @@ def test_a_legacy_allocation_carrying_the_settings_is_refused() -> None:
     with pytest.raises(ProviderError) as raised:
         driver.prepare_replay(_routable(allocation_id))
 
-    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
+    assert raised.value.reason is FailureReason.PROVIDER_UNAVAILABLE
+    assert api.updates == []
 
 
 def test_a_rolled_record_refuses_its_unrolled_machine() -> None:
