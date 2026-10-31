@@ -43,6 +43,8 @@ from creek_mcp.api.models import (
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
+    ExportQuery,
+    ExportResponse,
     JobAcceptedResponse,
     JobStatusResponse,
     JournalUpsertRequest,
@@ -183,6 +185,9 @@ OP_JOB_STATUS: Final[str] = "getPipelineJob"
 
 OP_AGENT_ACTIVITY: Final[str] = "getAgentActivity"
 """``operation_id`` of ``GET /v1/agent-activity``."""
+
+OP_EXPORT: Final[str] = "exportVault"
+"""``operation_id`` of ``GET /v1/export``."""
 
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``.
@@ -654,6 +659,17 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         requires_contract_version=True,
         summary="Suggest a reading with a verified journal quotation and benefit.",
         max_body_bytes=64 * 1024,
+    ),
+    RouteSpec(
+        path="/v1/export",
+        method="GET",
+        operation_id=OP_EXPORT,
+        capability=Capability.EXPORT,
+        request_model=None,
+        response_model=ExportResponse,
+        requires_contract_version=True,
+        summary="Page through the owner's own documents and fragments, every tier.",
+        query_model=ExportQuery,
     ),
     RouteSpec(
         path="/v1/health",

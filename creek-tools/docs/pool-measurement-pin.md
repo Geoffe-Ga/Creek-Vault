@@ -60,13 +60,17 @@ which of T19's clauses are satisfied — including the ones that are not.
 ## 1. What is pinned, and what actually verifies it
 
 A managed vault carries one `00-Creek-Meta`-external model package manifest
-(#1855 schema, version 1, **fields unchanged** by ADR-0016), read from the path
+(#1855 schema, version 1, **fields unchanged** by ADR-0016 except for the one
+optional `embedding` pin ADR-0018 adds), read from the path
 in `CREEK_MODEL_PACKAGE_FILE` and settable from no vault config
 (`creek_mcp/model_package.py`). Under O5 the operator fills it for a vendor
 runtime as follows.
 
-The schema is `extra="forbid"` with **no defaults**: all twelve fields below
-are required, and a manifest missing any one of them does not load at all. A
+The schema is `extra="forbid"`: the twelve fields below other than
+`embedding` are required with **no defaults**, and a manifest missing any one
+of them does not load at all. `embedding` is the one optional field (#1904,
+ADR-0018); leaving it out is how a manifest says the vendor offers no
+attested embedding model, and a managed vault then stays ungrounded. A
 manifest that fails to load is not a warning — `configured_manifest` raises
 `ModelPackageError`, `pinned_runtime_serves` returns `False`, and
 `--check pool` reports `pool-unconfigured` (**exit 30**, section 3), which
@@ -87,6 +91,7 @@ that exit appears.
 | `size_bytes` | Positive integer. **Hard to source:** a vendor-hosted model publishes no blob size. Use the upstream open-weights artefact the vendor names; it is not verified vault-side | The schema (positive only) |
 | `license_spdx` | An SPDX identifier, pattern-checked. **Hard to source:** the enclave image's licence and the model's licence may differ; this field is the model's | The schema (pattern only) |
 | `license_url` | Where that licence is published | — |
+| `embedding` | **Optional.** The attested embedding model, as an object of four fields: `model_name` (the vendor's catalogue id, e.g. `qwen3-embedding-4b`), `dimensions` (the vector length the vendor serves it at — take it from the vendor, not from the upstream model card, which may describe a different truncation), `similarity_threshold` (the resonance threshold calibrated for this model, strictly between 0 and 1; MiniLM's `0.75` does not transfer), and `runtime_inventory_digest` (`pool_identity_digest(runtime_name, runtime_version, <embedding model_name>)`). Omit it when the vendor has no attested embedding model | The identity listing must offer the model at that digest before any text is sent; every answer must name the model and have exactly `dimensions` floats per vector |
 
 ### The pool identity digest
 
@@ -362,9 +367,47 @@ until its cap is spent, which is why the cap — not the network — is the brak
 | Which measurement may price a cap | Only provider-reported counts. A `byte_upper_bound` is a bound on bytes; `unreported` and `not_measured` are absences. Each refuses with `ValueError` | `measured_reflection_tokens` |
 | Reset | By the vendor's update call, on adepthood's calendar month | Not built. #1900 merged carrying `expires_at` in the bundle, not the vendor calls that reset or extend it |
 | Expiry | Extended **in place** every 15 days for 30, so one missed cycle is survivable | `PoolCredential.expires_at` holds the date; nothing extends it yet (see Reset) |
-| Re-issue | Create-then-delete, only on compromise | Not built (see Reset) |
-| Revoke | At deletion, confirmed **before** the content-free receipt is issued; the issuer raises rather than returns on an unconfirmed revocation | `PoolBundleIssuer.revoke` |
-| Reconcile | A surviving credential is an orphan in the fleet report (`pool_credential_orphan`) | `AlertKind` |
+| Re-issue | Create-then-delete, only on compromise. A roll *is* this re-issue: every roll revokes the credential it replaced, because `issue` always mints; an issuer that hands the old credential back is refused before anything is written ([#1917](https://github.com/Geoffe-Ga/Creek-Vault/issues/1917)) | `roll_pool_bundle`; the vendor calls themselves are not built (see Reset) |
+| Superseded key | Recorded as a **pending revocation** in the same atomic write that stores the new bundle, cleared only once the vendor confirms it dead, so a vendor outage or a crash mid-roll leaves it owed rather than stranded ([#1918](https://github.com/Geoffe-Ga/Creek-Vault/issues/1918)) | `roll_pool_bundle`, `retry_pending_revocations` |
+| Revoke | At deletion, confirmed **before** the content-free receipt is issued; the issuer raises rather than returns on an unconfirmed revocation. Deletion revokes every pending revocation first, under the same rule, and the issuer's revoke must be idempotent | `PoolBundleIssuer.revoke` |
+| Reconcile | A surviving credential is an orphan in the fleet report (`pool_credential_orphan`). A pending revocation is reported as `pending_revocation` from the first pass and raises `pool_credential_orphan` once it is `stuck_deletion_seconds` old; more live vendor credentials under one allocation than one plus its pending revocations is a `duplicate_resource` | `AlertKind`, `FleetReconciler` |
+
+### A roll whose revocation did not confirm
+
+A roll writes the new bundle and the old credential's pending revocation in one
+atomic write, then asks the vendor to delete the old key. When that delete is
+unconfirmed — a vendor 5xx, a timeout, or the process dying — the roll raises,
+the new bundle stays stored, and the old key stays **owed**: its value is kept
+inside the encrypted record, never in a log, an alert or the report, which carry
+only the activation's allocation id, the obligation's age and a count. Nothing
+is made non-fatal and nothing is forgotten.
+
+Recovery is a retry, from the process that holds the pool issuer (the
+provisioning worker; the fleet report holds no revocation authority and calls
+no delete):
+
+1. `retry_pending_revocations(<activation>)` revokes every owed key and clears
+   each one as the vendor confirms it. A second outage raises again and leaves
+   the key owed.
+2. The next roll of that activation retries first and **refuses to mint** while
+   any revocation is still owed, so at most one superseded key is ever live.
+3. Deleting the allocation revokes every owed key before the current one, and
+   writes no tombstone while any is unconfirmed.
+
+When the fleet report lists a `pending_revocation` divergence, the old key is
+still spendable up to its cap. Under the `stuck_deletion_seconds` bound it is
+the normal window a retry closes; past it the report raises
+`pool_credential_orphan` for that allocation, and the response is the retry
+above once the vendor's admin API answers. If the vendor refuses the retry
+indefinitely, revoke the key by hand in the vendor's portal (only the vendor's
+own reference for it belongs in any note), then run the retry, which then
+confirms against a key that is already dead.
+
+*Not wired yet.* No production pool issuer exists (#1896), so nothing calls a
+roll today, and the operator fleet CLI is not yet given a pending-revocation
+source: wiring one is #1896's, together with the vendor's key listing. That
+alert is also **not deliverable** through adepthood's receiver until its closed
+kind list admits `pool_credential_orphan` (see Alerting above).
 
 An exhausted cap answers `insufficient_quota` (429, non-transient). The
 contract maps it to `temporarily_unavailable` so the vault refuses rather than

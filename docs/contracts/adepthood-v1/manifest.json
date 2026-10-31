@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.26.0",
+  "contract_version": "0.27.0",
   "files": [
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-ready.json",
-      "sha256": "12887143ef2aff2f84d615d9d5f0949482aab16e60d5a01606468eb00f6d9c97",
+      "sha256": "a5b43bdb5c23de72efe38d3b5b7a660964817a02bfbc6b061f7cd2fbec4c8725",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-unavailable.json",
-      "sha256": "d8af7849785daac7176cc7ae58ebbd49fac77f30829fdc9424a1d311d373f9bd",
+      "sha256": "a57cf95c793f150c2996e4a9ed5789c60d286346cb749f5b61b74d61aea69925",
       "state": null
     },
     {
@@ -76,7 +76,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "b6ee3d34ec9306e6cb1d13b3ec8385f3659b04486f25c2a85bc1538b47fbf5d3",
+      "sha256": "2b3d7c65178c1071aee118cdb778590eef49490f747e99bfc865b1263e3b9120",
       "state": "empty"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "12887143ef2aff2f84d615d9d5f0949482aab16e60d5a01606468eb00f6d9c97",
+      "sha256": "a5b43bdb5c23de72efe38d3b5b7a660964817a02bfbc6b061f7cd2fbec4c8725",
       "state": "success"
     },
     {
@@ -161,6 +161,55 @@
       "model": "ErrorEnvelope",
       "path": "examples/drive-connector/unavailable-service.json",
       "sha256": "bd64368c2cf504b3fc6c7619e4eb0f4c3eff52c31a839d3da4d24f8d00e9f68c",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "export",
+      "model": "NotApplicableExample",
+      "path": "examples/export/care-escalation.json",
+      "sha256": "a284f5f1745565cb2e8d7c7537c298ad82b6c06d638f69c02e41ae8251030c06",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "export",
+      "model": "ExportResponse",
+      "path": "examples/export/empty.json",
+      "sha256": "86623306e938e1dfc89d9b70f8a80d7f0554476eaf528c19ea659afaba1a3d8a",
+      "state": "empty"
+    },
+    {
+      "capability": "export",
+      "model": "ErrorEnvelope",
+      "path": "examples/export/incompatible-version.json",
+      "sha256": "4be1a1928f6b6c8c5fe58baf5941de29b981c37a5f462d2a84a62775da069d2a",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "export",
+      "model": "ErrorEnvelope",
+      "path": "examples/export/malformed-input.json",
+      "sha256": "e7eccc53c23413b6892985d066341d395a060f680e1875579defb2bfe9a4e537",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "export",
+      "model": "ErrorEnvelope",
+      "path": "examples/export/refusal.json",
+      "sha256": "6aeb0e513fa7f33ad1b594c5d99a075ad70e9e2a4552679c096135d92571ac0b",
+      "state": "refusal"
+    },
+    {
+      "capability": "export",
+      "model": "ExportResponse",
+      "path": "examples/export/success.json",
+      "sha256": "d110351ad403cbe1a4095a25e7678c5ca208008e4b28630505bdede01ae3bf82",
+      "state": "success"
+    },
+    {
+      "capability": "export",
+      "model": "ErrorEnvelope",
+      "path": "examples/export/unavailable-service.json",
+      "sha256": "86ced44e7f942a4b3f99a2088b8058a92d5d8218d2d229a2013cddabc55a342a",
       "state": "unavailable-service"
     },
     {
@@ -643,7 +692,7 @@
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "3ac888dd5b188c6d2bf323b4aa445286c7bc08200779f1456d4a7f7106c2174d",
+      "sha256": "c5cc0b61e9950d487dfd86774fa1fc19d1079941474906dfc2f30aa80de7a86f",
       "state": null
     },
     {
@@ -728,6 +777,34 @@
       "model": "ErrorEnvelope",
       "path": "schemas/ErrorEnvelope.schema.json",
       "sha256": "c76028a2a57b542f70b8b7dcb5da32eb41f1029f982917524af23c98612e302d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ExportDocument",
+      "path": "schemas/ExportDocument.schema.json",
+      "sha256": "6f84dc94414a88b5476b519bcce00926a6a97b22720cfb7d66599fe6e8396aa1",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ExportFragment",
+      "path": "schemas/ExportFragment.schema.json",
+      "sha256": "6c6d31d024031da3320a3ffb1273aa110a9e643cdb193de8261fb17ada57da50",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ExportQuery",
+      "path": "schemas/ExportQuery.schema.json",
+      "sha256": "8b01877e6fa47f262413535c7478068afcecf5d40583747c3bfe4c3a91c1c4ab",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ExportResponse",
+      "path": "schemas/ExportResponse.schema.json",
+      "sha256": "579c10b0491ec9a12e41a88d153b26b4037c1653924a54d4a20ed6421b539cb2",
       "state": null
     },
     {
@@ -881,7 +958,7 @@
       "capability": null,
       "model": "TierModel",
       "path": "schemas/TierModel.schema.json",
-      "sha256": "2936160c5beb8595c47f61c9f1b4dea94f4dbf6074cd2f7805ee496c6359ff9d",
+      "sha256": "a3d128de0c7b933c4d822180d06ad9d15307921bfd786d771d549fb5f469b768",
       "state": null
     },
     {

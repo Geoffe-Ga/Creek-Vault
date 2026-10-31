@@ -45,6 +45,69 @@ to locate the originating commit for any reference below.
   condition (f) is waived, not verified. T4 and T24 are not applicable under
   O5.
 
+- Publish `GET /v1/export`, the owner's paged export of their own vault-held
+  content (contract `0.27.0`, #2033; the Creek half of adepthood#3579). It
+  returns every staged upload and attachment as its original bytes (with a
+  SHA-256) and every fragment under `01-Fragments`, `09-Reference` and
+  `11-Other-Authors` verbatim, with its tier, primary frequency, phase, source
+  platform and originating document. It is the one `/v1` read that is not
+  ceiling-governed — `intimate` content crosses, under the new closed enum
+  `ExportTier` — so it is served only to the vault's sole configured consumer
+  (what a managed vault mounts); any other configuration is
+  `403 privacy_refused` before the vault is read. Pages hold at most 200 items
+  (default 50) and 10 MiB of raw content, a larger item is listed with
+  `content_included: false`, and the `d-`/`f-<sha256>` cursor is
+  restart-stable and names no file. An absent or unlistable vault is
+  `503 unavailable`, never a short `200`; the route logs nothing and audits
+  each page as a content-free `creek.export` entry. `TierModel`'s
+  `intimate_never_egresses` description now states its scope and this one
+  exception. `0.26` and every earlier minor stay served without seeing the
+  route.
+- Ground managed-vault reflections through the attested pool's embedding
+  model (#1904, ADR-0016 Q2 option (i), owner decision R4-4; recorded as
+  ADR-0018, which amends ADR-0004 for managed vaults only). A managed vault
+  whose request carries no writer's key and whose generation resolves to the
+  pool now embeds the query and up to 256 live cache misses — and the bulk
+  pass behind `POST /v1/links` — through the new
+  `pool_boundary.pool_embed` (`/v1/embeddings`), and nowhere else. Each
+  fragment's own tier goes to the router's new `refuses_off_device`
+  chokepoint before any request is built, so INTIMATE and untiered text is
+  never sent; batches are at most 256 texts and 1 MiB, the pool's identity
+  listing is checked before any text leaves, and an answer naming another
+  model or dimensionality is discarded. The model-package manifest gains an
+  optional `embedding` pin (model, dimensionality, similarity threshold,
+  identity digest), and every parquet row now records its vector space
+  (`route`, `dimensions`, `similarity_threshold`), so a space change
+  re-embeds instead of comparing vectors across spaces; parquets written
+  before this read as local. With no attested embedding model pinned, a
+  pool-routed reflection is answered ungrounded with nothing sent.
+  Self-hosted vaults and writer's-key requests are unchanged.
+- Cap every pool answer (#1906): generation and the identity listing at
+  1 MiB, an embeddings batch at 8 MiB, read incrementally and refused one
+  byte over with the new `PoolResponseTooLargeError`, which is distinct from
+  an unreachable pool and from an undecodable answer.
+- Never strand a rolled-away pool credential (#1918, #1917). `roll_pool_bundle`
+  now records the replaced vendor credential as a pending revocation in the
+  same atomic, durable write that stores the new bundle (it used a plain
+  `write_bytes` before), and clears it only once the vendor confirms it dead.
+  A vendor 5xx or a crash between the write and the revoke leaves the old key
+  owed and reachable instead of overwritten: `revoke` drains every owed key
+  before the current one and writes no tombstone while any is unconfirmed,
+  the new `retry_pending_revocations` retries them, and a roll retries any
+  outstanding one before it mints again. The revoke stays fatal. Every roll
+  now revokes the credential it replaced: `PoolBundleIssuer.issue` is
+  documented to always mint, its `revoke` to be idempotent, and an issuer
+  that hands back the old credential is refused before anything is written,
+  replacing an unreachable `if rolled.credential != previous.credential`
+  branch. `FleetReconciler` takes an optional listing-only
+  `PendingRevocationSource` (both secret managers implement
+  `pending_pool_revocations`) and reports each owed key as the new
+  `pending_revocation` divergence, alerting `pool_credential_orphan` once it
+  is `stuck_deletion_seconds` old; it also reports more vendor-listed
+  credentials under one live allocation than one plus its owed keys as
+  `duplicate_resource`. Reports and alerts carry allocation ids, ages and
+  counts only, never a key value.
+
 - Give existing managed-vault Machines an upgrade path (#1869, owner decision
   R2-1). A new vault image or runtime config no longer strands every older
   vault. `--converge-vault-machines` on the worker and the pilot is an

@@ -22,6 +22,7 @@ from creek.link.link_engine import run_link
 from creek.surface_modes import LINK_METHODS
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.grounding_route import link_embedder
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
 if TYPE_CHECKING:
@@ -64,6 +65,10 @@ def link_tool(
             config=config,
             method=method,
             rebuild=rebuild,
+            # A managed vault with no writer's key embeds through the attested
+            # pool (#1904, ADR-0018); everywhere else this is ``None`` and the
+            # local sentence-transformer is unchanged.
+            embedder=link_embedder(config.model_router),
         )
     except VaultLockTimeoutError:
         return refusal_response(

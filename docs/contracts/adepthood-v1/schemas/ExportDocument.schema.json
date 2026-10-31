@@ -1,0 +1,57 @@
+{
+  "additionalProperties": false,
+  "description": "One staged document \u2014 an upload or an attachment \u2014 as the vault holds it.\n\nAttributes:\n    document_id: The staged name, ``safe_stem(external_id)`` plus suffix.\n    size_bytes: The staged file's size.\n    sha256: The digest of ``content_base64``'s bytes, or ``None`` when the\n        content is not included.\n    content_base64: The original bytes, base64-encoded, or ``None`` when\n        the document is larger than :data:`EXPORT_PAGE_CONTENT_BYTES`.\n    content_included: Whether ``content_base64`` carries the document.",
+  "properties": {
+    "content_base64": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The original bytes, base64; null when not included.",
+      "title": "Content Base64"
+    },
+    "content_included": {
+      "description": "False only when the document exceeds the page budget.",
+      "title": "Content Included",
+      "type": "boolean"
+    },
+    "document_id": {
+      "description": "The staged document name.",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$",
+      "title": "Document Id",
+      "type": "string"
+    },
+    "sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "SHA-256 of the included bytes; null when not included.",
+      "title": "Sha256"
+    },
+    "size_bytes": {
+      "description": "The staged file size.",
+      "minimum": 0,
+      "title": "Size Bytes",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "document_id",
+    "size_bytes",
+    "sha256",
+    "content_base64",
+    "content_included"
+  ],
+  "title": "ExportDocument",
+  "type": "object"
+}

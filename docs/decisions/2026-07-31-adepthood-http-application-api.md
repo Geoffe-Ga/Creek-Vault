@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.26.0`
+- **Contract version**: `0.27.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -224,6 +224,7 @@ every content route refuses an undeclared minor anyway.
 | `letters` | `0.17` |
 | `agent-activity` | `0.22` |
 | `reading-recommendations` | `0.25` |
+| `export` | `0.27` |
 <!-- /capability-set -->
 
 **The build-out divergence is closed (#1112).** While epic #1071 was being
@@ -1033,6 +1034,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.27.0` | 2026-10-31 | **The owner's export: `GET /v1/export` (#2033, adepthood#3579).** A thirteenth capability, `export`, pages through the owner's own vault-held content: every staged upload and attachment as its original bytes (`content_base64` + `sha256`), and every fragment file under `01-Fragments`, `09-Reference` and `11-Other-Authors` verbatim with its `tier`, primary `frequency`, `phase`, `source_platform` and originating `document_id`. It is the one `/v1` read that is **not ceiling-governed**: `intimate` content crosses (new closed enum `ExportTier`), so the route is served only to the vault's **sole** configured consumer — the single-owner configuration a managed vault mounts — and every other configuration is `403 privacy_refused` before the vault is read. `TierModel.intimate_never_egresses` keeps its `true` and now states its scope (ceiling-governed reads) and this one exception. Pages hold at most `limit` items (default 50, clamped to 200) and 10 MiB of raw content; a larger item is listed with `content_included: false`. Order is documents then fragments, each by the SHA-256 of its on-disk key, and `next_cursor` is `<d\|f>-<digest>` — restart-stable and naming no file. A vault that is absent or cannot be listed is `503 unavailable`. Each page appends a content-free `creek.export` audit entry. `0.26` and every earlier supported minor remain served without seeing or reaching the route. |
 | `0.26.0` | 2026-10-28 | **A refused request key is fatal for an `llm` classification pass (#1877, [ADR-0015](../../creek-tools/docs/architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)).** When the vendor answers a writer's request-scoped key with `401`/`403`, the pass stops at the first refusal without retrying or dispatching the fragments not yet started, and `creek.classify` returns `{"status": "refused"}` with the fixed reason `the writer's request-scoped provider key was refused by its vendor` instead of an `ok` pass that classified nothing. On `/v1`, `GET /v1/jobs/{job_id}` gains `failure_code: "request_key_rejected" \| null` (closed enum `JobFailureCode`), so the consumer can ask the writer for a new key; every other outcome reports `null`. Callers below `0.26` see no `failure_code` and an unchanged `failed` body. `0.25` and every earlier supported minor remain served. |
 | `0.25.0` | 2026-10-26 | Adds opt-in `reading-recommendations`: a bounded accessible course shortlist and current open/personal journal excerpts go through the existing generation router. Responses choose supplied IDs, cite a verified verbatim quote, explain relevance and benefit, and retain inference provenance. No BYOK forwarding, no generic fallback; short-lived vault-scoped coalesced caching is invalidated around journal mutation. Older minors remain served. |
 | `0.24.0` | 2026-10-24 | **Authenticated agent MCP discovery (adepthood#3545).** `GET /v1/capabilities` adds `agent_mcp: {resource, authorization_server} \| null` from this allocation's actual mounted OAuth MCP configuration and public routing. Managed private TLS, legacy OAuth-free allocations, missing mounts and unavailable vaults report null. Earlier declared minors omit the field; unversioned discovery publishes it without changing the content minor a client already speaks. `0.23`, `0.22` and every earlier supported minor remain served. |

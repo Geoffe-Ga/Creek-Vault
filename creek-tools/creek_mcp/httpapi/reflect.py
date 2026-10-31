@@ -80,7 +80,7 @@ if TYPE_CHECKING:
 
     from creek.classify.llm.request_key import RequestKey
     from creek_mcp.httpapi.context import RequestContext
-    from creek_mcp.tools.reflect import GroundingSession, _LLMFactory
+    from creek_mcp.tools.reflect import GroundingRoute, GroundingSession, _LLMFactory
 
 _NOT_FOUND_REASON: Final[str] = "entry_ref not found"
 """The tool's unresolvable-``entry_ref`` refusal, verbatim."""
@@ -356,6 +356,9 @@ def _reflect(
             build_factory
             or partial(_default_llm_factory, vault, request_key, provenance)
         )()
+        grounding_route = (
+            None if build_factory is not None else _grounding_route(vault, request_key)
+        )
     except (RuntimeError, OSError, ValueError) as exc:
         return {
             "status": "refused",
@@ -375,7 +378,27 @@ def _reflect(
         privacy_tier_ceiling=context.ceiling,
         consumer=context.consumer,
         max_notes=parsed.max_notes,
+        grounding_route=grounding_route,
     )
+
+
+def _grounding_route(vault: Path, request_key: RequestKey | None) -> GroundingRoute:
+    """Return the production embedding-route decision for *vault* (#1904).
+
+    Bound only on the production path, beside the production factory: an
+    injected factory resolves no stage, so it cannot say whether the pool
+    answers this request, and grounding then keeps the local route.
+
+    Args:
+        vault: The vault being reflected against.
+        request_key: The writer's request-scoped key, or ``None``.
+
+    Returns:
+        The decision :func:`~creek_mcp.tools.reflect.reflect_tool` consults.
+    """
+    from creek_mcp.server import _build_reflect_grounding_route
+
+    return _build_reflect_grounding_route(vault, request_key)
 
 
 def _render_escalation(

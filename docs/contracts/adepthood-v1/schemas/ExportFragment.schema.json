@@ -1,0 +1,90 @@
+{
+  "$defs": {
+    "ExportTier": {
+      "description": "The privacy tier an exported fragment carries \u2014 every tier there is.\n\nThe one place on ``/v1`` where ``intimate`` is a constructible value, and\ndeliberately a separate enum from :class:`WireTierCeiling` rather than a\nwidening of it: every other position keeps its two-member vocabulary, so a\nceiling, a journal tier or a ``routed_tier`` still cannot say ``intimate``.\nThis enum is reachable only on the owner-only export.\n\nAttributes:\n    OPEN: Openly publishable content.\n    PERSONAL: Personal content.\n    INTIMATE: The owner's most private content, exported to the owner.\n    UNCLASSIFIED: Not yet classified.",
+      "enum": [
+        "open",
+        "personal",
+        "intimate",
+        "unclassified"
+      ],
+      "title": "ExportTier",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One classified fragment, with its tier, labels and stored file.\n\nAttributes:\n    fragment_id: The fragment's id.\n    tier: Its privacy tier \u2014 any tier, ``intimate`` included.\n    frequency: Its primary APTITUDE frequency code.\n    phase: Its Archetypal Wavelength phase.\n    source_platform: The platform its source came from.\n    document_id: The staged document it was ingested from, or ``None``\n        when it came from anywhere else.\n    markdown: The fragment file verbatim \u2014 frontmatter and body \u2014 or\n        ``None`` when it exceeds :data:`EXPORT_PAGE_CONTENT_BYTES`.\n    content_included: Whether ``markdown`` carries the file.",
+  "properties": {
+    "content_included": {
+      "description": "False only when the fragment exceeds the page budget.",
+      "title": "Content Included",
+      "type": "boolean"
+    },
+    "document_id": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The staged document it came from, or null.",
+      "title": "Document Id"
+    },
+    "fragment_id": {
+      "description": "The fragment id.",
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Fragment Id",
+      "type": "string"
+    },
+    "frequency": {
+      "description": "Primary APTITUDE frequency code.",
+      "pattern": "^(?:F(?:[1-9]|10)|unclassified)$",
+      "title": "Frequency",
+      "type": "string"
+    },
+    "markdown": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The fragment file verbatim; null when not included.",
+      "title": "Markdown"
+    },
+    "phase": {
+      "description": "Archetypal Wavelength phase.",
+      "pattern": "^[a-z][a-z_]{0,31}$",
+      "title": "Phase",
+      "type": "string"
+    },
+    "source_platform": {
+      "description": "The platform the fragment's source came from.",
+      "pattern": "^[a-z][a-z_]{0,31}$",
+      "title": "Source Platform",
+      "type": "string"
+    },
+    "tier": {
+      "$ref": "#/$defs/ExportTier",
+      "description": "The fragment's privacy tier."
+    }
+  },
+  "required": [
+    "fragment_id",
+    "tier",
+    "frequency",
+    "phase",
+    "source_platform",
+    "document_id",
+    "markdown",
+    "content_included"
+  ],
+  "title": "ExportFragment",
+  "type": "object"
+}

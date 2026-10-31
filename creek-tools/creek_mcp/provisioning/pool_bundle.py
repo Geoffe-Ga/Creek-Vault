@@ -430,7 +430,17 @@ class PoolBundleIssuer(Protocol):
     """
 
     def issue(self, allocation_id: str) -> PoolRuntimeBundle:
-        """Return a new bundle for *allocation_id* at the fleet identity."""
+        """Mint a new bundle for *allocation_id* at the fleet identity.
+
+        Every call mints a **fresh credential** that the caller then owns: it
+        never returns a credential an earlier call returned.  Decision 3.4's
+        re-issue is create-then-delete, and
+        :meth:`~creek_mcp.provisioning.production_secrets.EncryptedFileFlySecretManager.roll_pool_bundle`
+        relies on exactly that to revoke the credential it replaces, refusing
+        an issuer that hands the old one back (#1917).  A manifest-only
+        re-pin that keeps the vendor key is a different operation, not this
+        one, and is not built.
+        """
 
     def revoke(self, bundle: PoolRuntimeBundle) -> None:
         """Revoke *bundle*'s credential, confirming the pool now refuses it.
@@ -438,6 +448,12 @@ class PoolBundleIssuer(Protocol):
         It must raise rather than return when the revocation is unconfirmed:
         ``delete()`` calls this before destroying the Machine and before the
         content-free receipt is issued (Decision 1 item 3, T11).
+
+        It must also be idempotent: revoking a credential the vendor already
+        refuses confirms rather than raises.  A pending revocation (#1918) is
+        cleared only after this returns, so a crash between the vendor's
+        confirmation and that durable write retries a revocation that already
+        happened.
         """
 
 
@@ -452,6 +468,36 @@ class PoolCredentialRecord:
 
     provider_allocation_id: str
     provider_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPoolRevocation:
+    """One superseded pool credential still owed its vendor revocation (#1918).
+
+    A roll stores the replaced credential as a durable obligation in the same
+    atomic write as the new bundle, so the key stays reachable until the
+    vendor confirms it dead.  This record is what leaves the encrypted
+    document: an activation id and a timestamp, never the credential.
+
+    Attributes:
+        activation_id: The activation whose record owes the revocation.
+        superseded_at: When the roll replaced the credential.
+    """
+
+    activation_id: str
+    superseded_at: datetime
+
+
+class PendingRevocationSource(Protocol):
+    """Read-only listing of owed pool revocations, for fleet reconciliation.
+
+    Deliberately listing-only: the reconciler can call no delete, so retrying
+    belongs to the process holding the issuer, through ``revoke`` and
+    ``retry_pending_revocations`` on the secret manager.
+    """
+
+    def pending_pool_revocations(self) -> tuple[PendingPoolRevocation, ...]:
+        """Return every owed revocation across the fleet's stored records."""
 
 
 class PoolCredentialInventory(Protocol):

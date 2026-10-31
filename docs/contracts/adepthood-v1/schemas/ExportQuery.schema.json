@@ -1,0 +1,29 @@
+{
+  "additionalProperties": false,
+  "description": "The query string ``GET /v1/export`` accepts, and nothing else.\n\nAttributes:\n    cursor: The ``next_cursor`` of the previous page, verbatim, or absent\n        for the first page. Opaque: it is derived from the disk alone, so\n        it is stable across restarts, and a client must never build one.\n    limit: The most items wanted on this page. Values above\n        :data:`EXPORT_MAX_LIMIT` are clamped to it.",
+  "properties": {
+    "cursor": {
+      "anyOf": [
+        {
+          "pattern": "^[df]-[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The previous page's next_cursor, verbatim; absent first.",
+      "title": "Cursor"
+    },
+    "limit": {
+      "default": 50,
+      "description": "Most items to return; values above 200 are clamped to 200.",
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "title": "ExportQuery",
+  "type": "object"
+}

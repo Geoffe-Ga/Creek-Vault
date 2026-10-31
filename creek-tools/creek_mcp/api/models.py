@@ -100,6 +100,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.26",
     "0.25",
     "0.24",
     "0.23",
@@ -381,6 +382,12 @@ class Capability(StrEnum):
         AGENT_ACTIVITY: A content-free projection of the MCP audit chain —
             who asked the vault for what, when, and whether it was admitted.
             Since contract 0.22 (#1968).
+        READING_RECOMMENDATIONS: A grounded reading suggestion. Since 0.25.
+        EXPORT: The owner's own vault-held content — staged documents and
+            every fragment, at every tier — paged by an opaque cursor. Since
+            contract 0.27 (#2033). Served only to the vault's sole configured
+            consumer, because uploads are not consumer-scoped on disk and
+            nothing else can prove the caller owns them.
     """
 
     CAPABILITIES = "capabilities"
@@ -395,6 +402,7 @@ class Capability(StrEnum):
     LETTERS = "letters"
     AGENT_ACTIVITY = "agent-activity"
     READING_RECOMMENDATIONS = "reading-recommendations"
+    EXPORT = "export"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -455,6 +463,13 @@ _AGENT_ACTIVITY_MINOR: Final[str] = "0.22"
 
 Literal so a later contract bump cannot hide the capability from clients that
 correctly vendored 0.22.
+"""
+
+_EXPORT_MINOR: Final[str] = "0.27"
+"""The minor ``export`` was published at (#2033).
+
+Literal so a later contract bump cannot hide the capability from clients that
+correctly vendored 0.27.
 """
 
 REQUEST_KEYS_SINCE_MINOR: Final[str] = "0.18"
@@ -680,6 +695,7 @@ CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.LETTERS: _LETTERS_MINOR,
     Capability.AGENT_ACTIVITY: _AGENT_ACTIVITY_MINOR,
     Capability.READING_RECOMMENDATIONS: "0.25",
+    Capability.EXPORT: _EXPORT_MINOR,
 }
 """The contract minor each capability was first published at.
 
@@ -1241,7 +1257,11 @@ class TierModel(_WireModel):
             only ever fail closed.
         intimate_never_egresses: ``Literal[True]``. A promise, not a flag: the
             schema admits no other value, so a server cannot advertise the
-            opposite and a client need not branch on it.
+            opposite and a client need not branch on it. Its scope is every
+            ceiling-governed read. Since contract 0.27 (#2033) it has one
+            stated exception: ``GET /v1/export``, which is not
+            ceiling-governed and is served only to the vault's sole
+            configured consumer — the owner taking their own content back.
     """
 
     ceilings: list[WireTierCeiling] = Field(
@@ -1251,7 +1271,11 @@ class TierModel(_WireModel):
         description="Ceiling applied when the caller declares none.",
     )
     intimate_never_egresses: Literal[True] = Field(
-        description="Standing promise that intimate content never egresses.",
+        description=(
+            "Standing promise that intimate content never egresses through a "
+            "ceiling-governed read. The one exception is the owner-only "
+            "export, GET /v1/export, since contract 0.27."
+        ),
     )
 
 
@@ -3015,6 +3039,225 @@ class AgentActivityResponse(_WireModel):
     )
 
 
+# --------------------------------------------------------------------------
+# Owner export (#2033)
+# --------------------------------------------------------------------------
+
+EXPORT_DEFAULT_LIMIT: Final[int] = 50
+"""How many items one ``GET /v1/export`` page holds when ``limit`` is absent."""
+
+EXPORT_MAX_LIMIT: Final[int] = 200
+"""The most items — documents and fragments together — one export page holds.
+
+A clamp, not a refusal, as on ``GET /v1/agent-activity``: ``limit=5000`` is
+answered with two hundred items and a ``next_cursor``. Paging is how a client
+gets the rest, so a larger page buys nothing but a longer request.
+"""
+
+EXPORT_PAGE_CONTENT_BYTES: Final[int] = 10 * 1024 * 1024
+"""The most raw content bytes one export page carries: 10 MiB.
+
+Counted before encoding — a document's bytes, a fragment file's bytes — so the
+base64 body is at most four thirds of it. Equal to the upload route's decoded
+cap (``creek_mcp.tools.upload.MAX_UPLOAD_BYTES``), so every document the vault
+accepted through ``POST /v1/uploads`` fits on a page of its own. An item larger
+than this is still listed, with ``content_included: false`` and no content,
+rather than dropped.
+"""
+
+EXPORT_CURSOR_PATTERN: Final[str] = "^[df]-[0-9a-f]{64}$"
+"""A cursor: the kind of the last item visited and that item's order key.
+
+``d`` for a staged document or ``f`` for a fragment, then the SHA-256 hex
+digest the export is ordered by. A digest rather than a name, so a cursor —
+which travels in a URL and so in every access log, client log and proxy that
+sees one — carries no filename, external id or title.
+"""
+
+EXPORT_DOCUMENT_ID_PATTERN: Final[str] = "^[A-Za-z0-9._-]{1,128}$"
+"""A staged document's name: ``safe_stem(external_id)`` plus its sanitised suffix.
+
+The names ``creek.upload`` mints are made of exactly this alphabet
+(:mod:`creek_mcp.staged_names`), so a consumer that kept the ``external_id`` it
+uploaded under can recompute the name and join it back to its own record of the
+original filename.
+"""
+
+_MAX_EXPORT_FRAGMENT_ID_CHARS: Final[int] = 512
+"""Upper bound on an exported ``fragment_id``."""
+
+_EXPORT_FREQUENCY_PATTERN: Final[str] = "^(?:F(?:[1-9]|10)|unclassified)$"
+"""A fragment's primary APTITUDE frequency code, or ``unclassified``."""
+
+_EXPORT_LABEL_PATTERN: Final[str] = "^[a-z][a-z_]{0,31}$"
+"""A closed-vocabulary label value: a wavelength phase or a source platform."""
+
+_SHA256_PATTERN: Final[str] = "^[0-9a-f]{64}$"
+"""A lower-case hex SHA-256 digest."""
+
+
+class ExportTier(StrEnum):
+    """The privacy tier an exported fragment carries — every tier there is.
+
+    The one place on ``/v1`` where ``intimate`` is a constructible value, and
+    deliberately a separate enum from :class:`WireTierCeiling` rather than a
+    widening of it: every other position keeps its two-member vocabulary, so a
+    ceiling, a journal tier or a ``routed_tier`` still cannot say ``intimate``.
+    This enum is reachable only on the owner-only export.
+
+    Attributes:
+        OPEN: Openly publishable content.
+        PERSONAL: Personal content.
+        INTIMATE: The owner's most private content, exported to the owner.
+        UNCLASSIFIED: Not yet classified.
+    """
+
+    OPEN = "open"
+    PERSONAL = "personal"
+    INTIMATE = "intimate"
+    UNCLASSIFIED = "unclassified"
+
+
+class ExportQuery(_WireModel):
+    """The query string ``GET /v1/export`` accepts, and nothing else.
+
+    Attributes:
+        cursor: The ``next_cursor`` of the previous page, verbatim, or absent
+            for the first page. Opaque: it is derived from the disk alone, so
+            it is stable across restarts, and a client must never build one.
+        limit: The most items wanted on this page. Values above
+            :data:`EXPORT_MAX_LIMIT` are clamped to it.
+    """
+
+    cursor: str | None = Field(
+        default=None,
+        pattern=EXPORT_CURSOR_PATTERN,
+        description="The previous page's next_cursor, verbatim; absent first.",
+    )
+    limit: int = Field(
+        default=EXPORT_DEFAULT_LIMIT,
+        ge=1,
+        description=(
+            "Most items to return; values above "
+            f"{EXPORT_MAX_LIMIT} are clamped to {EXPORT_MAX_LIMIT}."
+        ),
+    )
+
+
+class ExportDocument(_WireModel):
+    """One staged document — an upload or an attachment — as the vault holds it.
+
+    Attributes:
+        document_id: The staged name, ``safe_stem(external_id)`` plus suffix.
+        size_bytes: The staged file's size.
+        sha256: The digest of ``content_base64``'s bytes, or ``None`` when the
+            content is not included.
+        content_base64: The original bytes, base64-encoded, or ``None`` when
+            the document is larger than :data:`EXPORT_PAGE_CONTENT_BYTES`.
+        content_included: Whether ``content_base64`` carries the document.
+    """
+
+    document_id: str = Field(
+        pattern=EXPORT_DOCUMENT_ID_PATTERN,
+        description="The staged document name.",
+    )
+    size_bytes: int = Field(ge=_MIN_COUNT, description="The staged file size.")
+    sha256: str | None = Field(
+        pattern=_SHA256_PATTERN,
+        description="SHA-256 of the included bytes; null when not included.",
+    )
+    content_base64: str | None = Field(
+        description="The original bytes, base64; null when not included.",
+    )
+    content_included: bool = Field(
+        description="False only when the document exceeds the page budget.",
+    )
+
+
+class ExportFragment(_WireModel):
+    """One classified fragment, with its tier, labels and stored file.
+
+    Attributes:
+        fragment_id: The fragment's id.
+        tier: Its privacy tier — any tier, ``intimate`` included.
+        frequency: Its primary APTITUDE frequency code.
+        phase: Its Archetypal Wavelength phase.
+        source_platform: The platform its source came from.
+        document_id: The staged document it was ingested from, or ``None``
+            when it came from anywhere else.
+        markdown: The fragment file verbatim — frontmatter and body — or
+            ``None`` when it exceeds :data:`EXPORT_PAGE_CONTENT_BYTES`.
+        content_included: Whether ``markdown`` carries the file.
+    """
+
+    fragment_id: str = Field(
+        min_length=1,
+        max_length=_MAX_EXPORT_FRAGMENT_ID_CHARS,
+        description="The fragment id.",
+    )
+    tier: ExportTier = Field(description="The fragment's privacy tier.")
+    frequency: str = Field(
+        pattern=_EXPORT_FREQUENCY_PATTERN,
+        description="Primary APTITUDE frequency code.",
+    )
+    phase: str = Field(
+        pattern=_EXPORT_LABEL_PATTERN,
+        description="Archetypal Wavelength phase.",
+    )
+    source_platform: str = Field(
+        pattern=_EXPORT_LABEL_PATTERN,
+        description="The platform the fragment's source came from.",
+    )
+    document_id: str | None = Field(
+        pattern=EXPORT_DOCUMENT_ID_PATTERN,
+        description="The staged document it came from, or null.",
+    )
+    markdown: str | None = Field(
+        description="The fragment file verbatim; null when not included.",
+    )
+    content_included: bool = Field(
+        description="False only when the fragment exceeds the page budget.",
+    )
+
+
+class ExportResponse(_WireModel):
+    """One page of the owner's vault-held content.
+
+    Documents come first, then fragments, each ordered by the SHA-256 of its
+    on-disk key (a document's ``document_id``, a fragment's vault-relative
+    path) — deterministic and restart-stable, but deliberately not
+    alphabetical, so the cursor need not spell a name. A page may hold both
+    kinds at the boundary.
+
+    Attributes:
+        status: Always ``"ok"``. An empty vault is two empty lists.
+        documents: Staged documents on this page.
+        fragments: Fragments on this page.
+        skipped: Files on this page that claimed to be fragments, or might
+            have been, but could not be read or validated. Counted rather
+            than dropped silently.
+        next_cursor: Where the next page starts, or ``None`` on the last page.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    documents: list[ExportDocument] = Field(
+        max_length=EXPORT_MAX_LIMIT,
+        description="Staged documents on this page, in export order.",
+    )
+    fragments: list[ExportFragment] = Field(
+        max_length=EXPORT_MAX_LIMIT,
+        description="Fragments on this page, in export order.",
+    )
+    skipped: int = Field(
+        ge=_MIN_COUNT,
+        description="Unreadable fragment files on this page.",
+    )
+    next_cursor: str | None = Field(
+        pattern=EXPORT_CURSOR_PATTERN,
+        description="Cursor for the next page; null on the last page.",
+    )
+
+
 class NotApplicableExample(_WireModel):
     """Marks a fixture-matrix cell that has no response shape to document.
 
@@ -3069,6 +3312,10 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "DriveDisconnectResponse": DriveDisconnectResponse,
     "DriveSyncResponse": DriveSyncResponse,
     "ErrorEnvelope": ErrorEnvelope,
+    "ExportDocument": ExportDocument,
+    "ExportFragment": ExportFragment,
+    "ExportQuery": ExportQuery,
+    "ExportResponse": ExportResponse,
     "JournalUpsertRequest": JournalUpsertRequest,
     "JournalUpsertResponse": JournalUpsertResponse,
     "JournalWithdrawResponse": JournalWithdrawResponse,

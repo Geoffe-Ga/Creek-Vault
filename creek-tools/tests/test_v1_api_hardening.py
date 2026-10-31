@@ -2646,6 +2646,7 @@ _READ_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
         "agent_activity",
         "capabilities",
         "drive",
+        "export",
         "generation",
         "provisioning",
         "routing",

@@ -74,6 +74,39 @@ class ModelVerification(StrEnum):
     DIGEST_MISMATCH = "digest-mismatch"
 
 
+MAX_EMBEDDING_DIMENSIONS: Final[int] = 8192
+"""Largest vector length a manifest may pin.
+
+A sanity ceiling, not a model fact: every embedding model either vendor
+catalog names today is well under it, and a pin above it is a typo that would
+otherwise size batches against a nonsense answer.
+"""
+
+
+class EmbeddingPackagePin(BaseModel):
+    """The pinned embedding identity of an attested pool (#1904, ADR-0018).
+
+    Optional on the manifest, and its absence is a decision rather than a
+    gap: a pool whose vendor offers no attested embedding model has no pin,
+    and a managed vault on it stays ungrounded (ADR-0016 Q2 option (iii)).
+
+    ``model_name`` is the vendor's model id, which carries no tag the way an
+    Ollama reference does; the identity is pinned instead by
+    ``runtime_inventory_digest``, which binds the model to the manifest's
+    runtime name and exact version exactly as the generation pin does. The
+    dimensionality and the similarity threshold are pinned here, not read
+    from vault config, because they define the vector space the vault's
+    parquet records (ADR-0016 Decision 1 item 13).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    model_name: Annotated[str, Field(pattern=_MODEL_REFERENCE.pattern)]
+    dimensions: Annotated[int, Field(gt=0, le=MAX_EMBEDDING_DIMENSIONS)]
+    similarity_threshold: Annotated[float, Field(gt=0.0, lt=1.0)]
+    runtime_inventory_digest: _Sha256
+
+
 class ModelPackageManifest(BaseModel):
     """Every pinned fact of one local model package; nothing is optional.
 
@@ -82,6 +115,10 @@ class ModelPackageManifest(BaseModel):
     the model; for Ollama that is the manifest digest from ``/api/tags``, not
     the weights digest. The two are kept separate so neither stands in for
     the other.
+
+    ``embedding`` is the one optional field (#1904): the pool's attested
+    embedding model, when its vendor offers one. It is additive — every
+    manifest written before it still loads unchanged, with no embedding pin.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
@@ -98,6 +135,7 @@ class ModelPackageManifest(BaseModel):
     size_bytes: PositiveInt
     license_spdx: Annotated[str, Field(pattern=_SPDX_ID)]
     license_url: str
+    embedding: EmbeddingPackagePin | None = None
 
     @field_validator("runtime_version")
     @classmethod

@@ -1404,8 +1404,12 @@ _EMBEDDING_CACHE_COLUMNS = {
     "model_name",
     "embedding",
     "computed_at",
+    "route",
+    "dimensions",
+    "similarity_threshold",
 }
-"""The parquet's entire schema — vectors and their freshness keys, no edges."""
+"""The parquet's entire schema — vectors, their freshness keys and the vector
+space each was written in (#1904), no edges."""
 
 
 class _FlatEncoder:

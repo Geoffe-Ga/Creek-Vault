@@ -183,6 +183,28 @@ def gated_as_intimate(tier: object) -> bool:
     return known is None or known is PrivacyTier.INTIMATE
 
 
+def refuses_off_device(tier: object, provider: str) -> bool:
+    """Report whether the chokepoint refuses *tier* content to *provider*.
+
+    The one gate, stated once: content gated as ``Intimate`` (see
+    :func:`gated_as_intimate`, which fails closed on ``None`` and on any value
+    naming no tier) may not reach a provider that is not intimate-eligible.
+    :meth:`ModelRouter._enforce_local_for_intimate` asks this of a resolved
+    stage; the attested pool's embedder asks it of **each fragment** in a
+    batch (ADR-0016 Decision 1 item 13, #1904), because a batch-level tier
+    would let one INTIMATE title ride beside open ones. Both callers therefore
+    share one definition of "refused", not two that could drift.
+
+    Args:
+        tier: The content's privacy tier, as a member, its value, or anything.
+        provider: The ``LLMConfig.provider`` string the content is bound for.
+
+    Returns:
+        ``True`` when the content must not be shown to *provider*.
+    """
+    return gated_as_intimate(tier) and not provider_intimate_eligible(provider)
+
+
 class ModelRouter:
     """Resolve a pipeline stage (and fragment tier) to an :class:`LLMConfig`.
 
@@ -311,7 +333,7 @@ class ModelRouter:
         Raises:
             IntimateRoutingError: When no local backend exists to redirect to.
         """
-        if not gated_as_intimate(tier) or provider_intimate_eligible(cfg.provider):
+        if not refuses_off_device(tier, cfg.provider):
             return cfg
         untiered = recognised_tier(tier) is None
         local = self.routing.for_stage("default")

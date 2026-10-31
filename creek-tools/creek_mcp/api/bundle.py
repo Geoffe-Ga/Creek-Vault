@@ -42,7 +42,11 @@ body appears in the bundle at all, and the one quoted line in the reflection
 example is labelled synthetic in the note beside it. No fixture carries
 ``tier: "intimate"`` or ``routed_tier: "intimate"`` anywhere — it is not even
 expressible, because :class:`~creek_mcp.api.models.WireTierCeiling` has two
-members. Payloads are built from the imported runtime constants
+members. The one exception to expressibility is
+:class:`~creek_mcp.api.models.ExportTier`, on the owner-only export (#2033);
+its example deliberately shows a ``personal`` fragment, so the "no intimate
+value in any fixture" invariant still holds over every file here. Payloads
+are built from the imported runtime constants
 (:data:`~creek_mcp.contract.CONTRACT_VERSION`,
 :data:`~creek_mcp.contract.ONTOLOGY_VERSION`,
 :data:`creek.generate.indexes.CANONICAL_FREQUENCY_NAMES`,
@@ -55,6 +59,7 @@ Like :mod:`creek_mcp.api.models`, this module imports no web framework.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from operator import attrgetter
@@ -721,6 +726,59 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 """A freshly-initialised vault: all zeroes, and emphatically not an error."""
 
 
+_EXPORT_DOCUMENT_BYTES: Final[bytes] = b"synthetic doc\n"
+"""The example document's original bytes: synthetic, and labelled so.
+
+Deliberately short. A base64 string of a sentence reads as a high-entropy
+secret to ``detect-secrets``, which scans these examples; fourteen bytes
+encode to twenty characters, too few to carry that much entropy.
+"""
+
+_EXPORT_DOCUMENT_ID: Final[str] = "adepthood-doc-example-0a1b2c3d4e5f.txt"
+"""A staged name in the ``safe_stem(external_id)`` + suffix shape."""
+
+_EXPORT_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "documents": [
+        {
+            "document_id": _EXPORT_DOCUMENT_ID,
+            "size_bytes": len(_EXPORT_DOCUMENT_BYTES),
+            "sha256": hashlib.sha256(_EXPORT_DOCUMENT_BYTES).hexdigest(),
+            "content_base64": base64.b64encode(_EXPORT_DOCUMENT_BYTES).decode("ascii"),
+            "content_included": True,
+        }
+    ],
+    "fragments": [
+        {
+            "fragment_id": "frag-example-0001",
+            "tier": "personal",
+            "frequency": "F3",
+            "phase": "rising",
+            "source_platform": "document",
+            "document_id": _EXPORT_DOCUMENT_ID,
+            "markdown": (
+                "---\ntype: fragment\nid: frag-example-0001\n"
+                "privacy_tier: personal\n---\n"
+                "synthetic doc\n"
+            ),
+            "content_included": True,
+        }
+    ],
+    "skipped": 0,
+    "next_cursor": "f-" + hashlib.sha256(b"01-Fragments/Notes/example.md").hexdigest(),
+}
+"""One staged document and the fragment made of it, with more to come."""
+
+_EXPORT_EMPTY: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "documents": [],
+    "fragments": [],
+    "skipped": 0,
+    "next_cursor": None,
+}
+"""A vault holding nothing yet, or the page past the last item: not an error."""
+
+
 # --------------------------------------------------------------------------
 # The 11 x 7 matrix
 # --------------------------------------------------------------------------
@@ -783,6 +841,10 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
         model="AgentActivityResponse",
         payload=_AGENT_ACTIVITY_SUCCESS,
     ),
+    Capability.EXPORT.value: _Example(
+        model="ExportResponse",
+        payload=_EXPORT_SUCCESS,
+    ),
 }
 """The ``success`` column: one canonical happy response per capability.
 
@@ -842,6 +904,10 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.AGENT_ACTIVITY.value: _Example(
         model="AgentActivityResponse",
         payload=_AGENT_ACTIVITY_EMPTY,
+    ),
+    Capability.EXPORT.value: _Example(
+        model="ExportResponse",
+        payload=_EXPORT_EMPTY,
     ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""

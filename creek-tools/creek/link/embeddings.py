@@ -5,6 +5,17 @@ for fragments and finds semantic resonances between them using cosine
 similarity.  Uses locally-run sentence-transformers with disk-based
 persistence via parquet so per-fragment freshness can be tracked across
 runs (INC-006).
+
+**Two vector spaces, never compared (#1904, ADR-0018).** A managed vault with
+no writer's key may have its grounding embeddings computed by the attested
+shared pool instead (ADR-0016 Decision 1 item 13). That model is not
+``all-MiniLM-L6-v2``, so its vectors live in a different space. Every
+persisted row therefore records the :class:`EmbeddingSpace` it was written
+under — route, model, dimensionality and similarity threshold — and
+:meth:`EmbeddingLinker.load_cache` admits only rows from the active space, so
+a switch is a detectable mismatch that re-embeds rather than a silent
+comparison of incommensurable vectors. A parquet written before the space was
+recorded reads as the local route, which is the only route that existed.
 """
 
 from __future__ import annotations
@@ -15,7 +26,7 @@ import logging
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, Protocol, cast
 
 from pydantic import BaseModel
 
@@ -30,7 +41,7 @@ from creek.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Iterable, Iterator, Mapping, Sequence
     from pathlib import Path
 
     import numpy as np
@@ -75,6 +86,80 @@ Similarities are computed one block of rows at a time so peak memory is
 resonance discovery tractable at ≥50k fragments."""
 
 
+LOCAL_EMBEDDING_ROUTE: Final[str] = "local"
+"""Route label for vectors from the vault's own sentence-transformer."""
+
+POOL_EMBEDDING_ROUTE: Final[str] = "pool"
+"""Route label for vectors served by the attested shared pool (#1904)."""
+
+
+@dataclass(frozen=True)
+class EmbeddingSpace:
+    """The identity of one vector space: what produced a vector, and how to read it.
+
+    Two vectors may be compared only when they share a space. The local route
+    keeps its pre-#1904 rule — the model name alone, because that is all a
+    legacy parquet recorded — so a self-hosted vault reads every row it wrote
+    before this field existed. The pool route pins all four facts, as ADR-0016
+    Decision 1 item 13 requires: a pool reporting another model, another
+    dimensionality or another calibrated threshold is a different space.
+
+    Attributes:
+        route: :data:`LOCAL_EMBEDDING_ROUTE` or :data:`POOL_EMBEDDING_ROUTE`.
+        model: The embedding model identifier.
+        dimensions: The pinned vector length, or ``None`` when the route does
+            not pin one (local).
+        similarity_threshold: The pinned resonance threshold, or ``None`` when
+            the route does not pin one (local reads it from vault config).
+    """
+
+    route: str
+    model: str
+    dimensions: int | None = None
+    similarity_threshold: float | None = None
+
+    def admits(self, row: CachedEmbedding) -> bool:
+        """Return whether *row* was written in exactly this space.
+
+        Args:
+            row: A persisted cache row.
+
+        Returns:
+            ``True`` only when the route and model match and, for every fact
+            this space pins, the row recorded the same value — and, for a
+            pinned dimensionality, the vector really has that length.
+        """
+        if row.route != self.route or row.model_name != self.model:
+            return False
+        if self.dimensions is not None and (
+            row.dimensions != self.dimensions or len(row.vector) != self.dimensions
+        ):
+            return False
+        return (
+            self.similarity_threshold is None
+            or row.similarity_threshold == self.similarity_threshold
+        )
+
+
+class TextEmbedder(Protocol):
+    """A non-local embedding route the linker delegates to (#1904).
+
+    The only implementation is
+    :class:`creek.classify.llm.pool_embeddings.PoolEmbedder`; the protocol
+    lives here so this module never imports the pool at load time.
+    """
+
+    @property
+    def space(self) -> EmbeddingSpace:
+        """The vector space every vector this route returns belongs to."""
+
+    def refuses(self, tier: object) -> bool:
+        """Return whether content of *tier* may never be sent on this route."""
+
+    def embed(self, items: Sequence[tuple[str, object]]) -> list[list[float] | None]:
+        """Return one vector per ``(text, tier)`` item, ``None`` where refused."""
+
+
 class EmbeddingModelUnavailableError(RuntimeError):
     """The configured sentence-transformer model could not be loaded (GAP-008).
 
@@ -85,6 +170,18 @@ class EmbeddingModelUnavailableError(RuntimeError):
     import-time failures or a corrupt cache directory. The exception
     message names the requested model so the operator can act without
     rummaging through a stack trace deep inside torch.
+    """
+
+
+class EmbeddingRefusedError(EmbeddingModelUnavailableError):
+    """A non-local embedding route produced no vector for a required text.
+
+    Raised by :meth:`EmbeddingLinker.generate_embedding` when the route refused
+    the text's tier at the chokepoint, or could not answer usably (identity
+    mismatch, transport failure, wrong dimensionality). A subclass of
+    :class:`EmbeddingModelUnavailableError` so every caller that already
+    degrades to "no grounding" on an unloadable model degrades identically
+    here. The message is fixed and content-free.
     """
 
 
@@ -126,6 +223,12 @@ class CachedEmbedding:
             load so a model swap forces a full recompute.
         vector: The embedding vector itself.
         computed_at: UTC timestamp at which the vector was produced.
+        route: The route that produced it (:data:`LOCAL_EMBEDDING_ROUTE` for
+            every row written before #1904).
+        dimensions: The vector length the row was written under, or ``None``
+            for a legacy row.
+        similarity_threshold: The resonance threshold the row was written
+            under, or ``None`` for a legacy row.
     """
 
     fragment_id: str
@@ -133,6 +236,42 @@ class CachedEmbedding:
     model_name: str
     vector: list[float]
     computed_at: datetime
+    route: str = LOCAL_EMBEDDING_ROUTE
+    dimensions: int | None = None
+    similarity_threshold: float | None = None
+
+
+_ROUTE_REFUSED: Final[str] = (
+    "the embedding route produced no vector for this text; grounding degrades"
+)
+
+
+def _cached_row(row: Mapping[str, Any]) -> CachedEmbedding:
+    """Return one parquet row as a :class:`CachedEmbedding`.
+
+    The three space columns are absent from a parquet written before #1904;
+    such a row is a local-route row with no recorded dimensionality or
+    threshold, which is exactly what produced it.
+
+    Args:
+        row: One row of ``pq.read_table(...).to_pylist()``.
+
+    Returns:
+        The typed entry.
+    """
+    computed_at = row["computed_at"]
+    if computed_at.tzinfo is None:
+        computed_at = computed_at.replace(tzinfo=UTC)
+    return CachedEmbedding(
+        fragment_id=row["fragment_id"],
+        content_hash=row["content_hash"],
+        model_name=row["model_name"],
+        vector=[float(x) for x in row["embedding"]],
+        computed_at=computed_at,
+        route=row.get("route") or LOCAL_EMBEDDING_ROUTE,
+        dimensions=row.get("dimensions"),
+        similarity_threshold=row.get("similarity_threshold"),
+    )
 
 
 def content_hash_for_text(text: str) -> str:
@@ -814,15 +953,68 @@ class EmbeddingLinker:
         config: The embeddings configuration specifying model and threshold.
     """
 
-    def __init__(self, config: EmbeddingsConfig) -> None:
+    def __init__(
+        self,
+        config: EmbeddingsConfig,
+        *,
+        embedder: TextEmbedder | None = None,
+    ) -> None:
         """Initialise the EmbeddingLinker with the given configuration.
 
         Args:
             config: Embeddings configuration with model name and
                 similarity threshold.
+            embedder: A non-local route to embed through instead of the local
+                sentence-transformer (#1904), or ``None`` for the local
+                default. When given, its pinned model and threshold replace
+                the configured ones, because a threshold calibrated for one
+                model's cosine distribution is meaningless for another's
+                (ADR-0004 fact 2) and a writable vault config must not be able
+                to move a pinned space.
         """
+        self._embedder = embedder
+        if embedder is not None:
+            pinned = embedder.space
+            overrides: dict[str, object] = {"model": pinned.model}
+            if pinned.similarity_threshold is not None:
+                overrides["similarity_threshold"] = pinned.similarity_threshold
+            config = config.model_copy(update=overrides)
         self.config = config
         self._model: SentenceTransformerType | None = None
+
+    @property
+    def space(self) -> EmbeddingSpace:
+        """The vector space this linker reads, writes and embeds in.
+
+        Returns:
+            The route's pinned space, or the local space named by the
+            configured model.
+        """
+        if self._embedder is not None:
+            return self._embedder.space
+        return EmbeddingSpace(route=LOCAL_EMBEDDING_ROUTE, model=self.config.model)
+
+    def embed_texts(
+        self, items: Sequence[tuple[str, object]]
+    ) -> list[list[float] | None]:
+        """Embed ``(text, tier)`` items, one vector or ``None`` per item.
+
+        On a non-local route the whole list goes to the route as one call, so
+        it can batch, gate each item's tier at the chokepoint and stop at the
+        first failure; a refused or unanswered item is ``None``. The local
+        route embeds each text exactly as :meth:`generate_embedding` always
+        has — one encode per text, tier ignored, because nothing leaves the
+        device — so its vectors are bit-identical to the pre-#1904 path.
+
+        Args:
+            items: ``(text, tier)`` pairs, in the order vectors are wanted.
+
+        Returns:
+            One entry per item, aligned with *items*.
+        """
+        if self._embedder is not None:
+            return self._embedder.embed(items)
+        return [self.generate_embedding(text) for text, _tier in items]
 
     def load_model(self) -> SentenceTransformerType:
         """Load the sentence-transformer model, caching after first call.
@@ -869,15 +1061,26 @@ class EmbeddingLinker:
                 raise EmbeddingModelUnavailableError(msg) from exc
         return self._model
 
-    def generate_embedding(self, text: str) -> list[float]:
+    def generate_embedding(self, text: str, *, tier: object = None) -> list[float]:
         """Generate a vector embedding for a single text string.
 
         Args:
             text: The text to encode.
+            tier: The text's privacy tier. Ignored on the local route; on a
+                non-local route it is handed to the chokepoint, and the
+                default ``None`` is untiered and therefore refused (#2016).
 
         Returns:
             A list of floats representing the embedding vector.
+
+        Raises:
+            EmbeddingRefusedError: When a non-local route produced no vector.
         """
+        if self._embedder is not None:
+            vector = self._embedder.embed([(text, tier)])[0]
+            if vector is None:
+                raise EmbeddingRefusedError(_ROUTE_REFUSED)
+            return vector
         import numpy as np  # lazy: numpy lives in the [embeddings] extra
 
         raw = self.load_model().encode(text)
@@ -919,6 +1122,9 @@ class EmbeddingLinker:
             self.config.model,
         )
 
+        if self._embedder is not None:
+            return self._route_embeddings(to_embed)
+
         import numpy as np  # lazy: numpy lives in the [embeddings] extra
 
         model = self.load_model()
@@ -934,6 +1140,37 @@ class EmbeddingLinker:
         return {
             frag.id: [float(x) for x in vectors[i]] for i, frag in enumerate(to_embed)
         }
+
+    def _route_embeddings(self, fragments: list[Fragment]) -> dict[str, list[float]]:
+        """Embed *fragments* through the non-local route, each with its own tier.
+
+        The fragment's own ``privacy_tier`` is what reaches the chokepoint —
+        never a batch-level tier — so an INTIMATE fragment is refused before
+        any request is built, and a fragment the route did not answer is
+        simply absent: the next pass embeds it (content-hash freshness), which
+        is what makes an interrupted re-embed resumable.
+
+        Args:
+            fragments: Fragments still needing a vector.
+
+        Returns:
+            Fragment ID to vector, for every fragment the route answered.
+        """
+        items = [(fragment_embedding_text(f), f.privacy_tier) for f in fragments]
+        vectors = self.embed_texts(items)
+        embedded = {
+            frag.id: vector
+            for frag, vector in zip(fragments, vectors, strict=True)
+            if vector is not None
+        }
+        if len(embedded) < len(fragments):
+            logger.warning(
+                "Embedding route answered %d of %d fragment(s); the rest were "
+                "refused by tier or left for the next pass.",
+                len(embedded),
+                len(fragments),
+            )
+        return embedded
 
     def save_cache(
         self,
@@ -1002,6 +1239,18 @@ class EmbeddingLinker:
                     [row.computed_at for row in rows],
                     type=pa.timestamp("us", tz="UTC"),
                 ),
+                # The vector space each row was written in (#1904), so a
+                # route, model, dimensionality or threshold change is a
+                # detectable mismatch rather than a silent mixing of spaces.
+                "route": pa.array([row.route for row in rows], type=pa.string()),
+                "dimensions": pa.array(
+                    [row.dimensions for row in rows],
+                    type=pa.int32(),
+                ),
+                "similarity_threshold": pa.array(
+                    [row.similarity_threshold for row in rows],
+                    type=pa.float64(),
+                ),
             },
         )
         # Staged beside the target and swapped in, so a write that dies
@@ -1014,9 +1263,12 @@ class EmbeddingLinker:
     def load_cache(self, path: Path) -> dict[str, CachedEmbedding]:
         """Load freshness-aware cache entries from a parquet file.
 
-        Entries whose ``model_name`` does not match the current
-        ``config.model`` are dropped — a model swap fully invalidates
-        the cache so the next run recomputes from scratch.
+        Only entries written in this linker's :attr:`space` are kept — a
+        model swap, a route switch (local to pool or back), or a change of
+        pinned dimensionality or threshold fully invalidates them, so the
+        next run recomputes rather than comparing vectors across spaces
+        (#1904). A row written before the space was recorded is a local-route
+        row, which preserves every self-hosted vault's existing cache.
 
         Args:
             path: Parquet file produced by :meth:`save_cache`.
@@ -1024,37 +1276,37 @@ class EmbeddingLinker:
         Returns:
             Mapping of fragment ID to :class:`CachedEmbedding`. Empty if
             the file does not exist (treated as a cache miss so the
-            engine can fall through to a full recompute without raising).
+            engine can fall through to a full recompute without raising),
+            and empty on a non-local route whose host has no parquet reader
+            — that route can still embed live, and a cache it cannot read is
+            only a cost, never a different answer.
         """
-        import pyarrow.parquet as pq  # lazy: pyarrow lives in [embeddings]
-
         if not path.exists():
+            return {}
+        try:
+            import pyarrow.parquet as pq  # lazy: pyarrow lives in [embeddings]
+        except ImportError:
+            if self._embedder is None:
+                raise
+            logger.warning("No parquet reader on this host; embedding live only")
             return {}
 
         data = pq.read_table(path).to_pylist()
-        active_model = self.config.model
+        space = self.space
         result: dict[str, CachedEmbedding] = {}
         skipped = 0
         for row in data:
-            if row["model_name"] != active_model:
+            entry = _cached_row(row)
+            if not space.admits(entry):
                 skipped += 1
                 continue
-            computed_at = row["computed_at"]
-            if computed_at.tzinfo is None:
-                computed_at = computed_at.replace(tzinfo=UTC)
-            result[row["fragment_id"]] = CachedEmbedding(
-                fragment_id=row["fragment_id"],
-                content_hash=row["content_hash"],
-                model_name=row["model_name"],
-                vector=[float(x) for x in row["embedding"]],
-                computed_at=computed_at,
-            )
+            result[entry.fragment_id] = entry
         if skipped:
             logger.info(
-                "Discarded %d cached embedding(s) from other model(s); "
+                "Discarded %d cached embedding(s) from other vector space(s); "
                 "active model is '%s'",
                 skipped,
-                active_model,
+                space.model,
             )
         logger.info("Loaded %d embedding cache row(s) from %s", len(result), path)
         return result
@@ -1077,15 +1329,19 @@ class EmbeddingLinker:
         """
         computed_at = datetime.now(tz=UTC)
         by_id = {f.id: f for f in fragments}
+        space = self.space
         return {
             frag_id: CachedEmbedding(
                 fragment_id=frag_id,
                 content_hash=content_hash_for_text(
                     fragment_embedding_text(by_id[frag_id]),
                 ),
-                model_name=self.config.model,
+                model_name=space.model,
                 vector=vector.copy(),
                 computed_at=computed_at,
+                route=space.route,
+                dimensions=len(vector),
+                similarity_threshold=self.config.similarity_threshold,
             )
             for frag_id, vector in vectors.items()
         }

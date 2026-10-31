@@ -2969,11 +2969,15 @@ def test_a_warmed_specialist_mutates_nothing_across_calls_at_any_ceiling(
 
     after = dict(vars(specialist))
     assert set(after) == {
+        "_embedder",
         "_linker",
         "_cache",
         "_cache_vault",
         "_max_live_embeds",
     }, "a gather added or removed an instance attribute"
+    # The embedding route is fixed at construction (#1904): it selects the
+    # vector space, never a caller's admitted content.
+    assert after["_embedder"] is before["_embedder"]
     assert after["_linker"] is before["_linker"], "the linker was rebuilt"
     assert after["_cache"] is before["_cache"], "the parquet map was rebuilt"
     assert after["_cache_vault"] == before["_cache_vault"]

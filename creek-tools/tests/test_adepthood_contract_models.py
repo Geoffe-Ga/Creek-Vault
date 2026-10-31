@@ -316,6 +316,33 @@ AGENT_ACTIVITY_RESPONSE_PAYLOAD: dict[str, Any] = {
     "rows": [AGENT_ACTIVITY_ROW_PAYLOAD],
 }
 
+EXPORT_DOCUMENT_PAYLOAD: dict[str, Any] = {
+    "document_id": "adepthood-doc-example-0a1b2c3d4e5f.txt",
+    "size_bytes": 4,
+    "sha256": "0" * 64,
+    "content_base64": "AAAAAA==",
+    "content_included": True,
+}
+
+EXPORT_FRAGMENT_PAYLOAD: dict[str, Any] = {
+    "fragment_id": "frag-example-0001",
+    "tier": "personal",
+    "frequency": "F3",
+    "phase": "rising",
+    "source_platform": "document",
+    "document_id": "adepthood-doc-example-0a1b2c3d4e5f.txt",
+    "markdown": "---\ntype: fragment\n---\nSynthetic.\n",
+    "content_included": True,
+}
+
+EXPORT_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "documents": [EXPORT_DOCUMENT_PAYLOAD],
+    "fragments": [EXPORT_FRAGMENT_PAYLOAD],
+    "skipped": 0,
+    "next_cursor": "f-" + "a" * 64,
+}
+
 VOICE_DRAFT_READ_RESPONSE_PAYLOAD: dict[str, Any] = {
     "status": "ok",
     "tier_ceiling": "personal",
@@ -561,6 +588,10 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     DriveDisconnectResponse.__name__: DRIVE_DISCONNECT_RESPONSE_PAYLOAD,
     DriveSyncResponse.__name__: DRIVE_SYNC_RESPONSE_PAYLOAD,
     ErrorEnvelope.__name__: ERROR_ENVELOPE_PAYLOAD,
+    "ExportDocument": EXPORT_DOCUMENT_PAYLOAD,
+    "ExportFragment": EXPORT_FRAGMENT_PAYLOAD,
+    "ExportQuery": {"cursor": "d-" + "0" * 64, "limit": 50},
+    "ExportResponse": EXPORT_RESPONSE_PAYLOAD,
     JournalUpsertRequest.__name__: JOURNAL_UPSERT_REQUEST_PAYLOAD,
     JournalUpsertResponse.__name__: JOURNAL_UPSERT_RESPONSE_PAYLOAD,
     JournalWithdrawResponse.__name__: JOURNAL_WITHDRAW_RESPONSE_PAYLOAD,
@@ -678,6 +709,7 @@ EXPECTED_UNREACHABLE_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("agent-activity", "care-escalation"),
         ("reading-recommendations", "care-escalation"),
         ("agent-activity", "refusal"),
+        ("export", "care-escalation"),
     }
 )
 
@@ -1140,7 +1172,7 @@ def test_bundle_root_name_matches_the_declared_dir_name() -> None:
 
 
 def test_capability_and_state_axes_are_pinned() -> None:
-    """The fixture matrix is 11 capabilities x 7 states = 77 cells."""
+    """The fixture matrix is 13 capabilities x 7 states = 91 cells."""
     assert CAPABILITIES == (
         "capabilities",
         "journal-upsert",
@@ -1154,6 +1186,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "letters",
         "agent-activity",
         "reading-recommendations",
+        "export",
     )
     assert EXAMPLE_STATES == (
         "success",
@@ -1164,7 +1197,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 84
+    assert len(_matrix()) == 91
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
