@@ -900,6 +900,38 @@ class ProvisioningStore:
             provider_allocation_id=str(row["provider_allocation_id"]),
         )
 
+    def list_routable_allocations(self) -> tuple[RoutableAllocation, ...]:
+        """Return every allocation routing would resolve (operator seam only).
+
+        The same ready, provider-managed, undeleted rows as
+        :meth:`get_routable_allocation`, for every owner, ordered by provider
+        allocation id so a bounded batch over them is deterministic (#1869).
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT jobs.job_id, jobs.canonical_activation_id, "
+                "jobs.requester_identity, jobs.consumer_identity, "
+                "allocations.provider_allocation_id "
+                "FROM provisioning_jobs AS jobs "
+                "JOIN provisioning_allocations AS allocations USING (job_id) "
+                "WHERE jobs.state = 'ready' "
+                "AND jobs.custody_mode = 'provider_managed' "
+                "AND allocations.requester_identity = jobs.requester_identity "
+                "AND allocations.consumer_identity = jobs.consumer_identity "
+                "AND allocations.deleted_at IS NULL "
+                "ORDER BY allocations.provider_allocation_id"
+            ).fetchall()
+        return tuple(
+            RoutableAllocation(
+                job_id=str(row["job_id"]),
+                activation_id=str(row["canonical_activation_id"]),
+                requester_identity=str(row["requester_identity"]),
+                consumer_identity=str(row["consumer_identity"]),
+                provider_allocation_id=str(row["provider_allocation_id"]),
+            )
+            for row in rows
+        )
+
     def count_allocations(self, *, active_only: bool = False) -> int:
         """Return all or only active durable allocations (test/telemetry seam)."""
         query = "SELECT COUNT(*) FROM provisioning_allocations"

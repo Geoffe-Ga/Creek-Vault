@@ -27,8 +27,13 @@ from creek_mcp.provisioning.mcp_oauth_rollout import (
     roll_owned_allocation,
 )
 from creek_mcp.provisioning.models import McpOAuthSettings, public_vault_url
-from creek_mcp.provisioning.production_secrets import EncryptedFileFlySecretManager
+from creek_mcp.provisioning.production_secrets import (
+    EncryptedFileFlySecretManager,
+    ReadOnlyFlySecretManager,
+)
 from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.vault_converge import ConvergeRequest
+from creek_mcp.provisioning.vault_converge import run as run_converge
 from creek_mcp.provisioning.worker import ProvisioningWorker
 
 if TYPE_CHECKING:
@@ -128,14 +133,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_mcp_oauth_roll_argument(parser: argparse.ArgumentParser) -> None:
-    """Add the one-shot MCP OAuth rollout selectors (#1974, #2004).
+    """Add the one-shot operator selectors (#1974, #2004, #1869).
 
     Given ``--roll-mcp-oauth REQUESTER CONSUMER`` the process composes as
     usual, rolls that one allocation onto the configured settings, and exits
     with the status :mod:`creek_mcp.provisioning.mcp_oauth_rollout` names
     instead of claiming jobs.  ``--check-mcp-audience`` instead runs the fleet
     check and exits ``0`` only when no allocation remains on the shared
-    audience.  The two are alternatives.
+    audience.  ``--converge-vault-machines`` instead runs the vault upgrade
+    batch of :mod:`creek_mcp.provisioning.vault_converge` — a dry run unless
+    ``--converge-apply`` is given.  The three are alternatives.
 
     Args:
         parser: The parser to extend.
@@ -155,6 +162,66 @@ def add_mcp_oauth_roll_argument(parser: argparse.ArgumentParser) -> None:
             "(#2004); run before --refuse-shared-mcp-audience"
         ),
     )
+    one_shot.add_argument(
+        "--converge-vault-machines",
+        action="store_true",
+        help=(
+            "plan (or, with --converge-apply, update) every vault Machine "
+            "behind the --fly-image policy (#1869)"
+        ),
+    )
+    parser.add_argument(
+        "--converge-apply",
+        action="store_true",
+        help="update stopped Machines instead of only listing the plan",
+    )
+    parser.add_argument(
+        "--converge-rollback",
+        action="store_true",
+        help="restore the prior configs the journal recorded instead",
+    )
+    parser.add_argument(
+        "--converge-limit",
+        type=_positive_int,
+        default=1,
+        help="the most Machines one run updates (default 1)",
+    )
+    parser.add_argument(
+        "--converge-journal",
+        type=Path,
+        default=None,
+        help="the upgrade's owner-only journal; required to apply or roll back",
+    )
+
+
+def selects_one_shot(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> bool:
+    """Return whether *args* select a one-shot instead of the service.
+
+    Args:
+        args: Parsed arguments.
+        parser: The parser, to report an incomplete converge request.
+
+    Returns:
+        ``True`` for ``--roll-mcp-oauth``, ``--check-mcp-audience`` or
+        ``--converge-vault-machines``.
+    """
+    converge = args.converge_vault_machines
+    modifiers = (
+        args.converge_apply
+        or args.converge_rollback
+        or args.converge_journal is not None
+        or args.converge_limit != 1
+    )
+    if modifiers and not converge:
+        parser.error("--converge-* options need --converge-vault-machines")
+    if (args.converge_apply or args.converge_rollback) and (
+        args.converge_journal is None
+    ):
+        parser.error("--converge-apply and --converge-rollback need --converge-journal")
+    return args.roll_mcp_oauth is not None or args.check_mcp_audience or converge
 
 
 def mcp_oauth_settings(args: argparse.Namespace) -> McpOAuthSettings | None:
@@ -208,16 +275,47 @@ def run_mcp_oauth_roll(
     )
 
 
+def run_vault_converge(args: argparse.Namespace, driver: FlyProviderDriver) -> int:
+    """Run the vault converge ``--converge-vault-machines`` selects (#1869).
+
+    The run reads the store's whole ownership-bound allocation set and the
+    activation records through a read-only reader, so it can never issue,
+    rotate or revoke a credential.
+
+    Args:
+        args: Parsed arguments carrying ``--database``, the secret state
+            mounts and the ``--converge-*`` options.
+        driver: The composed Fly driver, scoped to ``--fly-organization``.
+
+    Returns:
+        The run's exit status.
+    """
+    records = ReadOnlyFlySecretManager(
+        args.secret_state_directory,
+        master_key_file=args.secret_master_key_file,
+    )
+    return run_converge(
+        ProvisioningStore(args.database),
+        driver.with_secret_manager(records),
+        ConvergeRequest(
+            args.converge_journal,
+            rollback=args.converge_rollback,
+            apply=args.converge_apply,
+            limit=args.converge_limit,
+        ),
+    )
+
+
 def run_one_shot(
     args: argparse.Namespace,
     driver: FlyProviderDriver,
     secrets: EncryptedFileFlySecretManager,
 ) -> int:
-    """Run the one-shot rollout operation *args* selects.
+    """Run the one-shot operator operation *args* selects.
 
     Args:
-        args: Parsed arguments selecting ``--roll-mcp-oauth`` or, failing
-            that, ``--check-mcp-audience``.
+        args: Parsed arguments selecting ``--roll-mcp-oauth``,
+            ``--converge-vault-machines`` or ``--check-mcp-audience``.
         driver: The composed Fly driver.
         secrets: The composed encrypted record writer.
 
@@ -226,6 +324,8 @@ def run_one_shot(
     """
     if args.roll_mcp_oauth is not None:
         return run_mcp_oauth_roll(args, driver, secrets)
+    if args.converge_vault_machines:
+        return run_vault_converge(args, driver)
     return check_shared_audience(secrets)
 
 
@@ -382,8 +482,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     parser = build_parser()
     args = parser.parse_args(argv)
+    one_shot = selects_one_shot(args, parser)
     bundle = compose(args, parser)
-    if args.roll_mcp_oauth is not None or args.check_mcp_audience:
+    if one_shot:
         try:
             status = run_one_shot(args, bundle.driver, bundle.secrets)
         finally:

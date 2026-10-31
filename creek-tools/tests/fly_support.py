@@ -464,8 +464,13 @@ def fly_driver(
     discover_organization_apps: bool = False,
     fly_replay_enabled: bool = False,
     credentials: PoolCredentialInventory | None = None,
+    image: str = IMAGE,
 ) -> FlyProviderDriver:
-    """Return a driver over *api* with the synthetic org-scoped credential."""
+    """Return a driver over *api* with the synthetic org-scoped credential.
+
+    *image* is the policy's vault image; a test passes another digest to play
+    a control plane from before or after a vault image upgrade (#1869).
+    """
     credential = FlyCredential(
         token=PROVIDER_TOKEN,
         organization=ORGANIZATION,
@@ -474,7 +479,7 @@ def fly_driver(
     )
     policy = FlyProviderPolicy(
         organization=ORGANIZATION,
-        image=IMAGE,
+        image=image,
         routing_public_url=ROUTING_PUBLIC_URL,
         api_base_url=API_BASE_URL,
         discover_organization_apps=discover_organization_apps,
