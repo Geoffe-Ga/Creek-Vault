@@ -492,6 +492,9 @@ class AlertKind(StrEnum):
     # The Fly org token's operator-recorded expiry (#1867, ADR-0013 amendment):
     # within the warning window, already expired, or never recorded.
     PROVIDER_CREDENTIAL_EXPIRING = "provider_credential_expiring"
+    # The Fly provider refused the pilot's org token with a 401/403 (#1866):
+    # the pilot is degraded *now*, unlike an expiry warning ahead of time.
+    PROVIDER_CREDENTIAL_REJECTED = "provider_credential_rejected"
 
 
 @dataclass(frozen=True, slots=True)

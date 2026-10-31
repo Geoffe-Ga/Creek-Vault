@@ -23,6 +23,21 @@ to locate the originating commit for any reference below.
   reconcile receives the control plane's policy through the new
   `cli.admission_policy`; the standalone fleet CLI has none, so it reports a
   recoverable failed create but no longer resumes it.
+- Degrade instead of exiting when Fly refuses the pilot's credential (#1866,
+  extending owner decision R2-4). A `401` or `403` from the Fly Machines API
+  now sets `ProviderError.authentication_failed`, raises
+  `ProviderAuthenticationError` (a `ReconcileUnavailableError` subclass) from
+  the fleet reconciler, and makes `creek-provisioning-fleet` exit `4` with
+  `{"error": "provider_authentication_failed"}`. The supervised pilot no
+  longer stops on it: `ProviderAuthState` sets `provider_auth_failed`, which
+  refuses new activations beside the R2-4 alert gate, pauses worker claims so
+  no create or deletion runs against an unverified provider, and keeps
+  `/__fly/health` at `503`, while the edge keeps answering `/v1/*` with the
+  existing fast `503 temporarily_unavailable`. Entering the state collects
+  one new `provider_credential_rejected` alert through the R2-4 relay; the
+  next successful report clears it. Other provider failures (exit `1`) still
+  fail the scheduler. Adepthood's receiver must admit the new kind before
+  this build is deployed. Runbook §3 is amended.
 
 - Price the bench's pilot volume at the release ceiling (ADR-0017, owner
   decision R2-3): `PILOT_REFLECTIONS_PER_MONTH` is now 300 (15 live

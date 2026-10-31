@@ -111,6 +111,34 @@ stops all components, then releases provider transports. Mount
 atomic volume snapshot captures both. Keys and bearer credentials remain
 separate Fly secret-backed files and are not part of that snapshot.
 
+**Amended by #1866 (2026-10-31): a provider credential refusal degrades
+instead of exiting.** Owner decision R2-4 of 2026-10-27 ("when the alert
+channel fails: keep routing, retry alerts, refuse new activations") sets a
+degrade-don't-exit posture for the pilot, and #1866 extends it to a `401` or
+`403` from the Fly Machines API. Before this, a revoked org token made every
+report exit `1`, the scheduler stopped its peers, and Fly's three-restart cap
+left the control Machine stopped, so Adepthood met a ten-second connect
+timeout and nobody was alerted (incident 2026-10-13). Now the report exits `4`
+and the supervised process stays up with `provider_auth_failed` set:
+`/__fly/health` returns `503`; the control plane refuses every new activation
+with the existing `503 activation_unavailable`; the worker claims nothing, so
+no create and no deletion runs against an unverified provider (a deletion
+request is still accepted and runs once the provider is verified); and the
+edge keeps answering `/v1/*` with the existing fast
+`503 temporarily_unavailable`, because the router's per-request provider call
+is refused the same way. Entering the state delivers one
+`provider_credential_rejected` alert, retained and retried by the R2-4 alert
+relay if the sink is down; it carries only the kind's count, never token
+material, provider identifiers, or URLs. The first later report that succeeds
+clears the state, reopens admission and claims, and restores health. The
+state is held in memory, and `fly secrets set` restarts the Machine, so
+mounting a new token starts the process clear; a token still refused is
+caught again by the first report, which runs at boot while health is still
+`503`. Every other provider failure (exit `1`) still fails the scheduler
+exactly as described above. Adepthood's alert receiver validates a closed kind
+list: deploy this build only after it admits `provider_credential_rejected`,
+or the alert is refused and stays owed, keeping admission closed until it is.
+
 - The one `*.fly.dev` endpoint dispatches `/control/v1/*` to the control API
   and `/v1/*` to the replay router. It preserves the original bearer for the
   selected authentication realm and never tries either token against the

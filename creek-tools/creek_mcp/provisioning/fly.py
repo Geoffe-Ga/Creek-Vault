@@ -66,6 +66,8 @@ _VAULT_MOUNT: Final[str] = "/vault"
 _MANAGED_VAULT_MARKER: Final[str] = "1"
 _FLY_ABSENT_STATUS: Final[int] = 404
 """Fly's upstream resource-absence response; never exposed on Creek's wire."""
+# Fly refused the credential itself: revoked, expired, or under-scoped (#1866).
+_FLY_AUTHENTICATION_STATUSES: Final[frozenset[int]] = frozenset({401, 403})
 _DELETED_VOLUME_STATES: Final[frozenset[str]] = frozenset(
     {
         "scheduling_destroy",
@@ -1276,7 +1278,13 @@ class FlyProviderDriver:
             reason = FailureReason.PROVIDER_REJECTED
             if retryable and not authentication_expired:
                 reason = FailureReason.PROVIDER_UNAVAILABLE
-            raise ProviderError(reason, retryable=retryable) from None
+            raise ProviderError(
+                reason,
+                retryable=retryable,
+                authentication_failed=(
+                    response.status_code in _FLY_AUTHENTICATION_STATUSES
+                ),
+            ) from None
         return response
 
     def _reference(self, activation_id: str) -> _AllocationRef:

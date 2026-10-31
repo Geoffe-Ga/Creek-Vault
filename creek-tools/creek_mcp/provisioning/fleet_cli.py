@@ -8,7 +8,8 @@ Production Fly inventory discovers the configured organization directly;
 ``--inventory-file`` remains an additive audit input.
 
 Exit codes: 0 clean, 3 alerts present, 1 provider unavailable (or any
-emergency-stop failure), 2 usage error.
+emergency-stop failure), 2 usage error, 4 the provider refused the credential
+(a ``401``/``403``; #1866).
 """
 
 from __future__ import annotations
@@ -42,7 +43,11 @@ from creek_mcp.provisioning.fly import (
     FlyProviderPolicy,
     RefusingSecretManager,
 )
-from creek_mcp.provisioning.reconcile import FleetReconciler, ReconcileUnavailableError
+from creek_mcp.provisioning.reconcile import (
+    FleetReconciler,
+    ProviderAuthenticationError,
+    ReconcileUnavailableError,
+)
 from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
@@ -58,6 +63,8 @@ _DEFAULT_API_BASE_URL: Final[str] = "https://api.machines.dev"
 _EXIT_CLEAN: Final[int] = 0
 _EXIT_UNAVAILABLE: Final[int] = 1
 _EXIT_ALERTS: Final[int] = 3
+# Public: the supervised pilot degrades on this code instead of exiting (#1866).
+EXIT_PROVIDER_AUTH_FAILED: Final[int] = 4
 _REPORT_COMMANDS: Final[frozenset[str]] = frozenset({"report", "reconcile"})
 _INVENTORY_ERROR: Final[str] = (
     "--inventory-file must be a JSON list of app names ([a-z0-9-]) "
@@ -383,6 +390,13 @@ def _run_report(
             repair=args.command == "reconcile",
             confidential_compute_changed=args.confidential_compute_changed,
         )
+    except ProviderAuthenticationError:
+        if emit_output:
+            print(
+                json.dumps({"error": "provider_authentication_failed"}),
+                file=sys.stderr,
+            )
+        return EXIT_PROVIDER_AUTH_FAILED
     except ReconcileUnavailableError:
         if emit_output:
             print(json.dumps({"error": "provider_unavailable"}), file=sys.stderr)

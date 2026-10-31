@@ -52,11 +52,18 @@ class ProviderError(RuntimeError):
         *,
         retryable: bool,
         private_detail: str | None = None,
+        authentication_failed: bool = False,
     ) -> None:
-        """Keep private provider detail off the exception's public representation."""
+        """Keep private provider detail off the exception's public representation.
+
+        *authentication_failed* marks a provider that refused the credential
+        itself (a Fly ``401`` or ``403``), so the pilot can degrade rather than
+        exit (#1866); the public reason and retry policy are unchanged by it.
+        """
         super().__init__(f"provider operation failed: {reason.value}")
         self.reason = reason
         self.retryable = retryable
+        self.authentication_failed = authentication_failed
         del private_detail
 
 
