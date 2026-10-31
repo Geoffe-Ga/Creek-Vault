@@ -183,6 +183,7 @@ class EncryptedFileFlySecretManager:
         clock: Callable[[], datetime] | None = None,
         pool_bundles: PoolBundleIssuer | None = None,
         mcp_oauth: McpOAuthSettings | None = None,
+        per_allocation_mcp_resource: bool = False,
     ) -> None:
         """Load mounted key material and validate the owner-only state root.
 
@@ -194,9 +195,18 @@ class EncryptedFileFlySecretManager:
         (#1974) and, through :meth:`roll_mcp_oauth`, into an existing one on
         request.  An activation already issued keeps what its record holds, so
         configuring it re-verifies no existing Machine.
+
+        *per_allocation_mcp_resource* (#2002, R3-1) scopes each new
+        activation's resource to its own ``<edge>/a/<slug>/mcp``, the slug
+        minted once here and persisted in the record, so a create retry reads
+        back the same one.  Off — the default — every new activation names the
+        shared edge resource *mcp_oauth* holds, as before: the edge does not
+        route per-allocation paths until #2003.  It changes no existing record
+        and no roll; :meth:`roll_mcp_oauth` still writes the shared settings.
         """
         self._pool_bundles = pool_bundles
         self._mcp_oauth = mcp_oauth
+        self._per_allocation_mcp_resource = per_allocation_mcp_resource
         self._state_directory = state_directory.resolve()
         self._clock = clock or _utc_now
         _require_owner_only_directory(self._state_directory)
@@ -489,8 +499,19 @@ class EncryptedFileFlySecretManager:
             certificate.public_bytes(serialization.Encoding.PEM),
             private_pem,
             pool,
-            self._mcp_oauth,
+            self._new_mcp_oauth(),
         )
+
+    def _new_mcp_oauth(self) -> McpOAuthSettings | None:
+        """Return the settings one newly issued record is written with.
+
+        Returns:
+            ``None`` without configured settings; else the shared settings, or
+            — with the per-allocation flag — a fresh per-allocation scoping.
+        """
+        if self._mcp_oauth is None or not self._per_allocation_mcp_resource:
+            return self._mcp_oauth
+        return self._mcp_oauth.for_new_allocation()
 
     def _certificate(
         self,

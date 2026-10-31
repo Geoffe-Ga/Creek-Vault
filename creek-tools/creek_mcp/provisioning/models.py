@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass, field
 from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Final
 from urllib.parse import urlsplit
 
-from creek_mcp.mcp_path import MCP_PATH
+from creek_mcp.mcp_path import MCP_PATH, allocation_mcp_path
 from creek_mcp.oauth_resource import (
     AUTHORIZATION_SERVER_ENV,
     RESOURCE_URL_ENV,
@@ -25,6 +26,13 @@ _STORED_MCP_OAUTH_KEYS: Final[frozenset[str]] = frozenset(
     {"resource_url", "authorization_server"}
 )
 _HTTPS: Final[str] = "https"
+
+ALLOCATION_SLUG_BYTES: Final[int] = 24
+"""CSPRNG bytes per allocation slug: 192 bits, above R3-1's 128-bit floor (#2002).
+
+Unpadded base64url of 24 bytes is exactly
+:data:`~creek_mcp.mcp_path.ALLOCATION_SLUG_CHARS` characters.
+"""
 
 
 @unique
@@ -291,6 +299,36 @@ def mcp_resource_url(vault_url: str) -> str:
     return f"{vault_url.removesuffix(V1_PATH)}{MCP_PATH}"
 
 
+def new_allocation_slug() -> str:
+    """Mint one allocation's opaque resource slug (#2002, R3-1).
+
+    Fresh CSPRNG output, never derived from the requester, consumer or
+    activation identity, so the slug neither reveals nor can be predicted from
+    whose vault it names.  It is minted once, when the activation's encrypted
+    record is first written, and read back from that record ever after.
+
+    Returns:
+        :data:`ALLOCATION_SLUG_BYTES` random bytes as unpadded base64url.
+    """
+    return secrets.token_urlsafe(ALLOCATION_SLUG_BYTES)
+
+
+def allocation_mcp_resource_url(routing_public_url: str, slug: str) -> str:
+    """Return one managed allocation's own MCP resource URL (#2002).
+
+    Args:
+        routing_public_url: The shared public edge origin.
+        slug: The allocation's minted slug.
+
+    Returns:
+        The origin, without a trailing slash, plus ``/a/<slug>/mcp``.
+
+    Raises:
+        ValueError: When *slug* is not the minted grammar.
+    """
+    return f"{routing_public_url.rstrip('/')}{allocation_mcp_path(slug)}"
+
+
 @dataclass(frozen=True, slots=True)
 class McpOAuthSettings:
     """One activation's MCP resource-server settings, stored with its bundle.
@@ -344,6 +382,48 @@ class McpOAuthSettings:
             The settings, the resource derived by :func:`mcp_resource_url`.
         """
         return cls(mcp_resource_url(vault_url), authorization_server)
+
+    @classmethod
+    def for_allocation(
+        cls, routing_public_url: str, slug: str, authorization_server: str
+    ) -> McpOAuthSettings:
+        """Return the settings naming one managed allocation's own resource.
+
+        Args:
+            routing_public_url: The shared public edge origin.
+            slug: The allocation's minted slug.
+            authorization_server: Adepthood's issuer.
+
+        Returns:
+            The settings, the resource from :func:`allocation_mcp_resource_url`.
+        """
+        return cls(
+            allocation_mcp_resource_url(routing_public_url, slug),
+            authorization_server,
+        )
+
+    def for_new_allocation(self) -> McpOAuthSettings:
+        """Return these shared edge settings scoped to a fresh allocation.
+
+        The new resource keeps this resource's origin and issuer and names a
+        newly minted slug, so the edge origin has one source of truth: the
+        shared settings the control plane is configured with.
+
+        Returns:
+            Settings for ``<origin>/a/<new slug>/mcp``.
+
+        Raises:
+            ValueError: When these settings are not the shared edge resource
+                (origin plus ``/mcp``) — an allocation's resource is never the
+                base of another's.
+        """
+        if urlsplit(self.resource_url).path != MCP_PATH:
+            raise ValueError("only the shared edge resource is scoped per allocation")
+        return McpOAuthSettings.for_allocation(
+            self.resource_url.removesuffix(MCP_PATH),
+            new_allocation_slug(),
+            self.authorization_server,
+        )
 
     def runtime_env(self) -> dict[str, str]:
         """Return the two Machine environment entries these settings write.
