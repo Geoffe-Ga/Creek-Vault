@@ -33,8 +33,14 @@ from typing import Final
 import httpx
 
 from creek.classify.llm.local_boundary import ollama_get
+from creek.classify.llm.pool_attestation import (
+    AttestationVerdict,
+    PoolAttestationError,
+    attested_report,
+)
 from creek.classify.llm.pool_boundary import (
     PoolBoundaryError,
+    attesting_sidecar_mode,
     pool_list_models,
     pool_response_ok,
     pool_url_configured,
@@ -100,6 +106,7 @@ class ProbeStatus(StrEnum):
     POOL_UNREACHABLE = "pool-unreachable"
     POOL_MODEL_MISSING = "pool-model-missing"
     POOL_IDENTITY_MISMATCH = "pool-identity-mismatch"
+    POOL_ATTESTATION_FAILED = "pool-attestation-failed"
 
 
 _EXIT_CODES: Final[dict[ProbeStatus, int]] = {
@@ -119,6 +126,7 @@ _EXIT_CODES: Final[dict[ProbeStatus, int]] = {
     ProbeStatus.POOL_UNREACHABLE: 31,
     ProbeStatus.POOL_MODEL_MISSING: 32,
     ProbeStatus.POOL_IDENTITY_MISMATCH: 33,
+    ProbeStatus.POOL_ATTESTATION_FAILED: 34,
 }
 
 _UNAVAILABLE: Final[dict[ProbeTarget, ProbeStatus]] = {
@@ -260,21 +268,45 @@ def _pool_identity_status(manifest: ModelPackageManifest) -> ProbeStatus:
         the pinned digest; otherwise the precise failure. Nothing is logged
         and no prompt exists to leak.
     """
+    listing = _pool_listing()
+    if isinstance(listing, ProbeStatus):
+        return listing
+    if reported_pool_identity(listing, manifest.model_name) is None:
+        return ProbeStatus.POOL_MODEL_MISSING
+    if not pool_identity_matches(
+        listing,
+        model_name=manifest.model_name,
+        inventory_digest=manifest.runtime_inventory_digest,
+    ):
+        return ProbeStatus.POOL_IDENTITY_MISMATCH
+    return ProbeStatus.POOL_READY
+
+
+def _pool_listing() -> object:
+    """Return the pool's identity listing, or the status that stopped it.
+
+    In sidecar mode (#1896) the listing is the attestation report, and only
+    once it matches the Machine's pin: a report that fails the pin is
+    ``pool-attestation-failed`` (exit 34), never a weaker state. No generation
+    is made either way.
+
+    Returns:
+        The decoded listing, or a failing :class:`ProbeStatus`.
+    """
+    if attesting_sidecar_mode():
+        try:
+            return attested_report(budget=_PROBE_TIMEOUT)
+        except PoolAttestationError as exc:
+            if exc.verdict is AttestationVerdict.UNREACHABLE:
+                return ProbeStatus.POOL_UNREACHABLE
+            return ProbeStatus.POOL_ATTESTATION_FAILED
     try:
         response = pool_list_models(budget=_PROBE_TIMEOUT)
     except PoolBoundaryError:
         return ProbeStatus.POOL_UNREACHABLE
     if not pool_response_ok(response):
         return ProbeStatus.POOL_UNREACHABLE
-    if reported_pool_identity(response.payload, manifest.model_name) is None:
-        return ProbeStatus.POOL_MODEL_MISSING
-    if not pool_identity_matches(
-        response.payload,
-        model_name=manifest.model_name,
-        inventory_digest=manifest.runtime_inventory_digest,
-    ):
-        return ProbeStatus.POOL_IDENTITY_MISMATCH
-    return ProbeStatus.POOL_READY
+    return response.payload
 
 
 def _pool_status() -> ProbeStatus:
