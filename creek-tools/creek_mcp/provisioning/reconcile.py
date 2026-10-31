@@ -12,6 +12,12 @@ A failed create holds no admission slot (#2019), so every one that still owns
 provider resources is reported as ``incomplete_create``, and the resume above
 re-admits through the caller's ``ActivationAdmissionPolicy``; with no policy it
 is reported but never resumed.
+
+A rolled-away pool credential the vendor has not yet confirmed revoked (#1918)
+is read from an optional ``PendingRevocationSource`` and reported as
+``pending_revocation`` from the first pass; it alerts once it outlives the
+policy's deletion bound.  The source is listing-only: retrying belongs to the
+process holding the pool issuer, so this pass still calls no delete.
 """
 
 from __future__ import annotations
@@ -63,6 +69,10 @@ if TYPE_CHECKING:
         ProviderResource,
     )
     from creek_mcp.provisioning.models import FleetJob
+    from creek_mcp.provisioning.pool_bundle import (
+        PendingPoolRevocation,
+        PendingRevocationSource,
+    )
     from creek_mcp.provisioning.store import (
         ActivationAdmissionPolicy,
         ProvisioningStore,
@@ -185,6 +195,7 @@ def _classify_group(
     provider_allocation_id: str,
     resources: Sequence[ProviderResource],
     desired: FleetJob | None,
+    owed_revocations: int = 0,
 ) -> Iterator[Divergence]:
     """Compare one allocation's resources with the store's expectation.
 
@@ -192,12 +203,26 @@ def _classify_group(
     create is still in flight (or failed) and a pending deletion expect
     nothing in particular.  An inspected row must own exactly one Machine and
     one live volume: more is a duplicate per class, none is missing per class.
+    It may also own at most one live pool credential plus the
+    *owed_revocations* a roll left pending; any more is a duplicate credential
+    the store holds no record of (#1918).  None is not missing: a pool-free
+    activation owns no credential at all.
     """
     if desired is None:
         yield from _orphans_for(provider_allocation_id, resources)
         return
     if desired.job.state not in _INSPECTED_STATES:
         return
+    credentials = sum(1 for r in resources if _is_credential(r))
+    if credentials > 1 + owed_revocations:
+        yield Divergence(
+            DivergenceKind.DUPLICATE_RESOURCE,
+            Disposition.REPORTED,
+            provider_allocation_id,
+            ResourceClass.CREDENTIAL,
+            desired.job.job_id,
+            None,
+        )
     for resource_class, count in _class_counts(resources):
         if count == 1:
             continue
@@ -213,6 +238,28 @@ def _classify_group(
             resource_class,
             desired.job.job_id,
             None,
+        )
+
+
+def _classify_pending_revocations(
+    owed: Sequence[tuple[str, datetime]],
+    desired: Mapping[str, FleetJob],
+    now: datetime,
+) -> Iterator[Divergence]:
+    """Report each owed pool revocation with its age (#1918).
+
+    Always reported, never repaired here: the alert decision against the
+    policy bound is ``evaluate_alerts``'s, as for a deletion.
+    """
+    for provider_allocation_id, superseded_at in owed:
+        entry = desired.get(provider_allocation_id)
+        yield Divergence(
+            DivergenceKind.PENDING_REVOCATION,
+            Disposition.REPORTED,
+            provider_allocation_id,
+            ResourceClass.CREDENTIAL,
+            None if entry is None else entry.job.job_id,
+            max(0, int((now - superseded_at).total_seconds())),
         )
 
 
@@ -242,6 +289,11 @@ def _class_counts(
     )
 
 
+def _is_credential(resource: ProviderResource) -> bool:
+    """Return whether *resource* is a vendor-listed pool credential."""
+    return resource.resource_class is ResourceClass.CREDENTIAL
+
+
 def _is_machine(resource: ProviderResource) -> bool:
     """Return whether *resource* is a Machine."""
     return resource.resource_class is ResourceClass.MACHINE
@@ -268,11 +320,14 @@ class FleetReconciler:
         extra_app_names: Sequence[str] = (),
         usage: InjectedUsage | None = None,
         admission: ActivationAdmissionPolicy | None = None,
+        pending_revocations: PendingRevocationSource | None = None,
     ) -> None:
         """Bind the durable store, narrow provider seams, and operator policy.
 
         *admission* is the control plane's create fence; a failed create is
         resumed only through it, so ``None`` leaves every one reported.
+        *pending_revocations* lists the pool credentials a roll left owed
+        (#1918); ``None`` reports none.
         """
         self._store = store
         self._inventory = inventory
@@ -281,6 +336,7 @@ class FleetReconciler:
         self._extra_app_names = tuple(extra_app_names)
         self._usage = usage
         self._admission = admission
+        self._pending_revocations = pending_revocations
 
     def run_once(
         self,
@@ -297,6 +353,7 @@ class FleetReconciler:
             [job for job in fleet if _is_live(job)] + pending_deletes
         )
         resources = self._list_resources(desired)
+        owed = self._list_pending_revocations()
         groups: defaultdict[str, list[ProviderResource]] = defaultdict(list)
         for resource in resources:
             groups[resource.provider_allocation_id].append(resource)
@@ -307,8 +364,10 @@ class FleetReconciler:
                     provider_allocation_id,
                     groups.get(provider_allocation_id, ()),
                     desired.get(provider_allocation_id),
+                    sum(1 for record in owed if record[0] == provider_allocation_id),
                 )
             )
+        divergences.extend(_classify_pending_revocations(owed, desired, now))
         divergences.extend(
             self._classify_failed_creates(desired, groups, now, repair=repair)
         )
@@ -362,6 +421,37 @@ class FleetReconciler:
             raise ReconcileUnavailableError(
                 "provider inventory is unavailable"
             ) from exc
+
+    def _list_pending_revocations(self) -> tuple[tuple[str, datetime], ...]:
+        """Read every owed revocation, keyed by provider allocation id.
+
+        Read before any repair, so an unreadable record aborts the pass with
+        nothing changed rather than reporting that nothing is owed.
+
+        Returns:
+            ``(provider_allocation_id, superseded_at)`` per owed credential.
+
+        Raises:
+            ReconcileUnavailableError: When the source cannot be read.
+        """
+        if self._pending_revocations is None:
+            return ()
+        try:
+            records = self._pending_revocations.pending_pool_revocations()
+        except ValueError as exc:
+            raise ReconcileUnavailableError(
+                "pending revocation state is unreadable"
+            ) from exc
+        return tuple(self._owed_by_allocation(record) for record in records)
+
+    def _owed_by_allocation(
+        self, record: PendingPoolRevocation
+    ) -> tuple[str, datetime]:
+        """Key one owed revocation by the allocation its activation carries."""
+        return (
+            self._inventory.expected_allocation_id(record.activation_id),
+            record.superseded_at,
+        )
 
     def _classify_deletions(
         self,

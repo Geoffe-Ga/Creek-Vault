@@ -582,6 +582,12 @@ months_over_budget = 3
 raise no alert: the first is expected during a partial create and the second
 is the normal window between a delete request and provider confirmation.
 
+`pending_revocation` (#1918) appears only when the reconciler is given a
+pending-revocation source: a pool credential a roll replaced that the vendor
+has not yet confirmed revoked. It raises `pool_credential_orphan` once it is
+`stuck_deletion_seconds` old; the response is in the
+[pool runbook](pool-measurement-pin.md#a-roll-whose-revocation-did-not-confirm).
+
 ### Invoice reconciliation
 
 Each telemetry field maps to one invoice line. `sources` in the report says

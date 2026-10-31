@@ -356,9 +356,47 @@ until its cap is spent, which is why the cap — not the network — is the brak
 | Which measurement may price a cap | Only provider-reported counts. A `byte_upper_bound` is a bound on bytes; `unreported` and `not_measured` are absences. Each refuses with `ValueError` | `measured_reflection_tokens` |
 | Reset | By the vendor's update call, on adepthood's calendar month | Not built. #1900 merged carrying `expires_at` in the bundle, not the vendor calls that reset or extend it |
 | Expiry | Extended **in place** every 15 days for 30, so one missed cycle is survivable | `PoolCredential.expires_at` holds the date; nothing extends it yet (see Reset) |
-| Re-issue | Create-then-delete, only on compromise | Not built (see Reset) |
-| Revoke | At deletion, confirmed **before** the content-free receipt is issued; the issuer raises rather than returns on an unconfirmed revocation | `PoolBundleIssuer.revoke` |
-| Reconcile | A surviving credential is an orphan in the fleet report (`pool_credential_orphan`) | `AlertKind` |
+| Re-issue | Create-then-delete, only on compromise. A roll *is* this re-issue: every roll revokes the credential it replaced, because `issue` always mints; an issuer that hands the old credential back is refused before anything is written ([#1917](https://github.com/Geoffe-Ga/Creek-Vault/issues/1917)) | `roll_pool_bundle`; the vendor calls themselves are not built (see Reset) |
+| Superseded key | Recorded as a **pending revocation** in the same atomic write that stores the new bundle, cleared only once the vendor confirms it dead, so a vendor outage or a crash mid-roll leaves it owed rather than stranded ([#1918](https://github.com/Geoffe-Ga/Creek-Vault/issues/1918)) | `roll_pool_bundle`, `retry_pending_revocations` |
+| Revoke | At deletion, confirmed **before** the content-free receipt is issued; the issuer raises rather than returns on an unconfirmed revocation. Deletion revokes every pending revocation first, under the same rule, and the issuer's revoke must be idempotent | `PoolBundleIssuer.revoke` |
+| Reconcile | A surviving credential is an orphan in the fleet report (`pool_credential_orphan`). A pending revocation is reported as `pending_revocation` from the first pass and raises `pool_credential_orphan` once it is `stuck_deletion_seconds` old; more live vendor credentials under one allocation than one plus its pending revocations is a `duplicate_resource` | `AlertKind`, `FleetReconciler` |
+
+### A roll whose revocation did not confirm
+
+A roll writes the new bundle and the old credential's pending revocation in one
+atomic write, then asks the vendor to delete the old key. When that delete is
+unconfirmed — a vendor 5xx, a timeout, or the process dying — the roll raises,
+the new bundle stays stored, and the old key stays **owed**: its value is kept
+inside the encrypted record, never in a log, an alert or the report, which carry
+only the activation's allocation id, the obligation's age and a count. Nothing
+is made non-fatal and nothing is forgotten.
+
+Recovery is a retry, from the process that holds the pool issuer (the
+provisioning worker; the fleet report holds no revocation authority and calls
+no delete):
+
+1. `retry_pending_revocations(<activation>)` revokes every owed key and clears
+   each one as the vendor confirms it. A second outage raises again and leaves
+   the key owed.
+2. The next roll of that activation retries first and **refuses to mint** while
+   any revocation is still owed, so at most one superseded key is ever live.
+3. Deleting the allocation revokes every owed key before the current one, and
+   writes no tombstone while any is unconfirmed.
+
+When the fleet report lists a `pending_revocation` divergence, the old key is
+still spendable up to its cap. Under the `stuck_deletion_seconds` bound it is
+the normal window a retry closes; past it the report raises
+`pool_credential_orphan` for that allocation, and the response is the retry
+above once the vendor's admin API answers. If the vendor refuses the retry
+indefinitely, revoke the key by hand in the vendor's portal (only the vendor's
+own reference for it belongs in any note), then run the retry, which then
+confirms against a key that is already dead.
+
+*Not wired yet.* No production pool issuer exists (#1896), so nothing calls a
+roll today, and the operator fleet CLI is not yet given a pending-revocation
+source: wiring one is #1896's, together with the vendor's key listing. That
+alert is also **not deliverable** through adepthood's receiver until its closed
+kind list admits `pool_credential_orphan` (see Alerting above).
 
 An exhausted cap answers `insufficient_quota` (429, non-transient). The
 contract maps it to `temporarily_unavailable` so the vault refuses rather than
