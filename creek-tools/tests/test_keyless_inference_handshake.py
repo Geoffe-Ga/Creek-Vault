@@ -192,9 +192,10 @@ def test_the_field_arrived_at_its_own_minor() -> None:
     went red the first time an unrelated minor shipped (#1903 step 6, which
     moved the current minor to 0.21 without touching this field or this
     handshake). The claim it was making is not lost — the current minor is
-    pinned, once, by ``test_the_previous_minor_is_still_served`` in
-    ``tests/test_adepthood_contract_models.py``, which is the test whose job
-    that is and which already has to be edited at every bump.
+    pinned to the ADR by ``test_adr_publishes_the_runtime_contract_version``,
+    and the window around it is derived from it by
+    ``test_the_immediately_previous_minor_is_always_served`` (R2-5) in
+    ``tests/test_adepthood_contract_models.py``.
 
     ``"0.20" in SUPPORTED_CONTRACT_MINORS`` replaces it and is the assertion
     actually worth having here: it says the minor this field shipped at is
