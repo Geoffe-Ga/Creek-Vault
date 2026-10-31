@@ -163,8 +163,8 @@ Merge only when **every** condition is true. If any fails, stop and explain whic
   - `mcp__github__pull_request_read` with `method: "get_status"` (combined commit status), and
   - `mcp__github__pull_request_read` with `method: "get_check_runs"` (per-job detail).
 - No unresolved line-level review threads (`mcp__github__pull_request_read` with `method: "get_review_comments"` — each thread has `isResolved`). For a `COMMENTS` verdict, threads are resolved by linking the follow-up issue or by the moratorium-deferral reply (Step 1A.2/1A.6), not by code change.
-- The PR is `mergeable` and not `draft` (from the `get` response).
-- For a `COMMENTS` verdict: the PR carries no `do-not-auto-merge` label, and the compare API reports `behind_by == 0` against its base. If it is behind, sync it and wait for the fresh review on the new HEAD instead of merging.
+- The PR has no merge conflict and is not `draft` (from the `get` response): `mergeable` is `true` and `mergeable_state` is not `dirty`. Being **behind** the base (`mergeable_state: behind`) is **not** a blocker — do not sync just to catch up. A conflicted PR must merge the base in and resolve before merging. `mergeable: null` means GitHub has not finished computing it: re-fetch, and never read null as clear.
+- For a `COMMENTS` verdict: the PR carries no `do-not-auto-merge` label.
 
 Then squash-merge:
 
