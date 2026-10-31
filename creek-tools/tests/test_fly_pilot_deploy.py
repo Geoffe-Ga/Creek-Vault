@@ -562,13 +562,13 @@ def test_deploy_refuses_disabled_cross_network_replay_before_any_command(
 
 @pytest.mark.parametrize(
     "expiry",
-    ["2026-09-27T11:59:59+00:00", "2026-10-04T12:00:01+00:00"],
+    ["2026-09-27T11:59:59+00:00", "2026-12-26T12:00:01+00:00"],
 )
 def test_deploy_refuses_inactive_or_overlong_runtime_token_before_provider(
     tmp_path: Path,
     expiry: str,
 ) -> None:
-    """A deploy cannot begin outside the reviewed org-token lifetime."""
+    """A deploy cannot begin outside the 90-day org-token lifetime (R2-2)."""
     authorization, digest = _authorization(tmp_path)
     token_file = _token_file(tmp_path)
     commands: list[list[str]] = []

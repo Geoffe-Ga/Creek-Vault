@@ -58,7 +58,9 @@ _INVENTORY_ERROR: Final[str] = (
 )
 _APP_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[a-z0-9-]+")
 _MONTH_RE: Final[re.Pattern[str]] = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
-_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=7)
+# Owner decision R2-2: org tokens live at most 90 days; the scheduled report
+# warns 72 hours before the recorded expiry (#1867, #1868).
+_MAX_FLY_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=90)
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +148,7 @@ def compose_fly(
     if expires_at <= observed_at:
         parser.error("--fly-token-expires-at must be in the future")
     if expires_at > observed_at + _MAX_FLY_TOKEN_LIFETIME:
-        parser.error("--fly-token-expires-at must be no more than seven days away")
+        parser.error("--fly-token-expires-at must be no more than 90 days away")
     try:
         credential = FlyCredential.from_file(
             args.fly_token_file,

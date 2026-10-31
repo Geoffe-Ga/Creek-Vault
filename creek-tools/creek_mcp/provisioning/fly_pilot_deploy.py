@@ -40,6 +40,9 @@ _AUTH_KEYS: Final[frozenset[str]] = frozenset(
 )
 _HASH_PREFIX: Final[str] = "sha256:"
 _MAX_AUTHORIZATION_WINDOW: Final[timedelta] = timedelta(days=7)
+# Owner decision R2-2: the org token itself may live 90 days; the owner's
+# cost authorization stays a seven-day window bounded by the token's expiry.
+_MAX_TOKEN_LIFETIME: Final[timedelta] = timedelta(days=90)
 # Owner decision R2-3: alert at USD 60/month; the authorization must match.
 _PILOT_SPEND_CAP_USD_CENTS: Final[int] = 6000
 _MAX_TOKEN_FILE_BYTES: Final[int] = 4096
@@ -130,7 +133,7 @@ def load_authorization(
         or approved_until <= observed_at
         or approved_until > observed_at + _MAX_AUTHORIZATION_WINDOW
         or token_expires_at <= observed_at
-        or token_expires_at > observed_at + _MAX_AUTHORIZATION_WINDOW
+        or token_expires_at > observed_at + _MAX_TOKEN_LIFETIME
         or approved_until > token_expires_at
     ):
         raise ValueError("Fly pilot authorization is not active for these coordinates")

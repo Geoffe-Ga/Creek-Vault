@@ -700,14 +700,14 @@ def test_fly_composition_uses_a_refusing_secret_manager_and_fails_closed_on_prov
     "expires_at",
     [
         "2026-09-11T07:00:00+00:00",
-        "2026-09-18T07:00:01+00:00",
+        "2026-12-10T07:00:01+00:00",
     ],
 )
 def test_fly_composition_refuses_expired_or_long_lived_org_tokens(
     tmp_path: Path,
     expires_at: str,
 ) -> None:
-    """Every provider process enforces the pilot's seven-day token ceiling."""
+    """Every provider process enforces the pilot's 90-day token ceiling (R2-2)."""
     parser = build_parser()
     arguments = _fly_args(tmp_path)
     arguments[-1] = expires_at
