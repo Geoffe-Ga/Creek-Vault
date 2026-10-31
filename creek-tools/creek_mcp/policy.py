@@ -431,6 +431,67 @@ def admitted_tool(identity: CallerIdentity, tool_name: str) -> Admission | Refus
     return Refusal(reason=TOOL_NOT_GRANTED_REASON)
 
 
+REMOTE_UNSERVED_TOOLS: Final[frozenset[str]] = frozenset({"creek.ingest"})
+"""Profile tools a gated remote agent is granted but never served (#2006).
+
+Owner decision R3-5 keeps ``vault:journal`` and ``vault:pipeline`` advertised
+and makes them grantable. Every tool in both profiles serves a remote agent
+except ``creek.ingest``: it reads a caller-named *vault* path, so over the
+network its ``input path not found`` answer is an existence oracle over every
+slugified fragment filename, and a successful run re-ingests content the
+agent's ceiling never admitted. A remote agent has no other way to place a
+source in the vault than ``creek.upload``, which already ingests what it
+stages, so withholding ``creek.ingest`` costs the agent nothing it could use.
+
+The tool stays in ``vault:pipeline`` — moving it would change the grant
+partition, which is the owner's call — so it is still *listed* to a granted
+agent, and refused at dispatch by :func:`served_remotely`.
+:data:`creek_mcp.read_gate.TOOL_POSTURES`' ``served_remotely`` column mirrors
+this set, and ``tests/test_mcp_oauth_grant_profiles.py`` pins both.
+"""
+
+TOOL_NOT_SERVED_REMOTELY_REASON: Final[str] = (
+    "this tool is not served to a remote agent"
+)
+"""The single reason a granted remote agent is refused a withheld tool (#2006).
+
+A constant naming no path, no tier and no grant, on the #1090 rule; distinct
+from :data:`TOOL_NOT_GRANTED_REASON` so the agent (and the person reading its
+activity) can tell "you were not granted this" from "this is never served
+over the network, whatever you hold".
+"""
+
+
+def served_remotely(identity: CallerIdentity, tool_name: str) -> Admission | Refusal:
+    """Decide whether a tool *identity* was granted is served to it (#2006).
+
+    Asked after :func:`admitted_tool` admits the call and before the ceiling
+    question. Deliberately not part of :func:`admitted_tool`, which also
+    decides ``tools/list``: a withheld tool stays visible in the profile the
+    person consented to, and its refusal says why.
+
+    A local identity and an :data:`UNGATED` static consumer are never
+    withheld anything — the operator's own stdio and the pre-grant service
+    bearer keep the reach they had. Only a gated remote identity, an OAuth
+    agent or a scoped static consumer, is refused a tool in
+    :data:`REMOTE_UNSERVED_TOOLS`.
+
+    Args:
+        identity: Who is calling, from which side of the network, holding what.
+        tool_name: The tool the caller asked for, as it spelled it.
+
+    Returns:
+        ``Admission(ceiling=None)`` when the tool is served to this caller,
+        else a :class:`Refusal` carrying
+        :data:`TOOL_NOT_SERVED_REMOTELY_REASON`.
+    """
+    if not identity.is_remote or isinstance(identity.grants, Ungated):
+        return Admission(ceiling=None)
+    if tool_name in REMOTE_UNSERVED_TOOLS:
+        return Refusal(reason=TOOL_NOT_SERVED_REMOTELY_REASON)
+    return Admission(ceiling=None)
+
+
 def _parse_ceiling(requested: object) -> TierCeiling | None:
     """Return *requested* as a :class:`TierCeiling`, or ``None`` if it is not one.
 
