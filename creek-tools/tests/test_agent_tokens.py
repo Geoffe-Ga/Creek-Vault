@@ -993,6 +993,12 @@ def test_a_new_outage_after_a_recovery_is_logged_again(
 # --------------------------------------------------------------------------- #
 
 
+_ALLOCATION_RESOURCE: Final[str] = (
+    "https://v-7q2k.creek.example/a/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/mcp"
+)
+"""A per-allocation resource on the same issuer (#2003)."""
+
+
 def _revocable(
     status: FakeTokenStatus | None = None, clock: FakeClock | None = None
 ) -> tuple[JwtAgentTokenVerifier, FakeTokenStatus]:
@@ -1028,6 +1034,21 @@ def test_a_revoked_grant_is_refused_on_the_very_next_call() -> None:
     status.revoke()
 
     assert asyncio.run(verifier.verify_token(mint())) is None
+
+
+def test_a_per_allocation_scope_keeps_the_revocation_check() -> None:
+    """A verifier scoped to ``/a/<slug>/mcp`` (#2003) still asks per call.
+
+    Without this the shared edge would admit a revoked agent on every
+    per-allocation path while refusing it on ``/mcp``.
+    """
+    verifier, status = _revocable()
+    scoped = verifier.for_resource(_ALLOCATION_RESOURCE)
+    status.revoke()
+
+    assert scoped.revocation_enforced
+    assert asyncio.run(scoped.verify_token(mint(aud=_ALLOCATION_RESOURCE))) is None
+    assert status.queries
 
 
 def test_a_revocation_lands_once_the_cached_answer_ages_out() -> None:

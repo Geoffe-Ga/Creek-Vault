@@ -636,8 +636,9 @@ class JwtAgentTokenVerifier(TokenVerifier):
 
         The shared edge verifies a token on ``/a/<slug>/mcp`` against that
         allocation's own resource. The scope keeps this verifier's issuer,
-        key-set URL, key cache and subject pin, so one JWKS fetch serves every
-        allocation and only the required audience differs.
+        key-set URL, key cache, subject pin and revocation check (#2005), so
+        one JWKS fetch serves every allocation, a revoked agent is refused on
+        every path, and only the required audience differs.
 
         Args:
             resource_url: The resource whose exact URL every accepted token
@@ -653,6 +654,7 @@ class JwtAgentTokenVerifier(TokenVerifier):
             self._config.with_resource(resource_url),
             keys=self._keys,
             expected_subject=self._expected_subject,
+            revocation=self._revocation,
         )
 
     @property
