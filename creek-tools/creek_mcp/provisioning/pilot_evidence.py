@@ -121,13 +121,13 @@ class SourceFacts(BaseModel):
 
 
 class AuthorizationFacts(BaseModel):
-    """Explicit pilot limits, with no organization or owner identity."""
+    """Explicit pilot limits (R2-3: 15 vaults, USD 60), with no owner identity."""
 
     model_config = _CLOSED
     dedicated_organization: Literal[True]
-    max_live_allocations: Annotated[int, Field(ge=1, le=5)]
+    max_live_allocations: Annotated[int, Field(ge=1, le=15)]
     currency: Literal["USD"]
-    monthly_alert_usd_cents: Literal[2500]
+    monthly_alert_usd_cents: Literal[6000]
     region_recorded: Literal[True]
     cleanup_owner_recorded: Literal[True]
 

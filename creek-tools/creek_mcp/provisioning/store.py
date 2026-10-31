@@ -48,6 +48,27 @@ _SCHEMA_VERSION: Final[int] = 5
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
 MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
+# States that hold, or are about to hold, a provider allocation (R2-3).
+LIVE_JOB_STATES: Final[tuple[JobState, ...]] = (
+    JobState.PENDING,
+    JobState.PROVISIONING,
+    JobState.AWAITING_KEY_CEREMONY,
+    JobState.READY,
+)
+# A failed create also holds its slot: a post-provision handoff failure leaves
+# a running Machine reconcile does not flag, and ``retry`` re-enters ``pending``
+# without an admission check. This is reconcile's ``_is_live`` predicate.
+# The SQL text is a literal; every state is bound from the constants below, one
+# placeholder per value (a test pins that the two stay in step).
+_ADMISSION_COUNT_SQL: Final[str] = (
+    "SELECT COUNT(*) FROM provisioning_jobs "
+    "WHERE state IN (?, ?, ?, ?) OR (state = ? AND operation = ?)"
+)
+_ADMISSION_COUNT_PARAMETERS: Final[tuple[str, ...]] = (
+    *(state.value for state in LIVE_JOB_STATES),
+    JobState.FAILED.value,
+    JobOperation.CREATE.value,
+)
 
 _REQUESTER_MIGRATIONS: Final[dict[str, tuple[str, str]]] = {
     "provisioning_jobs": (
@@ -426,7 +447,7 @@ class ProvisioningStore:
         if not admission.new_activations_enabled:
             raise ActivationAdmissionError("new activation unavailable")
         row = connection.execute(
-            "SELECT COUNT(*) FROM provisioning_jobs WHERE state != 'deleted'"
+            _ADMISSION_COUNT_SQL, _ADMISSION_COUNT_PARAMETERS
         ).fetchone()
         assert row is not None
         if int(row[0]) >= admission.maximum_live_allocations:

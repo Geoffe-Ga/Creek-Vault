@@ -40,7 +40,8 @@ _AUTH_KEYS: Final[frozenset[str]] = frozenset(
 )
 _HASH_PREFIX: Final[str] = "sha256:"
 _MAX_AUTHORIZATION_WINDOW: Final[timedelta] = timedelta(days=7)
-_PILOT_SPEND_CAP_USD_CENTS: Final[int] = 2500
+# Owner decision R2-3: alert at USD 60/month; the authorization must match.
+_PILOT_SPEND_CAP_USD_CENTS: Final[int] = 6000
 _MAX_TOKEN_FILE_BYTES: Final[int] = 4096
 _FLY_TOKEN_PREFIX: Final[str] = "FlyV1 "
 _FLY_TOKEN_PAYLOAD_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_+/,=-]+")

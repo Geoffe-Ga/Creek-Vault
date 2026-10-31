@@ -318,10 +318,14 @@ def test_pilot_runbook_covers_every_cost_and_recovery_acceptance_boundary() -> N
         "never a personal token",
         "seven days",
         "immutable digest",
-        "maximum-live-allocations 5",
+        "maximum-live-allocations 15",
+        "r2-3",
+        "fifteen live allocations",
         "disable-new-activations",
         "no provider request",
-        "usd 25",
+        "usd 60.00",
+        "monthly_budget = 60.00",
+        "max_spend_usd_cents = 6000",
         "tls",
         "owner-only mounted files",
         "atomic snapshot",
@@ -348,6 +352,15 @@ def test_pilot_runbook_covers_every_cost_and_recovery_acceptance_boundary() -> N
         "independent lgtm",
     ):
         assert phrase in text
+    for stale in (
+        "usd 25",
+        "25.00",
+        "maximum-live-allocations 5`",
+        "five live allocations",
+        "cap of five",
+        "cap at five",
+    ):
+        assert stale not in text, stale
     assert "managed-vault-fly-pilot.md" in index
 
 

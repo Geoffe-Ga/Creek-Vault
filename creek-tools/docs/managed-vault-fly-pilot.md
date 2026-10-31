@@ -7,11 +7,21 @@ authorization to spend money. Stop before the first provider mutation until
 the owner records explicit cost authorization, the exact organization, region,
 public domains, alert destination, cleanup window, and maximum permitted spend.
 
-The pilot is intentionally bounded to five live allocations and a USD 25
-monthly alert. Fly does not supply a hard billing limit or native billing alert,
+The pilot is intentionally bounded to fifteen live allocations and a USD 60.00
+monthly alert (owner release decision R2-3: cap 15 vaults, alert at USD
+60/month). Fly does not supply a hard billing limit or native billing alert,
 so the Creek admission fence is the resource cap and the scheduled fleet report
 plus the operator's monitoring destination is the alert. A free allowance is
 not a cap.
+
+A job uses an admission slot while it holds, or is acquiring, a provider
+allocation: `pending`, `provisioning`, `awaiting_key_ceremony`, `ready`, and a
+`failed` create. A failed create keeps its slot because a post-provision
+handoff failure leaves its app, Machine, and volume running, and `retry`
+returns it to `pending` without a second admission check. A job that is
+releasing its vault (`deleting`, a `failed` delete, or `deleted`) frees its
+slot. Spend from a deletion the provider has not yet confirmed is guarded by
+the USD 60.00 alert and the `stuck_deletion` report, not by the cap.
 
 ## 1. Freeze and authorize the coordinates
 
@@ -166,7 +176,8 @@ separate Fly secret-backed files and are not part of that snapshot.
   `creek-managed-vault-pilot --roll-mcp-oauth <requester> <consumer>` while
   its Machine is stopped
   ([provisioning-control-plane.md](provisioning-control-plane.md#mcp-oauth-settings-per-activation-1974)).
-- Preserve the hard live-allocation cap of five and Fly replay's inclusive
+- Preserve the hard live-allocation cap (release value fifteen; the pilot
+  parser refuses zero, negative, and above-release values) and Fly replay's inclusive
   1 MiB body ceiling. The pilot journal lifecycle is supported; larger
   `/v1/uploads` requests are unavailable during the pilot and receive Creek's
   existing published `422` before any replay header is emitted.
@@ -202,7 +213,8 @@ must first create
 the named app and volume and set each declared base64 secret out of band. The
 live `deploy` mode requires the SHA-256 of a private, short-lived authorization
 record bound to the exact app, organization slug and private provider
-organization ID, region, the exact USD 25.00 pilot spend cap, and
+organization ID, region, the exact USD 60.00 pilot spend cap
+(`max_spend_usd_cents = 6000`), and
 `cross_network_replays_enabled=true`. Pass the approved mode-0400 or mode-0600
 org-token file with `--token-file`; the helper requires the effective operator
 to own the regular file, admits Fly's exact `FlyV1 ` prefix separator and
@@ -223,8 +235,8 @@ app's membership with read-only flyctl calls. It also inventories Machines and v
 empty pair or one already exact, admissible Machine/volume pair may proceed.
 Duplicate, partial, drifted, or uninspectable state is refused before mutation.
 It then runs
-`fly deploy --ha=false`; the supervised command is pinned to
-`--maximum-live-allocations 5` and
+`fly deploy --ha=false`; the supervised command runs with the release default
+`--maximum-live-allocations 15` and
 fails unless provider output reports exactly one started Machine and one
 encrypted attached volume in the approved region, with the exact control image
 digest, guest shape, restart policy, `/data` mount, and public service. It
@@ -254,7 +266,7 @@ export, retry, and deletion for existing allocations remain available.
 ## 4. Configure reporting and alert delivery
 
 The pilot policy file uses `currency = "USD"` and
-`monthly_budget = 25.00`. Fill every current Fly rate from the dated pricing
+`monthly_budget = 60.00` (R2-3). Fill every current Fly rate from the dated pricing
 source or the actual invoice; do not copy stale example rates. Missing snapshot,
 egress, or root-filesystem inputs remain unknown and unpriced in the report and
 are never entered as zero merely to obtain a clean estimate.
@@ -280,7 +292,7 @@ retried within the fixed three-attempt, five-second-per-attempt budget, and any
 remaining failure makes the supervised schedule unhealthy.
 Exercise alert delivery before admitting a user: temporarily set a test budget
 below the observed non-zero estimate, confirm `monthly_budget_departure` exits
-3 and reaches the recipient, then restore USD 25 and confirm the next scheduled
+3 and reaches the recipient, then restore USD 60.00 and confirm the next scheduled
 report. The transcript records the alert kind, delivery timestamp, and
 acknowledgement only—not provider IDs, tokens, URLs, or response bodies. Run the
 standalone report only in the approved private evidence environment when its
@@ -307,7 +319,7 @@ production dependency.
 Never revoke a token to create a fault, alter an organization-wide provider
 policy, delete a provider resource, replace a credential, or weaken TLS. Before
 each drill capture provider-authoritative allocation-scoped cardinality. Keep
-the admission cap at five but admit no other activation during the drill. If
+the configured admission cap but admit no other activation during the drill. If
 the scoped control affects another allocation, changes resource cardinality,
 survives its approved window, or cannot be removed immediately, abort the drill,
 disable new admissions, remove the fault, and run a clean inventory report.

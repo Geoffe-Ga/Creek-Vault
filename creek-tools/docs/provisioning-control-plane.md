@@ -33,9 +33,15 @@ with its filesystem's atomic snapshot mechanism; it contains job and provider
 allocation identifiers, but no plaintext provider token, consumer credential,
 recovery material, key material, or corpus content.
 
-The production CLI defaults to a five-live-allocation admission cap. The count
-includes every non-deleted durable job, so pending or deleting work reserves
-capacity before a provider call. The count and new job/alias insert share one
+The production CLI defaults to a five-live-allocation admission cap; the Fly
+pilot defaults to the release cap of fifteen (owner decision R2-3) and refuses
+any larger value. The count includes every job that holds or is acquiring a
+provider allocation (`pending`, `provisioning`, `awaiting_key_ceremony`,
+`ready`, and a `failed` create, which may still own a running Machine and can
+return to `pending` through `retry`), so queued work reserves capacity before a
+provider call. A `deleting`, failed-delete, or `deleted` job frees its slot;
+unconfirmed deletion spend is guarded by the budget alert and the
+`stuck_deletion` report. The count and new job/alias insert share one
 SQLite write transaction; concurrent API processes cannot cross the cap. Start
 the API with `--disable-new-activations` to refuse every new activation id with
 `503 activation_unavailable`. An exact existing id remains replayable, and

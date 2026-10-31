@@ -36,7 +36,7 @@ from creek_mcp.provisioning.models import (
     ResourceClass,
     ResourceState,
 )
-from creek_mcp.provisioning.store import InvalidJobTransitionError
+from creek_mcp.provisioning.store import LIVE_JOB_STATES, InvalidJobTransitionError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -58,14 +58,7 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 _BYTES_PER_GB: Final[int] = 1024**3
-_LIVE_STATES: Final[frozenset[JobState]] = frozenset(
-    {
-        JobState.PENDING,
-        JobState.PROVISIONING,
-        JobState.AWAITING_KEY_CEREMONY,
-        JobState.READY,
-    }
-)
+_LIVE_STATES: Final[frozenset[JobState]] = frozenset(LIVE_JOB_STATES)
 _INSPECTED_STATES: Final[frozenset[JobState]] = frozenset(
     {JobState.AWAITING_KEY_CEREMONY, JobState.READY}
 )

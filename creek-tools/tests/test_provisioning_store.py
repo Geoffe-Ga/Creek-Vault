@@ -9,6 +9,7 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -27,14 +28,22 @@ from creek_mcp.provisioning.models import (
     ResourceClass,
 )
 from creek_mcp.provisioning.store import (
+    _ADMISSION_COUNT_PARAMETERS,
+    _ADMISSION_COUNT_SQL,
     _OWNERSHIP_INDEXES,
     _SCHEMA,
+    LIVE_JOB_STATES,
     MAX_ACTIVATION_ALIASES_PER_CONSUMER,
+    ActivationAdmissionError,
+    ActivationAdmissionPolicy,
     ActivationConflictError,
     InvalidJobTransitionError,
     LostJobLeaseError,
     ProvisioningStore,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
 _OUTCOME = DeletionOutcome(
@@ -1024,3 +1033,179 @@ def test_months_over_budget_requires_calendar_consecutive_months_to_the_latest(
     store.record_budget_month("2026-02", over, budget, "USD", now=_NOW)
     assert store.months_over_budget(4) == (True, True, True, True)
     assert store.months_over_budget(5) == (True, True, True, True, True)
+
+
+_ADMISSION_CAP_TWO = ActivationAdmissionPolicy(maximum_live_allocations=2)
+
+
+def _occupant_pending(store: ProvisioningStore, name: str) -> None:
+    """Leave one create queued for a worker."""
+    store.submit(name, name, requester_identity="adepthood", now=_NOW)
+
+
+def _occupant_provisioning(store: ProvisioningStore, name: str) -> None:
+    """Leave one create claimed by a worker that has not settled it."""
+    _occupant_pending(store, name)
+    assert store.claim_next(now=_NOW) is not None
+
+
+def _occupant_awaiting_key_ceremony(store: ProvisioningStore, name: str) -> None:
+    """Leave one wrapped-artifact create waiting for its key ceremony."""
+    _ready_job(store, name, f"alloc-{name}")
+
+
+def _occupant_ready(store: ProvisioningStore, name: str) -> None:
+    """Leave one provider-managed vault serving."""
+    job = store.submit(name, name, requester_identity="adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.complete_create(
+        job.job_id,
+        claim.lease_token,
+        f"alloc-{name}",
+        handoff=lambda: None,
+        custody_mode=CustodyMode.PROVIDER_MANAGED,
+        now=_NOW,
+    )
+
+
+def _occupant_failed_create(store: ProvisioningStore, name: str) -> None:
+    """Leave one create that failed after its worker claimed it."""
+    job = store.submit(name, name, requester_identity="adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        FailureReason.HANDOFF_FAILED,
+        retryable=True,
+        now=_NOW,
+    )
+
+
+def _occupant_deleting(store: ProvisioningStore, name: str) -> None:
+    """Leave one vault whose deletion is queued but unconfirmed."""
+    job_id = _ready_job(store, name, f"alloc-{name}")
+    store.request_delete(job_id, "adepthood", now=_NOW)
+
+
+def _occupant_failed_delete(store: ProvisioningStore, name: str) -> None:
+    """Leave one vault whose deletion attempt failed."""
+    job_id = _ready_job(store, name, f"alloc-{name}")
+    store.request_delete(job_id, "adepthood", now=_NOW)
+    _fail_delete(store, job_id, retryable=True)
+
+
+def _occupant_deleted(store: ProvisioningStore, name: str) -> None:
+    """Leave one vault whose deletion the provider confirmed."""
+    job_id = _ready_job(store, name, f"alloc-{name}")
+    store.request_delete(job_id, "adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.complete_delete(job_id, claim.lease_token, _OUTCOME, now=_NOW)
+
+
+def _fill_cap_with(
+    store: ProvisioningStore,
+    occupant: Callable[[ProvisioningStore, str], None],
+    expected: tuple[JobState, JobOperation],
+) -> None:
+    """Hold one slot with a ready vault and one with *occupant*'s job."""
+    _occupant_ready(store, "occupant-ready")
+    occupant(store, "occupant-probe")
+    probe = next(
+        job.job
+        for job in store.list_fleet_jobs()
+        if job.job.activation_id == "occupant-probe"
+    )
+    assert (probe.state, probe.operation) == expected
+
+
+@pytest.mark.parametrize(
+    ("occupant", "expected"),
+    [
+        (_occupant_deleting, (JobState.DELETING, JobOperation.DELETE)),
+        (_occupant_failed_delete, (JobState.FAILED, JobOperation.DELETE)),
+        (_occupant_deleted, (JobState.DELETED, JobOperation.DELETE)),
+    ],
+    ids=["deleting", "failed-delete", "deleted"],
+)
+def test_jobs_releasing_their_vault_leave_an_admission_slot_free(
+    store: ProvisioningStore,
+    occupant: Callable[[ProvisioningStore, str], None],
+    expected: tuple[JobState, JobOperation],
+) -> None:
+    """A deletion in flight, failed, or confirmed no longer uses a slot (R2-3)."""
+    _fill_cap_with(store, occupant, expected)
+
+    admitted = store.submit(
+        "activation-after-release",
+        "user-after-release",
+        requester_identity="adepthood",
+        admission=_ADMISSION_CAP_TWO,
+        now=_NOW,
+    )
+
+    assert admitted.state is JobState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("occupant", "expected"),
+    [
+        (_occupant_pending, (JobState.PENDING, JobOperation.CREATE)),
+        (_occupant_provisioning, (JobState.PROVISIONING, JobOperation.CREATE)),
+        (
+            _occupant_awaiting_key_ceremony,
+            (JobState.AWAITING_KEY_CEREMONY, JobOperation.CREATE),
+        ),
+        (_occupant_ready, (JobState.READY, JobOperation.CREATE)),
+        (_occupant_failed_create, (JobState.FAILED, JobOperation.CREATE)),
+    ],
+    ids=["pending", "provisioning", "awaiting-key-ceremony", "ready", "failed-create"],
+)
+def test_jobs_holding_or_acquiring_a_vault_use_an_admission_slot(
+    store: ProvisioningStore,
+    occupant: Callable[[ProvisioningStore, str], None],
+    expected: tuple[JobState, JobOperation],
+) -> None:
+    """Live states, and a failed create that may still hold a Machine, count.
+
+    A post-provision handoff failure settles ``failed`` while its Machine keeps
+    running, and ``retry`` returns a failed create to ``pending`` without an
+    admission check, so freeing its slot would let the fleet exceed the cap.
+    """
+    _fill_cap_with(store, occupant, expected)
+    jobs_before = store.count_jobs()
+    aliases_before = store.count_activation_ids()
+
+    with pytest.raises(ActivationAdmissionError):
+        store.submit(
+            "activation-over-cap",
+            "user-over-cap",
+            requester_identity="adepthood",
+            admission=_ADMISSION_CAP_TWO,
+            now=_NOW,
+        )
+
+    assert store.count_jobs() == jobs_before
+    assert store.count_activation_ids() == aliases_before
+
+
+def test_live_job_states_name_every_state_that_holds_or_acquires_a_vault() -> None:
+    """The admission count's live set is spelled once and excludes teardown."""
+    assert LIVE_JOB_STATES == (
+        JobState.PENDING,
+        JobState.PROVISIONING,
+        JobState.AWAITING_KEY_CEREMONY,
+        JobState.READY,
+    )
+
+
+def test_admission_count_binds_every_live_state_and_the_failed_create() -> None:
+    """The literal SQL has exactly one placeholder per bound state value."""
+    assert _ADMISSION_COUNT_SQL.count("?") == len(_ADMISSION_COUNT_PARAMETERS)
+    assert (
+        *(state.value for state in LIVE_JOB_STATES),
+        JobState.FAILED.value,
+        JobOperation.CREATE.value,
+    ) == _ADMISSION_COUNT_PARAMETERS
