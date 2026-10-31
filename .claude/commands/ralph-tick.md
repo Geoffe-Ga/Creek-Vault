@@ -33,16 +33,19 @@ You are Ralph's brain for one wake of this project's local outer loop.
   and **no all-lanes Monitor** — you act on whichever lane a wake is about.
 - **Pessimistic, serialized merge.** Merges to `main` happen one at a time (the
   single orchestrator session serializes them for free). A lane merges only when
-  it is `LGTM` + CI-green + **up-to-date with `main`**. If `main` moved since a
-  lane went green, that lane **syncs** first (`fleet.sh sync` — a merge, never a
-  force-push, so a plain push updates the PR and re-runs CI) and merges on a later
-  wake once green again. A sync conflict drops that lane to Gate 1.
+  it is `LGTM` (or `COMMENTS` with findings filed) + CI-green + **free of merge
+  conflicts with `main`**. **Being behind `main` is not a blocker** (owner rule,
+  2026-10-31): if `main` moved since a lane went green but GitHub reports no
+  conflict, the lane merges as it is. If it **conflicts**, it merges `main` in and
+  resolves first (`fleet.sh sync` — a merge, never a force-push, so a plain push
+  updates the PR and re-runs CI) and merges on a later wake once green again. A
+  conflict the sync cannot resolve drops that lane to Gate 1.
 - **Immediate refill.** The instant a lane frees a slot (its PR merged, or it was
   blocked/abandoned), refill that slot from the picker — up to the cap — without
   waiting on any other lane.
 
-An imperfect independence guess therefore costs at most a sync; it can never
-merge broken or conflicting code, and it never makes a fast lane wait on a slow
+An imperfect independence guess therefore costs at most a conflict resolution;
+it can never merge conflicting code, and it never makes a fast lane wait on a slow
 one.
 
 ## The four gates (and the drop-back rule)
@@ -51,7 +54,7 @@ one.
 | 1 | **TDD** (Red→Green→Refactor, `stay-green`) | → Gate 2 | — |
 | 2 | **`cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`** | → push → Gate 3 | **drop to Gate 1** |
 | 3 | **CI** all green | → Gate 4 | **drop to Gate 1** (via `ci-debugging`) |
-| 4 | **Claude review `Verdict:`** | `LGTM` + green + up-to-date → **merge + mark issue done + refill**. `COMMENTS` + green + up-to-date (`ready-comments`) → **file `P0`–`P3` follow-up issues, then merge** — never iterate (Step 1) | `CHANGES_REQUESTED` → **drop to Gate 1** (via `address-feedback`) |
+| 4 | **Claude review `Verdict:`** | `LGTM` + green + no merge conflict → **merge + mark issue done + refill**. `COMMENTS` + green + no merge conflict (`ready-comments`) → **file `P0`–`P3` follow-up issues, then merge** — never iterate (Step 1) | `CHANGES_REQUESTED` → **drop to Gate 1** (via `address-feedback`) |
 
 "Drop to Gate 1" means: fix the root cause with a failing-test-first cycle, re-clear Gate 2 locally, push, and climb again. Never weaken a gate to pass it.
 
@@ -138,20 +141,15 @@ Route on `$MAIN_HEALTH`:
   2. **Dispatch ONE `ci-debugging` worker** against the attributed commit —
      one, not one per red lane — and report the failing check plus the blame
      range `main-health.sh` printed.
-  3. **Merging is NOT blanket-forbidden.** The rule is **"merge only lanes
-     carrying the proof"**, and `pr-ready.sh` already enforces it mechanically:
-     a lane that is behind reads `main-not-green` and holds, while a lane with
-     `behind_by == 0` and green CI has proof, for the commit-content class of
-     breakage — its CI ran on `refs/pull/N/merge`, a tree containing whatever
-     broke `main`, under the identical job matrix — and merges normally. That
-     proof says nothing about breakage that is not a function of the tree (a
-     freshly published dependency advisory, an expired pin, a yanked package
-     — see `pr-ready.sh`'s "WHY IT IS A PRECONDITION, NOT A GATE (#1159)"
-     block for the observed instance); that residual is a knowingly accepted
-     gap, not a hole in the argument. A `behind_by == 0` + green lane is
-     exactly the shape of the PR that FIXES `main`, so **do not refuse to
-     merge a lane the helper calls `ready`.** Blocking the remedy is how this
-     gate would deadlock the loop.
+  3. **Merging is NOT blanket-forbidden.** A reviewed lane (`ready` /
+     `ready-comments`) merges on green CI + no merge conflict whatever
+     `main`'s colour (owner rule, 2026-10-31: being behind is not a blocker),
+     so **do not refuse to merge a lane the helper calls `ready`** — that
+     includes the PR that FIXES `main`, and blocking the remedy is how this
+     gate would deadlock the loop. `main-not-green` now holds only a behind
+     `ready-unreviewed` bump, whose sole evidence is green CI against current
+     `main` (see `pr-ready.sh`'s "WHY IT IS A PRECONDITION, NOT A GATE
+     (#1159)" block).
   4. **Idempotence — key the dispatch off an OPEN GITHUB ISSUE, never a local
      file.** This tick wakes roughly every 180s while lanes are in CI, and
      `main` typically stays red for ~20 minutes, so an unguarded red path
@@ -167,22 +165,14 @@ Route on `$MAIN_HEALTH`:
      `main is red at <sha7>`, labels `P0 ci bug`, body carrying the failing
      check and the blame range — and assign it a lane. Otherwise adopt (or
      simply leave alone) the lane already working it.
-  5. **The convergence invariant: while `main` is red, exactly one *held* lane
-     is permitted to sync — the fix lane.** (This is scoped to lanes
-     `main-not-green` is holding; lanes the helper still calls `ready` keep
-     merging per point 3 above — the two are not in tension.) `main-not-green`
-     suppresses *routine freshness syncs*, but the fix lane's worker
-     deliberately runs `scripts/ralph/fleet.sh sync` on
-     its own lane each wake — the same "first action" rule adopted Dependabot
-     lanes already follow — because a fix must be built **on top of** the commit
-     it is fixing. Once that lane is current and green it reads plain `ready`,
-     merges, `main` goes green, and every held lane unfreezes on the next wake.
-     Without this the loop can wedge: a current+green lane merges while `main`
-     is red, which pushes the fix lane to `behind_by == 1`, which reads
-     `main-not-green`, which says do not sync.
-- **`pending` / `unknown` / `MH_RC` non-zero** — merges of *behind* lanes hold
-  mechanically (they read `main-not-green`); **everything else proceeds
-  normally**: workers keep building, PRs keep opening, Step 4 refills. The
+  5. **The fix lane builds on top of the break.** Its worker deliberately runs
+     `scripts/ralph/fleet.sh sync` on its own lane each wake — the same "first
+     action" rule adopted Dependabot lanes already follow — because a fix must
+     be built **on top of** the commit it is fixing. Once green it reads plain
+     `ready`, merges, and `main` goes green.
+- **`pending` / `unknown` / `MH_RC` non-zero** — merges of behind
+  `ready-unreviewed` bumps hold mechanically (they read `main-not-green`);
+  **everything else proceeds normally**: workers keep building, PRs keep opening, Step 4 refills. The
   asymmetry is deliberate. The **merge** decision fails closed because a bad
   merge stacks an unvalidated change on a possibly-broken tree and buries the
   culprit — near-unrecoverable. The **refill** decision proceeds because a bad
@@ -190,7 +180,7 @@ Route on `$MAIN_HEALTH`:
   near-moot anyway: if `gh` is unreadable here, `pick-next.sh` and
   `fleet.sh assign` are broken too, and Step 4 yields nothing.)
 
-### Step 1 — Merge every ready lane (serialized, up-to-date only)
+### Step 1 — Merge every ready lane (serialized, conflict-free only)
 
 Classify each in-flight PR with the authoritative readiness helper — never
 eyeball the CI rollup or grep `gh pr checks` (its output is TAB-delimited, so a
@@ -200,7 +190,7 @@ code** (`0`=green, `8`=pending, else=failed) and only honours an LGTM verdict
 posted **after** the PR's HEAD commit (stale-verdict guard):
 ```bash
 STATUS=$(scripts/ralph/pr-ready.sh "$PR_NUM") && RC=0 || RC=$?
-# ready | ready-comments | ready-unreviewed | behind | main-not-green | review-quota-exhausted |
+# ready | ready-comments | ready-unreviewed | behind | main-not-green |
 # pending | ci-failed | ci-unreadable | review-failed | changes-requested |
 # awaiting-review | optout
 ```
@@ -214,9 +204,9 @@ gh pr view "$PR_NUM" --comments --json state,mergeable,mergeStateStatus,statusCh
 ```
 Then act on `$STATUS`:
 
-- **`ready`** (`Verdict: LGTM` fresh + CI green + `mergeStateStatus` `CLEAN` +
-  the compare API reporting `behind_by == 0`). **Merge it now** — do not wait
-  for any other lane:
+- **`ready`** (`Verdict: LGTM` fresh + CI green + no merge conflict —
+  `mergeStateStatus` `CLEAN` or `BEHIND`; being behind `main` is not a blocker).
+  **Merge it now** — do not wait for any other lane:
   ```bash
   gh pr merge "$PR_NUM" --squash --delete-branch
   ISSUE_N=<issue this PR closed>
@@ -228,7 +218,7 @@ Then act on `$STATUS`:
   (Idempotent if `iteration-trigger.yml` or a prior wake already merged it — the
   PR shows MERGED; do the same close + `release` + state bump.)
 - **`ready-comments`** — a fresh, attested `Verdict: COMMENTS` plus every other
-  `ready` condition (CI green, `CLEAN`, current with `main`, no hold). The
+  `ready` condition (CI green, no merge conflict, no hold). The
   reviewer signed off with non-blocking findings. **Never iterate — dispatch no
   worker, push nothing, request no re-review.** Run `address-feedback` Step 1A
   yourself: file each actionable finding as a follow-up issue labelled `P0`–`P3`
@@ -236,8 +226,8 @@ Then act on `$STATUS`:
   loop-tooling rows, reply on and resolve every thread, and post the
   `Follow-ups filed: …` summary. Then re-run `pr-ready.sh`; still
   `ready-comments` → run the `ready` merge block above verbatim. (A `COMMENTS`
-  lane that is behind prints `behind` and syncs like any other; the fresh review
-  on the new HEAD decides.)
+  lane that is merely behind is still `ready-comments`; one that conflicts prints
+  `behind` and resolves first.)
 - **`ready-unreviewed`** — CI green with at least one non-review check that
   actually reported `SUCCESS` (not merely "skipping" — see below), plus
   `mergeStateStatus CLEAN` and `behind_by == 0`, but **no review gate can ever
@@ -274,76 +264,36 @@ Then act on `$STATUS`:
   it clears Gate 4 normally and reads plain `ready`. `ready-unreviewed` only
   ever covers a bump that was already current with `main` and already
   green — one nobody touched.
-- **`behind`** (`LGTM` + green but `mergeStateStatus` is `BEHIND`, **or** the
-  branch is behind `main` *for a reason that can invalidate its green*).
-  `CLEAN` means only "no merge conflict" — GitHub computes `BEHIND` solely when
-  the base branch enforces strict/up-to-date status checks, which this repo does
-  not, so `CLEAN` routinely reports on a PR that is dozens of commits stale
-  (measured live: PR #943 reported `MERGEABLE`/`UNSTABLE` while the compare API
-  said `behind_by: 22`; PR #863 said `44`). **Do not merge a branch whose green
-  says nothing about today's `main`.**
-
-  But **being behind is not by itself stale** (#1137). Requiring `behind_by == 0`
-  outright is quadratic in lane count — merging one lane pushes every *other*
-  lane behind, and each then pays a sync, a full CI round and a fresh review;
-  because that window is as long as the gap between merges, lanes went stale
-  again while re-proving themselves. Measured across that gate landing: CI runs
-  per PR 1.00 → 1.61 (max 5), p90 PR latency 15 → 104 min. `pr-ready.sh` now
-  prints `behind` only when the two changesets can actually interact: `main`
-  landed a cross-cutting change (lockfile, tool pin, workflow, check script,
-  root `conftest.py`), **or** this branch did, **or** the two touched a file in
-  common. Two fixes in unrelated modules no longer serialize. The sync below is
-  now itself conditional (#1160): a lane that also carries a fresh LGTM reads
-  `review-quota-exhausted` instead of `behind` when the reviewer is provably out
-  of quota, because the sync's own re-review couldn't happen — see that token
-  below. Same remedy when it does fire as plain `behind`:
+- **`behind`** — green, but not clearable without a sync. For a reviewed lane
+  that means a **merge conflict** with `main` (`DIRTY`/`CONFLICTING`), GitHub
+  still computing mergeability (`UNKNOWN` — never read as clear), or another
+  non-mergeable state. **A reviewed lane is never `behind` merely for being
+  behind** (owner rule, 2026-10-31). For a `ready-unreviewed` bump it also
+  means "not current for a reason": its review substitute is green CI against
+  current `main`, so `pr-ready.sh` still applies the #1137 rule to it — it reads
+  `behind` when `main` landed a cross-cutting change (lockfile, tool pin,
+  workflow, check script, root `conftest.py`), **or** the bump did, **or** the
+  two touched a file in common. Remedy either way:
   ```bash
   scripts/ralph/fleet.sh sync "$ISSUE_N" || echo "SYNC-CONFLICT $ISSUE_N"
   ```
   A clean sync → dispatch its `ralph-worker` to re-clear Gate 2 locally and push;
   it re-merges on a later wake once green. `SYNC-CONFLICT` → that lane drops to
   Gate 1 (worker resolves the conflict as a root-cause change, re-greens, pushes).
-- **`main-not-green`** (issue #1159) — this lane is behind `main`, so it is
-  about to use the #1157 relaxation (merge while behind, because the two
-  changesets provably cannot interact), and that relaxation's only
-  justification — the full CI run on `push: main` — is **not green**: it
-  failed, or nothing has concluded yet, or the answer was unreadable.
-  **Leave the lane, and specifically do NOT sync it.** A sync here would pull
-  the breakage into the lane, burn a ~14-minute CI round, and turn the lane's
-  own CI red — which the next wake would classify `ci-failed`, dispatching a
-  fix worker onto a failure this lane never caused. Its Step 5 wake retries:
-  `main-not-green` is in `watch-pr.sh`'s in-flight set, so the watcher keeps
-  polling instead of busy-waking the fleet. **The one exception is the lane
-  fixing `main`** (Step 0b) — that worker syncs on purpose, because its fix
-  must sit on top of the commit it is fixing.
-- **`review-quota-exhausted`** (issue #1160) — this lane is behind `main` for a
-  real reason and holds a fresh LGTM plus green CI, so it would otherwise print
-  `behind` — but `scripts/ralph/review-quota.sh` has positively proven the
-  `claude-review` reviewer is out of quota. `behind`'s remedy is
-  `fleet.sh sync`, which pushes a merge commit and, under `pr-ready.sh`'s own
-  stale-verdict guard, invalidates the LGTM the moment it lands — normally that
-  just costs one re-review, but with the reviewer out of quota the re-review
-  cannot happen, so the sync would destroy the only verdict this lane will ever
-  get. **Leave the lane; specifically do NOT sync it, and do NOT
-  `fleet.sh release` it** (see the Hard rule below). Its Step 5 wake retries
-  like `main-not-green`'s: `review-quota-exhausted` is in `watch-pr.sh`'s
-  in-flight set, so the watcher keeps polling rather than busy-waking the fleet.
-
-  **This does not hold forever.** Two triggers are each independently
-  sufficient to un-wedge it: (a) the `resetsAt` the probe recorded passes, so
-  the identical log now reads `available`; or (b) any newer conclusive
-  `code-review.yml` run — on any lane — concludes `success`, proving the
-  reviewer is back. Either way the token reverts to plain `behind` on the next
-  wake, the watcher exits on it (it is no longer in the in-flight set), Step 1
-  syncs, CI and a fresh review run, and the lane merges normally. The LGTM
-  *is* still destroyed at that sync — deliberately, because that is now the one
-  moment a replacement verdict is obtainable.
-
-  **Precedence with `main-not-green`:** that token still wins when both would
-  apply, because it is decided earlier, inside `branch_is_current`, before
-  `review-quota.sh` is ever consulted. Both remedies are "wait", so the
-  observable outcome is identical either way — a lane already held by
-  `main-not-green` simply never pays for the quota probe.
+- **`main-not-green`** (issue #1159) — only a `ready-unreviewed` bump reaches
+  this: it is behind `main`, so it is about to use the #1157 relaxation (clear
+  while behind, because the two changesets provably cannot interact), and that
+  relaxation's only justification — the full CI run on `push: main` — is **not
+  green**: it failed, or nothing has concluded yet, or the answer was
+  unreadable. **Leave the lane, and specifically do NOT sync it.** A sync here
+  would pull the breakage into the lane and turn its own CI red. Its Step 5
+  wake retries: `main-not-green` is in `watch-pr.sh`'s in-flight set.
+- **`review-quota-exhausted`** (issue #1160) — **retired 2026-10-31; no longer
+  emitted.** It held a reviewed lane that would otherwise sync, so the sync
+  would not spend an LGTM an exhausted reviewer could not re-issue. A reviewed
+  lane that is merely behind is now `ready` and merges with no sync, and a
+  conflicted lane's remedy is the sync (always exempt). If a stale reader still
+  sees it, treat it as a wait, and never `fleet.sh release` such a lane.
 - **`optout`** — `do-not-auto-merge` is on the PR's own labels, or on the
   labels of the LAST issue its body links via `Closes|Fixes|Resolves #N`.
   **Leave the PR entirely alone**: do not merge, do not sync, do not dispatch
@@ -416,9 +366,10 @@ Then act on `$STATUS`:
   dispatch. The next wake retries.
 
 You may merge more than one lane in a wake, but **re-run `pr-ready.sh` before
-each merge** — merging one lane pushes every other lane behind `main`, and only
-that helper's compare probe can see it. Serialized, always up-to-date:
-correctness holds; a ready lane is never held back by a slow sibling.
+each merge** — merging one lane can make another conflict with `main`, and
+GitHub recomputes mergeability after every push to `main` (the helper reads
+`behind` for `UNKNOWN` until it has). Serialized and conflict-free: a ready lane
+is never held back by a slow sibling, nor by merely being behind.
 
 If any merge happened, commit the `state.json` bump **once** — a single commit
 covering every merge this wake (state-only changes may go directly on `main`).
@@ -549,9 +500,9 @@ Code session and **does not exist** in a local terminal session.
    shape this wake:
    - **Any lane has an open PR in CI/review** (`pending`/`awaiting-review`, or
      freshly pushed): arm a **short** fallback, ~180s. Webhooks drop, deliver no
-     `behind→ready` transition or merge, and a sibling's merge silently pushes
-     every other lane's `behind_by` above `0` with no event on those lanes' PRs
-     — the short fallback bounds all of those blind spots to ~3 minutes.
+     `behind→ready` transition or merge, and a sibling's merge can silently put
+     another lane into conflict with no event on that lane's PR — the short
+     fallback bounds all of those blind spots to ~3 minutes.
    - **Every lane is still building (or the pool is empty)**: nothing is
      mid-flight for a webhook or a poll to catch — keep the long fallback,
      ~1200–1800s, as the safety net.
@@ -603,17 +554,18 @@ Step 0 and merges/refills whatever is ready.
 Pool of 4: issues A, B, C, D building in parallel. B is a tiny fix, D is a large
 feature.
 1. B finishes Gate 2.5, opens its PR; CI + review pass and `pr-ready.sh` reports
-   `ready` (`LGTM`+green+`CLEAN`+`behind_by == 0`).
+   `ready` (`LGTM`+green+no merge conflict).
 2. A wake fires (B's verdict). Step 1 merges **B now** — A, C, D are untouched and
    still mid-gate. Step 4 sees a free slot and assigns **E**, launching its worker.
 3. D is still at Gate 1. It never blocked B, and B's merge didn't wait for D.
-4. C later goes `LGTM`+green but `pr-ready.sh` reports `behind`
-   (`mergeStateStatus BEHIND`, or `CLEAN` with `behind_by > 0` — either way, B
-   and E landed since C went green). Step 1 syncs C; CI re-runs; C merges on
-   the next wake once green. D keeps going the whole time.
+4. C later goes `LGTM`+green; B and E landed since, so C is behind `main`. Being
+   behind is not a blocker: C does not conflict, so `pr-ready.sh` reports
+   `ready` and Step 1 merges it without a sync. Had B touched the same lines, C
+   would read `behind` (a conflict), merge `main` in, resolve, re-green, and
+   merge on a later wake. D keeps going the whole time.
 
 Continuous throughput, four lanes always busy, merges strictly serialized and
-always up-to-date.
+conflict-free.
 
 ## Sequential fallback
 
@@ -627,23 +579,23 @@ still worktree-isolated, same gates, same drop-backs.
   `ready-comments` once its findings are filed as prioritized follow-up issues
   (Step 1). No other evidence merges a lane.
 - **A `COMMENTS` verdict never iterates.** No worker, no push, no re-review:
-  its findings become `P0`–`P3` follow-up issues and the lane merges. "Up to date with `main`" means the compare
-  API's `behind_by == 0` — **never** `mergeStateStatus` alone: this repo does
-  not enforce strict/up-to-date status checks, so GitHub only computes
-  `BEHIND` in the narrow case it would already block the merge on its own, and
-  `CLEAN` routinely reports on a PR that is dozens of commits stale. A
-  `behind` lane syncs first.
+  its findings become `P0`–`P3` follow-up issues and the lane merges.
+- **Behind `main` is not a blocker; a merge conflict is** (owner rule,
+  2026-10-31). "Mergeable" means GitHub's `mergeStateStatus` is `CLEAN` or
+  `BEHIND`. `DIRTY`/`CONFLICTING` must merge `main` in and resolve first;
+  `UNKNOWN` (still computing) waits and is never read as clear. Only a
+  `ready-unreviewed` bump is still held to `behind_by == 0` (or behind-but-inert
+  with `main` green), as its review substitute.
 - **Never sync a lane while `main` is red — the fix lane is the one exception.**
   A sync imports the breakage, wastes a CI round, and re-reports as that lane's
-  own `ci-failed`. `pr-ready.sh` says so mechanically by printing
-  `main-not-green` instead of `behind` (#1159).
-- **Never `fleet.sh release` a `review-quota-exhausted` lane** (#1160).
+  own `ci-failed`. For a behind `ready-unreviewed` bump `pr-ready.sh` says so
+  mechanically by printing `main-not-green` instead of `behind` (#1159); a
+  reviewed lane is never synced merely for being behind, so it does not arise.
+- **Never `fleet.sh release` a lane with an open PR to free a slot** (#1180).
   `cmd_release` deletes the local branch, and a later `assign` recreates it
-  from `origin/main`, orphaning the PR's already-pushed commits (issue #1180).
-  `review-quota-exhausted` is the first token that can park a lane with an open
-  PR for **days** — exactly the slot pressure that tempts a release. Leave it
-  occupied; it un-wedges on its own (see the `review-quota-exhausted` bullet in
-  Step 1).
+  from `origin/main`, orphaning the PR's already-pushed commits. (This rule was
+  written for the now-retired `review-quota-exhausted` token, and still applies
+  to any lane parked waiting.)
 - **Never make a fast lane wait on a slow one.** No per-tick barrier, no
   all-lanes Monitor. Act on whichever lane a wake is about; refill freed slots
   immediately.

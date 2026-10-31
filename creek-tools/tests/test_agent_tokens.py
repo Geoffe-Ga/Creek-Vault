@@ -26,6 +26,12 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+from creek_mcp.agent_revocation import (
+    REVOCATION_CACHE_SECONDS,
+    STATUS_BEARER_FILE_ENV,
+    STATUS_URL_ENV,
+    TokenStatusQuery,
+)
 from creek_mcp.agent_tokens import (
     ACCEPTED_ALGORITHMS,
     AGENT_TOKEN_LOGGER_NAME,
@@ -35,6 +41,7 @@ from creek_mcp.agent_tokens import (
     ComposedTokenVerifier,
     HttpJwksFetcher,
     JwksCache,
+    JwtAgentTokenVerifier,
     _accepted_until,
     build_agent_verifier,
     looks_like_jwt,
@@ -52,16 +59,20 @@ from tests.agent_token_support import (
     RESOURCE_URL,
     ROGUE_KID,
     FakeClock,
+    FakeTokenStatus,
     StaticJwks,
     agent_verifier,
     ec_key,
     jwks,
     mint,
     resource_config,
+    revocation_cache,
     rsa_key,
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from mcp.server.auth.provider import AccessToken
 
 _STATIC_TOKEN: Final[str] = "unit-test-static-token-" + "s" * 20
@@ -975,3 +986,237 @@ def test_a_new_outage_after_a_recovery_is_logged_again(
     ]
     assert len(recovered) == 1
     assert ISSUER not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Revocation, checked on every call (#2005, R3-2)
+# --------------------------------------------------------------------------- #
+
+
+_ALLOCATION_RESOURCE: Final[str] = (
+    "https://v-7q2k.creek.example/a/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/mcp"
+)
+"""A per-allocation resource on the same issuer (#2003)."""
+
+
+def _revocable(
+    status: FakeTokenStatus | None = None, clock: FakeClock | None = None
+) -> tuple[JwtAgentTokenVerifier, FakeTokenStatus]:
+    """Return a verifier whose every acceptance asks *status* first.
+
+    Args:
+        status: The fake endpoint, or a fresh one.
+        clock: The revocation cache's wall clock.
+
+    Returns:
+        The verifier and its endpoint.
+    """
+    endpoint = FakeTokenStatus() if status is None else status
+    return agent_verifier(revocation=revocation_cache(endpoint, clock)), endpoint
+
+
+def test_a_standing_grant_is_accepted_and_asked_about_once() -> None:
+    """The check runs with the token's verified ``sub``, ``client_id``, ``iat``."""
+    verifier, status = _revocable()
+    issued_at = int(time.time())
+
+    access = asyncio.run(verifier.verify_token(mint(iat=issued_at)))
+
+    assert access is not None
+    assert status.queries == [
+        TokenStatusQuery(AGENT_SUBJECT, AGENT_CLIENT_ID, issued_at)
+    ]
+
+
+def test_a_revoked_grant_is_refused_on_the_very_next_call() -> None:
+    """No cached ``active`` yet: the withdrawal lands at once."""
+    verifier, status = _revocable()
+    status.revoke()
+
+    assert asyncio.run(verifier.verify_token(mint())) is None
+
+
+def test_a_per_allocation_scope_keeps_the_revocation_check() -> None:
+    """A verifier scoped to ``/a/<slug>/mcp`` (#2003) still asks per call.
+
+    Without this the shared edge would admit a revoked agent on every
+    per-allocation path while refusing it on ``/mcp``.
+    """
+    verifier, status = _revocable()
+    scoped = verifier.for_resource(_ALLOCATION_RESOURCE)
+    status.revoke()
+
+    assert scoped.revocation_enforced
+    assert asyncio.run(scoped.verify_token(mint(aud=_ALLOCATION_RESOURCE))) is None
+    assert status.queries
+
+
+def test_a_revocation_lands_once_the_cached_answer_ages_out() -> None:
+    """Admitted, revoked, admitted within the TTL, refused after it."""
+    clock = FakeClock(time.time())
+    verifier, status = _revocable(clock=clock)
+    token = mint()
+
+    assert asyncio.run(verifier.verify_token(token)) is not None
+    status.revoke()
+    clock.advance(REVOCATION_CACHE_SECONDS - 1)
+    assert asyncio.run(verifier.verify_token(token)) is not None
+    clock.advance(1)
+    assert asyncio.run(verifier.verify_token(token)) is None
+
+
+def test_an_unreachable_issuer_fails_closed_then_recovers() -> None:
+    """No fresh ``active`` and no answer: refused; the issuer back: admitted."""
+    verifier, status = _revocable()
+    status.failing = True
+    token = mint()
+
+    assert asyncio.run(verifier.verify_token(token)) is None
+    status.failing = False
+    assert asyncio.run(verifier.verify_token(token)) is not None
+
+
+def test_an_offline_refusal_never_asks_the_issuer() -> None:
+    """Revocation is checked only after every offline rule passed."""
+    verifier, status = _revocable()
+
+    for token in (mint(aud=OTHER_VAULT_URL), mint(iss="https://evil.example")):
+        assert asyncio.run(verifier.verify_token(token)) is None
+    assert status.queries == []
+
+
+@pytest.mark.parametrize("fractional", [True, False], ids=["fractional", "negative"])
+def test_an_issued_at_the_contract_cannot_carry_is_refused_unasked(
+    fractional: bool,
+) -> None:
+    """A fractional or out-of-range ``iat`` is never sent; it is refused.
+
+    The fractional ``iat`` is computed in the body, not in the parametrize
+    list: a clock value there would give every xdist worker a different test
+    id, and the run would stop at collection.
+
+    Args:
+        fractional: Mint a just-issued fractional ``iat`` rather than a
+            negative one; PyJWT accepts both, the status contract neither.
+    """
+    iat = time.time() - 0.5 if fractional else -1
+    verifier, status = _revocable()
+
+    assert asyncio.run(verifier.verify_token(mint(iat=iat))) is None
+    assert status.queries == []
+
+
+def test_without_a_revocation_check_nothing_is_asked() -> None:
+    """A vault with no status endpoint verifies offline, as before #2005."""
+    assert asyncio.run(agent_verifier().verify_token(mint())) is not None
+
+
+def test_a_static_token_is_never_checked_for_revocation() -> None:
+    """Static consumers are not agents: the composition never asks about them."""
+    verifier, status = _revocable()
+    composed = ComposedTokenVerifier(
+        ConsumerTokenVerifier({"adepthood": (_STATIC_TOKEN,)}), verifier
+    )
+
+    access = asyncio.run(composed.verify_token(_STATIC_TOKEN))
+
+    assert access is not None
+    assert status.queries == []
+
+
+@pytest.mark.parametrize(
+    ("revoked", "failing", "category"),
+    [(True, False, "revoked"), (False, True, "revocation unavailable")],
+)
+def test_a_revocation_refusal_logs_its_category_only(
+    caplog: pytest.LogCaptureFixture, revoked: bool, failing: bool, category: str
+) -> None:
+    """No token, no ``sub``, no ``client_id`` and no URL reach the log.
+
+    Args:
+        caplog: Pytest's log capture.
+        revoked: Whether the grant was withdrawn.
+        failing: Whether the issuer is unreachable.
+        category: The one label expected.
+    """
+    verifier, status = _revocable()
+    if revoked:
+        status.revoke()
+    status.failing = failing
+    token = mint()
+
+    with caplog.at_level(logging.DEBUG, logger=AGENT_TOKEN_LOGGER_NAME):
+        assert asyncio.run(verifier.verify_token(token)) is None
+
+    assert [r.getMessage() for r in caplog.records] == [
+        f"agent token refused: {category}"
+    ]
+    for secret in (token, AGENT_SUBJECT, AGENT_CLIENT_ID, ISSUER):
+        assert secret not in caplog.text
+
+
+def test_build_agent_verifier_turns_the_check_on_from_the_environment(
+    tmp_path: Path,
+) -> None:
+    """The status URL and bearer file configure a vault Machine's own check.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    bearer = tmp_path / "bearer"
+    bearer.write_text("unit-test-handoff-bearer-" + "h" * 20, encoding="utf-8")
+    bearer.chmod(0o600)
+    built = build_agent_verifier(
+        {
+            RESOURCE_URL_ENV: RESOURCE_URL,
+            AUTHORIZATION_SERVER_ENV: ISSUER,
+            STATUS_URL_ENV: (
+                f"{ISSUER}/internal/vault-provisioning/agent-token-status"
+            ),
+            STATUS_BEARER_FILE_ENV: str(bearer),
+        }
+    )
+
+    assert built is not None
+    assert built.revocation_enforced is True
+
+
+def test_an_oauth_vault_without_the_check_says_so_at_startup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Revocation not enforced is a startup warning, never silent.
+
+    Args:
+        caplog: Pytest's log capture.
+    """
+    with caplog.at_level(logging.WARNING, logger=AGENT_TOKEN_LOGGER_NAME):
+        built = build_agent_verifier(
+            {RESOURCE_URL_ENV: RESOURCE_URL, AUTHORIZATION_SERVER_ENV: ISSUER}
+        )
+
+    assert built is not None
+    assert built.revocation_enforced is False
+    assert "revocation is not enforced" in caplog.text
+
+
+def test_status_settings_without_a_resource_server_are_refused(
+    tmp_path: Path,
+) -> None:
+    """A revocation check with no tokens to check is a misconfiguration.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    bearer = tmp_path / "bearer"
+    bearer.write_text("unit-test-handoff-bearer-" + "h" * 20, encoding="utf-8")
+    bearer.chmod(0o600)
+
+    with pytest.raises(ValueError, match=STATUS_URL_ENV):
+        build_agent_verifier(
+            {
+                STATUS_URL_ENV: (
+                    f"{ISSUER}/internal/vault-provisioning/agent-token-status"
+                ),
+                STATUS_BEARER_FILE_ENV: str(bearer),
+            }
+        )

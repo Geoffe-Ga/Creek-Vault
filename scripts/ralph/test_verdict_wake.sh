@@ -121,6 +121,11 @@ RUNDIR="$WORK/run"
 mkdir -p "$BIN" "$RUNDIR"
 POSTED="$WORK/posted.txt"
 export POSTED
+# Call records the stubs leave behind: how many times the PR object was read
+# (the mergeability poll), and whether the compare API was asked at all.
+PULLS_COUNT="$WORK/pulls.count"
+COMPARE_CALLED="$WORK/compare.called"
+export PULLS_COUNT COMPARE_CALLED
 
 # --- the stubbed gh ---------------------------------------------------------
 # Arg-aware, driven by env vars each case sets. THE GRAPHQL ARM EMITS THE RAW
@@ -136,12 +141,17 @@ export POSTED
 #   CHECK_RUNS      comma-joined conclusions for the check-runs tally; the word
 #                   `null` becomes a JSON null (a run still in progress).
 #   PR_JSON         the `repos/O/R/pulls/N` object. Honoured when EMPTY, so a
-#                   case can play a lookup that answered nothing.
-#   PR_JSON_EC      its exit code; non-zero drives the script's `|| echo '{}'`.
-#   BEHIND_BY       what the compare API reports for `.behind_by`. Defaulted
-#                   with `-`, not `:-`, so `BEHIND_BY=''` reproduces an EMPTY
-#                   answer, which must fail closed rather than compare equal.
-#   COMPARE_EC      its exit code; non-zero plays a failed freshness probe.
+#                   case can play a lookup that answered nothing. The default is
+#                   conflict-free (`mergeable: true`, `mergeable_state: clean`).
+#   PR_JSON_EC      its exit code; non-zero plays a failed PR lookup, which the
+#                   script branches on (it treats the PR as `{}`).
+#   PR_JSON_LATER   when set, the answer to every pulls call AFTER the first, so
+#                   a case can play GitHub finishing its mergeability computation
+#                   (`mergeable: null` → a real answer) between polls.
+#   BEHIND_BY       what the compare API would report for `.behind_by`. The
+#                   script must never ask (being behind is not a blocker), and
+#                   the compare arm records a call in $COMPARE_CALLED if it does.
+#   COMPARE_EC      its exit code.
 #   HEAD_DATE       the head commit's `committer.date`. Defaulted with `-` so
 #                   `HEAD_DATE=''` reproduces an unreadable commit.
 #   HEAD_DATE_EC    its exit code; non-zero plays a failed commit lookup.
@@ -182,6 +192,7 @@ case "$args" in
       | jq -sc '{check_runs: map({conclusion: .})}'
     exit 0 ;;
   *compare/*)
+    : > "$COMPARE_CALLED"
     printf '%s\n' "${BEHIND_BY-0}"
     exit "${COMPARE_EC:-0}" ;;
   *"/commits/"*)
@@ -193,10 +204,14 @@ case "$args" in
     printf '%s\n' "${HEAD_DATE-2026-08-30T09:00:00Z}"
     exit "${HEAD_DATE_EC:-0}" ;;
   *"/pulls/"*)
-    if [[ -n "${PR_JSON+set}" ]]; then
+    n=$(( $(cat "$PULLS_COUNT" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$n" > "$PULLS_COUNT"
+    if [[ "$n" -gt 1 && -n "${PR_JSON_LATER+set}" ]]; then
+      printf '%s' "$PR_JSON_LATER"
+    elif [[ -n "${PR_JSON+set}" ]]; then
       printf '%s' "$PR_JSON"
     else
-      printf '{"base":{"ref":"main"},"labels":[]}'
+      printf '{"base":{"ref":"main"},"labels":[],"mergeable":true,"mergeable_state":"clean"}'
     fi
     exit "${PR_JSON_EC:-0}" ;;
   "pr comment"*)
@@ -215,6 +230,10 @@ exit 97
 STUB
 chmod +x "$BIN/gh"
 
+# The mergeability poll sleeps between reads; the suite must not.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/sleep"
+chmod +x "$BIN/sleep"
+
 # --- running the script -----------------------------------------------------
 # Every knob is passed through the environment of ONE invocation, so a case
 # cannot leak into the next. `posted.txt` is removed first, which is what makes
@@ -222,7 +241,7 @@ chmod +x "$BIN/gh"
 WAKE_RC=0
 WAKE_OUT=""
 wake() { # wake [VAR=VALUE ...] — run the script; sets WAKE_RC / WAKE_OUT
-  rm -f "$POSTED" "${POSTED}.argv"
+  rm -f "$POSTED" "${POSTED}.argv" "$PULLS_COUNT" "$COMPARE_CALLED"
   WAKE_RC=0
   WAKE_OUT="$(cd "$RUNDIR" && env PATH="$BIN:$PATH" \
     REPO="${WAKE_REPO:-owner/repo}" \
@@ -480,22 +499,71 @@ says "hold: an unreadable PR object holds the lane rather than clearing it" \
      '^\*\*VERDICT\*\*: HELD$' "$(posted)"
 
 # ===========================================================================
-# CURRENCY — this branch's own green proves nothing about today's base
+# MERGE CONFLICT — not currency. Owner rule (2026-10-31): "PRs don't need to be
+# brought up to the current main before merging. If there are no merge
+# conflicts then it is fine to merge a pr that passed all other gates."
 # ===========================================================================
-wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$LGTM_LINE")")")" \
-     CHECK_RUNS="$GREEN_RUNS" BEHIND_BY=7
-behindp="$(posted)"
-says  "behind: a head behind its base neutralises the VERDICT field (#1202)" \
-      '^\*\*VERDICT\*\*: NOT CURRENT$' "$behindp"
-lacks "behind: …and the summary says LGTM nowhere" 'VERDICT\*\*: LGTM' "$behindp"
-says  "behind: the Action names the base and the count" "behind_by='7'" "$behindp"
+LGTM_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$LGTM_LINE")")")"
+CONFLICTED_PR='{"base":{"ref":"main"},"labels":[],"mergeable":false,"mergeable_state":"dirty"}'
+BEHIND_PR='{"base":{"ref":"main"},"labels":[],"mergeable":true,"mergeable_state":"behind"}'
+COMPUTING_PR='{"base":{"ref":"main"},"labels":[],"mergeable":null,"mergeable_state":"unknown"}'
 
-# AN EMPTY COMPARE ANSWER IS NOT A ZERO. A failed or malformed compare leaves the
-# empty string, which must fail closed.
-wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$LGTM_LINE")")")" \
-     CHECK_RUNS="$GREEN_RUNS" BEHIND_BY='' COMPARE_EC=1
-says "behind: an unreadable compare fails closed to NOT CURRENT" \
-     '^\*\*VERDICT\*\*: NOT CURRENT$' "$(posted)"
+# BEHIND BUT CONFLICT-FREE CLEARS. GitHub says `behind`, the compare API would
+# say 7 — and neither matters: no conflict, every other gate passed.
+wake COMMENTS_NODES="$LGTM_NODES" CHECK_RUNS="$GREEN_RUNS" PR_JSON="$BEHIND_PR" BEHIND_BY=7
+behindp="$(posted)"
+says  "behind-but-clean: the VERDICT stays LGTM" '^\*\*VERDICT\*\*: LGTM$' "$behindp"
+says  "behind-but-clean: the merge is cleared" 'cleared to squash merge' "$behindp"
+lacks "behind-but-clean: never NOT CURRENT" 'NOT CURRENT' "$behindp"
+if [[ -e "$COMPARE_CALLED" ]]; then
+  bad "behind-but-clean: the compare API must not be asked how far behind the head is"
+else
+  ok "behind-but-clean: the compare API is never asked"
+fi
+
+# A MERGE CONFLICT REFUSES, and rewrites VERDICT (#1202) to a value with no
+# `LGTM` substring that is none of the three recognised verdicts.
+wake COMMENTS_NODES="$LGTM_NODES" CHECK_RUNS="$GREEN_RUNS" PR_JSON="$CONFLICTED_PR"
+conflictp="$(posted)"
+says  "conflict: a merge conflict neutralises the VERDICT field (#1202)" \
+      '^\*\*VERDICT\*\*: CONFLICTED$' "$conflictp"
+lacks "conflict: …and the summary says LGTM nowhere" 'VERDICT\*\*: LGTM' "$conflictp"
+lacks "conflict: …and nothing clears the merge" 'cleared to squash merge' "$conflictp"
+says  "conflict: the Action says to merge the base in and resolve" \
+      'merge conflict with main.*resolve' "$conflictp"
+
+# Either spelling of a conflict is one.
+wake COMMENTS_NODES="$LGTM_NODES" CHECK_RUNS="$GREEN_RUNS" \
+     PR_JSON='{"base":{"ref":"main"},"labels":[],"mergeable":true,"mergeable_state":"dirty"}'
+says "conflict: mergeable_state dirty alone refuses" '^\*\*VERDICT\*\*: CONFLICTED$' "$(posted)"
+wake COMMENTS_NODES="$LGTM_NODES" CHECK_RUNS="$GREEN_RUNS" \
+     PR_JSON='{"base":{"ref":"main"},"labels":[],"mergeable":false,"mergeable_state":"unknown"}'
+says "conflict: mergeable false alone refuses" '^\*\*VERDICT\*\*: CONFLICTED$' "$(posted)"
+
+# NULL IS "NOT YET KNOWN", NEVER CLEAR. GitHub computes `mergeable` lazily; the
+# script re-polls, and a null that never resolves refuses.
+wake COMMENTS_NODES="$LGTM_NODES" CHECK_RUNS="$GREEN_RUNS" PR_JSON="$COMPUTING_PR"
+nullp="$(posted)"
+says  "computing: an unresolved null refuses with its own VERDICT" \
+      '^\*\*VERDICT\*\*: MERGEABILITY UNKNOWN$' "$nullp"
+lacks "computing: …and nothing clears the merge" 'cleared to squash merge' "$nullp"
+polls="$(cat "$PULLS_COUNT" 2>/dev/null || echo 0)"
+if [[ "$polls" -gt 1 ]]; then
+  ok "computing: a null mergeable is re-polled ($polls reads) before refusing"
+else
+  bad "computing: a null mergeable was read only $polls time(s) — it must be re-polled"
+fi
+
+# A null that resolves mid-poll is used: to a clear answer it clears, to a
+# conflict it refuses.
+wake COMMENTS_NODES="$LGTM_NODES" CHECK_RUNS="$GREEN_RUNS" PR_JSON="$COMPUTING_PR" \
+     PR_JSON_LATER="$BEHIND_PR"
+says "computing → behind-but-clean: cleared once GitHub answers" \
+     'cleared to squash merge' "$(posted)"
+wake COMMENTS_NODES="$LGTM_NODES" CHECK_RUNS="$GREEN_RUNS" PR_JSON="$COMPUTING_PR" \
+     PR_JSON_LATER="$CONFLICTED_PR"
+says "computing → conflict: refused once GitHub answers" \
+     '^\*\*VERDICT\*\*: CONFLICTED$' "$(posted)"
 
 # ===========================================================================
 # STALENESS — the verdict must POSTDATE the head it is clearing
@@ -582,8 +650,12 @@ wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$C
 says "COMMENTS: a hold neutralises the VERDICT field" '^\*\*VERDICT\*\*: HELD$' "$(posted)"
 
 wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$COMMENTS_LINE")")")" \
-     CHECK_RUNS="$GREEN_RUNS" BEHIND_BY=7
-says "COMMENTS: a head behind its base reads NOT CURRENT" '^\*\*VERDICT\*\*: NOT CURRENT$' "$(posted)"
+     CHECK_RUNS="$GREEN_RUNS" PR_JSON="$BEHIND_PR" BEHIND_BY=7
+says "COMMENTS: a head behind its base but conflict-free is cleared after filing" \
+     'cleared to squash merge' "$(posted)"
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$COMMENTS_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS" PR_JSON="$CONFLICTED_PR"
+says "COMMENTS: a merge conflict reads CONFLICTED" '^\*\*VERDICT\*\*: CONFLICTED$' "$(posted)"
 
 wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$COMMENTS_LINE")")")" \
      CHECK_RUNS="$GREEN_RUNS" HEAD_DATE='2026-08-30T11:00:00Z'
@@ -697,7 +769,7 @@ lacks "dissent: …and the VERDICT field carries no LGTM for Step 4a to merge on
 
 # TWO `lacks` ARE NOT A PIN, AND THIS BRANCH IS THE ONE THAT PROVES IT. Every
 # other refusal value in this file is asserted by EXACT VALUE — `NOT ATTESTED`,
-# `HELD`, `NOT CURRENT`, `STALE` all have a `says '^\*\*VERDICT\*\*: X$'`. The
+# `HELD`, `CONFLICTED`, `MERGEABILITY UNKNOWN`, `STALE` all have a `says '^\*\*VERDICT\*\*: X$'`. The
 # dissent branch shipped with only the two negatives above, and MEASURED, both of
 # these renames left the whole suite green:
 #

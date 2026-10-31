@@ -63,8 +63,8 @@ git worktree add ".ultracode/worktrees/issue-$N" -b "issue/$N-<slug>" origin/mai
 Worktrees, not branches-in-place: lanes must not share a working tree.
 
 **Ready-to-merge.** Ask GitHub, in this order (see wake-protocol Step 1):
-`behind_by == 0` from the compare API → CI green on the current `headRefOid` →
-`LGTM` verdict postdating the head commit.
+no merge conflict (`mergeable: true`; being behind `main` is fine) → CI green
+on the current `headRefOid` → `LGTM` verdict postdating the head commit.
 
 **Wake.** No `watch-pr.sh` here, so either arm a per-PR activity subscription (if
 the session has one) or rely on background-task completion plus the

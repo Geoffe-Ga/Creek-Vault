@@ -1030,9 +1030,13 @@ grants.
 
 Under Adepthood Settings, "Where your writing lives", "Agents that may read your
 vault", choose **Stop** beside the agent. Adepthood revokes its refresh tokens at
-once; the access token it already holds runs out within its 600 seconds, because
-the vault verifies tokens offline and never calls Adepthood back. So the agent's
-calls stop within one access-token lifetime, with no vault restart. To stop a
+once. Where the vault checks revocation (owner decision R3-2, #2005 — see
+[Revocation on every call](#revocation-on-every-call-2005-r3-2)), the access
+token it already holds is refused within 30 seconds: the vault asks Adepthood
+whether the agent's grant still stands on every call, reusing a "still
+allowed" answer for at most 30 s. A vault with no revocation check configured
+verifies tokens offline only, so there the token runs out within its 600
+seconds instead. Either way no vault restart is needed. To stop a
 static-token agent instead, drop its token from the consumer registry (see
 [Rotating a consumer's secret](#rotating-a-consumers-secret-no-downtime)): within
 5 s on a mounted secret file, at the next restart for an environment variable.
@@ -1667,6 +1671,50 @@ claim (adepthood#3533), and its activity card joins it exactly to
 the person's vault at the shared edge and satisfies the managed subject pin.
 Historical audit rows keep their original subject-only stamp; no agent is guessed
 for an older entry, and the existing `0.22.0` consumer pattern and bound do not move.
+
+#### Revocation on every call (#2005, R3-2)
+
+Owner decision R3-2: the vault checks agent revocation on every call. After a
+token passes every rule above, and before any tool is listed or dispatched (or,
+at the managed edge, before any replay is prepared), the verifier asks
+Adepthood whether the agent's grant still covers it:
+
+```text
+POST <adepthood>/internal/vault-provisioning/agent-token-status
+Authorization: Bearer <the mounted handoff bearer>
+{"sub": "<token sub>", "client_id": "<token client_id>", "iat": <token iat>}
+→ 200 {"active": true | false}
+```
+
+Only the token's verified claims are sent, never the token. The bearer is the
+Creek control plane's mounted handoff bearer, the same one its alerts use; no
+user secret is in the request.
+
+| Answer | What the vault does |
+|---|---|
+| `{"active": true}` | Serves the call, and reuses the answer for `REVOCATION_CACHE_SECONDS` = **30 s** — the longest a revocation can take to land. |
+| `{"active": false}` | Refuses with the same `401` as an invalid token, and keeps that answer until the token expires. |
+| `401`, `400`, `429`, `5xx`, a redirect, a timeout, a malformed body | Refuses (**fail closed**) unless a fresh `active` answer is cached. Never cached itself, so the next call asks again. |
+
+Answers are cached per `(sub, client_id, iat)`, at most 4096 at once; a
+session's simultaneous first requests share one lookup. A token whose `iat` is
+not a whole number of seconds is refused without asking. A refusal is logged as
+`agent token refused: revoked` or `agent token refused: revocation unavailable`
+— never the token, `sub`, `client_id` or URL.
+
+The check is **off by default**. A vault Machine turns it on with both of:
+
+| Setting | Value |
+|---|---|
+| `CREEK_MCP_AGENT_TOKEN_STATUS_URL` | Adepthood's origin plus `/internal/vault-provisioning/agent-token-status`, `https` only. |
+| `CREEK_MCP_AGENT_TOKEN_STATUS_BEARER_FILE` | An owner-only file holding the handoff bearer. |
+
+The edge router takes the same pair as `--oauth-agent-token-status-url` and
+`--oauth-agent-token-status-bearer-file`. One without the other, or either
+without the OAuth settings, refuses startup. An OAuth vault or edge without
+them verifies offline as before and logs at startup that revocation is not
+enforced. Static consumer tokens are never checked: they are revoked by
+dropping them from the registry.
 The `scope` claim still supplies the grants, read exactly as a static
 token's grant suffix is. `creek:ungated` in a token is ignored. The remote tier
 cap applies unchanged, so a JWT caller asking for `intimate` is refused with

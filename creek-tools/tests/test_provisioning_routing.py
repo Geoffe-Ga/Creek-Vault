@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
+    from creek_mcp.agent_revocation import RevocationCache
+
 _TOKEN = "managed-vault-routing-token-" + "a" * 32
 _OTHER_TOKEN = "managed-vault-routing-token-" + "b" * 32
 _HEADERS = {
@@ -758,8 +760,13 @@ class _FakeAgentPrincipals:
         return _OWNER if consumer_identity == "user-001" else None
 
 
-def _agent_routing() -> tuple[AgentRouting, _FakeAgentPrincipals]:
+def _agent_routing(
+    revocation: RevocationCache | None = None,
+) -> tuple[AgentRouting, _FakeAgentPrincipals]:
     """Return an agent route for the edge's MCP URL over the local JWKS.
+
+    Args:
+        revocation: The edge's revocation check (#2005), if any.
 
     Returns:
         The route and its principal resolver.
@@ -767,19 +774,19 @@ def _agent_routing() -> tuple[AgentRouting, _FakeAgentPrincipals]:
     from tests.agent_token_support import agent_verifier
 
     principals = _FakeAgentPrincipals()
-    return (
-        AgentRouting(agent_verifier(resource_url=_EDGE_MCP_URL), principals),
-        principals,
-    )
+    verifier = agent_verifier(resource_url=_EDGE_MCP_URL, revocation=revocation)
+    return AgentRouting(verifier, principals), principals
 
 
 def _agent_client(
     tmp_path: Path,
+    revocation: RevocationCache | None = None,
 ) -> tuple[TestClient, _McpReplayProvider, _FakeAgentPrincipals]:
     """Return a replay-router client with agent routing configured.
 
     Args:
         tmp_path: Pytest's per-test directory.
+        revocation: The edge's revocation check (#2005), if any.
 
     Returns:
         The client, the replay provider and the principal resolver.
@@ -787,7 +794,7 @@ def _agent_client(
     store = ProvisioningStore(tmp_path / "routing.sqlite3")
     _ready_allocation(store)
     provider = _McpReplayProvider()
-    agent, principals = _agent_routing()
+    agent, principals = _agent_routing(revocation)
     app = build_fly_replay_routing_app(
         store, FakeRoutingVerifier(_OWNER), provider, agent=agent
     )
@@ -871,6 +878,59 @@ def test_a_refused_agent_token_never_wakes_a_vault(
     assert response.headers["www-authenticate"] == resource_config(
         _EDGE_MCP_URL
     ).challenge(401)
+    assert provider.calls == 0
+
+
+def test_the_edge_checks_revocation_before_preparing_a_replay(tmp_path: Path) -> None:
+    """A revoked agent wakes no vault; a standing one is checked, then replayed.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    from tests.agent_token_support import FakeTokenStatus, revocation_cache
+
+    status = FakeTokenStatus()
+    client, provider, principals = _agent_client(
+        tmp_path, revocation_cache(status, ttl_seconds=0)
+    )
+    token = _agent_token()
+
+    admitted = client.post(
+        "/mcp", headers={"Authorization": f"Bearer {token}"}, content=b"{}"
+    )
+    assert admitted.status_code == 307
+    assert len(status.queries) == provider.calls == 1
+
+    status.revoke("user-001")
+    refused = client.post(
+        "/mcp", headers={"Authorization": f"Bearer {token}"}, content=b"{}"
+    )
+
+    assert refused.status_code == 401
+    assert "Fly-Replay" not in refused.headers
+    assert len(status.queries) == 2
+    assert provider.calls == 1
+    assert principals.lookups == ["user-001"]
+
+
+def test_an_unreachable_issuer_at_the_edge_wakes_no_vault(tmp_path: Path) -> None:
+    """Fail closed at the edge: ``401``, no principal lookup, no replay.
+
+    Args:
+        tmp_path: Pytest's per-test directory.
+    """
+    from tests.agent_token_support import FakeTokenStatus, revocation_cache
+
+    status = FakeTokenStatus()
+    status.failing = True
+    client, provider, principals = _agent_client(tmp_path, revocation_cache(status))
+
+    response = client.post(
+        "/mcp", headers={"Authorization": f"Bearer {_agent_token()}"}, content=b"{}"
+    )
+
+    assert response.status_code == 401
+    assert principals.lookups == []
     assert provider.calls == 0
 
 

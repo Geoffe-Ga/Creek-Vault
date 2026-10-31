@@ -74,7 +74,7 @@
 # that refuses while leaving it alone still posts `**VERDICT**: LGTM` +
 # `**CI**: N/N Green` — the only two fields the merge path reads. `ACTION` is
 # diagnostic; `VERDICT` is the gate. The refusal values are chosen for their
-# BYTES — `HELD`, `NOT ATTESTED`, `NOT CURRENT`, `STALE`, `DISPUTED` — none
+# BYTES — `HELD`, `NOT ATTESTED`, `CONFLICTED`, `MERGEABILITY UNKNOWN`, `STALE`, `DISPUTED` — none
 # containing an `LGTM` substring and none being one of the three verdicts
 # SKILL.md recognises, so Step 4a falls to its item 5 and surfaces to a human
 # instead of merging. `scripts/ralph/test_pr_ready.sh` checks that property
@@ -299,7 +299,7 @@ if [ "$VLGTM" = "true" ]; then
       # `DISPUTED` carries no `LGTM` substring and is none of the three verdicts
       # `.claude/skills/await-claude-review/SKILL.md` recognises, so Step 4a
       # falls to its item 5 and surfaces to a human — the same fail-closed
-      # destination as `HELD`, `NOT ATTESTED` and `NOT CURRENT`, and the
+      # destination as `HELD`, `NOT ATTESTED` and `CONFLICTED`, and the
       # enclosing `[ "$VERDICT" = "LGTM" ]` below therefore never fires.
       VERDICT='DISPUTED' ;;
     ''|*LGTM*)
@@ -340,22 +340,39 @@ GREEN=$(jq '[.check_runs[] | select(.conclusion == "success")] | length'        
 # Green + LGTM is NOT enough to clear a merge, and this job used to clear on
 # those two alone. That made it a second code path able to falsify the invariant
 # scripts/ralph/pr-ready.sh enforces: it would tell the loop to merge the very
-# lanes that helper refuses — a branch behind its base (whose own green proves
-# nothing about today's main) and one a human put on hold with
-# `do-not-auto-merge`. Both checks below fail CLOSED: a missing/unreadable PR
-# object yields no labels (HELD="unknown") and an empty BEHIND, neither of which
-# clears.
-PR_JSON=$(gh api "repos/$REPO/pulls/$PR" 2>/dev/null || echo '{}')
+# lanes that helper refuses — one a human put on hold with `do-not-auto-merge`,
+# and one that CONFLICTS with its base. Being BEHIND the base is deliberately NOT
+# a blocker (owner rule, 2026-10-31: "If there are no merge conflicts then it is
+# fine to merge a pr that passed all other gates"), so nothing here asks how far
+# behind the head is.
+#
+# GitHub computes `mergeable` lazily and answers null until it has, so a null is
+# re-polled a few times and, if still null, refused as "not yet known" — never
+# read as clear. A PR object that cannot be read at all is treated as `{}`: no
+# labels (HELD="unknown") and a null `mergeable`, so both checks fail closed. The
+# lookup's exit status is branched on rather than swallowed, and its stderr is
+# left visible, so a transport failure stays distinguishable from a real answer.
+MERGEABLE_POLLS=4
+MERGEABLE_POLL_SECONDS=5
+read_pr() {
+  if ! PR_JSON=$(gh api "repos/$REPO/pulls/$PR"); then
+    echo "verdict-wake: could not read PR #$PR; hold and mergeability treated as unknown" >&2
+    PR_JSON='{}'
+  fi
+  MERGEABLE=$(jq -r 'if .mergeable == null then "null" else (.mergeable | tostring) end' <<<"$PR_JSON")
+  MERGE_STATE=$(jq -r '.mergeable_state // "unknown"' <<<"$PR_JSON")
+}
+read_pr
+POLL=1
+while [ "$MERGEABLE" = "null" ] && [ "$POLL" -lt "$MERGEABLE_POLLS" ]; do
+  sleep "$MERGEABLE_POLL_SECONDS"
+  read_pr
+  POLL=$((POLL + 1))
+done
 BASE=$(jq -r '.base.ref // empty' <<<"$PR_JSON")
 HELD=$(jq -r 'if .labels == null then "unknown"
               elif ([.labels[].name] | index("do-not-auto-merge")) then "yes"
               else "no" end' <<<"$PR_JSON")
-# behind_by counts base commits the head lacks. GitHub only reports
-# mergeStateStatus BEHIND when the base enforces strict status checks, which
-# this repo does not — so a branch many commits behind main reads CLEAN and only
-# this compare call can see it. Anything but a literal "0", including the empty
-# string a failed or malformed compare leaves, is "not current".
-BEHIND=$(gh api "repos/$REPO/compare/$BASE...$SHA?per_page=1" --jq '.behind_by' 2>/dev/null || true)
 
 # THE VERDICT MUST POSTDATE THE HEAD IT IS CLEARING, and nothing here compared
 # them. `pr-ready.sh` has enforced this since #1181 (`[[ "$verdict_date" >
@@ -428,7 +445,7 @@ if [ "$GREEN" = "$TOTAL" ] && { [ "$VERDICT" = "LGTM" ] || [ "$VERDICT" = "COMME
     # `[ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]` has already been
     # evaluated, and nothing reads VERDICT again before the BODY printf below.
     #
-    # THE `HELD` AND `BEHIND` BRANCHES DO THE SAME THING (#1202). They carried
+    # THE `HELD` AND CONFLICT BRANCHES DO THE SAME THING (#1202). They carried
     # the identical hole for as long as this branch did not: rewriting ACTION
     # alone, so `**VERDICT**: LGTM` stood and a `do-not-auto-merge` hold was
     # defeated exactly the way an unattested verdict was. The asymmetry was
@@ -437,14 +454,19 @@ if [ "$GREEN" = "$TOTAL" ] && { [ "$VERDICT" = "LGTM" ] || [ "$VERDICT" = "COMME
     # branches, so a fourth refusal inherits it.
     VERDICT='NOT ATTESTED'
     ACTION="NOT cleared to merge: the latest verdict does not attest that the reviewer read THIS PR - its provenance marker names '${MARKER_PR}', not ${PR}. Run scripts/ralph/fleet.sh sync (or push any commit) so the marker-emitting review workflow runs on this branch and the re-review is attested; re-running the old review run will not help, it replays the workflow file from the commit that run was launched from. See #1181."
-  elif [ "$BEHIND" != "0" ]; then
-    # Same rule, same reason (#1202): this branch's own green proves nothing
-    # about today's base, and pr-ready.sh refuses the lane for it — so the
-    # summary must not hand the merge path an `LGTM` the sibling clearance path
-    # would reject. `NOT CURRENT` carries no `LGTM` substring and is not a
-    # verdict SKILL.md recognises.
-    VERDICT='NOT CURRENT'
-    ACTION="NOT cleared to merge: this head is not current with ${BASE:-its base} (behind_by='${BEHIND}'). Run scripts/ralph/fleet.sh sync and let CI re-run first."
+  elif [ "$MERGEABLE" = "false" ] || [ "$MERGE_STATE" = "dirty" ]; then
+    # Same rule, same reason (#1202): a conflicting head cannot merge, and
+    # pr-ready.sh refuses the lane for it — so the summary must not hand the
+    # merge path an `LGTM` the sibling clearance path would reject. `CONFLICTED`
+    # carries no `LGTM` substring and is not a verdict SKILL.md recognises.
+    VERDICT='CONFLICTED'
+    ACTION="NOT cleared to merge: this PR has a merge conflict with ${BASE:-its base} (mergeable=${MERGEABLE}, mergeable_state=${MERGE_STATE}). Merge ${BASE:-the base} in and resolve it (scripts/ralph/fleet.sh sync), and let CI re-run first."
+  elif [ "$MERGEABLE" != "true" ]; then
+    # Same rule (#1202). Null after every poll means GitHub has not finished
+    # computing mergeability: unknown is not clear. `MERGEABILITY UNKNOWN`
+    # carries no `LGTM` substring and is not a verdict SKILL.md recognises.
+    VERDICT='MERGEABILITY UNKNOWN'
+    ACTION="NOT cleared to merge yet: GitHub has not finished computing whether this PR conflicts with ${BASE:-its base} (mergeable=${MERGEABLE}). Re-check mergeability before merging; being behind ${BASE:-its base} is not itself a blocker."
   elif [ -z "$HEAD_DATE" ] || ! [[ "$VDATE" > "$HEAD_DATE" ]]; then
     # Same rule, same reason (#1202). `[[ ]]`, not `[ ]`: inside `[ ]` a bare `>`
     # is a REDIRECTION, so `[ "$VDATE" > "$HEAD_DATE" ]` would test one argument
@@ -456,9 +478,9 @@ if [ "$GREEN" = "$TOTAL" ] && { [ "$VERDICT" = "LGTM" ] || [ "$VERDICT" = "COMME
     VERDICT='STALE'
     ACTION="NOT cleared to merge: the verdict (${VDATE}) does not postdate this head ${SHA} (${HEAD_DATE:-unreadable}) - it reviewed code that has since been replaced. Push or re-run the review workflow on the current head and wait for the fresh verdict."
   elif [ "$VERDICT" = "COMMENTS" ]; then
-    ACTION="${FILE_FOLLOWUPS} Then you are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks."
+    ACTION="${FILE_FOLLOWUPS} Then you are cleared to squash merge (no merge conflict with ${BASE:-its base}; being behind it is not a blocker), delete the branch, clean any worktrees, and unsubscribe from webhooks."
   else
-    ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
+    ACTION="You are cleared to squash merge (no merge conflict with ${BASE:-its base}; being behind it is not a blocker), delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
   fi
 elif [ "$VERDICT" = "COMMENTS" ]; then
   ACTION="${FILE_FOLLOWUPS} CI is not fully green yet - fix only the failing checks."

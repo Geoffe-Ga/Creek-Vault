@@ -241,12 +241,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("CREEK_PILOT_OAUTH_JWKS_URL"),
     )
     worker_cli.add_mcp_oauth_roll_argument(parser)
+    # One switch drives both halves: the worker mints each new allocation its
+    # own resource (#2002) exactly when the edge routes it (#2003). Off by
+    # default; enable only once Adepthood mints per-vault tokens (adepthood#3584).
+    routing_cli.add_mcp_audience_arguments(parser)
     parser.set_defaults(
         routing_public_url=None,
         oauth_resource_url=None,
-        # The pilot's edge serves only the shared resource, so its worker
-        # writes no per-allocation one (#2002) until the edge routes them (#2003).
-        per_allocation_mcp_resource=False,
         private_tls_ca_certificate_file=None,
         tls_cert=None,
         tls_key=None,
@@ -340,6 +341,7 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
             fly_machine_id=args.fly_machine_id,
             routing_miss_status=ROUTING_MISS_STATUS,
             healthy=health,
+            per_allocation_mcp=args.per_allocation_mcp_resource,
         )
         server = uvicorn.Server(
             uvicorn.Config(

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
+from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.exceptions import InvalidTag
@@ -25,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, r
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from creek_mcp.mcp_path import is_allocation_mcp_path
 from creek_mcp.provisioning.driver import ProviderError
 from creek_mcp.provisioning.fly import FlyRuntimeSecrets
 from creek_mcp.provisioning.models import FailureReason, McpOAuthSettings
@@ -698,6 +700,57 @@ class EncryptedFileRoutingCredentialVerifier:
             The owning principal, with its replay state.
         """
         return await asyncio.to_thread(self._principal_for_consumer, consumer_identity)
+
+    async def principal_for_resource(
+        self,
+        resource_url: str,
+        *,
+        authorization_server: str,
+        consumer_identity: str,
+    ) -> RoutingPrincipal | None:
+        """Return the owner whose record names *resource_url* (#2003, R3-1).
+
+        The edge's route for a per-allocation agent token: the token was
+        verified for exactly *resource_url* by *authorization_server*. The
+        record whose stored ``mcp_oauth`` names both is the allocation, and its
+        consumer must be the token's ``sub``. Same scan and refusals as the
+        other two lookups, so this route reaches no vault they could not.
+
+        Args:
+            resource_url: The per-allocation resource the request path names.
+            authorization_server: The issuer the token was verified against.
+            consumer_identity: The verified token's subject.
+
+        Returns:
+            The owning principal, or ``None`` unless all three agree.
+        """
+        return await asyncio.to_thread(
+            self._principal_for_resource,
+            resource_url,
+            authorization_server,
+            consumer_identity,
+        )
+
+    def _principal_for_resource(
+        self, resource_url: str, authorization_server: str, consumer_identity: str
+    ) -> RoutingPrincipal | None:
+        """Scan every active bundle for the one record naming *resource_url*.
+
+        Only a per-allocation resource selects a record: the shared edge
+        resource is many records' at once and so names no owner here.
+        """
+        if not is_allocation_mcp_path(urlsplit(resource_url).path):
+            return None
+        owner = self._unique_owner(
+            lambda document: (
+                document.mcp_oauth is not None
+                and document.mcp_oauth.resource_url == resource_url
+                and document.mcp_oauth.authorization_server == authorization_server
+            )
+        )
+        if owner is None or owner.consumer_identity != consumer_identity:
+            return None
+        return owner
 
     def _principal_for_consumer(
         self, consumer_identity: str
