@@ -3,6 +3,8 @@
 - **Status**: Accepted
 - **Date**: 2026-06-10
 - **Driving issue**: #624 (follow-up to epic #603, swappable LLM providers).
+- **Amended by**: [ADR-0018](0018-attested-pool-embeddings-for-managed-vaults.md)
+  (#1904), for managed vaults only. The text below is unchanged.
 
 ## Context
 

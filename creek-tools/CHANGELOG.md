@@ -9,6 +9,29 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Ground managed-vault reflections through the attested pool's embedding
+  model (#1904, ADR-0016 Q2 option (i), owner decision R4-4; recorded as
+  ADR-0018, which amends ADR-0004 for managed vaults only). A managed vault
+  whose request carries no writer's key and whose generation resolves to the
+  pool now embeds the query and up to 256 live cache misses — and the bulk
+  pass behind `POST /v1/links` — through the new
+  `pool_boundary.pool_embed` (`/v1/embeddings`), and nowhere else. Each
+  fragment's own tier goes to the router's new `refuses_off_device`
+  chokepoint before any request is built, so INTIMATE and untiered text is
+  never sent; batches are at most 256 texts and 1 MiB, the pool's identity
+  listing is checked before any text leaves, and an answer naming another
+  model or dimensionality is discarded. The model-package manifest gains an
+  optional `embedding` pin (model, dimensionality, similarity threshold,
+  identity digest), and every parquet row now records its vector space
+  (`route`, `dimensions`, `similarity_threshold`), so a space change
+  re-embeds instead of comparing vectors across spaces; parquets written
+  before this read as local. With no attested embedding model pinned, a
+  pool-routed reflection is answered ungrounded with nothing sent.
+  Self-hosted vaults and writer's-key requests are unchanged.
+- Cap every pool answer (#1906): generation and the identity listing at
+  1 MiB, an embeddings batch at 8 MiB, read incrementally and refused one
+  byte over with the new `PoolResponseTooLargeError`, which is distinct from
+  an unreachable pool and from an undecodable answer.
 - Free the admission slot of a failed create (#2019, owner decision R2-3).
   Reconcile now reports every failed create that still owns provider
   resources as `incomplete_create` (a handoff failure after `provision()`
