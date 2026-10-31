@@ -40,7 +40,9 @@ _LOGGER = logging.getLogger(__name__)
 # listener binds the Machine interface behind the exact edge-header gate.
 _HOST: Final[str] = str(IPv4Address(0))
 _PORT: Final[int] = 8080
-_MAX_LIVE_ALLOCATIONS: Final[int] = 5
+# Owner decision R2-3: the managed-vault release admits at most fifteen live
+# vaults. Operators may run tighter; the parser refuses anything looser.
+_RELEASE_MAX_LIVE_ALLOCATIONS: Final[int] = 15
 _REPLAY_BODY_CEILING: Final[int] = 1024 * 1024
 _FLY_KILL_TIMEOUT_SECONDS: Final[float] = 300.0
 _FLEET_CLEAN: Final[int] = 0
@@ -221,7 +223,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", default=_HOST, choices=(_HOST,))
     parser.add_argument("--port", type=int, default=_PORT, choices=(_PORT,))
-    parser.add_argument("--maximum-live-allocations", type=int, default=5, choices=(5,))
+    parser.add_argument(
+        "--maximum-live-allocations",
+        type=_release_bounded_allocations,
+        default=_RELEASE_MAX_LIVE_ALLOCATIONS,
+    )
     parser.add_argument("--disable-new-activations", action="store_true")
     parser.add_argument(
         "--oauth-authorization-server",
@@ -279,8 +285,6 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
     args.oauth_resource_url = mcp_resource_url(public_vault_url(expected_origin))
     if args.max_body_bytes != _REPLAY_BODY_CEILING:
         parser.error("--max-body-bytes must equal Fly replay's one MiB ceiling")
-    if args.maximum_live_allocations != _MAX_LIVE_ALLOCATIONS:
-        parser.error("--maximum-live-allocations must equal five for the pilot")
     if args.database.parent != args.secret_state_directory.parent:
         parser.error("database and encrypted runtime state must share one volume")
     reconcile_values = (
@@ -513,6 +517,16 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _release_bounded_allocations(value: str) -> int:
+    """Parse a live-allocation cap between one and the release cap inclusive."""
+    parsed = _positive_int(value)
+    if parsed > _RELEASE_MAX_LIVE_ALLOCATIONS:
+        raise argparse.ArgumentTypeError(
+            f"must not exceed the release cap of {_RELEASE_MAX_LIVE_ALLOCATIONS}"
+        )
     return parsed
 
 

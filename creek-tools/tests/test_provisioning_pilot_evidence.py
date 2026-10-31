@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from creek_mcp.provisioning import fly_pilot_deploy, pilot_cli
 from creek_mcp.provisioning.pilot_evidence import (
     ARTIFACT_KINDS,
     CostFacts,
@@ -68,9 +69,10 @@ def _document(tmp_path: Path) -> dict[str, Any]:
         },
         "authorization": {
             "dedicated_organization": True,
-            "max_live_allocations": 5,
+            # The evidence records the same figures the deploy and CLI pin (R2-3).
+            "max_live_allocations": pilot_cli._RELEASE_MAX_LIVE_ALLOCATIONS,
             "currency": "USD",
-            "monthly_alert_usd_cents": 2500,
+            "monthly_alert_usd_cents": fly_pilot_deploy._PILOT_SPEND_CAP_USD_CENTS,
             "region_recorded": True,
             "cleanup_owner_recorded": True,
         },
@@ -254,7 +256,10 @@ def test_reducer_emits_closed_content_free_passed_prerequisite(tmp_path: Path) -
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        (("authorization", "monthly_alert_usd_cents"), 2499),
+        (("authorization", "monthly_alert_usd_cents"), 2500),
+        (("authorization", "monthly_alert_usd_cents"), 5999),
+        (("authorization", "max_live_allocations"), 16),
+        (("authorization", "max_live_allocations"), 0),
         (("credentials", "personal_token_values"), 1),
         (("credentials", "secret_values_in_environment"), 1),
         (("credentials", "deploy_token_age_seconds"), 604801),

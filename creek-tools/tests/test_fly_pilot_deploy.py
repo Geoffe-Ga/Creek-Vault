@@ -49,7 +49,7 @@ def _authorization(
     tmp_path: Path,
     *,
     cross_network: bool = True,
-    max_spend_usd_cents: int = 2500,
+    max_spend_usd_cents: int = 6000,
 ) -> tuple[Path, str]:
     path = tmp_path / "private-authorization.json"
     document = {
@@ -589,8 +589,13 @@ def test_deploy_refuses_inactive_or_overlong_runtime_token_before_provider(
     assert commands == []
 
 
-@pytest.mark.parametrize("max_spend_usd_cents", [0, 2499, 2501, True])
-def test_deploy_requires_the_exact_reviewed_twenty_five_dollar_cap(
+def test_pilot_spend_cap_is_the_r2_3_sixty_dollar_alert() -> None:
+    """Owner decision R2-3 pins the pilot spend authorization at USD 60.00."""
+    assert fly_pilot_deploy._PILOT_SPEND_CAP_USD_CENTS == 6000
+
+
+@pytest.mark.parametrize("max_spend_usd_cents", [0, 2500, 5999, 6001, True])
+def test_deploy_requires_the_exact_reviewed_sixty_dollar_cap(
     tmp_path: Path,
     max_spend_usd_cents: int,
 ) -> None:

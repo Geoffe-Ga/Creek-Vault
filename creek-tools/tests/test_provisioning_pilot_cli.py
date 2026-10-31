@@ -181,10 +181,10 @@ def test_composition_shares_state_and_exposes_one_attested_endpoint(
     assert router.closed is True
 
 
-def test_composition_rejects_split_state_or_non_five_cap_before_resources(
+def test_composition_rejects_split_state_before_resources(
     tmp_path: Path,
 ) -> None:
-    """The pilot cannot drift into split SQLite/secrets or an unreviewed cap."""
+    """The pilot cannot drift into split SQLite and encrypted runtime state."""
     parser = pilot_cli.build_parser()
     split = _arguments(tmp_path)
     state_index = split.index("--secret-state-directory") + 1
@@ -193,9 +193,42 @@ def test_composition_rejects_split_state_or_non_five_cap_before_resources(
     with pytest.raises(SystemExit):
         pilot_cli.compose(parser.parse_args(split), parser)
 
-    cap = [*_arguments(tmp_path), "--maximum-live-allocations", "4"]
-    with pytest.raises(SystemExit):
-        parser.parse_args(cap)
+
+def test_release_cap_is_fifteen_live_allocations_by_default(tmp_path: Path) -> None:
+    """Owner decision R2-3 caps the managed-vault fleet at fifteen vaults."""
+    parser = pilot_cli.build_parser()
+
+    assert pilot_cli._RELEASE_MAX_LIVE_ALLOCATIONS == 15
+    assert parser.parse_args(_arguments(tmp_path)).maximum_live_allocations == 15
+
+
+@pytest.mark.parametrize("cap", [1, 5, 15])
+def test_pilot_accepts_any_cap_up_to_the_release_value(
+    tmp_path: Path,
+    cap: int,
+) -> None:
+    """An operator may run tighter than release, never looser."""
+    parser = pilot_cli.build_parser()
+    arguments = [*_arguments(tmp_path), "--maximum-live-allocations", str(cap)]
+
+    assert parser.parse_args(arguments).maximum_live_allocations == cap
+
+
+@pytest.mark.parametrize("cap", ["0", "-1", "16", "150", "1.5", "true"])
+def test_pilot_refuses_a_cap_that_is_not_positive_or_exceeds_release(
+    tmp_path: Path,
+    cap: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A typo cannot close the fleet to zero or open it past the release cap."""
+    parser = pilot_cli.build_parser()
+    arguments = [*_arguments(tmp_path), "--maximum-live-allocations", cap]
+
+    with pytest.raises(SystemExit) as refused:
+        parser.parse_args(arguments)
+
+    assert refused.value.code == 2
+    assert "--maximum-live-allocations" in capsys.readouterr().err
 
 
 def test_scheduler_uses_provider_authoritative_report_and_stops_cleanly(

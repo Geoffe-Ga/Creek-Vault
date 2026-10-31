@@ -9,6 +9,17 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Bound the managed-vault fleet to owner decision R2-3 (#1998): cap 15
+  vaults, alert at USD 60/month. The admission count now uses reconcile's
+  live predicate, so `deleting`, failed-delete and `deleted` jobs free their
+  slot; `pending`, `provisioning`, `awaiting_key_ceremony`, `ready` and a
+  `failed` create still count, because a post-provision handoff failure keeps
+  its Machine running and `retry` re-enters `pending` without an admission
+  check. `creek-managed-vault-pilot --maximum-live-allocations` defaults to 15
+  and refuses zero, negative and above-release values. The Fly pilot deploy
+  helper requires `max_spend_usd_cents == 6000`, pilot evidence records the
+  same figures, and the runbook's policy file uses `monthly_budget = 60.00`.
+
 - Harden request-scoped BYOK (#1877, ADR-0015), contract `0.26.0`. A writer's
   key is sent only to the vendor's own API host: `ANTHROPIC_BASE_URL`,
   `OPENAI_BASE_URL`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` and both SDKs'
