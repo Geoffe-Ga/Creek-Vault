@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
+_ROOMY = ActivationAdmissionPolicy(maximum_live_allocations=15)
 _OUTCOME = DeletionOutcome(
     "fake",
     (
@@ -446,7 +447,7 @@ def test_only_a_retryable_failure_can_return_to_pending(
 
     assert failed.state is JobState.FAILED
     assert failed.failure_reason is FailureReason.PROVIDER_UNAVAILABLE
-    retried = store.retry(retryable.job_id, "adepthood", now=_NOW)
+    retried = store.retry(retryable.job_id, "adepthood", admission=_ROOMY, now=_NOW)
     assert retried.state is JobState.PENDING
 
     claimed_again = store.claim_next(now=_NOW)
@@ -460,7 +461,7 @@ def test_only_a_retryable_failure_can_return_to_pending(
     )
 
     with pytest.raises(InvalidJobTransitionError, match="not retryable"):
-        store.retry(permanent.job_id, "adepthood", now=_NOW)
+        store.retry(permanent.job_id, "adepthood", admission=_ROOMY, now=_NOW)
 
 
 def test_operator_requeues_only_first_provider_rejected_create_without_allocation(
@@ -480,10 +481,12 @@ def test_operator_requeues_only_first_provider_rejected_create_without_allocatio
 
     recovered = store.requeue_failed_create(
         job.job_id,
+        admission=_ROOMY,
         now=_NOW + timedelta(minutes=1),
     )
     replay = store.requeue_failed_create(
         job.job_id,
+        admission=_ROOMY,
         now=_NOW + timedelta(minutes=2),
     )
 
@@ -502,7 +505,9 @@ def test_operator_requeues_only_first_provider_rejected_create_without_allocatio
         now=_NOW + timedelta(minutes=3),
     )
     with pytest.raises(InvalidJobTransitionError, match="not a recoverable create"):
-        store.requeue_failed_create(job.job_id, now=_NOW + timedelta(minutes=4))
+        store.requeue_failed_create(
+            job.job_id, admission=_ROOMY, now=_NOW + timedelta(minutes=4)
+        )
 
 
 def test_a_prior_create_retry_does_not_make_a_later_delete_retryable(
@@ -519,12 +524,12 @@ def test_a_prior_create_retry_does_not_make_a_later_delete_retryable(
         retryable=True,
         now=_NOW,
     )
-    store.retry(job.job_id, "adepthood", now=_NOW)
+    store.retry(job.job_id, "adepthood", admission=_ROOMY, now=_NOW)
     deleting = store.request_delete(job.job_id, "adepthood", now=_NOW)
 
     assert deleting.state is JobState.DELETING
     with pytest.raises(InvalidJobTransitionError, match="not retryable"):
-        store.retry(job.job_id, "adepthood", now=_NOW)
+        store.retry(job.job_id, "adepthood", admission=_ROOMY, now=_NOW)
 
 
 def test_concurrent_retries_of_a_failed_delete_remain_idempotent(
@@ -546,7 +551,11 @@ def test_concurrent_retries_of_a_failed_delete_remain_idempotent(
     with ThreadPoolExecutor(max_workers=8) as executor:
         states = list(
             executor.map(
-                lambda _: store.retry(job.job_id, "adepthood", now=_NOW).state,
+                lambda _: (
+                    store.retry(
+                        job.job_id, "adepthood", admission=_ROOMY, now=_NOW
+                    ).state
+                ),
                 range(16),
             )
         )
@@ -1129,15 +1138,21 @@ def _fill_cap_with(
         (_occupant_deleting, (JobState.DELETING, JobOperation.DELETE)),
         (_occupant_failed_delete, (JobState.FAILED, JobOperation.DELETE)),
         (_occupant_deleted, (JobState.DELETED, JobOperation.DELETE)),
+        (_occupant_failed_create, (JobState.FAILED, JobOperation.CREATE)),
     ],
-    ids=["deleting", "failed-delete", "deleted"],
+    ids=["deleting", "failed-delete", "deleted", "failed-create"],
 )
 def test_jobs_releasing_their_vault_leave_an_admission_slot_free(
     store: ProvisioningStore,
     occupant: Callable[[ProvisioningStore, str], None],
     expected: tuple[JobState, JobOperation],
 ) -> None:
-    """A deletion in flight, failed, or confirmed no longer uses a slot (R2-3)."""
+    """A deletion in flight, failed, or confirmed no longer uses a slot (R2-3).
+
+    Nor does a failed create (#2019): reconcile reports any provider leftovers
+    it holds, and ``retry`` / ``requeue_failed_create`` re-admit it through the
+    same fence before it can hold a slot again.
+    """
     _fill_cap_with(store, occupant, expected)
 
     admitted = store.submit(
@@ -1161,21 +1176,15 @@ def test_jobs_releasing_their_vault_leave_an_admission_slot_free(
             (JobState.AWAITING_KEY_CEREMONY, JobOperation.CREATE),
         ),
         (_occupant_ready, (JobState.READY, JobOperation.CREATE)),
-        (_occupant_failed_create, (JobState.FAILED, JobOperation.CREATE)),
     ],
-    ids=["pending", "provisioning", "awaiting-key-ceremony", "ready", "failed-create"],
+    ids=["pending", "provisioning", "awaiting-key-ceremony", "ready"],
 )
 def test_jobs_holding_or_acquiring_a_vault_use_an_admission_slot(
     store: ProvisioningStore,
     occupant: Callable[[ProvisioningStore, str], None],
     expected: tuple[JobState, JobOperation],
 ) -> None:
-    """Live states, and a failed create that may still hold a Machine, count.
-
-    A post-provision handoff failure settles ``failed`` while its Machine keeps
-    running, and ``retry`` returns a failed create to ``pending`` without an
-    admission check, so freeing its slot would let the fleet exceed the cap.
-    """
+    """Every live state counts against the cap, and a refusal writes nothing."""
     _fill_cap_with(store, occupant, expected)
     jobs_before = store.count_jobs()
     aliases_before = store.count_activation_ids()
@@ -1203,11 +1212,184 @@ def test_live_job_states_name_every_state_that_holds_or_acquires_a_vault() -> No
     )
 
 
-def test_admission_count_binds_every_live_state_and_the_failed_create() -> None:
-    """The literal SQL has exactly one placeholder per bound state value."""
+def test_admission_count_binds_exactly_the_live_states() -> None:
+    """The literal SQL has one placeholder per live state and nothing else (#2019)."""
     assert _ADMISSION_COUNT_SQL.count("?") == len(_ADMISSION_COUNT_PARAMETERS)
     assert (
-        *(state.value for state in LIVE_JOB_STATES),
-        JobState.FAILED.value,
-        JobOperation.CREATE.value,
-    ) == _ADMISSION_COUNT_PARAMETERS
+        tuple(state.value for state in LIVE_JOB_STATES) == _ADMISSION_COUNT_PARAMETERS
+    )
+    assert "failed" not in _ADMISSION_COUNT_SQL
+    assert "operation" not in _ADMISSION_COUNT_SQL
+
+
+def _failed_create(
+    store: ProvisioningStore,
+    name: str,
+    reason: FailureReason = FailureReason.PROVIDER_UNAVAILABLE,
+) -> str:
+    """Leave one first-attempt create failed, retryable unless rejected."""
+    job = store.submit(name, name, requester_identity="adepthood", now=_NOW)
+    claim = store.claim_next(now=_NOW)
+    assert claim is not None
+    store.record_failure(
+        job.job_id,
+        claim.lease_token,
+        reason,
+        retryable=reason is not FailureReason.PROVIDER_REJECTED,
+        now=_NOW,
+    )
+    return job.job_id
+
+
+def _fill_two_slots(store: ProvisioningStore) -> None:
+    """Occupy both slots of ``_ADMISSION_CAP_TWO`` with live vaults."""
+    _occupant_ready(store, "occupant-ready")
+    _occupant_pending(store, "occupant-pending")
+
+
+def _closed_gate_policy() -> ActivationAdmissionPolicy:
+    """Return a roomy policy whose runtime gate is closed (R2-4)."""
+    return ActivationAdmissionPolicy(
+        maximum_live_allocations=15,
+        runtime_gate=lambda: False,
+    )
+
+
+def test_a_failed_create_no_longer_occupies_an_admission_slot(
+    store: ProvisioningStore,
+) -> None:
+    """With one live vault and two failed creates, a cap of two still admits."""
+    _occupant_ready(store, "occupant-ready")
+    _failed_create(store, "failed-handoff", FailureReason.HANDOFF_FAILED)
+    _failed_create(store, "failed-rejected", FailureReason.PROVIDER_REJECTED)
+
+    admitted = store.submit(
+        "activation-beside-failures",
+        "user-beside-failures",
+        requester_identity="adepthood",
+        admission=_ADMISSION_CAP_TWO,
+        now=_NOW,
+    )
+
+    assert admitted.state is JobState.PENDING
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [_ADMISSION_CAP_TWO, ActivationAdmissionPolicy(new_activations_enabled=False)],
+    ids=["at-cap", "disabled"],
+)
+def test_retry_of_a_failed_create_is_refused_by_admission_and_writes_nothing(
+    store: ProvisioningStore,
+    policy: ActivationAdmissionPolicy,
+) -> None:
+    """A requester retry re-enters ``pending`` only through the admission fence."""
+    job_id = _failed_create(store, "failed-retry")
+    _fill_two_slots(store)
+    before = store.get(job_id, "adepthood")
+
+    with pytest.raises(ActivationAdmissionError, match="new activation unavailable"):
+        store.retry(job_id, "adepthood", admission=policy, now=_NOW)
+
+    assert store.get(job_id, "adepthood") == before
+    assert before is not None and before.state is JobState.FAILED
+    assert before.retryable is True
+
+
+def test_retry_of_a_failed_create_honours_the_runtime_gate(
+    store: ProvisioningStore,
+) -> None:
+    """A closed R2-4 gate refuses the retry; reopened, the same retry is admitted."""
+    job_id = _failed_create(store, "failed-gated")
+    is_open = [False]
+    policy = ActivationAdmissionPolicy(
+        maximum_live_allocations=15,
+        runtime_gate=lambda: is_open[0],
+    )
+    before = store.get(job_id, "adepthood")
+
+    with pytest.raises(ActivationAdmissionError):
+        store.retry(job_id, "adepthood", admission=policy, now=_NOW)
+    assert store.get(job_id, "adepthood") == before
+
+    is_open[0] = True
+    retried = store.retry(job_id, "adepthood", admission=policy, now=_NOW)
+
+    assert retried.state is JobState.PENDING
+
+
+def test_retry_of_a_failed_create_is_admitted_beside_a_free_slot(
+    store: ProvisioningStore,
+) -> None:
+    """Under the cap the retry proceeds, and then occupies the slot it took."""
+    job_id = _failed_create(store, "failed-admitted")
+    _occupant_ready(store, "occupant-ready")
+
+    retried = store.retry(job_id, "adepthood", admission=_ADMISSION_CAP_TWO, now=_NOW)
+
+    assert retried.state is JobState.PENDING
+    with pytest.raises(ActivationAdmissionError):
+        store.submit(
+            "activation-after-retry",
+            "user-after-retry",
+            requester_identity="adepthood",
+            admission=_ADMISSION_CAP_TWO,
+            now=_NOW,
+        )
+
+
+def test_concurrent_retries_of_failed_creates_cannot_cross_the_cap(
+    store: ProvisioningStore,
+) -> None:
+    """The count and the transition share one SQLite write fence."""
+    job_ids = [_failed_create(store, f"failed-race-{n}") for n in range(4)]
+    _occupant_ready(store, "occupant-ready")
+
+    def attempt(job_id: str) -> str:
+        try:
+            store.retry(job_id, "adepthood", admission=_ADMISSION_CAP_TWO, now=_NOW)
+        except ActivationAdmissionError:
+            return "refused"
+        return "admitted"
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        outcomes = sorted(executor.map(attempt, job_ids))
+
+    assert outcomes == ["admitted", "refused", "refused", "refused"]
+
+
+def test_retry_of_a_failed_delete_is_never_refused_by_admission(
+    store: ProvisioningStore,
+) -> None:
+    """Teardown frees a slot, so neither the cap nor a closed gate may block it."""
+    job_id = _ready_job(store, "delete-retry", "alloc-delete-retry")
+    store.request_delete(job_id, "adepthood", now=_NOW)
+    _fail_delete(store, job_id, retryable=True)
+    _fill_two_slots(store)
+
+    retried = store.retry(
+        job_id, "adepthood", admission=_closed_gate_policy(), now=_NOW
+    )
+
+    assert retried.state is JobState.DELETING
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [_ADMISSION_CAP_TWO, _closed_gate_policy()],
+    ids=["at-cap", "gate-closed"],
+)
+def test_requeue_failed_create_is_refused_by_admission_and_writes_nothing(
+    store: ProvisioningStore,
+    policy: ActivationAdmissionPolicy,
+) -> None:
+    """The operator requeue re-admits through the same fence as a new create."""
+    job_id = _failed_create(store, "rejected", FailureReason.PROVIDER_REJECTED)
+    _fill_two_slots(store)
+    before = store.get(job_id, "adepthood")
+
+    with pytest.raises(ActivationAdmissionError, match="new activation unavailable"):
+        store.requeue_failed_create(job_id, admission=policy, now=_NOW)
+
+    assert store.get(job_id, "adepthood") == before
+    assert before is not None and before.state is JobState.FAILED

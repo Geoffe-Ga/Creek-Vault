@@ -56,19 +56,16 @@ LIVE_JOB_STATES: Final[tuple[JobState, ...]] = (
     JobState.AWAITING_KEY_CEREMONY,
     JobState.READY,
 )
-# A failed create also holds its slot: a post-provision handoff failure leaves
-# a running Machine reconcile does not flag, and ``retry`` re-enters ``pending``
-# without an admission check. This is reconcile's ``_is_live`` predicate.
-# The SQL text is a literal; every state is bound from the constants below, one
-# placeholder per value (a test pins that the two stay in step).
+# A failed create does not hold a slot (#2019): reconcile reports any provider
+# leftovers it holds as ``incomplete_create``, and ``retry`` /
+# ``requeue_failed_create`` re-admit it through this same count before it can
+# return to ``pending``. The SQL text is a literal; every state is bound from
+# the constant above, one placeholder per value (a test pins the two in step).
 _ADMISSION_COUNT_SQL: Final[str] = (
-    "SELECT COUNT(*) FROM provisioning_jobs "
-    "WHERE state IN (?, ?, ?, ?) OR (state = ? AND operation = ?)"
+    "SELECT COUNT(*) FROM provisioning_jobs WHERE state IN (?, ?, ?, ?)"
 )
-_ADMISSION_COUNT_PARAMETERS: Final[tuple[str, ...]] = (
-    *(state.value for state in LIVE_JOB_STATES),
-    JobState.FAILED.value,
-    JobOperation.CREATE.value,
+_ADMISSION_COUNT_PARAMETERS: Final[tuple[str, ...]] = tuple(
+    state.value for state in LIVE_JOB_STATES
 )
 
 _REQUESTER_MIGRATIONS: Final[dict[str, tuple[str, str]]] = {
@@ -452,7 +449,7 @@ class ProvisioningStore:
         connection: sqlite3.Connection,
         admission: ActivationAdmissionPolicy,
     ) -> None:
-        """Refuse new ids before any alias or job mutation can cross the cap."""
+        """Refuse a new or re-admitted create before any write can cross the cap."""
         gate = admission.runtime_gate
         if not admission.new_activations_enabled or (gate is not None and not gate()):
             raise ActivationAdmissionError("new activation unavailable")
@@ -595,9 +592,16 @@ class ProvisioningStore:
         job_id: str,
         requester_identity: str,
         *,
+        admission: ActivationAdmissionPolicy,
         now: datetime | None = None,
     ) -> ProvisioningJob:
-        """Requeue a failed operation only when its recorded policy permits retry."""
+        """Requeue a failed operation only when its recorded policy permits retry.
+
+        A failed create holds no admission slot, so returning it to ``pending``
+        is re-admitted under *admission* inside this write fence; a refusal
+        raises ``ActivationAdmissionError`` and writes nothing.  A failed
+        delete frees a slot, so its retry is never gated.
+        """
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
             row = self._owned_job(connection, job_id, requester_identity)
@@ -619,6 +623,8 @@ class ProvisioningStore:
                 if row["operation"] == JobOperation.DELETE.value
                 else JobState.PENDING
             )
+            if target is JobState.PENDING:
+                self._require_activation_capacity(connection, admission)
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, "
                 "retry_count = retry_count + 1, "
@@ -1008,13 +1014,16 @@ class ProvisioningStore:
         self,
         job_id: str,
         *,
+        admission: ActivationAdmissionPolicy,
         now: datetime | None = None,
     ) -> ProvisioningJob:
         """Requeue one first-attempt provider rejection with no allocation.
 
         This operator seam is deliberately narrower than the requester retry
         endpoint.  The fleet reconciler calls it only after provider inventory
-        proves the deterministic allocation has no Machine or volume.
+        proves the deterministic allocation has no Machine or volume.  Like
+        ``retry``, it re-admits under *admission* inside the write fence and
+        writes nothing when that refuses (#2019).
         """
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
@@ -1044,6 +1053,7 @@ class ProvisioningStore:
                 or int(row["retry_count"]) != 0
             ):
                 raise InvalidJobTransitionError("job is not a recoverable create")
+            self._require_activation_capacity(connection, admission)
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, retry_count = 1, "
                 "failure_reason = NULL, updated_at = ? WHERE job_id = ?",

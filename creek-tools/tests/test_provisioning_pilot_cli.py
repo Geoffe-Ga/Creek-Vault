@@ -21,7 +21,7 @@ from creek_mcp.provisioning.pilot_supervisor import (
     PilotSupervisor,
     SupervisedComponent,
 )
-from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.store import ActivationAdmissionPolicy, ProvisioningStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -860,3 +860,57 @@ def test_failed_delivery_still_counts_as_a_fresh_provider_report(
 
     assert sink.attempts == [("stuck_deletion",)]
     assert freshness() is True
+
+
+def test_scheduler_hands_the_admission_policy_only_to_the_reconcile_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2019: a requeued failed create re-enters through the control plane's fence.
+
+    The report pass never repairs, so it receives no policy at all.
+    """
+    parser = pilot_cli.build_parser()
+    args = parser.parse_args(
+        [
+            *_arguments(tmp_path),
+            "--reconcile-interval-seconds",
+            "10",
+            "--reconcile-interruption-window-seconds",
+            "3",
+        ]
+    )
+    stop = Event()
+    admission = ActivationAdmissionPolicy(maximum_live_allocations=15)
+    received: list[tuple[str, object]] = []
+
+    def fake_main(arguments: list[str], **kwargs: object) -> int:
+        received.append((arguments[0], kwargs.get("admission", "absent")))
+        if arguments[0] == "reconcile":
+            stop.set()
+        return 0
+
+    clock = iter((0.0, 10.0, 10.0, 12.0))
+    monkeypatch.setattr(pilot_cli, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(pilot_cli.fleet_cli, "main", fake_main)
+
+    pilot_cli._run_scheduler(args, stop, admission=admission)
+
+    assert received == [("report", "absent"), ("reconcile", admission)]
+
+
+def test_pilot_admission_policy_matches_the_control_plane_and_shares_its_gate(
+    tmp_path: Path,
+) -> None:
+    """The fleet's re-admission fence is the one ``POST /activations`` uses."""
+    args = pilot_cli.build_parser().parse_args(
+        [*_arguments(tmp_path), "--maximum-live-allocations", "7"]
+    )
+    gate = AdmissionGate()
+
+    policy = pilot_cli.control_cli.admission_policy(args, gate)
+
+    assert policy == ActivationAdmissionPolicy(
+        new_activations_enabled=True, maximum_live_allocations=7
+    )
+    assert policy.runtime_gate is gate

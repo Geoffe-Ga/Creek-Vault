@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import math
 import os
@@ -36,6 +37,8 @@ from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from creek_mcp.provisioning.store import ActivationAdmissionPolicy
 
 _LOGGER = logging.getLogger(__name__)
 # The generic CLIs keep their non-loopback TLS refusal. This dedicated Fly-only
@@ -320,6 +323,8 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
     # cannot be delivered, and the control plane refuses new activations.
     admission_gate = AdmissionGate()
     control = control_cli.compose(args, parser, admission_gate=admission_gate)
+    # #2019: reconcile resumes a failed create only through this same fence.
+    admission = control_cli.admission_policy(args, admission_gate)
     worker: worker_cli.WorkerBundle | None = None
     router: routing_cli.ReplayRoutingBundle | None = None
     alerts: HttpFleetAlertSink | None = None
@@ -383,6 +388,7 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
                         stop,
                         fleet_fresh,
                         relay,
+                        admission=admission,
                     ),
                     ready=fleet_fresh,
                 ),
@@ -439,8 +445,13 @@ def _run_scheduler(
     stop: Event,
     freshness: _FleetFreshness | None = None,
     alerts: AlertRelay | None = None,
+    *,
+    admission: ActivationAdmissionPolicy | None = None,
 ) -> None:
-    """Serialize reports and optional repairs on explicit bounded cadences."""
+    """Serialize reports and optional repairs on explicit bounded cadences.
+
+    Only the reconcile pass repairs, so only it receives *admission* (#2019).
+    """
     next_reconcile = (
         monotonic() + args.reconcile_interval_seconds
         if args.reconcile_interval_seconds is not None
@@ -451,7 +462,7 @@ def _run_scheduler(
         now = monotonic()
         if next_reconcile is not None and now >= next_reconcile:
             started = monotonic()
-            _run_fleet_pass(args, "reconcile", alerts)
+            _run_fleet_pass(args, "reconcile", alerts, admission)
             elapsed = monotonic() - started
             if elapsed > args.reconcile_interruption_window_seconds:
                 raise RuntimeError("scheduled reconcile exceeded its accepted window")
@@ -465,6 +476,7 @@ def _run_fleet_pass(
     args: argparse.Namespace,
     command: str,
     alerts: AlertRelay | None,
+    admission: ActivationAdmissionPolicy | None = None,
 ) -> None:
     """Run one provider pass and hand its alerts to the retaining relay.
 
@@ -472,15 +484,20 @@ def _run_fleet_pass(
     refuses new activations instead of stopping the scheduler, so the pass
     still counts as a completed provider-authoritative report.
     """
+    run = (
+        fleet_cli.main
+        if admission is None
+        else functools.partial(fleet_cli.main, admission=admission)
+    )
     if alerts is not None:
-        exit_code = fleet_cli.main(
+        exit_code = run(
             _fleet_arguments(args, command),
             emit_output=False,
             alert_sink=alerts.collect,
         )
         alerts.flush()
     else:
-        exit_code = fleet_cli.main(
+        exit_code = run(
             _fleet_arguments(args, command),
             emit_output=False,
         )

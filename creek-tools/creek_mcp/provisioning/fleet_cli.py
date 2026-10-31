@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from creek_mcp.provisioning.budget import Alert, PolicyFile
     from creek_mcp.provisioning.inventory import FleetInventorySource, FleetStopper
     from creek_mcp.provisioning.models import FleetJob, FleetTelemetry
+    from creek_mcp.provisioning.store import ActivationAdmissionPolicy
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_API_BASE_URL: Final[str] = "https://api.machines.dev"
@@ -266,8 +267,14 @@ def main(
     clock: Callable[[], datetime] | None = None,
     emit_output: bool = True,
     alert_sink: Callable[[tuple[str, ...]], None] | None = None,
+    admission: ActivationAdmissionPolicy | None = None,
 ) -> int:
-    """Run one fleet command; the supervised pilot suppresses private output."""
+    """Run one fleet command; the supervised pilot suppresses private output.
+
+    *admission* is the control plane's create fence.  ``reconcile`` resumes a
+    recoverable failed create only through it, so without one (the standalone
+    operator CLI) such a create is reported but never resumed (#2019).
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     store = ProvisioningStore(args.database)
@@ -296,6 +303,7 @@ def main(
             month=month,
             emit_output=emit_output,
             alert_sink=alert_sink,
+            admission=admission,
             extra_alerts=() if credential_alert is None else (credential_alert,),
         )
     finally:
@@ -356,6 +364,7 @@ def _run_report(
     month: str | None,
     emit_output: bool,
     alert_sink: Callable[[tuple[str, ...]], None] | None,
+    admission: ActivationAdmissionPolicy | None,
     extra_alerts: tuple[Alert, ...] = (),
 ) -> int:
     """Run one pass, optionally emitting the private operator report."""
@@ -366,6 +375,7 @@ def _run_report(
         policy_file.policy,
         extra_app_names=app_names,
         usage=policy_file.usage,
+        admission=admission,
     )
     try:
         report = reconciler.run_once(

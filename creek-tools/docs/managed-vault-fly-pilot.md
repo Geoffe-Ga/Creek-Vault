@@ -15,13 +15,19 @@ plus the operator's monitoring destination is the alert. A free allowance is
 not a cap.
 
 A job uses an admission slot while it holds, or is acquiring, a provider
-allocation: `pending`, `provisioning`, `awaiting_key_ceremony`, `ready`, and a
-`failed` create. A failed create keeps its slot because a post-provision
-handoff failure leaves its app, Machine, and volume running, and `retry`
-returns it to `pending` without a second admission check. A job that is
-releasing its vault (`deleting`, a `failed` delete, or `deleted`) frees its
-slot. Spend from a deletion the provider has not yet confirmed is guarded by
-the USD 60.00 alert and the `stuck_deletion` report, not by the cap.
+allocation: `pending`, `provisioning`, `awaiting_key_ceremony`, and `ready`.
+A `failed` create frees its slot (#2019). If it left provider resources
+behind (a post-provision handoff failure leaves its app, Machine, and volume
+running), every fleet report flags them as `incomplete_create`, and
+`continuous_running` still stops an overrunning Machine. Its return to
+`pending`, by requester `retry` or by the reconciler's resume of a
+first-attempt rejection, is re-admitted through the same fence as a new
+activation: the cap, `--disable-new-activations`, and the R2-4 alert gate all
+apply, and a refusal writes nothing. A job that is releasing its vault
+(`deleting`, a `failed` delete, or `deleted`) frees its slot. Spend from a
+deletion the provider has not yet confirmed, or from a failed create's
+leftovers, is guarded by the USD 60.00 alert and the fleet report, not by the
+cap.
 
 ## 1. Freeze and authorize the coordinates
 
@@ -302,8 +308,8 @@ Each scheduled report captures provider inventory and fails visibly for:
 - `orphan_resource`;
 - `stuck_deletion`;
 - `continuous_running`;
-- `incomplete_create` when a failed create remains terminal after bounded
-  reconciliation;
+- `incomplete_create` when a failed create still owns provider resources, or
+  a provider rejection remains terminal after bounded reconciliation;
 - `monthly_budget_departure`;
 - `provider_credential_expiring` when the recorded Fly token expiry is within
   the warning window (72 hours by default), has passed, or was never recorded

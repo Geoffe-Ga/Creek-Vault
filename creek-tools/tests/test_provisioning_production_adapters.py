@@ -26,7 +26,7 @@ from creek_mcp.provisioning.production_secrets import (
     EncryptedFileRoutingCredentialVerifier,
 )
 from creek_mcp.provisioning.routing import RoutingPrincipal
-from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.store import ActivationAdmissionPolicy, ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
 from tests.fly_support import (
     PROVIDER_TOKEN,
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _NOW = datetime(2026, 9, 13, 12, tzinfo=UTC)
+_ADMISSION = ActivationAdmissionPolicy()
 _CONSUMER = "adepthood-user-001"
 _ACTIVATION = "activation-production-001"
 _REQUESTER = "adepthood"
@@ -587,7 +588,7 @@ def test_real_adapters_reconcile_full_fake_provider_and_callback_lifecycle(
     create_rotation = "rotated-fly-provider-create-canary"
     api.provider_token = create_rotation
     _owner_file(fly_token_file, create_rotation.encode())
-    store.retry(job.job_id, _CONSUMER, now=_NOW)
+    store.retry(job.job_id, _CONSUMER, admission=_ADMISSION, now=_NOW)
     driver = fly_driver_from_file(api, fly_token_file, secrets)
     worker = ProvisioningWorker(store, driver, handoff)
     assert worker.run_once(now=_NOW)
@@ -619,7 +620,7 @@ def test_real_adapters_reconcile_full_fake_provider_and_callback_lifecycle(
     delete_rotation = "rotated-fly-provider-delete-canary"
     api.provider_token = delete_rotation
     _owner_file(fly_token_file, delete_rotation.encode())
-    store.retry(job.job_id, _CONSUMER, now=_NOW)
+    store.retry(job.job_id, _CONSUMER, admission=_ADMISSION, now=_NOW)
     worker = ProvisioningWorker(
         store,
         fly_driver_from_file(api, fly_token_file, secrets),

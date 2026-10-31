@@ -7,6 +7,11 @@ stopping an overrunning Machine, requeueing a retryable failed delete, and
 resuming one first-attempt rejected create only when inventory proves that its
 deterministic app has no Machine or volume; the reconciler is typed against
 ``FleetInventorySource`` and ``FleetStopper`` and can call no delete.
+
+A failed create holds no admission slot (#2019), so every one that still owns
+provider resources is reported as ``incomplete_create``, and the resume above
+re-admits through the caller's ``ActivationAdmissionPolicy``; with no policy it
+is reported but never resumed.
 """
 
 from __future__ import annotations
@@ -36,7 +41,11 @@ from creek_mcp.provisioning.models import (
     ResourceClass,
     ResourceState,
 )
-from creek_mcp.provisioning.store import LIVE_JOB_STATES, InvalidJobTransitionError
+from creek_mcp.provisioning.store import (
+    LIVE_JOB_STATES,
+    ActivationAdmissionError,
+    InvalidJobTransitionError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -54,7 +63,10 @@ if TYPE_CHECKING:
         ProviderResource,
     )
     from creek_mcp.provisioning.models import FleetJob
-    from creek_mcp.provisioning.store import ProvisioningStore
+    from creek_mcp.provisioning.store import (
+        ActivationAdmissionPolicy,
+        ProvisioningStore,
+    )
 
 _LOGGER = logging.getLogger(__name__)
 _BYTES_PER_GB: Final[int] = 1024**3
@@ -134,7 +146,11 @@ def _jsonable(value: object) -> object:
 
 
 def _is_live(job: FleetJob) -> bool:
-    """Return whether *job* still owns (or is acquiring) provider resources."""
+    """Return whether *job* still owns (or is acquiring) provider resources.
+
+    A failed create is included although it holds no admission slot (#2019):
+    it may own a leftover Machine, which must be inventoried and reported.
+    """
     return job.job.state in _LIVE_STATES or (
         job.job.state is JobState.FAILED and job.job.operation is JobOperation.CREATE
     )
@@ -243,14 +259,20 @@ class FleetReconciler:
         *,
         extra_app_names: Sequence[str] = (),
         usage: InjectedUsage | None = None,
+        admission: ActivationAdmissionPolicy | None = None,
     ) -> None:
-        """Bind the durable store, narrow provider seams, and operator policy."""
+        """Bind the durable store, narrow provider seams, and operator policy.
+
+        *admission* is the control plane's create fence; a failed create is
+        resumed only through it, so ``None`` leaves every one reported.
+        """
         self._store = store
         self._inventory = inventory
         self._stopper = stopper
         self._policy = policy
         self._extra_app_names = tuple(extra_app_names)
         self._usage = usage
+        self._admission = admission
 
     def run_once(
         self,
@@ -370,32 +392,29 @@ class FleetReconciler:
         *,
         repair: bool,
     ) -> list[Divergence]:
-        """Report failed creates and recover only first-attempt empty residue."""
+        """Report failed creates and recover only first-attempt empty residue.
+
+        A provider rejection is always reported.  Any other failed create is
+        reported only while provider resources survive it - a handoff failure
+        after ``provision()`` leaves a running Machine (#2019).
+        """
         divergences: list[Divergence] = []
         for provider_allocation_id, entry in sorted(desired.items()):
             job = entry.job
             if not (
-                job.state is JobState.FAILED
-                and job.operation is JobOperation.CREATE
-                and job.failure_reason is FailureReason.PROVIDER_REJECTED
+                job.state is JobState.FAILED and job.operation is JobOperation.CREATE
             ):
                 continue
+            rejected = job.failure_reason is FailureReason.PROVIDER_REJECTED
             resources = tuple(groups.get(provider_allocation_id, ()))
+            if not (rejected or resources):
+                continue
             empty_app = len(resources) == 1 and (
                 resources[0].resource_class is ResourceClass.APP
             )
-            no_provider_residue = not resources
             disposition = Disposition.REPORTED
-            if repair and (empty_app or no_provider_residue):
-                try:
-                    self._store.requeue_failed_create(job.job_id, now=now)
-                except InvalidJobTransitionError:
-                    _LOGGER.info(
-                        "fleet repair skipped kind=incomplete_create subject=%s",
-                        job.job_id,
-                    )
-                else:
-                    disposition = Disposition.REPAIRED
+            if repair and rejected and (empty_app or not resources):
+                disposition = self._resume_create(job.job_id, now)
             divergences.append(
                 Divergence(
                     DivergenceKind.INCOMPLETE_CREATE,
@@ -407,6 +426,23 @@ class FleetReconciler:
                 )
             )
         return divergences
+
+    def _resume_create(self, job_id: str, now: datetime) -> Disposition:
+        """Re-admit one failed create; no policy or any refusal leaves it reported."""
+        admitted = self._admission is not None
+        if self._admission is not None:
+            try:
+                self._store.requeue_failed_create(
+                    job_id, admission=self._admission, now=now
+                )
+            except (ActivationAdmissionError, InvalidJobTransitionError):
+                admitted = False
+        if not admitted:
+            _LOGGER.info(
+                "fleet repair skipped kind=incomplete_create subject=%s", job_id
+            )
+            return Disposition.REPORTED
+        return Disposition.REPAIRED
 
     def _requeue(self, job_id: str, now: datetime) -> Disposition:
         """Requeue one failed delete; a concurrent transition leaves it reported."""
