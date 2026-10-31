@@ -589,9 +589,74 @@ to supply the evidence, not to buy a bigger model.
 
 ### Running it
 
-The eval is a library surface, driven from Python; it has no `bench.sh`
-subcommand, because supplying candidate outputs needs a model and no spend is
-authorized yet.
+`bench eval` (#1989) generates one candidate per named model, scores each in
+its own `run_eval`, and writes a ranked artifact:
+
+```bash
+./scripts/bench.sh eval --models gpt-oss-120b,glm-5.3,glm-5.3-flash \
+    --mode fake --judge hermetic --seed 17 --entries 16 --out eval.json
+```
+
+`--mode fake` and `--judge hermetic` are the defaults and the only combination
+the default test lane runs: no network, no key, no spend, and two runs at one
+seed write byte-identical files. Each model is then a deterministic
+`FakeCandidateSource`, so a fake run exercises the instrument and says nothing
+about any model; the artifact records `mode: fake`.
+
+**How a candidate is made.** `creek_mcp/bench/eval/candidates.py` builds one
+prompt from the synthetic corpus — every entry under its fragment id — and the
+Writing Desk instructions (word band, headings, banned phrases), and asks the
+`CandidateSource` once. Citations are parsed from `[[voice-0003]]` markers and
+kept as written: a fragment id the corpus does not contain stays on the
+candidate, scores zero on grounding, and is counted in the row's
+`invented_citations`. Because the prompt carries the corpus's own prose, voice
+match is judged rather than `unsupported` for these candidates (this is a fact
+about *this* prompt, not the production letter prompt #1880 describes).
+
+**Refusal does not discriminate between models, and the artifact says so.**
+The refusal probes are recorded by running Creek's acute-distress guard and
+tier ceiling, which refuse before any model is asked — `CARE_PROBE_TEXT` is
+never sent to a model and nothing INTIMATE reaches a provider. Every candidate
+therefore scores the same on that dimension. The artifact carries
+`non_discriminating_dimensions` naming it, with
+`discriminates_between_models: false`, and the ranking key ignores it.
+
+**Ranking.** Rows are ordered by verdict, then the number of dimensions at or
+above the pass line, then the weakest discriminating score, then model tag —
+never by a weighted average, which the rubric deliberately does not have. The
+basis is recorded in the artifact as `ranking_basis`. Each row carries its four
+dimension scores (with basis), the verdict, and that run's `EvalRecord`.
+
+**Reaching a provider takes an explicit flag and named credentials.** Nothing
+in CI does either:
+
+| Flag | Requires | Refused when |
+| --- | --- | --- |
+| `--mode live` | `--provider openai\|anthropic\|gemini`, `--api-key-env NAME` (and `--api-base URL` for an OpenAI-compatible endpoint) | either flag is absent, or the variable `NAME` is unset |
+| `--judge routed` | `--judge-provider`, `--judge-api-key-env NAME` (optionally `--judge-model`, `--judge-api-base`) | the same; the artifact records `judge: routed` |
+
+Live-only flags given without their mode are refused rather than ignored.
+Every source is built before the first call, and each provider still applies
+its own cloud-egress consent gate, so a missing consent stops the run before
+any model is billed. A run is bounded: at most five distinct models, one
+completion each, `--max-tokens` (default 800, at most 2048) per completion,
+and at most one judge call per model. A live candidate resolves through
+`ModelRouter.resolve_role("voice_drafter", OPEN)`, like the routed judge, so the
+routing chokepoint applies unchanged.
+
+A bounded pilot against an OpenAI-compatible confidential-inference proxy
+would look like this — an operator step, never run by the test suite:
+
+```bash
+export CREEK_CLOUD_CONSENT=1
+export PILOT_PROXY_KEY=...          # the key, held only in the environment
+./scripts/bench.sh eval --models gpt-oss-120b,glm-5.3,glm-5.3-flash \
+    --mode live --provider openai --api-base http://127.0.0.1:8080/v1 \
+    --api-key-env PILOT_PROXY_KEY --max-tokens 800 \
+    --judge hermetic --seed 17 --out eval-pilot.json
+```
+
+The library path is still available for hand-written candidates:
 
 ```python
 import tempfile
