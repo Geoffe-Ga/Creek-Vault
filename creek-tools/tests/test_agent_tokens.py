@@ -1064,13 +1064,21 @@ def test_an_offline_refusal_never_asks_the_issuer() -> None:
     assert status.queries == []
 
 
-@pytest.mark.parametrize("iat", [time.time() - 0.5, -1])
-def test_an_issued_at_the_contract_cannot_carry_is_refused_unasked(iat: float) -> None:
+@pytest.mark.parametrize("fractional", [True, False], ids=["fractional", "negative"])
+def test_an_issued_at_the_contract_cannot_carry_is_refused_unasked(
+    fractional: bool,
+) -> None:
     """A fractional or out-of-range ``iat`` is never sent; it is refused.
 
+    The fractional ``iat`` is computed in the body, not in the parametrize
+    list: a clock value there would give every xdist worker a different test
+    id, and the run would stop at collection.
+
     Args:
-        iat: An ``iat`` PyJWT accepts but the status contract does not.
+        fractional: Mint a just-issued fractional ``iat`` rather than a
+            negative one; PyJWT accepts both, the status contract neither.
     """
+    iat = time.time() - 0.5 if fractional else -1
     verifier, status = _revocable()
 
     assert asyncio.run(verifier.verify_token(mint(iat=iat))) is None
