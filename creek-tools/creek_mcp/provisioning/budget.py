@@ -489,6 +489,9 @@ class AlertKind(StrEnum):
     POOL_ADMIN_KEY_UNUSABLE = "pool_admin_key_unusable"
     POOL_ADMIN_KEY_REJECTED = "pool_admin_key_rejected"
     POOL_ADMIN_KEY_NEAR_EXPIRY = "pool_admin_key_near_expiry"
+    # The Fly provider refused the pilot's org token with a 401/403 (#1866):
+    # the pilot is degraded *now*, unlike an expiry warning ahead of time.
+    PROVIDER_CREDENTIAL_REJECTED = "provider_credential_rejected"
 
 
 @dataclass(frozen=True, slots=True)

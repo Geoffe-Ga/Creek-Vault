@@ -21,6 +21,7 @@ from creek_mcp.provisioning.pilot_supervisor import (
     PilotSupervisor,
     SupervisedComponent,
 )
+from creek_mcp.provisioning.provider_auth import ProviderAuthState
 from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
@@ -215,8 +216,11 @@ def test_composition_shares_state_and_exposes_one_attested_endpoint(
         assert client.get("/v1/health", headers=edge_headers).text == "router"
         assert client.get("/__fly/health").status_code == 503
     assert len(gates) == 1
-    assert isinstance(gates[0], AdmissionGate)
+    # One probe joins the R2-4 alert gate and the #1866 provider-auth state.
+    assert callable(gates[0])
+    assert gates[0]() is True
     assert isinstance(bundle.relay, AlertRelay)
+    assert isinstance(bundle.provider_auth, ProviderAuthState)
     bundle.close()
     assert worker.closed is True
     assert router.closed is True
@@ -229,13 +233,13 @@ def test_composition_shares_one_gate_between_alert_relay_and_control(
     """A failed alert delivery closes exactly the gate the control plane reads."""
     parser = pilot_cli.build_parser()
     args = parser.parse_args(_arguments(tmp_path))
-    gates: list[AdmissionGate] = []
+    gates: list[Callable[[], bool]] = []
 
     def fake_control(
         _namespace: object,
         _parser: object,
         *,
-        admission_gate: AdmissionGate,
+        admission_gate: Callable[[], bool],
     ) -> Starlette:
         gates.append(admission_gate)
         return _app("control")
@@ -259,7 +263,7 @@ def test_composition_shares_one_gate_between_alert_relay_and_control(
     bundle.relay.collect(("orphan_resource",))
     bundle.relay.flush()
 
-    assert gates[0].is_open is False
+    assert gates[0]() is False
     assert cast("_SyntheticSink", bundle.alerts).attempts == [("orphan_resource",)]
     bundle.close()
     assert cast("_SyntheticSink", bundle.alerts).closed is True
@@ -589,6 +593,7 @@ def test_worker_runner_sets_readiness_and_passes_exact_claim_policy(
         "poll_interval": timedelta(seconds=1),
         "fly_token_expires_at": bundle.fly_token_expires_at,
         "minimum_claim_validity": bundle.minimum_claim_validity,
+        "admit_claims": None,
     }
 
 

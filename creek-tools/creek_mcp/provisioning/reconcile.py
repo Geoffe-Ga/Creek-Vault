@@ -101,6 +101,14 @@ class ReconcileUnavailableError(RuntimeError):
     no repair ran (the idempotent key-ceremony expiry sweep has already run)."""
 
 
+class ProviderAuthenticationError(ReconcileUnavailableError):
+    """The provider refused the inventory credential itself (a ``401``/``403``).
+
+    A subclass, so every existing unavailability handler still applies; the
+    fleet CLI names it with its own exit code so the pilot can degrade (#1866).
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class FleetReport:
     """The content-free result of one reconciliation pass."""
@@ -325,6 +333,10 @@ class FleetReconciler:
                 app_names=self._extra_app_names,
             )
         except ProviderError as exc:
+            if exc.authentication_failed:
+                raise ProviderAuthenticationError(
+                    "provider refused the inventory credential"
+                ) from exc
             raise ReconcileUnavailableError(
                 "provider inventory is unavailable"
             ) from exc

@@ -360,6 +360,9 @@ def test_alert_vocabulary_is_exactly_seven_kinds_and_each_condition_maps_to_one(
         "pool_admin_key_unusable",
         "pool_admin_key_rejected",
         "pool_admin_key_near_expiry",
+        # #1866 (owner decision R2-4 extended): the Fly provider refused the
+        # pilot's credential, so the pilot degrades and alerts once.
+        "provider_credential_rejected",
     }
     assert alerts == (
         Alert(AlertKind.CONTINUOUS_RUNNING, "fly-hot", 7200, "7200", "7200"),

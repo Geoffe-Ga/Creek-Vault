@@ -32,10 +32,11 @@ from creek_mcp.provisioning.pilot_supervisor import (
     PilotSupervisor,
     SupervisedComponent,
 )
+from creek_mcp.provisioning.provider_auth import ProviderAuthState
 from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 _LOGGER = logging.getLogger(__name__)
 # The generic CLIs keep their non-loopback TLS refusal. This dedicated Fly-only
@@ -49,6 +50,7 @@ _REPLAY_BODY_CEILING: Final[int] = 1024 * 1024
 _FLY_KILL_TIMEOUT_SECONDS: Final[float] = 300.0
 _FLEET_CLEAN: Final[int] = 0
 _FLEET_ALERTS: Final[int] = 3
+_FLEET_PROVIDER_AUTH_FAILED: Final[int] = fleet_cli.EXIT_PROVIDER_AUTH_FAILED
 
 
 class _HealthBinding:
@@ -104,6 +106,7 @@ class PilotBundle:
     router: routing_cli.ReplayRoutingBundle = field(repr=False)
     alerts: HttpFleetAlertSink = field(repr=False)
     relay: AlertRelay = field(repr=False)
+    provider_auth: ProviderAuthState = field(repr=False)
 
     def close(self) -> None:
         """Release provider, callback, and credential-state resources."""
@@ -308,7 +311,12 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
     # Owner decision R2-4: the alert relay closes this gate while fleet alerts
     # cannot be delivered, and the control plane refuses new activations.
     admission_gate = AdmissionGate()
-    control = control_cli.compose(args, parser, admission_gate=admission_gate)
+    # #1866 extends R2-4 to a provider 401/403: while the provider refuses the
+    # credential, new activations and worker claims stop and health fails.
+    provider_auth = ProviderAuthState()
+    control = control_cli.compose(
+        args, parser, admission_gate=_all_admit(admission_gate, provider_auth)
+    )
     worker: worker_cli.WorkerBundle | None = None
     router: routing_cli.ReplayRoutingBundle | None = None
     alerts: HttpFleetAlertSink | None = None
@@ -362,7 +370,9 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
                 ),
                 SupervisedComponent(
                     "worker",
-                    lambda stop: _run_worker(worker, args, stop, worker_ready),
+                    lambda stop: _run_worker(
+                        worker, args, stop, worker_ready, provider_auth
+                    ),
                     ready=worker_ready.is_set,
                 ),
                 SupervisedComponent(
@@ -372,13 +382,16 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
                         stop,
                         fleet_fresh,
                         relay,
+                        provider_auth,
                     ),
-                    ready=fleet_fresh,
+                    ready=_all_admit(fleet_fresh, provider_auth),
                 ),
             )
         )
         health.bind(supervisor)
-        return PilotBundle(edge, supervisor, worker, router, alerts, relay)
+        return PilotBundle(
+            edge, supervisor, worker, router, alerts, relay, provider_auth
+        )
     except BaseException:
         if alerts is not None:
             alerts.close()
@@ -387,6 +400,11 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
         if worker is not None:
             worker.close()
         raise
+
+
+def _all_admit(*probes: Callable[[], bool]) -> Callable[[], bool]:
+    """Return one ``() -> bool`` probe that admits only while every probe does."""
+    return lambda: all(probe() for probe in probes)
 
 
 def _serve(server: uvicorn.Server, stop: Event) -> None:
@@ -411,6 +429,7 @@ def _run_worker(
     args: argparse.Namespace,
     stop: Event,
     ready: Event,
+    admit_claims: Callable[[], bool] | None = None,
 ) -> None:
     """Run durable claims from the same SQLite file until coordinated stop."""
     ready.set()
@@ -420,6 +439,7 @@ def _run_worker(
         poll_interval=timedelta(seconds=args.poll_interval_seconds),
         fly_token_expires_at=bundle.fly_token_expires_at,
         minimum_claim_validity=bundle.minimum_claim_validity,
+        admit_claims=admit_claims,
     )
 
 
@@ -428,55 +448,95 @@ def _run_scheduler(
     stop: Event,
     freshness: _FleetFreshness | None = None,
     alerts: AlertRelay | None = None,
+    provider: ProviderAuthState | None = None,
 ) -> None:
-    """Serialize reports and optional repairs on explicit bounded cadences."""
+    """Serialize reports and optional repairs on explicit bounded cadences.
+
+    A report the provider refused for its credential is not fresh: it skips
+    the repair and leaves health failed, but the loop keeps running (#1866).
+    """
     next_reconcile = (
         monotonic() + args.reconcile_interval_seconds
         if args.reconcile_interval_seconds is not None
         else None
     )
     while not stop.is_set():
-        _run_fleet_pass(args, "report", alerts)
-        now = monotonic()
-        if next_reconcile is not None and now >= next_reconcile:
-            started = monotonic()
-            _run_fleet_pass(args, "reconcile", alerts)
-            elapsed = monotonic() - started
-            if elapsed > args.reconcile_interruption_window_seconds:
-                raise RuntimeError("scheduled reconcile exceeded its accepted window")
-            next_reconcile = now + args.reconcile_interval_seconds
-        if freshness is not None:
-            freshness.mark()
+        if _run_fleet_pass(args, "report", alerts, provider):
+            next_reconcile = _reconcile_when_due(args, next_reconcile, alerts, provider)
+            if freshness is not None:
+                freshness.mark()
         stop.wait(args.fleet_interval_seconds)
+
+
+def _reconcile_when_due(
+    args: argparse.Namespace,
+    next_reconcile: float | None,
+    alerts: AlertRelay | None,
+    provider: ProviderAuthState | None,
+) -> float | None:
+    """Run one repair pass when its cadence is due; return the next due time."""
+    now = monotonic()
+    if next_reconcile is None or now < next_reconcile:
+        return next_reconcile
+    started = monotonic()
+    _run_fleet_pass(args, "reconcile", alerts, provider)
+    elapsed = monotonic() - started
+    if elapsed > args.reconcile_interruption_window_seconds:
+        raise RuntimeError("scheduled reconcile exceeded its accepted window")
+    return float(now + args.reconcile_interval_seconds)
 
 
 def _run_fleet_pass(
     args: argparse.Namespace,
     command: str,
     alerts: AlertRelay | None,
-) -> None:
+    provider: ProviderAuthState | None = None,
+) -> bool:
     """Run one provider pass and hand its alerts to the retaining relay.
 
     The relay contains a failed delivery (R2-4): it retries with backoff and
     refuses new activations instead of stopping the scheduler, so the pass
-    still counts as a completed provider-authoritative report.
+    still counts as a completed provider-authoritative report.  A provider
+    credential refusal degrades the same way when both the relay and the
+    *provider* state are composed (#1866), and returns false; without them it
+    stays a scheduler failure.
     """
-    if alerts is not None:
+    if alerts is None:
+        exit_code = fleet_cli.main(
+            _fleet_arguments(args, command),
+            emit_output=False,
+        )
+    else:
         exit_code = fleet_cli.main(
             _fleet_arguments(args, command),
             emit_output=False,
             alert_sink=alerts.collect,
         )
+        degraded = _record_provider_auth(exit_code, alerts, provider)
         alerts.flush()
-    else:
-        exit_code = fleet_cli.main(
-            _fleet_arguments(args, command),
-            emit_output=False,
-        )
+        if degraded:
+            return False
     if exit_code == _FLEET_ALERTS and alerts is None:
         raise RuntimeError("scheduled fleet alerts had no delivery transport")
     if exit_code not in {_FLEET_CLEAN, _FLEET_ALERTS}:
         raise RuntimeError(f"scheduled fleet {command} was not clean")
+    return True
+
+
+def _record_provider_auth(
+    exit_code: int,
+    alerts: AlertRelay,
+    provider: ProviderAuthState | None,
+) -> bool:
+    """Update *provider* from one pass; return whether the pass degraded."""
+    if provider is None:
+        return False
+    if exit_code == _FLEET_PROVIDER_AUTH_FAILED:
+        provider.record_failure(alerts.collect)
+        return True
+    if exit_code in {_FLEET_CLEAN, _FLEET_ALERTS}:
+        provider.record_success()
+    return False
 
 
 def _fleet_arguments(args: argparse.Namespace, command: str = "report") -> list[str]:

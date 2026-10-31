@@ -336,8 +336,14 @@ def run_loop(
     max_jobs: int | None = None,
     fly_token_expires_at: datetime | None = None,
     minimum_claim_validity: timedelta | None = None,
+    admit_claims: Callable[[], bool] | None = None,
 ) -> int:
-    """Process bounded claims until stopped, finishing the current claim safely."""
+    """Process bounded claims until stopped, finishing the current claim safely.
+
+    While *admit_claims* answers false the loop claims nothing and waits one
+    poll interval, then asks again: the pilot pauses provider work this way
+    while the provider refuses its credential (#1866), and resumes on recovery.
+    """
     interruptible_wait = wait or stop.wait
     observe = clock or _utc_now
     if (fly_token_expires_at is None) is not (minimum_claim_validity is None):
@@ -358,6 +364,9 @@ def run_loop(
                 "Fly credential rotation required; new claim admission closed"
             )
             break
+        if admit_claims is not None and not admit_claims():
+            interruptible_wait(poll_interval.total_seconds())
+            continue
         available = worker.run_once(now=observed_at)
         if available:
             processed += 1
