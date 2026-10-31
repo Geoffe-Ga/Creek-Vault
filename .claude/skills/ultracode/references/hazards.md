@@ -42,10 +42,11 @@ lane reports something strange, or when a gate looks suspiciously green.
   wall-clock far off is **runner eviction**. Re-run; do not debug.
 - **A timeout on an unreadable CI rollup proves nothing about the tree** — only
   that the classifier could not tell. Never convert it into a fix dispatch.
-- **`mergeStateStatus: CLEAN` says nothing about staleness.** Use `behind_by`.
-- **A false `behind` from a stale local ref destroys an LGTM for nothing.**
-  `git fetch` and re-check against the API first. And a *real* `behind` is still
-  mergeable when the file sets are disjoint.
+- **Behind `main` is not a merge blocker; a conflict is** (owner rule,
+  2026-10-31). Read GitHub's `mergeable` / `mergeStateStatus`, and treat a
+  `null` / `UNKNOWN` (still computing) as not-yet-known, never as clear.
+- **An unnecessary sync destroys an LGTM for nothing.** Sync only to resolve a
+  real conflict, confirmed against the API rather than a stale local ref.
 - **Lane verdict fields describe the run's start**, not its end. Read
   `findings[].fixed`.
 - **A background task's exit code may be the wrapper's, not the work's.** Write

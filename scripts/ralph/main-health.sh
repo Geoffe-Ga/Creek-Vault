@@ -11,6 +11,12 @@
 #   pending  nothing has concluded in the window, but a run is in flight
 #   unknown  we could not read an answer we are willing to act on
 #
+# SCOPE SINCE 2026-10-31: the owner made being behind `main` a non-blocker for
+# REVIEWED lanes ("If there are no merge conflicts then it is fine to merge a pr
+# that passed all other gates"), so pr-ready.sh now consults this helper only
+# for a behind `ready-unreviewed` bump, whose review substitute is green CI
+# against current `main`. The rationale below is unchanged for that lane class.
+#
 # ---------------------------------------------------------------------------
 # WHY THIS EXISTS (issue #1159)
 # ---------------------------------------------------------------------------

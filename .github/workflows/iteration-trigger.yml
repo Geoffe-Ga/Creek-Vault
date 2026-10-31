@@ -14,7 +14,9 @@ name: Iteration Trigger
 # second code path that falsifies it. It therefore mirrors five of them, and
 # names the blocker instead of clearing when any fails:
 #   * no `do-not-auto-merge` hold on the PR;
-#   * the head is current with its base (compare API `behind_by == 0`);
+#   * the PR has no merge conflict with its base (REST `mergeable` true and
+#     `mergeable_state` not `dirty`; a null `mergeable` is "not yet known" and
+#     refuses). Being BEHIND the base is NOT a blocker (owner rule, 2026-10-31);
 #   * the verdict carries the `<!-- creek-review pr=N -->` provenance marker for
 #     THIS PR (#1181) — the marker pr-ready.sh's MARKER_RE parses, read from the
 #     same comment the verdict came from;
@@ -41,7 +43,7 @@ name: Iteration Trigger
 # (#1266), and how #1199's allowlist had to be written twice.
 #
 # AND THE CLEARANCE CHAIN ITSELF IS NO LONGER IN THIS FILE (#1685). The hold,
-# the currency check and which blocker to name live in
+# the merge-conflict check and which blocker to name live in
 # `scripts/ralph/verdict-wake.sh`, which the summary step below calls. A `run:`
 # body is never EXECUTED by a test, so every guard on the version that lived
 # here was a per-line `grep` and therefore evadable by keeping the guarded line
@@ -60,7 +62,7 @@ name: Iteration Trigger
 # (`.claude/skills/await-claude-review/SKILL.md` Step 4a; its item 5 says in as
 # many words "Do not infer a verdict from the `Action:` prose"). `ACTION` is
 # diagnostic; `VERDICT` is the gate. The refusal values are chosen for their
-# BYTES — `HELD`, `NOT ATTESTED`, `NOT CURRENT` — none containing an `LGTM`
+# BYTES — `HELD`, `NOT ATTESTED`, `CONFLICTED`, `MERGEABILITY UNKNOWN` — none containing an `LGTM`
 # substring and none being one of the three verdicts SKILL.md recognises, so
 # Step 4a falls to item 5 and surfaces to a human instead of merging.
 # scripts/ralph/test_pr_ready.sh walks that chain — in

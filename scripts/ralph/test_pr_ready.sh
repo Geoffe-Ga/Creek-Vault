@@ -68,11 +68,17 @@
 #                  so a human hold is honoured even mid-run. An UNDETERMINABLE
 #                  hold (any lookup failing) exits 2 and prints nothing, so the
 #                  caller can never read silence as consent.
-#   freshness      `ready` additionally requires the compare API's
-#                  `behind_by == 0`. `mergeStateStatus == CLEAN` is NOT a
-#                  freshness signal — GitHub happily reports UNSTABLE/MERGEABLE
-#                  for a branch 22 commits behind main. Fails CLOSED (`behind`)
-#                  on an API error, an empty answer, or a non-integer.
+#   merge gate     owner rule (2026-10-31): a REVIEWED lane (`ready`,
+#                  `ready-comments`) clears on no merge conflict alone —
+#                  `mergeStateStatus` CLEAN or BEHIND — however far behind
+#                  `main` it is; DIRTY/CONFLICTING (a conflict) and UNKNOWN (not
+#                  yet computed) never clear. It never asks the compare API,
+#                  the inert-files rule, main-health.sh or review-quota.sh.
+#   freshness      `ready-unreviewed` (no reviewer: green CI against CURRENT
+#                  main is its review substitute) still requires the compare
+#                  API's `behind_by == 0` or a provably inert behind. Fails
+#                  CLOSED (`behind`) on an API error, an empty answer, or a
+#                  non-integer.
 #   ready-unreviewed  a PR with PROVABLY no review gate may merge without a
 #                  verdict. FIVE preconditions now, and #1181 added the first of
 #                  them: NO verdict-bearing comment was ever posted (the
@@ -89,23 +95,18 @@
 #                  `IFS='|' read -r a b c rest`; a non-empty `rest` (a `|` in a
 #                  branch name, a login, a date) must fail CLOSED, not silently
 #                  shift a field and merge on garbage.
-#   main health    the #1157 relaxation (a behind-but-inert lane merges anyway)
+#   main health    (`ready-unreviewed` only, since 2026-10-31) the #1157
+#                  relaxation (a behind-but-inert lane merges anyway)
 #                  is justified by ONE backstop: the full CI run on `push: main`
 #                  re-proving every squash-merge. So a lane that is about to USE
 #                  the relaxation must first prove the backstop is alive —
 #                  `main-not-green` (issue #1159). A lane with `behind_by == 0`
 #                  never uses the relaxation and therefore never asks.
-#   review quota   `behind`'s remedy is a sync, and a sync advances HEAD, which
-#                  invalidates a fresh LGTM under the stale-verdict guard above.
-#                  That normally costs one re-review. When the `claude-review`
-#                  quota is EXHAUSTED it costs the verdict outright, for days —
-#                  so such a lane reports `review-quota-exhausted` and waits
-#                  (issue #1160). The polarity of THAT probe is INVERTED with
-#                  respect to main health: only a positively-proven `exhausted`
-#                  holds the lane; `available`, `unknown`, an empty answer, a
-#                  non-zero exit, a garbage word, a missing helper and a
-#                  non-executable helper all fall through to today's `behind`,
-#                  because merging (or holding) stale is the worse error.
+#   review quota   RETIRED (2026-10-31). `review-quota-exhausted` held a
+#                  reviewed lane that would otherwise sync; such a lane is now
+#                  `ready` and merges with no sync, so pr-ready.sh no longer asks
+#                  review-quota.sh. Pinned: the token is never emitted and the
+#                  helper is never probed.
 #
 # Plus the cross-file coupling checks at the end of this file. They are
 # LOAD-BEARING, not decoration: `.github/workflows/code-review.yml` is the
@@ -755,9 +756,12 @@ check "exit 2 → ci-failed" "ci-failed" \
 check "green + CLEAN + fresh LGTM → ready" "ready" \
   "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" run 100)"
 
-# --- behind: green + fresh LGTM but not up-to-date -------------------------
-check "green + BEHIND + fresh LGTM → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="$FRESH|true" run 100)"
+# --- behind main is NOT a blocker; a conflict is ----------------------------
+# Owner rule (2026-10-31): "PRs don't need to be brought up to the current main
+# before merging. If there are no merge conflicts then it is fine to merge a pr
+# that passed all other gates." GitHub's BEHIND is conflict-free.
+check "green + BEHIND (conflict-free) + fresh LGTM → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=9 run 100)"
 
 # --- ready-comments: a fresh COMMENTS verdict is a sign-off, never a fix loop
 # Its findings become P0–P3 follow-up issues (address-feedback Step 1A) and the
@@ -765,10 +769,10 @@ check "green + BEHIND + fresh LGTM → behind" "behind" \
 # jq `true`, on a fresh, attested, non-LGTM verdict.
 check "green + CLEAN + current + fresh COMMENTS → ready-comments" "ready-comments" \
   "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 VERDICT="$FRESH|false" VERDICT_COMMENTS=true run 100)"
-check "fresh COMMENTS but BEHIND → behind" "behind" \
+check "fresh COMMENTS + BEHIND (conflict-free) → ready-comments" "ready-comments" \
   "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="$FRESH|false" VERDICT_COMMENTS=true run 100)"
-# Freshness against `main` is exactly LGTM's rule (including the inert-files
-# allowance), so the two tokens must agree on every compare answer.
+# COMMENTS clears on exactly LGTM's merge rule, so the two tokens must agree on
+# every compare answer — and since neither consults `behind_by`, both clear.
 for cmp_behind in 0 4; do
   lgtm_tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=$cmp_behind VERDICT="$FRESH|true" run 100)"
   comments_tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=$cmp_behind VERDICT="$FRESH|false" VERDICT_COMMENTS=true run 100)"
@@ -2193,17 +2197,73 @@ check "changelog noise: hold on an upstream #456 is not ours → ready" "ready" 
      PR_BODY="$CHANGELOG_BODY" ISSUE_LABELS_FOR=456 ISSUE_LABELS="$OPTOUT" \
      run 100)"
 
+# --- the merge gate is a CONFLICT check, not a freshness check -------------
+# Owner rule (2026-10-31): "PRs don't need to be brought up to the current main
+# before merging. If there are no merge conflicts then it is fine to merge a pr
+# that passed all other gates." So for a REVIEWED lane (fresh LGTM / COMMENTS)
+# nothing about being behind — how far, what `main` landed, whether `main`'s own
+# CI is green, whether the compare API can even be asked — may hold it back.
+# Only GitHub's merge state decides: CLEAN or BEHIND clears; DIRTY/CONFLICTING
+# (a conflict: merge `main` in and resolve) and UNKNOWN (not yet computed) do not.
+G_FAR="$WORK/gate-far-behind"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/vault/writer.py" OUR_FILES="creek/vault/writer.py" \
+       COMPARE_SENTINEL="$G_FAR" run 100)" || tok="exit-$?"
+check "reviewed + 22 behind, overlapping file, conflict-free → ready" "ready" "$tok"
+probed "a reviewed lane never asks the compare API how far behind it is" "no" "$G_FAR"
+
+G_RISK="$WORK/gate-risk-red-main"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/mine.py" MAIN_HEALTH=red \
+       MAIN_HEALTH_SENTINEL="$G_RISK" run 100)" || tok="exit-$?"
+check "reviewed + behind a risk-surface change + main RED → ready" "ready" "$tok"
+probed "a reviewed lane never consults main-health.sh" "no" "$G_RISK"
+
+check "reviewed + compare API error → ready (currency is not asked)" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+     BEHIND_BY='' COMPARE_EC=1 run 100)"
+check "reviewed + GitHub BEHIND + 17 behind → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=17 run 100)"
+check "fresh COMMENTS + 22 behind, overlapping file → ready-comments" "ready-comments" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" VERDICT_COMMENTS=true \
+     BEHIND_BY=22 THEIR_FILES="creek/shared.py" OUR_FILES="creek/shared.py" run 100)"
+
+# A conflict still refuses, behind or not: the remedy is to merge `main` in and
+# resolve (`fleet.sh sync`), which is what `behind` routes to.
+for conflicted in DIRTY CONFLICTING; do
+  check "reviewed + $conflicted (a merge conflict) → behind, never ready" "behind" \
+    "$(CHECKS_EC=0 MERGE_STATE=$conflicted HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=17 run 100)"
+  check "fresh COMMENTS + $conflicted → behind, never ready-comments" "behind" \
+    "$(CHECKS_EC=0 MERGE_STATE=$conflicted HEAD_DATE=$H VERDICT="$FRESH|false" VERDICT_COMMENTS=true run 100)"
+done
+# Mergeability GitHub has not finished computing is "not yet known", never clear.
+no_merge_token "reviewed + UNKNOWN (mergeability still computing) never merges" \
+  "$(CHECKS_EC=0 MERGE_STATE=UNKNOWN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 run 100)"
+no_merge_token "reviewed + BLOCKED never merges" \
+  "$(CHECKS_EC=0 MERGE_STATE=BLOCKED HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 run 100)"
+
+# ===========================================================================
+# THE COMPARE / INERT-FILES / MAIN-HEALTH MACHINERY NOW GUARDS ONLY
+# `ready-unreviewed`. Owner rule (2026-10-31): a REVIEWED lane (`ready`,
+# `ready-comments`) merges whenever GitHub reports no conflict, however far
+# behind `main` it is — pinned in the "merge gate is a CONFLICT check" block
+# below. A reviewless Dependabot bump has no reviewer, and "green CI against
+# CURRENT main" is its review substitute, so the #1022/#1137/#1157/#1159 currency
+# rules still bind it, unchanged. Every lane in this section is therefore that
+# reviewless bump (author + HEAD pusher Dependabot, `claude-review` SKIPPED, no
+# verdict), and a clearing answer is `ready-unreviewed`.
+# ===========================================================================
 # --- freshness: mergeStateStatus is NOT a freshness signal ------------------
 # Live PR #943 reports UNSTABLE/MERGEABLE while sitting exactly 22 commits behind
 # main: GitHub only says BEHIND when the base branch requires strict up-to-date
 # merging. So `ready` must ask the compare API for `behind_by` directly, or the
 # loop merges branches that never ran against current main.
 check "green + CLEAN + fresh LGTM but 22 behind, overlapping file → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
      THEIR_FILES="creek/vault/writer.py" OUR_FILES="creek/vault/writer.py" run 100)"
 
-check "behind_by 0 → ready" "ready" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 run 100)"
+check "behind_by 0 → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=0 run 100)"
 
 # --- behind ≠ stale: the #1137 regression ----------------------------------
 # Requiring `behind_by == 0` outright made every merge to `main` invalidate every
@@ -2211,21 +2271,21 @@ check "behind_by 0 → ready" "ready" \
 # and because that window is as long as the gap between merges, lanes went stale
 # again WHILE re-proving themselves. Two bug fixes in different modules cannot
 # turn each other red, so being behind is stale only for a REASON.
-check "behind but disjoint, inert files → ready" "ready" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+check "behind but disjoint, inert files → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
      THEIR_FILES="creek/classify/privacy.py,tests/test_privacy.py" \
      OUR_FILES="creek/vault/writer.py,tests/test_writer.py" run 100)"
 
 # One shared file IS a semantic interaction, even buried in a longer list.
 check "behind + one overlapping file among many → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=3 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=3 \
      THEIR_FILES="creek/a.py,creek/shared.py,creek/b.py" \
      OUR_FILES="creek/c.py,creek/d.py,creek/shared.py" run 100)"
 
 # A prefix match would read `creek/vault.py` as overlapping `creek/vault_index.py`
 # and re-impose the very serialization this change removes.
-check "behind + merely prefix-similar paths → ready" "ready" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=2 \
+check "behind + merely prefix-similar paths → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=2 \
      THEIR_FILES="creek/vault.py" OUR_FILES="creek/vault_index.py" run 100)"
 
 # --- the risk surface: what #1022 was actually right about ------------------
@@ -2238,7 +2298,7 @@ for risky in "creek-tools/uv.lock" "creek-tools/pyproject.toml" \
              "creek-tools/tests/conftest.py" ".github/workflows/ci.yml" \
              "creek-tools/scripts/check-all.sh"; do
   check "risk surface on main ($risky) → behind" "behind" \
-    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=4 \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=4 \
        THEIR_FILES="creek/unrelated.py,$risky" OUR_FILES="creek/mine.py" run 100)"
 done
 
@@ -2246,14 +2306,14 @@ done
 # that changes the tooling has proved it only against the tree at its merge base,
 # so everything main landed after that is code the new tooling never ran over.
 check "risk surface on OUR side, inert main → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=4 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=4 \
      THEIR_FILES="creek/unrelated.py" OUR_FILES="creek/mine.py,creek-tools/uv.lock" run 100)"
 
 # The twin: a path that merely LOOKS like the risk surface is not it. Without
 # this, `docs/pyproject.toml.md` or `creek/scripts/helper.py` would silently
 # re-serialize the fleet.
-check "risk-surface look-alikes are inert → ready" "ready" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=4 \
+check "risk-surface look-alikes are inert → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=4 \
      THEIR_FILES="docs/pyproject.toml.md,creek/scripts/helper.py,docs/workflows/ci.yml" \
      OUR_FILES="creek/mine.py" run 100)"
 
@@ -2261,56 +2321,56 @@ check "risk-surface look-alikes are inert → ready" "ready" \
 # The file listings decide whether to SKIP a sync, so an answer we cannot trust
 # has to read as "sync anyway" — the remedy is always safe, a false `ready` is not.
 check "main-side file listing errors → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=5 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=5 \
      THEIR_FILES="creek/a.py" THEIR_FILES_EC=1 OUR_FILES="creek/b.py" run 100)"
 
 check "branch-side file listing errors → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=5 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=5 \
      THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" OUR_FILES_EC=1 run 100)"
 
 # GitHub caps `.files` at 300. AT the cap the list is truncated, so "disjoint" is
 # an answer the data cannot support.
 TRUNCATED="$(seq 1 300 | sed 's|^|creek/f|; s|$|.py|' | paste -sd, -)"
 check "300-file (capped) main listing → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=6 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=6 \
      THEIR_FILES="$TRUNCATED" OUR_FILES="creek/mine.py" run 100)"
 
 # 299 is under the cap and therefore a complete, usable list — the non-vacuity
 # twin proving the check above is about truncation, not about list length.
 UNDER_CAP="$(seq 1 299 | sed 's|^|creek/f|; s|$|.py|' | paste -sd, -)"
-check "299-file (uncapped) main listing → ready" "ready" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=6 \
+check "299-file (uncapped) main listing → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=6 \
      THEIR_FILES="$UNDER_CAP" OUR_FILES="creek/mine.py" run 100)"
 
 # The merge base comes from the same call as behind_by and builds the main-side
 # compare range; a malformed one would compare against a garbage ref.
 check "malformed merge base → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=7 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=7 \
      MERGE_BASE="not-a-sha" THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" run 100)"
 
 check "empty merge base → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=7 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=7 \
      MERGE_BASE="" THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" run 100)"
 
 # Fail CLOSED. A compare call that errors (rate limit, 404 on a force-pushed OID)
 # must not inherit the happy answer that happens to be on stdout.
 check "compare API error → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" \
      BEHIND_BY=0 COMPARE_EC=1 run 100)"
 
 # An EMPTY answer is the dangerous one: `[[ "" -eq 0 ]]` is TRUE in bash, so a
 # naive numeric test reads "no answer" as "up to date".
 check "empty behind_by answer → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY='' run 100)"
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY='' run 100)"
 
 # `--jq .behind_by` prints the literal `null` when the field is absent.
 check "null behind_by answer → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=null run 100)"
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=null run 100)"
 
 # The new probe ADDS to the CLEAN requirement, it does not replace it: a BEHIND
 # mergeStateStatus still blocks even when compare says 0.
 check "BEHIND merge state with behind_by 0 → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 run 100)"
+  "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=0 run 100)"
 
 # The compare INPUTS are parsed defensively too. `<base>|<headOid>` is split on
 # the LAST '|' (a branch name may legally contain one; a SHA may not) — but a
@@ -2319,18 +2379,18 @@ check "BEHIND merge state with behind_by 0 → behind" "behind" \
 # against itself: `behind_by: 0`, a false `ready`. `c0ffee1` is exactly such a
 # name, so this case fails on any implementation that splits before checking.
 check "separator-free compare answer that looks like a SHA → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" \
      BASE_LINE_RAW="c0ffee1" BEHIND_BY=0 run 100)"
 
 # An empty answer (gh printing nothing while still exiting 0) is the same class.
 check "empty compare answer → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" \
      BASE_LINE_RAW="" BEHIND_BY=0 run 100)"
 
 # The legal twin: refusing every unusual base name would break a real one, so a
 # genuinely pipe-named base ref must still resolve and still read `ready`.
-check "pipe-named base ref still resolves → ready" "ready" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+check "pipe-named base ref still resolves → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" \
      BASE_REF='release|v2' HEAD_OID=deadbee BEHIND_BY=0 run 100)"
 
 # --- freshness probe is LAZY -----------------------------------------------
@@ -2370,37 +2430,37 @@ check "lazy compare: changes-requested lane token" "changes-requested" "$tok"
 probed "lazy compare: changes-requested lane does not probe" "no" "$S_CR"
 
 S_READY="$WORK/probe-ready"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" \
        BEHIND_BY=0 COMPARE_SENTINEL="$S_READY" run 100)" || tok="exit-$?"
-check "lazy compare: would-be-ready lane token" "ready" "$tok"
+check "lazy compare: would-be-ready lane token" "ready-unreviewed" "$tok"
 probed "lazy compare: would-be-ready lane DOES probe" "yes" "$S_READY"
 
 # The file listings are lazy INSIDE the compare probe as well: `behind_by == 0`
 # is the overwhelmingly common answer and must still cost exactly ONE request,
 # or the fix for #1137 would tax every already-current lane on every wake.
 S_F_CURRENT="$WORK/probe-files-current"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" \
        BEHIND_BY=0 FILES_SENTINEL="$S_F_CURRENT" run 100)" || tok="exit-$?"
-check "lazy files: current lane token" "ready" "$tok"
+check "lazy files: current lane token" "ready-unreviewed" "$tok"
 probed "lazy files: current lane does not list files" "no" "$S_F_CURRENT"
 
 S_F_BEHIND="$WORK/probe-files-behind"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=9 \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=9 \
        THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" \
        FILES_SENTINEL="$S_F_BEHIND" run 100)" || tok="exit-$?"
-check "lazy files: behind lane token" "ready" "$tok"
+check "lazy files: behind lane token" "ready-unreviewed" "$tok"
 probed "lazy files: behind lane DOES list files" "yes" "$S_F_BEHIND"
 
 # And a lane behind a RISK-SURFACE change never pays for the branch-side listing:
 # the main-side answer already decided it.
 S_F_RISK="$WORK/probe-files-risk"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=9 \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=9 \
        THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/b.py" OUR_FILES_EC=1 \
        FILES_SENTINEL="$S_F_RISK" run 100)" || tok="exit-$?"
 check "lazy files: risk-surface lane short-circuits" "behind" "$tok"
 
 S_OPTOUT="$WORK/probe-optout"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" \
        BEHIND_BY=22 PR_LABELS="$OPTOUT" COMPARE_SENTINEL="$S_OPTOUT" run 100)" || tok="exit-$?"
 check "lazy compare: opt-out lane token" "optout" "$tok"
 probed "lazy compare: opt-out lane does not probe" "no" "$S_OPTOUT"
@@ -2438,7 +2498,7 @@ probed "lazy compare: opt-out lane does not probe" "no" "$S_OPTOUT"
 # unvalidated change on top of a tree that is already red, and the loop would
 # then read the resulting CI failure as THIS lane's fault.
 check "behind + inert files but main CI RED → main-not-green" "main-not-green" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
      THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
      MAIN_HEALTH=red run 100)"
 
@@ -2446,8 +2506,8 @@ check "behind + inert files but main CI RED → main-not-green" "main-not-green"
 # lane with a healthy `main` still merges. If this ever flips to `behind` or
 # `main-not-green`, the serialization #1137 measured (CI runs per PR 1.00 →
 # 1.61, p90 latency 15 → 104 minutes) is back.
-check "behind + inert files, main CI green → ready" "ready" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+check "behind + inert files, main CI green → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
      THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
      MAIN_HEALTH=green run 100)"
 
@@ -2468,8 +2528,8 @@ check "behind + inert files, main CI green → ready" "ready" \
 # `main`, and the loop would need a bypass label — one more thing to get wrong,
 # and one more thing that can be left switched on. Here the loop cannot deadlock
 # by construction.
-check "behind_by 0 with main CI RED → ready (the deadlock pin)" "ready" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+check "behind_by 0 with main CI RED → ready-unreviewed (the deadlock pin)" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=0 \
      MAIN_HEALTH=red run 100)"
 
 # Fail CLOSED on everything that is not a green answer. `pending` is the common
@@ -2477,12 +2537,12 @@ check "behind_by 0 with main CI RED → ready (the deadlock pin)" "ready" \
 # that the backstop caught anything, so a lane that wants to SKIP a sync waits
 # one wake rather than merging on a maybe.
 check "behind + inert but main CI PENDING → main-not-green" "main-not-green" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
      THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
      MAIN_HEALTH=pending run 100)"
 
 check "behind + inert but main health UNKNOWN → main-not-green" "main-not-green" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
      THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
      MAIN_HEALTH=unknown run 100)"
 
@@ -2493,7 +2553,7 @@ check "behind + inert but main health UNKNOWN → main-not-green" "main-not-gree
 # useful. MAIN_HEALTH=green alongside EC=1 is the dangerous shape: the happy
 # answer is already on stdout when the call fails.
 rc=0
-out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
        MAIN_HEALTH=green MAIN_HEALTH_EC=1 run 100)" || rc=$?
 check "main-health lookup failure → main-not-green" "main-not-green" "$out"
@@ -2508,14 +2568,14 @@ check "main-health lookup failure still exits 0" "0" "$rc"
 # comparison, and `main-not-green` (wait) outranks `behind` (act).
 check "behind a risk-surface change with main CI RED → main-not-green, not behind" \
   "main-not-green" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
      THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/mine.py" \
      MAIN_HEALTH=red run 100)"
 
 # The twin: with `main` healthy the same lane is still `behind` — the ordering
 # change must not have swallowed #1157's risk-surface rule.
 check "behind a risk-surface change with main CI green → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
      THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/mine.py" \
      MAIN_HEALTH=green run 100)"
 
@@ -2534,7 +2594,7 @@ check "behind a risk-surface change with main CI green → behind" "behind" \
   MH_FLIGHT='{"status":"in_progress","conclusion":null,"headSha":"feed1234","databaseId":13,"url":"https://x/13"}'
 
   check "real run-list payload, main failing → main-not-green" "main-not-green" \
-    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
        MAIN_RUNS_JSON="[$MH_FAILURE,$MH_SUCCESS]" run 100)"
 
@@ -2548,13 +2608,13 @@ check "behind a risk-surface change with main CI green → behind" "behind" \
   # says "the serialization #1137 measured" in two other places), #1138 is the
   # change that REMOVED it ("the serialization #1138 removed", the same words in
   # all three files). Checked against those files rather than assumed.
-  check "real run-list payload, in flight over a success → ready" "ready" \
-    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+  check "real run-list payload, in flight over a success → ready-unreviewed" "ready-unreviewed" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
        MAIN_RUNS_JSON="[$MH_FLIGHT,$MH_SUCCESS]" run 100)"
 
   check "real run-list payload, empty window → main-not-green" "main-not-green" \
-    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
        MAIN_RUNS_JSON='[]' run 100)"
 }
@@ -2571,7 +2631,7 @@ cp "$READY" "$NOSIB/pr-ready.sh"
 chmod +x "$NOSIB/pr-ready.sh"
 run_nosib() { PATH="$BIN:$PATH" "$NOSIB/pr-ready.sh" "$@" 2>/dev/null; }
 
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
        run_nosib 100)" || tok="exit-$?"
 no_merge_token "missing main-health.sh sibling is never mergeable" "$tok"
@@ -2588,7 +2648,7 @@ printf '#!/usr/bin/env bash\necho green\n' > "$NOEXEC/main-health.sh"
 chmod 644 "$NOEXEC/main-health.sh"
 run_noexec() { PATH="$BIN:$PATH" "$NOEXEC/pr-ready.sh" "$@" 2>/dev/null; }
 
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
        run_noexec 100)" || tok="exit-$?"
 no_merge_token "non-executable main-health.sh sibling is never mergeable" "$tok"
@@ -2600,7 +2660,7 @@ no_merge_token "non-executable main-health.sh sibling is never mergeable" "$tok"
 # decided. Each gets its OWN sentinel path — a shared one would let an earlier
 # lane's probe satisfy a later lane's assertion.
 M_OPTOUT="$WORK/main-health-optout"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        PR_LABELS="$OPTOUT" MAIN_HEALTH_SENTINEL="$M_OPTOUT" run 100)" || tok="exit-$?"
 check "lazy main-health: opt-out lane token" "optout" "$tok"
 probed "lazy main-health: opt-out lane does not probe" "no" "$M_OPTOUT"
@@ -2632,18 +2692,18 @@ probed "lazy main-health: stale-verdict lane does not probe" "no" "$M_STALE"
 # mechanical: a lane that is already current never uses the relaxation, so it
 # never asks about `main` — not one request, on the overwhelmingly common path.
 M_CURRENT="$WORK/main-health-current"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=0 \
        MAIN_HEALTH=red MAIN_HEALTH_SENTINEL="$M_CURRENT" run 100)" || tok="exit-$?"
-check "lazy main-health: current lane token" "ready" "$tok"
+check "lazy main-health: current lane token" "ready-unreviewed" "$tok"
 probed "lazy main-health: current lane does not probe" "no" "$M_CURRENT"
 
 # ASSERTION (2): the behind lane really does make the call. Without this, a
 # probe deleted from pr-ready.sh would leave every green-default case passing.
 M_BEHIND="$WORK/main-health-behind"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
        MAIN_HEALTH_SENTINEL="$M_BEHIND" run 100)" || tok="exit-$?"
-check "lazy main-health: behind-past-merge-base lane token" "ready" "$tok"
+check "lazy main-health: behind-past-merge-base lane token" "ready-unreviewed" "$tok"
 probed "lazy main-health: behind lane DOES probe" "yes" "$M_BEHIND"
 
 # PRECEDENCE: the merge-base validation runs FIRST, so a malformed merge base
@@ -2651,332 +2711,48 @@ probed "lazy main-health: behind lane DOES probe" "yes" "$M_BEHIND"
 # probe placed above that validation would spend a request to answer a question
 # the lane had already answered.
 M_BADBASE="$WORK/main-health-badbase"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" REVIEW_CONCLUSIONS="SKIPPED" BEHIND_BY=22 \
        MERGE_BASE="not-a-sha" THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" \
        MAIN_HEALTH_SENTINEL="$M_BADBASE" run 100)" || tok="exit-$?"
 check "malformed merge base still short-circuits to behind" "behind" "$tok"
 probed "malformed merge base does not pay for main-health" "no" "$M_BADBASE"
 
-# --- review quota: when the remedy for `behind` DESTROYS the verdict (#1160) -
-# `behind`'s remedy is `fleet.sh sync`, which pushes a merge commit. That
-# advances HEAD, and the stale-verdict guard at the top of this file then
-# correctly stops counting the lane's LGTM — it reviewed older code. Normally
-# that costs exactly one re-review and the lane comes back. When the
-# `claude-review` quota is EXHAUSTED the re-review cannot happen at all, so the
-# sync destroys the only verdict the lane will ever get, and the lane is
-# unmergeable until the window resets.
-#
-# Observed on PR #1158: LGTM at 05:11:43Z, sync at 05:23:58Z, re-review rejected
-# in 24 seconds against a SEVEN-DAY window that would not reset for three days.
-# The loop did that to itself, with its own remedy, and then had nothing to
-# report but `behind` on every subsequent wake.
-#
-# ---------------------------------------------------------------------------
-# THE POLARITY IS INVERTED WITH RESPECT TO main-health.sh. DO NOT HARMONISE.
-# ---------------------------------------------------------------------------
-# main-health: anything that is not `green` HOLDS the lane.
-# review-quota: only a positively-proven `exhausted` HOLDS the lane.
-#
-# Both are fail-closed in the same sense — prefer the recoverable error — and
-# therefore take OPPOSITE actions, because the recoverable error is the opposite
-# one. A false `main-not-green` costs one wake. A false `review-quota-exhausted`
-# costs DAYS of a wedged lane with no un-wedge path, so every unreadable answer
-# here must fall through to today's behaviour: `behind`, sync, spend the verdict.
-# The issue says so outright: "Fails closed: if reviewability cannot be
-# determined, behave as today (sync), since merging stale is the worse error."
-#
-# The new token is printed in the terminal `else` of pr-ready.sh's final
-# if/elif/else (pr-ready.sh:1118-1151, the branch that would otherwise `echo
-# behind`) ONLY when ALL
-# of these hold: the lane would otherwise print `behind`, `ready_token` is
-# `ready` (not `ready-unreviewed`), `merge_state` is `CLEAN`, and the helper
-# positively answered `exhausted`.
-
-# THE RED CASE. A lane with everything a merge needs except currency: green CI,
-# CLEAN, a FRESH LGTM — and a real risk-surface reason to be behind (`uv.lock`
-# landed on `main`), so #1157's relaxation genuinely does not apply and the lane
-# genuinely does need a sync. With the reviewer available that sync is right.
-# With the reviewer exhausted it is the one move that cannot be undone.
-check "behind (risk surface) + fresh LGTM + quota EXHAUSTED → review-quota-exhausted" \
-  "review-quota-exhausted" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-     REVIEW_QUOTA=exhausted run 100)"
-
-# The same lane, behind an OVERLAPPING file rather than a risk surface — the
-# other way #1157 refuses to relax. Same verdict, so the new token is not an
-# accident of which disjointness rule fired.
-check "behind (overlapping file) + fresh LGTM + quota EXHAUSTED → review-quota-exhausted" \
-  "review-quota-exhausted" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-     MAIN_HEALTH=green THEIR_FILES="creek/shared.py" OUR_FILES="creek/shared.py" \
-     REVIEW_QUOTA=exhausted run 100)"
-
-# THE ANTI-MASKING PROOF, mirroring the three-part one at the head of the
-# main-health block above. Because the stub defaults REVIEW_QUOTA to
-# `available`, someone could delete the probe from pr-ready.sh entirely and every
-# other test in this file would still pass. Three assertions make that
-# impossible, and they only work TOGETHER:
-#   (1) REVIEW_QUOTA=available on the SAME lane → `behind` — the answer is
-#       genuinely consumed rather than the token being printed unconditionally;
-#   (2) the sentinel is PRESENT on the qualifying lane — the call is genuinely
-#       made rather than the token coming from somewhere else;
-#   (3) the sentinel is ABSENT on every non-qualifying lane — the laziness holds,
-#       so the probe is not simply unconditional.
-# Remove any one of the three and the other two pass vacuously. Do not.
-check "(1) same lane, quota AVAILABLE → behind (the answer is consumed)" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-     REVIEW_QUOTA=available run 100)"
-
-Q_QUALIFY="$WORK/quota-qualifying"
+# --- review quota (#1160): RETIRED with the behind-is-not-a-blocker rule ----
+# `review-quota-exhausted` held a lane that "genuinely needed a sync" so the sync
+# would not spend an LGTM the exhausted reviewer could never re-issue. It only
+# ever applied to a REVIEWED, CLEAN lane that would otherwise print `behind` —
+# a reviewed lane behind `main` for a reason. Under the owner rule (2026-10-31)
+# that lane is `ready`: it merges without a sync, so its verdict is never spent
+# and there is nothing to hold. A conflicting lane's remedy IS the sync and was
+# always exempt. So the probe is gone from pr-ready.sh, and these pin that the
+# exhausted quota no longer changes any token and is never asked.
+Q_BEHIND="$WORK/quota-retired-behind"
 tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
        MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_QUALIFY" run 100)" || tok="exit-$?"
-check "(2) qualifying lane token" "review-quota-exhausted" "$tok"
-probed "(2) the qualifying lane DOES probe the review quota" "yes" "$Q_QUALIFY"
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_BEHIND" run 100)" || tok="exit-$?"
+check "behind (risk surface) + fresh LGTM + quota exhausted → ready (no sync to hold)" "ready" "$tok"
+probed "a reviewed behind lane never probes the review quota" "no" "$Q_BEHIND"
 
-# --- THE INVERTED-POLARITY SWEEP --------------------------------------------
-# Everything that is not a proven `exhausted` must behave exactly as it did
-# before #1160. This is the assertion set a future "make it consistent with
-# main-health.sh" refactor would break, and breaking it wedges every behind lane
-# in the fleet for as long as the helper stays unreadable — which, unlike a red
-# `main`, nothing in the loop would ever repair.
-check "quota UNKNOWN → behind (fall through, do not hold)" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-     REVIEW_QUOTA=unknown run 100)"
+Q_DIRTY="$WORK/quota-retired-dirty"
+tok="$(CHECKS_EC=0 MERGE_STATE=DIRTY HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_DIRTY" run 100)" || tok="exit-$?"
+check "DIRTY + fresh LGTM + quota exhausted → behind (the sync IS the remedy)" "behind" "$tok"
+probed "a conflicting lane never probes the review quota" "no" "$Q_DIRTY"
 
-# The helper's own lookup failing (rate limit, 5xx, expired token) is the most
-# likely unreadable answer of all — and it is likeliest precisely when the API
-# budget is under pressure, i.e. on the very lanes this feature exists for. It
-# still falls through.
-check "quota helper's gh lookup fails → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-     REVIEW_QUOTA=exhausted REVIEW_RUNS_EC=1 run 100)"
-
-check "quota helper's log fetch fails → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-     REVIEW_QUOTA=exhausted REVIEW_LOG_EC=1 run 100)"
-
-# The observed FALSE POSITIVE, end to end through pr-ready.sh. This log came
-# from a review run that concluded SUCCESS and posted a full LGTM (job
-# 92768878061, the Aug-7 re-run of #1158's job): `status` is `allowed`, and the
-# `rejected` / `out_of_credits` words describe the overage BUDGET. Any matcher
-# naive enough to fire on it would hold every behind lane in the fleet for days
-# on a reviewer that was working the whole time.
-check "a healthy 'allowed' log carrying the word rejected → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-     REVIEW_QUOTA=exhausted \
-     REVIEW_LOG='{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":9999999999,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits"}}' \
-     run 100)"
-
-# --- the sibling seam, in the INVERTED direction ----------------------------
-# The same seam this file already exercises for main-health.sh in the `$NOSIB` /
-# `$NOEXEC` block above — a copy of pr-ready.sh in a directory whose siblings we
-# control — but with the opposite expectation. Cited by the fixture's variable
-# names rather than by line number on purpose: the two intra-file line citations
-# that used to be here were made stale by this very diff's own growth, and will
-# be again by the next one, whereas `$NOSIB` and `$NOEXEC` are greppable and
-# move with the code. A main-health.sh that cannot be asked HOLDS
-# the lane; a review-quota.sh that cannot be asked must NOT.
-#
-# Each lane plants a main-health.sh that answers `green`, because otherwise the
-# lane never reaches the terminal branch where the quota question is asked at
-# all, and every assertion below would pass for the wrong reason.
-plant_lane() { # plant_lane <name> <review-quota body, or "" for no helper> [mode]
-  local dir="$WORK/plant-$1"
-  mkdir -p "$dir"
-  cp "$READY" "$dir/pr-ready.sh"
-  chmod +x "$dir/pr-ready.sh"
-  # The shared verdict machinery ships BESIDE pr-ready.sh, so a planted copy
-  # needs it too — and must, because a copy without it refuses to classify
-  # rather than reading `awaiting-review` off a missing selector (#1263).
-  cp -R "$(dirname "$READY")/lib" "$dir/lib"
-  printf '#!/usr/bin/env bash\necho green\n' > "$dir/main-health.sh"
-  chmod +x "$dir/main-health.sh"
-  if [[ -n "$2" ]]; then
-    printf '%s' "$2" > "$dir/review-quota.sh"
-    chmod "${3:-755}" "$dir/review-quota.sh"
-  fi
-  printf '%s\n' "$dir/pr-ready.sh"
-}
-run_planted() { # run_planted <planted pr-ready.sh> <PR>
-  CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-    THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-    PATH="$BIN:$PATH" "$1" "$2" 2>/dev/null
-}
-
-# NON-VACUITY FIRST. The planted harness must be able to produce the POSITIVE
-# outcome, or every "…→ behind" assertion below would pass on a harness that
-# simply never reaches the probe. This one plants a helper that says `exhausted`
-# and nothing else.
-P_YES="$(plant_lane exhausted '#!/usr/bin/env bash
-echo exhausted
-')"
-tok="$(run_planted "$P_YES" 100)" || tok="exit-$?"
-check "planted harness non-vacuity: a helper saying exhausted holds the lane" \
-  "review-quota-exhausted" "$tok"
-
-P_AVAIL="$(plant_lane available '#!/usr/bin/env bash
-echo available
-')"
-tok="$(run_planted "$P_AVAIL" 100)" || tok="exit-$?"
-check "planted helper says available → behind" "behind" "$tok"
-
-P_EMPTY="$(plant_lane empty '#!/usr/bin/env bash
-exit 0
-')"
-tok="$(run_planted "$P_EMPTY" 100)" || tok="exit-$?"
-check "planted helper prints NOTHING → behind" "behind" "$tok"
-
-# A helper that exits non-zero WITH a happy answer already on stdout is the
-# dangerous shape (the output is there to be inherited). Under `set -e` an
-# unguarded call would also abort pr-ready.sh mid-classification, which the
-# orchestrator reads as a tooling error — dispatching nothing.
-P_EXIT2="$(plant_lane exit2 '#!/usr/bin/env bash
-echo exhausted
-exit 2
-')"
-rc=0
-tok="$(run_planted "$P_EXIT2" 100)" || rc=$?
-check "planted helper exits non-zero → behind" "behind" "$tok"
-check "planted helper exiting non-zero does not kill pr-ready.sh" "0" "$rc"
-
-# A word nobody recognises — a future token, a typo, a debug print. It is not
-# `exhausted`, so it is not a hold.
-P_GARBAGE="$(plant_lane garbage '#!/usr/bin/env bash
-echo dunno
-')"
-tok="$(run_planted "$P_GARBAGE" 100)" || tok="exit-$?"
-check "planted helper prints a garbage word → behind" "behind" "$tok"
-
-# A helper that is not there at all: a partial checkout, a packaging change, a
-# rename. Nothing about that says the reviewer is out of quota.
-P_MISSING="$(plant_lane missing "")"
-tok="$(run_planted "$P_MISSING" 100)" || tok="exit-$?"
-check "MISSING review-quota.sh sibling → behind" "behind" "$tok"
-
-# And a helper that exists but cannot be executed — the dropped exec bit #1092
-# actually shipped and test_exec_bits.sh guards. The planted file WOULD say
-# `exhausted` if it ran, so an implementation that `bash`es the helper instead of
-# checking `-x` fails here. Note this is the mirror of the main-health `$NOEXEC`
-# case above (named, not line-cited, for the reason given in the seam block):
-# there a non-executable helper must never read as `green`; here it must never
-# read as `exhausted`.
-P_NOEXEC="$(plant_lane noexec '#!/usr/bin/env bash
-echo exhausted
-' 644)"
-tok="$(run_planted "$P_NOEXEC" 100)" || tok="exit-$?"
-check "NON-EXECUTABLE review-quota.sh sibling → behind" "behind" "$tok"
-
-# --- guard conditions: lanes with nothing to preserve, or nothing to gain ----
-# `ready-unreviewed` is a Dependabot lane that has PROVABLY no review gate — no
-# verdict was ever posted and none ever will be. There is no LGTM for a sync to
-# destroy, so holding the lane would buy nothing and cost a merge. It syncs.
-Q_UNREVIEWED="$WORK/quota-ready-unreviewed"
+Q_UNREV="$WORK/quota-retired-unreviewed"
 tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" BEHIND_BY=22 \
        MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
        PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" \
        REVIEW_CONCLUSIONS="SKIPPED" REVIEW_QUOTA=exhausted \
-       REVIEW_QUOTA_SENTINEL="$Q_UNREVIEWED" run 100)" || tok="exit-$?"
-check "ready-unreviewed + behind + quota exhausted → behind (no verdict to lose)" \
-  "behind" "$tok"
-probed "(3) a ready-unreviewed lane does not probe the review quota" "no" "$Q_UNREVIEWED"
+       REVIEW_QUOTA_SENTINEL="$Q_UNREV" run 100)" || tok="exit-$?"
+check "ready-unreviewed + behind + quota exhausted → behind (no verdict to lose)" "behind" "$tok"
+probed "a ready-unreviewed lane never probes the review quota" "no" "$Q_UNREV"
 
-# A CONFLICTING lane's remedy IS the sync, and only the sync. The conflict never
-# self-resolves, and the lane's LGTM dies at Gate 1 regardless of quota — a
-# conflicted branch cannot merge at all. Holding it would therefore be a
-# PERMANENT wedge with no un-wedge path: the quota resets, the lane is still
-# conflicted, and nothing ever ran the one command that could fix it.
-Q_CONFLICT="$WORK/quota-conflicting"
-tok="$(CHECKS_EC=0 MERGE_STATE=CONFLICTING HEAD_DATE=$H VERDICT="$FRESH|true" \
-       BEHIND_BY=22 MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_CONFLICT" run 100)" || tok="exit-$?"
-check "CONFLICTING + fresh LGTM + quota exhausted → behind (the sync IS the remedy)" \
-  "behind" "$tok"
-probed "(3) a conflicting lane does not probe the review quota" "no" "$Q_CONFLICT"
-
-Q_DIRTY="$WORK/quota-dirty"
-tok="$(CHECKS_EC=0 MERGE_STATE=DIRTY HEAD_DATE=$H VERDICT="$FRESH|true" \
-       BEHIND_BY=22 MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_DIRTY" run 100)" || tok="exit-$?"
-check "DIRTY + fresh LGTM + quota exhausted → behind" "behind" "$tok"
-probed "(3) a dirty lane does not probe the review quota" "no" "$Q_DIRTY"
-
-# --- precedence: a lane already held does not pay for a second probe ---------
-# `main-not-green` outranks this token. Its remedy is also "wait", so nothing is
-# lost by reporting it — and the quota question is moot for a lane that is not
-# going to be synced either way.
-Q_MAINRED="$WORK/quota-main-red"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-       MAIN_HEALTH=red THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
-       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_MAINRED" run 100)" || tok="exit-$?"
-check "main RED + quota exhausted → main-not-green (main health outranks)" \
-  "main-not-green" "$tok"
-probed "(3) a main-not-green lane does not probe the review quota" "no" "$Q_MAINRED"
-
-# --- laziness: only a lane about to be TOLD TO SYNC may ask ------------------
-# Same rate-limit argument as every other probe in this file — and sharper here,
-# because the question being asked is literally "have we run out of API budget?"
-# Each lane gets its OWN sentinel path; a shared one would let an earlier lane's
-# probe satisfy a later lane's assertion.
-Q_OPTOUT="$WORK/quota-optout"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" PR_LABELS="$OPTOUT" \
-       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_OPTOUT" run 100)" || tok="exit-$?"
-check "lazy quota: opt-out lane token" "optout" "$tok"
-probed "lazy quota: opt-out lane does not probe" "no" "$Q_OPTOUT"
-
-Q_PENDING="$WORK/quota-pending"
-tok="$(CHECKS_EC=8 BEHIND_BY=22 REVIEW_QUOTA=exhausted \
-       REVIEW_QUOTA_SENTINEL="$Q_PENDING" run 100)" || tok="exit-$?"
-check "lazy quota: pending lane token" "pending" "$tok"
-probed "lazy quota: pending lane does not probe" "no" "$Q_PENDING"
-
-Q_CIFAIL="$WORK/quota-cifail"
-tok="$(CHECKS_EC=1 BEHIND_BY=22 REVIEW_QUOTA=exhausted TALLY_JSON="$CI_RED_TALLY" \
-       REVIEW_QUOTA_SENTINEL="$Q_CIFAIL" run 100)" || tok="exit-$?"
-check "lazy quota: ci-failed lane token" "ci-failed" "$tok"
-probed "lazy quota: ci-failed lane does not probe" "no" "$Q_CIFAIL"
-
-Q_CR="$WORK/quota-changes-requested"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" BEHIND_BY=22 \
-       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" REVIEW_QUOTA=exhausted \
-       REVIEW_QUOTA_SENTINEL="$Q_CR" run 100)" || tok="exit-$?"
-check "lazy quota: changes-requested lane token" "changes-requested" "$tok"
-probed "lazy quota: changes-requested lane does not probe" "no" "$Q_CR"
-
-# A STALE verdict is the case that looks closest to the RED one and is not it:
-# the LGTM already does not count, so a sync cannot destroy it. Nothing to hold.
-Q_STALE="$WORK/quota-stale"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|true" BEHIND_BY=22 \
-       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" REVIEW_QUOTA=exhausted \
-       REVIEW_QUOTA_SENTINEL="$Q_STALE" run 100)" || tok="exit-$?"
-check "lazy quota: stale-verdict lane token" "awaiting-review" "$tok"
-probed "lazy quota: stale-verdict lane does not probe" "no" "$Q_STALE"
-
-# A lane that is already CURRENT is about to merge. It is never told to sync, so
-# it never asks — on the overwhelmingly common path, this feature costs nothing.
-Q_CURRENT="$WORK/quota-current"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
-       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_CURRENT" run 100)" || tok="exit-$?"
-check "lazy quota: current lane token" "ready" "$tok"
-probed "lazy quota: current lane does not probe" "no" "$Q_CURRENT"
-
-# A lane that is behind but INERT merges under #1157 without a sync, so its LGTM
-# is in no danger either. Also the guard that #1157 has not been re-tightened:
-# if this ever flips to a hold, the serialization #1137 measured is back.
-Q_INERT="$WORK/quota-inert"
-tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
-       MAIN_HEALTH=green THEIR_FILES="creek/classify/privacy.py" \
-       OUR_FILES="creek/vault/writer.py" REVIEW_QUOTA=exhausted \
-       REVIEW_QUOTA_SENTINEL="$Q_INERT" run 100)" || tok="exit-$?"
-check "lazy quota: behind-but-inert lane still merges" "ready" "$tok"
-probed "lazy quota: behind-but-inert lane does not probe" "no" "$Q_INERT"
+if grep -qF 'REVIEW_QUOTA_HELPER' "$READY"; then
+  bad "pr-ready.sh still wires in review-quota.sh — the hold it fed can no longer fire"
+else
+  ok "pr-ready.sh no longer consults review-quota.sh"
+fi
 
 # --- ready-unreviewed: PROVABLY no review gate ------------------------------
 # `.github/workflows/code-review.yml` skips its `claude-review` job on Dependabot
@@ -3982,8 +3758,9 @@ fi
 # The assertion above pins ONE branch by its literal, which is exactly how the
 # hole it guards survived on the other two: #1181 added `VERDICT='NOT ATTESTED'`
 # inside its own `elif` and said so in that file's header, while the `HELD`
-# branch (a human's `do-not-auto-merge` hold) and the `BEHIND` branch (a head not
-# current with its base) kept rewriting `ACTION` alone. Both therefore posted
+# branch (a human's `do-not-auto-merge` hold) and the then-`BEHIND` branch (a
+# head not current with its base — since 2026-10-31 a merge-conflict branch)
+# kept rewriting `ACTION` alone. Both therefore posted
 # `**VERDICT**: LGTM` + `**CI**: N/N Green` — the two fields, and the ONLY two
 # fields, Step 4a reads — so a webhook-woken session merged a PR the workflow had
 # just refused to clear, including one a human had explicitly parked. That hold
@@ -4022,14 +3799,15 @@ readonly ITER_RECOGNISED_VERDICT_RE='^(LGTM|CHANGES[_ ]REQUESTED|COMMENTS)$'
 iter_refusals="$(iter_not_cleared_verdicts)"
 iter_refusal_count="$(grep -c . <<<"$iter_refusals" || true)"
 
-# THREE is the count at the time of writing (HELD, provenance, BEHIND) and the
+# THREE is the floor (HELD, provenance, merge conflict — plus, since 2026-10-31,
+# the not-yet-computed mergeability refusal) and the
 # floor is what is asserted, not the exact number: adding a fourth refusal is a
 # perfectly good change and must not turn this red, while dropping to two means a
 # branch that used to refuse has stopped refusing.
 if [[ "$iter_refusal_count" -ge 3 ]]; then
   ok "iteration-trigger.yml's clearance chain still has its $iter_refusal_count NOT-cleared branches"
 else
-  bad "iteration-trigger.yml has only $iter_refusal_count 'NOT cleared to merge' branches (expected at least 3: the do-not-auto-merge hold, the provenance marker, and a head behind its base) — a merge refusal has gone missing, or this extraction has drifted from the file"
+  bad "iteration-trigger.yml has only $iter_refusal_count 'NOT cleared to merge' branches (expected at least 3: the do-not-auto-merge hold, the provenance marker, and a merge conflict with its base) — a merge refusal has gone missing, or this extraction has drifted from the file"
 fi
 
 iter_refusal_n=0

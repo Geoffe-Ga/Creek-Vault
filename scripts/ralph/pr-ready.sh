@@ -5,7 +5,9 @@
 # (ralph-tick.md Step 1). Prints exactly one status token and exits 0 (it is a
 # query — a non-zero exit means a usage/tooling error, never a PR verdict):
 #
-#   ready            LGTM (fresh) + CI green + verified current with main → merge now
+#   ready            LGTM (fresh) + CI green + no merge conflict (mergeStateStatus
+#                    CLEAN or BEHIND) → merge now. Being behind main is NOT a
+#                    blocker (owner rule, 2026-10-31); only a conflict is
 #   ready-comments   COMMENTS (fresh, attested, read with the same fail-closed
 #                    polarity as LGTM) + every other `ready` condition → the
 #                    reviewer signed off with non-blocking findings: file each as
@@ -17,13 +19,18 @@
 #                    posted on it (#1199), Dependabot authored it AND pushed its
 #                    HEAD commit, and `claude-review`
 #                    reported SKIPPED → the orchestrator decides (see ralph-tick.md)
-#   behind           LGTM (fresh) + CI green, but `main` has landed something
-#                    since the merge base that can invalidate this branch's
-#                    green — a cross-cutting change (lockfile / tool pin /
+#   behind           CI green but not clearable without a sync: the branch has a
+#                    merge CONFLICT with its base (DIRTY/CONFLICTING — merge main
+#                    in and resolve), GitHub has not finished computing
+#                    mergeability (UNKNOWN), or another non-mergeable state; or a
+#                    would-be `ready-unreviewed` bump whose review substitute
+#                    (green CI against CURRENT main) does not hold because `main`
+#                    landed something since the merge base that can invalidate
+#                    its green — a cross-cutting change (lockfile / tool pin /
 #                    workflow / check script / root conftest) or an edit to a
-#                    file this branch also touches → sync first. Merely being
-#                    behind is NOT enough; see the freshness guard below.
-#   main-not-green   LGTM (fresh) + CI green, and this lane IS behind `main` — so
+#                    file it also touches. A REVIEWED lane is never `behind` for
+#                    merely being behind; see the merge gate below.
+#   main-not-green   a would-be `ready-unreviewed` bump that IS behind `main` — so
 #                    it is about to invoke the #1157 relaxation below, whose
 #                    whole justification is the full CI run on `push: main`. That
 #                    run is not green (it failed, or nothing has concluded yet, or
@@ -35,15 +42,14 @@
 #                    `green` answer from the `main-health.sh` sibling, including a
 #                    missing or non-executable helper, holds the lane (#1159).
 #   review-quota-exhausted
-#                    LGTM (fresh) + CI green + CLEAN, and this lane genuinely
-#                    needs a sync (it would print `behind`) — but the
-#                    `claude-review` quota is PROVEN exhausted, so the re-review
-#                    that sync makes necessary cannot happen. Syncing now would
-#                    destroy the only verdict the lane will ever get, so it
-#                    waits. Remedy: nothing to do — the rate-limit window resets
-#                    on its own, and the lane then reads `behind` and syncs
-#                    normally. Fails closed in the INVERTED direction — see the
-#                    polarity block below (#1160).
+#                    RETIRED (2026-10-31) — no longer emitted. It held a REVIEWED
+#                    CLEAN lane that would otherwise sync, so the sync would not
+#                    spend an LGTM an exhausted reviewer could never re-issue.
+#                    Under the behind-is-not-a-blocker rule that lane is `ready`
+#                    and merges without a sync, and a conflicting lane (whose
+#                    remedy IS the sync) was always exempt. Kept in this list,
+#                    and in watch-pr.sh's in-flight set, only so a stale caller
+#                    reading it still routes to "wait".
 #   pending          CI still running (or no checks registered yet) → wait for a later wake
 #   ci-failed        a NON-review check is POSITIVELY PROVEN failing/errored — a
 #                    rollup we could READ, holding at least one failing entry that
@@ -356,6 +362,22 @@
 # degrades to `awaiting-review` (wait), NEVER to `changes-requested` — the one
 # token that dispatches a fix worker must not fire on garbage.
 #
+# MERGE GATE (owner rule, 2026-10-31): "PRs don't need to be brought up to the
+# current main before merging. If there are no merge conflicts then it is fine
+# to merge a pr that passed all other gates." A REVIEWED lane (`ready`,
+# `ready-comments`) therefore clears on GitHub's `mergeStateStatus` alone: CLEAN
+# or BEHIND (both conflict-free) clears; DIRTY/CONFLICTING (a conflict — merge
+# main in and resolve), UNKNOWN (mergeability not yet computed — never read as
+# clear), BLOCKED, DRAFT and anything unrecognised do not, and print `behind`.
+# Nothing below — the compare probe, the inert-files rule, main-health.sh — is
+# consulted for a reviewed lane any more.
+#
+# EVERYTHING FROM HERE TO THE END OF THE #1159 BLOCK NOW GOVERNS ONLY
+# `ready-unreviewed`. That token has no reviewer; "green CI against CURRENT main"
+# is its review substitute, so being behind still matters there, exactly as
+# described below. The rationale is kept verbatim because it is still true of
+# that one lane class.
+#
 # Freshness guard: `mergeStateStatus` is NOT a freshness signal. GitHub computes
 # BEHIND only when the base branch enforces strict/up-to-date status checks,
 # which this repo does not — so a branch many commits behind `main` reports
@@ -449,44 +471,23 @@
 #     lane never caused.
 #
 # ---------------------------------------------------------------------------
-# THE SECOND PRECONDITION: NEVER SPEND A VERDICT THAT CANNOT BE REPLACED (#1160)
+# THE SECOND PRECONDITION (#1160) — RETIRED 2026-10-31
 # ---------------------------------------------------------------------------
-# `behind`'s remedy is `fleet.sh sync`, which pushes a merge commit, advances
-# HEAD, and therefore invalidates the lane's LGTM under the stale-verdict guard
-# above. Normally that costs one re-review and nothing else. When the
-# `claude-review` quota is exhausted the re-review cannot happen at all, so the
-# sync permanently destroys the only verdict the lane will ever get. Observed on
-# PR #1158: LGTM at 05:11:43Z, sync at 05:23:58Z, re-review rejected in 24
-# seconds against a `seven_day` window that would not reset for three days. The
-# loop did that to itself, with its own remedy.
-#
-# THE RULE IS NOT "never destroy the LGTM on sync". It is "NEVER DESTROY IT AT A
-# MOMENT WHEN IT CANNOT BE REPLACED" — a precondition on the remedy, exactly the
-# shape the #1159 block above establishes. Not a new merge gate, not a
-# relaxation of an existing one, and never a forced sync.
-#
-# It is spent in the terminal `else` (the would-be-`behind` branch) and ONLY when
-# all four of these hold:
-#   * the lane would otherwise print `behind` — that is what the `else` means;
-#   * `ready_token` is `ready`, NOT `ready-unreviewed`. A Dependabot lane with no
-#     review gate has no verdict for a sync to destroy, so holding it would buy
-#     nothing and cost a merge. It keeps syncing exactly as today;
-#   * `merge_state` is `CLEAN`. A CONFLICTING/DIRTY lane's remedy IS the sync:
-#     the conflict never self-resolves and the lane's LGTM dies at Gate 1
-#     regardless of quota, so holding it would be a PERMANENT wedge with no
-#     un-wedge path — the quota resets, the lane is still conflicted, and nothing
-#     ever ran the one command that could fix it;
-#   * `review-quota.sh` positively answered `exhausted`.
-# Sitting in that `else` also gives `main-not-green` precedence for free
-# (`branch_is_current` sets `main_health_hold`, so the `elif` fires first) and
-# guarantees an already-held lane never pays for the probe — no explicit
-# precedence code is needed, and adding some would be a second place to keep in
-# sync with this one.
+# `review-quota.sh` used to be asked, in the would-be-`behind` branch, whether a
+# REVIEWED CLEAN lane's sync could be re-reviewed — because a sync advances HEAD
+# and spends the LGTM, and on PR #1158 an exhausted reviewer made that loss last
+# three days. The question only arose for a reviewed lane that was conflict-free
+# but behind `main` for a reason. Under the owner's merge gate above, that lane
+# is `ready`: it merges with no sync, so its verdict is never spent. A conflicted
+# lane's remedy IS the sync and was always exempt (holding it was a permanent
+# wedge). With no lane left that the hold could apply to, the probe is removed
+# rather than left as unreachable code; `review-quota.sh` itself is untouched.
 #
 # THE FAIL-CLOSED POLARITY IS INVERTED WITH RESPECT TO `main-health.sh`.
 # DO NOT HARMONISE THEM.
 #   main-health.sh:  anything that is not `green` HOLDS the lane.
-#   review-quota.sh: only a positively-proven `exhausted` HOLDS the lane.
+#   review-quota.sh (no longer consulted — see the retired block above): only a
+#     positively-proven `exhausted` HELD the lane.
 #     `available`, `unknown`, an empty answer, a non-zero exit, a garbage word, a
 #     MISSING helper and a NON-EXECUTABLE helper all fall through to today's
 #     `behind` → sync.
@@ -680,28 +681,10 @@ readonly MAIN_HEALTHY_TOKEN="green"
 MAIN_HEALTH_HELPER="$(cd "$(dirname "$0")" && pwd)/main-health.sh"
 readonly MAIN_HEALTH_HELPER
 
-# The ONE answer from `review-quota.sh` that holds a would-be-`behind` lane, and
-# the token that reports it. Note the INVERTED polarity against
-# `MAIN_HEALTHY_TOKEN` two blocks up: there, every answer except one holds the
-# lane; here, every answer except one lets it sync. Both are fail-closed — see
-# the "SECOND PRECONDITION" block in the header for why the safe action is the
-# opposite one in each. Do not harmonise them (#1160).
-readonly REVIEW_QUOTA_EXHAUSTED_TOKEN="exhausted"
-readonly REVIEW_QUOTA_HELD_TOKEN="review-quota-exhausted"
-
-# The second sibling, resolved by THIS script's own dirname for the same reason
-# as `MAIN_HEALTH_HELPER` above — a worktree, a copied tree or a checkout at any
-# path must find its own helper and never a stray one on PATH. Declared and
-# assigned on separate lines because `readonly x="$(…)"` masks the command
-# substitution's exit status (SC2155).
-#
-# Invoked DIRECTLY, never as `bash "$REVIEW_QUOTA_HELPER"`: a helper whose exec
-# bit was dropped in packaging (#1092's failure, guarded by test_exec_bits.sh)
-# must read as "we could not ask" — which HERE means "sync as usual", the
-# inverted polarity's safe answer. `bash` would run a file the repo considers
-# uninstalled and hand back a hold from it.
-REVIEW_QUOTA_HELPER="$(cd "$(dirname "$0")" && pwd)/review-quota.sh"
-readonly REVIEW_QUOTA_HELPER
+# The `mergeStateStatus` values that mean the branch merges into its base with
+# NO conflict. BEHIND is one of them: being behind is not a merge blocker.
+readonly MERGE_STATE_CLEAN="CLEAN"
+readonly MERGE_STATE_BEHIND="BEHIND"
 
 # The `code-review.yml` job name as it appears in the status rollup (the job KEY;
 # that job declares no `name:` override, so the check name matches it), and the
@@ -1632,7 +1615,7 @@ if [[ "$verdict_repo" != */* ]]; then
   # to close, and a new fatal path on the path every lane takes reopens it.
   #
   # This file's own convention is already the tolerant one everywhere else a
-  # `gh` probe can flake — `|| ci_ec=$?`, `|| health=""`, `|| quota=""` — and
+  # `gh` probe can flake — `|| ci_ec=$?`, `|| health=""` — and
   # the answer is safe in the only direction that matters: `awaiting-review` is
   # an IN_FLIGHT token, so the lane keeps polling and the very next poll that CAN
   # name the repository classifies normally. Nothing is merged on a repository we
@@ -2213,12 +2196,22 @@ elif [[ "$verdict_lgtm" != "true" || -z "$verdict_date" ]] || ! [[ "$verdict_dat
   ready_token="ready-unreviewed"
 fi
 
-# CLEAN is KEPT as well as the freshness probe: it is the only signal for
-# DIRTY/CONFLICTING/BLOCKED/DRAFT/UNKNOWN, which `behind_by` cannot see. And the
-# `&&` short-circuit is what keeps the compare call off every lane that is not
-# already one step from merging — a non-CLEAN lane is going to `behind` either
-# way, so paying an API request to learn how far behind it is, is pure waste.
-if [[ "$merge_state" == "CLEAN" ]] && branch_is_current; then
+# The merge gate. A REVIEWED lane needs only to be conflict-free: CLEAN or
+# BEHIND. `ready-unreviewed` keeps its review substitute — CLEAN plus
+# `branch_is_current` (compare / inert files / main-health) — and the `&&`
+# short-circuit keeps every one of those probes off reviewed lanes entirely.
+is_conflict_free() {
+  [[ "$merge_state" == "$MERGE_STATE_CLEAN" || "$merge_state" == "$MERGE_STATE_BEHIND" ]]
+}
+merge_cleared() {
+  if [[ "$ready_token" == "ready-unreviewed" ]]; then
+    [[ "$merge_state" == "$MERGE_STATE_CLEAN" ]] && branch_is_current
+  else
+    is_conflict_free
+  fi
+}
+
+if merge_cleared; then
   echo "$ready_token"
 elif [[ -n "$main_health_hold" ]]; then
   # Not current, and the reason we cannot clear it is `main` itself. `behind`
@@ -2226,41 +2219,14 @@ elif [[ -n "$main_health_hold" ]]; then
   # is a sync, and a sync onto a red `main` imports the breakage, burns a CI
   # round, and re-reports as this lane's own `ci-failed`. Wait instead — and
   # `main-not-green` is in watch-pr.sh's IN_FLIGHT_TOKENS so waiting is what the
-  # watcher does, rather than busy-waking the fleet (#1159).
+  # watcher does, rather than busy-waking the fleet (#1159). Only a
+  # `ready-unreviewed` lane can reach this: no other lane calls
+  # `branch_is_current`.
   echo "main-not-green"
 else
-  # THE SECOND PRECONDITION (#1160). Reaching this `else` means "behind": the
-  # remedy is `fleet.sh sync`, which advances HEAD and so spends this lane's
-  # LGTM. Ask whether that verdict can be earned back before spending it.
-  #
-  # The guards are the header's four conditions, and the two written here are the
-  # lanes with nothing to preserve or nothing to gain: `ready-unreviewed` has no
-  # verdict to lose, and a non-CLEAN lane's ONLY remedy is the sync (holding it
-  # would be a permanent wedge). They are also what keeps the probe LAZY — the
-  # same rate-limit argument as every other probe in this file, and sharper here
-  # because the question is literally "have we run out of API budget?".
-  # `main-not-green` needs no guard of its own: it is the `elif` above, so a lane
-  # already held never reaches this branch and never pays for the call.
-  #
-  # `|| quota=""` because the helper runs under `set -e`: an unguarded call that
-  # exited non-zero would abort mid-classification, and the orchestrator reads a
-  # non-zero exit with empty stdout as a TOOLING error, dispatching nothing. That
-  # empty string then falls through to `behind`, which is the correct answer for
-  # an unreadable one. `--repo` is forwarded so a `--repo`-scoped invocation does
-  # not read some other repo's reviewer. The helper's own stderr is deliberately
-  # NOT swallowed: it is the only place the operator learns which run proved the
-  # exhaustion and when the window lifts.
-  quota=""
-  if [[ ( "$ready_token" == "ready" || "$ready_token" == "ready-comments" ) &&
-        "$merge_state" == "CLEAN" && -x "$REVIEW_QUOTA_HELPER" ]]; then
-    quota="$("$REVIEW_QUOTA_HELPER" ${repo_args[@]+"${repo_args[@]}"})" || quota=""
-  fi
-  # Compared against the ONE token that holds. Everything else — `available`,
-  # `unknown`, empty, a future token, a debug print — is not proof, and an
-  # unproven hold costs days of a wedged lane (see the polarity block).
-  if [[ "$quota" == "$REVIEW_QUOTA_EXHAUSTED_TOKEN" ]]; then
-    echo "$REVIEW_QUOTA_HELD_TOKEN"
-  else
-    echo "behind"
-  fi
+  # A merge conflict (merge main in and resolve), a mergeability GitHub has not
+  # finished computing, another non-mergeable state, or a reviewless bump that
+  # is not current. `fleet.sh sync` is the remedy for all of them and is always
+  # safe; it is never prescribed for a reviewed lane that is merely behind.
+  echo "behind"
 fi

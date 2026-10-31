@@ -38,7 +38,7 @@ of these frees a slot and moves you to SOMETHING CHANGED.
 
 ---
 
-## Step 1 — Merge every ready lane (serialized, up-to-date only)
+## Step 1 — Merge every ready lane (serialized, conflict-free only)
 
 Merges happen one at a time; the single orchestrator session serializes them for
 free. For each open PR, evaluate the §6 merge policy in SKILL.md.
@@ -47,14 +47,16 @@ Order of checks — cheapest first, and each one has failed a real merge:
 
 ```bash
 PR=<n>
-gh pr view "$PR" --json url,headRefOid,mergeStateStatus,statusCheckRollup
-gh api "repos/{owner}/{repo}/compare/main...$BRANCH" --jq .behind_by   # must be 0
+gh pr view "$PR" --json url,headRefOid,mergeable,mergeStateStatus,statusCheckRollup
+# mergeable must be MERGEABLE (mergeStateStatus CLEAN or BEHIND); behind is fine
 gh pr view "$PR" --comments --json comments \
   --jq '.comments[-5:] | .[] | {createdAt, author: .author.login, body: .body[0:200]}'
 ```
 
-1. `behind_by == 0` — **not** `mergeStateStatus`, which says `CLEAN` on badly
-   stale branches.
+1. No merge conflict — `mergeable` is `MERGEABLE` (`mergeStateStatus` `CLEAN` or
+   `BEHIND`). Being behind `main` is **not** a blocker (owner rule, 2026-10-31).
+   `CONFLICTING` / `DIRTY` → merge `main` in and resolve first; `UNKNOWN` →
+   GitHub is still computing, re-check later — never read it as clear.
 2. CI green on `headRefOid` — the *current* head, not "CI passed at some point".
 3. Verdict `LGTM` **and** `createdAt` later than the head commit's timestamp.
 4. Acceptance criteria met (check the dossier's checklist, not the issue body).

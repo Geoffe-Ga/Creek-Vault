@@ -257,9 +257,11 @@ Merge autonomously — no per-PR confirmation — when **all** hold:
 2. the reviewer's verdict is `LGTM` — or `COMMENTS` with every actionable
    item filed as a prioritized follow-up issue — and **postdates the head commit** (verdicts
    routinely land seconds before your next push — compare timestamps, always);
-3. the branch is **not behind** `main` — measure with the compare API's
-   `behind_by == 0`, **never** `mergeStateStatus` alone, which reports `CLEAN`
-   on branches dozens of commits stale;
+3. the PR has **no merge conflict** with `main` — GitHub's `mergeable` is
+   `true` / `mergeStateStatus` is `CLEAN` or `BEHIND`. **Being behind `main` is
+   not a blocker** (owner rule, 2026-10-31); a conflicted PR (`DIRTY` /
+   `CONFLICTING`) merges `main` in and resolves first, and a `null` / `UNKNOWN`
+   mergeability (still computing) is re-checked, never read as clear;
 4. the issue's full acceptance criteria are met.
 
 - **`COMMENTS` is not blocking and never iterates.** File each actionable item
@@ -267,9 +269,9 @@ Merge autonomously — no per-PR confirmation — when **all** hold:
   Step 1A), then merge. Never push a fix for a `COMMENTS` finding and never
   hold a green PR for a nit.
 - **`CHANGES_REQUESTED`** → back to Gate 1 via `address-feedback`.
-- A **real** `behind` can still be mergeable when the file sets are disjoint —
-  but a **false** `behind` from a stale local ref destroys an LGTM for nothing.
-  `git fetch` and re-check against the API before syncing.
+- **Do not sync a PR just because it is behind.** Sync only to resolve a real
+  conflict — every sync pushes a commit and so destroys the LGTM. Check
+  mergeability against the API (not a stale local ref) before syncing.
 - **Never sync a lane holding a fresh LGTM** (the stale-verdict guard destroys
   it) and **never sync while `main` is red** — you import the breakage and
   re-report it as that lane's own failure.
