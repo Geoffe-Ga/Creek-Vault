@@ -13,6 +13,22 @@ to locate the originating commit for any reference below.
   decision R2-3): `PILOT_REFLECTIONS_PER_MONTH` is now 300 (15 live
   allocations at the default allowance of 20), up from ADR-0016's 100.
 
+- Carry out owner decision R2-4 (#1999): when the fleet alert channel fails,
+  keep routing, retry alerts, refuse new activations. An `AlertDeliveryError`
+  no longer escapes the pilot scheduler or trips the supervisor's shared stop,
+  so the edge, worker and scheduler keep running and the Machine stays
+  healthy. The new `AlertRelay` keeps the undelivered alert-kind counts,
+  durably, and re-sends them with capped doubling backoff (one, two, then four
+  fleet intervals). While an alert is owed, an `AdmissionGate` consulted
+  beside the static admission policy refuses new activations with the
+  existing `503 activation_unavailable`, and the first delivery that succeeds
+  reopens it. Each failed delivery bumps the SQLite counter
+  `alert_delivery_failed` and writes one content-free `ERROR` log line; the
+  gap's start, failure count and owed kinds live in
+  `provisioning_alert_delivery_gaps` and `provisioning_pending_alerts`, so a
+  restart keeps admission closed. Provider failure (exit `1`) and stale
+  reports still fail health.
+
 - Check agent-token revocation on every call (#2005, owner decision R3-2).
   `JwtAgentTokenVerifier` asks Adepthood's
   `/internal/vault-provisioning/agent-token-status` (adepthood#3630) with the

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from queue import Empty, Queue
 from threading import Event
 from typing import TYPE_CHECKING, cast
 
@@ -14,9 +15,16 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from creek_mcp.provisioning import pilot_cli
+from creek_mcp.provisioning.alert_relay import AdmissionGate, AlertRelay
+from creek_mcp.provisioning.pilot_alerts import AlertDeliveryError
+from creek_mcp.provisioning.pilot_supervisor import (
+    PilotSupervisor,
+    SupervisedComponent,
+)
+from creek_mcp.provisioning.store import ProvisioningStore
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
     from pathlib import Path
 
     from creek_mcp.provisioning import routing_cli, worker_cli
@@ -96,6 +104,28 @@ class _RouterBundle:
         self.closed = True
 
 
+@dataclass
+class _SyntheticSink:
+    """A fake alert channel: records attempts, never opens a socket."""
+
+    alert_url: str = ""
+    bearer_file: object = None
+    failing: bool = True
+    closed: bool = False
+    attempts: list[tuple[str, ...]] = field(default_factory=list)
+    delivered: list[tuple[str, ...]] = field(default_factory=list)
+
+    def deliver(self, kinds: Iterable[str]) -> None:
+        batch = tuple(kinds)
+        self.attempts.append(batch)
+        if self.failing:
+            raise AlertDeliveryError("fleet alert delivery failed")
+        self.delivered.append(batch)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_composition_shares_state_and_exposes_one_attested_endpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -107,7 +137,15 @@ def test_composition_shares_state_and_exposes_one_attested_endpoint(
     router = _RouterBundle(_app("router"))
     observed: list[tuple[str, Path, Path, str | None]] = []
 
-    def fake_control(namespace: object, _parser: object) -> Starlette:
+    gates: list[object] = []
+
+    def fake_control(
+        namespace: object,
+        _parser: object,
+        *,
+        admission_gate: object = None,
+    ) -> Starlette:
+        gates.append(admission_gate)
         observed.append(
             (
                 "control",
@@ -176,9 +214,55 @@ def test_composition_shares_state_and_exposes_one_attested_endpoint(
         assert client.get("/control/v1/jobs/x", headers=edge_headers).text == "control"
         assert client.get("/v1/health", headers=edge_headers).text == "router"
         assert client.get("/__fly/health").status_code == 503
+    assert len(gates) == 1
+    assert isinstance(gates[0], AdmissionGate)
+    assert isinstance(bundle.relay, AlertRelay)
     bundle.close()
     assert worker.closed is True
     assert router.closed is True
+
+
+def test_composition_shares_one_gate_between_alert_relay_and_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed alert delivery closes exactly the gate the control plane reads."""
+    parser = pilot_cli.build_parser()
+    args = parser.parse_args(_arguments(tmp_path))
+    gates: list[AdmissionGate] = []
+
+    def fake_control(
+        _namespace: object,
+        _parser: object,
+        *,
+        admission_gate: AdmissionGate,
+    ) -> Starlette:
+        gates.append(admission_gate)
+        return _app("control")
+
+    monkeypatch.setattr(pilot_cli.control_cli, "compose", fake_control)
+    monkeypatch.setattr(
+        pilot_cli.worker_cli,
+        "compose",
+        lambda *_a, **_kw: _WorkerBundle(
+            object(), datetime.now(tz=UTC), timedelta(seconds=1)
+        ),
+    )
+    monkeypatch.setattr(
+        pilot_cli.routing_cli,
+        "compose_replay",
+        lambda *_a: _RouterBundle(_app("router")),
+    )
+    monkeypatch.setattr(pilot_cli, "HttpFleetAlertSink", _SyntheticSink)
+
+    bundle = pilot_cli.compose(args, parser)
+    bundle.relay.collect(("orphan_resource",))
+    bundle.relay.flush()
+
+    assert gates[0].is_open is False
+    assert cast("_SyntheticSink", bundle.alerts).attempts == [("orphan_resource",)]
+    bundle.close()
+    assert cast("_SyntheticSink", bundle.alerts).closed is True
 
 
 def test_composition_rejects_split_state_before_resources(
@@ -303,11 +387,13 @@ def test_alert_only_fleet_report_is_healthy_and_marks_first_report(
 
     monkeypatch.setattr(pilot_cli.fleet_cli, "main", alert)
 
-    sink = cast(
-        "pilot_cli.HttpFleetAlertSink",
-        type("Sink", (), {"deliver": delivered.append})(),
+    relay = AlertRelay(
+        ProvisioningStore(args.database),
+        AdmissionGate(),
+        delivered.append,
+        backoff_seconds=args.fleet_interval_seconds,
     )
-    pilot_cli._run_scheduler(args, stop, freshness, sink)
+    pilot_cli._run_scheduler(args, stop, freshness, relay)
 
     assert freshness() is True
     assert delivered == [("monthly_budget_departure",)]
@@ -385,7 +471,7 @@ def test_composition_rejects_shutdown_outside_claim_and_fly_budgets(
     monkeypatch.setattr(
         pilot_cli.control_cli,
         "compose",
-        lambda *_args: _app("control"),
+        lambda *_args, **_kwargs: _app("control"),
     )
     monkeypatch.setattr(
         pilot_cli.worker_cli,
@@ -576,3 +662,201 @@ def test_main_restores_signals_closes_bundle_and_reports_component_failure(
     assert supervisor.calls == ["start", "wait", ("stop", 180.0)]
     assert closed == [True]
     assert all(not callable(handler) for handler in handlers.values())
+
+
+_CONTROL_TOKEN = "pilot-alert-gap-token-" + "q" * 32
+_PASS_TIMEOUT_SECONDS = 10.0
+
+
+def _post_activation(client: TestClient, activation: str, consumer: str) -> int:
+    return client.post(
+        "/control/v1/activations",
+        headers={"Authorization": f"Bearer {_CONTROL_TOKEN}"},
+        json={"activation_id": activation, "consumer_identity": consumer},
+    ).status_code
+
+
+def test_alert_sink_failure_keeps_the_pilot_running_and_refuses_activations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2-4: routing survives a dead alert channel; only admission closes."""
+    parser = pilot_cli.build_parser()
+    args = parser.parse_args(
+        [*_arguments(tmp_path), "--fleet-interval-seconds", "0.01"]
+    )
+    (tmp_path / "control-tokens").write_text(
+        f"adepthood={_CONTROL_TOKEN}\n", encoding="utf-8"
+    )
+    gate = AdmissionGate()
+    control = TestClient(
+        pilot_cli.control_cli.compose(args, parser, admission_gate=gate)
+    )
+    assert _post_activation(control, "activation-before", "user-one") == 202
+    store = ProvisioningStore(args.database)
+    sink = _SyntheticSink()
+    clock = [0.0]
+    relay = AlertRelay(
+        store,
+        gate,
+        sink.deliver,
+        backoff_seconds=1,
+        clock=lambda: clock[0],
+    )
+    steps: Queue[bool] = Queue()
+    entered: Queue[int] = Queue()
+    passes = 0
+    stops: list[Event] = []
+
+    def fake_main(
+        _arguments: list[str],
+        *,
+        emit_output: bool = True,
+        alert_sink: Callable[[tuple[str, ...]], None] | None = None,
+    ) -> int:
+        nonlocal passes
+        assert emit_output is False
+        assert alert_sink is not None
+        passes += 1
+        entered.put(passes)
+        while True:
+            try:
+                sink.failing = steps.get(timeout=0.01)
+                break
+            except Empty:
+                if stops[0].is_set():
+                    return 0
+        alert_sink(("orphan_resource",))
+        clock[0] += 4
+        return 3
+
+    monkeypatch.setattr(pilot_cli.fleet_cli, "main", fake_main)
+
+    def scheduler(stop: Event) -> None:
+        stops.append(stop)
+        pilot_cli._run_scheduler(args, stop, None, relay)
+
+    supervisor = PilotSupervisor(
+        (
+            SupervisedComponent("edge", lambda stop: stop.wait()),
+            SupervisedComponent("worker", lambda stop: stop.wait()),
+            SupervisedComponent("scheduler", scheduler),
+        )
+    )
+    supervisor.start()
+    try:
+        assert entered.get(timeout=_PASS_TIMEOUT_SECONDS) == 1
+        steps.put(True)
+        assert entered.get(timeout=_PASS_TIMEOUT_SECONDS) == 2
+        steps.put(True)
+        assert entered.get(timeout=_PASS_TIMEOUT_SECONDS) == 3
+
+        assert supervisor.failed is False
+        assert supervisor.healthy is True
+        assert store.alert_delivery_failures() == 2
+        assert gate.is_open is False
+        assert _post_activation(control, "activation-during", "user-two") == 503
+        assert _post_activation(control, "activation-before", "user-one") == 202
+
+        steps.put(False)
+        assert entered.get(timeout=_PASS_TIMEOUT_SECONDS) == 4
+        assert sink.delivered == [("orphan_resource",)]
+        assert gate.is_open is True
+        assert store.open_alert_delivery_gap() is None
+        assert _post_activation(control, "activation-after", "user-two") == 202
+    finally:
+        supervisor.stop(timeout=_PASS_TIMEOUT_SECONDS)
+    assert supervisor.failed is False
+
+
+def test_provider_failure_still_stops_the_scheduler_with_a_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only alert delivery is decoupled: exit 1 stays a scheduler failure."""
+    args = pilot_cli.build_parser().parse_args(_arguments(tmp_path))
+    gate = AdmissionGate()
+    relay = AlertRelay(
+        ProvisioningStore(args.database),
+        gate,
+        _SyntheticSink().deliver,
+        backoff_seconds=args.fleet_interval_seconds,
+    )
+    freshness = pilot_cli._FleetFreshness(60)
+    monkeypatch.setattr(pilot_cli.fleet_cli, "main", lambda *_a, **_kw: 1)
+
+    with pytest.raises(RuntimeError, match="not clean"):
+        pilot_cli._run_scheduler(args, Event(), freshness, relay)
+
+    assert freshness() is False
+    assert gate.is_open is True
+
+
+def test_a_non_delivery_sink_error_still_stops_the_scheduler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sink bug is not an outage of the alert channel; it fails stop."""
+    args = pilot_cli.build_parser().parse_args(_arguments(tmp_path))
+
+    def broken(_kinds: Iterable[str]) -> None:
+        raise RuntimeError("sink bug")
+
+    relay = AlertRelay(
+        ProvisioningStore(args.database),
+        AdmissionGate(),
+        broken,
+        backoff_seconds=args.fleet_interval_seconds,
+    )
+
+    def alert(
+        _arguments: list[str],
+        *,
+        emit_output: bool = True,
+        alert_sink: Callable[[tuple[str, ...]], None] | None = None,
+    ) -> int:
+        del emit_output
+        assert alert_sink is not None
+        alert_sink(("orphan_resource",))
+        return 3
+
+    monkeypatch.setattr(pilot_cli.fleet_cli, "main", alert)
+
+    with pytest.raises(RuntimeError, match="sink bug"):
+        pilot_cli._run_scheduler(args, Event(), None, relay)
+
+
+def test_failed_delivery_still_counts_as_a_fresh_provider_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inventory was read, so a dead alert channel never stales health."""
+    args = pilot_cli.build_parser().parse_args(_arguments(tmp_path))
+    stop = Event()
+    freshness = pilot_cli._FleetFreshness(60)
+    sink = _SyntheticSink()
+    relay = AlertRelay(
+        ProvisioningStore(args.database),
+        AdmissionGate(),
+        sink.deliver,
+        backoff_seconds=args.fleet_interval_seconds,
+    )
+
+    def alert(
+        _arguments: list[str],
+        *,
+        emit_output: bool = True,
+        alert_sink: Callable[[tuple[str, ...]], None] | None = None,
+    ) -> int:
+        del emit_output
+        assert alert_sink is not None
+        alert_sink(("stuck_deletion",))
+        stop.set()
+        return 3
+
+    monkeypatch.setattr(pilot_cli.fleet_cli, "main", alert)
+
+    pilot_cli._run_scheduler(args, stop, freshness, relay)
+
+    assert sink.attempts == [("stuck_deletion",)]
+    assert freshness() is True
