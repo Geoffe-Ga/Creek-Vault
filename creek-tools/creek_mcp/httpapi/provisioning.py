@@ -140,12 +140,24 @@ class ProvisioningAPI:
         return _response(_job_payload(job), status_code=200)
 
     async def retry(self, request: Request) -> Response:
-        """Requeue one requester-owned retryable failure."""
+        """Requeue one requester-owned retryable failure.
+
+        A failed create is re-admitted under the same policy as a new
+        activation (#2019), so at the cap or behind a closed gate it is
+        refused exactly as ``activate`` refuses: 503, nothing written.
+        """
         job_id = request.path_params["job_id"]
         consumer = context_of(request.scope).consumer
         assert consumer is not None
         try:
             job = await write_off_loop(self._retry, job_id, consumer)
+        except ActivationAdmissionError:
+            return _error(
+                request,
+                "activation_unavailable",
+                "new activation unavailable",
+                503,
+            )
         except InvalidJobTransitionError as error:
             if await read_off_loop(self._store.get, job_id, consumer) is None:
                 return _error(request, "job_unavailable", "job unavailable", 403)
@@ -186,7 +198,9 @@ class ProvisioningAPI:
 
     def _retry(self, job_id: str, requester: str) -> ProvisioningJob:
         """Requeue at the injected instant; off-loop calls take positionals only."""
-        return self._store.retry(job_id, requester, now=self._clock())
+        return self._store.retry(
+            job_id, requester, admission=self._admission, now=self._clock()
+        )
 
     def _request_delete(self, job_id: str, requester: str) -> ProvisioningJob:
         """Enqueue teardown at the injected instant, never the wall clock."""

@@ -510,3 +510,72 @@ def test_every_mutating_route_stamps_the_injected_clock(
     assert retried.json()["updated_at"] == "2031-01-02T00:00:00+00:00"
     assert deleted.status_code == 202
     assert deleted.json()["updated_at"] == "2031-01-03T00:00:00+00:00"
+
+
+def _fail_claimed_create(store: ProvisioningStore) -> None:
+    """Settle the oldest queued create as a retryable transient failure."""
+    claimed = store.claim_next()
+    assert claimed is not None
+    store.record_failure(
+        claimed.job.job_id,
+        claimed.lease_token,
+        FailureReason.PROVIDER_UNAVAILABLE,
+        retryable=True,
+    )
+
+
+def test_retry_of_a_failed_create_at_the_cap_is_refused_and_writes_nothing(
+    store: ProvisioningStore,
+) -> None:
+    """#2019: a failed create frees its slot, so its retry must be re-admitted."""
+    verifier = ConsumerTokenVerifier({"adepthood": (_TOKEN,)})
+    client = TestClient(
+        build_provisioning_app(
+            store,
+            verifier,
+            admission=ActivationAdmissionPolicy(maximum_live_allocations=1),
+        )
+    )
+    failed = _submit(client, "activation-failed", consumer_identity="user-one").json()
+    _fail_claimed_create(store)
+    occupant = _submit(client, "activation-occupant", consumer_identity="user-two")
+    before = client.get(failed["status_url"], headers=_headers()).json()
+
+    refused = client.post(
+        f"/control/v1/jobs/{failed['job_id']}/retry", headers=_headers()
+    )
+
+    assert occupant.status_code == 202
+    assert refused.status_code == 503
+    assert refused.json()["code"] == "activation_unavailable"
+    assert refused.json()["message"] == "new activation unavailable"
+    assert client.get(failed["status_url"], headers=_headers()).json() == before
+    assert before["state"] == JobState.FAILED.value
+
+
+def test_closed_runtime_gate_refuses_a_failed_create_retry(
+    store: ProvisioningStore,
+) -> None:
+    """R2-4: the alert-gap gate covers re-admission exactly as it covers creation."""
+    verifier = ConsumerTokenVerifier({"adepthood": (_TOKEN,)})
+    gate = AdmissionGate()
+    client = TestClient(
+        build_provisioning_app(
+            store,
+            verifier,
+            admission=ActivationAdmissionPolicy(runtime_gate=gate),
+        )
+    )
+    failed = _submit(client, "activation-gated", consumer_identity="user-one").json()
+    _fail_claimed_create(store)
+    retry_url = f"/control/v1/jobs/{failed['job_id']}/retry"
+    gate.close()
+
+    refused = client.post(retry_url, headers=_headers())
+    gate.open()
+    admitted = client.post(retry_url, headers=_headers())
+
+    assert refused.status_code == 503
+    assert refused.json()["code"] == "activation_unavailable"
+    assert admitted.status_code == 202
+    assert admitted.json()["state"] == JobState.PENDING.value

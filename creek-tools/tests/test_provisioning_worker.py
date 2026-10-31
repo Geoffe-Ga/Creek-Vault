@@ -25,7 +25,7 @@ from creek_mcp.provisioning.models import (
     ReceiptOutcome,
     ResourceClass,
 )
-from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.store import ActivationAdmissionPolicy, ProvisioningStore
 from creek_mcp.provisioning.worker import ProvisioningWorker
 
 if TYPE_CHECKING:
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from creek_mcp.provisioning.models import ProvisioningJob
 
 _NOW = datetime(2026, 9, 6, 13, tzinfo=UTC)
+_ADMISSION = ActivationAdmissionPolicy()
 
 
 @pytest.fixture
@@ -198,7 +199,7 @@ def test_retry_reuses_the_same_provider_allocation(
     worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
 
     worker.run_once(now=_NOW)
-    store.retry(job.job_id, "adepthood", now=_NOW)
+    store.retry(job.job_id, "adepthood", admission=_ADMISSION, now=_NOW)
     worker.run_once(now=_NOW)
 
     result = store.get(job.job_id, "adepthood")
@@ -392,10 +393,10 @@ def test_failed_delete_bumps_receipt_attempts_and_terminal_failure_marks_it_fail
 
     worker.run_once(now=_NOW)
     after_first = store.list_deletion_receipts()[0]
-    store.retry(job.job_id, "adepthood", now=_NOW)
+    store.retry(job.job_id, "adepthood", admission=_ADMISSION, now=_NOW)
     worker.run_once(now=_NOW)
     after_second = store.list_deletion_receipts()[0]
-    store.retry(job.job_id, "adepthood", now=_NOW)
+    store.retry(job.job_id, "adepthood", admission=_ADMISSION, now=_NOW)
     worker.run_once(now=_NOW)
     terminal = store.list_deletion_receipts()[0]
 

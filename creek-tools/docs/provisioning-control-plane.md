@@ -36,16 +36,24 @@ recovery material, key material, or corpus content.
 The production CLI defaults to a five-live-allocation admission cap; the Fly
 pilot defaults to the release cap of fifteen (owner decision R2-3) and refuses
 any larger value. The count includes every job that holds or is acquiring a
-provider allocation (`pending`, `provisioning`, `awaiting_key_ceremony`,
-`ready`, and a `failed` create, which may still own a running Machine and can
-return to `pending` through `retry`), so queued work reserves capacity before a
-provider call. A `deleting`, failed-delete, or `deleted` job frees its slot;
+provider allocation (`pending`, `provisioning`, `awaiting_key_ceremony`, and
+`ready`), so queued work reserves capacity before a provider call. A
+`deleting`, failed-delete, `deleted`, or failed-create job frees its slot;
 unconfirmed deletion spend is guarded by the budget alert and the
-`stuck_deletion` report. The count and new job/alias insert share one
+`stuck_deletion` report, and a failed create's leftover provider resources are
+reported as `incomplete_create` (#2019). A failed create returns to `pending`
+only through the admission fence: `retry` of a failed create, and the fleet
+reconciler's resume of a first-attempt rejection, are refused with
+`503 activation_unavailable` (`ActivationAdmissionError`) at the cap, under
+`--disable-new-activations`, or behind a closed runtime gate, and write
+nothing. The standalone `creek-provisioning-fleet reconcile` holds no
+admission policy, so it reports such a create but never resumes it; the Fly
+pilot's scheduled reconcile passes the control plane's policy. The count and new job/alias insert share one
 SQLite write transaction; concurrent API processes cannot cross the cap. Start
 the API with `--disable-new-activations` to refuse every new activation id with
 `503 activation_unavailable`. An exact existing id remains replayable, and
-status, routing, retry, export, and deletion do not depend on create admission.
+status, routing, retry of a failed delete, export, and deletion do not depend
+on create admission.
 The refusal writes nothing and the provider-free API makes no Fly request.
 
 The checked-in contract is
