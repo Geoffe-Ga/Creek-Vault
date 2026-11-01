@@ -29,8 +29,11 @@ to locate the originating commit for any reference below.
   delivery channel fails. The relay now also persists alerts collected while
   it backs off, so they survive a restart. The design is a pull, recorded as
   an ADR-0013 amendment, and the runbook names the recipient and the action
-  for each kind. #2048's spend meter plugs in with one call,
-  `owe_vault_alert(SPEND_ALERT_KIND)`.
+  for each kind. The spend meter from #2048 (#2007) owes its EUR 5 alert with
+  one call, `owe_vault_alert(SPEND_ALERT_KIND)`, placed in
+  `PoolSpendMeter.record` after the once-a-month latch. A second crossing in
+  the same month owes nothing more. An outbox write failure is logged and
+  never fails the metered call.
 
 - ADR-0015 amendment (2026-11-01, adepthood#3578, owner decision R1-1): for an
   account that has not enrolled in user-held keys, a writer's request key may

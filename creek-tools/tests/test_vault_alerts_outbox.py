@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
 
 from creek.classify.llm import pool_attested
+from creek.classify.llm.pool_meter import PoolSpendMeter, PoolUsage, SpendState
+from creek.classify.llm.pool_prices import PriceTable
 from creek.vault_alerts import (
     OUTBOX_RELPATH,
     SCHEMA,
@@ -300,3 +303,94 @@ def test_a_pool_outcome_alert_is_owed_in_the_installed_outbox(
     state = outbox.summary()
     assert state is not None
     assert state.owed == {_ATTESTATION: 1}
+
+
+# --------------------------------------------------------------------------
+# #2007's spend alert is owed in the outbox, once per crossing (#2049).
+# --------------------------------------------------------------------------
+
+_SPEND_VENDOR = "examplevendor"
+_SPEND_MODEL = "example-chat-1"
+_NOVEMBER = datetime(2026, 11, 14, 9, 30, tzinfo=UTC)
+_FIVE_EUROS_OF_PROMPT = PoolUsage(
+    prompt_tokens=5_000_000, completion_tokens=0, embedding_tokens=0
+)
+
+
+def _spend_meter(vault: Path) -> PoolSpendMeter:
+    """Return a meter over invented prices: EUR 1 per million prompt tokens."""
+    prices = PriceTable.model_validate(
+        {
+            "schema_version": 1,
+            "vendors": {
+                _SPEND_VENDOR: {
+                    "status": "pinned",
+                    "currency": "EUR",
+                    "source_url": "https://prices.example.test/pricing",
+                    "read_on": "2026-10-30",
+                    "monthly_cap": "10.00",
+                    "alert_fraction": "0.5",
+                    "models": {
+                        _SPEND_MODEL: {
+                            "prompt_per_million": "1.00",
+                            "completion_per_million": "2.00",
+                        }
+                    },
+                }
+            },
+        }
+    )
+    return PoolSpendMeter(vault, prices=prices, clock=lambda: _NOVEMBER)
+
+
+def test_crossing_the_spend_line_owes_exactly_one_spend_alert(
+    tmp_path: Path,
+) -> None:
+    """The real meter's first crossing is owed once; later crossings add none."""
+    meter = _spend_meter(tmp_path)
+
+    with installed_vault_alert_outbox(tmp_path) as outbox:
+        first = meter.record(_SPEND_VENDOR, _SPEND_MODEL, _FIVE_EUROS_OF_PROMPT)
+        meter.record(_SPEND_VENDOR, _SPEND_MODEL, _FIVE_EUROS_OF_PROMPT)
+        _spend_meter(tmp_path).record(
+            _SPEND_VENDOR, _SPEND_MODEL, _FIVE_EUROS_OF_PROMPT
+        )
+
+    assert first.state is SpendState.THRESHOLD_REACHED
+    state = outbox.summary()
+    assert state is not None
+    assert state.owed == {_SPEND: 1}
+
+
+def test_spend_under_the_line_owes_nothing(tmp_path: Path) -> None:
+    """Below EUR 5 the meter raises no alert, so the outbox stays empty."""
+    with installed_vault_alert_outbox(tmp_path) as outbox:
+        _spend_meter(tmp_path).record(
+            _SPEND_VENDOR,
+            _SPEND_MODEL,
+            PoolUsage(prompt_tokens=4_000_000, completion_tokens=0, embedding_tokens=0),
+        )
+
+    assert outbox.summary() is None
+
+
+def test_an_outbox_write_failure_never_breaks_the_metered_call(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The ledger still records the crossing; the outbox failure is only logged."""
+    vault = tmp_path / "vault"
+    unwritable = tmp_path / "unwritable"
+    unwritable.write_text("not a directory", encoding="utf-8")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="creek.vault_alerts"),
+        installed_vault_alert_outbox(unwritable),
+    ):
+        spend = _spend_meter(vault).record(
+            _SPEND_VENDOR, _SPEND_MODEL, _FIVE_EUROS_OF_PROMPT
+        )
+
+    assert spend.state is SpendState.THRESHOLD_REACHED
+    assert "vault alert could not be recorded kind=monthly_budget_departure" in (
+        caplog.text
+    )
