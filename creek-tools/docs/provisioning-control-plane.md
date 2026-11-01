@@ -196,6 +196,14 @@ creek-provisioning-router \
   --tls-key /run/creek-secrets/router.key
 ```
 
+The router's client to each vault ignores the proxy environment (#2045).
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` cannot move a user's
+request off Fly's private network, and the client dials the `.internal` name
+or 6PN address itself. That client trusts only the CA in
+`--private-tls-ca-certificate-file`, never `SSL_CERT_FILE` or `SSL_CERT_DIR`.
+The Fly Machines API client still follows the proxy environment, because it
+carries no user content.
+
 The Adepthood callback is an authenticated HTTPS POST to
 `/internal/vault-provisioning/completions`. A `204` includes an identical
 replay; `409` and other non-timeout 4xx responses are terminal conflicts, while

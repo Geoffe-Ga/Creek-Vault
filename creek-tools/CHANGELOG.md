@@ -9,6 +9,18 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- The edge router's client to each user's vault now ignores ambient proxy
+  settings (#2045). It carries journal content over Fly's private network, but
+  it was built without `trust_env=False`, so an inherited `HTTPS_PROXY`,
+  `HTTP_PROXY` or `ALL_PROXY` would have routed that content through the
+  proxy. The client is now built by `routing_cli.private_vault_client`, which
+  sets `trust_env=False` and trusts only the explicit private CA. A dial-spy
+  test sets every proxy variable to a fake host and shows the router still
+  dials only the vault's `.internal` name or 6PN address. A structural test
+  over `routing_cli.py` keeps the client proxy-free. The sweep found no other
+  client under `creek_mcp/provisioning/` or `creek_mcp/httpapi/` that carries
+  user content: the Fly Machines API, handoff callback and fleet-alert clients
+  carry credentials or metadata only.
 - Stop labelling unattested pool answers as attested, and stop letting the
   environment choose where an enclave prompt goes (#2040, #1933).
   `pool:attested:<vendor>` is now derived from the attestation path, never
