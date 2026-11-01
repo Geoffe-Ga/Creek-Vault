@@ -613,12 +613,28 @@ Once prices are pinned, the line ends with
 `spend=<EUR, rounded up> threshold=5.00 cap=10.00 currency=EUR`. A vault that
 has not dialled this month prints `pool-spend month=<month> state=no-usage`.
 
+If prices are pinned but one of the month's counted models is not priced (a new
+model id the vendor started serving, say, or an embeddings model nobody pinned
+yet), the line is `price-partial`. The priced models still add up to a figure,
+but it is printed as `spend_lower_bound=`, never `spend=`, because the
+unpriced tokens can only add to the bill. The line then names the models to
+pin (#2052):
+
+```text
+pool-spend vendor=privatemode month=2026-11 state=price-partial prompt_tokens=6000011 completion_tokens=20 embedding_tokens=0 calls=3 estimated_calls=0 spend_lower_bound=6.00 threshold=5.00 cap=10.00 currency=EUR threshold_reached=yes unpriced_models=1 unpriced_model_ids=<model-id>
+```
+
+To clear it, add each named id to the vendor's `models` in a reviewed PR.
+`threshold_reached` compares the exact lower bound, not the rounded one, with
+the line.
+
 | State | Means |
 |---|---|
 | `no-usage` | No pool call has been metered this UTC month |
 | `under-threshold` | Priced, and below `monthly_cap × alert_fraction` |
 | `threshold-reached` | Priced, and at or above that line; the month's alert has been raised |
-| `price-unpinned` | Tokens only. The vendor, one of its models, or one counted direction has no pinned price. No € figure and no alert |
+| `price-partial` | Some counted models are priced and some are not (no entry, or no price for a direction they were counted in). The priced spend is reported as `spend_lower_bound`, never as a total, with the unpriced model count and ids. The alert fires if the lower bound alone reaches the line |
+| `price-unpinned` | Tokens only. The vendor is not pinned, or none of its counted models has a usable price. No € figure and no alert |
 | `price-table-invalid` | The shipped table failed validation; no € figure and no alert |
 | `ledger-unreadable` | The ledger exists but cannot be read; it is not overwritten |
 
@@ -627,13 +643,21 @@ has not dialled this month prints `pool-spend month=<month> state=no-usage`.
 `creek.pool` record:
 `{"event": "pool_spend", "alert": "monthly_budget_departure", "component": "pool", "vendor": ..., "month": ..., "spend": ..., "threshold": ..., "cap": ..., "currency": ...}`.
 That happens once per month per vault, and the latch in the ledger means a
-restart does not repeat it. The kind is the existing `monthly_budget_departure`, which adepthood's
+restart does not repeat it. On a `price-partial` month the record fires when
+the lower bound reaches the line, and it reads differently. `spend` is
+replaced by `"spend_lower_bound"`, and it adds `"price_state": "price-partial"`,
+`"unpriced_models": <count>` and `"unpriced_model_ids": [...]`. Model ids are
+closed identifiers, not content. Pinning the missing model later in the month
+does not raise a second alert. The kind is the existing `monthly_budget_departure`, which adepthood's
 receiver already admits, so no receiver change is needed. `component: "pool"`
 distinguishes it from the fleet's Fly budget. Like the five kinds above, it is
 **named in the vault's log and not yet delivered to the control plane**. Until
 it is, watch the vault's log stream or run `--check pool`. While prices are
 unpinned the meter writes one `{"event": "pool_spend", "status":
-"price_unpinned"}` record per process instead. A ledger write that fails is
+"price_unpinned"}` record per process instead. A `price-partial` month writes
+`{"event": "pool_spend", "status": "price_partial", "unpriced_models": ...,
+"unpriced_model_ids": [...]}`, once per process for each new set of unpriced
+models. A ledger write that fails is
 logged as `meter_unavailable` and never fails the reflection.
 
 ## 5. The per-use label, and the standing bar

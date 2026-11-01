@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
+from creek.classify.llm import pool_meter
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
 from creek.classify.llm.pool_boundary import (
     POOL_URL_ENV,
@@ -36,6 +37,7 @@ from creek.classify.llm.pool_meter import (
     LEDGER_RELPATH,
     UNANSWERED_COMPLETION_ESTIMATE,
     PoolSpendMeter,
+    PoolUsage,
     SpendState,
     active_pool_meter,
     pool_spend_meter,
@@ -476,8 +478,6 @@ def test_check_pool_prints_month_to_date_tokens_and_unpinned_state(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """With the shipped table, tokens are shown and EUR is withheld."""
-    from creek.classify.llm.pool_meter import PoolUsage
-
     PoolSpendMeter(tmp_path).record("privatemode", MODEL, PoolUsage(12, 5, 0))
 
     code, lines = _check_pool(tmp_path, monkeypatch, capsys)
@@ -487,6 +487,45 @@ def test_check_pool_prints_month_to_date_tokens_and_unpinned_state(
     assert "state=price-unpinned" in lines[1]
     assert "prompt_tokens=12 completion_tokens=5" in lines[1]
     assert "spend=" not in lines[1]
+
+
+def test_check_pool_names_unpriced_models_beside_a_lower_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A partly priced month shows a lower bound and the models to pin (#2052)."""
+    table = tmp_path / "prices.json"
+    table.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "vendors": {
+                    "privatemode": {
+                        "status": "pinned",
+                        "currency": "EUR",
+                        "source_url": "https://prices.example.test/",
+                        "read_on": "2026-10-30",
+                        "models": {MODEL: {"prompt_per_million": "1"}},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pool_meter, "PRICE_TABLE_PATH", table)
+    vault = tmp_path / "vault"
+    meter = PoolSpendMeter(vault)
+    meter.record("privatemode", MODEL, PoolUsage(6_000_000, 0, 0))
+    meter.record("privatemode", EMBED_MODEL, PoolUsage(0, 0, 7))
+
+    code, lines = _check_pool(vault, monkeypatch, capsys)
+
+    assert code == 0
+    assert "state=price-partial" in lines[1]
+    assert "spend_lower_bound=6.00" in lines[1]
+    assert " spend=" not in lines[1]
+    assert lines[1].endswith(f"unpriced_models=1 unpriced_model_ids={EMBED_MODEL}")
 
 
 def test_check_pool_reports_spend_even_when_the_probe_fails(
