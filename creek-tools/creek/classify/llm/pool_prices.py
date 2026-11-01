@@ -22,6 +22,11 @@ change was written without access to the vendor's published prices; until an
 operator fills it, the meter reports tokens and says ``price-unpinned``
 instead of a euro figure (:mod:`creek.classify.llm.pool_meter`).
 
+**Priced per model, never all or nothing (#2052).** A pinned entry prices
+each counted model it can and names the ones it cannot, in a
+:class:`VendorCost`. One unexpected model id therefore leaves the rest of the
+month's spend measurable as a lower bound, instead of hiding it.
+
 **Money is exact.** JSON numbers are parsed straight into :class:`Decimal`,
 as ADR-0013 Decision 4 requires of every operator amount, so a price written
 as ``0.1`` is exactly one tenth.
@@ -36,6 +41,7 @@ in.
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -86,8 +92,8 @@ class ModelPrices(BaseModel):
 
     A direction a model is never billed for may be left out: a chat model has
     no embedding price and an embedding model no completion price. A count in
-    a direction that has no price makes the whole line unpriced
-    (:meth:`cost`), never priced at zero.
+    a direction that has no price makes this model unpriced (:meth:`cost`),
+    never priced at zero.
 
     Attributes:
         prompt_per_million: Price per million prompt (input) tokens.
@@ -128,6 +134,22 @@ class ModelPrices(BaseModel):
                 return None
             total += Decimal(tokens) * rate / _TOKENS_PER_MILLION
         return total
+
+
+@dataclass(frozen=True, slots=True)
+class VendorCost:
+    """What a pinned entry could price of one month's per-model counts.
+
+    Attributes:
+        priced: The exact, unrounded cost of the models that are priced.
+        priced_models: How many counted models that cost covers.
+        unpriced: The sorted ids of counted models with no usable price. Any
+            of them makes :attr:`priced` a lower bound on the true spend.
+    """
+
+    priced: Decimal
+    priced_models: int
+    unpriced: tuple[str, ...]
 
 
 class VendorPrices(BaseModel):
@@ -185,28 +207,34 @@ class VendorPrices(BaseModel):
         """The spend at or above which the alert fires: cap x fraction."""
         return self.monthly_cap * self.alert_fraction
 
-    def price(self, counts: Mapping[str, tuple[int, int, int]]) -> Decimal | None:
-        """Return the exact cost of per-model ``(prompt, completion, embedding)``.
+    def price(self, counts: Mapping[str, tuple[int, int, int]]) -> VendorCost | None:
+        """Price per-model ``(prompt, completion, embedding)`` counts.
+
+        A model is unpriced when the entry lists no price for it, or lists none
+        for a direction it was counted in. It adds nothing to the cost and is
+        named instead, so the cost of the others survives as a lower bound.
 
         Args:
             counts: Token counts keyed by model id.
 
         Returns:
-            The unrounded total, or ``None`` when this entry is not pinned,
-            a model is not priced, or a counted direction has no price.
+            The priced cost and the unpriced model ids, or ``None`` when this
+            entry is not pinned.
         """
         if not self.pinned:
             return None
         total = Decimal(0)
+        unpriced: list[str] = []
         for model, (prompt, completion, embedding) in counts.items():
             prices = self.models.get(model)
             cost = (
                 None if prices is None else prices.cost(prompt, completion, embedding)
             )
             if cost is None:
-                return None
-            total += cost
-        return total
+                unpriced.append(model)
+            else:
+                total += cost
+        return VendorCost(total, len(counts) - len(unpriced), tuple(sorted(unpriced)))
 
 
 class PriceTable(BaseModel):

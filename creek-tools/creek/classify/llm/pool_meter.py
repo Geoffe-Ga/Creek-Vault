@@ -39,6 +39,17 @@ five vault-side pool kinds are named today; the latch is in the ledger, so a
 restart does not repeat it. Until the operator pins prices the meter reports
 tokens only, with the state ``price-unpinned``, and raises no alert.
 
+**Partly priced is still metered (#2052).** When a pinned vendor prices some
+of the month's counted models but not all — a new model id, an embeddings
+model not yet pinned — the priced models still sum to a figure. It is a
+*lower bound*, since an unpriced model can only add to the bill, so the line
+says ``price-partial``, reports ``spend_lower_bound`` and never ``spend``, and
+names how many models, and which ids, are unpriced. The alert fires when the
+lower bound alone reaches the line: alerting early is safe, and the month's
+latch still allows exactly one. A ``price_partial`` status record names the
+unpriced model ids once per process for each new set of them, so the
+operator knows what to pin.
+
 **Content-free.** The ledger and every record hold counts, money, a month,
 and closed vendor and model ids — never a prompt, an answer, a request id or a
 key. A vendor or model id that is not a closed identifier is stored as
@@ -71,6 +82,7 @@ from creek.classify.llm.pool_prices import (
     VENDOR_ID_PATTERN,
     PriceTable,
     PriceTableError,
+    VendorCost,
     VendorPrices,
     load_price_table,
 )
@@ -148,12 +160,14 @@ class SpendState(StrEnum):
     NO_USAGE = "no-usage"
     UNDER_THRESHOLD = "under-threshold"
     THRESHOLD_REACHED = "threshold-reached"
+    PRICE_PARTIAL = "price-partial"
     PRICE_UNPINNED = "price-unpinned"
     PRICE_TABLE_INVALID = "price-table-invalid"
     LEDGER_UNREADABLE = "ledger-unreadable"
 
 
 _ANNOUNCED: Final[dict[SpendState, str]] = {
+    SpendState.PRICE_PARTIAL: "price_partial",
     SpendState.PRICE_UNPINNED: "price_unpinned",
     SpendState.PRICE_TABLE_INVALID: "price_table_invalid",
 }
@@ -306,11 +320,17 @@ class VendorSpend:
         embedding_tokens: Embedded tokens this month.
         calls: Calls metered this month.
         estimated_calls: How many of those carried an estimate.
-        spend: Month-to-date spend rounded up to the cent, or ``None`` when no
-            price is pinned.
+        spend: Month-to-date spend rounded up to the cent, or ``None`` unless
+            every counted model is priced.
         threshold: The alert line, when priced.
         cap: The key's monthly cap, when priced.
-        currency: The currency of the three amounts, when priced.
+        currency: The currency of the amounts, when priced.
+        spend_lower_bound: For a ``price-partial`` line only, the priced
+            models' spend rounded up to the cent: a lower bound, never a total.
+        unpriced_models: The sorted ids of counted models with no price, for a
+            ``price-partial`` line.
+        threshold_reached: Whether the exact priced spend is at or above the
+            alert line.
     """
 
     vendor: str | None
@@ -325,6 +345,9 @@ class VendorSpend:
     threshold: Decimal | None = None
     cap: Decimal | None = None
     currency: str | None = None
+    spend_lower_bound: Decimal | None = None
+    unpriced_models: tuple[str, ...] = ()
+    threshold_reached: bool = False
 
     def summary_line(self) -> str:
         """Return the line ``--check pool`` prints: closed keys and values only."""
@@ -340,12 +363,39 @@ class VendorSpend:
             f"embedding_tokens={self.embedding_tokens} "
             f"calls={self.calls} estimated_calls={self.estimated_calls}"
         )
-        if self.spend is None:
+        if self.spend is not None:
+            return f"{line} {self._amounts('spend', self.spend)}"
+        if self.spend_lower_bound is None:
             return line
+        reached = "yes" if self.threshold_reached else "no"
         return (
-            f"{line} spend={self.spend} threshold={self.threshold} "
+            f"{line} {self._amounts('spend_lower_bound', self.spend_lower_bound)} "
+            f"threshold_reached={reached} "
+            f"unpriced_models={len(self.unpriced_models)} "
+            f"unpriced_model_ids={','.join(self.unpriced_models)}"
+        )
+
+    def _amounts(self, key: str, amount: Decimal) -> str:
+        """Return the money pairs: *key*, then threshold, cap and currency."""
+        return (
+            f"{key}={amount} threshold={self.threshold} "
             f"cap={self.cap} currency={self.currency}"
         )
+
+    def unpriced_fields(self) -> dict[str, object]:
+        """Return the content-free fields naming unpriced models, if any.
+
+        Returns:
+            ``unpriced_models`` (a count) and ``unpriced_model_ids`` (closed
+            ids) for a partly priced line; empty otherwise, so a fully priced
+            or fully unpinned record keeps exactly its former keys.
+        """
+        if not self.unpriced_models:
+            return {}
+        return {
+            "unpriced_models": len(self.unpriced_models),
+            "unpriced_model_ids": list(self.unpriced_models),
+        }
 
 
 def _utc_now() -> datetime:
@@ -436,7 +486,7 @@ class PoolSpendMeter:
         self._prices = prices
         self._prices_invalid = False
         self._clock = clock
-        self._announced: set[tuple[str, SpendState]] = set()
+        self._announced: set[tuple[str, SpendState, tuple[str, ...]]] = set()
 
     def record(self, vendor: str, model: str, usage: PoolUsage) -> VendorSpend:
         """Add one call's usage to the month and alert on the first crossing.
@@ -493,7 +543,7 @@ class PoolSpendMeter:
         line = ledger.vendors.setdefault(vendor, _VendorLedger())
         line.models.setdefault(model, _ModelCounts()).add(usage)
         spend = self._evaluate(month, vendor, line)
-        alert = spend.state is SpendState.THRESHOLD_REACHED and not line.alerted
+        alert = spend.threshold_reached and not line.alerted
         line.alerted = line.alerted or alert
         _write_atomically(self._ledger_path, ledger.model_dump_json(indent=2))
         return spend, alert
@@ -533,34 +583,55 @@ class PoolSpendMeter:
             return replace(unpriced, state=SpendState.PRICE_TABLE_INVALID)
         entry = table.vendor(vendor)
         cost = None if entry is None else entry.price(_per_model(line))
-        if entry is None or cost is None:
+        if entry is None or cost is None or not cost.priced_models:
             return unpriced
         return _priced(unpriced, entry, cost)
 
     def _alert(self, spend: VendorSpend) -> None:
-        """Write the month's one spend alert record."""
+        """Write the month's one spend alert record.
+
+        A fully priced line keeps the record's original keys. A partly priced
+        one reports ``spend_lower_bound`` in place of ``spend``, says
+        ``price_state: price-partial``, and names the unpriced models.
+        """
+        if spend.state is SpendState.PRICE_PARTIAL:
+            amount = {
+                "spend_lower_bound": str(spend.spend_lower_bound),
+                "price_state": spend.state.value,
+            }
+        else:
+            amount = {"spend": str(spend.spend)}
         _log(
             {
                 "alert": SPEND_ALERT_KIND,
                 "component": "pool",
                 "vendor": spend.vendor,
                 "month": spend.month,
-                "spend": str(spend.spend),
                 "threshold": str(spend.threshold),
                 "cap": str(spend.cap),
                 "currency": spend.currency,
-            },
+            }
+            | amount
+            | spend.unpriced_fields(),
             level=logging.WARNING,
         )
 
     def _announce(self, spend: VendorSpend) -> None:
-        """Raise a content-free status once per meter for an unpriced line."""
+        """Raise a content-free status once per meter for each unpriced set.
+
+        An unpinned line is announced once per vendor. A partly priced one is
+        announced again whenever its set of unpriced models changes, so each
+        new model id the operator must pin is named.
+        """
         label = _ANNOUNCED.get(spend.state)
-        key = (spend.vendor or "", spend.state)
+        key = (spend.vendor or "", spend.state, spend.unpriced_models)
         if label is None or key in self._announced:
             return
         self._announced.add(key)
-        _log({"status": label, "vendor": spend.vendor}, level=logging.WARNING)
+        _log(
+            {"status": label, "vendor": spend.vendor} | spend.unpriced_fields(),
+            level=logging.WARNING,
+        )
 
 
 def _per_model(line: _VendorLedger) -> dict[str, tuple[int, int, int]]:
@@ -571,17 +642,32 @@ def _per_model(line: _VendorLedger) -> dict[str, tuple[int, int, int]]:
     }
 
 
-def _priced(line: VendorSpend, entry: VendorPrices, cost: Decimal) -> VendorSpend:
-    """Return *line* priced at *cost*; the comparison uses the exact cost."""
-    threshold = entry.alert_threshold
-    reached = cost >= threshold
-    return replace(
+def _priced(line: VendorSpend, entry: VendorPrices, cost: VendorCost) -> VendorSpend:
+    """Return *line* priced at *cost*; the comparison uses the exact cost.
+
+    With any counted model unpriced, the figure is reported only as
+    ``spend_lower_bound`` under ``price-partial``, never as ``spend``.
+    """
+    reached = cost.priced >= entry.alert_threshold
+    amount = _cents_up(cost.priced)
+    priced = replace(
         line,
-        state=SpendState.THRESHOLD_REACHED if reached else SpendState.UNDER_THRESHOLD,
-        spend=_cents_up(cost),
-        threshold=_cents_up(threshold),
+        threshold=_cents_up(entry.alert_threshold),
         cap=_cents_up(entry.monthly_cap),
         currency=entry.currency,
+        threshold_reached=reached,
+    )
+    if cost.unpriced:
+        return replace(
+            priced,
+            state=SpendState.PRICE_PARTIAL,
+            spend_lower_bound=amount,
+            unpriced_models=cost.unpriced,
+        )
+    return replace(
+        priced,
+        state=SpendState.THRESHOLD_REACHED if reached else SpendState.UNDER_THRESHOLD,
+        spend=amount,
     )
 
 

@@ -57,6 +57,8 @@ VENDOR: Final[str] = "examplevendor"
 
 MODEL: Final[str] = "example-chat-1"
 EMBED_MODEL: Final[str] = "example-embed-1"
+UNPRICED_MODEL: Final[str] = "example-new-chat-2"
+"""A model id the invented vendor serves but the table does not price."""
 PROMPT_CANARY: Final[str] = "journal-canary-5b1d plaintext entry"
 REQUEST_ID_CANARY: Final[str] = "req-canary-0c9e"
 NOVEMBER: Final[datetime] = datetime(2026, 11, 14, 9, 30, tzinfo=UTC)
@@ -705,15 +707,18 @@ def test_a_vendor_absent_from_the_table_is_unpinned(tmp_path: Path) -> None:
     assert spend.state is SpendState.PRICE_UNPINNED
 
 
-def test_a_model_absent_from_a_pinned_vendor_is_unpinned(tmp_path: Path) -> None:
-    """One unpriced model makes the whole line unpriced, never partly zero."""
-    meter = _meter(tmp_path)
-    meter.record(VENDOR, MODEL, _prompt(10))
+def test_a_pinned_vendor_whose_only_counted_model_is_unpriced_is_unpinned(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With nothing priced there is no lower bound to report: tokens only."""
+    caplog.set_level(logging.INFO, logger=pool_meter.TELEMETRY_LOGGER)
 
-    spend = meter.record(VENDOR, "unlisted-model", _prompt(10))
+    spend = _meter(tmp_path).record(VENDOR, UNPRICED_MODEL, _prompt(50 * MILLION))
 
     assert spend.state is SpendState.PRICE_UNPINNED
     assert spend.spend is None
+    assert spend.spend_lower_bound is None
+    assert _alerts(caplog) == []
 
 
 def test_a_direction_without_a_price_is_unpinned(tmp_path: Path) -> None:
@@ -781,6 +786,248 @@ def test_the_default_meter_loads_the_shipped_table(tmp_path: Path) -> None:
     )
 
     assert spend.state is SpendState.PRICE_UNPINNED
+
+
+# --------------------------------------------------------------------------
+# Partly priced (#2052): priced models give a lower bound, and it still alerts.
+# --------------------------------------------------------------------------
+
+
+_FULL_ALERT_KEYS: Final = frozenset(
+    {
+        "event",
+        "alert",
+        "component",
+        "vendor",
+        "month",
+        "spend",
+        "threshold",
+        "cap",
+        "currency",
+    }
+)
+"""The fully-priced alert record's keys, unchanged by #2052."""
+
+
+def _statuses(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    """Return the decoded status (non-alert) records written to ``creek.pool``."""
+    return [
+        decoded
+        for record in caplog.records
+        if record.name == pool_meter.TELEMETRY_LOGGER
+        and "status" in (decoded := json.loads(record.getMessage()))
+    ]
+
+
+def test_a_vendor_cost_separates_priced_from_unpriced_models() -> None:
+    """The table prices what it can and names the models it cannot."""
+    vendor = _pinned().vendor(VENDOR)
+    assert vendor is not None
+
+    cost = vendor.price(
+        {
+            MODEL: (MILLION, 0, 0),
+            UNPRICED_MODEL: (MILLION, 0, 0),
+            "another-unlisted": (1, 0, 0),
+        }
+    )
+
+    assert cost is not None
+    assert cost.priced == Decimal(1)
+    assert cost.priced_models == 1
+    assert cost.unpriced == ("another-unlisted", UNPRICED_MODEL)
+
+
+def test_an_unpinned_vendor_prices_nothing() -> None:
+    """An operator-must-fill entry yields no cost at all, not a zero."""
+    vendor = _unpinned().vendor(VENDOR)
+    assert vendor is not None
+
+    assert vendor.price({MODEL: (1, 0, 0)}) is None
+
+
+def test_a_priced_model_over_the_line_and_an_unpriced_model_alert_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The lower bound alone reaching EUR 5 alerts, exactly once in the month."""
+    caplog.set_level(logging.INFO, logger=pool_meter.TELEMETRY_LOGGER)
+    meter = _meter(tmp_path)
+    meter.record(VENDOR, UNPRICED_MODEL, _prompt(MILLION))
+
+    for _ in range(3):
+        spend = meter.record(VENDOR, MODEL, _prompt(2 * MILLION))
+    _meter(tmp_path).record(VENDOR, MODEL, _prompt(MILLION))
+
+    assert spend.state is SpendState.PRICE_PARTIAL
+    assert spend.spend is None
+    assert spend.spend_lower_bound == Decimal("6.00")
+    assert spend.threshold_reached
+    assert spend.unpriced_models == (UNPRICED_MODEL,)
+    (alert,) = _alerts(caplog)
+    assert alert["price_state"] == "price-partial"
+    assert alert["spend_lower_bound"] == "6.00"
+    assert "spend" not in alert
+    assert alert["unpriced_models"] == 1
+    assert alert["unpriced_model_ids"] == [UNPRICED_MODEL]
+    assert alert["threshold"] == "5.00"
+    assert alert["component"] == "pool"
+
+
+def test_a_priced_model_under_the_line_and_an_unpriced_model_do_not_alert(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Below the line the month is partial and silent, whatever is unpriced."""
+    caplog.set_level(logging.INFO, logger=pool_meter.TELEMETRY_LOGGER)
+    meter = _meter(tmp_path)
+    meter.record(VENDOR, MODEL, _prompt(4_990_000))
+
+    spend = meter.record(VENDOR, UNPRICED_MODEL, _prompt(50 * MILLION))
+
+    assert spend.state is SpendState.PRICE_PARTIAL
+    assert spend.spend is None
+    assert spend.spend_lower_bound == Decimal("4.99")
+    assert not spend.threshold_reached
+    assert _alerts(caplog) == []
+
+
+def test_the_lower_bound_is_compared_exactly_not_after_rounding(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """EUR 4.9999 reads as 5.00 rounded up, but has not reached the line."""
+    caplog.set_level(logging.INFO, logger=pool_meter.TELEMETRY_LOGGER)
+    meter = _meter(tmp_path)
+    meter.record(VENDOR, UNPRICED_MODEL, _prompt(1))
+
+    spend = meter.record(VENDOR, MODEL, _prompt(4_999_900))
+
+    assert spend.spend_lower_bound == Decimal("5.00")
+    assert not spend.threshold_reached
+    assert _alerts(caplog) == []
+
+
+def test_a_direction_without_a_price_makes_only_that_model_unpriced(
+    tmp_path: Path,
+) -> None:
+    """A model priced for prompts but counted for completions joins the list."""
+    prices = _table(
+        **{
+            VENDOR: _pinned_entry(
+                models={
+                    MODEL: {"prompt_per_million": "1"},
+                    EMBED_MODEL: {"embedding_per_million": "1"},
+                }
+            )
+        }
+    )
+    meter = _meter(tmp_path, prices=prices)
+    meter.record(VENDOR, EMBED_MODEL, PoolUsage(0, 0, 2 * MILLION))
+
+    spend = meter.record(VENDOR, MODEL, PoolUsage(1, 1, 0))
+
+    assert spend.state is SpendState.PRICE_PARTIAL
+    assert spend.spend_lower_bound == Decimal("2.00")
+    assert spend.unpriced_models == (MODEL,)
+
+
+def test_a_partial_line_names_its_unpriced_models_in_the_summary(
+    tmp_path: Path,
+) -> None:
+    """``--check pool`` shows a lower bound, the count and the model ids."""
+    meter = _meter(tmp_path)
+    meter.record(VENDOR, MODEL, PoolUsage(6 * MILLION, 0, 0))
+    meter.record(VENDOR, UNPRICED_MODEL, PoolUsage(10, 20, 0))
+    meter.record(VENDOR, "example-new-chat-3", PoolUsage(1, 0, 0))
+
+    (line,) = (spend.summary_line() for spend in meter.report())
+
+    assert line == (
+        "pool-spend vendor=examplevendor month=2026-11 state=price-partial "
+        "prompt_tokens=6000011 completion_tokens=20 embedding_tokens=0 "
+        "calls=3 estimated_calls=0 spend_lower_bound=6.00 threshold=5.00 "
+        "cap=10.00 currency=EUR threshold_reached=yes unpriced_models=2 "
+        "unpriced_model_ids=example-new-chat-2,example-new-chat-3"
+    )
+    assert " spend=" not in line
+
+
+def test_a_partial_line_is_announced_once_per_set_of_unpriced_models(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The operator hears which models to pin, again only when the set grows."""
+    caplog.set_level(logging.INFO, logger=pool_meter.TELEMETRY_LOGGER)
+    meter = _meter(tmp_path)
+    meter.record(VENDOR, MODEL, _prompt(1))
+
+    for _ in range(3):
+        meter.record(VENDOR, UNPRICED_MODEL, _prompt(1))
+    meter.record(VENDOR, "example-new-chat-3", _prompt(1))
+
+    assert _statuses(caplog) == [
+        {
+            "event": "pool_spend",
+            "status": "price_partial",
+            "vendor": VENDOR,
+            "unpriced_models": 1,
+            "unpriced_model_ids": [UNPRICED_MODEL],
+        },
+        {
+            "event": "pool_spend",
+            "status": "price_partial",
+            "vendor": VENDOR,
+            "unpriced_models": 2,
+            "unpriced_model_ids": [UNPRICED_MODEL, "example-new-chat-3"],
+        },
+    ]
+
+
+def test_pinning_the_missing_model_later_does_not_alert_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The month's latch holds across partial and full pricing."""
+    caplog.set_level(logging.INFO, logger=pool_meter.TELEMETRY_LOGGER)
+    _meter(tmp_path).record(VENDOR, MODEL, _prompt(6 * MILLION))
+    _meter(tmp_path).record(VENDOR, UNPRICED_MODEL, _prompt(1))
+    models = {
+        MODEL: {"prompt_per_million": "1"},
+        UNPRICED_MODEL: {"prompt_per_million": "1"},
+    }
+    full = _table(**{VENDOR: _pinned_entry(models=models)})
+
+    spend = _meter(tmp_path, prices=full).record(VENDOR, MODEL, _prompt(1))
+
+    assert spend.state is SpendState.THRESHOLD_REACHED
+    assert spend.unpriced_models == ()
+    assert len(_alerts(caplog)) == 1
+
+
+def test_a_fully_priced_alert_record_is_unchanged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With every counted model priced, the alert carries exactly its old keys."""
+    caplog.set_level(logging.INFO, logger=pool_meter.TELEMETRY_LOGGER)
+
+    spend = _meter(tmp_path).record(VENDOR, MODEL, _prompt(5 * MILLION))
+
+    (alert,) = _alerts(caplog)
+    assert set(alert) == _FULL_ALERT_KEYS
+    assert spend.spend_lower_bound is None
+    assert spend.unpriced_models == ()
+    assert _statuses(caplog) == []
+
+
+def test_a_partial_alert_and_status_carry_no_content(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A free-text model id is stored and named only as the closed fallback."""
+    caplog.set_level(logging.DEBUG)
+    meter = _meter(tmp_path)
+    meter.record(VENDOR, PROMPT_CANARY, _prompt(1))
+
+    meter.record(VENDOR, MODEL, _prompt(6 * MILLION))
+
+    assert PROMPT_CANARY not in caplog.text
+    (alert,) = _alerts(caplog)
+    assert alert["unpriced_model_ids"] == [pool_meter.UNRECOGNISED_MODEL]
 
 
 # --------------------------------------------------------------------------

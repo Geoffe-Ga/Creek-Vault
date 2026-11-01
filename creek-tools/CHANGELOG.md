@@ -9,6 +9,22 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- One unpriced model no longer silences the €5 pool spend alert for the rest
+  of the month (#2052). The price table used to price a vendor's month all or
+  nothing, so a single counted model with no pinned price, or with no price for
+  a direction it was counted in, hid every other model's spend as
+  `price-unpinned`. Pricing is now per model. A pinned vendor whose counted
+  models are only partly priced reports the new state `price-partial`. The
+  priced models' spend appears as `spend_lower_bound`, never as `spend`,
+  together with `unpriced_models` (a count) and `unpriced_model_ids`. The
+  `monthly_budget_departure` alert fires once when that lower bound alone
+  reaches `monthly_cap x alert_fraction`, since unpriced tokens can only add to
+  the bill. It carries `price_state: "price-partial"`, the lower bound and the
+  unpriced ids, and the month's existing latch still limits it to one alert.
+  A content-free `price_partial` status record names the unpriced model ids
+  once per process for each new set, and `--check pool` prints them on the
+  spend line, so the operator knows which model to pin. Fully priced and fully
+  unpinned months keep their earlier states, lines and records unchanged.
 - Meter the shared pool's spend locally and alert at EUR 5, half the pilot
   key's EUR 10 monthly cap (R4-1, R4-2, #2007; owner decision 2026-11-01:
   local metering, not vendor-API polling). Every generation and embeddings
