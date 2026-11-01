@@ -25,6 +25,38 @@ to locate the originating commit for any reference below.
   once per process for each new set, and `--check pool` prints them on the
   spend line, so the operator knows which model to pin. Fully priced and fully
   unpinned months keep their earlier states, lines and records unchanged.
+- ADR-0015 amendment (2026-11-01, adepthood#3578, owner decision R1-1): for an
+  account that has not enrolled in user-held keys, a writer's request key may
+  now come from adepthood's encrypted store. Adepthood's background
+  classification submits (retries, queued successors, restart recovery) send
+  the same `X-Creek-Provider` / `X-Creek-Provider-Key` headers to the same
+  `POST /v1/classifications`, gated by `request_key_providers` as before.
+  Creek's custody is unchanged: it holds the key for one request and keeps
+  nothing. A job reclaimed after a restart still has no key. It lands `failed`
+  with no `failure_code`, and is re-keyed only by adepthood re-admitting it.
+  The new test
+  `test_a_keyed_job_lost_to_a_restart_keeps_no_key_and_is_readmitted_keyed`
+  pins this. No runtime code changed.
+- `bench eval --corpus-vault PATH` adds an owner-run real-voice check (refs
+  #1875). The owner can rank candidate models against a bounded sample of his
+  own vault, on his own machine, instead of the synthetic corpus. Only `open`
+  and `personal` fragments that are voice-proxy eligible and have a positive
+  `voice_weight` are admitted. The tier is read by the shared fail-closed
+  `raw_privacy_tier`, so INTIMATE, untiered, unknown and AI-authored fragments
+  never reach a prompt. The sample is seeded and capped at 20 fragments, 300
+  words each and 4,000 words in total, and appears in the prompt under opaque
+  `entry-NNNN` aliases. The command refuses to run under `CI`, without
+  `--mode live`, without `--i-own-this-vault`, with `--judge routed`, against
+  a path that is not a Creek vault, or when `--review-out` or `--unblind-out`
+  is missing or already exists. All of these are checked before the vault is
+  read or a provider is built. In this mode the `--out` ranking is
+  content-free: no prompt, fragment text, fragment id or candidate text. The
+  candidate texts go to a `0600` blinded review file, and the label-to-model
+  key goes to a separate `0600` file. The live source now resolves through the
+  router at the corpus's real tier rather than a hard-coded `open`. All tests
+  use synthetic vault fixtures. The Privatemode proxy steps in
+  `docs/bench.md` are still a marked placeholder.
+
 - Meter the shared pool's spend locally and alert at EUR 5, half the pilot
   key's EUR 10 monthly cap (R4-1, R4-2, #2007; owner decision 2026-11-01:
   local metering, not vendor-API polling). Every generation and embeddings

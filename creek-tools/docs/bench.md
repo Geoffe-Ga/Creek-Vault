@@ -686,11 +686,108 @@ write_record(result.record, Path("eval.json"))
 print(result.quality.verdict, result.quality.per_dimension)
 ```
 
+### Owner-run real-voice check
+
+The synthetic corpus can say whether a model follows instructions and cites
+honestly; it cannot say whether a model sounds like *you*. For that, #1875's
+owner runs `bench eval --corpus-vault` against his own vault, **on his own
+computer**. Nothing in this repository, its CI, or any agent session ever runs
+it: the tests build synthetic vault fixtures, and the command refuses outright
+when the `CI` environment variable is set.
+
+```bash
+# On your own machine, from creek-tools/, with your vault at ~/Creek.
+# PLACEHOLDER — Privatemode specifics are not yet documented here:
+#   start the vendor's proxy per its docs; then pass
+#   --api-base http://127.0.0.1:<port>/v1
+export CREEK_CLOUD_CONSENT=1
+export PRIVATEMODE_KEY=...          # the key, held only in the environment
+./scripts/bench.sh eval --models gpt-oss-120b,glm-5.3,glm-5.3-flash \
+    --mode live --provider openai --api-base http://127.0.0.1:<port>/v1 \
+    --api-key-env PRIVATEMODE_KEY --max-tokens 800 --seed 17 \
+    --corpus-vault ~/Creek --i-own-this-vault \
+    --review-out ~/creek-eval/review.md \
+    --unblind-out ~/creek-eval/unblind.json \
+    --out ~/creek-eval/eval.json
+```
+
+Then read `review.md` and decide which candidate sounds most like you,
+*before* opening `unblind.json`, which maps each label to its model.
+
+**What is refused, before the vault is read or a provider is built.**
+
+| Missing or wrong | Why |
+| --- | --- |
+| `CI` is set (any value) | A real vault is never read in CI. |
+| `--i-own-this-vault` absent | The flag is the acknowledgement that your open and personal prose will be sent to the provider you name. |
+| `--mode fake` | A fake run over a real vault measures nothing, so it is not offered. |
+| `--judge routed` | A routed judge would send the reference prose to a second provider. Only the local hermetic judge is allowed. |
+| `--review-out` or `--unblind-out` absent, either already existing (or a symlink), or any two of `--out`, `--review-out`, `--unblind-out` the same path | Both files are always new. Neither is ever overwritten. |
+| The path has no `00-Creek-Meta/` | It is not a Creek vault. |
+| Fewer than ten admissible fragments fit the bounds | The voice sample would be too thin to judge. The message gives counts only. |
+
+`--review-out`, `--unblind-out` and `--i-own-this-vault` without
+`--corpus-vault` are refused too, not ignored. The live-mode rules in the table
+above still apply unchanged: credentials by variable name, at most five
+models, one completion each, `--max-tokens` capped, no retries, and each
+provider's own cloud-egress consent gate.
+
+**What is read.** Fragments under `01-Fragments/`, through the shared vault
+loader (symlinks out of the tree are skipped; files that fail the schema are
+never seen). A fragment is admitted only when all three of these hold:
+
+- its `privacy_tier` is explicitly `open` or `personal`, read by the shared
+  fail-closed reader `raw_privacy_tier`. INTIMATE, explicit `unclassified`, a
+  missing tier and an unrecognised tier are all excluded;
+- it is `voice_proxy_eligible`: self-authored and not INTIMATE;
+- its `voice_weight` is above zero. Ingest stamps AI turns with `0.0`, so this
+  is a second quarantine if an authorship field is ever wrong.
+
+The admitted fragments are shuffled with `--seed` and taken in order up to 20
+fragments (`--entries` lowers the cap, 10 to 20) and 4,000 words. Each body is
+whitespace-collapsed and cut at 300 words. One seed over an unchanged vault
+always draws the same sample. In the prompt, fragments appear as
+`entry-0000`, `entry-0001` and so on rather than their ids, since an id can
+contain words from a title. The vault is never written to.
+
+**What leaves your machine.** Only the generation prompt: the Writing Desk
+instructions plus the sampled open and personal prose, sent once per model to
+the provider you named (for example Privatemode, through its local proxy). The
+live source is resolved through `ModelRouter.resolve_role("voice_drafter",
+<tier>)` at the sample's real tier (`personal` if any personal fragment was
+sampled), so the router's INTIMATE chokepoint sees the truth about what it is
+routing. The judge is local. Nothing else is sent.
+
+**What is written.**
+
+- `--out` is **content-free**. It holds `corpus_source: vault`, `vault_counts`
+  (scanned, admitted, excluded by tier, excluded by authorship, sampled,
+  words), and per model the tag, the four scores with their basis, the
+  verdict, the invented-citation count and the judge-request count. It holds
+  no generation prompt, no fragment text, no fragment id and no candidate
+  text. `voice_match` is judged here, not `unsupported`, because the prompt
+  really does carry your prose.
+- `--review-out` is Markdown, created with mode `0600`. It holds each
+  candidate's full text under the existing blinded labels (the `blind` /
+  `identity_map` shuffle at the run's seed), then which fragment id each
+  `entry-NNNN` alias stands for.
+- `--unblind-out` is JSON, created with mode `0600`. It maps each label to
+  its model tag.
+
+The review file and the key are your personal data. **Never commit or share
+them**: do not attach them to an issue or a PR, and do not paste them into a
+chat or an agent session. Keep them outside any git checkout and delete them
+once you have judged. Scores from a vault run are not comparable with scores
+from a synthetic run, because the reference prose differs. `corpus_source`
+says which one you are reading.
+
 ### The corpus, and the two artifacts
 
 The corpus is sixteen entries of prose **written for this harness** in one
 invented voice. There is no real journal content in any fixture, prompt or
-artifact — #1875's first constraint and #1850's privacy invariant. The root goes
+artifact — #1875's first constraint and #1850's privacy invariant. The single
+exception is the owner-run `--corpus-vault` check above, which runs only on
+the owner's machine and keeps its prose out of `--out`. The root goes
 through the same confinement gate as the capacity corpus (`confined_root`):
 strictly under the system temp directory, absent or empty, checked before
 anything is written, so a real vault is refused untouched with

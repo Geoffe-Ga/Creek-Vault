@@ -199,3 +199,51 @@ accepted here.
   raised to INTIMATE is re-atomized through `TierClassifiers.for_tier` on its
   new tier, so its children take the local INTIMATE route, or the rules pass
   when no local route exists, never the writer's provider.
+
+## Amendment (2026-11-01, adepthood#3578): the key may come from adepthood's encrypted store
+
+Owner decision R1-1 (2026-10-27) chose to keep the writer's key encrypted
+beyond the request, so that background classification can use it. On
+2026-11-01 the owner confirmed the split: "Split: un-enrolled stored
+server-side; enrolled stay user-held." Adepthood ADR 0009's amendment of the
+same date is the paired record. This amendment states what that changes for
+Creek. **Creek's custody does not change.**
+
+- **Where the key now comes from.** For an account that has not enrolled in
+  user-held keys, adepthood keeps the writer's key encrypted at rest. Its
+  background classification submits (a retried admission, a queued successor,
+  restart recovery, a save from a device that sent no key) send
+  `X-Creek-Provider` / `X-Creek-Provider-Key` from that stored copy. Before,
+  those submits went keyless. They use the same headers on the same route,
+  `POST /v1/classifications`, and only when this vault advertises the vendor
+  in `request_key_providers`. Creek cannot tell, and does not need to tell, a
+  key relayed from the writer's device from one read out of adepthood's store.
+  An enrolled account's key stays user-held, so its background classification
+  stays keyless until the writer's next online session relays it.
+- **Creek still holds a key for one request and keeps nothing.** "The key is
+  held for one request and kept nowhere" stands as written. The job record,
+  the vault, the audit log and every log line still never hold it. A keyed
+  `llm` job still carries it to its worker thread as an argument only.
+- **A reclaimed job still has no key.** A job whose worker is lost to a
+  restart or autostop is not resumed. Its next status read lands it `failed`
+  with `failure_reason: worker_lost` and no `failure_code`. Adepthood treats
+  that as retryable and re-admits a fresh job. **That job has a key only
+  because adepthood sends one again, from its stored copy.** Nothing in Creek
+  carries a key across the restart.
+  `tests/test_request_scoped_byok.py::test_a_keyed_job_lost_to_a_restart_keeps_no_key_and_is_readmitted_keyed`
+  pins this: the reclaimed job ends `failed` with no code, no file under the
+  vault holds the key, and the re-admission with the key is written by the
+  writer's vendor. No Creek code assumed a reclaimed job could never be
+  followed by a keyed one, so no code changed.
+- **A refused key ends with the run, as before.** A `401`/`403` still ends the
+  job `failed` with `failure_code: "request_key_rejected"` (the 2026-10-28
+  amendment). Adepthood now also deletes its stored copy when it lands that
+  code, so a refused key is not sent to this vault again.
+- **The boundary is unchanged.** Self-connected vaults still ignore a key.
+  INTIMATE fragments still take the local route or stay unclassified and never
+  reach the writer's vendor. The operator's key still never stands in for the
+  writer's.
+
+The custody that does change is adepthood's. Its stored copy is encrypted
+under the operator's key, and it is not operator-blind. Adepthood ADR 0009
+records that limit; this record does not repeat it as Creek's.

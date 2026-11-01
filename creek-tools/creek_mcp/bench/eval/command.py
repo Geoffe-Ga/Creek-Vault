@@ -28,6 +28,16 @@ most one judge call per model. Every source is built before the first call, so
 a model with unmet prerequisites stops the run before any other model is
 billed.
 
+**Owner-run real-voice check (#1875).** ``--corpus-vault PATH`` prompts and
+scores against a bounded sample of the owner's own vault instead of the
+synthetic corpus (:mod:`creek_mcp.bench.eval.vault_corpus`). It is refused
+unless ``--mode live``, ``--i-own-this-vault``, ``--review-out`` and
+``--unblind-out`` are all given, the judge is hermetic, ``CI`` is unset, the
+path is a Creek vault, and neither private output exists yet — every one of
+those checked before the vault is read or a provider is built. The ``--out``
+ranking is then content-free; the candidate texts go to the ``0600`` review
+file under blinded labels (:mod:`creek_mcp.bench.eval.review`).
+
 **Per-model runs.** Each model's candidate is scored by its own
 :func:`~creek_mcp.bench.eval.runner.run_eval` against a freshly built copy of
 the same deterministic corpus, so every row is that model's own verdict rather
@@ -47,6 +57,7 @@ from typing import TYPE_CHECKING, Final
 from creek.classify.llm.providers import build_provider
 from creek.classify.llm.router import ModelRouter
 from creek.config import LLMConfig
+from creek.models import PrivacyTier
 from creek_mcp.bench.eval.candidates import (
     PROMPT_CARRIES_VOICE_EVIDENCE,
     CandidateSource,
@@ -59,21 +70,40 @@ from creek_mcp.bench.eval.candidates import (
 from creek_mcp.bench.eval.dimensions import DEFAULT_INSTRUCTIONS, DeskInstructions
 from creek_mcp.bench.eval.judge import HermeticJudge, Judge, RoutedJudge
 from creek_mcp.bench.eval.ranking import (
+    CorpusSource,
     EvalMode,
     EvalRanking,
     ModelRow,
     rank_rows,
     write_ranking,
 )
+from creek_mcp.bench.eval.review import (
+    render_review,
+    unblind_key,
+    write_private,
+    write_unblind_key,
+)
 from creek_mcp.bench.eval.rubric import JudgeKind
-from creek_mcp.bench.eval.runner import EvalPlan, EvalPlanError, run_eval
+from creek_mcp.bench.eval.runner import (
+    EvalPlan,
+    EvalPlanError,
+    run_eval,
+    score_against,
+)
+from creek_mcp.bench.eval.vault_corpus import (
+    VAULT_MAX_ENTRIES,
+    VaultCorpus,
+    load_vault_corpus,
+)
 from creek_mcp.bench.eval.voice_corpus import build_voice_corpus
+from creek_mcp.tools.handshake import vault_available
 
 if TYPE_CHECKING:
     import argparse
     from collections.abc import Callable, Mapping
 
     from creek.classify.llm.base import LLMProvider
+    from creek_mcp.bench.eval.blinding import Candidate
     from creek_mcp.bench.eval.voice_corpus import VoiceCorpus
 
 MAX_MODELS: Final[int] = 5
@@ -105,6 +135,30 @@ _JUDGE_FLAGS: Final[tuple[tuple[str, str], ...]] = (
     ("judge_api_base", "--judge-api-base"),
     ("judge_api_key_env", "--judge-api-key-env"),
 )
+_VAULT_FLAGS: Final[tuple[tuple[str, str], ...]] = (
+    ("review_out", "--review-out"),
+    ("unblind_out", "--unblind-out"),
+)
+_VAULT_ONLY: Final[str] = "{} applies only with --corpus-vault"
+_UNDER_CI: Final[str] = (
+    "--corpus-vault is refused under CI: it reads a real vault and runs only "
+    "on the owner's own machine"
+)
+_NO_ACK: Final[str] = (
+    "--corpus-vault requires --i-own-this-vault: the vault's open and personal "
+    "prose is sent to the named provider"
+)
+_NOT_LIVE: Final[str] = "--corpus-vault requires --mode live"
+_ROUTED_JUDGE: Final[str] = (
+    "--corpus-vault takes only --judge hermetic: a routed judge would send the "
+    "vault's prose to a second provider"
+)
+_NEEDS_OUTPUT: Final[str] = "--corpus-vault requires {}"
+_OUTPUT_EXISTS: Final[str] = (
+    "{} names a file that already exists; it is never overwritten"
+)
+_NOT_DISTINCT: Final[str] = "--out, --review-out and --unblind-out must be distinct"
+_NOT_A_VAULT: Final[str] = "--corpus-vault does not name a Creek vault"
 _NO_MODELS: Final[str] = "--models must name at least one model"
 _DUPLICATE: Final[str] = "--models must not repeat a model"
 _TOO_MANY: Final[str] = f"--models may name at most {MAX_MODELS} models"
@@ -126,6 +180,8 @@ class RankedEvalPlan:
         seed: Presentation seed, shared by every model's run.
         entries: Synthetic corpus entries, inside #1875's 10-20 range.
         instructions: The Writing Desk instructions stated and scored.
+        vault: The owner-run vault sample, when ``--corpus-vault`` is used;
+            ``None`` for the synthetic corpus.
     """
 
     sources: Mapping[str, CandidateSource]
@@ -135,6 +191,7 @@ class RankedEvalPlan:
     seed: int = 0
     entries: int | None = None
     instructions: DeskInstructions = field(default=DEFAULT_INSTRUCTIONS)
+    vault: VaultCorpus | None = None
 
 
 def add_eval_arguments(parser: argparse.ArgumentParser) -> None:
@@ -157,6 +214,23 @@ def add_eval_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--judge-api-base", default=None)
     parser.add_argument("--judge-api-key-env", default=None)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--corpus-vault",
+        type=Path,
+        default=None,
+        help="owner-run: sample this Creek vault instead of the synthetic corpus",
+    )
+    parser.add_argument(
+        "--i-own-this-vault",
+        action="store_true",
+        help="acknowledge the vault is yours and its open/personal prose is sent",
+    )
+    parser.add_argument(
+        "--review-out", type=Path, default=None, help="private 0600 review file"
+    )
+    parser.add_argument(
+        "--unblind-out", type=Path, default=None, help="private 0600 unblinding key"
+    )
 
 
 def _models(text: str) -> tuple[str, ...]:
@@ -210,19 +284,34 @@ def _require_credentials(
     return provider, key_env
 
 
+def _live_credentials(
+    args: argparse.Namespace, environ: Mapping[str, str]
+) -> tuple[str, str] | None:
+    """Return the live ``(provider, key_env)``, or ``None`` for a fake run.
+
+    Raises:
+        EvalPlanError: When a live-only flag is given without ``--mode live``,
+            or a live run lacks its credentials.
+    """
+    if args.mode != EvalMode.LIVE:
+        _refuse_unused(args, _PROMPT_MODEL_FLAGS, "--mode live")
+        return None
+    return _require_credentials(
+        args.provider, args.api_key_env, ("--provider", "--api-key-env"), environ
+    )
+
+
 def _sources(
     args: argparse.Namespace,
     models: tuple[str, ...],
-    environ: Mapping[str, str],
+    credentials: tuple[str, str] | None,
     factory: Callable[[LLMConfig], LLMProvider],
+    tier: PrivacyTier,
 ) -> dict[str, CandidateSource]:
     """Build one source per model: fake by default, routed under ``live``."""
-    if args.mode != EvalMode.LIVE:
-        _refuse_unused(args, _PROMPT_MODEL_FLAGS, "--mode live")
+    if credentials is None:
         return {tag: FakeCandidateSource(tag) for tag in models}
-    provider, key_env = _require_credentials(
-        args.provider, args.api_key_env, ("--provider", "--api-key-env"), environ
-    )
+    provider, key_env = credentials
     return {
         tag: routed_source(
             LLMConfig(
@@ -233,6 +322,7 @@ def _sources(
             ),
             max_tokens=args.max_tokens,
             provider_factory=factory,
+            tier=tier,
         )
         for tag in models
     }
@@ -262,6 +352,52 @@ def _judge(
     return RoutedJudge(ModelRouter(config), provider_factory=factory), JudgeKind.ROUTED
 
 
+def _private_outputs(args: argparse.Namespace) -> None:
+    """Refuse missing, colliding or already-existing private output paths."""
+    for attribute, flag in _VAULT_FLAGS:
+        path: Path | None = getattr(args, attribute)
+        if path is None:
+            raise EvalPlanError(_NEEDS_OUTPUT.format(flag))
+        if path.exists() or path.is_symlink():
+            raise EvalPlanError(_OUTPUT_EXISTS.format(flag))
+    targets = {
+        args.out.resolve(),
+        args.review_out.resolve(),
+        args.unblind_out.resolve(),
+    }
+    if len(targets) != 1 + len(_VAULT_FLAGS):
+        raise EvalPlanError(_NOT_DISTINCT)
+
+
+def _corpus_vault(args: argparse.Namespace, environ: Mapping[str, str]) -> Path | None:
+    """Return the ``--corpus-vault`` path once every opt-in holds, else ``None``.
+
+    Nothing is read from the vault here beyond whether its Creek marker exists.
+
+    Raises:
+        EvalPlanError: On any refused or incomplete opt-in; see the module
+            docstring for the full list.
+    """
+    vault: Path | None = args.corpus_vault
+    if vault is None:
+        if args.i_own_this_vault:
+            raise EvalPlanError(_VAULT_ONLY.format("--i-own-this-vault"))
+        _refuse_unused(args, _VAULT_FLAGS, "--corpus-vault")
+        return None
+    if environ.get("CI", "").strip():
+        raise EvalPlanError(_UNDER_CI)
+    if not args.i_own_this_vault:
+        raise EvalPlanError(_NO_ACK)
+    if args.mode != EvalMode.LIVE:
+        raise EvalPlanError(_NOT_LIVE)
+    if args.judge != JudgeKind.HERMETIC:
+        raise EvalPlanError(_ROUTED_JUDGE)
+    _private_outputs(args)
+    if not vault_available(vault):
+        raise EvalPlanError(_NOT_A_VAULT)
+    return vault
+
+
 def plan_from_args(
     args: argparse.Namespace,
     *,
@@ -282,20 +418,35 @@ def plan_from_args(
 
     Raises:
         EvalPlanError: On any refused flag combination.
+        VaultCorpusError: When ``--corpus-vault`` cannot supply a bounded,
+            admissible sample.
     """
     models = _models(args.models)
     if not 1 <= args.max_tokens <= MAX_TOKENS_CEILING:
         raise EvalPlanError(_BAD_BUDGET)
     source_env = os.environ if environ is None else environ
     factory = build_provider if provider_factory is None else provider_factory
+    vault_path = _corpus_vault(args, source_env)
     judge, judge_kind = _judge(args, source_env, factory)
+    credentials = _live_credentials(args, source_env)
+    vault = (
+        None
+        if vault_path is None
+        else load_vault_corpus(
+            vault_path,
+            seed=args.seed,
+            max_entries=VAULT_MAX_ENTRIES if args.entries is None else args.entries,
+        )
+    )
+    tier = PrivacyTier.OPEN if vault is None else vault.tier
     return RankedEvalPlan(
-        sources=_sources(args, models, source_env, factory),
+        sources=_sources(args, models, credentials, factory, tier),
         judge=judge,
         judge_kind=judge_kind,
         mode=EvalMode(args.mode),
         seed=args.seed,
-        entries=args.entries,
+        entries=None if vault is not None else args.entries,
+        vault=vault,
     )
 
 
@@ -304,27 +455,32 @@ def _score_model(
     corpus: VoiceCorpus,
     tag: str,
     root: Path,
-) -> ModelRow:
+) -> tuple[ModelRow, Candidate]:
     """Generate *tag*'s candidate and score it in its own run."""
     candidate = generate_candidate(corpus, plan.instructions, tag, plan.sources[tag])
-    result = run_eval(
-        EvalPlan(
-            candidates=(candidate,),
-            judge=plan.judge,
-            judge_kind=plan.judge_kind,
-            seed=plan.seed,
-            entries=plan.entries,
-            instructions=plan.instructions,
-            voice_evidence_present=PROMPT_CARRIES_VOICE_EVIDENCE,
-        ),
-        root,
+    eval_plan = EvalPlan(
+        candidates=(candidate,),
+        judge=plan.judge,
+        judge_kind=plan.judge_kind,
+        seed=plan.seed,
+        entries=plan.entries,
+        instructions=plan.instructions,
+        voice_evidence_present=PROMPT_CARRIES_VOICE_EVIDENCE,
     )
-    return ModelRow(
+    # A vault sample is scored in place — it is never rebuilt or written;
+    # the synthetic corpus is rebuilt per model, as it always was.
+    result = (
+        run_eval(eval_plan, root)
+        if plan.vault is None
+        else score_against(eval_plan, corpus)
+    )
+    row = ModelRow(
         model_tag=tag,
         quality=result.quality,
         record=result.record,
         invented_citations=len(unknown_citations(candidate.citations, corpus)),
     )
+    return row, candidate
 
 
 def run_ranked_eval(plan: RankedEvalPlan, scratch: Path) -> EvalRanking:
@@ -333,7 +489,7 @@ def run_ranked_eval(plan: RankedEvalPlan, scratch: Path) -> EvalRanking:
     Args:
         plan: What to run.
         scratch: Absent or empty directory strictly under the system temp
-            dir; each model's corpus is built beneath it.
+            dir; each model's synthetic corpus is built beneath it.
 
     Returns:
         The ranked artifact.
@@ -342,42 +498,99 @@ def run_ranked_eval(plan: RankedEvalPlan, scratch: Path) -> EvalRanking:
         EvalPlanError: When the plan names no model, or its judge kind
             contradicts its judge — checked before any candidate is generated.
     """
+    ranking, _candidates = rank_with_candidates(plan, scratch)
+    return ranking
+
+
+def rank_with_candidates(
+    plan: RankedEvalPlan, scratch: Path
+) -> tuple[EvalRanking, tuple[Candidate, ...]]:
+    """Like :func:`run_ranked_eval`, also returning each model's candidate.
+
+    The candidates are in the order the models were named, which is the order
+    :func:`~creek_mcp.bench.eval.review.render_review` blinds them in.
+
+    Args:
+        plan: What to run.
+        scratch: As for :func:`run_ranked_eval`.
+
+    Returns:
+        The ranked artifact, and the candidates behind it.
+
+    Raises:
+        EvalPlanError: As for :func:`run_ranked_eval`.
+    """
     if not plan.sources:
         raise EvalPlanError(_NO_MODELS)
     expected = JudgeKind.ROUTED if plan.judge.is_cloud else JudgeKind.HERMETIC
     if plan.judge_kind is not expected:
         raise EvalPlanError(_JUDGE_MISMATCH)
-    corpus = build_voice_corpus(scratch / _GENERATION_DIR, entries=plan.entries)
-    rows = [
+    if plan.vault is None:
+        corpus = build_voice_corpus(scratch / _GENERATION_DIR, entries=plan.entries)
+        source, counts = CorpusSource.SYNTHETIC, None
+    else:
+        corpus = plan.vault.corpus
+        source, counts = CorpusSource.VAULT, plan.vault.counts.to_json_dict()
+    scored = [
         _score_model(plan, corpus, tag, scratch / _MODEL_DIR.format(index))
         for index, tag in enumerate(plan.sources)
     ]
-    return EvalRanking(
+    ranking = EvalRanking(
         mode=plan.mode,
         judge=plan.judge_kind,
         seed=plan.seed,
         corpus_entries=corpus.entry_count,
         generation_prompt=build_prompt(corpus, plan.instructions),
-        rows=rank_rows(rows),
+        rows=rank_rows(row for row, _candidate in scored),
+        corpus_source=source,
+        vault_counts=counts,
     )
+    return ranking, tuple(candidate for _row, candidate in scored)
 
 
-def run_eval_command(args: argparse.Namespace) -> str:
+def _write_private_outputs(
+    args: argparse.Namespace,
+    plan: RankedEvalPlan,
+    candidates: tuple[Candidate, ...],
+) -> None:
+    """Write the owner's review file and unblinding key, both ``0600``."""
+    if plan.vault is None:
+        return
+    write_private(
+        args.review_out, render_review(candidates, seed=plan.seed, vault=plan.vault)
+    )
+    write_unblind_key(args.unblind_out, unblind_key(candidates, seed=plan.seed))
+
+
+def run_eval_command(
+    args: argparse.Namespace,
+    *,
+    environ: Mapping[str, str] | None = None,
+    provider_factory: Callable[[LLMConfig], LLMProvider] | None = None,
+) -> str:
     """Run ``bench eval`` from parsed flags and write the ranking to ``--out``.
+
+    Under ``--corpus-vault`` the ranking is content-free, and the candidate
+    texts go to the private ``--review-out`` file with their key in
+    ``--unblind-out``.
 
     Args:
         args: Flags registered by :func:`add_eval_arguments`.
+        environ: As for :func:`plan_from_args`.
+        provider_factory: As for :func:`plan_from_args`.
 
     Returns:
-        The one-line summary the CLI prints.
+        The one-line summary the CLI prints. It names no file content.
     """
-    plan = plan_from_args(args)
+    plan = plan_from_args(args, environ=environ, provider_factory=provider_factory)
     with tempfile.TemporaryDirectory(prefix="creek-bench-eval-") as scratch:
-        ranking = run_ranked_eval(plan, Path(scratch))
+        ranking, candidates = rank_with_candidates(plan, Path(scratch))
+    _write_private_outputs(args, plan, candidates)
     write_ranking(ranking, args.out)
     top = ranking.rows[0]
     return (
         f"mode={ranking.mode.value} judge={ranking.judge.value} "
+        f"corpus={ranking.corpus_source.value} "
         f"models={len(ranking.rows)} top={top.model_tag} "
         f"verdict={top.quality.verdict.value} report={args.out}"
     )

@@ -946,6 +946,69 @@ def test_a_keyless_llm_classification_on_a_managed_vault_dials_no_vendor(
     assert vendor.requests == []
 
 
+def test_a_keyed_job_lost_to_a_restart_keeps_no_key_and_is_readmitted_keyed(
+    tmp_path: Path,
+    managed: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    every_log: pytest.LogCaptureFixture,
+) -> None:
+    """Creek's custody across a restart, as ADR-0015's 2026-11-01 amendment states it.
+
+    A keyed ``llm`` job whose worker is lost to a restart is not resumed. The
+    restarted process has no key for it, its record never held one, and its
+    next status read lands it ``failed`` with no ``failure_code``. Adepthood
+    reads that as retryable and re-admits a fresh job. That job carries a key
+    only because the caller sends one again, from adepthood's encrypted stored
+    copy for an un-enrolled writer (adepthood ADR 0009, amendment 2026-11-01).
+    """
+    from threading import Event
+
+    from creek_mcp.httpapi import pipeline as pipeline_module
+
+    vendor = _Vendor(monkeypatch)
+    _fragment(managed, "open-note", _OPEN_BODY, "open")
+    original = pipeline_module.classify_tool
+    started, release = Event(), Event()
+
+    def _first_run_is_lost(**kwargs: Any) -> dict[str, Any]:
+        """Hold the first worker until the restart has reclaimed its job."""
+        if started.is_set():
+            result: dict[str, Any] = original(**kwargs)
+            return result
+        started.set()
+        assert release.wait(timeout=5.0)
+        return {"status": "refused", "tool": "creek.classify", "reason": "late"}
+
+    monkeypatch.setattr(pipeline_module, "classify_tool", _first_run_is_lost)
+    with _client(managed) as first:
+        lost = first.post(
+            CLASSIFICATIONS_PATH,
+            json={"method": "llm"},
+            headers=_key_headers(ceiling="personal"),
+        )
+        assert lost.status_code == HTTP_ACCEPTED, lost.text
+        assert started.wait(timeout=5.0)
+        with _client(managed) as restarted:
+            reclaimed = restarted.get(
+                f"/v1/jobs/{lost.json()['job_id']}", headers=headers()
+            ).json()
+            readmitted = restarted.post(
+                CLASSIFICATIONS_PATH,
+                json={"method": "llm"},
+                headers=_key_headers(ceiling="personal"),
+            )
+            assert readmitted.status_code == HTTP_ACCEPTED, readmitted.text
+            terminal = _await_job(restarted, readmitted.json()["job_id"])
+        release.set()
+
+    assert reclaimed["state"] == "failed"
+    assert reclaimed["failure_code"] is None
+    assert terminal["state"] == "succeeded", terminal
+    assert terminal["result"]["method"] == "llm"
+    assert set(vendor.keys_sent()) == {CANARY_KEY}
+    _assert_canary_absent(tmp_path, every_log, lost, readmitted)
+
+
 def test_the_classify_tool_never_audits_the_key(
     managed: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
