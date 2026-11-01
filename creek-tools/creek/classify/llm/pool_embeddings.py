@@ -45,6 +45,7 @@ import secrets
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from creek.classify.llm.pool_attestation import attested_report
 from creek.classify.llm.pool_boundary import (
     POOL_EMBED_JSON_FLOAT_BYTES,
     POOL_MAX_DEADLINE_MS,
@@ -55,6 +56,7 @@ from creek.classify.llm.pool_boundary import (
     POOL_PERSONAL_TIER,
     POOL_REQUEST_ID_HEADER,
     PoolBoundaryError,
+    attesting_sidecar_mode,
     current_pool_scope,
     pool_embed,
     pool_response_ok,
@@ -212,6 +214,38 @@ def _answer_rows(payload: object, model: str, count: int) -> list[object] | None
     if not isinstance(rows, list) or len(rows) != count:
         return None
     return rows
+
+
+def _attested_payload(
+    payload: dict[str, object], model: str, texts: list[str]
+) -> dict[str, object]:
+    """Return the body to send for one batch, gating sidecar mode first (#1896).
+
+    Outside sidecar mode *payload* — the closed, vendor-neutral envelope — is
+    sent unchanged. In sidecar mode every batch is gated exactly like a
+    generation: the loopback sidecar's attestation report must match the
+    Machine's pin **before** the batch is built for the wire, so a report off
+    the pin sends no text at all. The batch is then translated onto the
+    vendor's OpenAI-compatible embeddings API, ``model`` and ``input`` only;
+    the tier has already been enforced per item at the chokepoint, and the
+    vendor has no field for it or for ``deadline_ms``.
+
+    Args:
+        payload: The closed envelope for this batch.
+        model: The pinned embedding model.
+        texts: The batch's admitted texts.
+
+    Returns:
+        The body to send.
+
+    Raises:
+        PoolAttestationError: In sidecar mode, when the report does not match
+            the pin; nothing is sent.
+    """
+    if not attesting_sidecar_mode():
+        return payload
+    attested_report()
+    return {"model": model, "input": texts}
 
 
 def parse_embeddings(
@@ -385,7 +419,10 @@ class PoolEmbedder:
             secrets.token_hex(_REQUEST_ID_BYTES) if scope is None else scope.request_id
         )
         try:
-            response = pool_embed(payload, headers={POOL_REQUEST_ID_HEADER: request_id})
+            response = pool_embed(
+                _attested_payload(payload, self.pin.model_name, texts),
+                headers={POOL_REQUEST_ID_HEADER: request_id},
+            )
         except PoolBoundaryError as exc:
             logger.warning("Pool embedding batch refused (%s)", type(exc).__name__)
             return None

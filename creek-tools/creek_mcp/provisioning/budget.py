@@ -495,6 +495,15 @@ class AlertKind(StrEnum):
     # The Fly provider refused the pilot's org token with a 401/403 (#1866):
     # the pilot is degraded *now*, unlike an expiry warning ahead of time.
     PROVIDER_CREDENTIAL_REJECTED = "provider_credential_rejected"
+    # The attesting pool, seen from one vault (ADR-0016 D1.12, #1896).  Each is
+    # named in the vault's content-free ``creek.pool`` record by
+    # ``creek.classify.llm.pool_attested.OUTCOME_ALERTS``; registered so the
+    # receiver's closed list can admit them, not yet delivered by any path.
+    POOL_ATTESTATION_FAILED = "pool_attestation_failed"
+    POOL_CREDENTIAL_REJECTED = "pool_credential_rejected"
+    POOL_ADMISSION_REFUSED = "pool_admission_refused"
+    POOL_VENDOR_RATE_LIMITED = "pool_vendor_rate_limited"
+    POOL_QUOTA_EXHAUSTED = "pool_quota_exhausted"
 
 
 @dataclass(frozen=True, slots=True)

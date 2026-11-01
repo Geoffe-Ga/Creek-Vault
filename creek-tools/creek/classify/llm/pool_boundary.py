@@ -83,6 +83,18 @@ provenance becomes ``pool:attested:<vendor>``. The attesting client that
 answer is labelled.
 """
 
+POOL_SIDECAR_VENDOR: Final[str] = "privatemode"
+"""The attesting vendor whose client runs as a loopback sidecar (#1896).
+
+Privatemode (Edgeless Systems GmbH) ships its attesting client for Python
+callers as a proxy that attests the vendor backend before forwarding anything
+(owner decision 2026-10-21 on #1896). When :data:`POOL_VENDOR_ENV` names it,
+the vault is in *sidecar mode*: :data:`POOL_URL_ENV` must be a loopback
+address (:func:`pool_destination` refuses anything else), the vendor key lives
+with the sidecar and never in this process, and every content dial is gated on
+the sidecar's attestation report (:mod:`creek.classify.llm.pool_attestation`).
+"""
+
 POOL_CONNECT_TIMEOUT: Final[float] = 1.0
 """Seconds allowed to establish the pool connection."""
 
@@ -97,6 +109,22 @@ POOL_MODELS_PATH: Final[str] = "/v1/models"
 
 POOL_GENERATE_PATH: Final[str] = "/v1/generate"
 """The pool's single generation endpoint."""
+
+POOL_ATTESTATION_PATH: Final[str] = "/creek/v1/attestation"
+"""The sidecar's attestation report: Creek's contract, not the vendor's (#1896).
+
+Sidecar mode reads this before every content dial and sends nothing unless the
+report matches the Machine's pin. The path is namespaced ``/creek/`` because
+the document's shape is defined by :mod:`creek.classify.llm.pool_attestation`,
+not by the vendor's OpenAI-compatible API.
+"""
+
+POOL_CHAT_COMPLETIONS_PATH: Final[str] = "/v1/chat/completions"
+"""The sidecar's OpenAI-compatible generation endpoint (ADR-0016 D1.4, D3.1).
+
+Under O5 the closed request shape is translated onto the vendor's
+OpenAI-compatible API; the sidecar forwards it inside the attested channel.
+"""
 
 POOL_EMBEDDINGS_PATH: Final[str] = "/v1/embeddings"
 """The pool's single embeddings endpoint (ADR-0016 Decision 1 item 13, #1904).
@@ -230,6 +258,10 @@ _UNREACHABLE: Final[str] = "the shared inference pool did not answer usably"
 _UNDECLARED_TIER: Final[str] = (
     "the pool request declares no admitted privacy tier; refusing to dial"
 )
+_NOT_LOOPBACK: Final[str] = (
+    "the attesting sidecar's destination is not a loopback address; refusing to dial"
+)
+_LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "::1"})
 _PROMPT_TOO_LONG: Final[str] = (
     "the pool request's prompt exceeds the contract's token cap; refusing to dial"
 )
@@ -382,8 +414,39 @@ def pool_destination(environ: Mapping[str, str] | None = None) -> str:
     raw = source.get(POOL_URL_ENV, "").strip().rstrip("/")
     if not raw:
         raise PoolDestinationError(_NO_DESTINATION)
-    _require_parts(raw)
+    parts = _require_parts(raw)
+    if attesting_sidecar_mode(source) and not _is_plain_loopback(parts):
+        raise PoolDestinationError(_NOT_LOOPBACK)
     return raw
+
+
+def attesting_sidecar_mode(environ: Mapping[str, str] | None = None) -> bool:
+    """Return whether the Machine runs the attesting vendor's loopback sidecar.
+
+    Args:
+        environ: Environment to read; ``os.environ`` when omitted.
+
+    Returns:
+        ``True`` when :data:`POOL_VENDOR_ENV` names :data:`POOL_SIDECAR_VENDOR`.
+    """
+    return pool_attesting_vendor(environ) == POOL_SIDECAR_VENDOR
+
+
+def _is_plain_loopback(parts: SplitResult) -> bool:
+    """Return whether *parts* is plain HTTP to a loopback IP literal.
+
+    Plain HTTP is correct here and only here: the hop never leaves the
+    Machine, and the attested, encrypted channel starts at the sidecar. A
+    hostname such as ``localhost`` is refused because a resolver decides where
+    it points; an IP literal cannot be redirected.
+
+    Args:
+        parts: A destination already checked by :func:`_require_parts`.
+
+    Returns:
+        ``True`` only for ``http`` to ``127.0.0.1`` or ``::1``.
+    """
+    return parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS
 
 
 def admit_pool_url(url: str, environ: Mapping[str, str] | None = None) -> str:
@@ -1103,6 +1166,53 @@ def pool_generate(
     """
     with open_pool_dial(budget=budget, environ=environ) as dial:
         return dial.request(POOL_GENERATE_PATH, payload=payload, headers=headers)
+
+
+def pool_attestation_report(
+    *, budget: float | None = None, environ: Mapping[str, str] | None = None
+) -> PoolResponse:
+    """Read the loopback sidecar's attestation report; it carries no content.
+
+    Args:
+        budget: Seconds left in the vault request.
+        environ: Environment to read; ``os.environ`` when omitted.
+
+    Returns:
+        The report response, unverified: judging it is
+        :mod:`creek.classify.llm.pool_attestation`'s job.
+
+    Raises:
+        PoolBoundaryError: As :meth:`PoolDial.request`.
+    """
+    with open_pool_dial(budget=budget, environ=environ) as dial:
+        return dial.request(POOL_ATTESTATION_PATH, payload=None)
+
+
+def pool_chat_completion(
+    payload: Mapping[str, object],
+    *,
+    budget: float | None = None,
+    environ: Mapping[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> PoolResponse:
+    """Send one translated generation to the loopback sidecar (#1896).
+
+    Args:
+        payload: The OpenAI-compatible body built from the closed shape.
+        budget: Seconds left in the vault request.
+        environ: Environment to read; ``os.environ`` when omitted.
+        headers: Per-request headers, such as the correlation id.
+
+    Returns:
+        The completion response.
+
+    Raises:
+        PoolBoundaryError: As :meth:`PoolDial.request`.
+    """
+    with open_pool_dial(budget=budget, environ=environ) as dial:
+        return dial.request(
+            POOL_CHAT_COMPLETIONS_PATH, payload=payload, headers=headers
+        )
 
 
 def pool_embed(

@@ -366,6 +366,13 @@ def test_alert_vocabulary_is_exactly_seven_kinds_and_each_condition_maps_to_one(
         # #1866 (owner decision R2-4 extended): the Fly provider refused the
         # pilot's credential, so the pilot degrades and alerts once.
         "provider_credential_rejected",
+        # ADR-0016 D1.12 (#1896): the attesting pool as one vault sees it.
+        # Named in the vault's content-free record; not yet delivered.
+        "pool_attestation_failed",
+        "pool_credential_rejected",
+        "pool_admission_refused",
+        "pool_vendor_rate_limited",
+        "pool_quota_exhausted",
     }
     assert alerts == (
         Alert(AlertKind.CONTINUOUS_RUNNING, "fly-hot", 7200, "7200", "7200"),

@@ -37,12 +37,19 @@ from creek.classify.llm.local_boundary import (
     ollama_get,
     ollama_post,
 )
+from creek.classify.llm.pool_admission import PoolAdmissionRefusedError
+from creek.classify.llm.pool_attestation import attested_report
+from creek.classify.llm.pool_attested import (
+    PoolVendorRateLimitedError,
+    call_attested_pool,
+)
 from creek.classify.llm.pool_boundary import (
     POOL_REQUEST_ID_HEADER,
     POOL_REQUEST_TIMEOUT,
     PoolBoundaryError,
     PoolPromptTooLongError,
     admit_pool_url,
+    attesting_sidecar_mode,
     pool_generate,
     pool_list_models,
     pool_prompt_within_cap,
@@ -2288,19 +2295,42 @@ def check_pool_available(
         ``False`` on any refusal, transport failure or mismatch.
     """
     ceiling = _POOL_IDENTITY_TIMEOUT if budget is None else budget
-    try:
-        response = pool_list_models(budget=ceiling)
-    except PoolBoundaryError:
-        return False
-    if not pool_response_ok(response):
+    listing = _pool_identity_listing(ceiling)
+    if listing is None:
         return False
     if inventory_digest is None:
-        return reported_pool_identity(response.payload, model_name) is not None
+        return reported_pool_identity(listing, model_name) is not None
     return pool_identity_matches(
-        response.payload,
+        listing,
         model_name=model_name,
         inventory_digest=inventory_digest,
     )
+
+
+def _pool_identity_listing(budget: float) -> object | None:
+    """Return the pool's identity listing, or ``None`` when it is unusable.
+
+    In sidecar mode the listing is the **verified attestation report** (#1896):
+    its ``runtime`` and ``models`` are what the attested session reported, so
+    the manifest comparison is made against attested facts rather than an
+    unattested side channel, and a report that fails the pin yields nothing.
+
+    Args:
+        budget: Seconds allowed for the read.
+
+    Returns:
+        The decoded listing, or ``None`` on any refusal or non-200 answer.
+    """
+    if attesting_sidecar_mode():
+        try:
+            return attested_report(budget=budget)
+        except PoolBoundaryError:
+            return None
+    try:
+        response = pool_list_models(budget=budget)
+    except PoolBoundaryError:
+        return None
+    return response.payload if pool_response_ok(response) else None
 
 
 def _admit_configured_destination(config: LLMConfig) -> None:
@@ -2457,6 +2487,50 @@ def call_pool(
     return _pool_completion(response.payload, model)
 
 
+def _call_attested(
+    config: LLMConfig,
+    prompt: str,
+    *,
+    timeout: float,
+    max_tokens: int | None,
+    system: str | None,
+) -> Completion:
+    """Send *prompt* through the attesting loopback sidecar (#1896).
+
+    The vault's own admission refusal and a vendor rate limit both surface as
+    :class:`ProviderRateLimitError`, which every route already maps to
+    ``rate_limited``; a spent monthly cap (``insufficient_quota``) does
+    **not**, because waiting cannot clear it, so it stays a plain refusal and
+    the route answers ``temporarily_unavailable``.
+
+    Args:
+        config: The stage configuration, read only for the model name.
+        prompt: The fully formatted prompt.
+        timeout: Seconds left for this call.
+        max_tokens: Optional output ceiling.
+        system: Optional system text.
+
+    Returns:
+        The completion.
+
+    Raises:
+        ProviderRateLimitError: On the vault's admission refusal or a vendor
+            rate limit.
+        PoolBoundaryError: On every other refusal.
+    """
+    _admit_configured_destination(config)
+    try:
+        return call_attested_pool(
+            model=_resolve_configured_model(config.model, DEFAULT_MODELS["pool"]),
+            prompt=prompt,
+            timeout=timeout,
+            max_tokens=max_tokens,
+            system=system,
+        )
+    except (PoolAdmissionRefusedError, PoolVendorRateLimitedError) as exc:
+        raise ProviderRateLimitError(_POOL_RATE_LIMITED) from exc
+
+
 class PoolProvider:
     """The shared confidential warm-inference pool (ADR-0016, #1894).
 
@@ -2560,6 +2634,14 @@ class PoolProvider:
             ProviderRateLimitError: On a 429 from the pool.
             RuntimeError: On any other refusal.
         """
+        if attesting_sidecar_mode():
+            return _call_attested(
+                self.config,
+                prompt,
+                timeout=self.REQUEST_TIMEOUT,
+                max_tokens=max_tokens,
+                system=system,
+            )
         return call_pool(
             self.config,
             prompt,

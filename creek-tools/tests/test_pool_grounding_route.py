@@ -81,7 +81,15 @@ _INTIMATE_TITLE: Final[str] = "intimate-title-1904-route-sentinel"
 _PARQUET_SENTINEL: Final[str] = "parquet-sentinel-1904-never-on-the-wire"
 
 _CONFIG_SUBPATH: Final[tuple[str, ...]] = ("00-Creek-Meta", "creek_config.yaml")
-_VENDOR: Final[str] = "privatemode"
+_VENDOR: Final[str] = "example-attested-vendor"
+"""A synthetic vendor label, deliberately **not** ``privatemode``.
+
+These tests drive the grounding route against the Creek-shaped fake pool
+(``/v1/generate``). Naming ``privatemode`` puts the vault in sidecar mode
+(#1896), which also requires a loopback attestation report matching the
+Machine's pin; that path, embeddings included, is exercised in
+``tests/test_pool_attested_sidecar.py``.
+"""
 
 HTTP_OK: Final[int] = 200
 
