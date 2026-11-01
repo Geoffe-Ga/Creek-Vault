@@ -15,6 +15,7 @@ summary counts match what operators see on disk.
 
 from __future__ import annotations
 
+import importlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
@@ -60,6 +61,13 @@ class _Materialisable(Protocol):
 _M = TypeVar("_M", bound=_Materialisable)
 
 logger = logging.getLogger(__name__)
+
+_CACHE_STACK_MODULES: tuple[str, ...] = ("numpy", "pyarrow.parquet")
+"""Modules the bulk pass needs whatever the route: similarity maths and cache.
+
+Both ship in the ``embeddings-cache`` extra, which the managed image installs
+without the local model (#1904).
+"""
 
 
 @dataclass(frozen=True)
@@ -700,6 +708,7 @@ def _load_or_compute_embeddings(
         freshly computed and cache-served entries, and the row count the
         cache write actually landed on disk.
     """
+    _require_cache_stack()
     linker = EmbeddingLinker(config=config.embeddings, embedder=embedder)
 
     cached = _safe_load_cache(linker, cache_path)
@@ -726,6 +735,31 @@ def _load_or_compute_embeddings(
         reused=len(fresh_ids),
         persisted=persisted,
     )
+
+
+def _require_cache_stack() -> None:
+    """Refuse the bulk pass up front when it could not finish.
+
+    Without numpy the pass cannot compute a single edge and without pyarrow it
+    cannot persist the vectors it bought, so on the pool route a missing module
+    used to surface only *after* every cache miss had been embedded and paid
+    for, as a bare ``ModuleNotFoundError`` deep inside the cache writer. Failing
+    here spends nothing and names the extra that fixes it.
+
+    Raises:
+        ModuleNotFoundError: When a module of the ``embeddings-cache`` extra
+            cannot be imported. The message names the module and the extra.
+    """
+    for module in _CACHE_STACK_MODULES:
+        try:
+            importlib.import_module(module)
+        except ImportError as exc:
+            msg = (
+                f"The bulk link pass needs {module!r} from the "
+                "creek-tools[embeddings-cache] extra (numpy, pyarrow); "
+                "nothing was embedded."
+            )
+            raise ModuleNotFoundError(msg, name=module) from exc
 
 
 def _safe_load_cache(

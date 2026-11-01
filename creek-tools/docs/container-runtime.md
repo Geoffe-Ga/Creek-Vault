@@ -25,6 +25,16 @@ docker build --tag creek-vault:local .
 docker image inspect creek-vault:local --format '{{.Id}}'
 ```
 
+The image installs the base dependencies plus exactly these extras: `anthropic`
+and `openai` (the request-key vendors), `documents`, `spreadsheets` and
+`presentations` (the `POST /v1/uploads` parsers), and `embeddings-cache`
+(`numpy` and `pyarrow`, so the pool-route bulk link pass behind `POST /v1/links`
+can compute resonances and persist `00-Creek-Meta/embeddings.parquet`). The
+local embedding model (`embeddings`: `sentence-transformers` and the torch stack)
+and OCR are deliberately absent; a managed vault embeds through the attested
+pool (ADR-0018). `tests/test_container_image_contract.py` pins the set and walks
+`uv.lock` to prove the model stack stays out.
+
 Record the resulting image digest with deployment metadata. A tag is a human
 label; the digest is the image identity suitable for the measured-image work
 that follows this runtime.

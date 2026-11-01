@@ -764,6 +764,10 @@ embeddings = [
     { name = "pyarrow" },
     { name = "sentence-transformers" },
 ]
+embeddings-cache = [
+    { name = "numpy" },
+    { name = "pyarrow" },
+]
 gdrive = [
     { name = "google-api-python-client" },
     { name = "google-auth-oauthlib" },
@@ -793,7 +797,8 @@ requires-dist = [
     { name = "bandit", marker = "extra == 'dev'", specifier = ">=1.9.4,<2" },
     { name = "chardet", specifier = ">=7.6.0" },
     { name = "creek-tools", extras = ["all"], marker = "extra == 'dev'" },
-    { name = "creek-tools", extras = ["anthropic", "openai", "gemini", "embeddings", "ocr", "documents", "spreadsheets", "presentations", "gdrive"], marker = "extra == 'all'" },
+    { name = "creek-tools", extras = ["anthropic", "openai", "gemini", "embeddings", "embeddings-cache", "ocr", "documents", "spreadsheets", "presentations", "gdrive"], marker = "extra == 'all'" },
+    { name = "creek-tools", extras = ["embeddings-cache"], marker = "extra == 'embeddings'" },
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "detect-secrets", marker = "extra == 'dev'", specifier = ">=1.5.0" },
     { name = "google-api-python-client", marker = "extra == 'gdrive'", specifier = ">=2.199.0" },
@@ -807,7 +812,7 @@ requires-dist = [
     { name = "markdownify", marker = "extra == 'documents'", specifier = ">=1.2.3" },
     { name = "mcp", specifier = ">=1.30.0,<2.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=2.3.1,<2.4.0" },
-    { name = "numpy", marker = "extra == 'embeddings'", specifier = ">=2.4.6,<2.5.0" },
+    { name = "numpy", marker = "extra == 'embeddings-cache'", specifier = ">=2.4.6,<2.5.0" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=2.41.0,<3.0.0" },
     { name = "openpyxl", marker = "extra == 'spreadsheets'", specifier = ">=3.1" },
     { name = "pdf2image", marker = "extra == 'ocr'", specifier = ">=1.0" },
@@ -815,7 +820,7 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'ocr'", specifier = ">=13.0.0" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.10.1" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.6.2" },
-    { name = "pyarrow", marker = "extra == 'embeddings'", specifier = ">=24.0.0,<25.0.0" },
+    { name = "pyarrow", marker = "extra == 'embeddings-cache'", specifier = ">=24.0.0,<25.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.15.0" },
@@ -849,7 +854,7 @@ requires-dist = [
     { name = "vulture", marker = "extra == 'dev'", specifier = ">=2.16,<3" },
     { name = "xenon", marker = "extra == 'dev'", specifier = ">=0.9.0" },
 ]
-provides-extras = ["anthropic", "openai", "gemini", "embeddings", "ocr", "documents", "spreadsheets", "presentations", "gdrive", "all", "dev"]
+provides-extras = ["anthropic", "openai", "gemini", "embeddings", "embeddings-cache", "ocr", "documents", "spreadsheets", "presentations", "gdrive", "all", "dev"]
 
 [[package]]
 name = "cryptography"
