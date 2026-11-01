@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 import yaml
 
@@ -19,6 +20,8 @@ DOCKERIGNORE = REPO_ROOT / ".dockerignore"
 CONTRACT_SCRIPT = REPO_ROOT / "creek-tools" / "scripts" / "container-contract.sh"
 DOC = REPO_ROOT / "creek-tools" / "docs" / "container-runtime.md"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+LOCK = REPO_ROOT / "creek-tools" / "uv.lock"
+PROJECT = "creek-tools"
 
 
 def test_base_image_is_version_and_digest_pinned() -> None:
@@ -68,20 +71,105 @@ def _installed_extras() -> set[str]:
     return set(re.findall(r"--extra (\S+)", sync["flags"]))
 
 
-def test_image_installs_exactly_the_request_key_and_upload_parser_extras() -> None:
-    """The image ships each advertised SDK and each upload route's parser, nothing more.
+_EMBEDDINGS_CACHE_EXTRA: Final[str] = "embeddings-cache"
+"""The extra carrying the bulk link pass's parquet writer and similarity maths.
+
+A managed vault embeds through the attested pool (#1904), so ``POST /v1/links``
+runs the bulk pass with no local model — but that pass still computes
+similarities with NumPy and persists ``00-Creek-Meta/embeddings.parquet`` with
+pyarrow. Without them it spends pool embeds and then dies on
+``ModuleNotFoundError``, and every reflection re-embeds its cache misses live.
+"""
+
+_PARQUET_STACK: Final[frozenset[str]] = frozenset({"numpy", "pyarrow"})
+"""Distributions the bulk pass needs to compute edges and persist the cache."""
+
+_LOCAL_MODEL_STACK: Final[frozenset[str]] = frozenset(
+    {"sentence-transformers", "torch", "transformers"}
+)
+"""The local embedding model the pool route exists so the image need not hold."""
+
+
+def test_image_installs_exactly_the_request_key_upload_and_cache_extras() -> None:
+    """The image ships each advertised SDK, each upload parser and the cache stack.
 
     A managed vault lists :class:`RequestKeyProvider` in
     ``request_key_providers`` (ADR-0015), so it must ship each vendor's SDK; and
     ``POST /v1/uploads`` routes every suffix in ``_EXTENSION_ROUTES`` to an
     ingestor that imports its parser from an extra. An image missing either
     accepts the request and then dies on ``ModuleNotFoundError`` (2026-10-23: a
-    ``.docx`` upload, ``No module named 'docx'``). Exact equality keeps the image
+    ``.docx`` upload, ``No module named 'docx'``). The pool-route bulk link pass
+    is the same failure for the embeddings cache. Exact equality keeps the image
     minimal: no other extra rides along.
     """
     expected = {provider.value for provider in RequestKeyProvider}
     expected |= set(_ROUTE_EXTRAS.values())
+    expected.add(_EMBEDDINGS_CACHE_EXTRA)
     assert _installed_extras() == expected
+
+
+def _locked_packages() -> dict[str, list[dict[str, object]]]:
+    """Return every ``uv.lock`` package entry, grouped by distribution name."""
+    with LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: dict[str, list[dict[str, object]]] = {}
+    for package in lock["package"]:
+        packages.setdefault(str(package["name"]), []).append(package)
+    return packages
+
+
+def _requirements(entry: dict[str, object], key: str) -> list[dict[str, object]]:
+    """Return the dependency list *entry* keeps under *key*, or ``[]``."""
+    value = entry.get(key, [])
+    return cast("list[dict[str, object]]", value)
+
+
+def _image_install_set() -> set[str]:
+    """Return every distribution the image's locked ``uv sync`` can install.
+
+    Walks ``uv.lock`` from the project's base dependencies plus each extra the
+    Dockerfile names, following requested extras of each dependency. Markers are
+    ignored, so the set over-approximates: anything it excludes is excluded on
+    every platform and interpreter the lock covers.
+    """
+    packages = _locked_packages()
+    (project,) = packages[PROJECT]
+    extras = cast(
+        "dict[str, list[dict[str, object]]]", project["optional-dependencies"]
+    )
+    pending = list(_requirements(project, "dependencies"))
+    for extra in _installed_extras():
+        pending.extend(extras[extra])
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    while pending:
+        requirement = pending.pop()
+        name = str(requirement["name"])
+        wanted = tuple(cast("list[str]", requirement.get("extra", [])))
+        if (name, wanted) in seen:
+            continue
+        seen.add((name, wanted))
+        for entry in packages[name]:
+            pending.extend(_requirements(entry, "dependencies"))
+            optional = cast(
+                "dict[str, list[dict[str, object]]]",
+                entry.get("optional-dependencies", {}),
+            )
+            for extra in wanted:
+                pending.extend(optional.get(extra, []))
+    return {name for name, _ in seen}
+
+
+def test_image_install_set_carries_the_parquet_stack_not_the_local_model() -> None:
+    """The pool bulk pass can persist its cache; the local model stays out.
+
+    The whole point of pool embeddings is that the managed image cannot hold
+    ``sentence-transformers`` and the torch stack under it, so the extra that
+    gives the image the parquet writer must not drag the model in with it.
+    """
+    installed = _image_install_set()
+
+    assert installed >= _PARQUET_STACK, sorted(_PARQUET_STACK - installed)
+    assert not installed & _LOCAL_MODEL_STACK, sorted(installed & _LOCAL_MODEL_STACK)
 
 
 def test_every_upload_route_is_accounted_for() -> None:
@@ -190,7 +278,11 @@ sys.meta_path.insert(0, BlockNumpy())
 
 
 def _run_without_numpy(body: str) -> subprocess.CompletedProcess[str]:
-    """Run *body* in a fresh interpreter where NumPy is unavailable, as in the image."""
+    """Run *body* in a fresh interpreter where NumPy is unavailable.
+
+    NumPy is an extra: the managed image now ships it (``embeddings-cache``), but
+    a base ``pip install creek-tools`` does not, and the API must serve either.
+    """
     return subprocess.run(
         [sys.executable, "-c", _BLOCK_NUMPY + body],
         capture_output=True,
@@ -201,7 +293,7 @@ def _run_without_numpy(body: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_http_api_cold_import_does_not_require_the_optional_author_stack() -> None:
-    """The base API image must start without importing optional NumPy code."""
+    """The base API install must start without importing optional NumPy code."""
     result = _run_without_numpy(
         'import creek_mcp.httpapi.app\nassert "creek.author" not in sys.modules\n'
     )
@@ -209,10 +301,10 @@ def test_http_api_cold_import_does_not_require_the_optional_author_stack() -> No
 
 
 def test_the_combined_app_builds_its_mcp_surface_without_numpy(tmp_path: Path) -> None:
-    """``create_app`` builds the ``/mcp`` server in the image's NumPy-free stack.
+    """``create_app`` builds the ``/mcp`` server in a NumPy-free base install.
 
     Building the MCP server imports the whole tool registry (#1962); a
-    module-level NumPy import anywhere on it would stop every managed vault at
+    module-level NumPy import anywhere on it would stop every base install at
     boot rather than at the first call that needed it.
 
     Args:
@@ -248,8 +340,8 @@ def test_the_container_contract_completes_an_mcp_handshake_over_tls() -> None:
 def test_reflection_route_imports_the_author_stack_without_numpy() -> None:
     """``POST /v1/reflections`` loads ``creek.author`` on first use; NumPy is an extra.
 
-    The image installs no extras, so a module-level NumPy import anywhere on that
-    lazy path fails the first reflection a vault ever serves (#1870).
+    A base install carries no extras, so a module-level NumPy import anywhere on
+    that lazy path fails the first reflection such a vault ever serves (#1870).
     """
     result = _run_without_numpy(
         "import creek_mcp.httpapi.reflect\n"

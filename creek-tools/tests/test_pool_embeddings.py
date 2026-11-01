@@ -50,7 +50,7 @@ from creek.classify.llm.pool_embeddings import (
 )
 from creek.classify.llm.request_key import RequestKey
 from creek.classify.llm.router import ModelRouter, refuses_off_device
-from creek.config import EmbeddingsConfig, LLMConfig, LLMRoutingConfig
+from creek.config import CreekConfig, EmbeddingsConfig, LLMConfig, LLMRoutingConfig
 from creek.link.embeddings import (
     LOCAL_EMBEDDING_ROUTE,
     POOL_EMBEDDING_ROUTE,
@@ -58,7 +58,9 @@ from creek.link.embeddings import (
     EmbeddingLinker,
     EmbeddingRefusedError,
     EmbeddingSpace,
+    embeddings_cache_path,
 )
+from creek.link.link_engine import LinkSummary, run_link
 from creek.models import Fragment, FragmentSource, PrivacyTier, SourcePlatform
 from creek_mcp.grounding_route import (
     GroundingUnavailableError,
@@ -66,6 +68,7 @@ from creek_mcp.grounding_route import (
     link_embedder,
 )
 from creek_mcp.model_package import ModelPackageManifest
+from tests.helpers import write_fragment_file
 from tests.pool_support import (
     PINNED_EMBED_DIMENSIONS,
     PINNED_EMBED_MODEL,
@@ -498,6 +501,7 @@ class _StaticEmbedder:
     def __init__(self, space: EmbeddingSpace, *, answer: bool = True) -> None:
         self._space = space
         self._answer = answer
+        self.texts_sent = 0
 
     @property
     def space(self) -> EmbeddingSpace:
@@ -507,6 +511,7 @@ class _StaticEmbedder:
         return refuses_off_device(tier, "pool")
 
     def embed(self, items: Sequence[tuple[str, object]]) -> list[list[float] | None]:
+        self.texts_sent += sum(not self.refuses(tier) for _text, tier in items)
         dims = self._space.dimensions or 1
         return [
             fake_vector(text, dims) if self._answer and not self.refuses(tier) else None
@@ -697,6 +702,109 @@ class TestVectorSpaces:
         assert pooled.load_cache(path) == {}
         with pytest.raises(ImportError):
             EmbeddingLinker(EmbeddingsConfig()).load_cache(path)
+
+
+_BULK_FRAGMENTS: Final[int] = 3
+"""OPEN fragments in the bulk-pass vault: enough for one similarity pair."""
+
+_LOCAL_MODEL_MODULES: Final[tuple[str, ...]] = (
+    "sentence_transformers",
+    "torch",
+    "transformers",
+)
+"""The local embedding model's import roots, absent from the managed image."""
+
+
+class TestBulkPassCache:
+    """``POST /v1/links`` on the pool route persists the cache it embedded.
+
+    The managed image ships the ``embeddings-cache`` extra (numpy, pyarrow) and
+    not the local model, so the bulk pass must persist the parquet with the
+    pool's vector space on every row and need nothing from the model stack.
+    """
+
+    @staticmethod
+    def _vault(tmp_path: Path) -> Path:
+        """Return a vault holding a few synthetic OPEN fragments."""
+        vault = tmp_path / "vault"
+        for index in range(_BULK_FRAGMENTS):
+            write_fragment_file(
+                vault=vault,
+                fragment=_fragment(f"frag-bulk-{index}", PrivacyTier.OPEN),
+                body="synthetic body",
+            )
+        return vault
+
+    @staticmethod
+    def _link(vault: Path, embedder: _StaticEmbedder) -> LinkSummary:
+        """Run the embeddings bulk pass over *vault* on the pool route."""
+        return run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="embeddings",
+            rebuild=False,
+            embedder=embedder,
+        )
+
+    def test_the_pool_bulk_pass_persists_the_cache_in_its_own_space(
+        self, tmp_path: Path
+    ) -> None:
+        """Every row carries the pool route, pinned dimensions and threshold."""
+        import pyarrow.parquet as pq
+
+        vault = self._vault(tmp_path)
+
+        summary = self._link(vault, _StaticEmbedder(_pool_space()))
+
+        table = pq.read_table(embeddings_cache_path(vault))
+        assert summary.vectors_persisted == _BULK_FRAGMENTS
+        assert table.num_rows == _BULK_FRAGMENTS
+        assert set(table.column("route").to_pylist()) == {POOL_EMBEDDING_ROUTE}
+        assert set(table.column("model_name").to_pylist()) == {PINNED_EMBED_MODEL}
+        assert set(table.column("dimensions").to_pylist()) == {PINNED_EMBED_DIMENSIONS}
+        assert set(table.column("similarity_threshold").to_pylist()) == {
+            PINNED_EMBED_THRESHOLD
+        }
+
+    def test_a_warm_pool_bulk_pass_sends_the_pool_nothing(self, tmp_path: Path) -> None:
+        """The persisted cache is what keeps a second pass off the pool."""
+        vault = self._vault(tmp_path)
+        embedder = _StaticEmbedder(_pool_space())
+        self._link(vault, embedder)
+        cold_texts = embedder.texts_sent
+
+        warm = self._link(vault, embedder)
+
+        assert cold_texts == _BULK_FRAGMENTS
+        assert warm.fragments_embedded == 0
+        assert embedder.texts_sent == cold_texts
+
+    def test_the_pool_bulk_pass_needs_nothing_from_the_local_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The managed image's install set is enough to finish the pass."""
+        for module in _LOCAL_MODEL_MODULES:
+            monkeypatch.setitem(sys.modules, module, None)
+        vault = self._vault(tmp_path)
+
+        summary = self._link(vault, _StaticEmbedder(_pool_space()))
+
+        assert summary.vectors_persisted == _BULK_FRAGMENTS
+
+    @pytest.mark.parametrize("module", ["numpy", "pyarrow.parquet"])
+    def test_a_missing_cache_stack_refuses_before_any_pool_spend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: str
+    ) -> None:
+        """No embed is bought for a pass that could neither link nor persist it."""
+        monkeypatch.setitem(sys.modules, module, None)
+        vault = self._vault(tmp_path)
+        embedder = _StaticEmbedder(_pool_space())
+
+        with pytest.raises(ModuleNotFoundError, match="embeddings-cache"):
+            self._link(vault, embedder)
+
+        assert embedder.texts_sent == 0
+        assert not embeddings_cache_path(vault).exists()
 
 
 def test_pure_python_cosine_matches_numpy(monkeypatch: pytest.MonkeyPatch) -> None:

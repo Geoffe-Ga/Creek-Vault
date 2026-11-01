@@ -33,6 +33,21 @@ to locate the originating commit for any reference below.
   IPv4 and IPv6 literals are still refused. `1.0x1:443` was accepted before
   this change and is refused now.
 
+- Ship `numpy` and `pyarrow` in the managed vault image so the pool-route bulk
+  link pass behind `POST /v1/links` can compute resonances and persist
+  `00-Creek-Meta/embeddings.parquet` (#1904). Their pins (unchanged:
+  `numpy>=2.4.6,<2.5.0`, `pyarrow>=24.0.0,<25.0.0`) move from the
+  `embeddings` extra into a new `embeddings-cache` extra, which `embeddings`
+  and `all` pull in, so self-hosted installs resolve exactly as before; the
+  root `Dockerfile` installs `embeddings-cache` and still no local model. The
+  image contract test now walks `uv.lock` from the image's extras and fails if
+  `sentence-transformers`, `torch` or `transformers` is reachable or if
+  `numpy`/`pyarrow` is not. The bulk pass also checks for both modules before
+  embedding anything: previously, without pyarrow, it embedded every cache miss
+  through the pool and then died in the cache writer, discarding vectors it had
+  paid for; now it raises a `ModuleNotFoundError` naming the extra and spends
+  nothing. Estimated image growth: about 210 MB installed (about 65 MB of
+  wheels). ADR-0018 carries an amendment.
 - Stop labelling unattested pool answers as attested, and stop letting the
   environment choose where an enclave prompt goes (#2040, #1933).
   `pool:attested:<vendor>` is now derived from the attestation path, never
