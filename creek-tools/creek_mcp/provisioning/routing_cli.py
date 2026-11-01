@@ -349,6 +349,48 @@ def _require_no_shared_audience(
         )
 
 
+def private_vault_client(
+    ca_certificate_file: Path,
+    *,
+    timeout_seconds: float,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> httpx.AsyncClient:
+    """Return the router-to-vault client: private CA only, no ambient proxy.
+
+    This client carries journal content from the edge router to a user's
+    vault over Fly's private network, so its destination is part of the
+    privacy argument (#2045). ``trust_env=False`` stops ``HTTP_PROXY`` /
+    ``HTTPS_PROXY`` / ``ALL_PROXY`` — set by an operator, a base image or an
+    injected variable — from routing that content through a proxy, and makes
+    the client resolve Fly's ``.internal`` names and 6PN addresses directly.
+    It also stops httpx reading ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``, which
+    this client never relied on: its trust is the explicit private CA from
+    ``--private-tls-ca-certificate-file`` and nothing else.
+
+    Args:
+        ca_certificate_file: The owner-only private CA certificate (PEM).
+        timeout_seconds: The per-request timeout.
+        transport: Optional transport override, for tests.
+
+    Returns:
+        A proxy-free client verifying TLS against the private CA alone.
+
+    Raises:
+        ValueError: The CA file is missing, not owner-only, or not UTF-8
+            (``UnicodeError`` is a ``ValueError``).
+        ssl.SSLError: The CA file is not a usable certificate.
+    """
+    private_context = ssl.create_default_context(
+        cadata=read_owner_only_file(ca_certificate_file).decode("utf-8")
+    )
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout_seconds),
+        verify=private_context,
+        transport=transport,
+        trust_env=False,
+    )
+
+
 def compose(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -388,20 +430,15 @@ def compose(
             args.secret_state_directory,
             master_key_file=args.secret_master_key_file,
         )
-        private_context = ssl.create_default_context(
-            cadata=read_owner_only_file(args.private_tls_ca_certificate_file).decode(
-                "utf-8"
-            )
+        private_client = private_vault_client(
+            args.private_tls_ca_certificate_file,
+            timeout_seconds=args.request_timeout_seconds,
+            transport=private_transport,
         )
         provider_client = httpx.Client(
             base_url=policy.api_base_url,
             timeout=httpx.Timeout(args.provider_timeout_seconds),
             transport=provider_transport,
-        )
-        private_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(args.request_timeout_seconds),
-            verify=private_context,
-            transport=private_transport,
         )
         driver = FlyProviderDriver(
             policy,

@@ -44,6 +44,7 @@ from creek.classify.llm.consent import (
     managed_local_only,
 )
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV, is_loopback_url
+from creek.classify.llm.pool_meter import pool_spend_meter
 from creek.config import (
     CONFIG_PATH_ENV_VAR,
     VAULT_CONFIG_RELPATH,
@@ -524,7 +525,11 @@ def run(settings: ContainerSettings) -> None:
     # The served app answers /mcp (#1962), so an ungated consumer is named here
     # exactly as creek-tools-mcp --transport network names it (#1964).
     announce_ungated_consumers(verifier)
-    with managed_local_only() if settings.managed else nullcontext():
+    with (
+        managed_local_only() if settings.managed else nullcontext(),
+        # Pool spend is metered onto this vault's own volume (#2007).
+        pool_spend_meter(settings.vault_path),
+    ):
         serve(
             create_app(
                 verifier=verifier, agent_verifier=agent_verifier_for(settings, secret)

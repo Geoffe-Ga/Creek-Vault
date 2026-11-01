@@ -21,6 +21,54 @@ to locate the originating commit for any reference below.
   The new test
   `test_a_keyed_job_lost_to_a_restart_keeps_no_key_and_is_readmitted_keyed`
   pins this. No runtime code changed.
+- Meter the shared pool's spend locally and alert at EUR 5, half the pilot
+  key's EUR 10 monthly cap (R4-1, R4-2, #2007; owner decision 2026-11-01:
+  local metering, not vendor-API polling). Every generation and embeddings
+  call through `pool_boundary` is handed to the new vendor-neutral
+  `creek/classify/llm/pool_meter.py`, which books the OpenAI-compatible
+  `usage` counts to the vendor the Machine names and the model the request
+  named. An answer without usable counts is estimated as a byte upper bound
+  and flagged; a dial that sent its body but got no answer is counted the same
+  way; a vendor refusal is not counted. The month-to-date ledger lives on the
+  vault's own volume (`00-Creek-Meta/pool/spend-ledger.json`). It is
+  content-free, durable across restarts, kept per UTC calendar month, and
+  never silently reset to zero. Prices are pinned configuration, not code:
+  `creek/classify/llm/pool_prices.json` (schema and validation in
+  `pool_prices.py`, a new vendor is a new entry). It ships with Privatemode
+  marked `operator_must_fill`, because no price was invented, so until an
+  operator pins prices the meter reports tokens only with the state
+  `price-unpinned` and raises no alert. Once prices are pinned, the first call
+  reaching `monthly_cap x alert_fraction` (defaults 10.00 and 0.5) writes one
+  `creek.pool` record naming the existing `monthly_budget_departure` kind with
+  `component: "pool"`. That happens once per month per vault, and the alert
+  re-arms on rollover. Both serving runtimes install the meter, and
+  `python -m creek_mcp.container_health --check pool` now prints a `pool-spend`
+  line per vendor after its state line, with its exit code unchanged. Runbook:
+  `docs/pool-measurement-pin.md`, "Spend metering and the €5 alert".
+- The edge router's client to each user's vault now ignores ambient proxy
+  settings (#2045). It carries journal content over Fly's private network, but
+  it was built without `trust_env=False`, so an inherited `HTTPS_PROXY`,
+  `HTTP_PROXY` or `ALL_PROXY` would have routed that content through the
+  proxy. The client is now built by `routing_cli.private_vault_client`, which
+  sets `trust_env=False` and trusts only the explicit private CA. A dial-spy
+  test sets every proxy variable to a fake host and shows the router still
+  dials only the vault's `.internal` name or 6PN address. #2044's structural
+  proxy-free rule now covers the builder. A second rule keeps the builder the
+  only place in `routing_cli.py` that builds this client. The client keeps its
+  pinned private CA rather than `local_boundary.environment_ca_trust`, which
+  would trust `SSL_CERT_FILE` or certifi instead. The sweep found no other
+  client under `creek_mcp/provisioning/` or `creek_mcp/httpapi/` that carries
+  user content: the Fly Machines API, handoff callback and fleet-alert clients
+  carry credentials or metadata only.
+- Pool sidecar egress pins are case-insensitive and detect IP literals
+  properly (#2042). `PoolSidecarPolicy` now lowercases the egress host instead
+  of refusing `Api.Example:443` with a confusing error. `valid_egress` now uses
+  `ipaddress.ip_address`, plus `socket.inet_aton` for legacy shorthand such as
+  `127.1` or `1.0x1`, to detect IP literals, instead of checking for an
+  all-digit last label. A hostname such as `pool.vendor.2049` is accepted, and
+  IPv4 and IPv6 literals are still refused. `1.0x1:443` was accepted before
+  this change and is refused now.
+
 - Ship `numpy` and `pyarrow` in the managed vault image so the pool-route bulk
   link pass behind `POST /v1/links` can compute resonances and persist
   `00-Creek-Meta/embeddings.parquet` (#1904). Their pins (unchanged:

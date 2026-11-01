@@ -24,6 +24,7 @@ from creek.classify.llm.pool_attestation import (
     POOL_EGRESS_ENV,
     POOL_MEASUREMENTS_ENV,
     POOL_SIGNING_IDENTITY_ENV,
+    valid_egress,
 )
 from creek.classify.llm.pool_boundary import POOL_VENDOR_ENV
 from creek_mcp.provisioning import fly_vault_bootstrap, pool_sidecar
@@ -105,6 +106,47 @@ def test_a_floating_partial_or_malformed_pin_is_refused(
     """The image is pinned by digest only; every other field is checked too."""
     with pytest.raises(ValueError, match="pool"):
         _policy(**overrides)
+
+
+def test_a_mixed_case_egress_host_is_normalised_not_refused() -> None:
+    """#2042: hostnames are case-insensitive, so operator casing is not an error.
+
+    ``load_pool_pin`` lowercases what the Machine reads back; the policy
+    lowercases what the operator typed, so the rendered ``env`` it is compared
+    against is the same canonical form.
+    """
+    policy = _policy(egress="Api.PrivateMode.Example:443")
+
+    assert policy.egress == "api.privatemode.example:443"
+    assert policy.runtime_env()[POOL_EGRESS_ENV] == "api.privatemode.example:443"
+
+
+def test_an_all_digit_final_label_is_a_hostname() -> None:
+    """#2042: a valid hostname whose last label is all digits is admitted."""
+    assert valid_egress("pool.vendor.example.2049:443")
+    assert _policy(egress="pool.vendor.2049:443").egress == "pool.vendor.2049:443"
+
+
+@pytest.mark.parametrize(
+    "egress",
+    [
+        "10.1.2.3:443",
+        "203.0.113.7:8443",
+        # Legacy shorthand the resolver still reads as an address.
+        "127.1:443",
+        "0x7f.1:443",
+        "1.0x1:443",
+        "[::1]:443",
+        "[2001:db8::1]:443",
+        "::1:443",
+        "2001:db8::1:443",
+    ],
+)
+def test_an_ip_literal_egress_is_still_refused(egress: str) -> None:
+    """#2042: the pin names one vendor host, never an IPv4 or IPv6 literal."""
+    assert not valid_egress(egress)
+    with pytest.raises(ValueError, match="pool sidecar egress"):
+        _policy(egress=egress)
 
 
 def test_the_pin_renders_only_non_secret_env() -> None:
