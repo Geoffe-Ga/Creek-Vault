@@ -21,6 +21,15 @@ to locate the originating commit for any reference below.
   client under `creek_mcp/provisioning/` or `creek_mcp/httpapi/` that carries
   user content: the Fly Machines API, handoff callback and fleet-alert clients
   carry credentials or metadata only.
+- Pool sidecar egress pins are case-insensitive and detect IP literals
+  properly (#2042). `PoolSidecarPolicy` now lowercases the egress host instead
+  of refusing `Api.Example:443` with a confusing error. `valid_egress` now uses
+  `ipaddress.ip_address`, plus `socket.inet_aton` for legacy shorthand such as
+  `127.1` or `1.0x1`, to detect IP literals, instead of checking for an
+  all-digit last label. A hostname such as `pool.vendor.2049` is accepted, and
+  IPv4 and IPv6 literals are still refused. `1.0x1:443` was accepted before
+  this change and is refused now.
+
 - Stop labelling unattested pool answers as attested, and stop letting the
   environment choose where an enclave prompt goes (#2040, #1933).
   `pool:attested:<vendor>` is now derived from the attestation path, never
