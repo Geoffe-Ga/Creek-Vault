@@ -9,6 +9,30 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Meter the shared pool's spend locally and alert at EUR 5, half the pilot
+  key's EUR 10 monthly cap (R4-1, R4-2, #2007; owner decision 2026-11-01:
+  local metering, not vendor-API polling). Every generation and embeddings
+  call through `pool_boundary` is handed to the new vendor-neutral
+  `creek/classify/llm/pool_meter.py`, which books the OpenAI-compatible
+  `usage` counts to the vendor the Machine names and the model the request
+  named. An answer without usable counts is estimated as a byte upper bound
+  and flagged; a dial that sent its body but got no answer is counted the same
+  way; a vendor refusal is not counted. The month-to-date ledger lives on the
+  vault's own volume (`00-Creek-Meta/pool/spend-ledger.json`). It is
+  content-free, durable across restarts, kept per UTC calendar month, and
+  never silently reset to zero. Prices are pinned configuration, not code:
+  `creek/classify/llm/pool_prices.json` (schema and validation in
+  `pool_prices.py`, a new vendor is a new entry). It ships with Privatemode
+  marked `operator_must_fill`, because no price was invented, so until an
+  operator pins prices the meter reports tokens only with the state
+  `price-unpinned` and raises no alert. Once prices are pinned, the first call
+  reaching `monthly_cap x alert_fraction` (defaults 10.00 and 0.5) writes one
+  `creek.pool` record naming the existing `monthly_budget_departure` kind with
+  `component: "pool"`. That happens once per month per vault, and the alert
+  re-arms on rollover. Both serving runtimes install the meter, and
+  `python -m creek_mcp.container_health --check pool` now prints a `pool-spend`
+  line per vendor after its state line, with its exit code unchanged. Runbook:
+  `docs/pool-measurement-pin.md`, "Spend metering and the €5 alert".
 - Ship `numpy` and `pyarrow` in the managed vault image so the pool-route bulk
   link pass behind `POST /v1/links` can compute resonances and persist
   `00-Creek-Meta/embeddings.parquet` (#1904). Their pins (unchanged:

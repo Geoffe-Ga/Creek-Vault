@@ -54,6 +54,7 @@ from creek.classify.llm.pool_boundary import (
     pool_prompt_within_cap,
     require_pool_request,
 )
+from creek.classify.llm.pool_meter import TELEMETRY_LOGGER
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -107,9 +108,6 @@ _HTTP_TOO_MANY_REQUESTS: Final[int] = 429
 _CREDENTIAL_STATUSES: Final[frozenset[int]] = frozenset({401, 403})
 _INSUFFICIENT_QUOTA: Final[str] = "insufficient_quota"
 _MS_PER_SECOND: Final[float] = 1000.0
-
-TELEMETRY_LOGGER: Final[str] = "creek.pool"
-"""Logger the content-free pool records go to."""
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(TELEMETRY_LOGGER)
 
