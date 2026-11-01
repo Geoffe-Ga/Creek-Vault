@@ -49,13 +49,41 @@ class EvalRecord:
     requests: tuple[JudgeRequest, ...]
     corpus_entries: int
 
-    def to_json_dict(self) -> dict[str, Any]:
+    def to_json_dict(self, *, content_free: bool = False) -> dict[str, Any]:
         """Return the JSON-serialisable form, seed and rubric version first.
 
         Both are at the top level because a score is comparable only within one
         rubric version and one seed, and a reader should not have to dig for
         either.
+
+        Args:
+            content_free: Replace the judge payloads — which carry the
+                candidate's text and the reference prose — with their count.
+                The owner-run vault eval (#1875) writes this form, because its
+                reference is the owner's own writing and its candidates are
+                written in his voice from it.
+
+        Returns:
+            The mapping :func:`write_record` serialises.
         """
+        payload = self._closed_fields()
+        if content_free:
+            payload["judge_requests"] = len(self.requests)
+            return payload
+        payload["requests"] = [
+            {
+                "candidate_id": request.candidate_id,
+                "dimension": request.dimension.value,
+                "rubric_version": request.rubric_version,
+                "candidate_text": request.candidate_text,
+                "reference_text": request.reference_text,
+            }
+            for request in self.requests
+        ]
+        return payload
+
+    def _closed_fields(self) -> dict[str, Any]:
+        """Return every field that is an enum, a number or a version — no text."""
         return {
             "kind": self.quality.kind,
             "rubric_version": self.quality.rubric_version,
@@ -72,16 +100,6 @@ class EvalRecord:
                 }
                 for dimension, score in self.quality.per_dimension.items()
             },
-            "requests": [
-                {
-                    "candidate_id": request.candidate_id,
-                    "dimension": request.dimension.value,
-                    "rubric_version": request.rubric_version,
-                    "candidate_text": request.candidate_text,
-                    "reference_text": request.reference_text,
-                }
-                for request in self.requests
-            ],
         }
 
 

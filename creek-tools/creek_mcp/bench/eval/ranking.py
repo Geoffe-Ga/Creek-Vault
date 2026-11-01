@@ -33,7 +33,7 @@ from creek_mcp.bench.eval import PASS_THRESHOLD, RUBRIC_VERSION
 from creek_mcp.bench.eval.rubric import Basis, Dimension, RubricVerdict
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
     from pathlib import Path
 
     from creek_mcp.bench.eval.record import EvalRecord
@@ -61,6 +61,16 @@ class EvalMode(StrEnum):
 
     FAKE = "fake"
     LIVE = "live"
+
+
+class CorpusSource(StrEnum):
+    """What the candidates were prompted with and scored against.
+
+    Scores from the two are not comparable: the reference prose differs.
+    """
+
+    SYNTHETIC = "synthetic"
+    VAULT = "vault"
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,13 +133,21 @@ class ModelRow:
     record: EvalRecord
     invented_citations: int
 
-    def to_json_dict(self, rank: int) -> dict[str, Any]:
+    def to_json_dict(self, rank: int, *, content_free: bool = False) -> dict[str, Any]:
         """Return this row's JSON form at *rank*.
 
         The dimension block is the record's own ``per_dimension``, so the row
         and its record cannot disagree about a score.
+
+        Args:
+            rank: The row's one-based position.
+            content_free: Write the record without its judge payloads; see
+                :meth:`~creek_mcp.bench.eval.record.EvalRecord.to_json_dict`.
+
+        Returns:
+            The row's mapping.
         """
-        record = self.record.to_json_dict()
+        record = self.record.to_json_dict(content_free=content_free)
         return {
             "rank": rank,
             "model_tag": self.model_tag,
@@ -180,9 +198,15 @@ class EvalRanking:
         judge: Which judge scored voice match — ``routed`` whenever a cloud
             judge was used, never ``hermetic``.
         seed: The presentation seed every model was scored at.
-        corpus_entries: How many synthetic entries were used.
+        corpus_entries: How many corpus entries were used.
         generation_prompt: The exact prompt every model was given.
         rows: The ranked rows, best first.
+        corpus_source: Synthetic, or the owner's own vault (#1875). A vault
+            ranking is **content-free**: it omits the generation prompt and
+            every judge payload, keeping scores, verdicts, model tags and
+            counts. The prose lives only in the owner's private review file.
+        vault_counts: For a vault ranking, what the loader admitted and
+            excluded — counts only.
     """
 
     mode: EvalMode
@@ -191,25 +215,34 @@ class EvalRanking:
     corpus_entries: int
     generation_prompt: str
     rows: tuple[ModelRow, ...]
+    corpus_source: CorpusSource = CorpusSource.SYNTHETIC
+    vault_counts: Mapping[str, int] | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         """Return the JSON form, run facts first and rows last."""
-        return {
+        content_free = self.corpus_source is CorpusSource.VAULT
+        payload: dict[str, Any] = {
             "kind": RANKING_KIND,
             "rubric_version": RUBRIC_VERSION,
             "mode": self.mode.value,
             "judge": self.judge.value,
             "seed": self.seed,
+            "corpus_source": self.corpus_source.value,
             "corpus_entries": self.corpus_entries,
             "ranking_basis": RANKING_BASIS,
             "non_discriminating_dimensions": [
                 caveat.to_json_dict() for caveat in NON_DISCRIMINATING
             ],
-            "generation_prompt": self.generation_prompt,
-            "rows": [
-                row.to_json_dict(rank) for rank, row in enumerate(self.rows, start=1)
-            ],
         }
+        if content_free:
+            payload["vault_counts"] = dict(self.vault_counts or {})
+        else:
+            payload["generation_prompt"] = self.generation_prompt
+        payload["rows"] = [
+            row.to_json_dict(rank, content_free=content_free)
+            for rank, row in enumerate(self.rows, start=1)
+        ]
+        return payload
 
 
 def write_ranking(ranking: EvalRanking, path: Path) -> None:

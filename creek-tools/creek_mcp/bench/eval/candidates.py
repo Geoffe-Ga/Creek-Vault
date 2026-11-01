@@ -32,10 +32,13 @@ own entries, so the voice-match dimension is judged rather than reported
 :data:`PROMPT_CARRIES_VOICE_EVIDENCE`, and says nothing about the production
 letter prompt #1880 describes.
 
-Everything the prompt carries is the synthetic corpus written for the harness;
-no real journal content can reach it, because the only corpus is the one
-:func:`~creek_mcp.bench.eval.voice_corpus.build_voice_corpus` writes behind the
-confinement gate.
+By default everything the prompt carries is the synthetic corpus written for
+the harness, built by
+:func:`~creek_mcp.bench.eval.voice_corpus.build_voice_corpus` behind the
+confinement gate. The one exception is the owner-run ``--corpus-vault`` path
+(#1875), which prompts with a bounded sample of the owner's own ``open`` and
+``personal`` prose — see :mod:`creek_mcp.bench.eval.vault_corpus` — and is
+refused under CI and without an explicit acknowledgement.
 """
 
 from __future__ import annotations
@@ -85,7 +88,7 @@ GENERATION_PROMPT: Final[str] = (
     "Answer with the reflection only.\n\n"
     "ENTRIES:\n{entries}\n"
 )
-"""The one generation prompt. Only ever filled with synthetic corpus text."""
+"""The one generation prompt: synthetic corpus text, or an owner-run vault sample."""
 
 _STRUCTURE: Final[str] = "Use exactly these headings, each on its own line: {}.\n"
 _ENTRY_SEPARATOR: Final[str] = "\n\n"
@@ -296,20 +299,28 @@ def routed_source(
     *,
     max_tokens: int,
     provider_factory: Callable[[LLMConfig], LLMProvider] = build_provider,
+    tier: PrivacyTier = PrivacyTier.OPEN,
 ) -> ProviderSource:
     """Build a live source for one candidate model through the model router.
 
-    The config is resolved at :data:`CANDIDATE_ROLE` with tier ``OPEN`` — the
-    synthetic corpus is open by construction — so the router's chokepoint
-    applies exactly as it does to every other generation stage.
+    The config is resolved at :data:`CANDIDATE_ROLE` with the corpus's tier —
+    ``OPEN`` for the synthetic corpus, which is open by construction, and the
+    most sensitive admitted tier for an owner-run vault sample — so the
+    router's chokepoint applies exactly as it does to every other generation
+    stage, and sees the truth about what the prompt carries.
 
     Args:
         config: The candidate model's provider config.
         max_tokens: Output ceiling per candidate.
         provider_factory: Builds the provider; injected so tests never dial.
+        tier: The privacy tier of the prompt's content.
 
     Returns:
         The live source.
+
+    Raises:
+        IntimateRoutingError: When the router gates *tier* and has no local
+            provider to redirect to — nothing is built.
     """
-    resolved = ModelRouter(config).resolve_role(CANDIDATE_ROLE, PrivacyTier.OPEN)
+    resolved = ModelRouter(config).resolve_role(CANDIDATE_ROLE, tier)
     return ProviderSource(provider_factory(resolved), max_tokens=max_tokens)
