@@ -6,8 +6,10 @@ argument: the request must reach *that vault's private address*, not whatever
 an inherited ``HTTPS_PROXY`` names. These tests pin the property two ways: a
 dial spy that records where the composed client actually connects with every
 proxy variable set to a fake host, and a structural rule over
-``routing_cli.py`` so a later edit cannot quietly build a proxy-honouring
-vault client.
+``routing_cli.py`` so a later edit cannot build the vault client anywhere but
+its one builder. That the builder itself is proxy-free (``trust_env=False``,
+no proxy, mounts or ``**kwargs``) is #2044's rule 4, extended to it in
+``tests/test_ollama_endpoint_invariant.py``.
 """
 
 from __future__ import annotations
@@ -62,11 +64,6 @@ _SIX_PN_VAULT: Final[str] = "fdaa:0:1:a7b:1::3"
 """A synthetic Fly 6PN IPv6 address, what that private name resolves to."""
 
 _REQUEST_TIMEOUT_SECONDS: Final[float] = 5.0
-
-_FORBIDDEN_CLIENT_KEYWORDS: Final[frozenset[str]] = frozenset(
-    {"proxy", "proxies", "mounts"}
-)
-"""Keywords that would route a client through a proxy explicitly."""
 
 _VAULT_CLIENT_BUILDER: Final[str] = "private_vault_client"
 
@@ -259,7 +256,7 @@ def test_compose_builds_the_vault_client_through_the_proxy_free_builder(
 
 
 # --------------------------------------------------------------------------
-# Structural rule: the vault client is built in one place, proxy-free.
+# Structural rule: the vault client is built in one place, with explicit trust.
 # --------------------------------------------------------------------------
 
 
@@ -285,13 +282,13 @@ def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
 
 
 def _vault_client_violations(source: str) -> list[str]:
-    """Return every way *source* could build a proxy-honouring vault client.
+    """Return every way *source* could build the vault client off the builder.
 
     The rule: every ``httpx.AsyncClient`` in the routing composition — the
     only async client there is the router-to-vault one — is built inside
-    :func:`~creek_mcp.provisioning.routing_cli.private_vault_client`, with a
-    literal ``trust_env=False``, an explicit ``verify=``, no ``**kwargs`` and
-    no explicit proxy or mounts; and ``compose`` builds its client through it.
+    :func:`~creek_mcp.provisioning.routing_cli.private_vault_client` with an
+    explicit ``verify=``, and ``compose`` builds its client through it. So
+    the builder's proxy-free rule covers every vault client there is.
 
     Args:
         source: The module source to check.
@@ -308,20 +305,10 @@ def _vault_client_violations(source: str) -> list[str]:
     ]
     found = [] if clients else ["no router-to-vault client is constructed"]
     for call in clients:
-        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
-        trust = keywords.get("trust_env")
         if owners.get(id(call)) != _VAULT_CLIENT_BUILDER:
             found.append(f"{call.lineno}: vault client built outside the builder")
-        if None in keywords:
-            found.append(f"{call.lineno}: **kwargs hides the client's settings")
-        if not (isinstance(trust, ast.Constant) and trust.value is False):
-            found.append(f"{call.lineno}: client honours the proxy environment")
-        if "verify" not in keywords:
+        if "verify" not in {keyword.arg for keyword in call.keywords}:
             found.append(f"{call.lineno}: private CA trust is not explicit")
-        found += [
-            f"{call.lineno}: explicit {name}= routes through a proxy"
-            for name in sorted(_FORBIDDEN_CLIENT_KEYWORDS & set(keywords))
-        ]
     compose_calls = {
         node.func.id
         for node in ast.walk(tree)
@@ -334,8 +321,8 @@ def _vault_client_violations(source: str) -> list[str]:
     return found
 
 
-def test_the_router_to_vault_client_ignores_the_proxy_environment() -> None:
-    """#2045: the real routing composition obeys the proxy-free rule."""
+def test_the_router_builds_its_vault_client_in_one_place() -> None:
+    """#2045: the real routing composition obeys the one-builder rule."""
     source = _ROUTING_CLI.read_text(encoding="utf-8")
 
     assert _vault_client_violations(source) == []
@@ -355,26 +342,6 @@ def compose(context):
 @pytest.mark.parametrize(
     ("planted", "expected"),
     [
-        (
-            _CLEAN.replace("trust_env=False, ", ""),
-            "client honours the proxy environment",
-        ),
-        (
-            _CLEAN.replace("trust_env=False", "trust_env=True"),
-            "client honours the proxy environment",
-        ),
-        (
-            _CLEAN.replace("verify=context", "verify=context, proxy='http://p:1'"),
-            "explicit proxy= routes through a proxy",
-        ),
-        (
-            _CLEAN.replace("verify=context", "verify=context, mounts={}"),
-            "explicit mounts= routes through a proxy",
-        ),
-        (
-            _CLEAN.replace("verify=context", "**settings"),
-            "**kwargs hides the client's settings",
-        ),
         (
             _CLEAN.replace(", verify=context", ""),
             "private CA trust is not explicit",
@@ -396,10 +363,10 @@ def compose(context):
 def test_planted_vault_client_violations_are_caught(
     planted: str, expected: str
 ) -> None:
-    """Each way of re-admitting the proxy environment is flagged."""
+    """Each way of building a vault client off the builder is flagged."""
     assert any(expected in found for found in _vault_client_violations(planted))
 
 
-def test_a_proxy_free_vault_client_passes() -> None:
+def test_a_builder_built_vault_client_passes() -> None:
     """The rule's clean fixture produces no violation."""
     assert _vault_client_violations(_CLEAN) == []

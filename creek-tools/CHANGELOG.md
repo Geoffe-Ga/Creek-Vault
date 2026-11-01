@@ -16,8 +16,11 @@ to locate the originating commit for any reference below.
   proxy. The client is now built by `routing_cli.private_vault_client`, which
   sets `trust_env=False` and trusts only the explicit private CA. A dial-spy
   test sets every proxy variable to a fake host and shows the router still
-  dials only the vault's `.internal` name or 6PN address. A structural test
-  over `routing_cli.py` keeps the client proxy-free. The sweep found no other
+  dials only the vault's `.internal` name or 6PN address. #2044's structural
+  proxy-free rule now covers the builder. A second rule keeps the builder the
+  only place in `routing_cli.py` that builds this client. The client keeps its
+  pinned private CA rather than `local_boundary.environment_ca_trust`, which
+  would trust `SSL_CERT_FILE` or certifi instead. The sweep found no other
   client under `creek_mcp/provisioning/` or `creek_mcp/httpapi/` that carries
   user content: the Fly Machines API, handoff callback and fleet-alert clients
   carry credentials or metadata only.

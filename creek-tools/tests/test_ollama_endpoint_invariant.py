@@ -683,6 +683,22 @@ def test_the_enclave_dials_ignore_the_proxy_environment(name: str) -> None:
     assert _boundary_violations(_function_source(providers, name)) == []
 
 
+def test_the_router_to_vault_dial_ignores_the_proxy_environment() -> None:
+    """#2045: the same rule holds for the client carrying journal content.
+
+    The edge router forwards a user's requests to their vault over Fly's
+    private network, so its destination is no more ambient than the
+    enclave's. The one builder of that client must be proxy-free; that it is
+    the only one, and that ``compose`` uses it, is pinned in
+    ``tests/test_routing_proxy_boundary.py``.
+    """
+    routing_cli = _ROOT / "creek_mcp" / "provisioning" / "routing_cli.py"
+
+    source = _function_source(routing_cli, "private_vault_client")
+
+    assert _boundary_violations(source) == []
+
+
 _POOL_MARKER = 'MODELS = "/v1/models"\n'
 
 
