@@ -337,18 +337,29 @@ refuses, because a key nobody dated expires unnoticed.
 **Alerting is registered, not yet emitted.** The three alert kinds exist in the
 closed `AlertKind` vocabulary, and each verdict maps onto one, but **no
 production path emits them**: a near-expiry verdict today is *recorded* on
-stderr at startup and **not delivered** to anyone. Two gates stand in the way,
-and neither is this page's to clear. The periodic re-check belongs to the
+stderr at startup and **not delivered** to anyone. One gate stands in the way,
+and it is not this page's to clear: the periodic re-check belongs to the
 attesting provider's fleet-report pass
 ([#1896](https://github.com/Geoffe-Ga/Creek-Vault/issues/1896)) — a control
 plane boots once and runs for months, so a startup-only check cannot warn
-about an expiry that arrives later. And adepthood's alert receiver enforces its
-*own* closed kind list, which today admits six kinds and not even
-`pool_credential_orphan`; an unknown kind is answered `400`, which
-`HttpFleetAlertSink` escalates to `AlertDeliveryError`, which fails the
-scheduler component and takes the Machine unhealthy. Wiring an emitter before
-that list is widened would convert a warning into an outage, so near-expiry is
-**not** an early warning yet, and this page does not pretend it is.
+about an expiry that arrives later. Until #1896 wires it, near-expiry is
+**not** an early warning, and this page does not pretend it is.
+
+The receiving end is already open. Adepthood's alert receiver enforces its
+*own* closed kind list, and since
+[adepthood#3646](https://github.com/Geoffe-Ga/adepthood/pull/3646) that list
+admits every `AlertKind` member (17 today), including the three admin-key kinds
+and `pool_credential_orphan`. A payload naming any kind the receiver does not
+know is refused whole with `400`. `HttpFleetAlertSink` does not retry a `400`
+and raises `AlertDeliveryError`, and the R2-4 alert relay
+([#1999](https://github.com/Geoffe-Ga/Creek-Vault/issues/1999)) contains it:
+routing keeps running, the undelivered counts stay owed and are retried with
+backoff, and new activations are refused until a delivery succeeds (see the
+[managed-vault pilot runbook](managed-vault-fly-pilot.md#4-configure-reporting-and-alert-delivery)).
+Every retry of an unknown kind is refused again, so it would keep admission
+closed, and hold back the other counts owed in the same batch, until Adepthood
+admits it. The standing rule is therefore **receiver first**: a new alert kind
+ships to Adepthood's receiver, then to Creek.
 
 *Also not built here:* the vendor calls themselves — the `update` that resets
 a cap, the in-place expiry extension and the create-then-delete re-issue — which
@@ -405,9 +416,9 @@ confirms against a key that is already dead.
 
 *Not wired yet.* No production pool issuer exists (#1896), so nothing calls a
 roll today, and the operator fleet CLI is not yet given a pending-revocation
-source: wiring one is #1896's, together with the vendor's key listing. That
-alert is also **not deliverable** through adepthood's receiver until its closed
-kind list admits `pool_credential_orphan` (see Alerting above).
+source: wiring one is #1896's, together with the vendor's key listing. Once
+raised, the alert is deliverable: adepthood's receiver admits
+`pool_credential_orphan` (see Alerting above).
 
 An exhausted cap answers `insufficient_quota` (429, non-transient). The
 contract maps it to `temporarily_unavailable` so the vault refuses rather than

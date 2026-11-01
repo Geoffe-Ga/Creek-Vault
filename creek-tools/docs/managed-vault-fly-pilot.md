@@ -436,10 +436,15 @@ monthly cap (R4-1, R4-2). `python -m creek_mcp.container_health --check pool` pr
 month to date. Prices must be pinned first; see
 [Spend metering and the €5 alert](pool-measurement-pin.md#spend-metering-and-the-5-alert-r4-2-2007).
 
-**Deploy order for `provider_credential_expiring`.** Adepthood's alert receiver
-validates the closed kind list, and an unknown kind is refused, which Creek
-treats as an alert-delivery failure. Deploy a Creek build that can raise this
-kind only after the Adepthood receiver admits `provider_credential_expiring`.
+**Deploy order for a new alert kind: receiver first.** Adepthood's alert
+receiver validates its own closed kind list, which today admits every
+`AlertKind` member (adepthood#3646). It refuses a payload naming any kind it
+does not know with `400`, which Creek treats as an alert-delivery failure
+under R2-4 below. That failure repeats on every retry, so it keeps new
+activations refused, and holds back every other owed count, until the receiver
+admits the kind. A new kind therefore ships to Adepthood's receiver first, then
+to Creek: deploy a Creek build that can raise it only after the receiver admits
+it. `provider_credential_expiring` followed this order.
 
 Configure `/internal/vault-provisioning/alerts` on the approved Adepthood HTTPS
 origin with the existing mounted handoff bearer. The supervised process sends

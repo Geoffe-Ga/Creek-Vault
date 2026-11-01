@@ -816,7 +816,7 @@ def test_an_attestation_refusal_records_its_verdict_and_alert(
 
 
 def test_every_named_alert_is_in_the_closed_alert_set() -> None:
-    """adepthood's receiver list must be widened by exactly these names."""
+    """Every named alert is an ``AlertKind``, which adepthood's receiver mirrors."""
     assert set(OUTCOME_ALERTS.values()) <= {kind.value for kind in AlertKind}
 
 
