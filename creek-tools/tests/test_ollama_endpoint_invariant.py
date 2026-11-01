@@ -649,6 +649,40 @@ def test_a_proxy_free_boundary_client_passes() -> None:
     assert _boundary_violations(source) == []
 
 
+_ENCLAVE_DIALS: Final[tuple[str, ...]] = ("_fetch_attestation_quote", "call_enclave")
+"""The attested enclave's two dials, allowlisted above as non-Ollama (#1933)."""
+
+
+def _function_source(module: Path, name: str) -> str:
+    """Return the source of top-level function *name* in *module*, with imports."""
+    source = module.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imports = "".join(
+        f"{ast.get_source_segment(source, node)}\n"
+        for node in tree.body
+        if isinstance(node, ast.Import | ast.ImportFrom)
+    )
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return imports + (ast.get_source_segment(source, node) or "")
+    msg = f"{name} not found in {module.name}"
+    raise AssertionError(msg)
+
+
+@pytest.mark.parametrize("name", _ENCLAVE_DIALS)
+def test_the_enclave_dials_ignore_the_proxy_environment(name: str) -> None:
+    """#1933: rule 4 holds for the enclave too; its destination is not ambient.
+
+    Allowlisting a dial out of the Ollama rule says what it is *not*; it must
+    not also exempt it from being proxy-free. Each enclave dial builds an
+    explicit ``trust_env=False`` client with no proxy or mounts, so the
+    environment cannot redirect a prompt bound for the attested endpoint.
+    """
+    providers = _ROOT / "creek" / "classify" / "llm" / "providers.py"
+
+    assert _boundary_violations(_function_source(providers, name)) == []
+
+
 _POOL_MARKER = 'MODELS = "/v1/models"\n'
 
 

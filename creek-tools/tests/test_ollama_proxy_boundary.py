@@ -211,7 +211,7 @@ def test_ca_environment_is_mapped_like_httpx_trust_env(
 
     monkeypatch.setattr(local_boundary.ssl, "create_default_context", _record)
 
-    assert local_boundary._ollama_verify() is sentinel
+    assert local_boundary.environment_ca_trust() is sentinel
     assert seen == [expected]
 
 
@@ -224,4 +224,4 @@ def test_default_trust_is_httpx_certifi_without_ca_environment(
     for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
         monkeypatch.setenv(name, "")
 
-    assert local_boundary._ollama_verify() is True
+    assert local_boundary.environment_ca_trust() is True

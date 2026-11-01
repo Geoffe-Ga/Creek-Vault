@@ -1573,6 +1573,8 @@ A successful answer names the route that wrote it in `inference_source` —
 labels `/v1` publishes — and `creek.draft` stamps the same value into the saved
 draft's frontmatter (`inference_source:`). A refusal, a deterministic Writing
 Desk render and a route this vocabulary does not label carry none.
+`pool:attested:<vendor>` appears only behind a passing attestation gate, never
+for a vendor that is merely named in `CREEK_POOL_VENDOR` (#2040).
 
 **Which clients can send the headers.** Only a client that lets its user set
 custom request headers on a streamable-HTTP MCP server:

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Final
 import pytest
 
 from creek.classify.llm import pool_admission, pool_attestation, pool_embeddings
+from creek.classify.llm.consent import MANAGED_VAULT_ENV
 from creek.classify.llm.pool_admission import (
     DEFAULT_POOL_RATE_PER_HOUR,
     HOURLY_LIMIT,
@@ -94,6 +95,7 @@ from creek.config import LLMConfig
 from creek.models import PrivacyTier
 from creek_mcp import container_health
 from creek_mcp.container_health import ProbeStatus
+from creek_mcp.provenance import stage_inference_source
 from creek_mcp.provisioning.budget import AlertKind
 
 if TYPE_CHECKING:
@@ -938,3 +940,19 @@ def test_outside_sidecar_mode_the_closed_envelope_is_sent_unchanged(
     monkeypatch.delenv(POOL_VENDOR_ENV, raising=False)
     envelope: dict[str, object] = {"model": EMBED_MODEL, "input": ["x"], "tier": "open"}
     assert pool_embeddings._attested_payload(envelope, EMBED_MODEL, ["x"]) is envelope
+
+
+def test_a_managed_vault_answers_through_the_sidecar_labelled_attested(
+    sidecar: FakeSidecar, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2040: sidecar mode is the one route that earns ``pool:attested:``.
+
+    On a managed Machine — where a named vendor without this gate is refused
+    before any dial — the attested sidecar still answers, after its report,
+    and the stage is labelled with the sidecar vendor.
+    """
+    monkeypatch.setenv(MANAGED_VAULT_ENV, "1")
+
+    assert _generate().text == "a reflection"
+    assert sidecar.paths == [POOL_ATTESTATION_PATH, POOL_CHAT_COMPLETIONS_PATH]
+    assert stage_inference_source("pool") == "pool:attested:privatemode"

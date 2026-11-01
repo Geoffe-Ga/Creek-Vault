@@ -438,14 +438,22 @@ the classification response (which you read inside `JobStatusResponse.result`).
 Its value is the route that answered: `pool:creek`, `pool:attested:<vendor>`,
 `request_key:<vendor>` or `local`. Treat an answer whose route differs from the
 one you disclosed to the writer as a stale-route condition rather than a
-success. The field is **absent** rather than guessed in four cases, and they
+success. The field is **absent** rather than guessed in five cases, and they
 are one absence on the wire on purpose: your declared minor predates it; the
 route is an operator's own cloud key on a self-hosted vault, which this
 contract has no name for; the route is the attested GPU-confidential-compute
-enclave, which it also has no name for; or no model was called at all, which
-covers a `method=rules` classification and a repeat letter returned as stored.
-A label the server cannot stand behind would defeat the only thing the field
-is for.
+enclave, which it also has no name for; the route is a self-hosted vault's
+pool whose configured vendor no attestation gate covers (#2040); or no model
+was called at all, which covers a `method=rules` classification and a repeat
+letter returned as stored. A label the server cannot stand behind would defeat
+the only thing the field is for.
+
+`pool:attested:<vendor>` is published only when every content dial to that
+vendor's channel is gated, fail closed, on an attestation check — today that is
+the attesting Privatemode sidecar (`pool:attested:privatemode`, #1896) — and
+the vendor's name alone never earns it (#2040). A **managed** vault whose pool names a
+vendor that no gate covers sends nothing at all: the request is refused with
+the route's existing unavailable shape, so there is no answer to mislabel.
 
 The enclave is called out separately because it is the absence most likely to
 read as a bug. An enclave is *unreadable* — attestation is verified before any

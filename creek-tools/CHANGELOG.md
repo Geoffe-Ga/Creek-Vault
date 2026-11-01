@@ -9,6 +9,30 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Stop labelling unattested pool answers as attested, and stop letting the
+  environment choose where an enclave prompt goes (#2040, #1933).
+  `pool:attested:<vendor>` is now derived from the attestation path, never
+  from the `CREEK_POOL_VENDOR` name: `pool_boundary.attested_pool_vendor`
+  returns a vendor only in #1896's sidecar mode, the one mode in which every
+  content dial (generation and each embeddings batch) is preceded by the
+  sidecar's attestation report and refused, sending nothing, when it is off
+  the pin. Any other name, near-misses of `privatemode` included, earns no
+  `attested`. A **managed** vault naming any other vendor is
+  refused before any socket opens — listing, generation and embeddings alike —
+  because ADR-0016 admits only the Creek-run pool (`pool:creek`) or the
+  *attested* O5 pool there, and ADR-0018 item 5 sends no embedding by an
+  unattested route. A **self-hosted** vault keeps its operator's destination
+  and serves the answer with `inference_source` omitted, which contract 0.19
+  already allows; no wire value changes, so no contract minor moves and
+  adepthood (which parses and ignores the field) needs no change. Separately,
+  the attested enclave's two dials (`_fetch_attestation_quote`,
+  `call_enclave`) now build their `httpx` client with `trust_env=False`, so
+  `HTTPS_PROXY` / `ALL_PROXY` can no longer redirect them; CA trust from
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` is kept through the shared
+  `local_boundary.environment_ca_trust` (renamed from `_ollama_verify`). A
+  socket-spy test with the proxy variables set to a fake host proves the dial
+  still records only the enclave host, and a structural test holds both
+  enclave dials to the boundary's proxy-free rule.
 - Build the vault side of the attesting Privatemode pool (#1896, ADR-0016 O5).
   Not live yet: no fleet policy enables it until the owner finishes the steps
   in `docs/pool-measurement-pin.md` section 4a. With
