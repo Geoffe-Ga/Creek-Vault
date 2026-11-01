@@ -143,3 +143,29 @@ which is exactly why this is an owner decision and not one a lane could make.
   grounding field would be a contract minor and is left to the owner.
 - **Neutral**: ADR-0004 is otherwise unchanged; `EmbeddingsConfig.model`
   still selects among local models on a self-hosted vault.
+
+## Amendment (2026-11-01, #1904): the image carries the parquet stack
+
+The consequence "The image still lacks a parquet reader" is closed. The numpy
+and pyarrow pins moved out of `embeddings` into their own `embeddings-cache`
+extra (`embeddings` now pulls it in, so self-hosted installs are unchanged), and
+the root `Dockerfile` installs `embeddings-cache` — without the local model.
+`tests/test_container_image_contract.py` walks `uv.lock` from the image's
+extras and fails if `sentence-transformers`, `torch` or `transformers` is
+reachable, or if `numpy` or `pyarrow` is not.
+
+The bulk pass on a managed Machine therefore persists
+`00-Creek-Meta/embeddings.parquet` with the pool's `route`, `dimensions` and
+`similarity_threshold` on every row, so a warm vault sends the pool nothing for
+its unchanged fragments and a reflection embeds one short query instead of up to
+256 cache misses.
+
+The earlier text's "fails as it does today, having sent no text it could not
+keep" understated the cost: without pyarrow the pass embedded every cache miss
+through the pool and only then died in the cache writer, discarding vectors it
+had paid for. The bulk pass now checks for numpy and `pyarrow.parquet` before it
+embeds anything and, if either is missing, raises a `ModuleNotFoundError` naming
+the `embeddings-cache` extra, having spent nothing. Image size grows by roughly
+210 MB installed (pyarrow 24.0.0 about 149 MB, numpy 2.4.6 about 60 MB with its
+bundled libraries; about 65 MB of compressed wheels), against more than 1 GB for
+torch alone.

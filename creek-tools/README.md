@@ -26,7 +26,8 @@ Optional dependencies are imported lazily, so you only need to install the ones 
 | `.pptx`                | `python-pptx`                |
 | Image OCR              | `pytesseract`, `pdf2image`, system-level `tesseract` and `poppler` |
 | Google Drive           | `google-api-python-client`, `google-auth-oauthlib` |
-| Embeddings             | `sentence-transformers`      |
+| Embeddings — local model | `sentence-transformers` plus the cache stack below (the `[embeddings]` extra) |
+| Embeddings — cache / bulk link pass | `numpy`, `pyarrow` (the `[embeddings-cache]` extra; the managed image ships it without the local model) |
 | LLM classification — Anthropic | `anthropic` (the `[anthropic]` extra) |
 | LLM classification — OpenAI    | `openai` (the `[openai]` extra) |
 | LLM classification — Gemini    | `google-genai` (the `[gemini]` extra) |

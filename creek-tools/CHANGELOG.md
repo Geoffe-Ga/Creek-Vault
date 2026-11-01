@@ -9,6 +9,21 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Ship `numpy` and `pyarrow` in the managed vault image so the pool-route bulk
+  link pass behind `POST /v1/links` can compute resonances and persist
+  `00-Creek-Meta/embeddings.parquet` (#1904). Their pins (unchanged:
+  `numpy>=2.4.6,<2.5.0`, `pyarrow>=24.0.0,<25.0.0`) move from the
+  `embeddings` extra into a new `embeddings-cache` extra, which `embeddings`
+  and `all` pull in, so self-hosted installs resolve exactly as before; the
+  root `Dockerfile` installs `embeddings-cache` and still no local model. The
+  image contract test now walks `uv.lock` from the image's extras and fails if
+  `sentence-transformers`, `torch` or `transformers` is reachable or if
+  `numpy`/`pyarrow` is not. The bulk pass also checks for both modules before
+  embedding anything: previously, without pyarrow, it embedded every cache miss
+  through the pool and then died in the cache writer, discarding vectors it had
+  paid for; now it raises a `ModuleNotFoundError` naming the extra and spends
+  nothing. Estimated image growth: about 210 MB installed (about 65 MB of
+  wheels). ADR-0018 carries an amendment.
 - Publish `GET /v1/export`, the owner's paged export of their own vault-held
   content (contract `0.27.0`, #2033; the Creek half of adepthood#3579). It
   returns every staged upload and attachment as its original bytes (with a

@@ -491,7 +491,7 @@ class _BoundedExtra:
 #: the membership rather than trusting the parametrisation.
 _BOUNDED_EXTRAS: tuple[_BoundedExtra, ...] = (
     _BoundedExtra(
-        extra="embeddings",
+        extra="embeddings-cache",
         distribution="pyarrow",
         locked_floor=Version("24.0.0"),
         pre_bound_floor=Version("17.0.0"),
@@ -505,7 +505,7 @@ _BOUNDED_EXTRAS: tuple[_BoundedExtra, ...] = (
         ),
     ),
     _BoundedExtra(
-        extra="embeddings",
+        extra="embeddings-cache",
         distribution="numpy",
         locked_floor=Version("2.4.6"),
         pre_bound_floor=Version("2.4.4"),

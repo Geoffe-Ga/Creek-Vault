@@ -135,6 +135,9 @@ anthropic = ["anthropic>=0.125.0,<1.0.0"]
 openai = ["openai>=2.41.0,<3.0.0"]
 gemini = ["google-genai>=1.0"]
 embeddings = [
+    # The parquet cache and the similarity maths, split out below so the
+    # managed image can ship them without the local model (#1904).
+    "creek-tools[embeddings-cache]",
     # Model-format hold, not a CVE. sentence-transformers loads the
     # model that produces every vector in the embeddings cache, and
     # 6.0.0 published 2026-08-18 against an open `>=2.2.0`, so a bare
@@ -142,6 +145,17 @@ embeddings = [
     # the release uv.lock resolves; `<6.0.0` holds the major for the
     # vetting pass #1592 tracks.
     "sentence-transformers>=5.7.0,<6.0.0",
+]
+# What the bulk link pass needs *besides* a model: numpy for the
+# similarity maths and pyarrow for `00-Creek-Meta/embeddings.parquet`.
+# Its own extra because a managed vault embeds through the attested
+# pool (#1904, ADR-0018) and its image cannot hold sentence-transformers
+# and the torch stack under it, but without these two `POST /v1/links`
+# buys pool embeds and then dies on ModuleNotFoundError, and every
+# reflection re-embeds its cache misses live. The root Dockerfile
+# installs this extra; tests/test_container_image_contract.py asserts the
+# image gets both and none of the model stack.
+embeddings-cache = [
     # Interpreter-matrix hold, not a CVE. numpy 2.5.x declares
     # `requires-python >=3.12` while this project declares >=3.11, so an
     # unbounded floor makes the lock resolve *two* numpys — 2.4.6 for
@@ -205,7 +219,7 @@ gdrive = [
 all = [
     # Self-referential extras (pip >= 21.2). Adding a new sub-extra
     # automatically flows into [all] without manual duplication.
-    "creek-tools[anthropic,openai,gemini,embeddings,ocr,documents,spreadsheets,presentations,gdrive]",
+    "creek-tools[anthropic,openai,gemini,embeddings,embeddings-cache,ocr,documents,spreadsheets,presentations,gdrive]",
 ]
 dev = [
     # `tests/conftest.py` imports numpy, `tests/test_classify.py` mocks
