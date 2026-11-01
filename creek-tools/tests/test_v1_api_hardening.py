@@ -2650,11 +2650,15 @@ _READ_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
         "generation",
         "provisioning",
         "routing",
+        "vault_alerts",
         "voice_drafts",
         "wheel",
     }
 )
 """Modules serving at least one route that mutates no vault state.
+
+``vault_alerts`` (#2049) is in both sets: its summary only reads the owed-alert
+outbox, and its acknowledgement writes it.
 
 ``drive`` is in both sets on purpose: ``GET /v1/connectors/drive`` reports
 status, while the sync and disconnect routes beside it write.
@@ -2681,6 +2685,7 @@ _WRITE_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
         "pipeline",
         "provisioning",
         "upload",
+        "vault_alerts",
         "voice_drafts",
     }
 )

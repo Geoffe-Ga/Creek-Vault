@@ -71,6 +71,8 @@ _REPORT_KEYS = {
     "estimate",
     "review_triggers",
     "inventory_mode",
+    # #2049: vaults still owing alerts, or last not read, from the store.
+    "vault_alerts_owed",
 }
 
 
@@ -211,6 +213,7 @@ def test_report_prints_json_exits_three_on_alerts_and_never_repairs(
         "stopped_rootfs",
     ]
     assert document["inventory_mode"] == "derived"
+    assert document["vault_alerts_owed"] == []
     assert still_failed is not None
     assert still_failed.state is JobState.FAILED
     assert "fleet alert kind=orphan_resource subject=fake-orphan-000" in caplog.text

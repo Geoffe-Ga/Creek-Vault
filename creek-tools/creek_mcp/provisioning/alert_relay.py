@@ -21,6 +21,11 @@ unreachable alert endpoint ended routing for every vault.
 
 The gap and the owed counts are durable, so a restarted pilot keeps admission
 closed until those alerts are actually delivered.
+
+Vault-side alerts the fleet pass pulls (#2049) arrive through the same
+:meth:`AlertRelay.collect`.  A vault is acknowledged as soon as its alerts are
+owed here, so counts collected while a retry is deferred are persisted into
+the open gap at once rather than held only in memory until the next attempt.
 """
 
 from __future__ import annotations
@@ -127,6 +132,10 @@ class AlertRelay:
         if not batch:
             return
         if self._retry_at is not None and self._clock() < self._retry_at:
+            if batch != self._pending:
+                # A vault alert is acknowledged to its vault once it is owed
+                # here, so what is owed must survive a restart (#2049).
+                self._store.retain_pending_alerts(batch)
             self._pending = batch
             return
         try:

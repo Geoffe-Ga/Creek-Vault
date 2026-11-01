@@ -497,8 +497,8 @@ class AlertKind(StrEnum):
     PROVIDER_CREDENTIAL_REJECTED = "provider_credential_rejected"
     # The attesting pool, seen from one vault (ADR-0016 D1.12, #1896).  Each is
     # named in the vault's content-free ``creek.pool`` record by
-    # ``creek.classify.llm.pool_attested.OUTCOME_ALERTS``; registered so the
-    # receiver's closed list can admit them, not yet delivered by any path.
+    # ``creek.classify.llm.pool_attested.OUTCOME_ALERTS``, owed in the vault's
+    # outbox and pulled to the operator by the fleet pass (#2049).
     POOL_ATTESTATION_FAILED = "pool_attestation_failed"
     POOL_CREDENTIAL_REJECTED = "pool_credential_rejected"
     POOL_ADMISSION_REFUSED = "pool_admission_refused"

@@ -33,8 +33,15 @@ from creek_mcp.provisioning.pilot_supervisor import (
     PilotSupervisor,
     SupervisedComponent,
 )
+from creek_mcp.provisioning.production_secrets import ReadOnlyFlySecretManager
 from creek_mcp.provisioning.provider_auth import ProviderAuthState
 from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.vault_alert_pull import (
+    DeferredSecretReader,
+    FlyVaultAlertTargets,
+    HttpVaultAlertEndpoint,
+    VaultAlertCollector,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -110,12 +117,15 @@ class PilotBundle:
     alerts: HttpFleetAlertSink = field(repr=False)
     relay: AlertRelay = field(repr=False)
     provider_auth: ProviderAuthState = field(repr=False)
+    vault_alerts: HttpVaultAlertEndpoint | None = field(default=None, repr=False)
 
     def close(self) -> None:
         """Release provider, callback, and credential-state resources."""
         self.router.close()
         self.worker.close()
         self.alerts.close()
+        if self.vault_alerts is not None:
+            self.vault_alerts.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -335,6 +345,7 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
     worker: worker_cli.WorkerBundle | None = None
     router: routing_cli.ReplayRoutingBundle | None = None
     alerts: HttpFleetAlertSink | None = None
+    vault_endpoint: HttpVaultAlertEndpoint | None = None
     try:
         worker = worker_cli.compose(args, parser, fly_replay_enabled=True)
         router = routing_cli.compose_replay(args, parser)
@@ -345,6 +356,10 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
             alerts.deliver,
             backoff_seconds=args.fleet_interval_seconds,
         )
+        # #2049: each report pass pulls running vaults' owed alerts into the
+        # same relay, over the vaults' private 6PN listeners.
+        vault_endpoint = HttpVaultAlertEndpoint()
+        vault_alerts = _vault_alert_collector(args, vault_endpoint)
         if (
             args.shutdown_timeout_seconds >= _FLY_KILL_TIMEOUT_SECONDS
             or worker.minimum_claim_validity.total_seconds()
@@ -399,6 +414,7 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
                         relay,
                         provider_auth,
                         admission=admission,
+                        vaults=vault_alerts,
                     ),
                     ready=_all_admit(fleet_fresh, provider_auth),
                 ),
@@ -406,9 +422,18 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
         )
         health.bind(supervisor)
         return PilotBundle(
-            edge, supervisor, worker, router, alerts, relay, provider_auth
+            edge,
+            supervisor,
+            worker,
+            router,
+            alerts,
+            relay,
+            provider_auth,
+            vault_endpoint,
         )
     except BaseException:
+        if vault_endpoint is not None:
+            vault_endpoint.close()
         if alerts is not None:
             alerts.close()
         if router is not None:
@@ -416,6 +441,26 @@ def compose(args: argparse.Namespace, parser: argparse.ArgumentParser) -> PilotB
         if worker is not None:
             worker.close()
         raise
+
+
+def _vault_alert_collector(
+    args: argparse.Namespace,
+    endpoint: HttpVaultAlertEndpoint,
+) -> VaultAlertCollector:
+    """Compose the pull of owed vault alerts over the pilot's own records."""
+    store = ProvisioningStore(args.database)
+    records = DeferredSecretReader(
+        functools.partial(
+            ReadOnlyFlySecretManager,
+            args.secret_state_directory,
+            master_key_file=args.secret_master_key_file,
+        )
+    )
+    return VaultAlertCollector(
+        store,
+        endpoint,
+        FlyVaultAlertTargets(store, records, args.fly_app_prefix),
+    )
 
 
 def _all_admit(*probes: Callable[[], bool]) -> Callable[[], bool]:
@@ -467,12 +512,15 @@ def _run_scheduler(
     provider: ProviderAuthState | None = None,
     *,
     admission: ActivationAdmissionPolicy | None = None,
+    vaults: VaultAlertCollector | None = None,
 ) -> None:
     """Serialize reports and optional repairs on explicit bounded cadences.
 
     A report the provider refused for its credential is not fresh: it skips
     the repair and leaves health failed, but the loop keeps running (#1866).
     Only the reconcile pass repairs, so only it receives *admission* (#2019).
+    Only the report pass pulls owed vault alerts, so only it receives
+    *vaults* (#2049).
     """
     next_reconcile = (
         monotonic() + args.reconcile_interval_seconds
@@ -480,7 +528,7 @@ def _run_scheduler(
         else None
     )
     while not stop.is_set():
-        if _run_fleet_pass(args, "report", alerts, provider):
+        if _run_fleet_pass(args, "report", alerts, provider, vaults=vaults):
             next_reconcile = _reconcile_when_due(
                 args, next_reconcile, alerts, provider, admission
             )
@@ -514,6 +562,8 @@ def _run_fleet_pass(
     alerts: AlertRelay | None,
     provider: ProviderAuthState | None = None,
     admission: ActivationAdmissionPolicy | None = None,
+    *,
+    vaults: VaultAlertCollector | None = None,
 ) -> bool:
     """Run one provider pass and hand its alerts to the retaining relay.
 
@@ -523,6 +573,10 @@ def _run_fleet_pass(
     credential refusal degrades the same way when both the relay and the
     *provider* state are composed (#1866), and returns false; without them it
     stays a scheduler failure.
+
+    With *vaults*, a completed pass also pulls every running vault's owed
+    alerts into the relay before its flush, and acknowledges them to the
+    vaults only after it (#2049).
     """
     run = (
         fleet_cli.main
@@ -541,7 +595,8 @@ def _run_fleet_pass(
             alert_sink=alerts.collect,
         )
         degraded = _record_provider_auth(exit_code, alerts, provider)
-        alerts.flush()
+        observed = not degraded and exit_code in {_FLEET_CLEAN, _FLEET_ALERTS}
+        _flush(alerts, vaults if observed else None)
         if degraded:
             return False
     if exit_code == _FLEET_ALERTS and alerts is None:
@@ -549,6 +604,19 @@ def _run_fleet_pass(
     if exit_code not in {_FLEET_CLEAN, _FLEET_ALERTS}:
         raise RuntimeError(f"scheduled fleet {command} was not clean")
     return True
+
+
+def _flush(alerts: AlertRelay, vaults: VaultAlertCollector | None) -> None:
+    """Pull owed vault alerts into *alerts*, flush, then acknowledge them.
+
+    The order is the delivery guarantee: a vault stops owing an alert only
+    after the relay has delivered it or durably retained it for retry.
+    """
+    if vaults is not None:
+        vaults.collect(alerts.collect)
+    alerts.flush()
+    if vaults is not None:
+        vaults.commit()
 
 
 def _record_provider_auth(
