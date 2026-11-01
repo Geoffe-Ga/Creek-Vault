@@ -284,16 +284,21 @@ class TestProvenance:
         ]
 
     @pytest.mark.usefixtures("isolated")
-    def test_an_attesting_vendor_is_named_in_the_provenance(
+    def test_a_vendor_nothing_attests_is_served_unlabelled(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answering_pool: FakePool
     ) -> None:
-        """Under O5 the label carries the vendor the Machine environment names."""
+        """#2040: a name is not an attestation, so the receipt omits the field.
+
+        A self-hosted vault (no managed marker) whose operator names a vendor
+        with no attestation gate still gets its answer — the operator chose
+        the destination — but never a ``pool:attested:`` label.
+        """
         monkeypatch.setenv(POOL_VENDOR_ENV, "tinfoil")
 
         response = _reflect(_pool_vault(tmp_path))
 
         assert response.status_code == HTTP_OK, response.text
-        assert response.json()["inference_source"] == "pool:attested:tinfoil"
+        assert "inference_source" not in response.json()
         assert answering_pool.accepted > 0
 
     @pytest.mark.usefixtures("isolated")

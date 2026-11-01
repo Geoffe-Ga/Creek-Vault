@@ -16,8 +16,11 @@ against a design that is **selected but not yet built**.
   ADR 0009 amendment** to items 3 and 4 merges. That amendment merged on
   2026-10-21 ([adepthood#3485](https://github.com/Geoffe-Ga/adepthood/pull/3485));
   ADR-0016's own Status line has not yet been updated to say so. The attesting
-  client that O5 needs is not built
-  ([#1896](https://github.com/Geoffe-Ga/Creek-Vault/issues/1896), open), so
+  client that O5 needs is **built on the vault side but not yet live**
+  ([#1896](https://github.com/Geoffe-Ga/Creek-Vault/issues/1896), section 4a:
+  the sidecar launch, the attestation gate, the closed request shape and the
+  vault's own admission; the vendor proxy binary, its digest and the
+  attestation-report adapter are owner steps), so
   **O3 remains documented as the fallback design**, which is why the dormant O3
   runbook below is kept rather than deleted.
 - **The vendor is chosen: Privatemode, operated by Edgeless Systems GmbH from
@@ -79,7 +82,7 @@ that exit appears.
 | `schema_version` | Literal `1`. ADR-0016 leaves the #1855 schema unchanged | The schema |
 | `runtime_name` | The vendor runtime's name, exactly as its identity listing reports it | The identity digest below |
 | `runtime_version` | The exact version the listing reports, which is what the identity digest binds. **Not** the minimum admitted version — that is a separate review-gate record in section 2 ("Minimum runtime version admitted"). `_pinned_version` refuses a range expression or a floating tag, and `pool_identity` hashes this string verbatim into the digest that `pool_identity_matches` compares with `hmac.compare_digest`, so writing the minimum here mismatches and exits 33 for a pool correctly inside the pinned window | The identity digest below |
-| `runtime_digest` | The SHA-256 over the pinned measurement bundle (Decision 3.2) | **Nothing in the vault today.** The field's shape is validated; no code reads it. Its verification is the attesting client's, which is not built (#1896) |
+| `runtime_digest` | The SHA-256 over the pinned measurement bundle (Decision 3.2) | **Nothing in the vault today.** The field's shape is validated; no code reads it. Under the sidecar the admitted measurements are carried in `CREEK_POOL_MEASUREMENTS` instead (section 4a), and the measurement itself is verified inside the vendor's proxy — vendor-asserted |
 | `model_name` | The vendor's catalogue model id | The identity listing must offer it |
 | `runtime_inventory_digest` | The pool identity digest, defined below | `pool_identity_matches`, before every prompt |
 | `model_blob_sha256` | Required by the schema, which ADR-0016 leaves unchanged, so the operator still fills it. No vault-side check consumes it for a pool runtime: `verify_weights` runs where the weights are, which under O5 is inside the vendor's enclave and not ours to run | — |
@@ -122,6 +125,7 @@ pool-ready.
 | `pool-unreachable` | 31 | The listing did not answer usably |
 | `pool-model-missing` | 32 | The listing offers no such model |
 | `pool-identity-mismatch` | 33 | The listing implies a different identity digest |
+| `pool-attestation-failed` | 34 | Sidecar mode only: the sidecar's attestation report does not match the Machine's pin (section 4a). The listing is that report, so nothing is compared until it passes |
 
 Dial budgets, from `creek/classify/llm/pool_boundary.py`: connect 1 s, request
 12 s, no retries, no second destination, and a cancel handle that closes the
@@ -147,11 +151,13 @@ Record, per pin:
 
 ### Re-pin procedure
 
-*Steps 1-3 are the vendor's side plus this page's review gate, and have **no
-code in this repository today**: the minimum-version pin is a record in the
-table above, not an admission rule, and no dual-serve window exists — a vault
-admits exactly one `runtime_inventory_digest`, and there is no two-digest
-admission path anywhere in `creek/` or `creek_mcp/`. Only step 4 has code.*
+*Steps 1-2 are the vendor's side plus this page's review gate. Since #1896
+the sidecar's attestation gate enforces the minimum version
+(`CREEK_POOL_MIN_VERSION`) and admits **at most two** measurements
+(`CREEK_POOL_MEASUREMENTS`), which is step 3's window at the attestation layer
+(section 4a). The identity digest is still single: a vault admits exactly one
+`runtime_inventory_digest`, so a runtime *version* change remains a per-activation
+manifest roll (step 4).*
 
 1. **Observe the new measurement.** The vendor publishes a measurement under
    the pinned signing identity at or above the minimum version.
@@ -159,13 +165,13 @@ admission path anywhere in `creek/` or `creek_mcp/`. Only step 4 has code.*
    transparency-log entry, and — when condition (f) is ever satisfied — who
    rebuilt it from source. A measurement under a different signing identity is
    not a re-pin; it is a new pin and a new review.
-3. **Open the dual-serve window.** *Designed, not built.* The design is that
-   during a review-gated window both the old and the new measurement are
-   served, and anything outside that pair fails closed until the operator
-   re-pins. No code admits two digests: today a single digest either matches
-   or the vault refuses (exit 33 above), so in practice a re-pin is a
-   cutover, not a window, and the old measurement stops being served the
-   moment the manifest changes.
+3. **Open the dual-serve window.** Set the sidecar policy's `measurements`
+   to the pair (old, new) and converge (section 4a); anything outside that pair
+   fails closed (exit 34). Close it by setting the new one alone and
+   converging again. Because the pin is fleet policy, a Machine not yet
+   converged is held by routing as awaiting convergence until the operator's
+   batch reaches it — the T26 "a policy flip rejects nothing" property holds
+   for the per-activation bundle, **not** for this sidecar pin.
 4. **Roll per activation, never fleet-wide.** The identity lives in the
    activation's stored `PoolRuntimeBundle` (`bundle_version`, `pool_url`,
    `manifest_json`, credential — `creek_mcp/provisioning/pool_bundle.py`), and
@@ -405,20 +411,108 @@ kind list admits `pool_credential_orphan` (see Alerting above).
 
 An exhausted cap answers `insufficient_quota` (429, non-transient). The
 contract maps it to `temporarily_unavailable` so the vault refuses rather than
-spending on, because retrying cannot clear it — *designed, not built:* the
-mapping lives in the attesting provider
-([#1896](https://github.com/Geoffe-Ga/Creek-Vault/issues/1896), still open).
-**The vault's own pool path does not read the 429 body at all:**
-`_pool_status_error` is documented "no body is read" and collapses every 429 to
-`ProviderRateLimitError`, so it cannot tell a spent cap from admission
-pressure and the `temporarily_unavailable` mapping genuinely does not exist in
-production. The **bench** client classifies the two codes apart
+spending on, because retrying cannot clear it. **In sidecar mode this is
+built** (#1896): `creek.classify.llm.pool_attested` reads only a 429's error
+code, raises `PoolQuotaExhaustedError` for `insufficient_quota` (a plain
+refusal, so the route answers `temporarily_unavailable`) and
+`PoolVendorRateLimitedError` for any other 429 (`rate_limited`). The O3 path's
+`_pool_status_error` still reads no body and collapses every 429 to
+`ProviderRateLimitError`. The **bench** client classifies the two codes apart
 ([#1892](https://github.com/Geoffe-Ga/Creek-Vault/issues/1892)):
 `BenchPoolClient._refuse_admission` raises `PoolQuotaExhaustedError` on
 `insufficient_quota`, which is a member of the bench's closed `Outcome`
 vocabulary. That is measurement, not the refusal contract. A control plane that is down when a key
 expires leaves that vault `temporarily_unavailable` until it returns — fail
 closed, accepted.
+
+## 4a. The attesting sidecar (#1896)
+
+Privatemode ships its attesting client for Python callers as a proxy, so under
+O5 it runs as a **loopback sidecar** beside the vault: the vault dials only
+`http://127.0.0.1:<port>` (in this mode `pool_destination` refuses any other
+destination, `localhost` included), and the sidecar alone dials the vendor.
+
+### What runs where
+
+| Piece | Where | What enforces it |
+|---|---|---|
+| The proxy binary | `/opt/creek-pool-sidecar/privatemode-proxy` in the vault image | The replay bootstrap hashes it and starts it only when its SHA-256 equals `CREEK_POOL_SIDECAR_SHA256`; otherwise it records `binary_unpinned` and the pool fails closed |
+| The proxy's user | uid/gid `10002`, neither root nor the vault's `10001` | `start_pool_sidecar` |
+| The vendor key | `/run/secrets/creek_pool_key`, normalized to root `0400` in sidecar mode | The bootstrap reads it as root and hands it to the proxy in its environment only — never on its command line, which every user on the Machine can list. The vault's own user has no read access to the file |
+| The proxy's output | Discarded | Creek does not vouch that a vendor log line is content-free |
+| The pin | Machine `env`, from the fleet policy's `PoolSidecarPolicy` | `_verify_machine` compares `env` exactly, so a Machine missing the sidecar or pinned otherwise is held for the operator's converge |
+
+The pin's Machine environment keys: `CREEK_POOL_VENDOR=privatemode`,
+`CREEK_POOL_SIDECAR_IMAGE` (the vendor image, digest form only),
+`CREEK_POOL_SIDECAR_SHA256`, `CREEK_POOL_SIDECAR_PORT`, `CREEK_POOL_EGRESS`
+(one `host:port`, no IP literal), `CREEK_POOL_SIGNING_IDENTITY`,
+`CREEK_POOL_MIN_VERSION`, `CREEK_POOL_MEASUREMENTS` (one or two SHA-256) and
+`CREEK_POOL_RATE_PER_HOUR`. The activation's own `CREEK_POOL_URL` must be the
+sidecar's loopback address on that port.
+
+### Before every content dial
+
+1. **The closed request shape** (Decision 1 item 4). `intimate` and unknown
+   tiers, a client-chosen `model`, sampling, cache and adapter fields, unknown
+   fields, a prompt over 4,096 tokens, a body over 1 MiB and a `deadline_ms`
+   outside 1–12,000 are each refused with a content-free 4xx reason. No
+   cache-control field is sent.
+2. **Admission** (Decision 1 item 8): at most 2 generations in flight per
+   vault and 60 an hour by default, refused at once as `rate_limited`.
+3. **Attestation** (T18): the sidecar's report at `/creek/v1/attestation` must
+   say `verified`, over `attested_tls`, under the pinned signing identity, for
+   a pinned measurement, with a transparency-log entry, at or above the
+   minimum version, through the pinned egress. Anything else — or no report —
+   sends nothing.
+4. **The dial**: an OpenAI-compatible chat completion carrying the pinned
+   model, the messages and `max_tokens` only; the random request id in a
+   header is the only correlation key.
+
+**Embeddings are gated the same way** (ADR-0018). Each grounding batch reads
+the attestation report again immediately before it is sent, and a report off
+the pin sends no text: the pass ends ungrounded. A matching batch goes out as
+`model` and `input` only. The tier has already been enforced per item at the
+chokepoint, and the vendor has no field for it or for `deadline_ms`.
+
+### What is tested, and what is vendor-asserted
+
+The tests (`tests/test_pool_attested_sidecar.py`) drive every refusal above
+against a fake sidecar and prove nothing reaches the chat endpoint. They do
+**not** test the vendor's proxy. That its report is true — the hardware quote,
+the measurement, the Sigstore signature, the transparency-log inclusion, and
+the binding of the attested measurement to the live session key that
+substitutes for D05 (c) — is **vendor-asserted**, and (f) remains waived, not
+verified.
+
+### Owner steps before the sidecar is enabled
+
+Nothing below has been done; each is a human step with Geoff as the named owner
+(release decisions 2026-10-27, OPS). Until all are done no fleet policy sets
+`PoolSidecarPolicy`, so no vault is in sidecar mode.
+
+| Step | Why it is a human step |
+|---|---|
+| Choose the proxy image and record its digest (`image`), then build the vault image with the binary at the path above and record its SHA-256 (`binary_sha256`) | The vendor's registry and documentation were not reachable from the agent's container |
+| Confirm against that image: the listen-port flag (`--port` assumed), the key environment variable (`PRIVATEMODE_API_KEY` assumed), and that it listens on loopback only | Same. A wrong flag or variable fails closed; a proxy listening beyond loopback would let other machines on the organization's private network spend the key, so **loopback-only is a precondition, not a default** |
+| Serve the attestation report contract above from the proxy's verification result, natively or through a thin adapter | The proxy's own status surface is not documented here; until a sidecar answers `/creek/v1/attestation`, every pool request is refused |
+| Create one key per activation in the Privatemode portal (€10/month cost cap, 1-year expiry, per R4-1 and R4-3) and hand it to the control plane | Privatemode documents no key-management API. Activation status while the key is pending: the vault runs pool-free, so a reflection is refused, never routed elsewhere |
+| Delete that key in the portal at deletion | Same. The deletion receipt must not claim revocation until the owner confirms it |
+
+Wiring a `PoolBundleIssuer` that accepts the owner's per-activation key, the
+usage alert at €5 (R4-2, mechanism still an open owner decision) and delivery
+of the five vault-side alert kinds below to the control plane are not built.
+
+### Content-free telemetry and alert kinds
+
+Each pool call writes one JSON record to the `creek.pool` logger: `event`,
+`outcome`, `request_id`, `latency_ms`, and where they apply a closed `detail`
+(the attestation verdict, the admission limit or the closed-shape reason),
+`alert`, `input_tokens` and `output_tokens`. Five alert kinds are registered in
+`AlertKind` and named in those records — `pool_attestation_failed`,
+`pool_credential_rejected` (a vendor 401/403), `pool_admission_refused`,
+`pool_vendor_rate_limited` and `pool_quota_exhausted` — and **no path delivers
+them to the control plane yet**; adepthood's receiver list must admit them
+before one does.
 
 ## 5. The per-use label, and the standing bar
 

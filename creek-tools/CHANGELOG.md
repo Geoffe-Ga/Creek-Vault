@@ -24,6 +24,68 @@ to locate the originating commit for any reference below.
   paid for; now it raises a `ModuleNotFoundError` naming the extra and spends
   nothing. Estimated image growth: about 210 MB installed (about 65 MB of
   wheels). ADR-0018 carries an amendment.
+- Stop labelling unattested pool answers as attested, and stop letting the
+  environment choose where an enclave prompt goes (#2040, #1933).
+  `pool:attested:<vendor>` is now derived from the attestation path, never
+  from the `CREEK_POOL_VENDOR` name: `pool_boundary.attested_pool_vendor`
+  returns a vendor only in #1896's sidecar mode, the one mode in which every
+  content dial (generation and each embeddings batch) is preceded by the
+  sidecar's attestation report and refused, sending nothing, when it is off
+  the pin. Any other name, near-misses of `privatemode` included, earns no
+  `attested`. A **managed** vault naming any other vendor is
+  refused before any socket opens — listing, generation and embeddings alike —
+  because ADR-0016 admits only the Creek-run pool (`pool:creek`) or the
+  *attested* O5 pool there, and ADR-0018 item 5 sends no embedding by an
+  unattested route. A **self-hosted** vault keeps its operator's destination
+  and serves the answer with `inference_source` omitted, which contract 0.19
+  already allows; no wire value changes, so no contract minor moves and
+  adepthood (which parses and ignores the field) needs no change. Separately,
+  the attested enclave's two dials (`_fetch_attestation_quote`,
+  `call_enclave`) now build their `httpx` client with `trust_env=False`, so
+  `HTTPS_PROXY` / `ALL_PROXY` can no longer redirect them; CA trust from
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` is kept through the shared
+  `local_boundary.environment_ca_trust` (renamed from `_ollama_verify`). A
+  socket-spy test with the proxy variables set to a fake host proves the dial
+  still records only the enclave host, and a structural test holds both
+  enclave dials to the boundary's proxy-free rule.
+- Build the vault side of the attesting Privatemode pool (#1896, ADR-0016 O5).
+  Not live yet: no fleet policy enables it until the owner finishes the steps
+  in `docs/pool-measurement-pin.md` section 4a. With
+  `CREEK_POOL_VENDOR=privatemode` the vault dials only a loopback sidecar (and
+  refuses any other `CREEK_POOL_URL`, `localhost` included). Before every
+  content dial it validates the closed request shape (content-free 4xx reasons
+  for `intimate` or unknown tiers, a client-chosen model, sampling, cache and
+  adapter fields, unknown fields, a prompt over 4,096 tokens, a body over
+  1 MiB, and a `deadline_ms` over 12,000). It then applies its own admission
+  (2 in flight, 60 an hour by default via `CREEK_POOL_RATE_PER_HOUR`, refused
+  at once as `rate_limited`) and requires the sidecar's attestation report at
+  `/creek/v1/attestation` to match the Machine's pin (signing identity,
+  minimum version, one or two measurements, a transparency-log entry, an
+  attested channel and the single egress). Anything else sends nothing. The
+  closed shape is translated to an OpenAI-compatible chat completion with no
+  cache-control or sampling field. A vendor 401/403 is a refusal; a 429
+  `insufficient_quota` is non-transient and answers `temporarily_unavailable`;
+  any other 429 is `rate_limited`. Pool embeddings (#1904, ADR-0018) are gated
+  the same way: every grounding batch re-reads the report before it is sent
+  and goes out as `model` and `input` only. On the control-plane side, the new
+  `FlyProviderPolicy.pool_sidecar` (`PoolSidecarPolicy`) holds the
+  operator-filled pin. The vendor image is accepted in digest form only, the
+  policy requires the replay runtime, and the pin reaches the Machine `env` of
+  every pool-bundle activation, so `_verify_machine` refuses a Machine without
+  the sidecar or with a different pin and the converge batch can roll vaults
+  onto it. The replay bootstrap starts the proxy only when its binary hash
+  matches the pin, as uid `10002`, with the key in its environment, never in
+  its argv. In this mode it keeps the key file root-only, so the vault user
+  has no read access to it. `--check pool` gains `pool-attestation-failed`
+  (exit 34), and the identity listing in sidecar mode is the verified report.
+  Five alert kinds are registered for adepthood's `_FleetAlertKind` and named
+  in the content-free `creek.pool` records: `pool_attestation_failed`,
+  `pool_credential_rejected`, `pool_admission_refused`,
+  `pool_vendor_rate_limited` and `pool_quota_exhausted`. No delivery path
+  sends them yet. That the attestation report is true is vendor-asserted:
+  condition (f) is waived, not verified. T4 and T24 are not applicable under
+  O5.
+
 - Publish `GET /v1/export`, the owner's paged export of their own vault-held
   content (contract `0.27.0`, #2033; the Creek half of adepthood#3579). It
   returns every staged upload and attachment as its original bytes (with a

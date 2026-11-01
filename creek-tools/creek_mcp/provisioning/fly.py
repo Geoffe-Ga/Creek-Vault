@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek_mcp.provisioning.models import ProvisioningJob
+    from creek_mcp.provisioning.pool_sidecar import PoolSidecarPolicy
 
 _ALLOCATION_DIGEST_LENGTH: Final[int] = 24
 _MAX_TOKEN_FILE_BYTES: Final[int] = 16 * 1024
@@ -303,6 +304,7 @@ class FlyProviderPolicy:
     readiness_timeout_seconds: int = _DEFAULT_READINESS_TIMEOUT_SECONDS
     discover_organization_apps: bool = False
     fly_replay_enabled: bool = False
+    pool_sidecar: PoolSidecarPolicy | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration before any provider request is possible."""
@@ -340,6 +342,10 @@ class FlyProviderPolicy:
             raise ValueError("Fly replay flag must be boolean")
         if self.routing_public_url is not None:
             _validate_public_route_url(self.routing_public_url)
+        if self.pool_sidecar is not None and not self.fly_replay_enabled:
+            # Only the replay runtime's root bootstrap can launch the sidecar
+            # and keep its key from the vault's user (#1896).
+            raise ValueError("the pool sidecar requires the Fly replay runtime")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1317,6 +1323,11 @@ class FlyProviderDriver:
             if runtime_secrets.pool is None
             else pool_runtime_env(runtime_secrets.pool)
         )
+        if runtime_secrets.pool is not None and self._policy.pool_sidecar is not None:
+            # The attesting sidecar and its pin (#1896): present exactly when
+            # this activation has a pool bundle, so ``_verify_machine`` checks
+            # it is there and pinned, and a pool-free vault is unaffected.
+            stored = {**stored, **self._policy.pool_sidecar.runtime_env()}
         if runtime_secrets.mcp_oauth is not None:
             stored = {**stored, **runtime_secrets.mcp_oauth.runtime_env()}
         if not self._policy.fly_replay_enabled:

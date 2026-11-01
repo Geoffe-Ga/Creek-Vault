@@ -81,9 +81,9 @@ _INTIMATE_TITLE: Final[str] = "intimate-title-1904-route-sentinel"
 _PARQUET_SENTINEL: Final[str] = "parquet-sentinel-1904-never-on-the-wire"
 
 _CONFIG_SUBPATH: Final[tuple[str, ...]] = ("00-Creek-Meta", "creek_config.yaml")
-_VENDOR: Final[str] = "privatemode"
 
 HTTP_OK: Final[int] = 200
+HTTP_UNAVAILABLE: Final[int] = 503
 
 
 def _write_fragment(vault: Path, frag_id: str, title: str, tier: str) -> None:
@@ -130,12 +130,15 @@ def _vault(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def managed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A managed Machine, pool vendor named, generation and embedding pinned."""
+    """A managed Machine on the O3 pool, generation and embedding pinned."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("CREEK_CONFIG", raising=False)
     monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
     monkeypatch.setenv(MANAGED_VAULT_ENV, "1")
-    monkeypatch.setenv(POOL_VENDOR_ENV, _VENDOR)
+    # The Creek-shaped fake pool is the O3 pool, which names no vendor. A
+    # named vendor is either the attested sidecar (its own suite) or refused
+    # on a managed Machine (#2040, the class at the end of this module).
+    monkeypatch.delenv(POOL_VENDOR_ENV, raising=False)
     pin_pool_manifest(tmp_path, monkeypatch, embedding=embedding_pin())
 
 
@@ -197,7 +200,7 @@ class TestPoolGroundedReflection:
         response = _reflect(_vault(tmp_path))
 
         assert response.status_code == HTTP_OK, response.text
-        assert response.json()["inference_source"] == f"pool:attested:{_VENDOR}"
+        assert response.json()["inference_source"] == "pool:creek"
         paths = _paths(pool)
         assert "/v1/embeddings" in paths
         assert paths.index("/v1/embeddings") < paths.index("/v1/generate")
@@ -312,3 +315,41 @@ def test_the_bulk_pass_persists_pool_vectors_and_sends_no_intimate_title(
     assert {row["dimensions"] for row in rows} == {PINNED_EMBED_DIMENSIONS}
     # A local linker reading the same parquet sees none of it.
     assert pooled.load_cache(embeddings_cache_path(vault)) == {}
+
+
+_UNGATED_VENDOR: Final[str] = "example-unattested-vendor"
+"""A synthetic vendor name no attestation gate covers (#2040)."""
+
+
+@pytest.fixture
+def ungated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A managed Machine whose pool vendor is named but attested by nothing."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    monkeypatch.setenv(LOOPBACK_ONLY_ENV, "1")
+    monkeypatch.setenv(MANAGED_VAULT_ENV, "1")
+    monkeypatch.setenv(POOL_VENDOR_ENV, _UNGATED_VENDOR)
+    pin_pool_manifest(tmp_path, monkeypatch, embedding=embedding_pin())
+
+
+@pytest.mark.usefixtures("ungated")
+class TestAnUngatedVendorOnAManagedVault:
+    """#2040, R4 "failed attestation/pins send no content": nothing is sent."""
+
+    def test_the_reflection_is_refused_and_the_pool_hears_nothing(
+        self, tmp_path: Path, pool: EmbeddingPool
+    ) -> None:
+        """No listing, no embeddings, no generation — and no label to be false."""
+        response = _reflect(_vault(tmp_path))
+
+        assert response.status_code == HTTP_UNAVAILABLE, response.text
+        assert "inference_source" not in response.json()
+        assert pool.requests == []
+
+    def test_the_bulk_pass_sends_no_title(
+        self, tmp_path: Path, pool: EmbeddingPool
+    ) -> None:
+        """The link-time embeddings pass is refused the same way, before a dial."""
+        link_tool(vault_path=_vault(tmp_path), method="embeddings")
+
+        assert pool.requests == []

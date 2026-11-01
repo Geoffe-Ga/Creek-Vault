@@ -60,7 +60,7 @@ _PROXY_ENV: Final[tuple[str, ...]] = (
     "ALL_PROXY",
     "all_proxy",
 )
-"""Proxy variables ``httpx`` reads, cleared so a dial records its true host."""
+"""Proxy variables a trusting ``httpx`` client would read (#1933)."""
 
 _UNSET: Final[object] = object()
 """Sentinel: serve the builder's well-formed default JSON body."""
@@ -191,9 +191,8 @@ def test_the_enclave_prompt_dial_leaves_the_device() -> None:
         patch(_VERIFY_TARGET, return_value=None),
         pytest.MonkeyPatch.context() as patcher,
     ):
-        # ``call_enclave`` builds a plain ``httpx.Client``, which honours the
-        # ambient proxy variables; a developer machine behind one would record
-        # the proxy's address instead of the enclave's.
+        # Cleared for a hermetic baseline; that the dial ignores them when
+        # set is pinned by the ambient-proxy test below (#1933).
         for variable in _PROXY_ENV:
             patcher.delenv(variable, raising=False)
         spy = SocketSpy(patcher)
@@ -202,6 +201,71 @@ def test_the_enclave_prompt_dial_leaves_the_device() -> None:
 
     assert spy.destinations == [("enclave.internal", 8443)]
     assert spy.hosts != ["127.0.0.1"]
+
+
+_FAKE_PROXY: Final[str] = "http://proxy.invalid:3128"
+"""An obviously fake proxy; a dial aimed at it would show up in the spy."""
+
+
+def _enclave_dials(
+    patcher: pytest.MonkeyPatch, *, proxied: bool
+) -> tuple[list[tuple[str, int]], list[str]]:
+    """Run one attested completion against a socket spy; return what it saw.
+
+    Both enclave dials are exercised — the attestation-quote fetch and, with
+    the gate stubbed, the generate call — so neither can inherit a proxy.
+
+    Args:
+        patcher: Scope for the environment and the spy.
+        proxied: Whether every proxy variable points at :data:`_FAKE_PROXY`.
+
+    Returns:
+        The destinations attempted, then every refusal message raised.
+    """
+    for variable in _PROXY_ENV:
+        if proxied:
+            patcher.setenv(variable, _FAKE_PROXY)
+        else:
+            patcher.delenv(variable, raising=False)
+    spy = SocketSpy(patcher)
+    messages: list[str] = []
+    with pytest.raises(EnclaveAttestationError) as attest:
+        build_provider(_config()).complete("a prompt that must not go far")
+    messages.append(str(attest.value))
+    with (
+        patch(_VERIFY_TARGET, return_value=None),
+        pytest.raises(httpx.HTTPError) as generate,
+    ):
+        build_provider(_config()).complete("a prompt that must not go far")
+    messages.append(str(generate.value))
+    return spy.destinations, messages
+
+
+def test_an_ambient_proxy_does_not_move_the_enclave_dials(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#1933: the environment cannot choose where an enclave prompt goes.
+
+    The destination is part of the security argument — the vault must be able
+    to say the prompt reached *the attested endpoint*, not merely some TLS
+    endpoint — so with every proxy variable set to a fake host the spy must
+    still record only the configured enclave host. The negative control
+    (variables unset) records the identical destinations, so this proves the
+    property rather than the absence of a proxy; and no refusal or log line
+    names the proxy.
+    """
+    recorded: list[list[tuple[str, int]]] = []
+    for proxied in (True, False):
+        with pytest.MonkeyPatch.context() as patcher:
+            destinations, messages = _enclave_dials(patcher, proxied=proxied)
+        recorded.append(destinations)
+        for message in messages:
+            assert "proxy.invalid" not in message
+            assert "enclave.internal" not in message
+
+    expected = [("enclave.internal", 8443), ("enclave.internal", 8443)]
+    assert recorded == [expected, expected]
+    assert "proxy.invalid" not in caplog.text
 
 
 def test_cloud_providers_remain_cloud() -> None:
