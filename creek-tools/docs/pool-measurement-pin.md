@@ -498,9 +498,11 @@ Nothing below has been done; each is a human step with Geoff as the named owner
 | Create one key per activation in the Privatemode portal (€10/month cost cap, 1-year expiry, per R4-1 and R4-3) and hand it to the control plane | Privatemode documents no key-management API. Activation status while the key is pending: the vault runs pool-free, so a reflection is refused, never routed elsewhere |
 | Delete that key in the portal at deletion | Same. The deletion receipt must not claim revocation until the owner confirms it |
 
-Wiring a `PoolBundleIssuer` that accepts the owner's per-activation key, the
-usage alert at €5 (R4-2, mechanism still an open owner decision) and delivery
-of the five vault-side alert kinds below to the control plane are not built.
+Wiring a `PoolBundleIssuer` that accepts the owner's per-activation key, and
+delivery of the vault-side alert kinds below to the control plane, are not
+built. The usage alert at €5 (R4-2) is built as local metering (below); until
+an operator pins the vendor's prices it reports tokens only and raises no
+alert.
 
 ### Content-free telemetry and alert kinds
 
@@ -513,6 +515,126 @@ Each pool call writes one JSON record to the `creek.pool` logger: `event`,
 `pool_vendor_rate_limited` and `pool_quota_exhausted` — and **no path delivers
 them to the control plane yet**; adepthood's receiver list must admit them
 before one does.
+
+### Spend metering and the €5 alert (R4-2, #2007)
+
+Privatemode sends no usage alert of its own, and no vendor usage API is read.
+The owner's decision on 2026-11-01 (on
+[#2007](https://github.com/Geoffe-Ga/Creek-Vault/issues/2007)) is to **meter
+locally**: count the tokens Creek sends through the pool, price them at the
+vendor's documented rate, and alert at €5, half of the key's €10 monthly cap
+(R4-1, R4-2).
+
+**What is counted.** Every generation and embeddings call passes through
+`creek/classify/llm/pool_boundary.py`, which hands it to
+`creek/classify/llm/pool_meter.py`. The meter is vendor-neutral: it reads the
+OpenAI-compatible `usage` block (`prompt_tokens` and `completion_tokens`; an
+embeddings answer reports `prompt_tokens`, booked as embedding tokens) and
+books it to the vendor the Machine environment names (`CREEK_POOL_VENDOR`, or
+`creek` for the Creek-run pool) and the model the request named.
+
+- A reported count is taken as reported.
+- An answer with no usable count is **estimated from bytes**, one token per
+  byte of the compact JSON request or answer. A byte-level BPE token covers
+  at least one byte, so that is a ceiling, not a guess. The call is counted
+  in `estimated_calls`.
+- A dial that sent its body but got no answer, for example cancelled at the
+  deadline, may still be billed. It is counted as an estimate: the request's
+  byte bound plus its `max_tokens`, or 1,024 completion tokens when it named
+  none.
+- A vendor refusal (any non-200 answer) bills nothing and is not counted. A
+  dial that never connected sent nothing and is not counted. The identity
+  listing and the attestation report are not content calls and are not counted.
+
+Every prompt token is priced at the full prompt rate, even where the vendor
+publishes a cheaper cached-input rate. The vault sends no cache field, and
+over-counting is the safe direction for a brake.
+
+**Where it lives.** One ledger per vault, at
+`00-Creek-Meta/pool/spend-ledger.json` on the vault's own volume, so each
+activation key has its own count. It is written atomically under a
+cross-process lock and survives a restart. It holds only the UTC calendar month,
+per-vendor and per-model token and call counts, and the month's alert latch.
+It never holds a prompt, an answer, a request id or a key. The first call
+of a new UTC month starts the count at zero and re-arms the alert. A ledger
+that cannot be read is reported as `ledger-unreadable` and left in place. It
+is never reset to zero. The vendor's own reset boundary is not documented
+here, so near the turn of a month the two counts can differ.
+
+A whole-vault purge sweeps this ledger with the rest of `00-Creek-Meta/`. A
+purge in mid-month therefore restarts the local count. The vendor's cap is
+unaffected.
+
+**Pinning prices.** Prices are configuration, not code. They live in
+`creek/classify/llm/pool_prices.json`, which ships in the image. Change it in a
+reviewed PR, never on a Machine. The shipped Privatemode entry reads
+`"status": "operator_must_fill"` with no models: this change was written
+without access to the vendor's published prices, so none was entered. To pin
+them, read the vendor's current price page and replace the entry:
+
+```json
+"privatemode": {
+  "status": "pinned",
+  "currency": "EUR",
+  "source_url": "https://<the vendor's price page>",
+  "read_on": "<the date you read it, YYYY-MM-DD>",
+  "monthly_cap": "10.00",
+  "alert_fraction": "0.5",
+  "models": {
+    "<pinned chat model id>": {
+      "prompt_per_million": "<EUR per 1M prompt tokens>",
+      "completion_per_million": "<EUR per 1M completion tokens>",
+      "cached_prompt_per_million": "<EUR, if the vendor lists one, else omit>"
+    },
+    "<pinned embedding model id>": {
+      "embedding_per_million": "<EUR per 1M embedded tokens>"
+    }
+  }
+}
+```
+
+Each model the vault dials needs an entry, keyed by the exact model id it
+sends. A pinned entry without `source_url` (https only), `read_on` or at least
+one model is refused, and so is an `operator_must_fill` entry that lists
+models. Amounts are exact decimals. `monthly_cap` and `alert_fraction` default
+to €10 and 0.5 when omitted. Moving to another vendor means adding that
+vendor's entry, under the id `CREEK_POOL_VENDOR` names. No code changes.
+
+**Reading spend.** `python -m creek_mcp.container_health --check pool` prints its state line
+and then one `pool-spend` line per vendor metered this month. The exit code is
+still the probe's own. For example:
+
+```text
+pool-ready
+pool-spend vendor=privatemode month=2026-11 state=price-unpinned prompt_tokens=48210 completion_tokens=9120 embedding_tokens=301442 calls=212 estimated_calls=0
+```
+
+Once prices are pinned, the line ends with
+`spend=<EUR, rounded up> threshold=5.00 cap=10.00 currency=EUR`. A vault that
+has not dialled this month prints `pool-spend month=<month> state=no-usage`.
+
+| State | Means |
+|---|---|
+| `no-usage` | No pool call has been metered this UTC month |
+| `under-threshold` | Priced, and below `monthly_cap × alert_fraction` |
+| `threshold-reached` | Priced, and at or above that line; the month's alert has been raised |
+| `price-unpinned` | Tokens only. The vendor, one of its models, or one counted direction has no pinned price. No € figure and no alert |
+| `price-table-invalid` | The shipped table failed validation; no € figure and no alert |
+| `ledger-unreadable` | The ledger exists but cannot be read; it is not overwritten |
+
+**The alert.** The first metered call that takes the month's spend to at least
+`monthly_cap × alert_fraction` (€5.00 by default, compared exactly) writes one
+`creek.pool` record:
+`{"event": "pool_spend", "alert": "monthly_budget_departure", "component": "pool", "vendor": ..., "month": ..., "spend": ..., "threshold": ..., "cap": ..., "currency": ...}`.
+That happens once per month per vault, and the latch in the ledger means a
+restart does not repeat it. The kind is the existing `monthly_budget_departure`, which adepthood's
+receiver already admits, so no receiver change is needed. `component: "pool"`
+distinguishes it from the fleet's Fly budget. Like the five kinds above, it is
+**named in the vault's log and not yet delivered to the control plane**. Until
+it is, watch the vault's log stream or run `--check pool`. While prices are
+unpinned the meter writes one `{"event": "pool_spend", "status":
+"price_unpinned"}` record per process instead. A ledger write that fails is
+logged as `meter_unavailable` and never fails the reflection.
 
 ## 5. The per-use label, and the standing bar
 
@@ -642,6 +764,7 @@ with the vendor's documentation.
 - Owner ratification and the sub-issue cut table: comments on
   [#1849](https://github.com/Geoffe-Ga/Creek-Vault/issues/1849).
 - Code this page quotes: `creek/classify/llm/pool_boundary.py`,
+  `creek/classify/llm/pool_meter.py`, `creek/classify/llm/pool_prices.py`,
   `creek/classify/llm/providers.py` (`POOL_IDENTITY_SCHEME`,
   `pool_identity_digest`, `pool_identity_matches`, `PoolProvider`),
   `creek_mcp/model_pin.py`, `creek_mcp/model_package.py`,

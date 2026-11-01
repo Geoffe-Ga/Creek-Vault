@@ -25,6 +25,7 @@ from creek.models import Fragment, FragmentSource, SourcePlatform
 from tests.helpers import write_fragment_file as _write_fragment
 
 if TYPE_CHECKING:
+    from datetime import datetime, timedelta
     from pathlib import Path
 
 
@@ -93,7 +94,6 @@ def test_classified_at_is_la_tz_aware(tmp_path: Path) -> None:
     timestamps elsewhere in the pipeline. Pin the contract.
     """
     from datetime import datetime
-    from zoneinfo import ZoneInfo
 
     vault = tmp_path / "vault"
     fragment = Fragment(
@@ -119,8 +119,39 @@ def test_classified_at_is_la_tz_aware(tmp_path: Path) -> None:
     assert isinstance(classified_at, str)
     parsed = datetime.fromisoformat(classified_at)
     assert parsed.tzinfo is not None
-    la_offset = ZoneInfo("America/Los_Angeles").utcoffset(parsed)
-    assert parsed.utcoffset() == la_offset
+    assert parsed.utcoffset() == _la_offset_at(parsed)
+
+
+def _la_offset_at(stamp: datetime) -> timedelta | None:
+    """Return LA's UTC offset at the instant *stamp* names (#2053).
+
+    ``ZoneInfo.utcoffset(stamp)`` reads only the wall time, so during the
+    fall-back hour it resolves the ambiguous time to daylight time even when
+    the stamp is standard time. Converting the instant itself is exact.
+    """
+    from zoneinfo import ZoneInfo
+
+    return stamp.astimezone(ZoneInfo("America/Los_Angeles")).utcoffset()
+
+
+@pytest.mark.parametrize(
+    ("stamp", "expected_hours"),
+    [
+        ("2026-11-01T01:30:00-07:00", -7),  # fall-back hour, first pass (PDT)
+        ("2026-11-01T01:30:00-08:00", -8),  # fall-back hour, second pass (PST)
+        ("2026-03-08T03:30:00-07:00", -7),  # just after the spring-forward gap
+        ("2026-03-08T01:30:00-08:00", -8),  # just before the spring-forward gap
+    ],
+)
+def test_la_offset_is_read_from_the_instant_not_the_wall_time(
+    stamp: str, expected_hours: int
+) -> None:
+    """A correctly stamped LA time matches LA's offset across DST edges (#2053)."""
+    from datetime import datetime, timedelta
+
+    parsed = datetime.fromisoformat(stamp)
+    assert _la_offset_at(parsed) == timedelta(hours=expected_hours)
+    assert parsed.utcoffset() == _la_offset_at(parsed)
 
 
 def test_run_classify_preserves_manual_without_force(tmp_path: Path) -> None:

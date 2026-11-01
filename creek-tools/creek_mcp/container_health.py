@@ -14,6 +14,12 @@ identity listing (ADR-0016 Decision 1 item 9). Attestation of the pinned
 measurement set is the attesting client's own cached verification and lands
 with that provider; this probe reports the identity half.
 
+``--check pool`` also prints the vault's month-to-date pool spend after its
+state line (#2007): one content-free ``pool-spend`` line per vendor metered
+this UTC month — tokens, and the euro figure only once the operator has pinned
+prices. It reads the ledger on the vault's volume and writes nothing, and it
+never changes the exit code: spend is reported, not a readiness failure.
+
 The image healthcheck keeps probing ``ready``, so neither a missing model nor
 an unreachable pool ever marks the vault API unhealthy: storage-ready implies
 neither model-ready nor pool-ready, and ``ready`` never consults the pool.
@@ -45,6 +51,7 @@ from creek.classify.llm.pool_boundary import (
     pool_response_ok,
     pool_url_configured,
 )
+from creek.classify.llm.pool_meter import PoolSpendMeter
 from creek.classify.llm.providers import (
     call_ollama,
     ollama_digest_matches,
@@ -365,15 +372,23 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Print one content-free state and exit with its stable code."""
+    """Print one content-free state and exit with its stable code.
+
+    ``--check pool`` follows the state with the month's ``pool-spend`` lines
+    (#2007); they never change the exit code.
+    """
     args = _parser().parse_args(argv)
     target = ProbeTarget(args.check)
+    settings: ContainerSettings | None = None
     try:
         settings = ContainerSettings.from_environ()
         result = probe(settings, target)
     except ContainerConfigurationError:
         result = ProbeResult(_UNAVAILABLE[target])
     print(result.status.value)
+    if target is ProbeTarget.POOL and settings is not None:
+        for spend in PoolSpendMeter(settings.vault_path).report():
+            print(spend.summary_line())
     raise SystemExit(result.exit_code)
 
 
