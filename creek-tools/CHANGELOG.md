@@ -9,6 +9,18 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- ADR-0015 amendment (2026-11-01, adepthood#3578, owner decision R1-1): for an
+  account that has not enrolled in user-held keys, a writer's request key may
+  now come from adepthood's encrypted store. Adepthood's background
+  classification submits (retries, queued successors, restart recovery) send
+  the same `X-Creek-Provider` / `X-Creek-Provider-Key` headers to the same
+  `POST /v1/classifications`, gated by `request_key_providers` as before.
+  Creek's custody is unchanged: it holds the key for one request and keeps
+  nothing. A job reclaimed after a restart still has no key. It lands `failed`
+  with no `failure_code`, and is re-keyed only by adepthood re-admitting it.
+  The new test
+  `test_a_keyed_job_lost_to_a_restart_keeps_no_key_and_is_readmitted_keyed`
+  pins this. No runtime code changed.
 - Ship `numpy` and `pyarrow` in the managed vault image so the pool-route bulk
   link pass behind `POST /v1/links` can compute resonances and persist
   `00-Creek-Meta/embeddings.parquet` (#1904). Their pins (unchanged:
