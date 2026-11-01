@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
-from creek.classify.llm import pool_admission
+from creek.classify.llm import pool_admission, pool_attestation, pool_embeddings
 from creek.classify.llm.pool_admission import (
     DEFAULT_POOL_RATE_PER_HOUR,
     HOURLY_LIMIT,
@@ -72,6 +72,7 @@ from creek.classify.llm.pool_attested import (
 from creek.classify.llm.pool_boundary import (
     POOL_ATTESTATION_PATH,
     POOL_CHAT_COMPLETIONS_PATH,
+    POOL_EMBEDDINGS_PATH,
     POOL_MAX_REQUEST_BYTES,
     POOL_PROMPT_CHARS_PER_TOKEN,
     POOL_PROMPT_TOKEN_CAP,
@@ -82,6 +83,7 @@ from creek.classify.llm.pool_boundary import (
     declared_pool_request,
     pool_destination,
 )
+from creek.classify.llm.pool_embeddings import PoolEmbedder, PoolEmbeddingPin
 from creek.classify.llm.providers import (
     PoolProvider,
     ProviderRateLimitError,
@@ -89,6 +91,7 @@ from creek.classify.llm.providers import (
     pool_identity_digest,
 )
 from creek.config import LLMConfig
+from creek.models import PrivacyTier
 from creek_mcp import container_health
 from creek_mcp.container_health import ProbeStatus
 from creek_mcp.provisioning.budget import AlertKind
@@ -813,3 +816,125 @@ def test_an_attestation_refusal_records_its_verdict_and_alert(
 def test_every_named_alert_is_in_the_closed_alert_set() -> None:
     """adepthood's receiver list must be widened by exactly these names."""
     assert set(OUTCOME_ALERTS.values()) <= {kind.value for kind in AlertKind}
+
+
+# --------------------------------------------------------------------------
+# T18 on the embeddings path (#1904 under #1896): every batch is gated too.
+# --------------------------------------------------------------------------
+
+EMBED_MODEL: Final[str] = "qwen3-embedding-4b"
+EMBED_DIMENSIONS: Final[int] = 4
+EMBED_PIN: Final[PoolEmbeddingPin] = PoolEmbeddingPin(
+    model_name=EMBED_MODEL,
+    dimensions=EMBED_DIMENSIONS,
+    similarity_threshold=0.5,
+    runtime_inventory_digest=pool_identity_digest(RUNTIME, VERSION, EMBED_MODEL),
+)
+_EMBED_TEXTS: Final[tuple[str, ...]] = ("embed-canary-one", "embed-canary-two")
+
+
+def _embed_answer(count: int) -> dict[str, object]:
+    """Return an OpenAI-compatible embeddings answer for *count* texts."""
+    return {
+        "model": EMBED_MODEL,
+        "data": [
+            {"index": index, "embedding": [0.1] * EMBED_DIMENSIONS}
+            for index in range(count)
+        ],
+    }
+
+
+@pytest.fixture
+def embed_sidecar(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeSidecar]:
+    """A matching sidecar that also answers embeddings, pinned."""
+    fake = FakeSidecar(
+        {
+            POOL_ATTESTATION_PATH: (
+                200,
+                _report(models=[{"name": MODEL}, {"name": EMBED_MODEL}]),
+            ),
+            POOL_EMBEDDINGS_PATH: (200, _embed_answer(len(_EMBED_TEXTS))),
+        }
+    )
+    _pin(monkeypatch, fake.url)
+    yield fake
+    fake.close()
+
+
+def _embed() -> list[list[float] | None]:
+    """Embed the canary texts as ``personal`` items."""
+    items = [(text, PrivacyTier.PERSONAL) for text in _EMBED_TEXTS]
+    return PoolEmbedder(EMBED_PIN).embed(items)
+
+
+def test_a_matching_report_lets_the_embeddings_batch_proceed(
+    embed_sidecar: FakeSidecar,
+) -> None:
+    """Matching: the batch goes out as ``model`` and ``input`` only."""
+    vectors = _embed()
+
+    assert vectors == [[0.1] * EMBED_DIMENSIONS] * len(_EMBED_TEXTS)
+    assert embed_sidecar.paths[-1] == POOL_EMBEDDINGS_PATH
+    # Attestation is read for the identity check and again before the batch.
+    assert embed_sidecar.paths[-2] == POOL_ATTESTATION_PATH
+    assert embed_sidecar.seen[-1][3] == {
+        "model": EMBED_MODEL,
+        "input": list(_EMBED_TEXTS),
+    }
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        pytest.param(
+            _report(
+                measurement=MEASUREMENT[:-1] + "b",
+                models=[{"name": EMBED_MODEL}],
+            ),
+            id="tampered-measurement",
+        ),
+        pytest.param(
+            _report(measurement="d" * 64, models=[{"name": EMBED_MODEL}]),
+            id="unpinned-measurement",
+        ),
+        pytest.param(
+            _report(channel="tls", models=[{"name": EMBED_MODEL}]),
+            id="plain-tls",
+        ),
+    ],
+)
+def test_a_report_off_the_pin_sends_no_embeddings_text(
+    embed_sidecar: FakeSidecar, report: object
+) -> None:
+    """T18: no request reaches ``/v1/embeddings``; the pass is ungrounded."""
+    embed_sidecar.routes[POOL_ATTESTATION_PATH] = (200, report)
+
+    assert _embed() == [None] * len(_EMBED_TEXTS)
+    assert POOL_EMBEDDINGS_PATH not in embed_sidecar.paths
+    assert "embed-canary" not in json.dumps([seen[3] for seen in embed_sidecar.seen])
+
+
+def test_a_report_that_turns_bad_after_the_identity_check_stops_the_batch(
+    embed_sidecar: FakeSidecar, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate runs before each batch, not only once per pass, like generation."""
+    reports = iter([_report(models=[{"name": EMBED_MODEL}]), _report(status="failed")])
+    real = pool_attestation.pool_attestation_report
+
+    def flip(**kwargs: Any) -> Any:
+        embed_sidecar.routes[POOL_ATTESTATION_PATH] = (200, next(reports))
+        return real(**kwargs)
+
+    monkeypatch.setattr(pool_attestation, "pool_attestation_report", flip)
+
+    assert _embed() == [None] * len(_EMBED_TEXTS)
+    assert POOL_EMBEDDINGS_PATH not in embed_sidecar.paths
+
+
+def test_outside_sidecar_mode_the_closed_envelope_is_sent_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The O3 shape keeps its tier and deadline; no report is read."""
+    monkeypatch.delenv(POOL_VENDOR_ENV, raising=False)
+    envelope: dict[str, object] = {"model": EMBED_MODEL, "input": ["x"], "tier": "open"}
+    assert pool_embeddings._attested_payload(envelope, EMBED_MODEL, ["x"]) is envelope

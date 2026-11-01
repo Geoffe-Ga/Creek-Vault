@@ -26,7 +26,9 @@ to locate the originating commit for any reference below.
   closed shape is translated to an OpenAI-compatible chat completion with no
   cache-control or sampling field. A vendor 401/403 is a refusal; a 429
   `insufficient_quota` is non-transient and answers `temporarily_unavailable`;
-  any other 429 is `rate_limited`. On the control-plane side, the new
+  any other 429 is `rate_limited`. Pool embeddings (#1904, ADR-0018) are gated
+  the same way: every grounding batch re-reads the report before it is sent
+  and goes out as `model` and `input` only. On the control-plane side, the new
   `FlyProviderPolicy.pool_sidecar` (`PoolSidecarPolicy`) holds the
   operator-filled pin. The vendor image is accepted in digest form only, the
   policy requires the replay runtime, and the pin reaches the Machine `env` of

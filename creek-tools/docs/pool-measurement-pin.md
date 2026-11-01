@@ -468,6 +468,12 @@ sidecar's loopback address on that port.
    model, the messages and `max_tokens` only; the random request id in a
    header is the only correlation key.
 
+**Embeddings are gated the same way** (ADR-0018). Each grounding batch reads
+the attestation report again immediately before it is sent, and a report off
+the pin sends no text: the pass ends ungrounded. A matching batch goes out as
+`model` and `input` only. The tier has already been enforced per item at the
+chokepoint, and the vendor has no field for it or for `deadline_ms`.
+
 ### What is tested, and what is vendor-asserted
 
 The tests (`tests/test_pool_attested_sidecar.py`) drive every refusal above
