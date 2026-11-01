@@ -86,6 +86,7 @@ from creek.classify.llm.pool_prices import (
     VendorPrices,
     load_price_table,
 )
+from creek.vault_alerts import owe_vault_alert
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -513,6 +514,8 @@ class PoolSpendMeter:
             return VendorSpend(vendor, month, SpendState.LEDGER_UNREADABLE)
         if alert:
             self._alert(spend)
+            # Owed until the control plane acks it; never raises (#2049).
+            owe_vault_alert(SPEND_ALERT_KIND)
         self._announce(spend)
         return spend
 

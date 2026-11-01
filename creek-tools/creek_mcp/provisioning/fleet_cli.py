@@ -49,6 +49,7 @@ from creek_mcp.provisioning.reconcile import (
     ReconcileUnavailableError,
 )
 from creek_mcp.provisioning.store import ProvisioningStore
+from creek_mcp.provisioning.vault_alert_schema import CollectionOutcome
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -415,8 +416,24 @@ def _run_report(
     if report.alerts and alert_sink is not None:
         alert_sink(tuple(alert.kind.value for alert in report.alerts))
     if emit_output:
-        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        document = report.to_dict()
+        document["vault_alerts_owed"] = _vault_alerts_owed(store)
+        print(json.dumps(document, indent=2, sort_keys=True))
     return _EXIT_ALERTS if report.alerts else _EXIT_CLEAN
+
+
+def _vault_alerts_owed(store: ProvisioningStore) -> list[dict[str, object]]:
+    """Return every vault still owing alerts, or last not read (#2049).
+
+    The control plane cannot read a stopped vault's volume, so this is what
+    the pilot's own pulls last saw: closed alert-kind counts per allocation,
+    kept from the last successful read while the vault was unreachable.
+    """
+    return [
+        status.to_dict()
+        for status in store.vault_alert_status()
+        if status.owed or status.outcome is not CollectionOutcome.COLLECTED
+    ]
 
 
 def _record_closed_month(

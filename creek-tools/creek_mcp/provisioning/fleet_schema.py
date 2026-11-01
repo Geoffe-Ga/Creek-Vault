@@ -321,6 +321,28 @@ def record_alert_delivery_failure(
     )
 
 
+def retain_pending_alerts(
+    connection: sqlite3.Connection,
+    pending: Mapping[str, int],
+) -> None:
+    """Replace the open gap's owed counts without counting another failure.
+
+    The relay calls this when it defers a retry with new alerts collected, so
+    an alert accepted between two attempts survives a restart (#2049).  With
+    no open gap there is nothing to extend, and nothing is written.
+    """
+    row = connection.execute(
+        "SELECT 1 FROM provisioning_alert_delivery_gaps WHERE closed_at IS NULL"
+    ).fetchone()
+    if row is None:
+        return
+    connection.execute("DELETE FROM provisioning_pending_alerts")
+    connection.executemany(
+        "INSERT INTO provisioning_pending_alerts (kind, count) VALUES (?, ?)",
+        sorted(pending.items()),
+    )
+
+
 def close_alert_delivery_gap(connection: sqlite3.Connection, now: datetime) -> None:
     """Close the open gap at *now* and forget the alerts it was owed."""
     connection.execute(

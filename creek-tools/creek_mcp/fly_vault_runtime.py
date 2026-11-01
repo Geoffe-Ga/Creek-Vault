@@ -3,6 +3,10 @@
 Every vault this entry point serves is Adepthood-managed, so it is local-only
 whether or not the managed-vault marker is present (#1863): cloud consent in
 the environment refuses startup, and consent is pinned off while it serves.
+
+Beside the replayed ``/v1`` and ``/mcp`` listener it installs the vault's
+owed-alert outbox and serves the two-route private listener the control plane
+pulls owed alerts from (#2049), bound to the Machine's 6PN address alone.
 """
 
 from __future__ import annotations
@@ -13,12 +17,16 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import Thread
 from typing import TYPE_CHECKING, Final
+
+import uvicorn
 
 from creek.classify.llm.consent import managed_local_only
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
 from creek.classify.llm.pool_meter import pool_spend_meter
 from creek.config import CONFIG_PATH_ENV_VAR
+from creek.vault_alerts import VAULT_ALERTS_PORT, installed_vault_alert_outbox
 from creek_mcp.container_runtime import (
     ContainerConfigurationError,
     ContainerSettings,
@@ -29,6 +37,7 @@ from creek_mcp.container_runtime import (
 )
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.cli import serve
+from creek_mcp.httpapi.vault_alerts import build_vault_alerts_app
 from creek_mcp.provisioning.pilot_control import validate_fly_runtime
 from creek_mcp.provisioning.production_secrets import read_owner_only_file
 from creek_mcp.provisioning.replay_contract import is_replay_state
@@ -41,9 +50,12 @@ from creek_mcp.remote_auth import (
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
+    from creek_mcp.httpapi.vault_alerts import VaultAlertsApplication
+
 REPLAY_STATE_FILE_ENV: Final[str] = "CREEK_CONTAINER_FLY_REPLAY_STATE_FILE"
 _DEFAULT_REPLAY_STATE = Path("/run/secrets/creek_replay_state")
 _VAULT_PATH_ENV_VAR: Final[str] = "CREEK_VAULT_PATH"
+_LISTENER_STOP_SECONDS: Final[float] = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +134,40 @@ def _runtime_environment(config_path: Path, vault_path: Path) -> Iterator[None]:
                 os.environ[name] = value
 
 
+@contextmanager
+def private_alert_listener(
+    app: VaultAlertsApplication, host: str
+) -> Iterator[None]:  # pragma: no cover - the one seam that binds the 6PN socket
+    """Serve *app* on *host*'s alert port in a thread for the block.
+
+    Tests replace this seam, as they replace :func:`serve`, so no test binds a
+    real private address.
+
+    Args:
+        app: The owed-alert listener.
+        host: The Machine's Fly 6PN address, validated by the settings.
+
+    Yields:
+        Nothing; the listener runs until the block ends.
+    """
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=VAULT_ALERTS_PORT,
+            access_log=False,
+            log_config=None,
+        )
+    )
+    thread = Thread(target=server.run, name="creek-vault-alerts", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        server.should_exit = True
+        thread.join(timeout=_LISTENER_STOP_SECONDS)
+
+
 def run(settings: FlyVaultSettings) -> None:
     """Serve plaintext only behind Fly Proxy with replay state plus bearer auth."""
     prepared = prepare_vault(settings.container)
@@ -141,6 +187,15 @@ def run(settings: FlyVaultSettings) -> None:
         managed_local_only(),
         # Pool spend is metered onto this vault's own volume (#2007).
         pool_spend_meter(settings.container.vault_path),
+        installed_vault_alert_outbox(settings.container.vault_path) as outbox,
+        private_alert_listener(
+            build_vault_alerts_app(
+                outbox=outbox,
+                verifier=verifier,
+                fly_replay_state=replay_state,
+            ),
+            settings.fly_private_ip,
+        ),
     ):
         announce_rotation_window(verifier)
         announce_ungated_consumers(verifier)

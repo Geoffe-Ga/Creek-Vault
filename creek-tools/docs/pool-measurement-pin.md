@@ -512,9 +512,12 @@ Each pool call writes one JSON record to the `creek.pool` logger: `event`,
 `alert`, `input_tokens` and `output_tokens`. Five alert kinds are registered in
 `AlertKind` and named in those records — `pool_attestation_failed`,
 `pool_credential_rejected` (a vendor 401/403), `pool_admission_refused`,
-`pool_vendor_rate_limited` and `pool_quota_exhausted` — and **no path delivers
-them to the control plane yet**; adepthood's receiver list must admit them
-before one does.
+`pool_vendor_rate_limited` and `pool_quota_exhausted`. Each named alert is
+also owed in the vault's on-volume outbox. The control plane's fleet pass
+pulls it from there and delivers it through the fleet-alert channel (#2049),
+whose receiver already admits all five (adepthood#3646). What each alert asks
+the operator to do is in the
+[managed-vault pilot runbook](managed-vault-fly-pilot.md#vault-side-alerts-2049).
 
 ### Spend metering and the €5 alert (R4-2, #2007)
 

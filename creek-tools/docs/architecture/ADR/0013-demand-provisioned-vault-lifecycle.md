@@ -13,6 +13,9 @@
   transition. Historical ceremony states remain readable for migration only.
 - **Alert amendment**: [Amended by #1867](#amended-by-1867-2026-10-31) adds
   `provider_credential_expiring` to the closed operator alert list.
+- **Vault-alert amendment**: [Amended by #2049](#amended-by-2049-2026-11-01)
+  carries alerts raised inside a vault to the operator: the control plane
+  pulls them.
 - **Consumer counterpart**: Adepthood ADR 0007, "Confidential vaults are
   provisioned on demand, not at signup"
 
@@ -209,3 +212,87 @@ owner with release decision R2-2 (Fly org tokens live at most 90 days):
 - **Receiver first.** The consumer's alert receiver validates the same closed
   list, so it must admit the new kind before a Creek build that raises it is
   deployed.
+
+## Amended by #2049 (2026-11-01)
+
+This record stays as written. Decision 4's alerts were all raised by the
+control plane's fleet pass. Since ADR-0016 (#1896) and #2007 a managed vault
+raises some of its own: the attesting pool's `pool_attestation_failed`,
+`pool_credential_rejected`, `pool_admission_refused`,
+`pool_vendor_rate_limited` and `pool_quota_exhausted`, and the local spend
+meter's EUR 5 alert (`monthly_budget_departure`). Each was written only to the
+vault's own `creek.pool` log, and the fleet report cannot read a vault volume,
+so none reached a person.
+
+**Decision: the control plane pulls.** Each fleet report pass reads, from
+every vault the same pass observed running, a closed, counts-only owed-alert
+summary, and hands the new counts to the same `AlertRelay` and
+`HttpFleetAlertSink` its own alerts use. The pull was chosen over a vault push
+for three reasons:
+
+- **No new egress from the vault.** A managed vault is local-only and its one
+  outbound path is the pinned pool sidecar. A push would give every vault a
+  route to the control plane; a pull adds none.
+- **No new credential.** The control plane already holds each allocation's
+  replay state (known only to it and that Machine) and consumer bearer. The
+  vault already verifies both on every replayed request. A push would need a
+  vault-to-control-plane credential, and the consumer bearer cannot serve,
+  because Adepthood holds it too and could forge or suppress alerts with it.
+- **It fits autostop.** A stopped vault cannot push. Under the pull, its owed
+  alerts wait on its volume, and the first pass that sees it running reads
+  them. The pass never wakes a stopped vault.
+
+**The channel.**
+
+- **Vault side** (`creek/vault_alerts.py`). An outbox on the volume records a
+  cumulative raised count and a cumulative acknowledged count per kind, with
+  a random epoch minted when the outbox is created. The only kinds are the
+  closed `VAULT_ALERT_KINDS` subset of `AlertKind`. Writes are atomic and
+  locked across processes, and a damaged document is reported, never reset.
+- **Private listener** (`creek_mcp/httpapi/vault_alerts.py`). It has two
+  routes, `GET /internal/vault-alerts` and `POST /internal/vault-alerts/ack`.
+  It is served on port 8824 at the Machine's `FLY_PRIVATE_IP` (6PN) only,
+  never in the Fly service config, and never on the published `/v1` app. The
+  stack is the `/v1` layers in the same order: access log, error boundary,
+  the replay-state guard, then the bearer guard. The edge replays only
+  published paths, so no public request reaches it.
+- **Control-plane side** (`creek_mcp/provisioning/vault_alert_pull.py`). It
+  dials `http://<app>.internal:8824` with a proxy-free bounded client, and
+  every answer is parsed against the closed shape before anything is trusted.
+  Counts above a durable per-allocation, per-epoch mark are new. The pass
+  hands them to the relay, flushes, records the marks, and only then
+  acknowledges the vault.
+
+**Guarantees.**
+
+- **Counts only.** Nothing but closed kinds and counts crosses either hop or
+  is stored: no subject, request id, vendor id, amount, prompt, answer or key.
+  The receiver's `creek_fleet_alert_v1` document is unchanged, and Adepthood's
+  receiver already admits every kind (adepthood#3646).
+- **Delivered once, never lost.** A vault stops owing an alert only after the
+  relay has delivered it or retained it durably. The relay now also persists
+  counts it collects while backing off. Because the mark is written before the
+  acknowledgement, a lost acknowledgement causes a re-acknowledgement, not a
+  second delivery. The one duplicate window is a control-plane crash between
+  the relay's flush and the mark. In that case the alert is delivered twice,
+  never lost.
+- **Visible while owed.** For each vault, the store keeps the outcome of the
+  last read and the counts last seen owed. `creek-provisioning-fleet report`
+  prints them as `vault_alerts_owed`. An unreachable vault keeps its
+  last-known counts there.
+- **The bound.** An alert raised in a vault that autostops before any pass
+  sees it running is delivered at the first pass that does. The pilot's pass
+  runs every five minutes.
+
+**Admission (R2-4).** An alert that a vault still owes does not close the
+activation gate. A stopped vault holding a spend alert is the ordinary case,
+not a failed alert channel. R2-4 still governs the channel itself. If the
+relay cannot deliver vault alerts, it refuses new activations exactly as it
+does for fleet alerts.
+
+**Spend alert.** The spend meter raises its alert with the one call
+`owe_vault_alert("monthly_budget_departure")`. At the receiver this kind looks
+the same as the fleet budget departure. In the control plane's log the two are
+different lines: `vault alert kind=monthly_budget_departure count=1` for the
+vault's alert, and `fleet alert kind=monthly_budget_departure` for the fleet
+estimate, which is raised again on every pass while it holds.

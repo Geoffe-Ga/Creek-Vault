@@ -489,6 +489,76 @@ acknowledgement only—not provider IDs, tokens, URLs, or response bodies. Run t
 standalone report only in the approved private evidence environment when its
 full subject/inventory detail is required.
 
+### Vault-side alerts (#2049)
+
+Some alerts are raised inside a managed vault rather than by the fleet report:
+the attesting pool's five outcome alerts and the vault's local spend alert.
+The vault writes each one to an owed-alert outbox on its own volume. It does
+not send it anywhere. After every scheduled report pass, the control Machine
+reads the outbox of each vault that the same pass observed running. It hands
+the new counts to the same relay and the same
+`/internal/vault-provisioning/alerts` delivery described above, then
+acknowledges them to the vault. The design is recorded in the
+[ADR-0013 #2049 amendment](architecture/ADR/0013-demand-provisioned-vault-lifecycle.md#amended-by-2049-2026-11-01).
+
+**Who receives them.** The same person who receives the fleet alerts: the
+alert recipient recorded in step 1, through Adepthood's fleet-alert receiver
+and its operator email. The payload is still only
+`{"schema":"creek_fleet_alert_v1","counts":{...}}`, so the email names the
+kind and the count. It never names the vault, the user, a vendor id or an
+amount. To find which vault raised an alert, use the control Machine's log
+line `vault alert kind=<kind> count=<n>` for the time of the pass. In the
+approved private evidence environment, `creek-provisioning-fleet report` also
+lists `vault_alerts_owed`.
+
+**What each alert asks you to do.**
+
+| Kind | What happened in the vault | What to do |
+|------|----------------------------|------------|
+| `pool_attestation_failed` | The pool sidecar's attestation report did not match the Machine's pinned measurement, so nothing was sent and the pool answer was refused. | Treat it as a possible vendor measurement change. Do not widen the pin. Follow the [re-pin procedure](pool-measurement-pin.md#re-pin-procedure) only after the new measurement is reviewed. If the vendor has not announced a change, escalate to the owner. |
+| `pool_credential_rejected` | The vendor answered 401/403 to this vault's pool key. | Check the organization admin key alerts first. Then roll that activation's pool bundle ([key custody and rotation](pool-measurement-pin.md#4-key-custody-and-rotation)) and confirm that the superseded key's revocation clears. |
+| `pool_admission_refused` | The vault's own pool limiter refused a call. | Usually transient load. If it appears on several passes in a row, look for a runaway job on that vault before raising any limit. |
+| `pool_vendor_rate_limited` | The vendor answered 429 with a rate limit, not a spent quota. | Usually transient. If it persists, check the vendor's status and the recorded rate limits, and decide with the owner whether the pool can carry the load. |
+| `pool_quota_exhausted` | The vendor answered 429 `insufficient_quota`: this vault's key has spent its monthly cap (EUR 10, R4-1), and the vault's pool calls fail until the cap resets. | Decide with the owner whether to raise this key's cap or wait for the monthly reset. Tell the user if their pool features are unavailable. |
+| `monthly_budget_departure` (from a vault) | The vault's metered pool spend reached the EUR 5 alert line of its EUR 10 key cap (R4-2, #2007). It is raised once per vault per month. | Review that vault's pool usage against expectations before it reaches the cap. Note that the fleet report raises the same kind for the fleet's USD 60 budget, on every pass while that holds. The log line tells the two apart. |
+
+**Delivery guarantees, and their one bound.**
+
+- Each alert is delivered once. The control plane records how much it has
+  handed on, per vault and per outbox, before it acknowledges the vault, so a
+  lost acknowledgement does not cause a second email. The one exception is a
+  control-plane crash in the instant between delivery and that record: the
+  alert is then delivered twice, never lost.
+- A vault keeps an alert on its volume until the control plane acknowledges
+  it, across restarts. The pass never wakes a stopped vault. A vault that
+  autostops before any pass sees it running delivers its alerts at the first
+  pass that does, every five minutes at the default interval.
+- An unreachable vault is logged as `vault alerts not collected
+  outcome=unreachable`. It keeps its last-known owed counts in
+  `vault_alerts_owed`.
+- An alert that a vault still owes does **not** refuse new activations.
+  R2-4 applies to the delivery channel itself: if the receiver cannot be
+  reached, vault alerts are retained, and admission closes exactly as it does
+  for fleet alerts.
+
+**Network path.** Each vault serves the outbox on a second listener, port
+`8824`, bound to its `FLY_PRIVATE_IP` (6PN) only. That port is not in the
+Machine's Fly service config, and the edge never routes it. The control
+Machine dials `http://<vault-app>.internal:8824`. That only resolves inside the
+`adepthood-managed-vault-pilot` organization, which is one more reason the
+control app and the vault apps must share that organization. Requests carry
+the allocation's replay state and consumer bearer, exactly as a replayed
+request does. Until a vault runs an image with this listener, its reads log
+`outcome=unreachable` and change nothing else, so the control Machine and the
+vault image can be deployed in either order.
+
+**Exercise it before admitting a user.** Use a disposable synthetic
+allocation, never a real beta account. Stop the receiver, raise a vault alert,
+and confirm three things: the `fleet alert delivery failed` line appears, the
+alert stays pending, and the vault was acknowledged. Then restore the receiver
+and confirm that exactly one delivery arrives. The automated version of this
+drill is `tests/test_vault_alert_pull.py`.
+
 The supervised schedule runs reconcile less frequently than report because it
 may stop a Machine and interrupt background work. The reviewed config pins a
 3,600-second cadence and a 120-second accepted interruption window; the single

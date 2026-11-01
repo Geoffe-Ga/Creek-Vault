@@ -55,6 +55,7 @@ from creek.classify.llm.pool_boundary import (
     require_pool_request,
 )
 from creek.classify.llm.pool_meter import TELEMETRY_LOGGER
+from creek.vault_alerts import owe_vault_alert
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -120,10 +121,11 @@ OUTCOME_ALERTS: Final[dict[str, str]] = {
 }
 """Which outcomes are alert-worthy, by the fleet alert kind they name.
 
-Every value is a member of
-:class:`creek_mcp.provisioning.budget.AlertKind` (asserted by the tests). The
-record carries the name so a collector can raise it; no path delivers these
-to the control plane yet.
+Every value is a member of :data:`creek.vault_alerts.VAULT_ALERT_KINDS` and so
+of :class:`creek_mcp.provisioning.budget.AlertKind` (asserted by the tests).
+The record carries the name, and :func:`record_pool_outcome` also owes it in
+the vault's outbox, from which the control plane's fleet pass pulls it to the
+operator (#2049).
 """
 
 
@@ -473,6 +475,9 @@ def record_pool_outcome(
             {key: value for key, value in usage.items() if key.endswith("_tokens")}
         )
     _LOGGER.info(json.dumps(record, sort_keys=True))
+    if alert is not None:
+        # Owed to the operator until the control plane acknowledges it (#2049).
+        owe_vault_alert(alert)
     return record
 
 

@@ -14,6 +14,7 @@ import argparse
 import dataclasses
 import json
 import logging
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
@@ -312,6 +313,9 @@ def test_a_new_replay_vault_publishes_its_resource_and_pins_its_subject(
     monkeypatch.setattr(runtime, "announce_rotation_window", lambda _verifier: None)
     served: list[Any] = []
     monkeypatch.setattr(runtime, "serve", lambda app, _args: served.append(app))
+    monkeypatch.setattr(
+        runtime, "private_alert_listener", lambda _app, _host: nullcontext()
+    )
 
     runtime.run(settings)
 

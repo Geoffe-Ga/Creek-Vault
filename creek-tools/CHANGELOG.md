@@ -9,6 +9,32 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Vault-side pool and spend alerts now reach the operator (#2049). A managed
+  vault's pool outcome alerts (`pool_attestation_failed`,
+  `pool_credential_rejected`, `pool_admission_refused`,
+  `pool_vendor_rate_limited`, `pool_quota_exhausted`) and its spend alert
+  (`monthly_budget_departure`) used to go only to the vault's own log. Each is
+  now owed in a closed, counts-only outbox on the vault volume
+  (`creek/vault_alerts.py`). The vault serves that outbox on a private
+  listener, port 8824 on its 6PN address only, behind the same replay-state
+  and bearer guards as a replayed request. The edge cannot reach it. After
+  each report pass, the pilot's scheduler reads every running vault's
+  outbox (`creek_mcp/provisioning/vault_alert_pull.py`). It hands new counts
+  to the existing `AlertRelay` and `HttpFleetAlertSink`, records a durable
+  per-epoch mark, and only then acknowledges the vault. Each alert is
+  therefore delivered once and lost neither by a vault restart nor by a lost
+  acknowledgement. An unreachable or stopped vault keeps its alerts owed, and
+  `creek-provisioning-fleet report` lists them as `vault_alerts_owed`. An owed
+  vault alert does not refuse new activations; R2-4 still applies when the
+  delivery channel fails. The relay now also persists alerts collected while
+  it backs off, so they survive a restart. The design is a pull, recorded as
+  an ADR-0013 amendment, and the runbook names the recipient and the action
+  for each kind. The spend meter from #2048 (#2007) owes its EUR 5 alert with
+  one call, `owe_vault_alert(SPEND_ALERT_KIND)`, placed in
+  `PoolSpendMeter.record` after the once-a-month latch. A second crossing in
+  the same month owes nothing more. An outbox write failure is logged and
+  never fails the metered call.
+
 - One unpriced model no longer silences the €5 pool spend alert for the rest
   of the month (#2052). The price table used to price a vendor's month all or
   nothing, so a single counted model with no pinned price, or with no price for

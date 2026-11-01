@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, cast
 from uuid import uuid4
 
-from creek_mcp.provisioning import fleet_schema
+from creek_mcp.provisioning import fleet_schema, vault_alert_schema
 from creek_mcp.provisioning.ceremony import (
     KEY_CEREMONY_TTL,
     CeremonyConflictError,
@@ -231,6 +231,7 @@ class ProvisioningStore:
             self._install_requester_guards(connection)
             connection.executescript(_OWNERSHIP_INDEXES)
             connection.executescript(fleet_schema.FLEET_SCHEMA)
+            connection.executescript(vault_alert_schema.VAULT_ALERT_SCHEMA)
             fleet_schema.backfill_pending_receipts(connection)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
@@ -985,6 +986,58 @@ class ProvisioningStore:
         """Return the open alert-channel gap, if delivery is currently failing."""
         with self._connect() as connection:
             return fleet_schema.open_alert_delivery_gap(connection)
+
+    def retain_pending_alerts(self, pending: Mapping[str, int]) -> None:
+        """Durably replace the open gap's owed counts; no-op with no gap (#2049)."""
+        with self._connect(write=True) as connection:
+            fleet_schema.retain_pending_alerts(connection, pending)
+
+    def vault_alert_marks(
+        self,
+        provider_allocation_id: str,
+        epoch: str,
+    ) -> dict[str, int]:
+        """Return the vault-alert counts already handed on for one outbox epoch."""
+        with self._connect() as connection:
+            return vault_alert_schema.vault_alert_marks(
+                connection, provider_allocation_id, epoch
+            )
+
+    def record_vault_alert_marks(
+        self,
+        provider_allocation_id: str,
+        epoch: str,
+        marks: Mapping[str, int],
+    ) -> None:
+        """Durably raise one outbox epoch's handed-on marks (#2049)."""
+        with self._connect(write=True) as connection:
+            vault_alert_schema.record_vault_alert_marks(
+                connection, provider_allocation_id, epoch, marks
+            )
+
+    def record_vault_alert_check(
+        self,
+        provider_allocation_id: str,
+        outcome: vault_alert_schema.CollectionOutcome,
+        *,
+        now: datetime,
+        owed: Mapping[str, int] | None = None,
+    ) -> None:
+        """Record one vault-alert collection attempt and what it found owed."""
+        with self._connect(write=True) as connection:
+            vault_alert_schema.record_vault_alert_check(
+                connection, provider_allocation_id, outcome, now, owed
+            )
+
+    def vault_alert_status(self) -> tuple[vault_alert_schema.VaultAlertStatus, ...]:
+        """Return every allocation's last vault-alert collection attempt."""
+        with self._connect() as connection:
+            return vault_alert_schema.list_vault_alert_status(connection)
+
+    def running_allocation_ids(self) -> frozenset[str]:
+        """Return the allocations the latest fleet pass observed running."""
+        with self._connect() as connection:
+            return vault_alert_schema.running_allocation_ids(connection)
 
     def record_machine_state(
         self,
