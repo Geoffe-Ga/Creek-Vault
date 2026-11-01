@@ -40,8 +40,10 @@ for the same reason :data:`~creek.classify.llm.pool_boundary.POOL_URL_ENV` is.
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import os
 import re
+import socket
 from dataclasses import dataclass
 from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Final
@@ -199,8 +201,14 @@ def _measurements(raw: str) -> frozenset[str] | None:
 def valid_egress(value: str) -> bool:
     """Return whether *value* is a pinned egress destination, ``host:port``.
 
-    A DNS name with at least one dot and an explicit port; no scheme, path,
-    credentials or IP literal, so the pin names exactly one vendor host.
+    A lowercase DNS name with at least one dot and an explicit port; no
+    scheme, path, credentials or IP literal, so the pin names exactly one
+    vendor host. Lowercase is the canonical form: callers holding operator
+    input lowercase it first (:func:`load_pool_pin`,
+    ``PoolSidecarPolicy``), so the pin compares equal however it was typed.
+    A final label of digits alone is a hostname, not an address (#2042);
+    the regex already refuses every IPv6 literal, and
+    :func:`_is_address_literal` refuses the IPv4 ones.
 
     Args:
         value: The candidate destination.
@@ -211,9 +219,44 @@ def valid_egress(value: str) -> bool:
     if _EGRESS.fullmatch(value) is None:
         return False
     host, port = value.rsplit(":", 1)
-    if host.rsplit(".", 1)[-1].isdigit():
+    if _is_address_literal(host):
         return False
     return 0 < int(port) <= _MAX_PORT
+
+
+def _is_address_literal(host: str) -> bool:
+    """Return whether *host* is an IP address rather than a name.
+
+    :func:`ipaddress.ip_address` recognises the canonical forms only.
+    :func:`socket.inet_aton` also accepts the legacy shorthand the system
+    resolver still reads as an address (``127.1``, ``0x7f.1``), which the
+    canonical parser would let through as a "hostname".
+
+    Args:
+        host: The host part of an egress pin.
+
+    Returns:
+        ``True`` when either parser reads *host* as an address.
+    """
+    return _parses_as_canonical_address(host) or _parses_as_legacy_ipv4(host)
+
+
+def _parses_as_canonical_address(host: str) -> bool:
+    """Return whether :func:`ipaddress.ip_address` reads *host* as an address."""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _parses_as_legacy_ipv4(host: str) -> bool:
+    """Return whether :func:`socket.inet_aton` reads *host* as an IPv4 address."""
+    try:
+        socket.inet_aton(host)
+    except OSError:
+        return False
+    return True
 
 
 def load_pool_pin(environ: Mapping[str, str] | None = None) -> PoolPin | None:
