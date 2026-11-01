@@ -130,7 +130,13 @@ class PoolSidecarPolicy:
     rate_per_hour: int = DEFAULT_POOL_RATE_PER_HOUR
 
     def __post_init__(self) -> None:
-        """Refuse a pin that is floating, partial or malformed."""
+        """Refuse a pin that is floating, partial or malformed.
+
+        The egress host is lowercased first (#2042): hostnames are
+        case-insensitive, and :func:`load_pool_pin` lowercases what the
+        Machine reads back, so the rendered ``env`` must carry the same form.
+        """
+        object.__setattr__(self, "egress", self.egress.lower())
         if _IMMUTABLE_IMAGE.fullmatch(self.image) is None:
             raise ValueError("pool sidecar image must use an immutable sha256 digest")
         if _SHA256_HEX.fullmatch(self.binary_sha256) is None:
