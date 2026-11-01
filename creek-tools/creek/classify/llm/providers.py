@@ -34,6 +34,7 @@ from creek.classify.llm.consent import (
 )
 from creek.classify.llm.local_boundary import (
     NonLoopbackOllamaError,
+    environment_ca_trust,
     ollama_get,
     ollama_post,
 )
@@ -1302,7 +1303,11 @@ def _fetch_attestation_quote(
         EnclaveAttestationError: When the quote cannot be fetched or parsed.
     """
     try:
-        with httpx.Client(timeout=timeout) as client:
+        # Proxy-free for the reason :func:`call_enclave` gives (#1933): the
+        # quote must come from the host the prompt will be sent to.
+        with httpx.Client(
+            timeout=timeout, trust_env=False, verify=environment_ca_trust()
+        ) as client:
             resp = client.get(
                 f"{url}{ENCLAVE_ATTESTATION_PATH}", params={"nonce": nonce}
             )
@@ -1423,6 +1428,16 @@ def call_enclave(
     The caller (:meth:`EnclaveProvider.complete`) MUST have verified attestation
     first; this helper performs no gating of its own.
 
+    **The environment may not choose the destination (#1933).** The client is
+    built with ``trust_env=False``, so ``HTTPS_PROXY`` / ``ALL_PROXY`` (either
+    case) cannot redirect the dial. The prompt would stay TLS-protected through
+    a proxy's ``CONNECT`` tunnel, but the security argument for this path is
+    that the prompt reaches *the attested endpoint*, not merely an endpoint
+    over TLS — and a vault whose environment can move the socket cannot say
+    where the prompt went. CA trust from ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``
+    is kept (:func:`~creek.classify.llm.local_boundary.environment_ca_trust`),
+    so an enclave behind a private CA still verifies.
+
     Args:
         config: LLM configuration carrying ``enclave_url`` and model name.
         prompt: The fully-formatted prompt.
@@ -1445,7 +1460,9 @@ def call_enclave(
         payload["max_tokens"] = max_tokens
     if system is not None:
         payload["system"] = system
-    with httpx.Client(timeout=timeout) as client:
+    with httpx.Client(
+        timeout=timeout, trust_env=False, verify=environment_ca_trust()
+    ) as client:
         response = client.post(
             f"{config.enclave_url}{ENCLAVE_GENERATE_PATH}", json=payload
         )

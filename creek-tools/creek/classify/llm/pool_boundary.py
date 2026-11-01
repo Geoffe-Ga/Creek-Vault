@@ -58,6 +58,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 from urllib.parse import urlsplit
 
+from creek.classify.llm.consent import is_managed_vault
+
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
     from urllib.parse import SplitResult
@@ -77,8 +79,11 @@ POOL_VENDOR_ENV: Final[str] = "CREEK_POOL_VENDOR"
 Read from the Machine environment for the same reason :data:`POOL_URL_ENV` is:
 which vendor attests this pool is a platform fact about the allocation, not a
 writable-vault setting. Unset means the Creek-run pool of ADR-0016 O3, whose
-provenance is ``pool:creek``; set, it names the vendor behind O5 and the
-provenance becomes ``pool:attested:<vendor>``. The attesting client that
+provenance is ``pool:creek``. Set, it *names* the vendor behind O5, and naming
+is not attesting: the provenance becomes ``pool:attested:<vendor>`` only in
+sidecar mode, where every content dial is gated on the sidecar's attestation
+report (:func:`attested_pool_vendor`), and a managed vault refuses to dial any
+other named vendor (#2040). The attesting client that
 *verifies* that vendor's measurement set is #1896's; this key is only how the
 answer is labelled.
 """
@@ -265,6 +270,10 @@ _LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "::1"})
 _PROMPT_TOO_LONG: Final[str] = (
     "the pool request's prompt exceeds the contract's token cap; refusing to dial"
 )
+_UNATTESTED_VENDOR: Final[str] = (
+    "the managed vault's pool names a vendor no attestation gate covers; "
+    "refusing to dial"
+)
 
 
 class PoolBoundaryError(RuntimeError):
@@ -342,6 +351,19 @@ class PoolPromptTooLongError(PoolBoundaryError):
     """
 
 
+class PoolUnattestedVendorError(PoolDestinationError):
+    """A managed vault names a pool vendor that nothing attests (#2040).
+
+    ADR-0016 admits two pools on a managed Machine: the Creek-run O3 pool,
+    which names no vendor, and the vendor-attested O5 pool, which is O5 only
+    *with* its attestation gate (Decision 3.3). A vendor name with no gate
+    behind it is neither, and Decision 1 item 10 and ADR-0018 item 5 say the
+    same thing of it: no content leaves by an unattested route. So every dial
+    is refused before a socket opens. The message names neither the vendor
+    nor the destination.
+    """
+
+
 class PoolTierUndeclaredError(PoolBoundaryError):
     """No admitted tier was declared for this request, so nothing is sent.
 
@@ -390,10 +412,63 @@ def pool_attesting_vendor(environ: Mapping[str, str] | None = None) -> str | Non
 
     Returns:
         The vendor name, lower-cased and stripped, or ``None`` when
-        :data:`POOL_VENDOR_ENV` is unset or blank — the Creek-run pool.
+        :data:`POOL_VENDOR_ENV` is unset or blank — the Creek-run pool. A
+        name, not an attestation: :func:`attested_pool_vendor` is the
+        question a label may ask.
     """
     source = os.environ if environ is None else environ
     return source.get(POOL_VENDOR_ENV, "").strip().lower() or None
+
+
+def attested_pool_vendor(environ: Mapping[str, str] | None = None) -> str | None:
+    """Return the vendor whose attestation gates this channel, or ``None`` (#2040).
+
+    The one fact ``pool:attested:<vendor>`` is derived from, and it is a fact
+    about the **attestation path**, not about the vendor's name. Sidecar mode
+    (:func:`attesting_sidecar_mode`) is the only mode in which every dial that
+    carries content is preceded by
+    :func:`~creek.classify.llm.pool_attestation.attested_report`, which
+    refuses — sending nothing — unless the sidecar's report matches the
+    Machine's pin: generation through
+    :func:`~creek.classify.llm.pool_attested.call_attested_pool`, and every
+    embeddings batch through the same check in
+    :mod:`creek.classify.llm.pool_embeddings`. So an answer that exists at all
+    in sidecar mode is one whose channel was attested, and sidecar mode is the
+    only thing that can make this return a vendor. Any other name in
+    :data:`POOL_VENDOR_ENV` says only whom the operator *meant* to dial.
+
+    Args:
+        environ: Environment to read; ``os.environ`` when omitted.
+
+    Returns:
+        :data:`POOL_SIDECAR_VENDOR` in sidecar mode; otherwise ``None`` — the
+        Creek-run pool (labelled ``pool:creek`` by the caller) or a named
+        vendor nothing attests (left unlabelled).
+    """
+    return POOL_SIDECAR_VENDOR if attesting_sidecar_mode(environ) else None
+
+
+def _refuse_unattested_vendor(environ: Mapping[str, str] | None) -> None:
+    """Refuse a managed vault's dial to a vendor no attestation gate covers.
+
+    ADR-0016 admits two pools on a managed Machine: the Creek-run O3 pool
+    (no vendor named) and the vendor-attested O5 pool, which is O5 only *with*
+    its gate. A self-hosted vault is not refused: its operator chose the
+    destination, and its answers are served with ``inference_source`` omitted
+    rather than a false ``attested``.
+
+    Args:
+        environ: Environment to read; ``os.environ`` when omitted.
+
+    Raises:
+        PoolUnattestedVendorError: On a managed vault that names a vendor
+            while not in sidecar mode.
+    """
+    if not is_managed_vault(environ):
+        return
+    named = pool_attesting_vendor(environ) is not None
+    if named and attested_pool_vendor(environ) is None:
+        raise PoolUnattestedVendorError(_UNATTESTED_VENDOR)
 
 
 def pool_destination(environ: Mapping[str, str] | None = None) -> str:
@@ -1110,8 +1185,11 @@ def open_pool_dial(
 
     Raises:
         PoolDestinationError: When no destination is pinned.
+        PoolUnattestedVendorError: On a managed vault naming a vendor no
+            attestation gate covers; nothing is dialled.
         PoolDialCancelledError: When the budget is already spent.
     """
+    _refuse_unattested_vendor(environ)
     scope = current_pool_scope()
     limit = _tightest(budget, None if scope is None else scope.remaining())
     dial = PoolDial(

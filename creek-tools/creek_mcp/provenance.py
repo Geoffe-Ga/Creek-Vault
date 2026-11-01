@@ -20,9 +20,13 @@ that then fails produces a refusal, and a refusal carries no
 destination that was never dialled.
 
 **An unlabelled answer is an honest answer.** ADR-0016's four values name the
-routes this contract can stand behind. Two configured routes are none of them
-— an operator's own cloud key on a self-hosted vault, and the attested
-enclave — so nothing is recorded and the field is omitted. The consumer's use
+routes this contract can stand behind. Three configured routes are none of
+them — an operator's own cloud key on a self-hosted vault, the attested
+enclave, and a self-hosted pool whose ``CREEK_POOL_VENDOR`` names a vendor no
+attestation gate covers (#2040) — so nothing is recorded and the field is
+omitted. ``attested`` is a claim that a gate passed, so it is derived from
+the gate (:func:`~creek.classify.llm.pool_boundary.attested_pool_vendor`),
+never from the vendor's name. The consumer's use
 for the field is to notice a route it did not expect, and a guessed label
 would defeat exactly that.
 
@@ -46,7 +50,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from creek.classify.llm.pool_boundary import pool_attesting_vendor
+from creek.classify.llm.pool_boundary import (
+    attested_pool_vendor,
+    pool_attesting_vendor,
+)
 from creek.classify.llm.providers import provider_egresses
 from creek_mcp.api.models import (
     INFERENCE_SOURCE_LOCAL,
@@ -103,19 +110,15 @@ def stage_inference_source(
             when omitted.
 
     Returns:
-        ``pool:creek`` or ``pool:attested:<vendor>`` for the shared pool,
-        ``local`` for a provider whose dial never leaves the device, and
-        ``None`` for any other route that egresses — an operator's own cloud
-        key, or the attested enclave — because none of ADR-0016's four values
-        names one.
+        ``pool:creek`` for the Creek-run pool, ``pool:attested:<vendor>`` only
+        for a vendor an attestation gate covers, ``local`` for a provider whose
+        dial never leaves the device, and ``None`` for any other route that
+        egresses — a pool vendor nothing attests, an operator's own cloud key,
+        or the attested enclave — because none of ADR-0016's four values
+        names it truthfully.
     """
     if provider == POOL_PROVIDER:
-        vendor = pool_attesting_vendor(environ)
-        return (
-            INFERENCE_SOURCE_POOL_CREEK
-            if vendor is None
-            else attested_pool_source(vendor)
-        )
+        return _pool_inference_source(environ)
     # Asked of the destination, not of the consent gate.
     # ``provider_is_cloud`` means "an operator cloud key, consent-gated",
     # which the attested enclave answers ``False`` to while dialling a remote
@@ -123,6 +126,28 @@ def stage_inference_source(
     # answer that had left the device, the one claim ADR-0016 T15 has a socket
     # spy to refute (#1894).
     return None if provider_egresses(provider) else INFERENCE_SOURCE_LOCAL
+
+
+def _pool_inference_source(environ: Mapping[str, str] | None) -> str | None:
+    """Return the shared pool's provenance value, or ``None`` (#2040).
+
+    ``attested`` is read from :func:`attested_pool_vendor` — the gate — and
+    never from the vendor name, which only says who the operator *meant* to
+    dial. A name with no gate behind it publishes nothing: the contract
+    already allows an absent field, so the receipt is honest without a new
+    wire value. (A managed vault never reaches that branch with an answer;
+    the boundary refuses the dial.)
+
+    Args:
+        environ: Environment to read; ``os.environ`` when omitted.
+
+    Returns:
+        ``pool:creek``, ``pool:attested:<vendor>`` or ``None``.
+    """
+    if pool_attesting_vendor(environ) is None:
+        return INFERENCE_SOURCE_POOL_CREEK
+    vendor = attested_pool_vendor(environ)
+    return None if vendor is None else attested_pool_source(vendor)
 
 
 def request_key_inference_source(request_key: RequestKey) -> str | None:

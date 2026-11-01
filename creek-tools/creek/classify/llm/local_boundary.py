@@ -163,19 +163,22 @@ def ollama_client(
             ``httpx.MockTransport``).
 
     Returns:
-        A proxy-free client verifying TLS per :func:`_ollama_verify`.
+        A proxy-free client verifying TLS per :func:`environment_ca_trust`.
     """
     return httpx.Client(
         base_url=base_url,
         timeout=timeout,
         transport=transport,
         trust_env=False,
-        verify=_ollama_verify(),
+        verify=environment_ca_trust(),
     )
 
 
-def _ollama_verify() -> ssl.SSLContext | bool:
-    """Return the CA trust an Ollama client verifies TLS against.
+def environment_ca_trust() -> ssl.SSLContext | bool:
+    """Return the CA trust a proxy-free client verifies TLS against.
+
+    Shared by every client that sets ``trust_env=False``: the Ollama boundary
+    here, and the attested enclave's two dials (#1933).
 
     ``trust_env=False`` keeps proxies out, but it also stops httpx reading
     ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``, which would silently break an HTTPS

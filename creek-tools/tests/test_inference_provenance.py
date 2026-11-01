@@ -28,6 +28,7 @@ from starlette.testclient import TestClient
 from creek.classify.classify_engine import _PreparedFragment
 from creek.classify.llm import providers as providers_module
 from creek.classify.llm.pool_boundary import (
+    POOL_SIDECAR_VENDOR,
     POOL_URL_ENV,
     POOL_VENDOR_ENV,
     pool_wire_tier,
@@ -57,7 +58,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _CONFIG_SUBPATH: Final[tuple[str, ...]] = ("00-Creek-Meta", "creek_config.yaml")
-_VENDOR: Final[str] = "tinfoil"
 _KEY: Final[str] = "sk-ant-api03-PROVENANCEtestKEY-never-logged"
 _ENCLAVE_URL: Final[str] = "https://enclave.internal:8443"
 _ENTRY: Final[str] = "I keep saying yes to things I do not want, and I feel it later."
@@ -87,10 +87,15 @@ class TestStageLabelling:
         assert stage_inference_source("pool", {}) == INFERENCE_SOURCE_POOL_CREEK
 
     def test_an_attested_pool_carries_the_vendor_the_machine_names(self) -> None:
-        """O5's label is parameterised, which is why the wire takes a pattern."""
-        source = stage_inference_source("pool", {POOL_VENDOR_ENV: _VENDOR})
-        assert source == attested_pool_source(_VENDOR)
-        assert source == f"pool:attested:{_VENDOR}"
+        """O5's label is parameterised, which is why the wire takes a pattern.
+
+        Only in sidecar mode, the one route gated on attestation (#2040): any
+        other name publishes nothing, which ``tests/test_pool_attested_label.py``
+        pins.
+        """
+        source = stage_inference_source("pool", {POOL_VENDOR_ENV: POOL_SIDECAR_VENDOR})
+        assert source == attested_pool_source(POOL_SIDECAR_VENDOR)
+        assert source == f"pool:attested:{POOL_SIDECAR_VENDOR}"
 
     @pytest.mark.parametrize(
         "offered",
