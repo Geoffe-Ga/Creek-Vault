@@ -37,6 +37,13 @@ Four properties are owned here rather than left to call sites:
   because an omitted tier is precisely what makes the pool's own INTIMATE
   refusal impossible.
 
+Every generation and embeddings call is also **metered** here, because this
+is the one place each of them passes through: an answered call is handed to
+:func:`~creek.classify.llm.pool_meter.meter_answer` with the vendor's reported
+usage, and a call that sent its body but got no answer to
+:func:`~creek.classify.llm.pool_meter.meter_unanswered`, which counts it
+conservatively (#2007). Metering reads only counts and never fails the call.
+
 ``tests/test_ollama_endpoint_invariant.py`` keeps this module the only place a
 pool path or :data:`POOL_URL_ENV` is turned into a request.
 """
@@ -59,6 +66,12 @@ from typing import TYPE_CHECKING, Final
 from urllib.parse import urlsplit
 
 from creek.classify.llm.consent import is_managed_vault
+from creek.classify.llm.pool_meter import (
+    CREEK_RUN_POOL_VENDOR,
+    PoolCallKind,
+    meter_answer,
+    meter_unanswered,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
@@ -952,10 +965,21 @@ class PoolDial:
         self._lock = threading.Lock()
         self._connection: http.client.HTTPConnection | None = None
         self._cancelled = False
+        self._dispatched = False
 
     def __enter__(self) -> PoolDial:
         """Return this dial for use in a ``with`` block."""
         return self
+
+    @property
+    def dispatched(self) -> bool:
+        """Whether this dial began sending its request to the pool.
+
+        ``False`` until a connection exists and the request starts going out,
+        so a dial refused before that — a spent budget, a cancellation, an
+        unreachable pool, an oversized body — is known to have cost nothing.
+        """
+        return self._dispatched
 
     def __exit__(self, *_exc: object) -> None:
         """Close the connection however the block ended."""
@@ -997,6 +1021,7 @@ class PoolDial:
         body = _encode(payload)
         connection = self._connect()
         try:
+            self._dispatched = True
             connection.request(
                 _POST if body is not None else _GET,
                 path,
@@ -1202,6 +1227,73 @@ def open_pool_dial(
     return dial
 
 
+@dataclass(frozen=True, slots=True)
+class _ContentCall:
+    """One billable pool endpoint: what it is, where, and its answer cap."""
+
+    kind: PoolCallKind
+    path: str
+    max_response_bytes: int
+
+
+_GENERATE_CALL: Final[_ContentCall] = _ContentCall(
+    PoolCallKind.GENERATION, POOL_GENERATE_PATH, POOL_MAX_RESPONSE_BYTES
+)
+_CHAT_CALL: Final[_ContentCall] = _ContentCall(
+    PoolCallKind.GENERATION, POOL_CHAT_COMPLETIONS_PATH, POOL_MAX_RESPONSE_BYTES
+)
+_EMBED_CALL: Final[_ContentCall] = _ContentCall(
+    PoolCallKind.EMBEDDING, POOL_EMBEDDINGS_PATH, POOL_MAX_EMBED_RESPONSE_BYTES
+)
+
+
+def _metered_request(
+    call: _ContentCall,
+    payload: Mapping[str, object],
+    *,
+    budget: float | None,
+    environ: Mapping[str, str] | None,
+    headers: Mapping[str, str] | None,
+) -> PoolResponse:
+    """Send one content call and meter it, answered or not (#2007).
+
+    The vendor id the spend is booked to is the one the Machine environment
+    names, or :data:`~creek.classify.llm.pool_meter.CREEK_RUN_POOL_VENDOR` for
+    the Creek-run pool, so the meter needs no knowledge of any vendor.
+
+    Args:
+        call: Which billable endpoint, and its answer cap.
+        payload: The JSON request body.
+        budget: Seconds left in the vault request.
+        environ: Environment to read; ``os.environ`` when omitted.
+        headers: Per-request headers, such as the correlation id.
+
+    Returns:
+        The response.
+
+    Raises:
+        PoolBoundaryError: As :meth:`PoolDial.request`, after metering a dial
+            that had already sent its body.
+    """
+    vendor = pool_attesting_vendor(environ) or CREEK_RUN_POOL_VENDOR
+    with open_pool_dial(budget=budget, environ=environ) as dial:
+        try:
+            response = dial.request(
+                call.path,
+                payload=payload,
+                headers=headers,
+                max_response_bytes=call.max_response_bytes,
+            )
+        except PoolBoundaryError:
+            if dial.dispatched:
+                meter_unanswered(call.kind, vendor, payload)
+            raise
+    meter_answer(
+        call.kind, vendor, payload, status=response.status, payload=response.payload
+    )
+    return response
+
+
 def pool_list_models(
     *, budget: float | None = None, environ: Mapping[str, str] | None = None
 ) -> PoolResponse:
@@ -1242,8 +1334,13 @@ def pool_generate(
     Raises:
         PoolBoundaryError: As :meth:`PoolDial.request`.
     """
-    with open_pool_dial(budget=budget, environ=environ) as dial:
-        return dial.request(POOL_GENERATE_PATH, payload=payload, headers=headers)
+    return _metered_request(
+        _GENERATE_CALL,
+        payload,
+        budget=budget,
+        environ=environ,
+        headers=headers,
+    )
 
 
 def pool_attestation_report(
@@ -1287,10 +1384,13 @@ def pool_chat_completion(
     Raises:
         PoolBoundaryError: As :meth:`PoolDial.request`.
     """
-    with open_pool_dial(budget=budget, environ=environ) as dial:
-        return dial.request(
-            POOL_CHAT_COMPLETIONS_PATH, payload=payload, headers=headers
-        )
+    return _metered_request(
+        _CHAT_CALL,
+        payload,
+        budget=budget,
+        environ=environ,
+        headers=headers,
+    )
 
 
 def pool_embed(
@@ -1324,13 +1424,13 @@ def pool_embed(
     inputs = payload.get("input")
     if isinstance(inputs, list) and len(inputs) > POOL_MAX_EMBED_BATCH:
         raise PoolRequestTooLargeError(_TOO_LARGE)
-    with open_pool_dial(budget=budget, environ=environ) as dial:
-        return dial.request(
-            POOL_EMBEDDINGS_PATH,
-            payload=payload,
-            headers=headers,
-            max_response_bytes=POOL_MAX_EMBED_RESPONSE_BYTES,
-        )
+    return _metered_request(
+        _EMBED_CALL,
+        payload,
+        budget=budget,
+        environ=environ,
+        headers=headers,
+    )
 
 
 def pool_response_ok(response: PoolResponse) -> bool:

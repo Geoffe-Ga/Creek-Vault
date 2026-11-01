@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Final
 
 from creek.classify.llm.consent import managed_local_only
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+from creek.classify.llm.pool_meter import pool_spend_meter
 from creek.config import CONFIG_PATH_ENV_VAR
 from creek_mcp.container_runtime import (
     ContainerConfigurationError,
@@ -138,6 +139,8 @@ def run(settings: FlyVaultSettings) -> None:
     with (
         _runtime_environment(prepared.config_path, settings.container.vault_path),
         managed_local_only(),
+        # Pool spend is metered onto this vault's own volume (#2007).
+        pool_spend_meter(settings.container.vault_path),
     ):
         announce_rotation_window(verifier)
         announce_ungated_consumers(verifier)
