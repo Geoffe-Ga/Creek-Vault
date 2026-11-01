@@ -53,15 +53,23 @@ distinguishable from "a pool, with no usable admin key".
 PoolAdminKeyCheck.alert` maps each status onto the closed
 :class:`~creek_mcp.provisioning.budget.AlertKind` vocabulary, but **no
 production path calls it yet**, so a ``NEAR_EXPIRY`` verdict today is
-*recorded on stderr at startup, not delivered to anyone*.  Two things have to
+*recorded on stderr at startup, not delivered to anyone*.  One thing has to
 land before it can be: the fleet-report emission belongs to the attesting
 provider (#1896), which owns the only periodic pass that could re-check a
-long-running control plane, and adepthood's alert receiver enforces **its own**
-closed kind list, which today admits six kinds and not even
-``pool_credential_orphan``.  Emitting an unknown kind would be answered 400,
-which Creek's sink escalates to ``AlertDeliveryError``, which fails the
-scheduler component and takes the Machine unhealthy — so wiring an emitter
-before that list is widened would turn a warning into an outage.  Nothing here
+long-running control plane.  The receiving end is already open: adepthood's
+alert receiver enforces **its own** closed kind list, and since adepthood#3646
+that list admits every ``AlertKind`` member, these three included.
+
+The receiver-first order still binds every *future* kind.  The receiver
+refuses a payload naming any kind it does not know with a 400, which
+:class:`~creek_mcp.provisioning.pilot_alerts.HttpFleetAlertSink` does not
+retry and raises as ``AlertDeliveryError``.  Under owner decision R2-4 (#1999)
+:class:`~creek_mcp.provisioning.alert_relay.AlertRelay` contains that error:
+routing keeps running, the whole batch stays owed and is retried with backoff,
+and new activations are refused until a delivery succeeds.  An unknown kind is
+refused again on every retry, so it would hold admission closed — and hold
+back every other owed count in the batch — until adepthood admits it.  So a
+new kind ships to adepthood's receiver first, then to Creek.  Nothing here
 pretends otherwise: near-expiry is not an early warning until #1896 wires it.
 
 No spend is authorized (Decision 4): nothing here dials a vendor.
@@ -298,8 +306,8 @@ class PoolAdminKeyCheck:
         """Return this verdict's closed operator alert, or ``None``.
 
         **No production path calls this yet** — see the module docstring for
-        the two gates (#1896's fleet-report pass, and adepthood's own closed
-        kind list) that have to clear before an alert can be delivered.
+        the gate (#1896's fleet-report pass) that has to clear before an alert
+        can be delivered.  adepthood's receiver already admits all three kinds.
 
         Returns:
             The alert, or ``None`` when there is nothing to report.  The

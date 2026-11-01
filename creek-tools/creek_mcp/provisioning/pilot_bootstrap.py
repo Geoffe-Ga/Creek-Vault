@@ -165,7 +165,7 @@ def _require_custodied_pool_admin_key() -> None:
     frame and is never returned here.
 
     Nothing delivers this verdict to an operator yet: emission waits on
-    #1896's fleet-report pass and on adepthood's receiver admitting the kinds
+    #1896's fleet-report pass.  adepthood's receiver already admits the kinds
     (see the ``pool_admin_key`` module docstring).
 
     Raises:

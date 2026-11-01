@@ -9,6 +9,19 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Docs: the fleet-alert receiver is described as it is now. The
+  `pool_admin_key` module docstring and `docs/pool-measurement-pin.md` said
+  adepthood's receiver "admits six kinds and not even `pool_credential_orphan`"
+  and that a `400` from it fails the scheduler and takes the Machine unhealthy.
+  Since adepthood#3646 the receiver admits every `AlertKind` member (17 today),
+  and since R2-4 (#1999) a refused delivery is retained and retried by
+  `AlertRelay` while routing keeps running and new activations are refused.
+  The admin-key alerts still wait on #1896's fleet-report pass, and nothing
+  else. The pages, `pilot_bootstrap`'s matching note and the pilot runbook's
+  deploy-order paragraph now state the standing rule: a new alert kind ships
+  to adepthood's receiver first, then to Creek. Docs and docstrings only; no
+  behaviour change.
+
 - Vault-side pool and spend alerts now reach the operator (#2049). A managed
   vault's pool outcome alerts (`pool_attestation_failed`,
   `pool_credential_rejected`, `pool_admission_refused`,
