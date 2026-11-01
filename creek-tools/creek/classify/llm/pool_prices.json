@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "vendors": {
+    "privatemode": {
+      "status": "operator_must_fill",
+      "currency": "EUR",
+      "source_url": null,
+      "read_on": null,
+      "monthly_cap": "10.00",
+      "alert_fraction": "0.5",
+      "models": {}
+    }
+  }
+}

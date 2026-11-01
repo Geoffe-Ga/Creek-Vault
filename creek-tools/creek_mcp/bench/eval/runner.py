@@ -149,13 +149,46 @@ def run_eval(plan: EvalPlan, corpus_root: Path) -> EvalResult:
         EvalCorpusError: When the built corpus cannot serve as a reference.
         JudgeUnavailableError: When a routed judge could not produce a score.
     """
+    _check_plan(plan)
+    corpus = build_voice_corpus(corpus_root, entries=plan.entries)
+    corpus_health(corpus)
+    return score_against(plan, corpus)
+
+
+def _check_plan(plan: EvalPlan) -> None:
+    """Refuse a plan with no candidate, or whose judge kind contradicts its judge.
+
+    Raises:
+        EvalPlanError: On either refusal.
+    """
     if not plan.candidates:
         raise EvalPlanError(_NO_CANDIDATES)
     expected_kind = JudgeKind.ROUTED if plan.judge.is_cloud else JudgeKind.HERMETIC
     if plan.judge_kind is not expected_kind:
         raise EvalPlanError(_JUDGE_MISMATCH)
-    corpus = build_voice_corpus(corpus_root, entries=plan.entries)
-    corpus_health(corpus)
+
+
+def score_against(plan: EvalPlan, corpus: VoiceCorpus) -> EvalResult:
+    """Score every candidate in *plan* against an already-built *corpus*.
+
+    The scoring half of :func:`run_eval`, for a corpus that was not built from
+    the synthetic entries — the owner-run vault sample of
+    :mod:`creek_mcp.bench.eval.vault_corpus`, which is read in place and must
+    never be written. *plan*'s ``entries`` is ignored: the corpus is given.
+
+    Args:
+        plan: What to evaluate.
+        corpus: The reference corpus; read, never written.
+
+    Returns:
+        The quality score, the prompt-bearing record, and *corpus*.
+
+    Raises:
+        EvalPlanError: When the plan names no candidate, or its declared
+            ``judge_kind`` contradicts the judge it carries.
+        JudgeUnavailableError: When a routed judge could not produce a score.
+    """
+    _check_plan(plan)
     blinded = blind(plan.candidates, seed=plan.seed)
     requests: list[JudgeRequest] = []
     scores: dict[Dimension, DimensionScore] = {

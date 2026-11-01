@@ -24,6 +24,7 @@ import uvicorn
 
 from creek.classify.llm.consent import managed_local_only
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
+from creek.classify.llm.pool_meter import pool_spend_meter
 from creek.config import CONFIG_PATH_ENV_VAR
 from creek.vault_alerts import VAULT_ALERTS_PORT, installed_vault_alert_outbox
 from creek_mcp.container_runtime import (
@@ -184,6 +185,8 @@ def run(settings: FlyVaultSettings) -> None:
     with (
         _runtime_environment(prepared.config_path, settings.container.vault_path),
         managed_local_only(),
+        # Pool spend is metered onto this vault's own volume (#2007).
+        pool_spend_meter(settings.container.vault_path),
         installed_vault_alert_outbox(settings.container.vault_path) as outbox,
         private_alert_listener(
             build_vault_alerts_app(

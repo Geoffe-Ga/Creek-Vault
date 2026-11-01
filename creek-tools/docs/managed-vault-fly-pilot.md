@@ -429,6 +429,13 @@ Each scheduled report captures provider inventory and fails visibly for:
   (#1867);
 - unknown and unpriced cost inputs.
 
+The shared pool's spend is a separate line, in euros, kept on each vault rather
+than in this report. Each vault meters the tokens it sends and names
+`monthly_budget_departure` in its own log at €5, half the pilot key's €10
+monthly cap (R4-1, R4-2). `python -m creek_mcp.container_health --check pool` prints the
+month to date. Prices must be pinned first; see
+[Spend metering and the €5 alert](pool-measurement-pin.md#spend-metering-and-the-5-alert-r4-2-2007).
+
 **Deploy order for `provider_credential_expiring`.** Adepthood's alert receiver
 validates the closed kind list, and an unknown kind is refused, which Creek
 treats as an alert-delivery failure. Deploy a Creek build that can raise this

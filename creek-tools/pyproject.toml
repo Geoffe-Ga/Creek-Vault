@@ -429,6 +429,7 @@ include = ["creek", "creek.*", "creek_mcp", "creek_mcp.*"]
 "creek.templates" = ["**/*", "**/.gitkeep"]
 "creek.classify.examples" = ["*.yaml"]
 "creek.generate.exemplars" = ["*.yaml"]
+"creek.classify.llm" = ["pool_prices.json"]
 
 [tool.pytest.ini_options]
 # pytest 9 is required: this config uses the `strict_markers` / `strict_config`
