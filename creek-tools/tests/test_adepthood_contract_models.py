@@ -640,6 +640,7 @@ EXPECTED_ERROR_CODES: frozenset[str] = frozenset(
         "unavailable",
         "temporarily_unavailable",
         "rate_limited",
+        "request_key_rejected",
         "internal_error",
     }
 )
@@ -655,11 +656,12 @@ EXPECTED_ERROR_STATUS: tuple[tuple[str, int], ...] = (
     ("unavailable", 503),
     ("temporarily_unavailable", 503),
     ("rate_limited", 429),
+    ("request_key_rejected", 424),
     ("internal_error", 500),
 )
 
 ALLOWED_HTTP_STATUSES: frozenset[int] = frozenset(
-    {401, 403, 404, 409, 415, 422, 429, 500, 501, 503}
+    {401, 403, 404, 409, 415, 422, 424, 429, 500, 501, 503}
 )
 
 EXPECTED_RETRY_POLICY: tuple[tuple[str, str], ...] = (
@@ -673,6 +675,7 @@ EXPECTED_RETRY_POLICY: tuple[tuple[str, str], ...] = (
     ("unavailable", "retry_after_operator_action"),
     ("temporarily_unavailable", "retry_with_backoff"),
     ("rate_limited", "retry_with_backoff"),
+    ("request_key_rejected", "terminal"),
     ("internal_error", "retry_with_backoff"),
 )
 
@@ -916,14 +919,16 @@ def test_contract_model_rejects_an_unknown_key(model_name: str) -> None:
 
 
 def test_error_code_membership_is_frozen() -> None:
-    """``ErrorCode`` carries exactly the eleven agreed wire codes.
+    """``ErrorCode`` carries exactly the twelve agreed wire codes.
 
     Nine since contract 0.2; ``unsupported_source`` joined at 0.8 (#1524),
-    which is also what brought ``415`` into the published status set, and
-    ``rate_limited`` joined at 0.19 (#1894, ADR-0016), which brought ``429``.
+    which is also what brought ``415`` into the published status set,
+    ``rate_limited`` joined at 0.19 (#1894, ADR-0016), which brought ``429``,
+    and ``request_key_rejected`` joined at 0.28 (ADR-0015), which brought
+    ``424``.
     """
     assert {code.value for code in ErrorCode} == EXPECTED_ERROR_CODES
-    assert len(ErrorCode) == 11
+    assert len(ErrorCode) == 12
 
 
 def test_error_code_has_no_care_escalation_member() -> None:

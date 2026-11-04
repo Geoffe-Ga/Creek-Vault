@@ -39,6 +39,7 @@ from creek_mcp.api.models import (
     Capability,
     ErrorCode,
     ExportResponse,
+    minor_at_least,
 )
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.httpapi import export as export_mod
@@ -519,7 +520,7 @@ def test_a_vault_with_a_second_consumer_refuses_and_reads_nothing(
 def test_the_route_is_gated_on_its_minor(vault: Path) -> None:
     """A ``0.26`` caller is neither told about the route nor served it."""
     assert CAPABILITY_SINCE_MINOR[Capability.EXPORT] == _EXPORT_MINOR
-    assert CONTRACT_MINOR == _EXPORT_MINOR
+    assert minor_at_least(CONTRACT_MINOR, _EXPORT_MINOR)
     with _owner_client(vault) as test_client:
         old = test_client.get(EXPORT_PATH, headers=headers(minor=_BEFORE_EXPORT_MINOR))
         old_caps = test_client.get(

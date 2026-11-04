@@ -520,6 +520,12 @@ neither told about the route nor served it, and `0.26` stays in the window.
 Adepthood can use the route only once its pin reaches `0.27`, which R2-5 lets
 it do after every vault reports `0.27`.
 
+`0.28.0` adds one error code, `request_key_rejected`, at HTTP `424`, served on
+`POST /v1/reflections` and `POST /v1/letters/{external_id}` when the vendor
+refuses the writer's request key. Before, both routes answered that refusal
+`503 temporarily_unavailable`. A `0.27` caller is still served that `503`,
+byte-identical, and `0.27` stays in the window.
+
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE
 /v1/connectors/drive` and `POST /v1/connectors/drive/syncs`. It is additive in
@@ -741,6 +747,7 @@ existence-and-rank oracle. Clients must branch on `code`, never parse prose.
 | `unavailable` | 503 | retry after operator action |
 | `temporarily_unavailable` | 503 | retry with backoff |
 | `rate_limited` | 429 | retry with backoff |
+| `request_key_rejected` | 424 | terminal |
 | `internal_error` | 500 | retry with backoff |
 
 Retry policy is the static published table (`retry-policy.json`), a pure
@@ -769,6 +776,22 @@ declaring the minor its route began serving it at — `0.19` for reflections,
 pre-`0.19` caller that is the only spelling its vendored vocabulary has; for a
 `0.20` caller asking for a letter it is the version window holding, because the
 document that minor published records no 429 on that route.
+
+**`request_key_rejected` means the writer's own key, and only that.** Added at
+contract `0.28.0` ([ADR-0015](architecture/ADR/0015-request-scoped-byok-on-managed-vaults.md)),
+it is served on `POST /v1/reflections` and `POST /v1/letters/{external_id}`
+when the vendor answered the key you sent in `X-Creek-Provider-Key` with
+`401` or `403`. It is terminal: the same key fails the same way on every
+attempt, so ask the writer for a new key rather than retrying. The status is
+`424 Failed Dependency` because the request failed when the vendor call it
+depended on failed, and because the OpenAPI document carries one response
+object per status, so it cannot share `503` with `temporarily_unavailable`.
+The message is a constant and carries nothing from the vendor's reply. A
+request without a key never earns it: the operator's own refused key is still
+`503 temporarily_unavailable`. A caller declaring a minor below `0.28` is
+served `503 temporarily_unavailable` for a refused key, as before. A
+classification job reports the same fact as `failure_code:
+"request_key_rejected"` on `GET /v1/jobs/{job_id}` (since `0.26.0`).
 
 **What `rate_limited` actually is, stated precisely, because two plausible
 readings of it are wrong.**

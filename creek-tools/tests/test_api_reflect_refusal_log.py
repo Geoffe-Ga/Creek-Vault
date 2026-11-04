@@ -193,6 +193,7 @@ def test_an_answered_reflection_logs_no_refusal(
     [
         (PROMPT_TOO_LONG_REASON, PROMPT_TOO_LONG_REASON),
         (RATE_LIMITED_REASON, RATE_LIMITED_REASON),
+        ("reflection request key rejected", "reflection request key rejected"),
         (
             "reflection unavailable: IntimateRoutingError",
             "reflection unavailable: IntimateRoutingError",

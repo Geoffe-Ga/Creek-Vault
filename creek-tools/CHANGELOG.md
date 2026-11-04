@@ -9,6 +9,22 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- A writer's refused provider key is now reported as refused, not as a wait
+  (contract 0.28.0, ADR-0015). When the vendor answered a writer's
+  request-scoped key `401`/`403` on `POST /v1/reflections` or
+  `POST /v1/letters/{external_id}`, both routes caught the typed
+  `RequestKeyRejectedError` as a plain `RuntimeError` and served
+  `503 temporarily_unavailable`. The consumer then told the writer to try
+  again, which can never clear a rejected key. Both routes now serve the new
+  closed code `request_key_rejected` at `424 Failed Dependency`, disposition
+  `terminal`, with one constant message about the key. A caller declaring a
+  minor below 0.28 is still served the `503` it was served before,
+  byte-identical but for the correlation id, through the shared
+  `served_error_code` and `REQUEST_KEY_REJECTED_SINCE_MINOR`. The operator's
+  own refused key is unchanged. `0.27` stays served. The bundle
+  (`retry-policy.json`, the `ErrorEnvelope` schema, the manifest), the OpenAPI
+  golden, both contract ADRs, ADR-0015 and `docs/api.md` move with it.
+
 - Docs: the fleet-alert receiver is described as it is now. The
   `pool_admin_key` module docstring and `docs/pool-measurement-pin.md` said
   adepthood's receiver "admits six kinds and not even `pool_credential_orphan`"

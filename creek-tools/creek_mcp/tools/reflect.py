@@ -75,7 +75,10 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol
 from creek._containment import escaping_child
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
 from creek.classify.llm.pool_boundary import pool_prompt_within_cap
-from creek.classify.llm.providers import ProviderRateLimitError
+from creek.classify.llm.providers import (
+    ProviderRateLimitError,
+    RequestKeyRejectedError,
+)
 from creek.vault.reader import CORPUS_SUBDIRS, try_validate_fragment
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
@@ -142,6 +145,22 @@ pool-capped one should. The ``retry_after`` such an error may carry is **not**
 forwarded: the published ``Retry-After`` is a constant, because a wait derived
 from a vendor's own response would relay upstream detail this surface never
 relays.
+"""
+
+REQUEST_KEY_REJECTED_REASON: Final[str] = "reflection request key rejected"
+"""The refusal reason for a writer's request key its vendor refused (0.28).
+
+Separated from the generic provider-failure refusal for the reason
+:data:`RATE_LIMITED_REASON` is: the two want different client behaviour. An
+outage may clear on retry; a key the vendor answered ``401``/``403`` fails the
+same way every time, and only the writer replacing it helps (ADR-0015).
+:func:`creek_mcp.httpapi.reflect.reflect_refusal_code` maps it to
+``request_key_rejected``. Raised only for a call that carried a request key, so
+the operator's own refused key still reaches the generic refusal. Fixed text:
+never the key, the vendor's message or its status.
+
+Imported by the HTTP adapter rather than respelled there, like
+:data:`PROMPT_TOO_LONG_REASON`.
 """
 
 _DEFAULT_MAX_NOTES = 6
@@ -1202,26 +1221,11 @@ def reflect_tool(
         max_tokens = _reflection_output_token_budget(max_notes)
         llm = llm_factory(tier, max_tokens=max_tokens)
         response_text = llm(prompt)
-    except ProviderRateLimitError:
-        # A cap, not an outage. Separated from the refusal below because only
-        # one of the two is cleared by waiting, and contract 0.19 gives them
-        # different wire codes.
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            reason=RATE_LIMITED_REASON,
-        )
     except RuntimeError as exc:
-        # Covers a missing/unavailable provider, ``IntimateRoutingError`` and
-        # every ``PoolBoundaryError`` — the router raises the first rather
-        # than egressing intimate content when no local backend exists, and
-        # the pool boundary raises the last when its one destination refuses,
-        # is unreachable, or dies mid-request after accepting the connection
-        # (#1894: that last path used to escape as an unhandled ``OSError``).
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
-            reason=f"reflection unavailable: {type(exc).__name__}",
+            reason=_dial_refusal_reason(exc),
         )
 
     raw_notes, essay = _parse_notes(response_text)
@@ -1240,6 +1244,42 @@ def reflect_tool(
         ceiling=privacy_tier_ceiling,
         tier=tier,
     )
+
+
+def _dial_refusal_reason(exc: RuntimeError) -> str:
+    """Return the published refusal reason for a failed model dial.
+
+    Three outcomes, distinguished because each wants different client
+    behaviour and, on ``/v1``, a different wire code:
+
+    - :class:`~creek.classify.llm.providers.ProviderRateLimitError` is a cap,
+      not an outage: only waiting clears it (contract 0.19).
+    - :class:`~creek.classify.llm.providers.RequestKeyRejectedError` is the
+      writer's own key refused by its vendor: nothing but a new key clears it
+      (contract 0.28). Both subclass ``RuntimeError``, which is why they are
+      tested here first rather than falling through to the generic reason —
+      the fall-through once told a writer to retry a key that will never be
+      accepted.
+    - Anything else covers a missing/unavailable provider,
+      ``IntimateRoutingError`` and every ``PoolBoundaryError`` — the router
+      raises the first rather than egressing intimate content when no local
+      backend exists, and the pool boundary raises the last when its one
+      destination refuses, is unreachable, or dies mid-request after
+      accepting the connection (#1894). Its reason carries only the
+      exception's type name, never its message.
+
+    Args:
+        exc: What the factory or the completion raised.
+
+    Returns:
+        :data:`RATE_LIMITED_REASON`, :data:`REQUEST_KEY_REJECTED_REASON`, or
+        ``"reflection unavailable: <TypeName>"``.
+    """
+    if isinstance(exc, ProviderRateLimitError):
+        return RATE_LIMITED_REASON
+    if isinstance(exc, RequestKeyRejectedError):
+        return REQUEST_KEY_REJECTED_REASON
+    return f"reflection unavailable: {type(exc).__name__}"
 
 
 def _related(

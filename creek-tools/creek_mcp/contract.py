@@ -20,8 +20,28 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.27.0"
+CONTRACT_VERSION: Final[str] = "0.28.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.28.0 (ADR-0015): a writer's request-scoped key refused by its vendor
+(``401``/``403``) on ``POST /v1/reflections`` or
+``POST /v1/letters/{external_id}`` is served as the new closed code
+``request_key_rejected``, ``424 Failed Dependency``, retry disposition
+``terminal``. Both routes used to catch the typed
+``RequestKeyRejectedError`` 0.26 introduced as a plain ``RuntimeError`` and
+serve ``503 temporarily_unavailable``, so the consumer told the writer to wait
+and try again — which can never clear a rejected key. The message is one
+constant about the key and nothing else, and the vendor was dialled once.
+``424`` because the OpenAPI document carries one response object per status
+and every other plausible one is taken; the request failed because the request
+it depended on, the vendor call, did. A caller declaring a minor below
+:data:`~creek_mcp.api.models.REQUEST_KEY_REJECTED_SINCE_MINOR` is served the
+``503 temporarily_unavailable`` it has always received, byte-identical but for
+the correlation id, through the one
+:func:`creek_mcp.httpapi.generation.served_error_code`. The operator's own key
+refused by its vendor is unchanged: only the writer's key is the writer's to
+replace. No MCP tool's shape moves, because no MCP call carries a request key.
+``0.27`` stays served.
 
 0.27.0 (#2033, adepthood#3579): ``/v1`` publishes a thirteenth capability,
 ``export``, served by ``GET /v1/export?cursor=&limit=``: the owner's own

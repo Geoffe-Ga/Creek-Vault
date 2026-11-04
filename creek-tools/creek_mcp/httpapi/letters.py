@@ -59,6 +59,7 @@ from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.generation import (
     declared_minor_at_least,
     served_error_code,
+    serves_request_key_rejected,
 )
 from creek_mcp.httpapi.journal import admissible_external_id
 from creek_mcp.httpapi.vault import configured_vault, request_key_of
@@ -87,6 +88,7 @@ REFUSAL_CODES: Final[dict[LetterRefusal, ErrorCode]] = {
     LetterRefusal.ABOVE_CEILING: ErrorCode.PRIVACY_REFUSED,
     LetterRefusal.PROVIDER_UNAVAILABLE: ErrorCode.TEMPORARILY_UNAVAILABLE,
     LetterRefusal.RATE_LIMITED: ErrorCode.RATE_LIMITED,
+    LetterRefusal.REQUEST_KEY_REJECTED: ErrorCode.REQUEST_KEY_REJECTED,
     LetterRefusal.EMPTY_LETTER: ErrorCode.TEMPORARILY_UNAVAILABLE,
     LetterRefusal.STORAGE_BUSY: ErrorCode.TEMPORARILY_UNAVAILABLE,
     LetterRefusal.STORAGE_INVALID: ErrorCode.INTERNAL_ERROR,
@@ -109,6 +111,13 @@ identically wherever a caller meets it (#1903 step 6). The concurrency sheds in
 :data:`~creek_mcp.api.models.LETTER_RATE_LIMITED_SINCE_MINOR` is served the
 ``temporarily_unavailable`` this route answered at ``0.20``, by
 :func:`~creek_mcp.httpapi.generation.served_error_code`.
+
+``REQUEST_KEY_REJECTED`` is ``424`` and terminal, the code and status
+``POST /v1/reflections`` serves for the same refused writer's key since
+contract 0.28: no retry clears a key its vendor refused, so a ``503`` would
+send the writer round a loop. A caller below
+:data:`~creek_mcp.api.models.REQUEST_KEY_REJECTED_SINCE_MINOR` is served the
+``temporarily_unavailable`` this route answered before, by the same function.
 """
 
 
@@ -251,6 +260,7 @@ def _render(
     inference_source: str | None,
     *,
     serve_rate_limited: bool,
+    serve_request_key_rejected: bool,
 ) -> Response:
     """Map one tool outcome onto its wire response.
 
@@ -262,7 +272,9 @@ def _render(
     """
     if isinstance(outcome, LetterRefusal):
         code = served_error_code(
-            REFUSAL_CODES[outcome], serve_rate_limited=serve_rate_limited
+            REFUSAL_CODES[outcome],
+            serve_rate_limited=serve_rate_limited,
+            serve_request_key_rejected=serve_request_key_rejected,
         )
         return error_response(code, context)
     if isinstance(outcome, LetterEscalation):
@@ -311,4 +323,5 @@ async def handle_letter(request: Request) -> Response:
         serve_rate_limited=declared_minor_at_least(
             request, LETTER_RATE_LIMITED_SINCE_MINOR
         ),
+        serve_request_key_rejected=serves_request_key_rejected(request),
     )
