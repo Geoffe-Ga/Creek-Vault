@@ -5817,7 +5817,8 @@ def _build_draft_llm_factory(
         if cached is not None:
             return cached
         try:
-            resolved = config.model_router.resolve("classification", tier)
+            # A draft is generation: ``classification`` names the labelling model.
+            resolved = config.model_router.resolve("generation", tier)
         except IntimateRoutingError as exc:
             # The one refusal that must be legible, exactly as on ``creek
             # compile`` (#962): keying the call by tier *introduces* this

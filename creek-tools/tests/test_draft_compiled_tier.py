@@ -79,11 +79,13 @@ _VAULT_CLOUD_MODEL = "vault-cloud-model"
 
 
 def _write_routing_config(vault: Path) -> None:
-    """Write a two-stage routing config: local ``default``, cloud ``classification``.
+    """Write a routing config: local ``default``, cloud ``generation``.
 
-    ``creek draft`` resolves the ``classification`` stage, so a config whose
-    classification provider is a cloud one is what makes "routed local" an
-    observable event rather than a tautology.
+    ``creek draft`` resolves the ``generation`` stage, so a config whose
+    generation provider is a cloud one is what makes "routed local" an
+    observable event rather than a tautology. ``classification`` names a
+    different cloud model, so a draft that resolved the wrong stage would
+    surface as the wrong model name.
 
     Args:
         vault: Vault root; the config lands in ``00-Creek-Meta``.
@@ -94,23 +96,25 @@ def _write_routing_config(vault: Path) -> None:
         "llm:\n"
         f"  default:\n    provider: ollama\n    model: {_VAULT_LOCAL_MODEL}\n"
         f"  classification:\n"
+        f"    provider: anthropic\n    model: {_VAULT_CLOUD_MODEL}-labelling\n"
+        f"  generation:\n"
         f"    provider: anthropic\n    model: {_VAULT_CLOUD_MODEL}\n",
         encoding="utf-8",
     )
 
 
 def _assert_unrouted_resolution_is_cloud(vault: Path) -> None:
-    """Pin that this vault's config resolves ``classification`` to the cloud.
+    """Pin that this vault's config resolves ``generation`` to the cloud.
 
     The anti-vacuity half of the CLI assertion: without it, "routed local"
-    would pass for free on a config whose classification stage was local to
+    would pass for free on a config whose generation stage was local to
     begin with.
 
     Args:
         vault: Vault whose ``creek_config.yaml`` is under test.
     """
     config = load_config(vault / "00-Creek-Meta" / "creek_config.yaml")
-    unrouted = config.model_router.resolve("classification", PrivacyTier.OPEN)
+    unrouted = config.model_router.resolve("generation", PrivacyTier.OPEN)
     assert unrouted.provider == "anthropic"
     assert unrouted.model == _VAULT_CLOUD_MODEL
 

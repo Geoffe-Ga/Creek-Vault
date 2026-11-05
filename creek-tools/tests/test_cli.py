@@ -5621,6 +5621,48 @@ def test_build_draft_llm_falls_back_to_config_max_tokens(
     assert captured["max_tokens"] == 2048
 
 
+@pytest.mark.parametrize("tier_name", ["OPEN", "PERSONAL"])
+def test_build_draft_llm_routes_through_the_generation_stage(
+    monkeypatch: pytest.MonkeyPatch, tier_name: str
+) -> None:
+    """A draft is generation: it must use ``llm.generation``, not classification.
+
+    The two stages name different models, so a factory that resolved the
+    ``classification`` stage would write every essay with the labelling
+    model while the config promises the drafting one.
+    """
+    from creek import cli as cli_module
+    from creek.classify.llm.providers import AnthropicCompletion
+    from creek.config import CreekConfig, LLMConfig, LLMRoutingConfig
+    from creek.models import PrivacyTier
+
+    built: list[LLMConfig] = []
+
+    class _Classifier:
+        available = True
+
+        def __init__(self, config: LLMConfig) -> None:
+            built.append(config)
+
+        def invoke_prompt_with_metadata(
+            self,
+            prompt: str,
+            *,
+            max_tokens: int | None = None,
+        ) -> AnthropicCompletion:
+            del prompt, max_tokens
+            return AnthropicCompletion(text="body")
+
+    monkeypatch.setattr("creek.classify.llm.LLMClassifier", _Classifier)
+    routing = LLMRoutingConfig(
+        classification=LLMConfig(provider="anthropic", model="labelling-model"),
+        generation=LLMConfig(provider="anthropic", model="drafting-model"),
+    )
+    factory = cli_module._build_draft_llm_factory(CreekConfig(llm=routing))
+    factory(PrivacyTier[tier_name])("a prompt")
+    assert [config.model for config in built] == ["drafting-model"]
+
+
 # ---- voice-check subcommand ------------------------------------------
 
 
