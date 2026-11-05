@@ -1,0 +1,19 @@
+# DAST-only tooling, installed by .github/workflows/dast-contract.yml and by
+# nothing else. An exact (==) pin, so a gate's verdict never depends on the day
+# it ran: scripts/dast-contract-fuzz.sh fixes the seed, and this fixes the tool.
+#
+# Deliberately NOT in pyproject.toml's [dev] extra or uv.lock. Schemathesis pulls
+# in hypothesis, jsonschema-rs, werkzeug, requests, rich and pyrate-limiter --
+# a large transitive surface to add to every contributor's environment, and to
+# every pip-audit run, for a tool no local gate invokes.
+#
+# To run the planted-bug proof locally:
+#   uv pip install -r requirements-dast.txt
+#   python -m pytest tests/dast_planted_bug_check.py --no-cov
+# Without the executable that check fails with a message naming this file.
+#
+# Bump deliberately: the planted-bug proof in the DAST workflow runs against
+# whatever is pinned here, so an upgrade that stops catching a 500, stops
+# catching a schema violation, or starts printing the bearer token into its
+# report turns the workflow red before it reports on the real API.
+schemathesis==4.32.3

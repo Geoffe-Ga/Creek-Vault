@@ -348,6 +348,12 @@ creek-tools/
 │   ├── coverage-per-file.sh          # Per-file gate (80% strict, 65% waiver floor; TEST-002)
 │   ├── coverage-waivers.txt          # Documented waivers for the per-file gate
 │   ├── coverage.sh                   # pytest --cov-fail-under (90% aggregate)
+│   ├── dast-contract-fuzz.sh         # DAST PR gate: Schemathesis over every /v1 operation
+│   ├── dast-schemathesis.toml        # Per-operation allowances for documented 503 refusals
+│   ├── dast-zap-rules.tsv            # Nightly ZAP rule dispositions, each with a reason
+│   ├── dast_scan_evidence.py         # Proves the ZAP scan got past the bearer gate
+│   ├── dast_serve.py                 # Starts the DAST target: production CLI + access log
+│   ├── dast_zap_sarif.py             # ZAP JSON report -> SARIF for the Security tab
 │   ├── dev-setup.sh                  # One-shot CI-equivalent dev environment (issue #206)
 │   ├── fix-all.sh                    # Auto-fix the lint + format gates
 │   ├── format.sh                     # Ruff format
@@ -386,6 +392,7 @@ creek-tools/
 ├── uv.lock                           # Canonical pinned lockfile (uv sync)
 ├── requirements.txt                  # Unpinned pip fallback (production)
 ├── requirements-dev.txt              # Unpinned pip fallback (development)
+├── requirements-dast.txt             # Exact Schemathesis pin, DAST workflows only
 ├── README.md                         # Project overview
 └── CLAUDE.md                         # This file
 ```
