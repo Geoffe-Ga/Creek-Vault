@@ -9,6 +9,17 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `creek draft` now writes with the `generation` model. The CLI draft
+  factory resolved the `classification` stage, so a vault routing
+  `classification` to a small labelling model (Haiku, say) and `generation` to
+  a drafting model (Sonnet) had every essay written by the labelling model. The
+  bug predates #1031 and survived it, because the tier-routing tests put their
+  only cloud model on `classification`. The factory resolves `generation`, the
+  stage `creek compile` and the config comments already promised. The routing
+  fixtures now give `classification` and `generation` different model names, so
+  resolving the wrong stage fails those tests. `creek draft` on a config that
+  sets no `generation` stage falls back to `default`, as every other stage does.
+
 - Docs: the fleet-alert receiver is described as it is now. The
   `pool_admin_key` module docstring and `docs/pool-measurement-pin.md` said
   adepthood's receiver "admits six kinds and not even `pool_credential_orphan`"
