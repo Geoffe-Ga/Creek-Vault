@@ -1,0 +1,202 @@
+name: DAST Contract Fuzz
+
+# Boots a throwaway instance of the /v1 vault API on loopback and asks one
+# question of every operation it publishes: can schema-aware but adversarial
+# input make this endpoint break its own contract -- a 500, a body its own
+# document forbids, a status it never declared?
+#
+# The instance is production-shaped where it matters to an attacker: the same
+# `creek-tools-api` startup refusals (scripts/dast_serve.py only adds a log
+# handler), the same bearer gate, the same uv.lock resolution and the same
+# extras the single-vault image installs (Dockerfile), so no local embedding
+# model is present. It is throwaway where it must be: a freshly scaffolded vault
+# under $RUNNER_TEMP and a token minted for this run.
+#
+# The document is `creek-tools-api --print-openapi` from the same checkout. It
+# is generated from creek_mcp/api/routes.py, the one table the Starlette adapter
+# also routes from, so the spec this gate judges against cannot drift away from
+# the code it is judging.
+#
+# A pull-request gate, and deliberately path-filtered to what can change the
+# answer. Running on `pull_request` does not by itself make it a required check:
+# a branch-protection rule naming it would wait forever on a PR the filter
+# skipped, so making it required means dropping the filter first.
+#
+# Never `pull_request_target`: this job checks out and executes the head of the
+# branch under test, so it must not hold write-scoped credentials.
+
+on:
+  # Scoped to main: unscoped, `push` also fires on every PR branch push and
+  # starts a second identical run beside the `pull_request` one.
+  push:
+    branches: [main]
+    paths:
+      - "creek-tools/creek/**"
+      - "creek-tools/creek_mcp/**"
+      - "creek-tools/scripts/dast*"
+      - "creek-tools/tests/dast_planted_bug_check.py"
+      - "creek-tools/pyproject.toml"
+      - "creek-tools/uv.lock"
+      - "creek-tools/requirements-dast.txt"
+      - ".github/workflows/dast-contract.yml"
+  # The same list as `push`, kept identical by tests/test_dast_workflows.py.
+  pull_request:
+    paths:
+      - "creek-tools/creek/**"
+      - "creek-tools/creek_mcp/**"
+      - "creek-tools/scripts/dast*"
+      - "creek-tools/tests/dast_planted_bug_check.py"
+      - "creek-tools/pyproject.toml"
+      - "creek-tools/uv.lock"
+      - "creek-tools/requirements-dast.txt"
+      - ".github/workflows/dast-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dast-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Kept equal to ci.yml's pin; see the reasoning there.
+  UV_PINNED_VERSION: '0.13.4'
+
+jobs:
+  contract-fuzz:
+    name: Fuzz every /v1 operation against its own contract
+    runs-on: ubuntu-latest
+    # The fuzz itself takes seconds; this ceiling only stops a wedged server or
+    # a hung install from running forever.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: creek-tools
+    env:
+      BASE_URL: http://127.0.0.1:8823
+      DAST_CONSUMER: dast
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Cache uv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-dast-${{ hashFiles('creek-tools/uv.lock', 'creek-tools/requirements-dast.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-dast-
+
+      - name: Install the production resolution plus the fuzzer
+        run: |
+          python -m pip install "uv==${UV_PINNED_VERSION}"
+          # The single-vault image's extras, exactly (Dockerfile).
+          uv sync --locked --no-dev \
+            --extra anthropic --extra openai \
+            --extra documents --extra spreadsheets --extra presentations \
+            --extra embeddings-cache
+          # pytest for the planted-bug proof, constrained to uv.lock so it is
+          # the version every other lane runs; schemathesis at its own pin.
+          uv export --locked --all-extras --no-emit-project --no-hashes \
+            -o "$RUNNER_TEMP/locked.txt"
+          uv pip install -r requirements-dast.txt pytest -c "$RUNNER_TEMP/locked.txt"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      # Prove the pinned fuzzer catches a planted 500, a planted schema lie and
+      # an unallowed 503 before trusting it to report on the real API. A gate
+      # that has never been watched fail is not known to work. The suite
+      # fails -- never skips -- when the executable is missing.
+      #
+      # --noconftest and an empty addopts: tests/conftest.py and the coverage
+      # flags belong to the unit lane and need its full dev environment; this
+      # check needs neither.
+      - name: Prove the fuzzer catches a planted bug
+        run: python -m pytest --noconftest -o addopts="" -p no:cacheprovider tests/dast_planted_bug_check.py
+
+      - name: Scaffold a throwaway vault and mint a token
+        run: |
+          VAULT="$RUNNER_TEMP/vault"
+          creek init --vault "$VAULT"
+          # `vault_path: .` resolves against the server's working directory;
+          # pinned absolute so the instance can never write into the checkout.
+          sed -i "s#^vault_path: .*#vault_path: $VAULT#" "$VAULT/00-Creek-Meta/creek_config.yaml"
+          grep -qx "vault_path: $VAULT" "$VAULT/00-Creek-Meta/creek_config.yaml"
+          TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+          echo "::add-mask::$TOKEN"
+          {
+            echo "VAULT=$VAULT"
+            echo "DAST_TOKEN=$TOKEN"
+            echo "API_LOG=$RUNNER_TEMP/api.log"
+            echo "OPENAPI_DOC=$RUNNER_TEMP/openapi.json"
+            echo "REPORT_DIR=$RUNNER_TEMP/dast-contract-report"
+            echo "CONTRACT_MINOR=$(python -c 'from creek_mcp.api.models import CONTRACT_MINOR; print(CONTRACT_MINOR)')"
+          } >> "$GITHUB_ENV"
+
+      - name: Start the target instance
+        run: |
+          # From $RUNNER_TEMP, with the checkout on PYTHONPATH, so nothing the
+          # server writes relative to its working directory lands in the repo.
+          cd "$RUNNER_TEMP"
+          CREEK_MCP_CONSUMER_TOKENS="$DAST_CONSUMER=$DAST_TOKEN" \
+          PYTHONPATH="$GITHUB_WORKSPACE/creek-tools" \
+            nohup python -m scripts.dast_serve \
+              --config "$VAULT/00-Creek-Meta/creek_config.yaml" > "$API_LOG" 2>&1 &
+
+      - name: Wait for readiness and prove the token opens an authenticated route
+        run: |
+          # /v1/health is itself behind the bearer gate, so a 200 here proves
+          # the instance is up AND the token works; then /v1/wheel proves the
+          # contract-minor header is accepted too. Without both, the fuzz would
+          # be a very expensive 401 test.
+          for _ in $(seq 1 45); do
+            if curl -fsS -o /dev/null -H "Authorization: Bearer $DAST_TOKEN" "$BASE_URL/v1/health"; then
+              curl -fsS -o /dev/null \
+                -H "Authorization: Bearer $DAST_TOKEN" \
+                -H "X-Creek-Contract-Version: $CONTRACT_MINOR" \
+                "$BASE_URL/v1/wheel"
+              echo "instance is ready and the token is accepted"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the instance never became ready"
+          cat "$API_LOG"
+          exit 1
+
+      - name: Export the published document
+        run: python -m creek_mcp.httpapi --print-openapi > "$OPENAPI_DOC"
+
+      # The command lives in a script so a test can run it with a recording
+      # stub and assert on the argv it builds. Nothing may be appended to this
+      # step: a trailing command would become its exit code.
+      - name: Contract fuzz
+        run: scripts/dast-contract-fuzz.sh
+
+      # Schemathesis renders the header it was handed as `Authorization:
+      # [Filtered]` in every reproduction it prints; the planted-bug proof
+      # asserts that still holds for the pinned version, so the token does not
+      # reach this public artifact.
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dast-contract-report
+          path: ${{ runner.temp }}/dast-contract-report
+          if-no-files-found: warn
+
+      - name: Stop the instance
+        if: always()
+        run: pkill -f "scripts.dast_serve" || echo "no instance left to stop"
+
+      - name: Server log
+        if: always()
+        run: cat "$API_LOG" || echo "no server log was written"

@@ -1,0 +1,298 @@
+name: DAST Deep API Scan
+
+# Boot a throwaway instance of the /v1 vault API and attack it with OWASP ZAP.
+#
+# dast-contract.yml asks a narrow question on every pull request -- can
+# schema-aware input make an endpoint break its own contract -- and is budgeted
+# to finish in a minute or two. This is the job that can afford to be slow: it
+# imports the document the instance publishes about itself into ZAP and lets
+# ZAP spend up to twenty minutes sending the payloads a fuzzer never sends --
+# traversal strings, injection probes, malformed encodings -- at every
+# published operation, while the passive rules read every response.
+#
+# ADVISORY BY DESIGN. ZAP's own findings never redden the run (`fail_action:
+# false`); the verdict is published where a verdict survives -- the Security
+# tab, with history and dismissal tracking -- plus a raw artifact. What DOES
+# redden the run is the harness failing: the instance never becoming ready, the
+# token not working, ZAP's traffic never getting past the bearer gate, or ZAP
+# writing no report -- the states in which a clean-looking result means nothing
+# was scanned. Those open or update ONE tracking issue (job `report-failure`).
+#
+# WHY THE API SCAN AND NOT THE BASELINE SPIDER. /v1 serves JSON, has no HTML
+# and nothing to crawl, so a spider would visit one URL and report a clean sweep
+# of nothing. Importing the OpenAPI document puts ZAP in front of the real
+# router surface.
+#
+# NEVER SCAN A HOST THIS JOB DID NOT START. The target is hardcoded to the
+# loopback instance started below, and tests/test_dast_workflows.py fails the
+# build if any other host is ever named here. Pointing a nightly attack scan at
+# a deployed vault -- they hold people's journals -- would be an unauthorised
+# scan, not a CI change.
+#
+# Never `pull_request` and never `pull_request_target`: a scan reachable from a
+# fork would let anyone aim these payloads using code they wrote themselves.
+
+on:
+  schedule:
+    # 03:17 UTC nightly, off the hour so it does not queue behind every other
+    # repository's midnight-aligned cron.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# Least privilege: `contents: read` for the checkout, `security-events: write`
+# for the SARIF upload. The reporting job declares the wider set it needs on
+# itself, so the job that runs an attack container never holds issue scope.
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  # Two ZAP containers attacking one loopback instance would each report on the
+  # other's traffic. Queue a manual dispatch behind a nightly run, never kill it.
+  group: dast-deep
+  cancel-in-progress: false
+
+env:
+  # Kept equal to ci.yml's pin; see the reasoning there.
+  UV_PINNED_VERSION: '0.13.4'
+
+jobs:
+  zap-api-scan:
+    name: Attack an ephemeral instance and publish what it finds
+    runs-on: ubuntu-latest
+    # ZAP's attack phase is bounded at twenty minutes by
+    # scanner.maxScanDurationInMins below; this ceiling covers install, boot,
+    # the image pull and the conversion on top, and only exists so a wedged
+    # container cannot run for six hours. A job cancelled at its ceiling writes
+    # no SARIF, so this must never be the thing that stops the scan.
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: creek-tools
+    env:
+      BASE_URL: http://127.0.0.1:8823
+      DAST_CONSUMER: dast
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The workspace is bind-mounted read-write into a container about to
+          # be handed attacker-shaped input; keep the token out of .git/config.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Cache uv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-dast-${{ hashFiles('creek-tools/uv.lock', 'creek-tools/requirements-dast.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-dast-
+
+      - name: Install the production resolution
+        run: |
+          python -m pip install "uv==${UV_PINNED_VERSION}"
+          # The single-vault image's extras, exactly (Dockerfile).
+          uv sync --locked --no-dev \
+            --extra anthropic --extra openai \
+            --extra documents --extra spreadsheets --extra presentations \
+            --extra embeddings-cache
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Scaffold a throwaway vault and mint a token
+        run: |
+          VAULT="$RUNNER_TEMP/vault"
+          creek init --vault "$VAULT"
+          # `vault_path: .` resolves against the server's working directory;
+          # pinned absolute so the instance can never write into the checkout.
+          sed -i "s#^vault_path: .*#vault_path: $VAULT#" "$VAULT/00-Creek-Meta/creek_config.yaml"
+          grep -qx "vault_path: $VAULT" "$VAULT/00-Creek-Meta/creek_config.yaml"
+          TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+          echo "::add-mask::$TOKEN"
+          {
+            echo "VAULT=$VAULT"
+            echo "DAST_TOKEN=$TOKEN"
+            echo "API_LOG=$RUNNER_TEMP/api.log"
+            echo "CONTRACT_MINOR=$(python -c 'from creek_mcp.api.models import CONTRACT_MINOR; print(CONTRACT_MINOR)')"
+          } >> "$GITHUB_ENV"
+
+      - name: Start the target instance
+        run: |
+          # From $RUNNER_TEMP, with the checkout on PYTHONPATH, so nothing the
+          # server writes relative to its working directory lands in the
+          # workspace ZAP mounts.
+          cd "$RUNNER_TEMP"
+          CREEK_MCP_CONSUMER_TOKENS="$DAST_CONSUMER=$DAST_TOKEN" \
+          PYTHONPATH="$GITHUB_WORKSPACE/creek-tools" \
+            nohup python -m scripts.dast_serve \
+              --config "$VAULT/00-Creek-Meta/creek_config.yaml" > "$API_LOG" 2>&1 &
+
+      - name: Wait for readiness and prove the token opens an authenticated route
+        run: |
+          # /v1/health is behind the bearer gate, so a 200 proves the instance
+          # is up AND the token works; /v1/wheel then proves the contract-minor
+          # header is accepted. Without both, every request ZAP sends would be
+          # answered at the door and the report would still look clean.
+          for _ in $(seq 1 45); do
+            if curl -fsS -o /dev/null -H "Authorization: Bearer $DAST_TOKEN" "$BASE_URL/v1/health"; then
+              curl -fsS -o /dev/null \
+                -H "Authorization: Bearer $DAST_TOKEN" \
+                -H "X-Creek-Contract-Version: $CONTRACT_MINOR" \
+                "$BASE_URL/v1/wheel"
+              echo "instance is ready and the token is accepted"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the instance never became ready"
+          cat "$API_LOG"
+          exit 1
+
+      # The action bind-mounts the workspace into the ZAP container as
+      # /zap/wrk, so the document goes to the workspace root, where `target`
+      # names it. The line count marks where ZAP's traffic starts in the access
+      # log: the readiness probe above is itself an authenticated /v1/wheel
+      # request, and the evidence step must not be satisfied by it.
+      - name: Export the published document and mark the log
+        run: |
+          python -m creek_mcp.httpapi --print-openapi > "$GITHUB_WORKSPACE/creek-openapi.json"
+          echo "API_LOG_MARK=$(wc -l < "$API_LOG")" >> "$GITHUB_ENV"
+
+      # ZAP_AUTH_* is the documented way to hand the container a credential;
+      # _SITE scopes it to the host under test so it cannot follow a redirect
+      # anywhere else. Every /v1 route but the handshake also refuses a request
+      # without a matching contract minor, so a replacer rule sets that header
+      # on every request -- without it the scan would be one 409 repeated.
+      - name: ZAP API scan
+        uses: zaproxy/action-api-scan@5158fe4d9d8fcc75ea204db81317cce7f9e5453d  # v0.10.0
+        env:
+          ZAP_AUTH_HEADER: Authorization
+          ZAP_AUTH_HEADER_VALUE: Bearer ${{ env.DAST_TOKEN }}
+          ZAP_AUTH_HEADER_SITE: 127.0.0.1
+        with:
+          target: creek-openapi.json
+          format: openapi
+          # Left at the action's default image rather than a digest: ZAP ships
+          # rule updates continuously, and the container has nothing to steal --
+          # a throwaway vault and a token useless after this run.
+          docker_name: "ghcr.io/zaproxy/zaproxy:stable"
+          rules_file_name: "creek-tools/scripts/dast-zap-rules.tsv"
+          # -O sets the server URL: the document publishes no `servers` block.
+          # -T bounds only startup and the passive queue; the attack phase is
+          # bounded by scanner.maxScanDurationInMins, passed through -z.
+          # There is no -I and there must not be one: it would pass every
+          # warning at once, un-reviewed.
+          cmd_options: >-
+            -O http://127.0.0.1:8823 -T 10
+            -z "-config scanner.maxScanDurationInMins=20
+            -config replacer.full_list(0).description=contract-minor
+            -config replacer.full_list(0).enabled=true
+            -config replacer.full_list(0).matchtype=REQ_HEADER
+            -config replacer.full_list(0).matchstr=X-Creek-Contract-Version
+            -config replacer.full_list(0).regex=false
+            -config replacer.full_list(0).replacement=${{ env.CONTRACT_MINOR }}"
+          fail_action: false
+          # Findings belong in the Security tab, which dedupes them and tracks
+          # dismissals; the action's own issue writer would open a second,
+          # unmanaged stream and is the only thing here that would need
+          # `issues: write`.
+          allow_issue_writing: false
+          artifact_name: zap-native-reports
+
+      # The steps above prove the token works. They cannot prove ZAP attached it
+      # to ZAP's own traffic, and those two worlds look identical in every other
+      # artifact: the report still names a site, the passive rules still fire
+      # on 401s, the SARIF still uploads. The access log records the
+      # authenticated consumer of every request, so it is read here -- only the
+      # lines ZAP caused -- before anything is published.
+      - name: Prove the scan reached authenticated code
+        run: |
+          tail -n "+$((API_LOG_MARK + 1))" "$API_LOG" > "$RUNNER_TEMP/zap-traffic.log"
+          python -m scripts.dast_scan_evidence \
+            --log "$RUNNER_TEMP/zap-traffic.log" \
+            --consumer "$DAST_CONSUMER" \
+            --probe-path /v1/wheel >> "$GITHUB_STEP_SUMMARY"
+
+      # Fails when the report cannot be read: ZAP writing no report is exactly
+      # the state in which an empty SARIF would upload as a clean scan.
+      - name: Convert the ZAP report to SARIF
+        run: |
+          python -m scripts.dast_zap_sarif \
+            --report "$GITHUB_WORKSPACE/report_json.json" \
+            --sarif "$GITHUB_WORKSPACE/report_sarif.sarif" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the findings to code scanning
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
+        with:
+          sarif_file: report_sarif.sarif
+          category: dast-deep
+
+      # Copied next to the reports so the artifact has one root; the run where
+      # the evidence step fails is the run where someone needs this file.
+      - name: Collect the server log
+        if: always()
+        run: cp "$API_LOG" "$GITHUB_WORKSPACE/api.log" || echo "no server log was written"
+
+      - name: Upload the raw report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dast-deep-report
+          path: |
+            report_json.json
+            report_md.md
+            report_sarif.sarif
+            api.log
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Stop the instance
+        if: always()
+        run: pkill -f "scripts.dast_serve" || echo "no instance left to stop"
+
+      # The tail, not the whole file: a twenty-minute attack leaves thousands of
+      # access lines. The full file is in the artifact above.
+      - name: Server log
+        if: always()
+        run: |
+          echo "$(wc -l < "$API_LOG") lines logged; last 300 follow"
+          tail -n 300 "$API_LOG"
+
+  report-failure:
+    name: Report a harness failure so it is not silent
+    needs: zap-api-scan
+    if: failure()
+    runs-on: ubuntu-latest
+    # Job-level and wider than the file's header on purpose: only this job,
+    # which runs no attack container, ever holds issue scope.
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      TITLE: "DAST deep scan: the nightly harness did not complete"
+    steps:
+      # One tracking issue, opened or updated -- never one per night. A harness
+      # failure is not a finding (ZAP's findings never fail this workflow); it
+      # means the night's scan proved nothing.
+      - name: Open or update the tracking issue
+        run: |
+          existing=$(gh issue list --state open --search "\"$TITLE\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n 1)
+          body="The nightly deep API scan failed before it could publish a verdict: $RUN_URL
+
+          This is a harness failure, not a finding. The instance did not become ready, the token was not accepted, ZAP's traffic never got past the bearer gate, or ZAP wrote no report. Until it is fixed, the Security tab is not being refreshed."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Failed again: $RUN_URL"
+            echo "Updated #$existing" >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+            echo "Opened a tracking issue" >> "$GITHUB_STEP_SUMMARY"
+          fi
