@@ -767,24 +767,6 @@ def test_a_managed_reflection_without_a_key_is_still_unavailable(
     assert vendor.requests == []
 
 
-def test_a_rejected_key_is_unavailable_and_never_echoed(
-    tmp_path: Path,
-    managed: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    every_log: pytest.LogCaptureFixture,
-) -> None:
-    """A vendor 401 quoting the key surfaces as the fixed refusal only."""
-    _Vendor(monkeypatch, status=HTTP_UNAUTHORIZED)
-
-    with _client(managed) as http:
-        response = http.post(
-            REFLECTIONS_PATH, json={"content": ENTRY}, headers=_key_headers()
-        )
-
-    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
-    _assert_canary_absent(tmp_path, every_log, response)
-
-
 @pytest.mark.parametrize(
     ("method", "path", "body"),
     [

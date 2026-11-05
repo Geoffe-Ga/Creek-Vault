@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.27.0",
+  "contract_version": "0.28.0",
   "files": [
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-ready.json",
-      "sha256": "a5b43bdb5c23de72efe38d3b5b7a660964817a02bfbc6b061f7cd2fbec4c8725",
+      "sha256": "bcb756d6101b5fc5672d0617d51bc1c2d31417d23c5e3b2a662ff995118f816e",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-unavailable.json",
-      "sha256": "a57cf95c793f150c2996e4a9ed5789c60d286346cb749f5b61b74d61aea69925",
+      "sha256": "126137687e8f06b82e87dfe031e1f79ea1175ed14c0c933b715b4bd1b581044f",
       "state": null
     },
     {
@@ -76,7 +76,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "2b3d7c65178c1071aee118cdb778590eef49490f747e99bfc865b1263e3b9120",
+      "sha256": "1d9e10532858afdb7fce3afd83782b210e1d5b2e517f47d5c6896a0c1ce74cef",
       "state": "empty"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "a5b43bdb5c23de72efe38d3b5b7a660964817a02bfbc6b061f7cd2fbec4c8725",
+      "sha256": "bcb756d6101b5fc5672d0617d51bc1c2d31417d23c5e3b2a662ff995118f816e",
       "state": "success"
     },
     {
@@ -657,7 +657,7 @@
       "capability": null,
       "model": null,
       "path": "retry-policy.json",
-      "sha256": "9351047069af3f87a273fd8bcb677857cc83fcee9f45beb211a09e60c8fa633b",
+      "sha256": "4813329e280836f088087a6b0d82be66beb7da5caf7f675441ea6e2de18910e8",
       "state": null
     },
     {
@@ -776,7 +776,7 @@
       "capability": null,
       "model": "ErrorEnvelope",
       "path": "schemas/ErrorEnvelope.schema.json",
-      "sha256": "c76028a2a57b542f70b8b7dcb5da32eb41f1029f982917524af23c98612e302d",
+      "sha256": "49b4daa48b2c1a85e12746b45ad08930eee94279bbcd8f33a2b3a01fe6540fb4",
       "state": null
     },
     {

@@ -2772,7 +2772,13 @@ def test_every_exit_path_appends_exactly_one_audit_entry(
 
 _COMPLEXITY_BUDGET = 6
 _BUDGETED = frozenset(
-    {"reflect_tool", "_admit_entry", "_gather_grounding", "_reflection_response"}
+    {
+        "reflect_tool",
+        "_admit_entry",
+        "_gather_grounding",
+        "_reflection_response",
+        "_dial_refusal_reason",
+    }
 )
 
 

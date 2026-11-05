@@ -44,7 +44,10 @@ from typing import TYPE_CHECKING, Final, Protocol, TypeAlias
 
 from creek._fslock import VaultLockTimeoutError
 from creek.care.guardrail import CARE_POLICY
-from creek.classify.llm.providers import ProviderRateLimitError
+from creek.classify.llm.providers import (
+    ProviderRateLimitError,
+    RequestKeyRejectedError,
+)
 from creek.voice_drafts import (
     VoiceDraftAccessDeniedError,
     VoiceDraftAction,
@@ -113,6 +116,13 @@ class LetterRefusal(StrEnum):
             dialling the very same ``generation`` chokepoint against the very
             same account (ADR-0016 Decision 1 items 4 and 8; #1903 step 6).
             Nothing is stored, exactly as for every other refusal.
+        REQUEST_KEY_REJECTED: The vendor refused the writer's request-scoped
+            key (ADR-0015) with ``401``/``403``. Split from
+            ``PROVIDER_UNAVAILABLE`` because waiting never clears it — only
+            the writer replacing the key does — and because the reflection
+            route beside this one reports it the same way since contract
+            0.28. Raised only for a call that carried a request key; the
+            operator's own refused key stays ``PROVIDER_UNAVAILABLE``.
         EMPTY_LETTER: The model's turn was blank; nothing is stored.
         STORAGE_BUSY: The Voice Draft mutation lock could not be taken in time.
         STORAGE_INVALID: The addressed slot exists but is not a valid draft.
@@ -121,6 +131,7 @@ class LetterRefusal(StrEnum):
     ABOVE_CEILING = "above_ceiling"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     RATE_LIMITED = "rate_limited"
+    REQUEST_KEY_REJECTED = "request_key_rejected"
     EMPTY_LETTER = "empty_letter"
     STORAGE_BUSY = "storage_busy"
     STORAGE_INVALID = "storage_invalid"
@@ -294,7 +305,10 @@ def _generate(call: LetterCall, source: LetterSource) -> str | LetterRefusal:
     per-account admission refusal as an unavailable provider — while
     ``creek_mcp/tools/reflect.py``, dialling the same chokepoint, separated the
     two. A cap clears by waiting and an outage may not, and the writer is owed
-    the difference on whichever route they happened to ask on.
+    the difference on whichever route they happened to ask on. A refused
+    request key is ordered ahead of the broad clause for the same reason
+    (contract 0.28): it too subclasses ``RuntimeError``, and it clears only
+    when the writer replaces the key.
     """
     tier = routing_tier(call.ceiling, source.tier)
     try:
@@ -302,6 +316,8 @@ def _generate(call: LetterCall, source: LetterSource) -> str | LetterRefusal:
         completion = llm(build_letter_prompt(source))
     except ProviderRateLimitError:
         return LetterRefusal.RATE_LIMITED
+    except RequestKeyRejectedError:
+        return LetterRefusal.REQUEST_KEY_REJECTED
     except (RuntimeError, OSError, ValueError):
         # ``IntimateRoutingError`` is a ``RuntimeError``: the router refused to
         # egress and there is no local backend. It never falls back to cloud.
