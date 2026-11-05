@@ -154,6 +154,15 @@ class LLMConfig(BaseModel):
     INTIMATE chokepoint: BYOK only affects OPEN/PERSONAL cloud stages; INTIMATE
     is still redirected to a local/enclave provider before any key is read."""
 
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    """Optional ``reasoning_effort`` sent by the ``openai`` provider.
+
+    A reasoning model behind an OpenAI-compatible endpoint can spend a whole
+    ``max_tokens`` allowance on hidden reasoning and return empty content —
+    the OpenAI-side counterpart of Ollama's ``think: False``. ``None`` (the
+    default) sends no field at all, because a non-reasoning OpenAI model
+    rejects it. Other providers do not read it."""
+
     enclave_url: str | None = None
     """Base URL of the attested GPU-CC enclave endpoint (provider ``enclave``).
 

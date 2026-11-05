@@ -122,12 +122,24 @@ An OpenAI-compatible endpoint (a confidential-inference proxy, say) is
 reached as ``openai`` with ``--api-base``.
 """
 
+REASONING_EFFORTS: Final[tuple[str, ...]] = ("low", "medium", "high")
+"""Values ``--reasoning-effort`` accepts, sent as the OpenAI ``reasoning_effort``.
+
+A reasoning model can spend the whole ``--max-tokens`` budget on hidden
+reasoning and answer with nothing; a lower effort leaves room for the text.
+Only the ``openai`` provider sends it, so it is refused with any other.
+"""
+
 _GENERATION_DIR: Final[str] = "generation"
 _MODEL_DIR: Final[str] = "model-{}"
 _PROMPT_MODEL_FLAGS: Final[tuple[tuple[str, str], ...]] = (
     ("provider", "--provider"),
     ("api_base", "--api-base"),
     ("api_key_env", "--api-key-env"),
+    ("reasoning_effort", "--reasoning-effort"),
+)
+_OPENAI_ONLY_FLAGS: Final[tuple[tuple[str, str], ...]] = (
+    ("reasoning_effort", "--reasoning-effort"),
 )
 _JUDGE_FLAGS: Final[tuple[tuple[str, str], ...]] = (
     ("judge_provider", "--judge-provider"),
@@ -206,6 +218,12 @@ def add_eval_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--provider", choices=LIVE_PROVIDERS, default=None)
     parser.add_argument("--api-base", default=None)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=None,
+        help="OpenAI reasoning_effort for every candidate (--provider openai only)",
+    )
     parser.add_argument(
         "--api-key-env", default=None, help="NAME of the variable holding the key"
     )
@@ -291,11 +309,14 @@ def _live_credentials(
 
     Raises:
         EvalPlanError: When a live-only flag is given without ``--mode live``,
-            or a live run lacks its credentials.
+            an OpenAI-only flag with another provider, or a live run lacks
+            its credentials.
     """
     if args.mode != EvalMode.LIVE:
         _refuse_unused(args, _PROMPT_MODEL_FLAGS, "--mode live")
         return None
+    if args.provider != "openai":
+        _refuse_unused(args, _OPENAI_ONLY_FLAGS, "--provider openai")
     return _require_credentials(
         args.provider, args.api_key_env, ("--provider", "--api-key-env"), environ
     )
@@ -319,6 +340,7 @@ def _sources(
                 model=tag,
                 api_base=args.api_base,
                 api_key_env=key_env,
+                reasoning_effort=args.reasoning_effort,
             ),
             max_tokens=args.max_tokens,
             provider_factory=factory,

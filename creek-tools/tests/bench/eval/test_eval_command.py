@@ -143,6 +143,7 @@ def test_the_defaults_are_the_hermetic_pair() -> None:
             ("--judge", "routed", "--judge-provider", "openai"),
             id="routed-no-key",
         ),
+        pytest.param(("--reasoning-effort", "low"), id="fake-with-reasoning-effort"),
         pytest.param(("--max-tokens", "0"), id="no-token-budget"),
         pytest.param(("--max-tokens", "100000"), id="unbounded-token-budget"),
     ],
@@ -253,3 +254,54 @@ def test_a_live_plan_builds_one_bounded_source_per_model() -> None:
     assert {config.api_key_env for config in built} == {_KEY_ENV}
     plan.sources["glm-5.3"].generate("[voice-0000] I went out.")
     assert stubs["glm-5.3"].calls == [300]
+    assert {config.reasoning_effort for config in built} == {None}
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_a_reasoning_effort_reaches_every_candidate_config(effort: str) -> None:
+    """``--reasoning-effort`` is applied to every candidate, never to some."""
+    built: list[LLMConfig] = []
+
+    def _factory(config: LLMConfig) -> StubProvider:
+        built.append(config)
+        return StubProvider(config.model or "")
+
+    args = _args(
+        "--mode",
+        "live",
+        "--provider",
+        "openai",
+        "--api-key-env",
+        _KEY_ENV,
+        "--reasoning-effort",
+        effort,
+    )
+    plan_from_args(args, environ={_KEY_ENV: "x"}, provider_factory=_factory)
+    assert [config.reasoning_effort for config in built] == [effort] * 3
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "gemini"])
+def test_a_reasoning_effort_off_openai_is_refused_not_ignored(provider: str) -> None:
+    """Only the OpenAI provider sends the field, so elsewhere it is refused."""
+    args = _args(
+        "--mode",
+        "live",
+        "--provider",
+        provider,
+        "--api-key-env",
+        _KEY_ENV,
+        "--reasoning-effort",
+        "low",
+    )
+    with pytest.raises(EvalPlanError, match=r"^--reasoning-effort applies only"):
+        plan_from_args(
+            args,
+            environ={_KEY_ENV: "x"},
+            provider_factory=lambda config: StubProvider(config.model or ""),
+        )
+
+
+def test_an_unknown_reasoning_effort_is_rejected_by_the_parser() -> None:
+    """The flag is a closed vocabulary; argparse exits on anything else."""
+    with pytest.raises(SystemExit):
+        _args("--reasoning-effort", "maximum")

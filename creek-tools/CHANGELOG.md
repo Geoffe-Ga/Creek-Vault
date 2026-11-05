@@ -9,6 +9,18 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `bench eval --reasoning-effort low|medium|high` (OpenAI provider only). A
+  reasoning model behind an OpenAI-compatible endpoint can spend the whole
+  `--max-tokens` budget on hidden reasoning and answer with nothing. Through
+  Privatemode, `glm-5.3` and `glm-5.3-flash` did so even at the 2,048-token
+  ceiling, so an owner-run voice review showed two blank candidates out of three.
+  `LLMConfig` gains an optional `reasoning_effort`, which `OpenAIProvider` sends
+  only when it is set. With no value it passes the SDK's `omit`, so no field
+  reaches the wire and the default request is unchanged. The flag applies to
+  every candidate alike and is refused outside `--mode live --provider openai`
+  rather than ignored. `docs/bench.md` now gives the verified Privatemode proxy
+  steps in place of its placeholder.
+
 - Docs: the fleet-alert receiver is described as it is now. The
   `pool_admin_key` module docstring and `docs/pool-measurement-pin.md` said
   adepthood's receiver "admits six kinds and not even `pool_credential_orphan`"
