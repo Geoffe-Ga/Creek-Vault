@@ -73,9 +73,24 @@ def test_access_lines_are_parsed_and_noise_is_skipped() -> None:
     ]
 
 
-def test_the_denials_are_exactly_the_bearer_gate_refusals() -> None:
-    """Every other status, a 500 included, means a handler ran."""
-    assert frozenset({401, 403}) == DENIAL_STATUSES
+def test_the_denials_are_exactly_the_gate_refusals() -> None:
+    """Every other status, a 500 included, means a handler ran.
+
+    401/403 are the bearer gate; 409 is the contract-minor gate, which answers
+    before any handler on every route but the handshake and health.
+    """
+    assert frozenset({401, 403, 409}) == DENIAL_STATUSES
+
+
+def test_a_contract_minor_refusal_on_the_probe_is_not_evidence() -> None:
+    """A broken contract-header replacer makes every probe a 409.
+
+    The consumer authenticated, but no handler ran and no active rule attacked
+    anything -- the same silent green as a missing token, one gate later.
+    """
+    requests = [("GET", _PROBE, _CONSUMER, 409)]
+
+    assert not reached_handlers(requests, _CONSUMER, _PROBE)
 
 
 def test_an_authenticated_answer_on_the_probe_route_is_evidence() -> None:
@@ -118,6 +133,7 @@ def test_authenticated_routes_counts_distinct_templates_only() -> None:
         ("GET", "/v1/wheel", _CONSUMER, 422),
         ("PUT", "/v1/voice-drafts/{external_id}", _CONSUMER, 400),
         ("GET", "/v1/export", _CONSUMER, 401),
+        ("GET", "/v1/agent-activity", _CONSUMER, 409),
         ("GET", "/v1/health", "-", 200),
         ("GET", "-", _CONSUMER, 404),
     ]
@@ -153,7 +169,7 @@ def test_the_command_fails_when_every_probe_was_refused(
 
     assert _run(log) == EXIT_HARNESS_ERROR
     captured = capsys.readouterr()
-    assert "never got past the bearer gate" in captured.err
+    assert "never got past the gates" in captured.err
     assert captured.out == ""
 
 

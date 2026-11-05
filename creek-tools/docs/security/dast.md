@@ -68,7 +68,8 @@ like a scanner that found nothing. Each lane therefore proves it can fail:
   forbid a skip.
 - **Deep scan.** [`scripts/dast_scan_evidence.py`](../../scripts/dast_scan_evidence.py)
   reads only the access-log lines ZAP caused. It fails the run unless ZAP was
-  answered as the minted consumer, past the bearer gate, on the probe route.
+  answered as the minted consumer, past both the bearer gate and the
+  contract-minor gate (`401`/`403`/`409`), on the probe route.
   A harness failure (instance not ready, token refused, no report written)
   turns the run red and opens or updates a single tracking issue. ZAP's own
   findings never do.

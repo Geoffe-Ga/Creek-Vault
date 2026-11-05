@@ -65,8 +65,15 @@ _ACCESS_LINE: Final[re.Pattern[str]] = re.compile(
     r"status=(?P<status>\d{3})"
 )
 
-DENIAL_STATUSES: Final[frozenset[int]] = frozenset({401, 403})
-"""The two answers the bearer gate gives. Anything else means a handler ran."""
+DENIAL_STATUSES: Final[frozenset[int]] = frozenset({401, 403, 409})
+"""Answers given before any handler runs. Anything else means a handler ran.
+
+``401``/``403`` are the bearer gate. ``409`` is the contract-minor gate
+(``ErrorCode.INCOMPATIBLE_VERSION``, its only source), which refuses every route
+but the handshake and health -- the probe route included -- before routing to a
+handler. Counting it as "reached" would let a broken contract-header replacer
+turn the whole scan into one refusal and still pass this check.
+"""
 
 _UNMATCHED: Final[str] = "-"
 """How the access log names a route the router never matched."""
@@ -105,7 +112,7 @@ def _behind_gate(request: Request, consumer: str) -> bool:
 
     Returns:
         ``True`` when the request authenticated as *consumer*, matched a route
-        and was not refused by the gate.
+        and was refused by neither the bearer gate nor the contract-minor gate.
     """
     _, route, logged_consumer, status = request
     return (
@@ -127,9 +134,10 @@ def reached_handlers(
 
     Returns:
         ``True`` when at least one request to *probe_path* authenticated as
-        *consumer* and was answered with anything but a gate refusal. Success
-        on some other route proves nothing about the probe, and an anonymous
-        success proves nothing about the token.
+        *consumer* and was answered with anything but a refusal in
+        :data:`DENIAL_STATUSES`. Success on some other route proves nothing
+        about the probe, and an anonymous success proves nothing about the
+        token.
     """
     return any(
         request[1] == probe_path and _behind_gate(request, consumer)
@@ -245,10 +253,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary = _summarise(requests, args.consumer)
     if not reached_handlers(requests, args.consumer, args.probe_path):
         sys.stderr.write(
-            f"the scan never got past the bearer gate: {summary} No request to "
+            f"the scan never got past the gates: {summary} No request to "
             f"{args.probe_path} was answered for `{args.consumer}` with anything "
-            "but a refusal, so no handler ran and no active rule attacked "
-            "anything.\n"
+            f"but {'/'.join(str(code) for code in sorted(DENIAL_STATUSES))}, so "
+            "no handler ran and no active rule attacked anything.\n"
         )
         return EXIT_HARNESS_ERROR
     sys.stdout.write(f"{summary}\n")
