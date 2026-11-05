@@ -165,9 +165,11 @@ jobs:
 
       # ZAP_AUTH_* is the documented way to hand the container a credential;
       # _SITE scopes it to the host under test so it cannot follow a redirect
-      # anywhere else. Every /v1 route but the handshake also refuses a request
-      # without a matching contract minor, so a replacer rule sets that header
-      # on every request -- without it the scan would be one 409 repeated.
+      # anywhere else. Every /v1 route but the handshake and health also
+      # refuses a request without a matching contract minor
+      # (creek_mcp/api/routes.py, requires_contract_version), so a replacer
+      # rule sets that header on every request -- without it the scan would
+      # be one 409 repeated.
       - name: ZAP API scan
         uses: zaproxy/action-api-scan@5158fe4d9d8fcc75ea204db81317cce7f9e5453d  # v0.10.0
         env:
