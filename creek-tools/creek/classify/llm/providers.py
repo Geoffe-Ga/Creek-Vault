@@ -1836,13 +1836,19 @@ class OpenAIProvider:
         Returns:
             The raw ``chat.completions.create`` response object.
         """
+        from openai import omit
+
         # Resolved first: building a request-key client sets the scrub.
         client = self.client
+        # ``omit`` leaves the field off the wire: a non-reasoning model rejects it.
+        effort = self.config.reasoning_effort
+        reasoning_effort = omit if effort is None else effort
         if system is None:
             return client.chat.completions.create(
                 model=self.model,
                 max_tokens=ceiling,
                 messages=[{"role": "user", "content": prompt}],
+                reasoning_effort=reasoning_effort,
                 extra_headers=self._scrubbed_headers,
             )
         return client.chat.completions.create(
@@ -1852,6 +1858,7 @@ class OpenAIProvider:
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
+            reasoning_effort=reasoning_effort,
             extra_headers=self._scrubbed_headers,
         )
 
