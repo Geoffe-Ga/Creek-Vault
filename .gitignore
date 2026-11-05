@@ -91,3 +91,6 @@ graphify-out/
 # worker inside its worktree. Ephemeral and per-lane; a `git add .` would
 # otherwise sweep it into that lane's PR.
 scratchpad/
+
+# Schemathesis run cache (scripts/dast-contract-fuzz.sh)
+.schemathesis/
