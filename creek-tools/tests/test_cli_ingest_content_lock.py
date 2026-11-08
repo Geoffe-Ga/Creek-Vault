@@ -11,6 +11,7 @@ traceback, when another writer holds it first.
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 from typer.testing import CliRunner
@@ -281,6 +282,10 @@ _CLASSIFY_SKIPPED = f"classify skipped: {CONTENT_MUTATION_BUSY_REASON}"
 
 _LINK_SKIPPED = f"link skipped: {CONTENT_MUTATION_BUSY_REASON}"
 """The ``skipped_steps`` line a busy Tier-B link pass records."""
+_SKIP_LOG_CLASSIFY = "sync.classify.skip reason=content-busy"
+"""The scheduler-log line an operator greps for when sync classify is skipped."""
+_SKIP_LOG_LINK = "sync.link.skip reason=content-busy"
+"""The scheduler-log line an operator greps for when sync link is skipped."""
 
 
 def _read_sync_state(vault: Path) -> dict[str, Any]:
@@ -294,6 +299,7 @@ def _read_sync_state(vault: Path) -> dict[str, Any]:
 def test_a_content_busy_sync_classify_pass_is_skipped_and_last_run_still_written(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A Tier-A tick whose rules-classify pass meets contention still records.
 
@@ -306,12 +312,16 @@ def test_a_content_busy_sync_classify_pass_is_skipped_and_last_run_still_written
     vault = _sync_vault(tmp_path, monkeypatch)
     _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
 
-    with _content_lock_held_elsewhere(vault):
+    with (
+        _content_lock_held_elsewhere(vault),
+        caplog.at_level(logging.INFO, logger="creek.cli"),
+    ):
         result = _invoke_sync(vault)
 
     assert result.exit_code == 0, result.output
     assert "Traceback" not in result.output
     assert f"[sync] {_CLASSIFY_SKIPPED}" in _flat(result.output)
+    assert _SKIP_LOG_CLASSIFY in caplog.messages
     state = _read_sync_state(vault)
     assert state["sources"]["journal"]["failures"] == [
         f"skipped: {CONTENT_MUTATION_BUSY_REASON}"
@@ -380,6 +390,7 @@ def test_a_busy_tier_b_classify_skips_link_and_index_and_still_records(
 def test_a_busy_tier_b_link_is_recorded_and_index_still_runs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A busy link pass is a recorded skip; the index rebuild is not lost.
 
@@ -401,12 +412,16 @@ def test_a_busy_tier_b_link_is_recorded_and_index_still_runs(
     monkeypatch.setattr("creek.classify.classify_engine.run_classify", _classify_clean)
     monkeypatch.setattr("creek.cli._sync_index", _index_spy)
 
-    with _content_lock_held_elsewhere(vault):
+    with (
+        _content_lock_held_elsewhere(vault),
+        caplog.at_level(logging.INFO, logger="creek.cli"),
+    ):
         result = _invoke_tier_b(vault)
 
     assert result.exit_code == 0, result.output
     assert "Traceback" not in result.output
     assert f"[sync] {_LINK_SKIPPED}" in _flat(result.output)
+    assert _SKIP_LOG_LINK in caplog.messages
     assert indexed == [vault]
     assert _read_sync_state(vault)["skipped_steps"] == [_LINK_SKIPPED]
 

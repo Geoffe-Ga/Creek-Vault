@@ -189,6 +189,33 @@ def test_the_hold_runs_its_body_with_the_content_lock_held(tmp_path: Path) -> No
     assert _content_lock_is_held(vault) is False
 
 
+def test_run_link_does_its_work_inside_the_content_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run_link``'s whole pass runs under the hold, not after it (#2087).
+
+    The busy test only proves the wait happens at acquisition; this one fails
+    if the pass is moved out of the ``with`` block, for example to load the
+    embedding model first, which would reopen the #1799 withdraw race for link.
+    """
+    vault = tmp_path / "vault"
+    held: list[bool] = []
+
+    def _recording_pass(**_kwargs: object) -> object:
+        """Record whether the content lock is held while the pass runs."""
+        held.append(_content_lock_is_held(vault))
+        return None
+
+    monkeypatch.setattr(
+        "creek.link.link_engine._run_link_with_content_lock_held", _recording_pass
+    )
+
+    run_link(vault_path=vault, config=CreekConfig(), method="temporal", rebuild=False)
+
+    assert held == [True]
+    assert _content_lock_is_held(vault) is False
+
+
 def test_a_contended_hold_raises_busy_and_never_runs_its_body(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
