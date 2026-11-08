@@ -9,6 +9,37 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `creek.draft` and `creek.classify` no longer return provider error text as
+  their refusal reason (refs #2073). `creek.draft` was a real leak: a vendor
+  4xx message (which `providers._error_detail` forwards) or a rejected request
+  key's text became the refusal `reason`, and an Ollama `httpx.HTTPError` —
+  not a `RuntimeError` — escaped the tool so FastMCP served it, provider URL
+  included, as an `isError` result. It now catches `(RuntimeError,
+  httpx.HTTPError)` at both sites and answers fixed reasons:
+  `LLM provider unavailable for draft` when the provider cannot be built,
+  `LLM provider call failed for draft` when the call fails, and
+  `REQUEST_KEY_REJECTED_REASON` for a vendor-refused writer's key. The
+  router's `IntimateRoutingError` message is kept, the documented residual.
+  `creek.classify` is hardening: its refusal and a rules fallback's
+  `fallback_reason` are now the fixed `LLM provider unavailable for
+  classification` instead of the engine's CLI message (provider name and
+  env-var remediation), which the CLI still prints. Both tools log the
+  exception type with the traceback on their own module logger. The new
+  classify constant `LLM_PROVIDER_UNAVAILABLE_REASON` lives beside its
+  exception in `creek.classify.classify_engine`, and
+  `REQUEST_KEY_REJECTED_REASON` moved beside `RequestKeyRejectedError` in
+  `creek.classify.llm.providers` (still importable from
+  `creek_mcp.tools.classify`), so `creek.draft` imports no sibling tool
+  module. `/v1` is unchanged: `pipeline_refusal_code` deliberately leaves the
+  classify constant unmapped, so an `llm` job still fails closed to
+  `internal_error`, and `docs/api.md` needs no edit. **Operator-visible:** a
+  failed `llm` classification job now records `failure_reason: "refused: LLM
+  provider unavailable for classification"` instead of the engine's message;
+  a managed vault's fallback records the same fixed `fallback_reason`; and the
+  keyless-draft remediation hint (`Check Ollama or ANTHROPIC_API_KEY
+  configuration.`) and any vendor message now appear only in the server log
+  (`creek_mcp.tools.draft` / `creek_mcp.tools.classify`), not on the wire.
+
 - `creek.classify.entry` and `creek.upload` now decide their privacy gate
   inside the vault content-mutation lock, finishing the sweep #930 started
   for `creek.compile` (refs #2068, #2069, #930). `classify.entry` used to
