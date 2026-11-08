@@ -48,6 +48,7 @@ import pytest
 from creek._fslock import VaultLockTimeoutError
 from creek.classify.classify_engine import LLM_PROVIDER_UNAVAILABLE_REASON, run_classify
 from creek.classify.llm import LLMClassificationResult
+from creek.classify.llm.providers import REQUEST_KEY_REJECTED_REASON
 from creek.classify.rules import FREQUENCY_SIGNALS, WAVELENGTH_PHASE_SIGNALS
 from creek.config import EmbeddingsConfig, load_vault_config
 from creek.link import embeddings as embeddings_module
@@ -60,9 +61,11 @@ from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     CONTRACT_MINOR,
     ERROR_MESSAGES,
+    RETRY_POLICY,
     Capability,
     ErrorCode,
     ErrorEnvelope,
+    RetryDisposition,
     minor_at_least,
 )
 from creek_mcp.httpapi import pipeline as pipeline_module
@@ -79,7 +82,7 @@ from tests.v1_api_support import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from starlette.testclient import TestClient
@@ -1618,3 +1621,248 @@ def test_an_embeddings_job_whose_model_cannot_load_records_a_fixed_refusal(
     assert record["failure_reason"] == "refused: embedding model unavailable"
     assert _LEAK_MARKER not in json.dumps(record)
     assert _LEAK_MARKER not in json.dumps(body)
+
+
+# --------------------------------------------------------------------------- #
+# A durable job that meets content-lock contention reads ``busy`` (#2075)
+# --------------------------------------------------------------------------- #
+
+_BUSY_JOB_MINOR: Final[str] = "0.29"
+"""The minor that first publishes ``failure_code: "busy"`` (#2075).
+
+Spelled as the literal a consumer would send rather than imported, so a later
+bump that moved the code's floor would surface here instead of agreeing with
+itself.
+"""
+
+_BUSY_FAILURE_REASON: Final[str] = "refused: vault content mutation busy"
+"""The private ``failure_reason`` a busy job records, spelled out.
+
+Not built from the constant: this is the string the operator reads in a job
+record, and a rename of the constant must not silently change it.
+"""
+
+
+def _raise_lock_timeout_naming(vault: Path) -> Callable[..., object]:
+    """Return an engine stub that times out the way a second writer does.
+
+    Args:
+        vault: The vault root, interpolated so a leak of the lock's own
+            message onto the wire or into the record is caught.
+
+    Returns:
+        A keyword-only stand-in for ``run_classify`` or ``run_link``.
+    """
+
+    def _raise(**_kwargs: object) -> object:
+        """Time out while taking the vault content lock.
+
+        Args:
+            **_kwargs: The engine's arguments, unread.
+
+        Raises:
+            VaultLockTimeoutError: Always, naming a marker and the vault path.
+        """
+        msg = f"busy at {_LEAK_MARKER} {vault}"
+        raise VaultLockTimeoutError(msg)
+
+    return _raise
+
+
+def _busy_job(
+    api: TestClient, path: str, body: dict[str, str], *, minor: str = CONTRACT_MINOR
+) -> str:
+    """Queue one durable job whose engine meets lock contention; await it.
+
+    Args:
+        api: The client.
+        path: Which pipeline route to call.
+        body: The long-method request.
+        minor: The contract minor the submitting caller declares.
+
+    Returns:
+        The terminal job's id.
+    """
+    accepted = api.post(path, json=body, headers=headers(minor=minor))
+    assert accepted.status_code == HTTP_ACCEPTED, accepted.text
+    job_id: str = accepted.json()["job_id"]
+    _await_terminal(api, job_id)
+    return job_id
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "engine"),
+    [
+        (
+            CLASSIFICATIONS_PATH,
+            {"method": "llm"},
+            "creek_mcp.tools.classify.run_classify",
+        ),
+        (LINKS_PATH, {"method": "embeddings"}, "creek_mcp.tools.link.run_link"),
+    ],
+    ids=["classifications-llm", "links-embeddings"],
+)
+def test_a_durable_job_that_meets_content_lock_contention_reads_busy(
+    api: TestClient,
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    body: dict[str, str],
+    engine: str,
+) -> None:
+    """A timed-out content lock is ``busy`` on the job, as it is ``503`` in sync.
+
+    The synchronous routes answer this condition ``503
+    temporarily_unavailable`` (#2066), which tells the client to back off and
+    resubmit. The durable job used to end ``failed`` with ``failure_code:
+    null`` — indistinguishable from an operator fault the caller must not
+    retry into (#2075). The engine is patched *below* the tool, so the tool's
+    own ``VaultLockTimeoutError`` to fixed-reason translation stays under test;
+    neither the lock's message nor the vault path reaches the body or the
+    private record.
+    """
+    monkeypatch.setattr(engine, _raise_lock_timeout_naming(vault))
+
+    job_id = _busy_job(api, path, body, minor=_BUSY_JOB_MINOR)
+    polled = api.get(f"/v1/jobs/{job_id}", headers=headers(minor=_BUSY_JOB_MINOR))
+
+    assert polled.status_code == HTTP_OK
+    assert polled.json() == {
+        "status": "ok",
+        "job_id": job_id,
+        "state": "failed",
+        "result": None,
+        "failure_code": "busy",
+    }
+    record = _stored_job(vault, job_id)
+    assert record["failure_reason"] == _BUSY_FAILURE_REASON
+    assert record["failure_code"] == "busy"
+    for text in (polled.text, json.dumps(record)):
+        assert _LEAK_MARKER not in text
+        assert str(vault) not in text
+
+
+@pytest.mark.parametrize(
+    ("minor", "served"),
+    [
+        ("0.29", {"failure_code": "busy"}),
+        ("0.28", {"failure_code": None}),
+        ("0.26", {"failure_code": None}),
+        ("0.25", {}),
+    ],
+    ids=["0.29-busy", "0.28-null", "0.26-null", "0.25-absent"],
+)
+def test_a_busy_job_is_downgraded_below_its_minor(
+    api: TestClient,
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minor: str,
+    served: dict[str, str | None],
+) -> None:
+    """A caller that vendored a closed code set is never shown ``busy``.
+
+    ``0.26``-``0.28`` consumers validate ``failure_code`` against a closed enum
+    holding only ``request_key_rejected``, so they are served the ``null`` they
+    always received for this failure; below ``0.26`` the key is absent, as it
+    always was. The record itself still says ``busy``: the downgrade is a
+    property of the response, not of what was stored.
+    """
+    monkeypatch.setattr(
+        "creek_mcp.tools.link.run_link", _raise_lock_timeout_naming(vault)
+    )
+
+    job_id = _busy_job(api, LINKS_PATH, {"method": "embeddings"})
+    polled = api.get(f"/v1/jobs/{job_id}", headers=headers(minor=minor))
+
+    assert polled.status_code == HTTP_OK
+    assert polled.json() == {
+        "status": "ok",
+        "job_id": job_id,
+        "state": "failed",
+        "result": None,
+        **served,
+    }
+    assert _stored_job(vault, job_id)["failure_code"] == "busy"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"status": "refused", "reason": CONTENT_MUTATION_BUSY_REASON}, "busy"),
+        (
+            {"status": "refused", "reason": REQUEST_KEY_REJECTED_REASON},
+            "request_key_rejected",
+        ),
+        ({"status": "refused", "reason": f"x {CONTENT_MUTATION_BUSY_REASON}"}, None),
+        ({"status": "refused", "reason": f"{CONTENT_MUTATION_BUSY_REASON} x"}, None),
+        (
+            {
+                "status": "refused",
+                "reason": f"provider said '{CONTENT_MUTATION_BUSY_REASON}' at /x",
+            },
+            None,
+        ),
+        ({"status": "refused", "reason": EMBEDDING_MODEL_UNAVAILABLE_REASON}, None),
+        ({"status": "refused", "reason": LLM_PROVIDER_UNAVAILABLE_REASON}, None),
+        ({"status": "refused", "reason": ""}, None),
+        ({"status": "refused"}, None),
+        ({"status": "refused", "reason": [CONTENT_MUTATION_BUSY_REASON]}, None),
+        ({"status": "error", "reason": CONTENT_MUTATION_BUSY_REASON}, None),
+        ({"reason": CONTENT_MUTATION_BUSY_REASON}, None),
+    ],
+    ids=[
+        "busy",
+        "request-key-rejected",
+        "busy-prefixed-text",
+        "busy-suffixed-text",
+        "quoted-inside-busy",
+        "embedding-model-unavailable",
+        "llm-provider-unavailable",
+        "empty-reason",
+        "missing-reason",
+        "non-str-reason",
+        "not-refused-status",
+        "missing-status",
+    ],
+)
+def test_the_job_failure_code_is_exact_and_fails_closed(
+    raw: dict[str, Any], expected: str | None
+) -> None:
+    """Only a fixed reason, matched exactly, earns a published job code.
+
+    The same exact-equality rule :func:`pipeline_refusal_code` applies on the
+    synchronous path (#2065, #2066): a reason that merely *contains* the busy
+    text — which an ``in``, ``startswith`` or ``endswith`` match would accept
+    — is provider text, and it stays ``null``. The two operator-side fixed
+    reasons (an unloadable embedding model, an unreachable LLM provider) are
+    deliberately codeless: resubmitting cannot clear them.
+    """
+    assert pipeline_module._failure_code(raw) == expected
+
+
+_PIPELINE_FIXED_REASONS: Final[tuple[str, ...]] = (
+    CONTENT_MUTATION_BUSY_REASON,
+    EMBEDDING_MODEL_UNAVAILABLE_REASON,
+    LLM_PROVIDER_UNAVAILABLE_REASON,
+    REQUEST_KEY_REJECTED_REASON,
+)
+"""Every fixed refusal reason the two pipeline tools return for a durable job."""
+
+
+@pytest.mark.parametrize("reason", _PIPELINE_FIXED_REASONS)
+def test_a_retryable_sync_refusal_has_a_job_code(reason: str) -> None:
+    """A reason the sync path tells a client to retry is never a codeless job.
+
+    #2075 exists because #2066 made the busy reason retryable on the
+    synchronous routes and nothing forced the durable job to agree. This pins
+    the two together over every fixed reason: when the sync code's
+    :data:`RETRY_POLICY` is ``retry_with_backoff`` and the code is not the
+    fail-closed ``internal_error`` (whose retry advice covers *unknown*
+    faults), the same reason on a job must carry a published code, or a job
+    client has no way to learn what a sync client is told.
+    """
+    code = pipeline_refusal_code(reason)
+    retryable = RETRY_POLICY[code] is RetryDisposition.RETRY_WITH_BACKOFF
+    if retryable and code is not ErrorCode.INTERNAL_ERROR:
+        refused = {"status": "refused", "reason": reason}
+        assert pipeline_module._failure_code(refused) is not None
