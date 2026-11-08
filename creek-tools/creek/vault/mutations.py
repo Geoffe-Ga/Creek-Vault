@@ -27,6 +27,25 @@ lock inside its own ``gdrive.lock`` and around the ingest only, never around
 the network download; no holder of this lock ever takes ``gdrive.lock``, so
 the order is always connector first, content second.
 
+The remaining ``01-Fragments`` writers joined in #2086, each at its surface
+for the same reentrancy reason:
+
+* the ``creek ingest`` vault migrations ``--pin-source-ids`` (including its
+  ``--dry-run``), ``--refresh-dates`` and ``--refresh-ai-chat`` hold it around
+  their migration call, after the vault-exists check, so ``pin_ids`` and
+  ``refresh`` stay lock-free;
+* ``creek process`` holds it across stages 2-4 (ingest, classify, vault
+  write) in ``Pipeline.run`` and lets go before stage 5, whose ``run_link``
+  takes it itself;
+* the ``creek purge`` commands and the ``creek.purge.*`` MCP tools hold it
+  around the engine call only — never across a confirmation prompt — and
+  :class:`~creek.purge.engine.PurgeEngine` stays lock-free, because the
+  ``/v1`` journal withdraw calls it while already holding the lock;
+* :func:`creek.ingest.discord.write_fragments` is the one deliberate
+  exception to "at the surface": it holds the lock itself, because it is the
+  single writer for all three Discord paths (bot capture, Data Package, the
+  exporter) and none of their callers holds it. Its callers must not.
+
 The classify, link and compile engines take the lock through
 :func:`hold_content_mutation` as well (#2087), so losing the acquisition race
 on those paths is :class:`ContentMutationBusyError` and their CLI and sync
