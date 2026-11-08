@@ -235,8 +235,9 @@ def test_structural_path_context_has_exactly_one_production_caller() -> None:
     """Only :mod:`creek.compile.engine` may render the breadcrumb (#931).
 
     The ancestry channel is closed by *ranking* ancestors in
-    :func:`creek.classify.privacy_filter.ancestry_tiers`, which
-    ``creek.compile``'s two entry points consult. A second renderer
+    :meth:`creek.classify.privacy_filter.AncestorIndex.chain_tiers`, over the
+    index ``creek.compile``'s engine builds from its one walk — which both of
+    ``creek.compile``'s entry points consult. A second renderer
     elsewhere in ``creek`` / ``creek_mcp`` would re-open the leak silently,
     with no test failing — so the caller count is pinned rather than merely
     noted. Adding a renderer means adding its tier gate first, then this

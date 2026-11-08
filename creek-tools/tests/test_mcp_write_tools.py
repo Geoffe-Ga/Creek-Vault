@@ -17,14 +17,24 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.classify.llm.router import ModelRouter
-from creek.classify.privacy_filter import PrivacyTierOverride, tier_sensitivity
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    build_ancestor_index,
+    tier_sensitivity,
+)
 from creek.cli import _REPORT_DISPATCH
-from creek.compile.engine import PARADOX_LOG_RELPATH
+from creek.compile.engine import PARADOX_LOG_RELPATH, SourceAdmissionRefusedError
 from creek.config import LLMConfig, LLMRoutingConfig
-from creek.models import PrivacyTier
+from creek.models import Fragment, PrivacyTier
 from creek.save import TARGET_SUBDIRS
 from creek.surface_modes import REPORT_TYPES
+from creek.vault.mutations import (
+    CONTENT_MUTATION_LOCK_RELPATH,
+    content_mutation_lock_path,
+)
+from creek.vault.reader import iter_vault_fragments
 from creek_mcp.audit import (
     MCP_AUDIT_RELPATH,
     MCPAuditLog,
@@ -48,6 +58,8 @@ from creek_mcp.tools.skills import skills_refresh_tool
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
+
+    from creek.compile.engine import SourceAdmission
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +403,7 @@ def test_save_at_unclassified_redacts_the_body_under_a_personal_ceiling(
 # verbatim at every tier, which is exactly what these tests supply. So the
 # title remains a cleartext surface here by design, not by defect.
 _PARADOX_TITLE = "Both true at once"
-_PARADOX_SECRET = "CLEARTEXT-CANARY-1491"
+_PARADOX_SECRET = "CLEARTEXT-CANARY-1491"  # pragma: allowlist secret
 _PARADOX_BODY = (
     "Two framings collide.\n\n"
     + _PARADOX_SECRET
@@ -1663,6 +1675,63 @@ class _RecordingLLMFactory:
         return lambda _prompt: "{}"
 
 
+class _AdmittingEngineStub:
+    """A ``compile_to_vault`` stand-in that still runs the wrapper's real admission.
+
+    Since #930 the ceiling gate is no longer a wrapper-side call that runs
+    *before* the engine: it is the ``admit_sources`` hook the wrapper hands
+    the engine, which evaluates it on its one walk. A stub that swallowed the
+    hook through ``**_kw`` would therefore retire admission on every row it
+    replaced — an over-refusing gate (one rejecting ``personal`` at
+    ``ceiling=personal``, say) would sail through the matrices below. So this
+    stub does what the engine does in the order the engine does it: build the
+    whole-corpus index from a real walk, ask the hook, refuse with the
+    engine's own :class:`~creek.compile.engine.SourceAdmissionRefusedError`,
+    and only then build the client and write a page. ``admissions`` records
+    every answer the hook gave, so each row can pin the decision it reached
+    and not merely the status it ended in.
+
+    The ``llm_factory`` call is load-bearing for the reason
+    :class:`_RecordingLLMFactory` gives (#962): the engine builds the client,
+    so a stub that skipped it would zero ``factory.calls`` on every row. The
+    tier passed is the content tier the real engine would derive for the
+    row's single source fragment.
+    """
+
+    def __init__(self, vault: Path, content_tier: PrivacyTier) -> None:
+        """Bind the stub to *vault* and the content tier the engine would derive."""
+        self.vault = vault
+        self.content_tier = content_tier
+        self.target_path = vault / "02-Threads" / "Active" / "thread-x.md"
+        self.admissions: list[bool] = []
+
+    def __call__(
+        self,
+        *,
+        fragment_ids: list[str],
+        llm_factory: Callable[[PrivacyTier], object],
+        admit_sources: SourceAdmission | None = None,
+        **_kw: object,
+    ) -> Path:
+        """Admit through the real hook, then build the client and write a page."""
+        if admit_sources is not None:
+            ancestors = build_ancestor_index(
+                (fragment, raw)
+                for _path, fragment, _body, raw in iter_vault_fragments(
+                    self.vault / "01-Fragments",
+                )
+            )
+            admitted = admit_sources(ancestors, fragment_ids)
+            self.admissions.append(admitted)
+            if not admitted:
+                raise SourceAdmissionRefusedError
+        llm_factory(self.content_tier)
+        self.target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.target_path.exists():
+            self.target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
+        return self.target_path
+
+
 def test_compile_refuses_intimate_source_under_open_ceiling(vault: Path) -> None:
     """An ``intimate`` source fragment is refused at ``ceiling=open``.
 
@@ -1860,31 +1929,8 @@ def test_compile_source_tier_ceiling_matrix(
     never-invoked factory.
     """
     _write_fragment(vault, frag_id="frag-src", privacy_tier=privacy_tier)
-    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
-
-    def _stub_compile(
-        *,
-        llm_factory: Callable[[PrivacyTier], object],
-        **_kw: object,
-    ) -> object:
-        """Stand in for the engine: build the client, then write a page.
-
-        The ``llm_factory`` call is load-bearing, not decorative. Since
-        #962 the engine builds the compile client itself instead of
-        receiving a pre-built one, so a stub that swallowed the factory
-        would drive ``factory.calls`` to 0 on every row and the allowed-row
-        assertion below would silently stop distinguishing "the gate
-        passed" from "the wrapper short-circuited". The tier passed is the
-        one the real engine derives from this row's single source fragment.
-        """
-        llm_factory(PrivacyTier(privacy_tier))
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not target_path.exists():
-            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
-        return target_path
-
-    if allowed:
-        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    engine = _AdmittingEngineStub(vault, PrivacyTier(privacy_tier))
+    monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", engine)
     factory = _RecordingLLMFactory()
 
     result = compile_tool(
@@ -1897,6 +1943,7 @@ def test_compile_source_tier_ceiling_matrix(
         privacy_tier_ceiling=ceiling,
     )
 
+    assert engine.admissions == [allowed]
     if allowed:
         assert result["status"] == "ok"
         assert factory.calls == 1
@@ -1942,33 +1989,14 @@ def test_compile_refuses_unclassified_source_at_open_ceiling(
 
     Args:
         vault: The seeded vault fixture.
-        monkeypatch: Used to stub the compile engine on the admitted row.
+        monkeypatch: Used to stand in for the compile engine on every row, with
+            admission still decided by the real hook (#930).
         ceiling: The caller's declared ceiling.
         allowed: Whether *ceiling* must admit the unclassified source.
     """
     _write_fragment(vault, frag_id="frag-src", privacy_tier="unclassified")
-    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
-
-    def _stub_compile(
-        *,
-        llm_factory: Callable[[PrivacyTier], object],
-        **_kw: object,
-    ) -> object:
-        """Stand in for the engine: build the client, then write a page.
-
-        Calls ``llm_factory`` because the engine does (#962); a stub that
-        swallowed it would zero out ``factory.calls`` and quietly retire the
-        admitted row's "the work really got done" assertion. The tier is the
-        explicit ``unclassified`` this row's source carries.
-        """
-        llm_factory(PrivacyTier.UNCLASSIFIED)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not target_path.exists():
-            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
-        return target_path
-
-    if allowed:
-        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    engine = _AdmittingEngineStub(vault, PrivacyTier.UNCLASSIFIED)
+    monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", engine)
     factory = _RecordingLLMFactory()
 
     result = compile_tool(
@@ -1981,6 +2009,7 @@ def test_compile_refuses_unclassified_source_at_open_ceiling(
         privacy_tier_ceiling=ceiling,
     )
 
+    assert engine.admissions == [allowed]
     if allowed:
         assert result["status"] == "ok"
         assert factory.calls == 1
@@ -2055,29 +2084,10 @@ def test_compile_fails_closed_when_privacy_tier_key_is_absent(
     at ``personal``, where this file is refused.
     """
     _write_fragment_without_tier(vault, frag_id="frag-legacy")
-    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
-
-    def _stub_compile(
-        *,
-        llm_factory: Callable[[PrivacyTier], object],
-        **_kw: object,
-    ) -> object:
-        """Stand in for the engine: build the client, then write a page.
-
-        Calls ``llm_factory`` because the engine does (#962); a stub that
-        swallowed it would zero out ``factory.calls`` and quietly retire the
-        admitted rows' "the work really got done" assertion. The tier is the
-        fail-closed ``INTIMATE`` the engine derives for a fragment whose
-        ``privacy_tier`` key is absent — the very reading this test is about.
-        """
-        llm_factory(PrivacyTier.INTIMATE)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not target_path.exists():
-            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
-        return target_path
-
-    if allowed:
-        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    # INTIMATE is the fail-closed tier the engine derives for a fragment whose
+    # ``privacy_tier`` key is absent — the very reading this test is about.
+    engine = _AdmittingEngineStub(vault, PrivacyTier.INTIMATE)
+    monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", engine)
     factory = _RecordingLLMFactory()
 
     result = compile_tool(
@@ -2090,6 +2100,7 @@ def test_compile_fails_closed_when_privacy_tier_key_is_absent(
         privacy_tier_ceiling=ceiling,
     )
 
+    assert engine.admissions == [allowed]
     if allowed:
         assert result["status"] == "ok"
         assert factory.calls == 1
@@ -2457,6 +2468,250 @@ def test_compile_reports_unknown_target_kind_even_with_above_ceiling_sources(
     assert "unknown target_kind" in result["reason"]
     assert result["reason"] != _ABOVE_CEILING_REASON
     assert factory.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# compile — one walk, admission decided inside the content lock (issue #930)
+# ---------------------------------------------------------------------------
+
+_LOCK_PROBE_TIMEOUT_SECONDS = 0.0
+"""Wait budget for the same-thread content-lock probe: none at all.
+
+:func:`creek._fslock.vault_lock` guards each lock file with a non-reentrant
+per-path :class:`threading.Lock`, so a probe from the thread that already holds
+the lock cannot take it and times out at once. That makes "is the content lock
+held right now?" a deterministic question with no second thread to join.
+"""
+
+_WALK_TARGETS = (
+    "creek.classify.privacy_filter.iter_vault_fragments",
+    "creek.compile.engine.iter_vault_fragments",
+    "creek_mcp.tools.compile.iter_vault_fragments",
+)
+"""Every module binding through which a compile could walk ``01-Fragments``.
+
+The last one does not exist; it is patched with ``raising=False`` so a future
+wrapper-side load cannot slip past the counter by importing the loader itself.
+"""
+
+
+def _count_walks(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[Path],
+    on_call: Callable[[int], None] | None = None,
+) -> None:
+    """Count every ``01-Fragments`` walk a compile makes, through any binding.
+
+    The real loader materialises the whole directory into a list before it
+    returns, so *on_call* runs strictly **after** the records of that walk
+    exist: a file it rewrites can only be seen by a later walk.
+
+    Args:
+        monkeypatch: Used to replace each binding in :data:`_WALK_TARGETS`.
+        calls: Receives the root of every walk, in order.
+        on_call: Optional hook run after each walk with the walk count so far.
+    """
+    real = iter_vault_fragments
+
+    def _walk(root: Path) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
+        """Delegate to the real loader, then record the walk and run the hook."""
+        records = real(root)
+        calls.append(root)
+        if on_call is not None:
+            on_call(len(calls))
+        return records
+
+    for target in _WALK_TARGETS:
+        monkeypatch.setattr(target, _walk, raising=False)
+
+
+def test_compile_tool_walks_the_vault_exactly_once(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admitted MCP compile parses ``01-Fragments`` once, not twice (#930).
+
+    Before #930 the wrapper's admission survey walked the corpus and the
+    engine then walked it again to load what it compiles: double the pre-LLM
+    I/O at the 35k-fragment bar, and two snapshots that could disagree. The
+    ancestry pair is here so the one walk is shown to serve the #931 ranking
+    too, not just the named ids.
+    """
+    _write_fragment(vault, frag_id="frag-open", privacy_tier="open")
+    _seed_ancestry(vault, ancestor_tier="open", child_tier="open")
+    calls: list[Path] = []
+    _count_walks(monkeypatch, calls)
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-open", "frag-child"],
+        target_kind="thread",
+        target_id="thread-once",
+        target_title="Once",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert factory.calls == 1
+    assert calls == [vault / "01-Fragments"]
+
+
+def test_compile_admission_and_content_come_from_one_walk(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier raised after the walk cannot be compiled under the old admission.
+
+    The TOCTOU #930 names. The hook rewrites ``frag-open`` as ``intimate`` on
+    disk the moment the *first* walk has returned. With admission and content
+    read by two walks, the first admits the call at ``ceiling=open`` and the
+    second hands the engine an intimate fragment — an admitted compile whose
+    sources the caller could never have been admitted to, visible here as the
+    factory being keyed ``INTIMATE``. With one walk the rewrite lands after the
+    only snapshot either decision reads, so the call is admitted *and*
+    compiled as ``open``.
+
+    The final assertion is the anti-vacuity: the rewrite really happened, so
+    the clean factory tiers are not explained by a hook that never fired.
+    """
+    _write_fragment(vault, frag_id="frag-open", privacy_tier="open")
+
+    def _raise_the_tier(walks: int) -> None:
+        """Re-tier ``frag-open`` as intimate right after the first walk only."""
+        if walks == 1:
+            _write_fragment(vault, frag_id="frag-open", privacy_tier="intimate")
+
+    calls: list[Path] = []
+    _count_walks(monkeypatch, calls, _raise_the_tier)
+    factory = _TierRecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-open"],
+        target_kind="thread",
+        target_id="thread-race",
+        target_title="Race",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [PrivacyTier.OPEN]
+    assert all(
+        tier is not None and write_tier_allowed(tier, TierCeiling.OPEN)
+        for tier in factory.tiers
+    )
+    on_disk = frontmatter.load(str(vault / "01-Fragments" / "Notes" / "frag-open.md"))
+    assert on_disk.metadata["privacy_tier"] == "intimate"
+
+
+def test_compile_tool_decides_admission_inside_the_content_mutation_lock(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every walk a compile makes — admission's included — holds the content lock.
+
+    ``creek classify`` and the ``creek.classify`` MCP tool rewrite tiers under
+    ``vault_lock(content_mutation_lock_path(vault))``. An admission survey run
+    outside that lock is unserialised against them however many walks there
+    are, so this pins *where* the decision is read, not just how often. The
+    probe is same-thread and deterministic: see
+    :data:`_LOCK_PROBE_TIMEOUT_SECONDS`.
+    """
+    _write_fragment(vault, frag_id="frag-open", privacy_tier="open")
+    held: list[bool] = []
+
+    def _probe_lock(_walks: int) -> None:
+        """Record whether the content-mutation lock is held during this walk."""
+        try:
+            with vault_lock(
+                content_mutation_lock_path(vault),
+                timeout=_LOCK_PROBE_TIMEOUT_SECONDS,
+            ):
+                held.append(False)
+        except VaultLockTimeoutError:
+            held.append(True)
+
+    calls: list[Path] = []
+    _count_walks(monkeypatch, calls, _probe_lock)
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-open"],
+        target_kind="thread",
+        target_id="thread-locked",
+        target_title="Locked",
+        llm_factory=_RecordingLLMFactory(),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert held
+    assert all(held), f"a compile walk ran outside the content lock: {held}"
+
+
+def _vault_files(vault: Path) -> set[Path]:
+    """Return every file under *vault*, vault-relative."""
+    return {path.relative_to(vault) for path in vault.rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize(
+    ("seed", "fragment_ids"),
+    [
+        (
+            partial(_write_fragment, frag_id="frag-sealed", privacy_tier="intimate"),
+            ["frag-sealed"],
+        ),
+        (
+            partial(_seed_ancestry, ancestor_tier="intimate", child_tier="open"),
+            ["frag-child"],
+        ),
+    ],
+    ids=["named-id", "unnamed-ancestor"],
+)
+def test_compile_refusal_walks_the_vault_exactly_once(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seed: Callable[[Path], None],
+    fragment_ids: list[str],
+) -> None:
+    """A refused compile also walks once and leaves no content-bearing state.
+
+    Both refusal routes — a named above-ceiling id (#848) and an unnamed
+    above-ceiling ancestor (#931) — are decided from the engine's one walk.
+    The only files a refusal may create are the audit row's log and the
+    zero-byte content-mutation lock file, which the in-lock admission now
+    takes on refused calls too: an advisory lock file holds no vault-derived
+    bytes, so it can carry nothing about the sources.
+    """
+    seed(vault)
+    before = _vault_files(vault)
+    calls: list[Path] = []
+    _count_walks(monkeypatch, calls)
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=fragment_ids,
+        target_kind="thread",
+        target_id="thread-refused-once",
+        target_title="Refused once",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert factory.calls == 0
+    assert calls == [vault / "01-Fragments"]
+    entries = [e for e in _read_audit(vault) if e["tool"] == "creek.compile"]
+    assert len(entries) == 1
+    created = _vault_files(vault) - before
+    assert created <= {MCP_AUDIT_RELPATH, CONTENT_MUTATION_LOCK_RELPATH}
+    lock_file = vault / CONTENT_MUTATION_LOCK_RELPATH
+    assert not lock_file.exists() or lock_file.stat().st_size == 0
 
 
 # ---------------------------------------------------------------------------
@@ -3131,7 +3386,7 @@ class TestLinkAdvisoryFields:
 # save — an untitled save must not title itself from line 1 (issue #1505)
 # ---------------------------------------------------------------------------
 
-_UNTITLED_SECRET = "CLEARTEXT-CANARY-1505"
+_UNTITLED_SECRET = "CLEARTEXT-CANARY-1505"  # pragma: allowlist secret
 """Sentinel standing in for whatever the operator's first line actually says.
 
 Named apart from :data:`_PARADOX_SECRET` on purpose: that one is kept *off*

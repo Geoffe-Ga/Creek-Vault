@@ -556,6 +556,21 @@ before the compile LLM is invoked or the page is written — so an
 intimate fragment can never be laundered into an open-tier compiled
 page. The refusal is audited but names no fragment ids and no tiers.
 
+Since #930 that admission is decided inside the content-mutation lock,
+from the same single `01-Fragments` load that is then compiled: the
+engine evaluates the source-tier gate (ancestry included, #931) on the
+records it walked, before it resolves ids or builds an LLM client. The
+decision is therefore serialised against `creek classify` and the
+`creek.classify` MCP tool, which take the same lock, and an admitted
+compile parses the corpus once rather than twice. Hand edits in a text
+editor are not coordinated by the lock, but they can no longer split
+admission from content — a write after the load is simply not part of
+that compile. Under lock contention the call returns the content-free
+`vault content mutation busy` refusal instead, which is not audited, and
+a refused call now leaves the zero-byte
+`00-Creek-Meta/locks/content-mutations.lock` behind (it holds no vault
+content).
+
 ### Read-side posture (#932)
 
 Every registered tool's relationship to the caller's ceiling is now a
