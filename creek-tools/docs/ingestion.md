@@ -263,10 +263,15 @@ still writing ([#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079)).
   prints one line — `vault content mutation busy: another Creek writer holds
   this vault; retry once it finishes.` — exits **1**, and writes nothing. Rerun
   it once the other writer finishes.
-- `creek sync --tier A` does not exit on contention: the busy source is
-  recorded in `last-run.json` as `skipped: vault content mutation busy`, the
-  rest of the tick runs, and the next tick's incremental ingest picks the
-  source up.
+- `creek sync --tier A` does not exit when a source's *ingest* meets
+  contention: that source is marked `skipped: vault content mutation busy`, the
+  remaining sources are tried, and the next tick's incremental ingest picks it
+  up. The record reaches `last-run.json` only if the other writer releases the
+  lock before the tick's rules-classify pass, which takes the same lock with
+  the same 10-second bound. Under sustained contention that pass still ends
+  the tick with a `VaultLockTimeoutError` traceback and no `last-run.json` — a
+  known gap tracked as a follow-up to
+  [#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079).
 - A long ingest holds the lock for its whole run, so remote journal writes,
   uploads, classify and link calls answer `vault content mutation busy` (503
   over `/v1`) until it finishes.

@@ -106,8 +106,9 @@ the connector's lock (#1590) — which clears the instant the holder finishes,
 precisely what a backoff is for. The same holds for
 :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` (#2079): the
 ingest phase found another content writer (a journal write, an upload, a
-classify or link pass) holding the vault, and the files it fetched were
-discarded so the retried sync fetches and ingests them. That constant is
+classify or link pass) holding the vault, and what it fetched was set aside
+so the retried sync ingests it — a newly fetched file discarded and fetched
+again, an overwritten staged file kept and deferred. That constant is
 imported from :mod:`creek.vault.mutations`, its home, rather than through the
 tool module. None of them carries any detail about what failed — see
 :data:`~creek_mcp.tools.drive.SYNC_FAILED_REASON` for why the detail stays in
