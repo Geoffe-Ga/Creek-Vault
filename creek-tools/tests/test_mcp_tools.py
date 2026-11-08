@@ -12,8 +12,7 @@ import pytest
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
-from creek_mcp.tools import author as author_mod
-from creek_mcp.tools.author import author_tool
+from creek_mcp.tools.author import AUTHOR_PROVIDER_FAILED_REASON, author_tool
 from creek_mcp.tools.draft import DRAFT_PROVIDER_FAILED_REASON, draft_tool
 from creek_mcp.tools.lint import lint_tool
 from creek_mcp.tools.mine import mine_tool
@@ -1138,7 +1137,5 @@ def test_author_tool_wraps_desk_errors(
     assert result["status"] == "error"
     assert result["tool"] == "creek.author"
     assert result["tier_ceiling_enforced"] is False
-    assert result["reason"] == getattr(
-        author_mod, "AUTHOR_PROVIDER_FAILED_REASON", None
-    )
+    assert result["reason"] == AUTHOR_PROVIDER_FAILED_REASON
     assert "provider unavailable" not in result["reason"]

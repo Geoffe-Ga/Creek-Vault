@@ -25,8 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from creek.author.conductor import run_author
-from creek_mcp.tools import author as author_mod
-from creek_mcp.tools.author import author_tool
+from creek_mcp.tools.author import AUTHOR_DESK_FAILED_REASON, author_tool
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -371,5 +370,5 @@ def test_malformed_config_keeps_yielding_an_error_envelope(
 
     assert result["status"] == "error"
     reason = result["reason"]
-    assert reason == getattr(author_mod, "AUTHOR_DESK_FAILED_REASON", None)
+    assert reason == AUTHOR_DESK_FAILED_REASON
     assert absent_from_reason not in reason

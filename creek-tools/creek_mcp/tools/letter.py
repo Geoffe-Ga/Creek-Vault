@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Final, Protocol, TypeAlias
 from creek._fslock import VaultLockTimeoutError
 from creek.care.guardrail import CARE_POLICY
 from creek.classify.llm.providers import (
+    PROVIDER_CALL_FAILURES,
     ProviderRateLimitError,
     RequestKeyRejectedError,
 )
@@ -98,6 +99,20 @@ stored half-written.
 """
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+
+_UNAVAILABLE_FAILURES: Final[tuple[type[Exception], ...]] = (
+    *PROVIDER_CALL_FAILURES,
+    OSError,
+    ValueError,
+)
+"""What a letter's dial raises that means "no provider can write it now".
+
+:data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` — an Ollama
+``httpx.HTTPError`` included since #2083 — plus the ``OSError`` and
+``ValueError`` a broken provider configuration raises while the factory is
+built. Named rather than starred inline because mypy rejects a starred
+``except`` tuple.
+"""
 
 
 class LetterRefusal(StrEnum):
@@ -318,9 +333,14 @@ def _generate(call: LetterCall, source: LetterSource) -> str | LetterRefusal:
         return LetterRefusal.RATE_LIMITED
     except RequestKeyRejectedError:
         return LetterRefusal.REQUEST_KEY_REJECTED
-    except (RuntimeError, OSError, ValueError):
+    except _UNAVAILABLE_FAILURES:
         # ``IntimateRoutingError`` is a ``RuntimeError``: the router refused to
         # egress and there is no local backend. It never falls back to cloud.
+        # An Ollama ``httpx.HTTPError`` is not a ``RuntimeError``, and it is an
+        # unavailable provider all the same: ``docs/api.md`` promises a
+        # retryable ``503`` for one, not the ``500`` its escape used to earn
+        # (#2083). No new log record here: ``_log_outcome`` already writes the
+        # closed-vocabulary record the module's Disclosure paragraph allows.
         return LetterRefusal.PROVIDER_UNAVAILABLE
     letter = _bounded_letter(completion)
     return letter or LetterRefusal.EMPTY_LETTER
