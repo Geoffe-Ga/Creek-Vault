@@ -473,3 +473,60 @@ def test_a_stale_creek_config_beside_an_explicit_vault_is_temporarily_unavailabl
     for leaked in (str(config), "zz-secret-config-dir"):
         assert leaked not in caplog.text, leaked
         assert leaked not in response.text, leaked
+
+
+@pytest.mark.parametrize(
+    ("factory", "status", "causes"),
+    [
+        (_empty_factory, _OK, []),
+        (
+            _raising_factory,
+            _SERVICE_UNAVAILABLE,
+            ["cause=reflection unavailable: RuntimeError"],
+        ),
+    ],
+    ids=["answering-factory", "raising-factory"],
+)
+def test_v1_reflect_with_an_injected_factory_never_builds_the_route(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    factory: Callable[..., Callable[[str], str]],
+    status: int,
+    causes: list[str],
+) -> None:
+    """An injected factory gets no grounding route on ``/v1``, as on MCP (#2091).
+
+    The ``/v1`` twin of
+    ``test_mcp_reflect_with_an_injected_factory_never_builds_the_route``. The
+    vault's own config cannot parse, and only the production grounding route
+    reads it before ``reflect_tool`` runs, so building that route beside an
+    injected factory would refuse every call ``reflection unavailable:
+    ParserError``. Instead the outcome is the factory's own: an answer, or its
+    dial error by type name. Never ``ParserError``, and never the path.
+
+    Args:
+        vault: The seeded vault, given a config YAML cannot parse.
+        monkeypatch: Unsets ``CREEK_CONFIG`` so the vault's own file is read.
+        caplog: The log capture, at ``DEBUG`` on every logger.
+        factory: The injected tier-keyed LLM factory.
+        status: The HTTP status the factory's own outcome earns.
+        causes: The refusal-log causes expected, in order; none for an answer.
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    config = vault / "00-Creek-Meta" / "creek_config.yaml"
+    config.write_text(_YAML_INVALID_CONFIG, encoding="utf-8")
+    caplog.set_level(logging.DEBUG)
+
+    response = _post(vault, factory)
+
+    assert response.status_code == status
+    refusals = [r.getMessage() for r in _refusal_lines(caplog)]
+    assert len(refusals) == len(causes)
+    for message, cause in zip(refusals, causes, strict=True):
+        assert cause in message, message
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [m for m in warned if "ParserError" in m], warned
+    for leaked in (str(config), _YAML_LEAK):
+        assert leaked not in caplog.text, leaked
+        assert leaked not in response.text, leaked
