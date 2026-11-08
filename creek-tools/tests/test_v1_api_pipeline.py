@@ -1344,3 +1344,36 @@ def test_an_embedding_refusal_on_the_link_route_is_the_same_refusal(
     response = api.post(LINKS_PATH, json={"method": "eddies"}, headers=headers())
 
     _assert_static_unavailable_refusal(response, vault)
+
+
+def test_an_unrelated_link_engine_fault_is_still_a_server_fault(
+    api: TestClient, vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the typed model error is a refusal; any other fault stays a ``500``.
+
+    The unavailable-model error subclasses :class:`RuntimeError`, so widening
+    the handler's catch to ``RuntimeError`` or ``Exception`` would serve real
+    engine bugs as a ``503 unavailable`` that tells clients to stop retrying
+    until an operator acts. This pins the catch to the typed error.
+    """
+
+    def _raise_engine_bug(**_kwargs: object) -> object:
+        """Fail the way a defect in the clustering stage would.
+
+        Args:
+            **_kwargs: The route's tool arguments, unread.
+
+        Raises:
+            RuntimeError: Always, unrelated to the embedding model.
+        """
+        msg = f"corrupt cluster state {_LEAK_MARKER}"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(pipeline_module, "link_tool", _raise_engine_bug)
+    _write_fragment(vault, "f0", _signal_body(), tier="personal")
+
+    response = api.post(LINKS_PATH, json={"method": "eddies"}, headers=headers())
+
+    assert response.status_code == HTTP_SERVER_FAULT
+    assert response.json()["code"] == ErrorCode.INTERNAL_ERROR.value
+    assert _LEAK_MARKER not in response.text
