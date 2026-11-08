@@ -53,7 +53,12 @@ egress guarantee is untouched, and this route can no more reach a network
 provider than the classification half can. And the parquet is a cache, so the
 work a long call performs is not lost: it lands, and a retry is the fast path.
 Those methods remain synchronous for compatibility; only explicit ``llm`` and
-``embeddings`` requests take the job path.
+``embeddings`` requests take the job path. When the local model cannot load at
+all — the shipped image installs no ``embeddings`` extra, or the cache is empty
+and the download is blocked — the stage raises
+:class:`~creek.link.embeddings.EmbeddingModelUnavailableError` and the route
+answers the static ``503 unavailable`` refusal; the model name, cache path and
+underlying error stay in the operator log (#2060).
 
 **Both passes are idempotent and resumable**, which is what makes a synchronous
 route honest despite that deadline. ``run_classify`` short-circuits on the
@@ -77,6 +82,7 @@ from pydantic import BaseModel, ValidationError
 
 from creek.classify.llm.consent import is_managed_vault
 from creek.classify.llm.request_key import InvalidRequestKeyError
+from creek.link.embeddings import EmbeddingModelUnavailableError
 from creek_mcp.api.models import (
     JOB_FAILURE_CODE_SINCE_MINOR,
     OK_STATUS,
@@ -664,6 +670,14 @@ async def handle_classification(request: Request) -> Response:
 async def handle_link(request: Request) -> Response:
     """Run one linker stage over the whole vault and report its counts.
 
+    ``eddies`` and ``threads`` embed every uncached fragment with the local
+    sentence-transformer. When that model cannot load — no ``embeddings``
+    extra on the image, an empty cache with the download blocked, or a
+    non-local route refusing the text — the engine raises
+    :class:`~creek.link.embeddings.EmbeddingModelUnavailableError`, and this
+    handler answers the static ``503 unavailable`` refusal rather than letting
+    it reach the error boundary as ``500 internal_error`` (#2060).
+
     Args:
         request: The request in flight.
 
@@ -682,7 +696,23 @@ async def handle_link(request: Request) -> Response:
             retier=False,
             context=context,
         )
-    result = await write_off_loop(_link, request, parsed, context)
+    try:
+        result = await write_off_loop(_link, request, parsed, context)
+    except EmbeddingModelUnavailableError as exc:
+        # ``unavailable``, not ``temporarily_unavailable``: as with drive.py's
+        # operator-action refusals, no retry installs a missing extra or
+        # unblocks a download, so RETRY_POLICY must tell the client to stop
+        # backing off. The engine's message names the model, the cache path
+        # and the third-party error — it rides the traceback into the operator
+        # log only, never the message format and never the wire.
+        logger.exception(
+            "link stage %s refused as unavailable: %s request_id=%s",
+            parsed.method.value,
+            type(exc).__name__,
+            context.request_id,
+            extra={"request_id": context.request_id},
+        )
+        return error_response(ErrorCode.UNAVAILABLE, context)
     return _rendered(result, context, _link_model)
 
 
