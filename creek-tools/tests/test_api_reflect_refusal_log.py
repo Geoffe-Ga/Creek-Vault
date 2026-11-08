@@ -17,6 +17,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+from creek.classify.llm.providers import ProviderRateLimitError
 from creek_mcp.api.routes import PROVIDER_HEADER, PROVIDER_KEY_HEADER
 from creek_mcp.httpapi.reflect import REFUSAL_LOGGER_NAME, refusal_cause
 from creek_mcp.tools.reflect import PROMPT_TOO_LONG_REASON, RATE_LIMITED_REASON
@@ -299,3 +300,40 @@ def test_a_syntax_invalid_vault_config_is_a_logged_503_without_its_path(
     for leaked in (str(config), "flow sequence"):
         assert leaked not in caplog.text, leaked
         assert leaked not in response.text, leaked
+
+
+_TOO_MANY_REQUESTS: Final[int] = 429
+
+
+def test_a_rate_limit_raised_while_building_keeps_the_unavailable_503(
+    vault: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A build-time rate limit is still ``503``, not the dial's ``429`` (#2091).
+
+    The shared seam builder names *any* build failure by type, as this route
+    always has; only a rate limit met at the dial is ``rate_limited``. Pinned
+    so routing the build through the MCP tool's helper changed no wire code.
+    """
+    caplog.set_level(logging.WARNING, logger=REFUSAL_LOGGER_NAME)
+
+    def _thunk() -> Callable[..., Callable[[str], str]]:
+        """Fail to build the factory with a rate limit.
+
+        Raises:
+            ProviderRateLimitError: Always.
+        """
+        raise ProviderRateLimitError(_INTERNAL_DETAIL)
+
+    app = build_app(vault_path=vault, reflect_llm_factory=_thunk)
+    with TestClient(app) as client:
+        response = client.post(
+            REFLECTIONS_PATH, json={"content": _ENTRY}, headers=headers(ceiling="open")
+        )
+
+    assert response.status_code == _SERVICE_UNAVAILABLE
+    assert response.status_code != _TOO_MANY_REQUESTS
+    [record] = _refusal_lines(caplog)
+    message = record.getMessage()
+    assert "code=temporarily_unavailable" in message
+    assert "cause=reflection unavailable: ProviderRateLimitError" in message
+    assert _INTERNAL_DETAIL not in caplog.text

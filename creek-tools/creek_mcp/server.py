@@ -114,7 +114,7 @@ from creek_mcp.tools import (
 )
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.handshake import AuthMode
-from creek_mcp.tools.reflect import GroundingSession
+from creek_mcp.tools.reflect import GroundingSession, build_reflect_seams
 from creek_mcp.tools.revoice import revoice_tool
 from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
@@ -1153,6 +1153,13 @@ def build_server(
     revoice_factory = partial(_author_factory_for, vault, revoice_llm_factory)
     compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
     reflect_factory = partial(_reflect_factory_for, vault, reflect_llm_factory)
+    # As on ``/v1`` (#2091): an injected factory resolves no stage, so it cannot
+    # say whether the pool answers a call, and grounding keeps the local route.
+    reflect_route = (
+        None
+        if reflect_llm_factory is not None
+        else partial(_build_reflect_grounding_route, vault)
+    )
 
     # One grounding session per server (#1034): ``creek.reflect``'s retrieval
     # specialist is built and warmed once here rather than per call, so the
@@ -1165,6 +1172,7 @@ def build_server(
         transport=transport,
         auth=_auth_mode(named, resource_server),
         reflect_factory=reflect_factory,
+        reflect_route=reflect_route,
         grounding_session=GroundingSession(),
     )
     _register_authoring_tools(
@@ -1329,6 +1337,7 @@ def _register_conversation_tools(
     transport: Transport,
     auth: AuthMode,
     reflect_factory: _ScopedFactory[_LLMFactory],
+    reflect_route: Callable[[RequestKey | None], GroundingRoute] | None,
     grounding_session: GroundingSession,
 ) -> None:
     """Register the five conversational tools on *server*.
@@ -1356,7 +1365,14 @@ def _register_conversation_tools(
             ``creek.handshake`` publishes (#1963).
         reflect_factory: Builds the tier-keyed LLM factory for one
             ``creek.reflect`` call from its request-scoped key and route
-            recorder (#1967). Invoked lazily per call.
+            recorder (#1967). Invoked lazily per call, inside
+            :func:`~creek_mcp.tools.reflect.build_reflect_seams`' catch, so a
+            vault config that cannot load is a type-name refusal rather than
+            FastMCP ``isError`` text naming its path (#2091).
+        reflect_route: Builds one ``creek.reflect`` call's embedding-route
+            decision from its request-scoped key, under the same catch; or
+            ``None`` when the factory was injected, so grounding keeps the
+            local route exactly as ``POST /v1/reflections`` does (#2091).
         grounding_session: The server-scoped :class:`GroundingSession` whose
             warmed retrieval specialist every ``creek.reflect`` call reuses
             (#1034). Constructed by ``build_server`` and threaded in rather
@@ -1390,16 +1406,24 @@ def _register_conversation_tools(
         """Return anchored Higher-Self margin notes on a single journal entry."""
         provenance = InferenceProvenance()
         request_key = bound_request_key()
+        seams = build_reflect_seams(
+            partial(reflect_factory, request_key, provenance),
+            None if reflect_route is None else partial(reflect_route, request_key),
+            ceiling=privacy_tier_ceiling,
+        )
+        if isinstance(seams, dict):
+            return _labelled(seams, provenance)
+        llm_factory, grounding_route = seams
         response = reflect_tool(
             vault_path=vault,
-            llm_factory=reflect_factory(request_key, provenance),
+            llm_factory=llm_factory,
             content=content,
             entry_ref=entry_ref,
             care_guard=acute_distress_guard,
             session=grounding_session,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
-            grounding_route=_build_reflect_grounding_route(vault, request_key),
+            grounding_route=grounding_route,
         )
         return _labelled(response, provenance)
 

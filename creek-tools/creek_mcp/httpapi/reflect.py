@@ -70,6 +70,7 @@ from creek_mcp.tools.reflect import (
     PROMPT_TOO_LONG_REASON,
     RATE_LIMITED_REASON,
     REQUEST_KEY_REJECTED_REASON,
+    build_reflect_seams,
     reflect_tool,
 )
 
@@ -353,27 +354,26 @@ def _reflect(
             then omitted rather than guessed.
 
     Returns:
-        The tool's return dict, a synthetic refusal when the factory itself
-        could not be built, or ``None`` when there is no readable vault to
-        reflect against, which the caller renders as the ``unavailable``
-        refusal.
+        The tool's return dict; the
+        :func:`~creek_mcp.tools.reflect.build_reflect_seams` refusal when the
+        factory or the grounding route could not be built — a vault config
+        YAML cannot parse included, which once escaped as a ``500`` (#2091);
+        or ``None`` when there is no readable vault to reflect against, which
+        the caller renders as the ``unavailable`` refusal.
     """
     vault = configured_vault(request)
     if vault is None:
         return None
-    try:
-        factory = (
-            build_factory
-            or partial(_default_llm_factory, vault, request_key, provenance)
-        )()
-        grounding_route = (
-            None if build_factory is not None else _grounding_route(vault, request_key)
-        )
-    except (RuntimeError, OSError, ValueError) as exc:
-        return {
-            "status": "refused",
-            "reason": f"{_UNAVAILABLE_PREFIX}{type(exc).__name__}",
-        }
+    seams = build_reflect_seams(
+        build_factory or partial(_default_llm_factory, vault, request_key, provenance),
+        None
+        if build_factory is not None
+        else partial(_grounding_route, vault, request_key),
+        ceiling=context.ceiling,
+    )
+    if isinstance(seams, dict):
+        return seams
+    factory, grounding_route = seams
     return reflect_tool(
         vault_path=vault,
         llm_factory=factory,

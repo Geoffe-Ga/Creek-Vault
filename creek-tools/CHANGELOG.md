@@ -9,6 +9,30 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`creek.reflect` refuses a vault config that cannot load by type name,
+  never as `isError` text naming its path (#2091, follow-up to #2083).** The
+  MCP tool built its LLM factory and grounding route before `reflect_tool`'s
+  catch, so a stale `CREEK_CONFIG` (`FileNotFoundError`), a schema-invalid
+  config (`ValidationError`) and a config YAML cannot parse (`ParserError`)
+  each reached the client as `Error executing tool creek.reflect: ...` with the
+  server's config path in it. Both seams are now built by one helper,
+  `creek_mcp.tools.reflect.build_reflect_seams`, whose catch is
+  `(RuntimeError, OSError, ValueError, YAMLError)`; a failure answers
+  `reflection unavailable: <TypeName>` and logs one type-name-only WARNING on
+  `creek_mcp.tools.reflect`. `YAMLError` is listed because it is not a
+  `ValueError`: `POST /v1/reflections`, which already caught the other three,
+  now shares the helper, so a YAML-syntax-invalid vault config there is
+  `503 temporarily_unavailable` instead of `500 internal_error`. A build
+  failure's reason is the literal type-name reason on both surfaces, so a
+  rate-limit or rejected-key error raised while *building* keeps `/v1`'s
+  existing `503`. An injected `reflect_llm_factory` now gets no grounding route
+  on MCP, as on `/v1`, so it never reads the config to build one. A
+  build refusal is decided before `reflect_tool` runs and so, as on `/v1`
+  before, appends no line to the MCP audit log. The same pattern in
+  `creek.classify`, `creek.link`, `creek.redact.scan`, `creek.report`,
+  `creek.draft`, `creek.compile` and the `/v1` letter and reading routes is
+  left to follow-ups.
+
 - **`creek sync` keeps its last-run record when classify or link meets
   content-lock contention (#2087, follow-up to #2079).** `run_classify`,
   `run_link` and `compile_to_vault` now take the vault content-mutation lock
