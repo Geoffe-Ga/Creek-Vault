@@ -16,4 +16,4 @@
 # whatever is pinned here, so an upgrade that stops catching a 500, stops
 # catching a schema violation, or starts printing the bearer token into its
 # report turns the workflow red before it reports on the real API.
-schemathesis==4.32.3
+schemathesis==4.33.1
