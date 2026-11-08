@@ -7577,16 +7577,36 @@ def _build_engine(
     so every ``creek purge`` command takes that boundary itself, around its
     engine call only, through :func:`_hold_content_or_exit_1` (#2086).
 
+    The vault layout is validated here, before any command can reach that
+    hold: acquiring the lock creates ``00-Creek-Meta/locks/`` and the engine
+    writes ``00-Creek-Meta/audit/purge.jsonl``, so a mistyped ``--vault``
+    must be refused while it is still untouched (#2086, #2098). The refusal
+    keeps the wording the engine's own marker check uses, so every purge
+    names a mistyped vault the same way.
+
     Args:
         vault: Optional explicit vault override.
         dry_run: Whether to preview changes only.
 
     Returns:
         A ready-to-use :class:`PurgeEngine`.
+
+    Raises:
+        typer.Exit: With code ``1`` when the resolved path is not a vault.
     """
     from creek.purge import PurgeEngine as _Engine
+    from creek.vault.writer import require_vault_layout
 
     vault_path = _resolve_vault(vault)
+    try:
+        require_vault_layout(vault_path)
+    except FileNotFoundError as exc:
+        console.print(
+            f"[red]Aborted: {escape(str(vault_path))} does not appear to be a "
+            f"Creek vault ({escape(str(exc))}). Run `creek init --vault <path>` "
+            "first, or fix the --vault argument.[/red]",
+        )
+        raise typer.Exit(code=1) from exc
     return _Engine(vault_path, dry_run=dry_run)
 
 
@@ -7834,6 +7854,7 @@ def purge_vault(
     from creek.purge.engine import VAULT_PURGE_CONFIRMATION
 
     engine = _build_engine(vault, dry_run=dry_run)
+    _require_purge_vault_marker(engine.vault_path)
 
     if dry_run:
         try:
@@ -7877,6 +7898,30 @@ def purge_vault(
         console.print(f"[red]Aborted: {exc}[/red]")
         raise typer.Exit(code=1) from exc
     _render_purge_result(result)
+
+
+def _require_purge_vault_marker(vault_path: Path) -> None:
+    """Refuse ``purge vault`` on a tree without its vault marker, before the hold.
+
+    ``purge vault`` alone demands ``00-Creek-Meta/creek_config.yaml`` (GAP-003)
+    on top of the layout :func:`_build_engine` checks. The engine checks it
+    too, but only once the content lock is held, and acquiring the lock
+    creates ``00-Creek-Meta/locks/``: checked here first, a tree the command
+    refuses is left exactly as it was (#2086).
+
+    Args:
+        vault_path: Root the purge would wipe.
+
+    Raises:
+        typer.Exit: With code ``1`` when the marker file is missing.
+    """
+    from creek.purge.engine import require_vault_marker
+
+    try:
+        require_vault_marker(vault_path)
+    except ValueError as exc:
+        console.print(f"[red]Aborted: {escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
 
 
 def _resolve_purge_phrase(

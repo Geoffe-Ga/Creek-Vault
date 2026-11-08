@@ -287,6 +287,75 @@ def test_purge_vault_resolves_its_phrase_outside_the_content_lock(
     assert held_at_phrase == [False]
 
 
+_BAD_VAULTS: dict[str, bool] = {"missing": False, "not-a-vault": True}
+"""Each kind of mistyped ``--vault``, and whether the directory exists."""
+
+
+@_EACH_PURGE
+@pytest.mark.parametrize("mode", ["dry-run", "confirmed"])
+@pytest.mark.parametrize("bad_vault", sorted(_BAD_VAULTS))
+def test_purge_mistyped_vault_gains_no_lock_or_audit(
+    tmp_path: Path,
+    purge: str,
+    mode: str,
+    bad_vault: str,
+) -> None:
+    """A mistyped ``--vault`` is refused before the hold scaffolds anything.
+
+    Acquiring the content lock creates ``00-Creek-Meta/locks/``, and the
+    engine's audit log ``00-Creek-Meta/audit/``, so the purge target must be
+    validated before either: a typo must not leave Creek folders behind in
+    whatever directory it happened to name (#2086, #2098).
+    """
+    target = tmp_path / bad_vault
+    if _BAD_VAULTS[bad_vault]:
+        target.mkdir()
+    argv = _PURGES[purge][1]
+
+    result = _invoke([*argv, "--dry-run"] if mode == "dry-run" else argv, target)
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "does not appear to be a Creek vault" in _flat(result.output)
+    assert "Traceback" not in result.output
+    assert not (target / "00-Creek-Meta" / "locks").exists()
+    assert not (target / "00-Creek-Meta" / "audit").exists()
+    assert target.exists() is _BAD_VAULTS[bad_vault]
+    if target.exists():
+        assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("mode", ["dry-run", "confirmed"])
+def test_purge_vault_on_an_unmarked_vault_gains_no_lock(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    """``purge vault`` checks its ``creek_config.yaml`` marker before the hold.
+
+    A directory with both vault folders but no marker passes the layout check
+    every purge shares, yet ``purge vault`` refuses it (GAP-003). That refusal
+    must also come before the lock, which would otherwise leave
+    ``00-Creek-Meta/locks/`` behind in a tree the command then declines to
+    touch (#2086).
+    """
+    target = tmp_path / "unmarked"
+    for name in ("00-Creek-Meta", "01-Fragments"):
+        (target / name).mkdir(parents=True)
+    argv = _PURGES["vault"][1]
+
+    result = _invoke([*argv, "--dry-run"] if mode == "dry-run" else argv, target)
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "does not appear to be a Creek vault" in _flat(result.output)
+    assert not (target / "00-Creek-Meta" / "locks").exists()
+    assert not (target / "00-Creek-Meta" / "audit").exists()
+    assert sorted(path.name for path in target.rglob("*")) == [
+        "00-Creek-Meta",
+        "01-Fragments",
+    ]
+
+
 def test_purge_engine_under_an_existing_hold_does_not_nest_the_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

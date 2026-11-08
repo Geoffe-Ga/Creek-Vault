@@ -32,7 +32,13 @@ to locate the originating commit for any reference below.
   purge tools, still reads `purge engine failed: …`). `PurgeEngine`,
   `pin_ids`, `refresh` and `VaultWriter` stay lock-free, so the `/v1` journal
   withdraw, which already holds the lock when it calls `PurgeEngine`, does
-  not nest it.
+  not nest it. Every `creek purge` command now validates `--vault` (it must
+  hold `00-Creek-Meta/` and `01-Fragments/`, and for `purge vault` its
+  `creek_config.yaml` marker) before taking the lock: a
+  mistyped or non-vault path exits 1 with `does not appear to be a Creek
+  vault` and gains neither `00-Creek-Meta/locks/` nor
+  `00-Creek-Meta/audit/purge.jsonl` (re #2098, whose first item this fixes:
+  `purge fragment` and friends used to scaffold that audit log and exit 0).
 
 - **`creek sync` keeps its last-run record when classify or link meets
   content-lock contention (#2087, follow-up to #2079).** `run_classify`,
