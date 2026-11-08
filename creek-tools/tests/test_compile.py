@@ -2207,7 +2207,8 @@ def test_compile_to_vault_walks_the_vault_exactly_once(
     second pass doubles the pre-LLM wall clock. The ancestor index is
     therefore built from the records ``_load_fragments_for_compile`` already
     walked, and this counter is what stops a future lane reintroducing the
-    convenient-but-quadratic ``ancestry_tiers(vault_path, ...)`` call here.
+    convenient second ``iter_vault_fragments`` walk here (the shape the MCP
+    gate had until #930 removed it).
     """
     _write_ancestry_pair(vault, ancestor_tier=PrivacyTier.INTIMATE)
     real = iter_vault_fragments

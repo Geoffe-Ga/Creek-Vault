@@ -37,11 +37,14 @@ an explicit ``unclassified`` only in the raw frontmatter — is ``INTIMATE``),
 caller that must tell a named-but-absent id from a named-but-filtered-out one
 (``creek.draft``) can. Everyone else wants the reduction and keeps the list.
 
-:func:`build_ancestor_index` / :class:`AncestorIndex` / :func:`ancestry_tiers`
-(#931) are the ancestry-aware sibling of :func:`source_tiers`, for the one
-caller — ``creek.compile`` — whose prompt renders a fragment's *ancestors*
-alongside the fragment itself. They exist as a separate survey rather than as a
-widening of :func:`source_tiers` on purpose; see that function's docstring.
+:func:`build_ancestor_index` / :class:`AncestorIndex` (#931) are the
+ancestry-aware sibling of :func:`source_tiers`, for the one caller —
+``creek.compile`` — whose prompt renders a fragment's *ancestors* alongside the
+fragment itself. They take records the caller already walked:
+``creek.compile.engine`` builds the index from its one walk, and since #930 the
+MCP gate ranks that same index rather than walking the vault a second time.
+They exist as a separate survey rather than as a widening of
+:func:`source_tiers` on purpose; see that function's docstring.
 
 :func:`raw_privacy_tier` and :func:`within_ceiling` (#968) are the
 raw-frontmatter siblings of that pair, for generation flows that never build a
@@ -541,7 +544,8 @@ def source_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[PrivacyT
     ``structural_path`` breadcrumb, so an ancestor's title never reaches
     their prompts and ranking ancestry there would refuse calls that leak
     nothing. ``creek.compile`` is the one caller whose prompt *does* render
-    ancestry, and it uses :func:`ancestry_tiers` instead. The two are two
+    ancestry, and it ranks :meth:`AncestorIndex.chain_tiers` over the
+    engine's walk instead (#930). The two are two
     functions rather than one flag because they answer two different
     questions; ``tests/test_privacy_filter.py``'s
     ``test_source_tiers_stays_ancestry_blind`` pins the difference so a
@@ -651,7 +655,7 @@ def resolved_source_tiers(
     collapsing them refuses drafts that leak nothing (#1031).
 
     It is a second function rather than a flag on the first for the same
-    reason :func:`ancestry_tiers` is (#931): the two answer different
+    reason :class:`AncestorIndex` is (#931): the two answer different
     questions, and every existing caller wants the reduction, not the map.
     They share ``_walk_source_tiers``, so there is one walk to keep correct.
 
@@ -738,8 +742,11 @@ class AncestorIndex:
 
     Built once per call by :func:`build_ancestor_index` from records the
     caller has *already* walked, so ranking ancestry costs no extra pass
-    over ``01-Fragments``. :func:`ancestry_tiers` is the walk-it-for-me
-    entry point for callers that have no walk of their own.
+    over ``01-Fragments``. There is deliberately no walk-it-for-me entry
+    point: the one consumer, ``creek.compile``, ranks the index its engine
+    builds inside the content-mutation lock, so admission and compiled
+    content are one snapshot (#930). A convenience that walked the vault
+    itself would invite exactly the second, unlocked walk #930 removed.
 
     Attributes:
         entries: One :class:`_AncestorEntry` per fragment the index covers.
@@ -923,49 +930,6 @@ def build_ancestor_index(
             breadcrumb_len=len(fragment.structural_path),
         )
     return AncestorIndex(entries=entries)
-
-
-def ancestry_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[PrivacyTier]:
-    """Return the tiers of *fragment_ids* **and their ancestors**, in one vault walk.
-
-    The ancestry-aware sibling of :func:`source_tiers` (#931), and the entry
-    point for callers that have no corpus walk of their own —
-    ``creek_mcp.tools.compile._survey_sources`` is the only one.
-
-    It exists because ``creek.compile``'s prompt renders an admitted
-    fragment's ancestry: :func:`creek.hierarchy.structural_path_context`
-    returns the persisted ``structural_path`` — ancestor headings the
-    splitter accumulated — and ``_build_prompt`` emits it after
-    ``structural_path:``. #848's gate ranks only the ids a caller *names*, so
-    an ``open`` child of an ``intimate`` parent was admitted at
-    ``ceiling=open`` and carried its parent's heading to a cloud-routed
-    provider. Ranking the ancestry closes that channel without redacting the
-    breadcrumb, which is unredactable anyway: the persisted entries are bare
-    strings with no owning-fragment id.
-
-    Uses the same shared loader as :func:`source_tiers` and
-    ``creek.compile.engine._load_fragments_for_compile``, for the same
-    reason: a file one side sees and the other does not is the bug class
-    these surveys exist to prevent. The walk is a single non-short-circuiting
-    pass and the ranking that follows it is exhaustive, so probe cost stays
-    uniform by construction — see :meth:`AncestorIndex.chain_tiers` rule (f).
-
-    Args:
-        vault_path: Vault root; fragments are read from ``01-Fragments``.
-        fragment_ids: The ids the caller named. Duplicates collapse; an id
-            that does not resolve contributes nothing, exactly as in
-            :func:`source_tiers`, so a caller's not-found path is untouched.
-
-    Returns:
-        The tiers to reduce over. See :meth:`AncestorIndex.chain_tiers` for
-        why this is a bag rather than one entry per requested id.
-    """
-    return build_ancestor_index(
-        (fragment, raw)
-        for _path, fragment, _body, raw in iter_vault_fragments(
-            vault_path / "01-Fragments",
-        )
-    ).chain_tiers(fragment_ids)
 
 
 def record_privacy_override(

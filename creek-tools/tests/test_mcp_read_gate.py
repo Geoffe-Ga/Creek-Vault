@@ -602,10 +602,10 @@ def test_the_compile_ancestry_rationale_clause_is_executed() -> None:
     result be *consumed*, so a call-and-discard edit that left the name
     present cannot satisfy this either.
 
-    #930 re-pointed it. The clause used to name ``ancestry_tiers``, a
-    walk-it-yourself survey ``_survey_sources`` called before the engine
-    walked the corpus again; since #930 the engine makes the only walk, inside
-    the content-mutation lock, and ``_survey_sources`` ranks the index built
+    #930 re-pointed it. The clause used to name a walk-it-yourself survey
+    that ``_survey_sources`` called before the engine walked the corpus again;
+    since #930 the engine makes the only walk, inside the content-mutation
+    lock, and ``_survey_sources`` ranks the index built
     from it with ``AncestorIndex.chain_tiers`` directly. The property pinned
     is unchanged: the ancestry-aware ranking, not its ancestry-blind sibling
     ``source_tiers``, is what compile's gate consumes.
@@ -4870,7 +4870,8 @@ def _prompt_probe_compile(vault: Path) -> _PromptCapture:
       frontmatter field before it walks ``parent_id`` at all, so no ancestor
       need be loaded for one to be rendered. That was #931, now **closed by
       #1283**, which ranks the whole chain through
-      ``creek.classify.privacy_filter.ancestry_tiers`` at the same gate —
+      ``creek.classify.privacy_filter.AncestorIndex.chain_tiers`` at the same
+      gate (over the engine's one walk since #930) —
       including the depth-0 case (a breadcrumb with no resolvable
       ``parent_id``), which fails closed under its rule (e).
 

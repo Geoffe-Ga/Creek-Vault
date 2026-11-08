@@ -111,10 +111,10 @@ def structural_path_context(
     above-ceiling parent's heading reached the compile prompt through an
     admitted child (#931). Rendering the breadcrumb is therefore only safe
     where the ancestry has already been *ranked*:
-    :func:`creek.classify.privacy_filter.ancestry_tiers` (and its pure
-    sibling :func:`~creek.classify.privacy_filter.build_ancestor_index`) is
-    the survey that does it. ``creek.compile.engine`` is the only production
-    caller, pinned by
+    :meth:`creek.classify.privacy_filter.AncestorIndex.chain_tiers`, over the
+    index :func:`~creek.classify.privacy_filter.build_ancestor_index` builds
+    from the compile engine's one walk (#930), is the survey that does it.
+    ``creek.compile.engine`` is the only production caller, pinned by
     ``tests/test_hierarchy.py::test_structural_path_context_has_exactly_one_production_caller``;
     a second renderer must add its tier gate first.
 
