@@ -699,7 +699,12 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "identical refusal as a genuine above-ceiling document. And the "
             "ledger this gate resolves through is upload.jsonl, not "
             "markdown.jsonl, so a journal external_id and an upload "
-            "external_id can never collide however alike they look."
+            "external_id can never collide however alike they look. The "
+            "gate, staging and the ingest it admits run inside ONE hold of "
+            "the vault content-mutation lock (#2069), the lock creek classify "
+            "escalates tiers under, so the tier read here is still the tier "
+            "on disk when the overwrite lands; contention refuses 'vault "
+            "content mutation busy' before anything is staged."
         ),
         gate_module="creek_mcp.tools.upload",
         gate_symbol="refuse_above_ceiling",
@@ -770,9 +775,10 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "did not supply, and the tool hands back that fragment's "
             "frequency, phase, privacy tier and classification provenance. "
             "The tier the gate compares is the fragment's CURRENT PERSISTED "
-            "one, read through the shared "
-            "privacy_filter.source_tiers walk and reduced by "
-            "max_source_tier -- never the caller's own declared tier, which "
+            "one, read by privacy_filter.fragment_tier from every file "
+            "carrying the id and reduced by max_source_tier (an id on "
+            "several files gates on the strictest) -- never the caller's "
+            "own declared tier, which "
             "is not a gate at all, and never a staged-frontmatter tier, "
             "which is stale the moment creek classify escalates the "
             "fragment. It fails closed twice over: a MISSING privacy_tier "
@@ -783,10 +789,16 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "INTIMATE as well, so every locator divergence is refused rather "
             "than answered. It REFUSES rather than excluding, on "
             "state_read's rule: the target is caller-addressed and singular, "
-            "so there is nothing to partially admit. The resolution walk is "
-            "exhaustive and sits BELOW the gate, so a refused id and a "
-            "not-found id cost the same and the refusal leaks no position "
-            "through timing."
+            "so there is nothing to partially admit. The tier and the record "
+            "come from ONE exhaustive iter_vault_fragments snapshot taken "
+            "inside the vault content-mutation lock creek classify writes "
+            "under, and the gate and the answer are both evaluated in that "
+            "hold (#2068): the served classification and the gated tier "
+            "belong to one state of the file, and because the whole snapshot "
+            "precedes the gate a refused id and a not-found id cost the same, "
+            "so the refusal leaks no position through timing. Lock contention "
+            "answers the content-free 'vault content mutation busy', decided "
+            "before the snapshot."
         ),
         gate_module="creek_mcp.tools.classify_entry",
         gate_symbol="refuse_above_ceiling",

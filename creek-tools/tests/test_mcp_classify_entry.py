@@ -487,7 +487,7 @@ def test_a_fragment_with_no_privacy_tier_key_fails_closed_to_intimate(
     """A *missing* key ranks INTIMATE, distinctly from an explicit unclassified.
 
     This is #1033, and it is the whole reason the gate goes through
-    ``source_tiers``/``fragment_tier`` rather than reading
+    ``fragment_tier`` on the raw frontmatter rather than reading
     ``fragment.privacy_tier`` off the validated model — which defaults to
     ``unclassified`` (rank 1) and therefore fails **open** at
     ``ceiling=personal``. The contrast below is what makes that non-vacuous:

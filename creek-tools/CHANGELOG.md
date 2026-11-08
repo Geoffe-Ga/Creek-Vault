@@ -9,6 +9,29 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `creek.classify.entry` and `creek.upload` now decide their privacy gate
+  inside the vault content-mutation lock, finishing the sweep #930 started
+  for `creek.compile` (refs #2068, #2069, #930). `classify.entry` used to
+  gate on one walk of `01-Fragments` and serve the record from a second,
+  with no lock across either, so a `creek classify` re-tier between them
+  could be answered as the old tier beside the new classification; it now
+  gates and answers from one exhaustive snapshot taken under the lock (an id
+  on several files still gates on the strictest). `upload` used to run its
+  #970 overwrite gate with no lock held, so a concurrent escalation could
+  land between admission and the overwrite; it now holds the lock once from
+  that gate through staging, ingest and the success audit. Contention past
+  the lock's bound answers the content-free `vault content mutation busy`
+  refusal on both tools — unaudited and with nothing staged on `upload`,
+  where only a timeout acquiring the lock is reported that way — and
+  `POST /v1/uploads` maps it by exact equality to `503
+  temporarily_unavailable` instead of `500 internal_error`.
+  **Operator-visible:** both tools may now create the zero-byte
+  `00-Creek-Meta/locks/content-mutations.lock`, and either can wait up to the
+  lock's 10-second bound behind another content writer (a large upload or OCR
+  run likewise makes other writers wait). No contract version change: `503`
+  is already published on every route and the busy reason is a free-text
+  `reason` value, as in #2066.
+
 - `creek.link` and `creek.report unnamed` now answer an embedding model that
   cannot load with the fixed, content-free refusal `embedding model
   unavailable` instead of raising (refs #2065). `EmbeddingLinker.load_model`'s
