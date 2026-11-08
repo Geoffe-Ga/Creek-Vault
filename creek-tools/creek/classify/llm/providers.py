@@ -221,6 +221,19 @@ class RequestKeyRejectedError(RuntimeError):
     """
 
 
+REQUEST_KEY_REJECTED_REASON: Final[str] = (
+    "the writer's request-scoped provider key was refused by its vendor"
+)
+"""Why a request-keyed pass stopped on :class:`RequestKeyRejectedError` (#1877).
+
+Fixed text: never the key, the vendor's message or its status. ``creek.classify``
+and ``creek.draft`` both answer it (#2073), and the ``/v1`` job worker matches
+this exact string to publish ``failure_code: request_key_rejected``, so it is a
+constant, not prose. It lives beside the exception rather than in either tool
+module, so neither tool has to import the other (#1772).
+"""
+
+
 def _retry_after_seconds(exc: object) -> float | None:
     """Extract a ``Retry-After`` hint (in seconds) from a vendor exception.
 
