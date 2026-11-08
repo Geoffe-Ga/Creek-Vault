@@ -425,7 +425,7 @@ def _render(
     Returns:
         A ``200`` carrying the published response model and nothing else.
     """
-    payload = CapabilitiesResponse(
+    body = CapabilitiesResponse(
         status=status,
         contract_version=CONTRACT_VERSION,
         contract_minor=CONTRACT_MINOR,
@@ -438,8 +438,7 @@ def _render(
         inference_pool=inference_pool,
         keyless_inference=keyless_inference,
         agent_mcp=agent_mcp,
-    )
-    body = payload.model_dump(mode="json")
+    ).model_dump(mode="json")
     if request_keys is None:
         body.pop("request_key_providers")
     if inference_pool is None:

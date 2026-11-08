@@ -725,7 +725,7 @@ class FlyProviderDriver:
             candidate, reference, volume_id, secrets
         ):
             self._rejected("recorded Fly Machine config is not this allocation")
-        self._update_machine(reference, machine, {**candidate, "skip_launch": True})
+        self._update_machine(reference, machine, candidate | {"skip_launch": True})
         restored = self._plan(
             self._require_machine(reference), reference, volume_id, secrets
         )
@@ -1246,8 +1246,8 @@ class FlyProviderDriver:
                 ],
                 "restart": {"policy": "no"},
                 "services": [self._runtime_service()],
-                **runtime,
-            },
+            }
+            | runtime,
         }
 
     def _runtime_secret_files(
@@ -1331,7 +1331,7 @@ class FlyProviderDriver:
         if runtime_secrets.mcp_oauth is not None:
             stored = {**stored, **runtime_secrets.mcp_oauth.runtime_env()}
         if not self._policy.fly_replay_enabled:
-            return {"env": {MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER, **stored}}
+            return {"env": {MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER} | stored}
         return {
             # Fly ignores config.user; process overrides need both the user
             # and command rather than inheriting config.init.exec.
@@ -1352,8 +1352,8 @@ class FlyProviderDriver:
                 "CREEK_CONTAINER_EXPECTED_FLY_APP": reference.app_name,
                 "CREEK_CONTAINER_EXPECTED_FLY_REGION": self._policy.region,
                 MANAGED_VAULT_ENV: _MANAGED_VAULT_MARKER,
-                **stored,
-            },
+            }
+            | stored,
             "init": {},
         }
 
@@ -1580,8 +1580,7 @@ class FlyProviderDriver:
     ) -> bool:
         """Accept only the request mount or Fly's exact reviewed enrichment."""
         requested = {"volume": volume_id, "path": _VAULT_MOUNT, "encrypted": True}
-        normalized = {
-            **requested,
+        normalized = requested | {
             "size_gb": self._policy.volume_size_gb,
             "name": reference.volume_name,
         }
@@ -1590,7 +1589,7 @@ class FlyProviderDriver:
     def _machine_service_is_exact(self, value: object) -> bool:
         """Accept Fly's boolean normalization without weakening scale-to-zero."""
         requested = self._runtime_service()
-        normalized = {**requested, "autostop": True, "force_instance_key": None}
+        normalized = requested | {"autostop": True, "force_instance_key": None}
         return value in ([requested], [normalized])
 
     def _require_machine(self, reference: _AllocationRef) -> Mapping[str, Any]:
@@ -1868,7 +1867,7 @@ def _env_drift(observed: Mapping[str, Any], wanted: Mapping[str, Any]) -> list[s
         for name in set(observed) | set(wanted)
         if observed.get(name, _ABSENT) != wanted.get(name, _ABSENT)
     }
-    if any(_ENV_NAME_RE.fullmatch(str(name)) is None for name in names):
+    if any(_ENV_NAME_RE.fullmatch(name) is None for name in names):
         return ["env"]
     return [f"env.{name}" for name in sorted(names)]
 

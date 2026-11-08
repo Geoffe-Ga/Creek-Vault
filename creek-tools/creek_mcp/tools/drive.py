@@ -355,7 +355,7 @@ def drive_status_tool(
         "status": "ok",
         "tier_ceiling": privacy_tier_ceiling.value,
         "connection": state,
-        "scopes": list(drive.scopes),
+        "scopes": drive.scopes.copy(),
         "can_sync": state == STATE_CONNECTED,
     }
 

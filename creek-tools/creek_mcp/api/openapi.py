@@ -386,7 +386,7 @@ def _components() -> dict[str, Any]:
         schema = model.model_json_schema(ref_template=COMPONENT_REF_TEMPLATE)
         hoisted.update(schema.get(_DEFS_KEY, {}))
         models[name] = {key: value for key, value in schema.items() if key != _DEFS_KEY}
-    return {**hoisted, **models}
+    return hoisted | models
 
 
 def _is_unbuilt(spec: RouteSpec) -> bool:

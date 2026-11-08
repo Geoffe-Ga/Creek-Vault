@@ -258,7 +258,7 @@ def _revocation(args: argparse.Namespace) -> RevocationCache | None:
     """
     url = args.oauth_agent_token_status_url
     bearer_file = args.oauth_agent_token_status_bearer_file
-    if url is None and bearer_file is None:
+    if url is bearer_file is None:
         return None
     if url is None or bearer_file is None:
         msg = (

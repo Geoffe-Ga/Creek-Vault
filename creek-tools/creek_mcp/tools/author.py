@@ -165,12 +165,11 @@ def _privacy_refusal_response(
         The canonical refusal keys plus this verb's own non-content metadata and
         the privacy findings.
     """
-    return {
-        **refusal_response(
-            tool=TOOL_NAME,
-            ceiling=tier_ceiling,
-            reason=_PRIVACY_REFUSAL_REASON.format(count=len(leaks)),
-        ),
+    return refusal_response(
+        tool=TOOL_NAME,
+        ceiling=tier_ceiling,
+        reason=_PRIVACY_REFUSAL_REASON.format(count=len(leaks)),
+    ) | {
         # "refused" with "enforced: True" is not a contradiction. This flag is a
         # claim about the #660 retrieval filter, which ran and did its job: at
         # ceiling=all the caller *is* admitted to intimate content, so no

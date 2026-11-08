@@ -143,7 +143,7 @@ def _configured_scopes(drive: GoogleDriveConfig) -> list[str]:
     Returns:
         The configured scopes.
     """
-    return list(drive.scopes)
+    return drive.scopes.copy()
 
 
 def _readonly_scopes(drive: GoogleDriveConfig) -> list[str] | None:
@@ -364,9 +364,7 @@ def _unavailable(tool: str, ceiling: TierCeiling) -> dict[str, Any]:
     Returns:
         The structured refusal.
     """
-    return dict(
-        refusal_response(tool=tool, ceiling=ceiling, reason=GRANT_UNAVAILABLE_REASON)
-    )
+    return refusal_response(tool=tool, ceiling=ceiling, reason=GRANT_UNAVAILABLE_REASON)
 
 
 def _refused(tool: str, ceiling: TierCeiling) -> dict[str, Any]:
@@ -379,9 +377,7 @@ def _refused(tool: str, ceiling: TierCeiling) -> dict[str, Any]:
     Returns:
         The structured refusal.
     """
-    return dict(
-        refusal_response(tool=tool, ceiling=ceiling, reason=GRANT_REFUSED_REASON)
-    )
+    return refusal_response(tool=tool, ceiling=ceiling, reason=GRANT_REFUSED_REASON)
 
 
 def drive_authorize_tool(

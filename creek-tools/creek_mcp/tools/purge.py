@@ -160,7 +160,7 @@ def _audit_success(
         args=args,
         tier_ceiling=TierCeiling.OPEN,
         consumer=consumer,
-        affected_fragment_ids=list(result.affected_fragment_ids),
+        affected_fragment_ids=result.affected_fragment_ids.copy(),
     )
 
 
@@ -204,8 +204,7 @@ def _result_payload(
     See :data:`_ENGINE_STATUS_TO_WIRE` for the two success spellings.
     """
     total = len(result.deleted_files)
-    return {
-        **result.model_dump(mode="json"),
+    return result.model_dump(mode="json") | {
         "deleted_files": result.deleted_files[:_MAX_DELETED_FILE_PATHS],
         "deleted_files_total": total,
         "deleted_files_truncated": total > _MAX_DELETED_FILE_PATHS,

@@ -15,6 +15,15 @@ pass by trading away Bandit's ``-ll`` severity threshold, Pylint's
 as a target and then carving it back out with an ``--exclude`` /
 ``--ignore-paths`` flag on the same command line.
 
+Issue #965 extends the same contract to the refurb modernisation gate and
+the interrogate docstring gate. Both now scan ``creek_mcp/`` through their
+single wrapper script, which CI, ``lint-extended.sh`` and pre-commit all call.
+Interrogate is held to its threshold *per package*: one combined run reports
+a single aggregate, so ``creek/``'s much larger, near-fully documented tree
+would mask a ``creek_mcp/`` shortfall. The behavioural tests at the bottom
+run each real wrapper against a throwaway tree to prove it fails on a
+``creek_mcp/`` violation, not merely that the word ``creek_mcp`` appears.
+
 Command lines are read with shell and YAML comments stripped first. Several
 of these files quote the very command they invoke inside an explanatory
 comment (``typecheck.sh`` line 57, ``pylint.sh`` line 66, ``ci.yml`` line
@@ -24,9 +33,15 @@ against the command that actually runs.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import shutil
+import subprocess
+import sys
+import textwrap
 import tomllib
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -39,6 +54,7 @@ from tests.shell_command_support import (
 )
 from tests.shell_command_support import ci_steps as _ci_steps
 from tests.shell_command_support import command_lines as _command_lines
+from tests.shell_command_support import load_yaml as _load_yaml
 from tests.shell_command_support import non_comment_lines as _non_comment_lines
 
 PYPROJECT = CREEK_TOOLS_DIR / "pyproject.toml"
@@ -65,6 +81,37 @@ _FAIL_UNDER_DEFAULT = re.compile(
 _EXCLUSION_FLAGS = frozenset(
     {"--exclude", "-x", "--ignore", "--ignore-paths", "--ignore-patterns"}
 )
+
+# The CLAUDE.md §6.1 docstring floor. The wrapper default, the CI workflow env
+# and lint-extended's knob may each sit above it, never below.
+_DOCSTRING_COVERAGE_FLOOR = 95
+
+# ``DOCSTRING_GATED_PACKAGES=(creek/ creek_mcp/)`` and its refurb twin: the
+# named arrays each wrapper loops or expands over (#965).
+_DOCSTRING_GATED_PACKAGES = re.compile(r"^\s*DOCSTRING_GATED_PACKAGES=\(([^)]*)\)")
+_REFURB_GATED_PACKAGES = re.compile(r"^\s*REFURB_GATED_PACKAGES=\(([^)]*)\)")
+
+_DOCSTRING_THRESHOLD_DEFAULT = re.compile(
+    r'DOCSTRING_COVERAGE_THRESHOLD="\$\{DOCSTRING_COVERAGE_THRESHOLD:-([0-9]+)\}"'
+)
+_INTERROGATE_FAIL_UNDER_DEFAULT = re.compile(
+    r'INTERROGATE_FAIL_UNDER="\$\{INTERROGATE_FAIL_UNDER:-([0-9]+)\}"'
+)
+
+# Interrogate's path- and name-exclusion flags. Kept apart from
+# ``_EXCLUSION_FLAGS`` because ``-e`` is pylint's ``--enable`` there.
+_INTERROGATE_EXCLUSION_FLAGS = frozenset({"-e", "--exclude", "-r", "--ignore-regex"})
+
+# Refurb flags that switch checks off: per-code (``--ignore``/``--disable``)
+# or wholesale (``--disable-all``).
+_REFURB_WEAKENING_FLAGS = frozenset({"--ignore", "--disable", "--disable-all"})
+
+# Behavioural fixture sizing for the aggregate-masking proof: creek/ holds a
+# module docstring plus 60 documented functions (61/61) and creek_mcp/ a
+# module docstring plus 2 bare ones (1/3). A single combined run sees
+# 62/64 = 96.9% and passes at 95; only a per-package run sees creek_mcp's 33%.
+_FIXTURE_DOCUMENTED_FUNCTIONS = 60
+_FIXTURE_UNDOCUMENTED_FUNCTIONS = 2
 
 # MyPy settings that would silently switch checking back off for a module.
 # Mapping is ``setting -> value that disables checking``.
@@ -321,8 +368,8 @@ def test_refurb_gate_pins_the_supported_python_floor() -> None:
     the precondition for running it once instead of once per matrix leg.
     """
     script = SCRIPTS_DIR / "lint-refurb.sh"
-    lines = _command_lines(script, r"refurb creek")
-    assert lines, f"no `refurb creek/` invocation found in {script}"
+    lines = _command_lines(script, r"^\s*(exec\s+)?refurb\s")
+    assert lines, f"no `refurb` invocation found in {script}"
     assert "--python-version" in lines[0], (
         f"refurb gate no longer pins --python-version: {lines[0]!r}"
     )
@@ -458,3 +505,304 @@ def test_pyproject_mypy_config_does_not_disable_creek_mcp() -> None:
                 f"[[tool.mypy.overrides]] for {modules!r} disables checking "
                 f"via {setting}={disabling_value!r}"
             )
+
+
+# --- Issue #965: refurb and interrogate cover creek_mcp/ ----------------------
+
+
+def _gated_packages(script: Path, pattern: re.Pattern[str]) -> set[str]:
+    """Return the package roots a wrapper's named array declares.
+
+    Args:
+        script: The wrapper script to read.
+        pattern: Regex whose first group captures the array body.
+
+    Returns:
+        The declared roots with any trailing ``/`` stripped.
+    """
+    bodies = [
+        match.group(1)
+        for line in _non_comment_lines(script)
+        if (match := pattern.search(line)) is not None
+    ]
+    assert len(bodies) == 1, (
+        f"expected exactly one {pattern.pattern!r} declaration in {script}, "
+        f"found {bodies!r}"
+    )
+    return {token.rstrip("/") for token in shlex.split(bodies[0])}
+
+
+def _flag_names(command: str) -> set[str]:
+    """Return every option name on ``command``, ``--flag=value`` included."""
+    return {
+        token.partition("=")[0]
+        for token in shlex.split(command.rstrip().rstrip("\\"), comments=True)
+        if token.startswith("-")
+    }
+
+
+def _ci_step(name: str) -> dict[str, Any]:
+    """Return the single ci.yml step called ``name``."""
+    matches = [step for step in _ci_steps() if step.get("name") == name]
+    assert len(matches) == 1, (
+        f"expected exactly one ci.yml step named {name!r}, found {len(matches)}"
+    )
+    return matches[0]
+
+
+def _ci_run_lines() -> list[str]:
+    """Return every stripped, non-empty ``run:`` line across ci.yml."""
+    return [
+        line.strip()
+        for step in _ci_steps()
+        if isinstance(step.get("run"), str)
+        for line in str(step["run"]).splitlines()
+        if line.strip()
+    ]
+
+
+def _tool_path_env() -> dict[str, str]:
+    """Return an environment whose PATH resolves the project's lint tools.
+
+    The tools are dev extras installed beside the running interpreter. The
+    caller's ``DOCSTRING_COVERAGE_THRESHOLD`` is dropped so the wrapper's own
+    default is what the fixture exercises.
+    """
+    env = dict(os.environ)
+    env.pop("DOCSTRING_COVERAGE_THRESHOLD", None)
+    env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}"
+    return env
+
+
+def _run_wrapper_in(
+    project: Path, script_name: str, tool: str
+) -> subprocess.CompletedProcess[str]:
+    """Run a copy of ``scripts/<script_name>`` with ``project`` as its root.
+
+    The wrapper ``cd``s to its own parent directory, so copying it into
+    ``project/scripts/`` aims it at the fixture tree instead of the repo.
+
+    Args:
+        project: Fixture root holding ``creek/`` and ``creek_mcp/``.
+        script_name: The wrapper's file name under ``scripts/``.
+        tool: The binary the wrapper invokes; asserted present, never skipped.
+
+    Returns:
+        The completed process.
+    """
+    env = _tool_path_env()
+    assert shutil.which(tool, path=env["PATH"]), (
+        f"{tool} is a locked dev dependency; the gate proof must not skip"
+    )
+    scripts = project / "scripts"
+    scripts.mkdir()
+    shutil.copy2(SCRIPTS_DIR / script_name, scripts / script_name)
+    return subprocess.run(
+        ["bash", str(scripts / script_name)],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _write_module(path: Path, functions: int, *, documented: bool) -> None:
+    """Write a module with a docstring and ``functions`` trivial functions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = '"""Fixture module."""\n'
+    for index in range(functions):
+        doc = f'    """Return {index}."""\n' if documented else ""
+        body += f"\n\ndef function_{index}() -> int:\n{doc}    return {index}\n"
+    path.write_text(body, encoding="utf-8")
+
+
+def _docstring_fixture(tmp_path: Path, *, creek_mcp_documented: bool) -> Path:
+    """Build the aggregate-masking tree described by the fixture constants."""
+    _write_module(
+        tmp_path / "creek" / "documented.py",
+        _FIXTURE_DOCUMENTED_FUNCTIONS,
+        documented=True,
+    )
+    _write_module(
+        tmp_path / "creek_mcp" / "bare.py",
+        _FIXTURE_UNDOCUMENTED_FUNCTIONS,
+        documented=creek_mcp_documented,
+    )
+    return tmp_path
+
+
+def _refurb_fixture(tmp_path: Path, *, creek_mcp_clean: bool) -> Path:
+    """Build a tree whose only possible refurb finding lives in creek_mcp/."""
+    clean = textwrap.dedent(
+        '''\
+        """Fixture module."""
+
+
+        def name() -> str:
+            """Return a name."""
+            return "bob"
+        '''
+    )
+    (tmp_path / "creek").mkdir()
+    (tmp_path / "creek" / "clean.py").write_text(clean, encoding="utf-8")
+    (tmp_path / "creek_mcp").mkdir()
+    (tmp_path / "creek_mcp" / "modern.py").write_text(
+        clean if creek_mcp_clean else clean.replace('"bob"', 'str("bob")'),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_interrogate_wrapper_declares_both_packages() -> None:
+    """lint-interrogate.sh runs one per-package interrogate over both roots."""
+    script = SCRIPTS_DIR / "lint-interrogate.sh"
+    assert _gated_packages(script, _DOCSTRING_GATED_PACKAGES) == {
+        "creek",
+        "creek_mcp",
+    }
+    lines = _command_lines(script, r"^\s*(exec\s+)?interrogate\s")
+    assert len(lines) == 1, f"expected one interrogate command line, got {lines!r}"
+    invocation, _, fallback = lines[0].partition("||")
+    command = shlex.split(invocation, comments=True)
+    recovery = shlex.split(fallback, comments=True)
+    assert "--fail-under=$DOCSTRING_COVERAGE_THRESHOLD" in command, lines[0]
+    assert command[-1] == "$package", (
+        f"interrogate must run once per package, not over a fixed list: {lines[0]!r}"
+    )
+    assert recovery in ([], ["package_status=$?"]), (
+        f"a failing package must be recorded by exit code, never swallowed: "
+        f"{lines[0]!r}"
+    )
+    assert not _flag_names(lines[0]) & _INTERROGATE_EXCLUSION_FLAGS, lines[0]
+
+
+def test_interrogate_gate_fails_on_creek_mcp_shortfall_masked_by_aggregate(
+    tmp_path: Path,
+) -> None:
+    """A creek_mcp/ shortfall fails the gate even when the aggregate passes."""
+    result = _run_wrapper_in(
+        _docstring_fixture(tmp_path, creek_mcp_documented=False),
+        "lint-interrogate.sh",
+        "interrogate",
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "creek_mcp" in output, output
+
+
+def test_interrogate_gate_passes_when_both_packages_are_documented(
+    tmp_path: Path,
+) -> None:
+    """Positive control: the same tree, fully documented, passes the gate."""
+    result = _run_wrapper_in(
+        _docstring_fixture(tmp_path, creek_mcp_documented=True),
+        "lint-interrogate.sh",
+        "interrogate",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_ci_docstring_step_calls_the_wrapper() -> None:
+    """CI runs the docstring gate through its wrapper, never inline."""
+    step = _ci_step("Check docstring coverage")
+    assert str(step["run"]).strip() == "./scripts/lint-interrogate.sh"
+    inline = [line for line in _ci_run_lines() if line.split()[0] == "interrogate"]
+    assert not inline, f"ci.yml re-spells interrogate inline: {inline!r}"
+
+
+def test_lint_extended_routes_interrogate_through_the_wrapper() -> None:
+    """lint-extended.sh must not keep a second, creek/-only interrogate."""
+    script = SCRIPTS_DIR / "lint-extended.sh"
+    assert not _command_lines(script, r"^\s*interrogate\s")
+    assert _command_lines(script, r"\./scripts/lint-interrogate\.sh")
+
+
+def test_interrogate_gate_keeps_docstring_threshold() -> None:
+    """Widening interrogate must not lower its threshold anywhere."""
+    script_body = "\n".join(_non_comment_lines(SCRIPTS_DIR / "lint-interrogate.sh"))
+    match = _DOCSTRING_THRESHOLD_DEFAULT.search(script_body)
+    assert match is not None, "lint-interrogate.sh lost its threshold default"
+    assert int(match.group(1)) >= _DOCSTRING_COVERAGE_FLOOR
+
+    workflow = _load_yaml(CI_WORKFLOW)
+    assert (
+        int(workflow["env"]["DOCSTRING_COVERAGE_THRESHOLD"])
+        >= _DOCSTRING_COVERAGE_FLOOR
+    )
+    job_env = workflow["jobs"]["static-analysis"].get("env") or {}
+    step_env = _ci_step("Check docstring coverage").get("env") or {}
+    assert "DOCSTRING_COVERAGE_THRESHOLD" not in job_env
+    assert "DOCSTRING_COVERAGE_THRESHOLD" not in step_env
+
+    extended = "\n".join(_non_comment_lines(SCRIPTS_DIR / "lint-extended.sh"))
+    knob = _INTERROGATE_FAIL_UNDER_DEFAULT.search(extended)
+    assert knob is not None, "lint-extended.sh lost its INTERROGATE_FAIL_UNDER"
+    assert int(knob.group(1)) >= _DOCSTRING_COVERAGE_FLOOR
+
+
+def test_pyproject_interrogate_config_does_not_exclude_creek_mcp() -> None:
+    """A widened interrogate target must not be undone by pyproject config."""
+    config = _pyproject()["tool"].get("interrogate", {})
+    offenders = [
+        value
+        for key in ("exclude", "ignore-regex", "ignore_regex")
+        for value in _as_list(config.get(key))
+        if "creek_mcp" in value
+    ]
+    assert not offenders, f"[tool.interrogate] re-excludes creek_mcp: {offenders!r}"
+
+
+def test_refurb_wrapper_declares_both_packages() -> None:
+    """lint-refurb.sh expands one refurb run over both package roots."""
+    script = SCRIPTS_DIR / "lint-refurb.sh"
+    assert _gated_packages(script, _REFURB_GATED_PACKAGES) == {"creek", "creek_mcp"}
+    lines = _command_lines(script, r"^\s*(exec\s+)?refurb\s")
+    assert len(lines) == 1, f"expected one refurb command line, got {lines!r}"
+    assert '"${REFURB_GATED_PACKAGES[@]}"' in lines[0], lines[0]
+    assert not _flag_names(lines[0]) & _REFURB_WEAKENING_FLAGS, lines[0]
+
+
+def test_refurb_gate_fails_on_a_creek_mcp_finding(tmp_path: Path) -> None:
+    """A refurb finding confined to creek_mcp/ fails the real wrapper."""
+    result = _run_wrapper_in(
+        _refurb_fixture(tmp_path, creek_mcp_clean=False), "lint-refurb.sh", "refurb"
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "creek_mcp" in output, output
+    assert "FURB123" in output, output
+
+
+def test_refurb_gate_passes_when_both_packages_are_clean(tmp_path: Path) -> None:
+    """Positive control: the same tree without the finding passes."""
+    result = _run_wrapper_in(
+        _refurb_fixture(tmp_path, creek_mcp_clean=True), "lint-refurb.sh", "refurb"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_ci_refurb_step_calls_the_wrapper() -> None:
+    """CI runs refurb through its wrapper, never inline."""
+    step = _ci_step("Run Refurb (STYLE-001 modernisation gate)")
+    assert str(step["run"]).strip() == "./scripts/lint-refurb.sh"
+    inline = [line for line in _ci_run_lines() if line.split()[0] == "refurb"]
+    assert not inline, f"ci.yml re-spells refurb inline: {inline!r}"
+
+
+def test_lint_extended_routes_refurb_through_the_wrapper() -> None:
+    """lint-extended.sh must not keep a second, creek/-only refurb."""
+    script = SCRIPTS_DIR / "lint-extended.sh"
+    assert not _command_lines(script, r"^\s*refurb\s")
+    assert _command_lines(script, r"\./scripts/lint-refurb\.sh")
+
+
+def test_pyproject_refurb_config_does_not_exclude_creek_mcp() -> None:
+    """A widened refurb target must not be undone by a per-path amend."""
+    config = _pyproject()["tool"].get("refurb", {})
+    offenders = [
+        str(amend)
+        for amend in config.get("amend", [])
+        if "creek_mcp" in str(amend.get("path", ""))
+    ]
+    assert not offenders, f"[tool.refurb] amends creek_mcp away: {offenders!r}"

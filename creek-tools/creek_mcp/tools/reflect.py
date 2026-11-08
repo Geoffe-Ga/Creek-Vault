@@ -695,7 +695,7 @@ def _capped_prompt(
         The prompt to send, or ``None`` when even the ungrounded prompt
         exceeds the cap.
     """
-    snippets = list(grounding)
+    snippets = grounding.copy()
     while True:
         prompt = _build_prompt(entry, snippets, max_notes=max_notes)
         if pool_prompt_within_cap(prompt):

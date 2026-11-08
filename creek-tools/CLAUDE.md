@@ -45,8 +45,8 @@ Always invoke tools through `./scripts/*` instead of directly.
 | Type check | `mypy .` | `./scripts/typecheck.sh` |
 | Lint code | `ruff check .` | `./scripts/lint.sh` |
 | Pylint score | `pylint creek/` | `./scripts/pylint.sh` |
-| Docstring coverage | `interrogate creek/` | `./scripts/lint-interrogate.sh` |
-| Modernisation hints | `refurb creek/` | `./scripts/lint-refurb.sh` |
+| Docstring coverage | `interrogate creek/ creek_mcp/` | `./scripts/lint-interrogate.sh` |
+| Modernisation hints | `refurb creek/ creek_mcp/` | `./scripts/lint-refurb.sh` |
 | Exception hygiene | `tryceratops creek/` | `./scripts/lint-tryceratops.sh` |
 | Dead-code detection | `vulture creek/` | `./scripts/lint-vulture.sh` |
 | All checks | *(run each tool)* | `./scripts/check-all.sh` |
@@ -358,8 +358,8 @@ creek-tools/
 │   ├── fix-all.sh                    # Auto-fix the lint + format gates
 │   ├── format.sh                     # Ruff format
 │   ├── lint-extended.sh              # OPTIONAL — not invoked by check-all.sh or CI
-│   ├── lint-interrogate.sh           # Docstring-coverage gate over creek/
-│   ├── lint-refurb.sh                # Modernisation-hint gate
+│   ├── lint-interrogate.sh           # Docstring-coverage gate over creek/ + creek_mcp/
+│   ├── lint-refurb.sh                # Modernisation-hint gate over creek/ + creek_mcp/
 │   ├── lint-tryceratops.sh           # Exception-hygiene gate
 │   ├── lint-vulture.sh               # Dead-code gate wrapper — the one entrypoint (issue #1395)
 │   ├── lint.sh                       # Ruff lint
@@ -430,8 +430,11 @@ All code must meet these standards before merging to main:
   `scripts/coverage-waivers.txt` (enforced by
   `coverage-per-file.sh`; see TEST-002).
 - **Docstring**: ≥95% (`interrogate --fail-under=95`, in
-  `lint-interrogate.sh` — which `check-all.sh` runs, and which targets
-  `creek/` only — and the `interrogate` pre-commit hook).
+  `lint-interrogate.sh` — which `check-all.sh` runs and CI calls, and the
+  `interrogate` pre-commit hook). Each of `creek/` and `creek_mcp/` must
+  reach 95% on its own: the script runs interrogate once per package, so
+  the larger package's aggregate cannot mask the smaller one's shortfall
+  (#965).
 - **Test markers**: `integration`, `e2e`, `live`, `slow` — the four
   registered in the markers table of `pyproject.toml`. There is no unit
   marker: anything unmarked is a unit test. Strictness is set as an ini
@@ -479,8 +482,9 @@ All code must meet these standards before merging to main:
 - **pip-audit**: zero vulnerabilities except documented unfixable
   CVEs in `scripts/security.sh` and `.github/workflows/ci.yml`
   (DEP-003).
-- **Refurb (modernisation hints)**: zero violations. STYLE-001 closed
-  the backlog (148 → 0). Gated by `scripts/lint-refurb.sh` in both
+- **Refurb (modernisation hints)**: zero violations over `creek/` and
+  `creek_mcp/`. STYLE-001 closed the `creek/` backlog (148 → 0) and #965
+  the `creek_mcp/` one (60 → 0). Gated by `scripts/lint-refurb.sh` in both
   `check-all.sh` and CI. New `FURB…` findings block the build; the
   `# noqa: FURB…  # <one-line justification>` escape hatch is reserved
   for documented carve-outs (defaultdict→dict conversions for
