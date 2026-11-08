@@ -9,6 +9,36 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `creek.link` and `creek.report unnamed` now answer an embedding model that
+  cannot load with the fixed, content-free refusal `embedding model
+  unavailable` instead of raising (refs #2065). `EmbeddingLinker.load_model`'s
+  error message names the configured model, the cache directory and the
+  loader's own error, and FastMCP 1.x served that `str(exc)` to MCP clients as
+  an `isError` result on the `embeddings` (the default), `eddies` and
+  `threads` stages and on `unnamed`. Both tools log the exception type with
+  the traceback on their own module logger, and write no audit entry and no
+  partial artefact. The reason constant `EMBEDDING_MODEL_UNAVAILABLE_REASON`
+  lives beside the exception in `creek.link.embeddings`, and
+  `pipeline_refusal_code` maps it by exact equality to `503 unavailable`, so
+  `POST /v1/links` keeps #2060's answer; the adapter now logs one
+  code-and-`request_id` record per tool refusal. **Operator-visible:** a
+  durable `embeddings` link job that fails this way records
+  `failure_reason: "refused: embedding model unavailable"` where it used to
+  record `"exception: EmbeddingModelUnavailableError"`; the public job body
+  is unchanged (`failed`, `result: null`, `failure_code: null`). `paradox`
+  and `synchronicity` are cache-only and never load the model.
+
+- `POST /v1/classifications` and `POST /v1/links` now answer vault
+  content-lock contention with `503 temporarily_unavailable` instead of
+  `500 internal_error` (refs #2066). Both tools already refused a timed-out
+  lock with the fixed `vault content mutation busy` reason, but
+  `pipeline_refusal_code` fell through to `internal_error`. It now matches
+  that constant by exact equality — the same disposition and envelope
+  `PUT /v1/journal-entries` gives its own busy refusal — and keeps the
+  fail-closed fall-through for every other reason. No contract bump: `503`
+  is already published on every operation, and the DAST allowance list is
+  unchanged.
+
 - `POST /v1/links` now refuses `eddies` and `threads` with the static
   `503 unavailable` instead of `500 internal_error` when the local embedding
   model cannot load (refs #2060). The shipped image installs no `embeddings`
