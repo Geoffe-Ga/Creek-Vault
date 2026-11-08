@@ -146,11 +146,12 @@ def link_embedder(
     every non-INTIMATE tier shares. Each fragment's own tier is still handed
     to the chokepoint inside the embedder; this only picks the route. A pin
     that cannot be met keeps the local route. The managed image installs no
-    ``embeddings`` extra, so that route cannot load a model: ``eddies`` and
-    ``threads`` raise
+    ``embeddings`` extra, so that route cannot load a model: every embedding
+    stage (``embeddings``, ``eddies``, ``threads``) reaches
     :class:`~creek.link.embeddings.EmbeddingModelUnavailableError`, which
-    ``POST /v1/links`` refuses as ``503 unavailable`` (#2060). The pass sends
-    no text anywhere.
+    ``creek.link`` answers with the fixed ``embedding model unavailable``
+    refusal (#2065) and ``POST /v1/links`` serves as ``503 unavailable``
+    (#2060). The pass sends no text anywhere.
 
     Args:
         router: The vault's model router.
