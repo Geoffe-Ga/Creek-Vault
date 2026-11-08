@@ -672,11 +672,13 @@ async def handle_link(request: Request) -> Response:
 
     ``eddies`` and ``threads`` embed every uncached fragment with the local
     sentence-transformer. When that model cannot load — no ``embeddings``
-    extra on the image, an empty cache with the download blocked, or a
-    non-local route refusing the text — the engine raises
-    :class:`~creek.link.embeddings.EmbeddingModelUnavailableError`, and this
-    handler answers the static ``503 unavailable`` refusal rather than letting
-    it reach the error boundary as ``500 internal_error`` (#2060).
+    extra on the image, or an empty cache with the download blocked — the
+    engine raises
+    :class:`~creek.link.embeddings.EmbeddingModelUnavailableError` (whose
+    :class:`~creek.link.embeddings.EmbeddingRefusedError` subclass a non-local
+    route raises for a refused text is caught alike), and this handler
+    answers the static ``503 unavailable`` refusal rather than letting it
+    reach the error boundary as ``500 internal_error`` (#2060).
 
     Args:
         request: The request in flight.
