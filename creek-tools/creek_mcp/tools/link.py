@@ -25,7 +25,10 @@ from creek.link.embeddings import (
 )
 from creek.link.link_engine import run_link
 from creek.surface_modes import LINK_METHODS
-from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.grounding_route import link_embedder
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
@@ -86,7 +89,11 @@ def link_tool(
             # local sentence-transformer is unchanged.
             embedder=link_embedder(config.model_router),
         )
-    except VaultLockTimeoutError:
+    except (ContentMutationBusyError, VaultLockTimeoutError):
+        # Acquiring the content lock past its wait is ContentMutationBusyError
+        # (#2087). The bare-timeout arm is kept on purpose: a lock timeout
+        # under the engine's hold still reads busy, as it always has, rather
+        # than escaping as a FastMCP error or a /v1 job `internal_error`.
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,

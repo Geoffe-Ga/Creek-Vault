@@ -266,12 +266,34 @@ still writing ([#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079)).
 - `creek sync --tier A` does not exit when a source's *ingest* meets
   contention: that source is marked `skipped: vault content mutation busy`, the
   remaining sources are tried, and the next tick's incremental ingest picks it
-  up. The record reaches `last-run.json` only if the other writer releases the
-  lock before the tick's rules-classify pass, which takes the same lock with
-  the same 10-second bound. Under sustained contention that pass still ends
-  the tick with a `VaultLockTimeoutError` traceback and no `last-run.json` — a
-  known gap tracked as a follow-up to
-  [#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079).
+  up. The tick's rules-classify pass takes the same lock with the same
+  10-second bound; if it is busy too, it is skipped rather than raised, the
+  console prints `[sync] classify skipped: vault content mutation busy`, and
+  `last-run.json` records it under a top-level `skipped_steps` list beside the
+  per-source records. The tick exits **0** either way
+  ([#2087](https://github.com/Geoffe-Ga/Creek-Vault/issues/2087)).
+- `creek sync --tier B` records contention the same way, in this order: a busy
+  LLM classify is recorded and the tick stops there — link and the index
+  rebuild do not run, because link waits on the same lock and would very
+  likely spend a second 10-second wait on the same holder, and the next tick
+  re-derives both. A busy link (after a classify that ran) is recorded and the
+  index still rebuilds. `creek sync --status` prints each recorded line as
+  `Skipped last tick: …`, even when no source ran.
+- `creek classify`, `creek link`, `creek compile`, `creek fill --upgrade` and
+  `creek process` print the same busy line and exit **1** when the engine they
+  call cannot take the lock. The engines (`run_classify`, `run_link`,
+  `compile_to_vault`) take it through `hold_content_mutation` and raise
+  `ContentMutationBusyError` on that acquisition timeout. `creek process` meets
+  the lock at its link stage, after its earlier stages ran; every one of these
+  commands is idempotent, so rerunning it converges. `creek fill`'s per-step
+  link stages stay non-fatal: a busy one is reported as `failed` and the
+  sequence continues.
+- `creek review` is unchanged: a manual decision whose save meets contention
+  is recorded as `failed to persist …` on the session's error list (the lock
+  timeout is an `OSError`), and the review carries on.
+- Only a timeout *acquiring* the lock is reported as busy. A lock timeout
+  raised under the hold — the writer's `.id-index.lock`, say, after fragments
+  may already be on disk — propagates as `VaultLockTimeoutError`.
 - A long ingest holds the lock for its whole run, so remote journal writes,
   uploads, classify and link calls answer `vault content mutation busy` (503
   over `/v1`) until it finishes.

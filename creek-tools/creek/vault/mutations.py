@@ -27,6 +27,13 @@ lock inside its own ``gdrive.lock`` and around the ingest only, never around
 the network download; no holder of this lock ever takes ``gdrive.lock``, so
 the order is always connector first, content second.
 
+The classify, link and compile engines take the lock through
+:func:`hold_content_mutation` as well (#2087), so losing the acquisition race
+on those paths is :class:`ContentMutationBusyError` and their CLI and sync
+callers can tell it from a timeout raised mid-pass.  Manual review
+(``creek.classify.review_runner``) keeps its raw acquisition on purpose: its
+save path records the timeout as an ``OSError`` and lets the session continue.
+
 The filename is deliberately content-wide rather than journal-specific.  The
 empty lock file contains no vault-derived data, and whole-vault erasure keeps
 its inode so deleting a held pathname cannot split the critical section.

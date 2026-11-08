@@ -609,6 +609,17 @@ first, content second. A long ingest holds the lock for its whole run, so remote
 journal, upload, classify and link calls answer `vault content mutation busy`
 (503 over `/v1`) during that window.
 
+The classify, link and compile engines take the lock through the same
+`hold_content_mutation` since
+[#2087](https://github.com/Geoffe-Ga/Creek-Vault/issues/2087), so losing the
+acquisition race raises `ContentMutationBusyError` rather than a bare
+`VaultLockTimeoutError`. `creek.classify`, `creek.link` and `creek.compile`
+catch both types and answer the same fixed `vault content mutation busy`
+refusal, so their responses, the durable-job `busy` failure code and the 503
+over `/v1` are unchanged. Keeping the bare-timeout arm is deliberate: a lock
+timeout raised *under* an engine's hold still reads busy on these three tools,
+as it always has, rather than escaping as a FastMCP error.
+
 ### Read-side posture (#932)
 
 Every registered tool's relationship to the caller's ceiling is now a
@@ -2027,6 +2038,10 @@ boundary. This closes stale load-to-write races: a pipeline pass cannot load a
 journal fragment, let withdrawal report success, and then recreate the removed
 fragment or a derived page. A pass that cannot take the boundary within the
 bounded lock wait returns the ordinary structured refusal and is safe to retry.
+Inside the engines that wait is `hold_content_mutation`, whose acquisition
+timeout is `ContentMutationBusyError` (#2087); manual review keeps its raw
+acquisition, so a busy save is recorded on the review's error list instead of
+ending the session.
 
 For tools that accept a `body` argument (`creek.save`), the audit entry
 records `body_len` rather than `body` — on both the success and the
