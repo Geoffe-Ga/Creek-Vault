@@ -145,8 +145,12 @@ def link_embedder(
     route admits none — so it follows the keyless rule, asked for the route
     every non-INTIMATE tier shares. Each fragment's own tier is still handed
     to the chokepoint inside the embedder; this only picks the route. A pin
-    that cannot be met keeps the local route, which on a managed image has no
-    model and so embeds nothing — the pass sends no text anywhere.
+    that cannot be met keeps the local route. The managed image installs no
+    ``embeddings`` extra, so that route cannot load a model: ``eddies`` and
+    ``threads`` raise
+    :class:`~creek.link.embeddings.EmbeddingModelUnavailableError`, which
+    ``POST /v1/links`` refuses as ``503 unavailable`` (#2060). The pass sends
+    no text anywhere.
 
     Args:
         router: The vault's model router.
