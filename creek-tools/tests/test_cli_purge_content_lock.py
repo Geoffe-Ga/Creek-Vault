@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import pytest
 from typer.testing import CliRunner
 
-from creek._fslock import DEFAULT_LOCK_TIMEOUT_SECONDS
+from creek._fslock import DEFAULT_LOCK_TIMEOUT_SECONDS, VaultLockTimeoutError
 from creek.cli import app
+from creek.ingest import refresh as refresh_mod
 from creek.models import Fragment, FragmentSource, PrivacyTier, SourcePlatform
 from creek.purge.engine import VAULT_PURGE_CONFIRMATION, PurgeEngine
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON, hold_content_mutation
@@ -215,6 +216,54 @@ def test_a_busy_vault_is_one_line_and_exit_1_and_purges_nothing(
     assert "Traceback" not in result.output
     assert held == []
     assert _fragment_digests(vault) == before
+
+
+_INNER_DETAIL = "id-index lock busy"
+"""What a contended inner lock says when it times out under the hold."""
+
+_UNDER_HOLD: dict[str, tuple[object, str, list[str]]] = {
+    "purge-fragment": (PurgeEngine, "purge_fragment", _PURGES["fragment"][1]),
+    "refresh-dates": (
+        refresh_mod,
+        "refresh_authored_dates",
+        ["ingest", "--refresh-dates"],
+    ),
+}
+"""A purge and a migration: the writer each holds the lock around, and argv."""
+
+
+@pytest.mark.parametrize("command", sorted(_UNDER_HOLD))
+def test_a_timeout_under_the_cli_hold_is_not_reported_as_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """Only acquisition is busy; a timeout under ``_hold_content_or_exit_1`` is not.
+
+    By the time an inner lock — a per-directory ``.id-index.lock``, say —
+    times out, the purge or migration may already have unlinked or rewritten
+    fragments. Printing the busy line would tell the operator a vault was
+    untouched when it may be half-changed, so the timeout propagates as
+    itself, and the content lock is still let go.
+    """
+    vault = _seed_vault(tmp_path)
+    owner, name, argv = _UNDER_HOLD[command]
+    held: list[bool] = []
+
+    def _inner_times_out(*_args: object, **_kwargs: object) -> NoReturn:
+        """Time out the way a contended inner lock does mid-write."""
+        held.append(_content_lock_is_held(vault))
+        raise VaultLockTimeoutError(_INNER_DETAIL)
+
+    monkeypatch.setattr(owner, name, _inner_times_out)
+
+    result = _invoke(argv, vault)
+
+    assert isinstance(result.exception, VaultLockTimeoutError), result.output
+    assert str(result.exception) == _INNER_DETAIL
+    assert _BUSY_LINE not in _flat(result.output)
+    assert held == [True]
+    assert _content_lock_is_held(vault) is False
 
 
 @pytest.mark.parametrize("purge", ["fragment", "classifications", "daterange"])
