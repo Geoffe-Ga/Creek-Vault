@@ -19,7 +19,11 @@ of them was asserted in this docstring and implemented nowhere):
   content-free :data:`_ABOVE_CEILING_REASON` and the same audit row as a
   named-id violation — a distinguishable refusal would be a fresh oracle
   saying "the offender is above you in the tree".
-  The check runs
+  Since #930 the check is *evaluated by the engine*: this wrapper hands
+  :func:`creek.compile.engine.compile_to_vault` a
+  :class:`~creek.compile.engine.SourceAdmission` hook, which the engine
+  runs on the one ``01-Fragments`` walk it makes, inside the
+  content-mutation lock it already holds. It still runs
   ahead of any LLM client being built, any page being written, and any
   paradox being logged — the three places the source ids would
   otherwise escape (enumerated in :func:`compile_tool`). And when that
@@ -32,7 +36,7 @@ of them was asserted in this docstring and implemented nowhere):
   :func:`creek.compile.engine.compile_to_vault`, from the fragments it
   loaded itself, and the engine calls the factory; this wrapper
   contributes only the ceiling half, by wrapping the factory it was
-  handed. The client is therefore still built after the gate and before
+  handed. The client is therefore still built after admission and before
   any write, but no longer by evaluating a call argument here.
 - **The refusal names nothing.** It carries the fixed
   :data:`_ABOVE_CEILING_REASON`: no ids, no titles, no tiers, not even a
@@ -43,10 +47,13 @@ of them was asserted in this docstring and implemented nowhere):
   and is a deliberate departure from ``reflect``, which appends
   unconditionally at the top of the call — :func:`compile_tool`
   explains why compile cannot do the same.
-- **The gate and the engine share one fragment loader.** Both read the
-  vault through :func:`creek.vault.reader.iter_vault_fragments`, so the
-  two can never disagree about which files exist or which of them are
-  fragments (see :func:`_survey_sources`).
+- **Admission and content are one snapshot.** The gate and the engine
+  share one fragment loader, and since #930 one *call* of it: the engine
+  walks ``01-Fragments`` once, inside the content-mutation lock, and both
+  the admission decision and the fragments it compiles come from that
+  walk. The two can therefore never disagree about which files exist,
+  which of them are fragments, or what tier any of them carries (see
+  :func:`_survey_sources`).
 
 **Idempotency semantics (audit-dedup only).** The wrapper fingerprints
 the target file after each compile and stamps the hash under
@@ -67,8 +74,11 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, cast
 
 from creek._fslock import VaultLockTimeoutError
-from creek.classify.privacy_filter import ancestry_tiers
-from creek.compile.engine import TARGET_KINDS, compile_to_vault
+from creek.compile.engine import (
+    TARGET_KINDS,
+    SourceAdmissionRefusedError,
+    compile_to_vault,
+)
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import (
@@ -79,9 +89,11 @@ from creek_mcp.tier_ceiling import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
-    from creek.compile.engine import CompileLLM
+    from creek.classify.privacy_filter import AncestorIndex
+    from creek.compile.engine import CompileLLM, SourceAdmission
     from creek.models import CompileTargetKind, PrivacyTier
 
 TOOL_NAME = "creek.compile"
@@ -127,11 +139,14 @@ TOOL_NAME = "creek.compile"
 #   order. The reasoning moved rather than being dropped because the property
 #   is now shared: switching that one function to a lazy loader would re-open
 #   the timing channel here and in ``creek.draft`` at the same time. Compile
-#   now calls the ancestry-aware ``ancestry_tiers`` (#931), which preserves
-#   the property in both halves: one non-short-circuiting walk, then an
-#   exhaustive ranking of every resolved id's whole chain before any
-#   decision is read (``AncestorIndex.chain_tiers`` rule (f)). A lazy
-#   per-parent lookup would re-open the channel this constant guards.
+#   ranks ancestry (#931) through ``AncestorIndex.chain_tiers`` over the index
+#   the engine builds from its single walk (#930), which preserves the
+#   property in both halves: one non-short-circuiting walk
+#   (``creek.compile.engine._load_fragments_for_compile`` materialises the
+#   whole corpus before admission is asked), then an exhaustive ranking of
+#   every resolved id's whole chain before any decision is read
+#   (``AncestorIndex.chain_tiers`` rule (f)). A lazy per-parent lookup would
+#   re-open the channel this constant guards.
 #
 # Accepted because the real control is the audit trail, not id entropy: every
 # True probe appends a ``creek.compile`` entry distinguishable from a success
@@ -158,7 +173,7 @@ class CompileLLMFactory(Protocol):
 
     The factory is invoked lazily so an unconfigured LLM provider only
     fails the ``creek.compile`` invocation, not server startup — and not
-    at all when the source-tier gate refuses. The server bootstrap
+    at all when the source-tier admission refuses. The server bootstrap
     supplies a production factory; tests pass a stub.
     """
 
@@ -173,7 +188,7 @@ def _fingerprint(path: Path) -> str | None:
 
 
 class _SourceGate(NamedTuple):
-    """The admission signal one walk over the requested source fragments yields.
+    """The admission signal one ranking of the requested sources yields.
 
     A single field, and still a :class:`~typing.NamedTuple` rather than a
     bare ``bool``: the anti-vacuous-truth property in :func:`_survey_sources`
@@ -191,7 +206,9 @@ class _SourceGate(NamedTuple):
 
 
 def _survey_sources(
-    vault_path: Path, fragment_ids: list[str], ceiling: TierCeiling
+    ancestors: AncestorIndex,
+    fragment_ids: Sequence[str],
+    ceiling: TierCeiling,
 ) -> _SourceGate:
     """Survey the requested source fragments for an admission decision.
 
@@ -199,29 +216,46 @@ def _survey_sources(
     :class:`_SourceGate`, not a bool, so ``if _survey_sources(...)`` would be
     vacuously true; the caller must branch on ``.above_ceiling`` explicitly.
 
-    The vault is walked through
-    :func:`creek.vault.reader.iter_vault_fragments` — the exact function
-    :func:`creek.compile.engine._load_fragments_for_compile` calls — so the set
-    of files this gate inspects and the set the engine would compile are
-    identical *by construction*. A bespoke ``frontmatter.load`` walk would
-    diverge: :func:`creek.vault.reader.try_load_fragment` rejects files whose
-    ``type`` is not ``fragment`` and files that fail ``Fragment`` schema
-    validation, both of which a raw scan happily reads. That divergence would
-    create a class of file one side sees and the other does not — precisely the
-    bug class this gate exists to prevent. A file the shared loader skips
-    (unreadable, non-fragment, schema-invalid) is invisible to gate and engine
-    alike, and so fails closed to the engine's "not found".
+    **It reads the engine's walk, not one of its own (#930).** *ancestors* is
+    the whole-corpus index :func:`creek.compile.engine._load_fragments_for_compile`
+    builds from the single :func:`creek.vault.reader.iter_vault_fragments`
+    pass it makes inside the content-mutation lock, and this survey runs as
+    the :class:`~creek.compile.engine.SourceAdmission` hook
+    :func:`_ceiling_admission` hands the engine. So the set of files this gate
+    inspects and the set the engine compiles are not merely identical by
+    construction — the shared-loader argument #848 made against a bespoke
+    ``frontmatter.load`` scan, which would read files
+    :func:`creek.vault.reader.try_load_fragment` rejects — they are the *same
+    records*. A file the loader skips (unreadable, non-fragment,
+    schema-invalid) is invisible to gate and engine alike, and so fails closed
+    to the engine's "not found".
 
-    That parity is by construction but not instantaneous: the gate walks the
-    vault, returns, and the engine then walks it again. A concurrent writer that
-    *raises* a fragment's tier inside that window (``creek classify``, the
-    ``creek.classify`` MCP tool, a text editor) would be **admitted** under the
-    pre-write tier. #962 closed the *routing* half of that window and only that
-    half: the engine now derives its routing tier from the fragments it has in
-    hand, so no window separates the tier a call is routed by from the bytes it
-    sends. The admission half above is unchanged — this walk still precedes the
-    engine's — and closing it still means handing the loaded fragments to the
-    engine, tracked as a follow-up along with eliminating the duplicated walk.
+    Before #930 this survey walked the vault itself, outside the lock, and
+    the engine then walked it again inside. A concurrent writer that *raised*
+    a fragment's tier between the two (``creek classify``, the
+    ``creek.classify`` MCP tool) was **admitted** under the pre-write tier and
+    compiled under the post-write one. Moving the decision into the engine's
+    walk closes that, and it has to be a hook rather than a load in this
+    wrapper: :func:`creek._fslock.vault_lock` is non-reentrant, so this
+    wrapper cannot take the content lock around ``compile_to_vault`` (which
+    takes it itself), and a load taken *before* the engine's lock is
+    unserialised against ``creek classify`` however few walks there are.
+
+    Residual risks, stated rather than left for a reader to assume away:
+
+    - **Text-editor writes are not coordinated by the lock.** One can still
+      land while a compile runs. What it can no longer do is split admission
+      from content: both come from the one snapshot, so a write after the
+      walk is simply not part of this compile.
+    - **Under lock contention a would-be refusal is the busy refusal.** A
+      call that cannot take the content lock within its bounded wait returns
+      :data:`creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` without
+      admission ever being evaluated, and that refusal is not audited. It is
+      content-free and independent of every tier, so it is no oracle — but a
+      ceiling probe sent while the vault is busy leaves no audit row.
+    - **A refused probe now holds the content lock for one walk**, and so
+      creates the zero-byte ``00-Creek-Meta/locks/content-mutations.lock``
+      if it did not already exist. The file carries no vault-derived bytes.
 
     Admission is decided by :func:`creek_mcp.tier_ceiling.write_tier_allowed`
     rather than the :func:`~creek_mcp.tier_ceiling.tier_allowed` it delegates
@@ -235,26 +269,26 @@ def _survey_sources(
     would silently desync if ``ALL``'s semantics ever changed.
 
     Args:
-        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        ancestors: The whole-corpus index from the engine's one walk.
         fragment_ids: The ids the caller asked to compile. An id with no
-            matching fragment in the vault is **not** a violation — it falls
-            through to the engine's ``ValueError("Fragment(s) not found in
-            vault: ...")`` so a legitimate caller still learns the id does not
-            resolve. Since #962 that holds unconditionally: the engine builds
-            the LLM client *itself*, after its own load, so the not-found
-            refusal no longer races an eagerly-evaluated ``llm_factory(tier)``
-            call argument and no longer depends on the operator's model config.
+            matching fragment in the vault is **not** a violation — it
+            contributes nothing to the ranking and falls through to the
+            engine's ``ValueError("Fragment(s) not found in vault: ...")`` so
+            a legitimate caller still learns the id does not resolve. The
+            engine raises that only after this survey has admitted the call,
+            so an above-ceiling id still wins over a missing one.
         ceiling: The caller's declared ceiling.
 
-    Since #931 the survey is :func:`creek.classify.privacy_filter.ancestry_tiers`
-    rather than its ancestry-blind sibling ``source_tiers``, so "requested
-    fragment" below means the named ids **and** their ancestors. Compile is
-    the only tool that needs the wider survey: its prompt renders an
-    admitted fragment's persisted ``structural_path``, which is a list of
-    ancestor headings, so #848's named-ids-only gate admitted an ``open``
-    child of an ``intimate`` parent and shipped the parent's heading to the
-    provider. ``draft`` / ``journal`` / ``upload`` render no breadcrumb and
-    keep the narrower survey deliberately.
+    Since #931 the ranking is
+    :meth:`~creek.classify.privacy_filter.AncestorIndex.chain_tiers` rather
+    than the ancestry-blind ``source_tiers``, so "requested fragment" below
+    means the named ids **and** their ancestors. Compile is the only
+    tool that needs the wider survey: its prompt renders an admitted
+    fragment's persisted ``structural_path``, which is a list of ancestor
+    headings, so #848's named-ids-only gate admitted an ``open`` child of an
+    ``intimate`` parent and shipped the parent's heading to the provider.
+    ``draft`` / ``journal`` / ``upload`` render no breadcrumb and keep the
+    narrower survey deliberately.
 
     Returns:
         A :class:`_SourceGate` whose ``above_ceiling`` is ``True`` when at
@@ -274,14 +308,39 @@ def _survey_sources(
         ``creek.compile.engine`` from fragments it loaded itself and never
         reaches this wrapper at all, so there is nothing here to leak.
     """
-    # One shared survey (#958) so ``creek.compile`` and ``creek.draft`` can
-    # never read the same file's tier two different ways. Compile takes the
-    # ancestry-aware variant (#931) because compile — alone among the survey's
-    # callers — renders an admitted fragment's ancestors into its prompt.
-    tiers = ancestry_tiers(vault_path, fragment_ids)
+    # Compile ranks ancestry (#931) because compile — alone among the
+    # source-tier gates — renders an admitted fragment's ancestors into its
+    # prompt. ``chain_tiers`` is exhaustive by rule (f): every resolved id's
+    # chain is ranked before the reduction below reads any of it.
+    tiers = ancestors.chain_tiers(fragment_ids)
     return _SourceGate(
         above_ceiling=any(not write_tier_allowed(tier, ceiling) for tier in tiers),
     )
+
+
+def _ceiling_admission(ceiling: TierCeiling) -> SourceAdmission:
+    """Return the engine admission hook enforcing *ceiling* (#930).
+
+    The hook is :func:`_survey_sources` and nothing more, adapted to the
+    :class:`~creek.compile.engine.SourceAdmission` shape: the engine supplies
+    the index from its one walk and the requested ids, and reads back whether
+    the call may proceed. A refusal surfaces from ``compile_to_vault`` as
+    :class:`~creek.compile.engine.SourceAdmissionRefusedError`, which
+    :func:`compile_tool` audits and answers with :data:`_ABOVE_CEILING_REASON`.
+
+    Args:
+        ceiling: The caller's declared ceiling.
+
+    Returns:
+        A hook admitting a compile only when no requested fragment, and no
+        ancestor of one, ranks above *ceiling*.
+    """
+
+    def _admit(ancestors: AncestorIndex, fragment_ids: Sequence[str], /) -> bool:
+        """Admit the compile when nothing it would render is above *ceiling*."""
+        return not _survey_sources(ancestors, fragment_ids, ceiling).above_ceiling
+
+    return _admit
 
 
 def compile_tool(
@@ -348,18 +407,21 @@ def compile_tool(
             reason="fragment_ids must be non-empty",
         )
 
-    # The write-side source-tier gate (#848). Its position is load-bearing in
+    # The write-side source-tier gate (#848), evaluated since #930 by the
+    # engine on its one walk, inside the content-mutation lock, through the
+    # ``admit_sources`` hook passed below. Its position is load-bearing in
     # both directions.
     #
     # It sits *below* the two argument-validation refusals above because
     # neither ordering leaks — those checks read only caller-supplied input and
     # touch no vault state, so they can answer nothing about the corpus. The
-    # tiebreaker is cost asymmetry: this gate is a full ``01-Fragments`` walk,
-    # so gating first would let any caller force a 35k-file parse with a
+    # tiebreaker is cost asymmetry: admission needs a full ``01-Fragments``
+    # walk, so gating first would let any caller force a 35k-file parse with a
     # syntactically invalid call.
     #
-    # It sits *above* everything that follows, because each of those steps
-    # hands the source fragments somewhere the caller is not admitted to:
+    # It sits *above* everything else the engine does — the engine evaluates
+    # the hook straight after its load — because each of those steps hands the
+    # source fragments somewhere the caller is not admitted to:
     #
     # - ``compile_to_vault`` builds an LLM client from the factory passed
     #   below, and the prompt the engine builds emits ``id:`` and ``title:``
@@ -382,9 +444,14 @@ def compile_tool(
     #   idempotency state behind.
     #
     # The gate also deliberately wins over the engine's missing-id
-    # ``ValueError``. Were it the other way round, a caller could pair one
-    # above-ceiling id with a batch of guesses and read back from the
-    # "not found" list which of those guesses exist.
+    # ``ValueError`` (the engine runs the hook before it checks for missing
+    # ids). Were it the other way round, a caller could pair one above-ceiling
+    # id with a batch of guesses and read back from the "not found" list which
+    # of those guesses exist.
+    #
+    # The refusal is audited after ``compile_to_vault`` has returned, so the
+    # audit append happens with the content lock already released; it touches
+    # only the MCP audit log, never vault content.
     #
     # This refusal is audited while the two argument-validation refusals above
     # are not, mirroring ``save_tool`` / ``journal_ingest_tool``: an attempted
@@ -402,22 +469,6 @@ def compile_tool(
     # one field the log persists verbatim — is omitted, as are ``created_path``
     # and ``created_tier`` (nothing was created). ``target_title`` is omitted
     # too: caller free text, irrelevant to a refusal.
-    gate = _survey_sources(vault_path, fragment_ids, privacy_tier_ceiling)
-    if gate.above_ceiling:
-        MCPAuditLog(vault_path).append(
-            tool=TOOL_NAME,
-            args={
-                "target_kind": target_kind,
-                "target_id": target_id,
-                "fragment_ids": list(fragment_ids),
-            },
-            tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
-        )
-        return refusal_response(
-            tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason=_ABOVE_CEILING_REASON
-        )
-
     kind = cast("CompileTargetKind", target_kind)
     try:
         written = compile_to_vault(
@@ -435,11 +486,26 @@ def compile_tool(
             # ceiling loses to the sources' own tiers, and low-tier sources
             # lose to a high ceiling. (``creek compile`` correctly has no
             # ceiling term at all; its operator is the vault owner.) The engine
-            # runs this only after the gate above, so a refused call still
-            # reaches no provider.
+            # runs this only after ``admit_sources`` has admitted the call, so
+            # a refused call still reaches no provider.
             llm_factory=lambda content_tier: llm_factory(
                 routing_tier(privacy_tier_ceiling, content_tier),
             ),
+            admit_sources=_ceiling_admission(privacy_tier_ceiling),
+        )
+    except SourceAdmissionRefusedError:
+        MCPAuditLog(vault_path).append(
+            tool=TOOL_NAME,
+            args={
+                "target_kind": target_kind,
+                "target_id": target_id,
+                "fragment_ids": list(fragment_ids),
+            },
+            tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+        return refusal_response(
+            tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason=_ABOVE_CEILING_REASON
         )
     except (ValueError, RuntimeError) as exc:
         return refusal_response(

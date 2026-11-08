@@ -225,6 +225,7 @@ from creek.config import CreekConfig, LLMConfig
 from creek.generate.compile_routing import COMPILE_GAPS_RELPATH
 from creek.generate.mining import MiningStrategy
 from creek.models import Fragment, PrivacyTier
+from creek.vault.mutations import CONTENT_MUTATION_LOCK_RELPATH
 from creek.vault.writer import INDEX_FILENAME, INDEX_LOCK_FILENAME
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.policy import Transport
@@ -581,19 +582,18 @@ def test_the_counts_only_rationale_is_not_reused_by_a_provider_reaching_tool() -
 
 
 def test_the_compile_ancestry_rationale_clause_is_executed() -> None:
-    """``creek.compile``'s rationale names ``ancestry_tiers``; something must call it.
+    """``creek.compile``'s rationale names ``chain_tiers``; something must call it.
 
     Layer (c) verifies a ``GATED`` claim against the implementation, but only
     for the ONE symbol the entry names in ``gate_symbol``. ``creek.compile``'s
     is ``_survey_sources``, so ``test_gated_tools_expose_their_named_gate_symbol``
     and ``test_gated_tools_actually_call_their_named_gate_symbol`` both pass
     over a module that had stopped ranking ancestry entirely — the rationale's
-    second half, "``ancestry_tiers`` walks parent_id and an above-ceiling
-    ancestor refuses the whole call with the same content-free reason", is
-    prose that nothing in this file executed. That is precisely the #1279
-    shape the counts-only-rationale test above exists to prevent, one clause
-    down, and it is the reason a manifest is only worth having if it cannot
-    lie.
+    ancestry clause, "``_survey_sources`` ranks them through
+    ``AncestorIndex.chain_tiers``, which walks parent_id", is prose that
+    nothing else in this file executes. That is precisely the #1279 shape the
+    counts-only-rationale test above exists to prevent, one clause down, and
+    it is the reason a manifest is only worth having if it cannot lie.
 
     The repair is to **execute** the claim, not to delete it: the sentence is
     true at HEAD. It follows the idiom the test above established — the
@@ -602,6 +602,14 @@ def test_the_compile_ancestry_rationale_clause_is_executed() -> None:
     result be *consumed*, so a call-and-discard edit that left the name
     present cannot satisfy this either.
 
+    #930 re-pointed it. The clause used to name ``ancestry_tiers``, a
+    walk-it-yourself survey ``_survey_sources`` called before the engine
+    walked the corpus again; since #930 the engine makes the only walk, inside
+    the content-mutation lock, and ``_survey_sources`` ranks the index built
+    from it with ``AncestorIndex.chain_tiers`` directly. The property pinned
+    is unchanged: the ancestry-aware ranking, not its ancestry-blind sibling
+    ``source_tiers``, is what compile's gate consumes.
+
     Note what this does NOT assert: that the refusal happens. That is a layer
     (f) claim, and it is
     :func:`test_compile_refuses_an_unnamed_intimate_ancestor`'s. This one is
@@ -609,24 +617,26 @@ def test_the_compile_ancestry_rationale_clause_is_executed() -> None:
     ``creek_mcp/read_gate.py`` reddens this test and nothing else in the file.
     """
     rationale = TOOL_POSTURES["creek.compile"].rationale
-    assert "ancestry_tiers" in rationale, (
-        "the creek.compile rationale no longer names ancestry_tiers. If the "
-        "ancestry survey was removed, #1283 regressed; if the prose was "
+    assert "chain_tiers" in rationale, (
+        "the creek.compile rationale no longer names chain_tiers. If the "
+        "ancestry ranking was removed, #1283 regressed; if the prose was "
         "trimmed, a reader can no longer follow the manifest to the code that "
         "closes the persisted-structural_path channel."
     )
     module = importlib.import_module("creek.classify.privacy_filter")
-    assert hasattr(module, "ancestry_tiers"), (
-        "the rationale names creek.classify.privacy_filter.ancestry_tiers, but "
-        "that symbol does not resolve -- the prose has drifted from the code."
+    assert hasattr(module.AncestorIndex, "chain_tiers"), (
+        "the rationale names creek.classify.privacy_filter.AncestorIndex."
+        "chain_tiers, but that symbol does not resolve -- the prose has "
+        "drifted from the code."
     )
-    assert _calls_symbol(_import_tool_module("creek.compile"), "ancestry_tiers"), (
-        "creek.compile's rationale claims ancestry_tiers ranks the ancestors "
-        "of every named fragment, but creek_mcp/tools/compile.py never calls "
-        "it (or calls it and discards the result). Layer (c) cannot see this: "
-        "it checks only the gate_symbol _survey_sources, which is still called "
-        "either way. Swapping ancestry_tiers back for its ancestry-blind "
-        "sibling source_tiers is the pre-#1283 shape and re-opens the channel."
+    assert _calls_symbol(_import_tool_module("creek.compile"), "chain_tiers"), (
+        "creek.compile's rationale claims AncestorIndex.chain_tiers ranks the "
+        "ancestors of every named fragment, but creek_mcp/tools/compile.py "
+        "never calls it (or calls it and discards the result). Layer (c) "
+        "cannot see this: it checks only the gate_symbol _survey_sources, "
+        "which is still called either way. Swapping chain_tiers back for its "
+        "ancestry-blind sibling source_tiers is the pre-#1283 shape and "
+        "re-opens the channel."
     )
 
 
@@ -5563,6 +5573,15 @@ def _is_artifact_carve_out(relpath: Path) -> bool:
     directory, so a directory-shaped carve-out would blind the derivation to
     compile's marker — one of the two artifacts this layer exists to force.
 
+    The shared content-mutation lock file is carved out the same way, by its
+    exact relative path (:data:`creek.vault.mutations.CONTENT_MUTATION_LOCK_RELPATH`)
+    and never by its ``locks/`` directory. Like ``INDEX_LOCK_FILENAME`` it is a
+    zero-byte advisory lock that :func:`creek._fslock.vault_lock` opens for
+    append and never writes, so it cannot carry content. It needs naming here
+    since #930: ``creek.compile`` now decides admission inside that lock, so a
+    *refused* compile creates the file too, and the refusal's byte-snapshot
+    would otherwise read a content-free lock as a write.
+
     Args:
         relpath: A vault-relative path.
 
@@ -5570,7 +5589,7 @@ def _is_artifact_carve_out(relpath: Path) -> bool:
         ``True`` when the path is bookkeeping the derivation must ignore.
     """
     return (
-        relpath == MCP_AUDIT_RELPATH
+        relpath in {MCP_AUDIT_RELPATH, CONTENT_MUTATION_LOCK_RELPATH}
         or relpath.name in _ARTIFACT_DERIVATION_CARVE_OUT_NAMES
     )
 

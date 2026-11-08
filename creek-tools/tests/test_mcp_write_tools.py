@@ -19,9 +19,13 @@ import pytest
 
 from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.classify.llm.router import ModelRouter
-from creek.classify.privacy_filter import PrivacyTierOverride, tier_sensitivity
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    build_ancestor_index,
+    tier_sensitivity,
+)
 from creek.cli import _REPORT_DISPATCH
-from creek.compile.engine import PARADOX_LOG_RELPATH
+from creek.compile.engine import PARADOX_LOG_RELPATH, SourceAdmissionRefusedError
 from creek.config import LLMConfig, LLMRoutingConfig
 from creek.models import Fragment, PrivacyTier
 from creek.save import TARGET_SUBDIRS
@@ -54,6 +58,8 @@ from creek_mcp.tools.skills import skills_refresh_tool
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
+
+    from creek.compile.engine import SourceAdmission
 
 
 # ---------------------------------------------------------------------------
@@ -1669,6 +1675,63 @@ class _RecordingLLMFactory:
         return lambda _prompt: "{}"
 
 
+class _AdmittingEngineStub:
+    """A ``compile_to_vault`` stand-in that still runs the wrapper's real admission.
+
+    Since #930 the ceiling gate is no longer a wrapper-side call that runs
+    *before* the engine: it is the ``admit_sources`` hook the wrapper hands
+    the engine, which evaluates it on its one walk. A stub that swallowed the
+    hook through ``**_kw`` would therefore retire admission on every row it
+    replaced — an over-refusing gate (one rejecting ``personal`` at
+    ``ceiling=personal``, say) would sail through the matrices below. So this
+    stub does what the engine does in the order the engine does it: build the
+    whole-corpus index from a real walk, ask the hook, refuse with the
+    engine's own :class:`~creek.compile.engine.SourceAdmissionRefusedError`,
+    and only then build the client and write a page. ``admissions`` records
+    every answer the hook gave, so each row can pin the decision it reached
+    and not merely the status it ended in.
+
+    The ``llm_factory`` call is load-bearing for the reason
+    :class:`_RecordingLLMFactory` gives (#962): the engine builds the client,
+    so a stub that skipped it would zero ``factory.calls`` on every row. The
+    tier passed is the content tier the real engine would derive for the
+    row's single source fragment.
+    """
+
+    def __init__(self, vault: Path, content_tier: PrivacyTier) -> None:
+        """Bind the stub to *vault* and the content tier the engine would derive."""
+        self.vault = vault
+        self.content_tier = content_tier
+        self.target_path = vault / "02-Threads" / "Active" / "thread-x.md"
+        self.admissions: list[bool] = []
+
+    def __call__(
+        self,
+        *,
+        fragment_ids: list[str],
+        llm_factory: Callable[[PrivacyTier], object],
+        admit_sources: SourceAdmission | None = None,
+        **_kw: object,
+    ) -> Path:
+        """Admit through the real hook, then build the client and write a page."""
+        if admit_sources is not None:
+            ancestors = build_ancestor_index(
+                (fragment, raw)
+                for _path, fragment, _body, raw in iter_vault_fragments(
+                    self.vault / "01-Fragments",
+                )
+            )
+            admitted = admit_sources(ancestors, fragment_ids)
+            self.admissions.append(admitted)
+            if not admitted:
+                raise SourceAdmissionRefusedError
+        llm_factory(self.content_tier)
+        self.target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.target_path.exists():
+            self.target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
+        return self.target_path
+
+
 def test_compile_refuses_intimate_source_under_open_ceiling(vault: Path) -> None:
     """An ``intimate`` source fragment is refused at ``ceiling=open``.
 
@@ -1866,31 +1929,8 @@ def test_compile_source_tier_ceiling_matrix(
     never-invoked factory.
     """
     _write_fragment(vault, frag_id="frag-src", privacy_tier=privacy_tier)
-    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
-
-    def _stub_compile(
-        *,
-        llm_factory: Callable[[PrivacyTier], object],
-        **_kw: object,
-    ) -> object:
-        """Stand in for the engine: build the client, then write a page.
-
-        The ``llm_factory`` call is load-bearing, not decorative. Since
-        #962 the engine builds the compile client itself instead of
-        receiving a pre-built one, so a stub that swallowed the factory
-        would drive ``factory.calls`` to 0 on every row and the allowed-row
-        assertion below would silently stop distinguishing "the gate
-        passed" from "the wrapper short-circuited". The tier passed is the
-        one the real engine derives from this row's single source fragment.
-        """
-        llm_factory(PrivacyTier(privacy_tier))
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not target_path.exists():
-            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
-        return target_path
-
-    if allowed:
-        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    engine = _AdmittingEngineStub(vault, PrivacyTier(privacy_tier))
+    monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", engine)
     factory = _RecordingLLMFactory()
 
     result = compile_tool(
@@ -1903,6 +1943,7 @@ def test_compile_source_tier_ceiling_matrix(
         privacy_tier_ceiling=ceiling,
     )
 
+    assert engine.admissions == [allowed]
     if allowed:
         assert result["status"] == "ok"
         assert factory.calls == 1
@@ -1948,33 +1989,14 @@ def test_compile_refuses_unclassified_source_at_open_ceiling(
 
     Args:
         vault: The seeded vault fixture.
-        monkeypatch: Used to stub the compile engine on the admitted row.
+        monkeypatch: Used to stand in for the compile engine on every row, with
+            admission still decided by the real hook (#930).
         ceiling: The caller's declared ceiling.
         allowed: Whether *ceiling* must admit the unclassified source.
     """
     _write_fragment(vault, frag_id="frag-src", privacy_tier="unclassified")
-    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
-
-    def _stub_compile(
-        *,
-        llm_factory: Callable[[PrivacyTier], object],
-        **_kw: object,
-    ) -> object:
-        """Stand in for the engine: build the client, then write a page.
-
-        Calls ``llm_factory`` because the engine does (#962); a stub that
-        swallowed it would zero out ``factory.calls`` and quietly retire the
-        admitted row's "the work really got done" assertion. The tier is the
-        explicit ``unclassified`` this row's source carries.
-        """
-        llm_factory(PrivacyTier.UNCLASSIFIED)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not target_path.exists():
-            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
-        return target_path
-
-    if allowed:
-        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    engine = _AdmittingEngineStub(vault, PrivacyTier.UNCLASSIFIED)
+    monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", engine)
     factory = _RecordingLLMFactory()
 
     result = compile_tool(
@@ -1987,6 +2009,7 @@ def test_compile_refuses_unclassified_source_at_open_ceiling(
         privacy_tier_ceiling=ceiling,
     )
 
+    assert engine.admissions == [allowed]
     if allowed:
         assert result["status"] == "ok"
         assert factory.calls == 1
@@ -2061,29 +2084,10 @@ def test_compile_fails_closed_when_privacy_tier_key_is_absent(
     at ``personal``, where this file is refused.
     """
     _write_fragment_without_tier(vault, frag_id="frag-legacy")
-    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
-
-    def _stub_compile(
-        *,
-        llm_factory: Callable[[PrivacyTier], object],
-        **_kw: object,
-    ) -> object:
-        """Stand in for the engine: build the client, then write a page.
-
-        Calls ``llm_factory`` because the engine does (#962); a stub that
-        swallowed it would zero out ``factory.calls`` and quietly retire the
-        admitted rows' "the work really got done" assertion. The tier is the
-        fail-closed ``INTIMATE`` the engine derives for a fragment whose
-        ``privacy_tier`` key is absent — the very reading this test is about.
-        """
-        llm_factory(PrivacyTier.INTIMATE)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not target_path.exists():
-            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
-        return target_path
-
-    if allowed:
-        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    # INTIMATE is the fail-closed tier the engine derives for a fragment whose
+    # ``privacy_tier`` key is absent — the very reading this test is about.
+    engine = _AdmittingEngineStub(vault, PrivacyTier.INTIMATE)
+    monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", engine)
     factory = _RecordingLLMFactory()
 
     result = compile_tool(
@@ -2096,6 +2100,7 @@ def test_compile_fails_closed_when_privacy_tier_key_is_absent(
         privacy_tier_ceiling=ceiling,
     )
 
+    assert engine.admissions == [allowed]
     if allowed:
         assert result["status"] == "ok"
         assert factory.calls == 1
