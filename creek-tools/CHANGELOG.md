@@ -9,6 +9,20 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `POST /v1/links` now refuses `eddies` and `threads` with the static
+  `503 unavailable` instead of `500 internal_error` when the local embedding
+  model cannot load (refs #2060). The shipped image installs no `embeddings`
+  extra, so on any vault with uncached fragments the lazy
+  `sentence_transformers` import failed inside `EmbeddingLinker.load_model`
+  and the typed `EmbeddingModelUnavailableError` (and its
+  `EmbeddingRefusedError` subclass) escaped to the error boundary. The route
+  now catches it in the HTTP adapter and logs the type name and `request_id`,
+  with the model name, cache path and underlying error carried only by the
+  traceback in the operator log. `unavailable`, not `temporarily_unavailable`,
+  because only operator action clears it. No contract bump: `503` is already
+  published for the operation. `docs/api.md`, the `link_embedder` docstring
+  and the DAST 503 allowance list move with it.
+
 - A writer's refused provider key is now reported as refused, not as a wait
   (contract 0.28.0, ADR-0015). When the vendor answered a writer's
   request-scoped key `401`/`403` on `POST /v1/reflections` or

@@ -56,3 +56,13 @@ include-name = "POST /v1/reading-recommendations"
 
 [operations.checks.not_a_server_error]
 expected-statuses = ["2xx", "3xx", "4xx", "503"]
+
+# The fuzzed POST /v1/uploads seeds fragments, and the throwaway instance has no
+# reachable embedding model (no `embeddings` extra, and no download). docs/api.md
+# publishes that as POST /v1/links's 503 unavailable for eddies/threads: only an
+# operator can install the extra or populate the cache (#2060).
+[[operations]]
+include-name = "POST /v1/links"
+
+[operations.checks.not_a_server_error]
+expected-statuses = ["2xx", "3xx", "4xx", "503"]
