@@ -219,6 +219,26 @@ def test_the_data_package_helper_writes_inside_the_content_lock(
     assert _content_lock_is_held(vault) is False
 
 
+def test_a_data_package_into_a_non_vault_gains_no_lock_directory(
+    tmp_path: Path,
+) -> None:
+    """``write_fragments`` refuses a non-vault before the lock scaffolds it.
+
+    Acquiring the content lock creates ``00-Creek-Meta/locks/``, so the
+    ``VaultWriter`` — whose constructor checks the vault layout — is built
+    before the hold, and a mistyped ``--vault`` stays exactly as it was.
+    """
+    vault = tmp_path / "not-a-vault"
+    vault.mkdir()
+    package = _write_data_package(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="Required vault directory missing"):
+        run_discord_data_package(vault, package)
+
+    assert not (vault / "00-Creek-Meta" / "locks").exists()
+    assert list(vault.iterdir()) == []
+
+
 def test_a_busy_data_package_cli_run_is_one_line_and_exit_1(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
