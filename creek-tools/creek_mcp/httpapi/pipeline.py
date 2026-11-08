@@ -55,10 +55,13 @@ work a long call performs is not lost: it lands, and a retry is the fast path.
 Those methods remain synchronous for compatibility; only explicit ``llm`` and
 ``embeddings`` requests take the job path. When the local model cannot load at
 all — the shipped image installs no ``embeddings`` extra, or the cache is empty
-and the download is blocked — the stage raises
-:class:`~creek.link.embeddings.EmbeddingModelUnavailableError` and the route
-answers the static ``503 unavailable`` refusal; the model name, cache path and
-underlying error stay in the operator log (#2060).
+and the download is blocked — ``link_tool`` catches
+:class:`~creek.link.embeddings.EmbeddingModelUnavailableError` and returns the
+fixed :data:`~creek.link.embeddings.EMBEDDING_MODEL_UNAVAILABLE_REASON` refusal
+(#2065), which this adapter maps to the static ``503 unavailable``; the model
+name, cache path and underlying error stay in the tool's operator log (#2060).
+A timed-out vault content lock is the tools' busy refusal and answers ``503
+temporarily_unavailable``, as ``/v1/journal-entries`` does for its own (#2066).
 
 **Both passes are idempotent and resumable**, which is what makes a synchronous
 route honest despite that deadline. ``run_classify`` short-circuits on the
@@ -82,7 +85,11 @@ from pydantic import BaseModel, ValidationError
 
 from creek.classify.llm.consent import is_managed_vault
 from creek.classify.llm.request_key import InvalidRequestKeyError
-from creek.link.embeddings import EmbeddingModelUnavailableError
+from creek.link.embeddings import (
+    EMBEDDING_MODEL_UNAVAILABLE_REASON,
+    EmbeddingModelUnavailableError,
+)
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     JOB_FAILURE_CODE_SINCE_MINOR,
     OK_STATUS,
@@ -163,6 +170,20 @@ def pipeline_refusal_code(reason: str) -> ErrorCode:
     arbitrary text from a provider client and exactly the material that must
     never reach a body.
 
+    A timed-out vault content lock is the tools' fixed
+    :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` and maps to
+    ``temporarily_unavailable`` (#2066): the other writer finishes and a retry
+    succeeds, the same disposition ``PUT /v1/journal-entries`` gives its own
+    busy refusal (:func:`creek_mcp.httpapi.journal.journal_refusal_code`). The
+    match is exact equality on the imported constant, never a prefix or
+    substring test, so provider text that merely quotes it still fails closed.
+
+    ``link_tool``'s fixed
+    :data:`~creek.link.embeddings.EMBEDDING_MODEL_UNAVAILABLE_REASON` maps, by
+    the same exact equality, to ``unavailable`` (#2065): no retry installs a
+    missing extra or unblocks a download, so the client must stop backing off
+    until an operator acts — the code #2060 published for the same condition.
+
     Args:
         reason: The ``reason`` field of a structured tool refusal.
 
@@ -171,6 +192,10 @@ def pipeline_refusal_code(reason: str) -> ErrorCode:
     """
     if reason.startswith(_UNKNOWN_METHOD_PREFIX):
         return ErrorCode.INVALID_REQUEST
+    if reason == CONTENT_MUTATION_BUSY_REASON:
+        return ErrorCode.TEMPORARILY_UNAVAILABLE
+    if reason == EMBEDDING_MODEL_UNAVAILABLE_REASON:
+        return ErrorCode.UNAVAILABLE
     return ErrorCode.INTERNAL_ERROR
 
 
@@ -305,9 +330,17 @@ def _rendered(
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
     if result.get("status") != OK_STATUS:
-        return error_response(
-            pipeline_refusal_code(str(result.get("reason", ""))), context
+        code = pipeline_refusal_code(str(result.get("reason", "")))
+        # The code and the request id only — never the reason, which is the
+        # tool's text and, for an unclassified provider failure, arbitrary
+        # third-party text. The tool logs its own detail on its own logger.
+        logger.warning(
+            "pipeline tool refused as %s request_id=%s",
+            code.value,
+            context.request_id,
+            extra={"request_id": context.request_id},
         )
+        return error_response(code, context)
     try:
         payload = build(result)
     except (ValidationError, ValueError, KeyError, TypeError):
@@ -676,9 +709,13 @@ async def handle_link(request: Request) -> Response:
     engine raises
     :class:`~creek.link.embeddings.EmbeddingModelUnavailableError` (whose
     :class:`~creek.link.embeddings.EmbeddingRefusedError` subclass a non-local
-    route raises for a refused text is caught alike), and this handler
-    answers the static ``503 unavailable`` refusal rather than letting it
-    reach the error boundary as ``500 internal_error`` (#2060).
+    route raises for a refused text is caught alike). ``link_tool`` now turns
+    it into the fixed
+    :data:`~creek.link.embeddings.EMBEDDING_MODEL_UNAVAILABLE_REASON` refusal
+    (#2065), which :func:`pipeline_refusal_code` maps to the static ``503
+    unavailable`` (#2060). The ``except`` below is kept as defence in depth:
+    should the error ever escape the tool again, it still answers ``503``
+    rather than reaching the error boundary as ``500 internal_error``.
 
     Args:
         request: The request in flight.
@@ -701,12 +738,15 @@ async def handle_link(request: Request) -> Response:
     try:
         result = await write_off_loop(_link, request, parsed, context)
     except EmbeddingModelUnavailableError as exc:
-        # ``unavailable``, not ``temporarily_unavailable``: as with drive.py's
-        # operator-action refusals, no retry installs a missing extra or
-        # unblocks a download, so RETRY_POLICY must tell the client to stop
-        # backing off. The engine's message names the model, the cache path
-        # and the third-party error — it rides the traceback into the operator
-        # log only, never the message format and never the wire.
+        # Defence in depth: ``link_tool`` already refuses this with a fixed
+        # reason (#2065), so it reaches here only if a future change lets it
+        # escape the tool. ``unavailable``, not ``temporarily_unavailable``:
+        # as with drive.py's operator-action refusals, no retry installs a
+        # missing extra or unblocks a download, so RETRY_POLICY must tell the
+        # client to stop backing off. The engine's message names the model,
+        # the cache path and the third-party error — it rides the traceback
+        # into the operator log only, never the message format and never the
+        # wire.
         logger.exception(
             "link stage %s refused as unavailable: %s request_id=%s",
             parsed.method.value,
