@@ -45,6 +45,7 @@ from uuid import UUID
 import frontmatter
 import pytest
 
+from creek._fslock import VaultLockTimeoutError
 from creek.classify.classify_engine import run_classify
 from creek.classify.llm import LLMClassificationResult
 from creek.classify.rules import FREQUENCY_SIGNALS, WAVELENGTH_PHASE_SIGNALS
@@ -52,10 +53,13 @@ from creek.config import EmbeddingsConfig, load_vault_config
 from creek.link import embeddings as embeddings_module
 from creek.link.embeddings import EmbeddingRefusedError
 from creek.models import Frequency, Phase, PrivacyTier
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     CONTRACT_MINOR,
+    ERROR_MESSAGES,
     Capability,
     ErrorCode,
+    ErrorEnvelope,
     minor_at_least,
 )
 from creek_mcp.httpapi import pipeline as pipeline_module
@@ -1004,8 +1008,18 @@ def test_pipeline_is_a_published_capability_at_the_current_minor() -> None:
         ("unknown method 'llm'; supported: rules", ErrorCode.INVALID_REQUEST),
         ("ollama at http://127.0.0.1:11434 is unreachable", ErrorCode.INTERNAL_ERROR),
         ("", ErrorCode.INTERNAL_ERROR),
+        (CONTENT_MUTATION_BUSY_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
+        ("embedding model unavailable", ErrorCode.UNAVAILABLE),
+        (f"x {CONTENT_MUTATION_BUSY_REASON}", ErrorCode.INTERNAL_ERROR),
     ],
-    ids=["unknown-method", "provider-detail", "empty"],
+    ids=[
+        "unknown-method",
+        "provider-detail",
+        "empty",
+        "content-mutation-busy",
+        "embedding-model-unavailable",
+        "contains-busy-text",
+    ],
 )
 def test_pipeline_refusal_code_is_total_and_fails_closed(
     reason: str, expected: ErrorCode
@@ -1018,8 +1032,74 @@ def test_pipeline_refusal_code_is_total_and_fails_closed(
     from being narrated as a plausible caller-facing refusal — and
     :func:`~creek_mcp.httpapi.errors.error_response` renders one constant per
     code, so the text itself never reaches a body.
+
+    The two fixed reasons are matched by **exact equality** (#2065, #2066):
+    the ``contains-busy-text`` case pins that a reason merely *containing* the
+    busy text — which a ``startswith``/``in`` match would accept — still fails
+    closed, so provider text that happened to quote it is never promoted to a
+    retryable refusal.
     """
     assert pipeline_refusal_code(reason) is expected
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "engine"),
+    [
+        (
+            CLASSIFICATIONS_PATH,
+            {"method": "rules"},
+            "creek_mcp.tools.classify.run_classify",
+        ),
+        (LINKS_PATH, {"method": "temporal"}, "creek_mcp.tools.link.run_link"),
+        (LINKS_PATH, {"method": "eddies"}, "creek_mcp.tools.link.run_link"),
+    ],
+    ids=["classifications-rules", "links-temporal", "links-eddies"],
+)
+def test_vault_lock_contention_on_a_pipeline_route_is_temporarily_unavailable(
+    api: TestClient,
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    body: dict[str, str],
+    engine: str,
+) -> None:
+    """A bounded content-lock timeout is a retryable ``503``, not a server fault.
+
+    Both tools already render a timed-out vault content lock as the fixed
+    :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` refusal; the
+    adapter used to fall through to ``500 internal_error`` on it (#2066). The
+    condition clears on its own once the other writer finishes, so it is the
+    same ``503 temporarily_unavailable`` ``PUT /v1/journal-entries`` answers for
+    its own busy refusal (``creek_mcp/httpapi/journal.py``,
+    ``journal_refusal_code``) — and the same closed three-field envelope, which
+    carries none of the lock's detail.
+    """
+
+    def _raise_lock_timeout(**_kwargs: object) -> object:
+        """Time out the way a second writer holding the vault lock does.
+
+        Args:
+            **_kwargs: The engine's arguments, unread.
+
+        Raises:
+            VaultLockTimeoutError: Always, naming a marker that must not leak.
+        """
+        msg = f"busy at {_LEAK_MARKER}"
+        raise VaultLockTimeoutError(msg)
+
+    monkeypatch.setattr(engine, _raise_lock_timeout)
+
+    response = api.post(path, json=body, headers=headers())
+
+    assert response.status_code == HTTP_UNAVAILABLE
+    payload = response.json()
+    assert payload["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert payload["message"] == ERROR_MESSAGES[ErrorCode.TEMPORARILY_UNAVAILABLE]
+    ErrorEnvelope.model_validate(payload)
+    assert set(payload) == set(ErrorEnvelope.model_fields)
+    assert payload["request_id"]
+    assert _LEAK_MARKER not in response.text
+    assert str(vault) not in response.text
 
 
 @pytest.mark.parametrize(
@@ -1377,3 +1457,67 @@ def test_an_unrelated_link_engine_fault_is_still_a_server_fault(
     assert response.status_code == HTTP_SERVER_FAULT
     assert response.json()["code"] == ErrorCode.INTERNAL_ERROR.value
     assert _LEAK_MARKER not in response.text
+
+
+def _stored_job(vault: Path, job_id: str) -> dict[str, Any]:
+    """Return the raw private record of *job_id*, as written on disk.
+
+    Read as bytes rather than through the jobs module, the way
+    ``tests/test_managed_vault_classify_fallback.py`` does, so a reader that
+    defaulted a missing field could not make an assertion pass.
+
+    Args:
+        vault: The vault root.
+        job_id: The job's UUID.
+
+    Returns:
+        The decoded record.
+    """
+    path = vault / "00-Creek-Meta" / "State" / "jobs" / f"{job_id}.json"
+    loaded: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    return loaded
+
+
+def test_an_embeddings_job_whose_model_cannot_load_records_a_fixed_refusal(
+    api: TestClient, vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable ``embeddings`` job records the tool's fixed refusal (#2065).
+
+    ``creek.link`` now answers an unloadable model with the fixed
+    ``embedding model unavailable`` refusal instead of raising, so the job's
+    private ``failure_reason`` is that constant rather than the exception's
+    type name — and the public projection still says only ``failed``.
+    """
+
+    def _raise(_model_name: str, _cache_folder: str | None = None) -> object:
+        """Fail the way a missing extra or a blocked download does.
+
+        Args:
+            _model_name: Unread.
+            _cache_folder: Unread.
+
+        Raises:
+            OSError: Always, carrying a marker that must not be recorded.
+        """
+        msg = f"ProxyError: 403 {_LEAK_MARKER}"
+        raise OSError(msg)
+
+    monkeypatch.setattr(embeddings_module, "_load_sentence_transformer", _raise)
+    for index in range(3):
+        _write_fragment(vault, f"f{index}", _signal_body(), tier="personal")
+
+    accepted = api.post(LINKS_PATH, json={"method": "embeddings"}, headers=headers())
+    job_id = accepted.json()["job_id"]
+    body = _await_terminal(api, job_id)
+
+    assert body == {
+        "status": "ok",
+        "job_id": job_id,
+        "state": "failed",
+        "result": None,
+        "failure_code": None,
+    }
+    record = _stored_job(vault, job_id)
+    assert record["failure_reason"] == "refused: embedding model unavailable"
+    assert _LEAK_MARKER not in json.dumps(record)
+    assert _LEAK_MARKER not in json.dumps(body)
