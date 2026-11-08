@@ -60,8 +60,8 @@ install -r requirements-dev.txt` still works as an unpinned fallback.
 ./scripts/complexity.sh         # Radon/Xenon complexity analysis
 ./scripts/coverage-per-file.sh  # Per-file coverage gate (TEST-002)
 ./scripts/pylint.sh             # Pylint score gate (≥9.0); in check-all.sh + CI
-./scripts/lint-interrogate.sh   # Docstring coverage gate (≥95%, creek/ only); in check-all.sh + CI
-./scripts/lint-refurb.sh        # Modernisation-hint gate; in check-all.sh + CI
+./scripts/lint-interrogate.sh   # Docstring coverage gate (≥95% per package, creek/ + creek_mcp/); in check-all.sh + CI
+./scripts/lint-refurb.sh        # Modernisation-hint gate (creek/ + creek_mcp/); in check-all.sh + CI
 ./scripts/lint-tryceratops.sh   # Exception-hygiene gate; in check-all.sh + CI
 ./scripts/lint-vulture.sh       # Dead-code gate (vulture, per-type confidence floors); in check-all.sh + CI
 ./scripts/lint-extended.sh      # Optional: pylint, refurb, tryceratops, vulture, interrogate, shellcheck
