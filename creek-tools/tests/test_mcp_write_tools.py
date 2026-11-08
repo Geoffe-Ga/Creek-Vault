@@ -9,6 +9,7 @@ tier-ceiling enforcement helper, and the audit-log write-side fields
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import UTC, datetime
 from functools import partial
@@ -32,7 +33,9 @@ from creek.models import Fragment, PrivacyTier
 from creek.save import TARGET_SUBDIRS
 from creek.surface_modes import REPORT_TYPES
 from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
     CONTENT_MUTATION_LOCK_RELPATH,
+    ContentMutationBusyError,
     content_mutation_lock_path,
 )
 from creek.vault.reader import iter_vault_fragments
@@ -42,6 +45,7 @@ from creek_mcp.audit import (
     verify_mcp_audit_chain,
 )
 from creek_mcp.tier_ceiling import TierCeiling, write_tier_allowed
+from creek_mcp.tools import compile as compile_mod
 from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.ingest import ingest_tool
@@ -1611,18 +1615,49 @@ def test_compile_writes_audit_then_noop_on_re_run(
     assert len(compile_entries) == 1
 
 
-def test_compile_propagates_engine_errors_as_refusal(
-    vault: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A ``ValueError`` / ``RuntimeError`` becomes a structured refusal."""
+_COMPILE_LEAK_MARKER = "COMPILE-LEAK-MARKER"
+"""A token planted in an injected compile engine failure; never served."""
+
+_COMPILE_LOGGER = "creek_mcp.tools.compile"
+"""The operator log ``creek.compile`` records an engine refusal on (#2074)."""
+
+
+def _compile_reason(name: str) -> str:
+    """Return one of :mod:`creek_mcp.tools.compile`'s fixed reasons (#2074).
+
+    Read by name at call time so this module still collects, and fails per
+    test, against a tree that has not defined it yet.
+
+    Args:
+        name: The constant's attribute name.
+
+    Returns:
+        Its value.
+    """
+    value = getattr(compile_mod, name)
+    assert isinstance(value, str)
+    return value
+
+
+def _compile_with_engine_raising(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> dict[str, object]:
+    """Run ``compile_tool`` with ``compile_to_vault`` replaced by a raise of *exc*.
+
+    Args:
+        vault: The vault root.
+        monkeypatch: pytest's patcher.
+        exc: What the engine raises.
+
+    Returns:
+        The tool's response.
+    """
 
     def _broken(**_kw: object) -> object:
-        msg = "engine boom"
-        raise ValueError(msg)
+        raise exc
 
     monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _broken)
-    result = compile_tool(
+    return compile_tool(
         vault_path=vault,
         fragment_ids=["frag-1"],
         target_kind="thread",
@@ -1631,8 +1666,107 @@ def test_compile_propagates_engine_errors_as_refusal(
         llm_factory=lambda tier: lambda _prompt: "{}",
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
+
+
+def _compile_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return the records ``creek.compile`` logged on its operator logger.
+
+    Args:
+        caplog: pytest's log capture.
+
+    Returns:
+        Every record on :data:`_COMPILE_LOGGER`.
+    """
+    return [r for r in caplog.records if r.name == _COMPILE_LOGGER]
+
+
+def test_compile_refuses_an_unknown_engine_error_with_a_fixed_reason(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An engine ``ValueError`` nothing names is the fixed refusal (#2074).
+
+    Before #2074 its text was the reason. A pydantic ``ValidationError`` — a
+    ``ValueError`` — can carry vault frontmatter, so only creek's own typed
+    ``CompileRequestError`` is echoed; anything else stays on the log.
+    """
+    caplog.set_level(logging.WARNING, logger=_COMPILE_LOGGER)
+
+    result = _compile_with_engine_raising(
+        vault, monkeypatch, ValueError(f"engine boom {_COMPILE_LEAK_MARKER}")
+    )
+
     assert result["status"] == "refused"
-    assert "engine boom" in result["reason"]
+    assert result["reason"] == _compile_reason("COMPILE_FAILED_REASON")
+    assert _COMPILE_LEAK_MARKER not in repr(result)
+    (record,) = _compile_records(caplog)
+    assert "ValueError" in record.getMessage()
+    assert _COMPILE_LEAK_MARKER not in record.getMessage()
+
+
+def test_compile_refuses_an_engine_oserror_without_its_path(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An ``OSError`` from the engine is a fixed refusal, not FastMCP isError.
+
+    ``_resolve_target_path`` and ``_write_compiled_page`` touch the disk, and
+    before #2074 their ``OSError`` escaped ``compile_tool`` with a vault path in
+    its text. The path now rides only the operator record's traceback.
+    """
+    caplog.set_level(logging.WARNING, logger=_COMPILE_LOGGER)
+    leaked_path = "/home/owner/vault/02-Threads/x.md"
+
+    result = _compile_with_engine_raising(
+        vault, monkeypatch, OSError(f"{leaked_path} {_COMPILE_LEAK_MARKER}")
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _compile_reason("COMPILE_FAILED_REASON")
+    assert leaked_path not in repr(result)
+    assert _COMPILE_LEAK_MARKER not in repr(result)
+    (record,) = _compile_records(caplog)
+    assert isinstance(record.exc_info, tuple), record.exc_info
+    assert type(record.exc_info[1]) is OSError
+    assert "OSError" in record.getMessage()
+    assert leaked_path not in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("exc", "reason", "audit_rows"),
+    [
+        (SourceAdmissionRefusedError(), _ABOVE_CEILING_REASON, 1),
+        (ContentMutationBusyError(), CONTENT_MUTATION_BUSY_REASON, 0),
+        (VaultLockTimeoutError("inner lock"), CONTENT_MUTATION_BUSY_REASON, 0),
+    ],
+    ids=["admission", "busy", "lock-timeout"],
+)
+def test_compile_except_arm_ordering(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc: Exception,
+    reason: str,
+    audit_rows: int,
+) -> None:
+    """The fail-closed fallback sits below the admission and busy arms (#2074).
+
+    Neither exception is a ``ValueError`` or ``RuntimeError``, so a catch-all
+    placed above them would swallow the audited ceiling refusal and the busy
+    refusal into the generic one. Busy stays unaudited (accepted, #2071), and
+    neither is an engine failure the operator log should carry.
+    """
+    caplog.set_level(logging.DEBUG, logger=_COMPILE_LOGGER)
+
+    result = _compile_with_engine_raising(vault, monkeypatch, exc)
+
+    assert result["status"] == "refused"
+    assert result["reason"] == reason
+    compile_rows = [e for e in _read_audit(vault) if e["tool"] == "creek.compile"]
+    assert len(compile_rows) == audit_rows
+    assert _compile_records(caplog) == []
 
 
 # ---------------------------------------------------------------------------

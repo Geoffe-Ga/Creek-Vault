@@ -35,6 +35,10 @@ Two later sites follow:
   the ``/v1`` refusal-log contract
   (``tests/test_api_reflect_refusal_log.py``) forbids provider text in *any*
   record on that path, so reflect logs the exception's type name only.
+- ``creek.compile`` answered any engine ``ValueError`` / ``RuntimeError`` with
+  ``reason=str(exc)``, so a vendor 4xx message reached the client, and caught
+  no ``httpx`` error at all, so an Ollama failure escaped as FastMCP
+  ``isError`` text, URL included (#2074).
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Final
 
+import frontmatter
 import httpx
 import pytest
 
@@ -57,6 +62,7 @@ from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV
 from creek_mcp.server import Transport, build_server
 from creek_mcp.tools import author as author_mod
 from creek_mcp.tools import classify as classify_mod
+from creek_mcp.tools import compile as compile_mod
 from creek_mcp.tools import draft as draft_mod
 from creek_mcp.tools.classify import REQUEST_KEY_REJECTED_REASON, classify_tool
 from tests.v1_api_support import seed_vault
@@ -85,6 +91,12 @@ _AUTHOR_LOGGER: Final[str] = "creek_mcp.tools.author"
 
 _REFLECT_LOGGER: Final[str] = "creek_mcp.tools.reflect"
 """The operator log ``creek.reflect`` records its dial refusal on (#2083)."""
+
+_COMPILE_LOGGER: Final[str] = "creek_mcp.tools.compile"
+"""The operator log ``creek.compile`` records its engine refusal on (#2074)."""
+
+_VAULT_PATH: Final[str] = "/srv/secret/vault"
+"""A server-side path planted in a vendor message; never served either."""
 
 
 def _draft_reason(name: str) -> str:
@@ -786,3 +798,208 @@ def test_mcp_reflect_logs_a_runtime_dial_failure_by_type_name_only(
     assert structured["reason"] == "reflection unavailable: RuntimeError"
     _assert_no_leak(answer)
     _assert_one_type_name_record(caplog, _REFLECT_LOGGER, "RuntimeError")
+
+
+# ---------------------------------------------------------------------------
+# creek.compile (#2074)
+# ---------------------------------------------------------------------------
+
+
+def _write_open_fragment(vault: Path, frag_id: str = "frag-1") -> None:
+    """Write one ``open``-tier fragment the compile engine can resolve.
+
+    Args:
+        vault: The vault root.
+        frag_id: The fragment's id, also its filename stem.
+    """
+    post = frontmatter.Post(
+        content="Body text.",
+        type="fragment",
+        id=frag_id,
+        title=f"Title {frag_id}",
+        created="2026-05-01T00:00:00+00:00",
+        ingested="2026-05-01T00:00:00+00:00",
+        source={"platform": "journal", "author": "self"},
+        frequency={"primary": "F1", "secondary": []},
+        privacy_tier="open",
+        eddies=[],
+    )
+    (vault / "01-Fragments" / "Notes" / f"{frag_id}.md").write_text(
+        frontmatter.dumps(post), encoding="utf-8"
+    )
+
+
+def _call_compile(
+    vault: Path, factory: Callable[[object], Callable[[str], str]]
+) -> Any:
+    """Call the registered ``creek.compile`` tool and return FastMCP's answer.
+
+    Args:
+        vault: The vault root, holding ``frag-1``.
+        factory: The injected tier-keyed compile LLM factory.
+
+    Returns:
+        FastMCP's raw ``call_tool`` answer.
+    """
+    server = build_server(
+        transport=Transport.STDIO, vault_path=vault, compile_llm_factory=factory
+    )
+    return asyncio.run(
+        server.call_tool(
+            "creek.compile",
+            {
+                "fragment_ids": ["frag-1"],
+                "target_kind": "thread",
+                "target_id": "thread-x",
+                "target_title": "Thread X",
+            },
+        )
+    )
+
+
+def _compile_reason(name: str) -> str:
+    """Return one of :mod:`creek_mcp.tools.compile`'s fixed refusal constants.
+
+    Read by name so this module still collects, and fails per test, against a
+    tree that has not defined them yet.
+
+    Args:
+        name: The constant's attribute name.
+
+    Returns:
+        Its value.
+    """
+    value = getattr(compile_mod, name)
+    assert isinstance(value, str)
+    return value
+
+
+def _raising_factory(exc: Exception) -> Callable[[object], Callable[[str], str]]:
+    """Return a compile LLM factory whose client raises *exc* when called.
+
+    Args:
+        exc: What the provider call raises.
+
+    Returns:
+        A tier → client factory.
+    """
+    llm = _raising(exc)
+    return lambda _tier: llm
+
+
+def _failing_factory(exc: Exception) -> Callable[[object], Callable[[str], str]]:
+    """Return a compile LLM factory that raises *exc* while building the client.
+
+    Args:
+        exc: What building the provider raises.
+
+    Returns:
+        A tier → client factory that never returns.
+    """
+
+    def _factory(_tier: object) -> Callable[[str], str]:
+        """Fail to build the client the way an unreachable provider does.
+
+        Args:
+            _tier: Unread.
+
+        Raises:
+            Exception: Always, *exc*.
+        """
+        raise exc
+
+    return _factory
+
+
+_COMPILE_PROVIDER_FAILURES: Final = pytest.mark.parametrize(
+    ("make_error", "type_name"),
+    [
+        (
+            lambda: RuntimeError(
+                "Anthropic API call failed: BadRequestError (HTTP 400): "
+                f"{_VAULT_PATH} {_MARKER}"
+            ),
+            "RuntimeError",
+        ),
+        (
+            lambda: httpx.ConnectError(f"connect failed for url {_URL!r} {_MARKER}"),
+            "ConnectError",
+        ),
+        # Its message is already fixed and URL-free; the defect was that, as an
+        # ``httpx.TransportError``, it escaped ``compile_tool`` altogether.
+        (NonLoopbackOllamaError, "NonLoopbackOllamaError"),
+    ],
+    ids=["vendor-4xx", "ollama-connect-error", "non-loopback-ollama"],
+)
+
+
+@_COMPILE_PROVIDER_FAILURES
+@pytest.mark.parametrize(
+    "make_factory",
+    [_raising_factory, _failing_factory],
+    ids=["generate-call", "client-build"],
+)
+def test_mcp_compile_refuses_a_provider_failure_without_its_text(
+    vault: Path,
+    caplog: pytest.LogCaptureFixture,
+    make_error: Callable[[], Exception],
+    type_name: str,
+    make_factory: Callable[[Exception], Callable[[object], Callable[[str], str]]],
+) -> None:
+    """A provider failure is the fixed "call failed" refusal, text on the log.
+
+    Before #2074 the vendor case echoed its 4xx text and the planted path via
+    ``reason=str(exc)``, and both ``httpx`` cases escaped ``compile_tool``
+    altogether — here they would raise out of ``call_tool``. The engine both
+    builds and calls the client, so a failure at either step reads the same.
+    """
+    caplog.set_level(logging.WARNING, logger=_COMPILE_LOGGER)
+    _write_open_fragment(vault)
+
+    answer = _call_compile(vault, make_factory(make_error()))
+
+    structured = _structured(answer)
+    assert structured["status"] == "refused"
+    assert structured["reason"] == _compile_reason("COMPILE_PROVIDER_FAILED_REASON")
+    _assert_no_leak(answer, _VAULT_PATH, "BadRequestError")
+    _assert_one_operator_record(caplog, _COMPILE_LOGGER, type_name)
+    assert not (vault / "02-Threads" / "Active" / "thread-x.md").exists()
+
+
+def test_mcp_compile_keeps_the_routers_own_reason(
+    vault: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``IntimateRoutingError`` is the residual: its creek-written text stays.
+
+    It is a ``RuntimeError``, so it must be told apart *before* the provider
+    tuple claims it, and it is still logged once like every provider failure.
+    """
+    caplog.set_level(logging.WARNING, logger=_COMPILE_LOGGER)
+    _write_open_fragment(vault)
+    refusal = IntimateRoutingError("anthropic")
+
+    answer = _call_compile(vault, _failing_factory(refusal))
+
+    structured = _structured(answer)
+    assert structured["status"] == "refused"
+    assert structured["reason"] == str(refusal)
+    _assert_one_operator_record(caplog, _COMPILE_LOGGER, "IntimateRoutingError")
+    assert structured["reason"] != _compile_reason("COMPILE_PROVIDER_FAILED_REASON")
+
+
+def test_mcp_compile_echoes_a_caller_error_without_logging_it(
+    vault: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A not-found id keeps its creek-written text and leaves no operator record.
+
+    The text names only ids the caller sent; a malformed call is not an
+    operator signal, so it rides no log record either.
+    """
+    caplog.set_level(logging.DEBUG, logger=_COMPILE_LOGGER)
+
+    answer = _call_compile(vault, _raising_factory(RuntimeError(_MARKER)))
+
+    structured = _structured(answer)
+    assert structured["status"] == "refused"
+    assert structured["reason"] == "Fragment(s) not found in vault: frag-1"
+    assert [r for r in caplog.records if r.name == _COMPILE_LOGGER] == []
