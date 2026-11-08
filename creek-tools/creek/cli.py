@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -46,12 +47,17 @@ from creek.pipeline import (
 )
 from creek.save import SaveTarget
 from creek.surface_modes import LINK_METHODS, REPORT_TYPES
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
+    hold_content_mutation,
+)
 
 logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
     from creek.author.conductor import VoiceClientFactory
     from creek.author.models import AuthoredDraft
@@ -77,6 +83,16 @@ if TYPE_CHECKING:
     from creek.models import CompileTargetKind, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
+
+_CONTENT_BUSY_MESSAGE: Final[str] = (
+    f"{CONTENT_MUTATION_BUSY_REASON}: another Creek writer holds this vault; "
+    "retry once it finishes."
+)
+"""What ``creek ingest`` prints when the content-mutation lock is held (#2079).
+
+Built on the shared reason constant so the CLI and the remote surfaces name the
+condition in the same words; it carries no path and no holder identity.
+"""
 
 _INCLUDE_TIER_HELP = (
     "Privacy-tier override: open, personal, intimate, or all. "
@@ -499,6 +515,30 @@ def _print_advisory(message: str) -> None:
     console.print(f"[yellow]{escape(message)}[/yellow]", soft_wrap=True)
 
 
+@contextlib.contextmanager
+def _exit_1_when_content_busy() -> Iterator[None]:
+    """Turn a busy vault into one line and exit 1 for ``creek ingest`` (#2079).
+
+    Contention is an ordinary operational outcome — a ``creek classify`` pass
+    or a remote journal write holds the vault — so it is a message naming the
+    reason and a retry, never a traceback. Only
+    :class:`~creek.vault.mutations.ContentMutationBusyError` is translated;
+    a lock timeout raised *under* the hold propagates as itself.
+
+    Yields:
+        Nothing. The block runs the ingest.
+
+    Raises:
+        typer.Exit: With code ``1`` when the content-mutation lock stayed
+            held past the bounded wait; nothing was written.
+    """
+    try:
+        yield
+    except ContentMutationBusyError as exc:
+        console.print(f"[red]{_CONTENT_BUSY_MESSAGE}[/red]")
+        raise typer.Exit(code=1) from exc
+
+
 def _print_ingest_warning(message: str) -> None:
     """Show one ingest advisory to the operator, as it is detected (#1329).
 
@@ -553,24 +593,38 @@ def _run_ingest(
         to — which is what went wrong when the un-pinned-vault advisory was
         left to a return value nobody read (#1329).
 
+        The whole ``run_ingest`` call runs inside the vault content-mutation
+        lock (#2079), so classify and link never load a snapshot this ingest
+        is still writing. The vault is validated first: the lock's directory
+        is created on acquisition, and a mistyped ``--vault`` must not gain
+        one.
+
     Raises:
         typer.Exit: With code ``1`` when the vault cannot be opened.
+        ContentMutationBusyError: When another writer held the content lock
+            past the bounded wait. Not translated here, because the two callers
+            answer it differently: ``creek ingest`` exits 1, while
+            ``creek sync`` records it against the source and carries on so
+            ``last-run.json`` is still written.
     """
     from creek.ingest.images import OcrConfigError
     from creek.ingest.pipeline import run_ingest
+    from creek.vault.writer import require_vault_layout
 
     try:
-        result = run_ingest(
-            ingestor_cls=ingestor_cls,
-            source_type=source_type,
-            input_path=input_path,
-            vault_path=vault_path,
-            reclassify_threshold=reclassify_threshold,
-            since=since,
-            incremental=incremental,
-            ocr=ocr,
-            on_warning=_print_ingest_warning,
-        )
+        require_vault_layout(vault_path)
+        with hold_content_mutation(vault_path):
+            result = run_ingest(
+                ingestor_cls=ingestor_cls,
+                source_type=source_type,
+                input_path=input_path,
+                vault_path=vault_path,
+                reclassify_threshold=reclassify_threshold,
+                since=since,
+                incremental=incremental,
+                ocr=ocr,
+                on_warning=_print_ingest_warning,
+            )
     except FileNotFoundError as exc:
         console.print(f"[red]Vault unavailable: {exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -1242,15 +1296,26 @@ def _sync_ingest_source(
         return SourceRunRecord(
             failures=(f"skipped: source path not found ({input_path})",),
         )
-    written, errors, discovered = _run_ingest(
-        ingestor_cls=ingestor_cls,
-        source_type=ingest_type,
-        input_path=input_path,
-        vault_path=vault_path,
-        reclassify_threshold=config.classification.reclassify_on_edit_threshold,
-        incremental=True,
-        ocr=config.ocr,
-    )
+    try:
+        written, errors, discovered = _run_ingest(
+            ingestor_cls=ingestor_cls,
+            source_type=ingest_type,
+            input_path=input_path,
+            vault_path=vault_path,
+            reclassify_threshold=config.classification.reclassify_on_edit_threshold,
+            incremental=True,
+            ocr=config.ocr,
+        )
+    except ContentMutationBusyError:
+        # Recorded, never raised (#2079): an exit here would skip
+        # `_write_sync_state` exactly as the comment below describes. Nothing
+        # was ingested, and the next tick's incremental pass picks it up.
+        console.print(
+            f"[yellow][sync] skipping {source}: {CONTENT_MUTATION_BUSY_REASON}"
+            "[/yellow]",
+        )
+        logger.info("sync.tier_a.skip source=%s reason=content-busy", source)
+        return SourceRunRecord(failures=(f"skipped: {CONTENT_MUTATION_BUSY_REASON}",))
     recorded = _render_source_errors(source, errors)
     # There is no `creek sync --strict`, and there must not be one here by
     # accident: `strict=True` raises `typer.Exit(1)`, which propagates out of
@@ -2189,17 +2254,18 @@ def ingest(
 
     since_dt = _parse_since_arg(since) if since is not None else None
 
-    written, errors, discovered = _run_ingest(
-        ingestor_cls=ingestor_cls,
-        source_type=type,
-        input_path=input,
-        vault_path=vault_path,
-        reclassify_threshold=config.classification.reclassify_on_edit_threshold,
-        print_summary=True,
-        since=since_dt,
-        incremental=incremental,
-        ocr=config.ocr,
-    )
+    with _exit_1_when_content_busy():
+        written, errors, discovered = _run_ingest(
+            ingestor_cls=ingestor_cls,
+            source_type=type,
+            input_path=input,
+            vault_path=vault_path,
+            reclassify_threshold=config.classification.reclassify_on_edit_threshold,
+            print_summary=True,
+            since=since_dt,
+            incremental=incremental,
+            ocr=config.ocr,
+        )
 
     console.print(f"[bold green]Ingested {written} fragment(s).[/bold green]")
     if errors:

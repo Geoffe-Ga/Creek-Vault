@@ -2006,6 +2006,14 @@ def run_ingest(
     vault raises :class:`FileNotFoundError` (from :class:`VaultWriter`) for the
     caller to translate.
 
+    **Callers own the vault content-mutation lock; this function must never
+    take it** (#2079). Every surface that writes through here — ``creek
+    ingest`` / ``creek sync`` Tier A, ``creek.ingest``, the Drive sync's ingest
+    phase, ``creek.upload`` and ``creek.journal`` — holds
+    :func:`creek.vault.mutations.content_mutation_lock_path` across this call.
+    The lock is not reentrant, and upload and journal already call this while
+    holding it, so taking it here would deadlock them for the full timeout.
+
     Args:
         ingestor_cls: Concrete :class:`Ingestor` subclass to run.
         source_type: Registry key, used to prefix error messages and to select

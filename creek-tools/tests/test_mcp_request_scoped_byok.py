@@ -44,6 +44,7 @@ from creek_mcp.composition_jobs import SYNC_DEADLINE_ENV
 from creek_mcp.httpapi import mcp_request_key
 from creek_mcp.policy import Transport
 from creek_mcp.provenance import InferenceProvenance
+from creek_mcp.tools.draft import DRAFT_PROVIDER_UNAVAILABLE_REASON
 from tests.mcp_http_support import call_tool, open_session
 from tests.test_request_scoped_byok import (
     CANARY_KEY,
@@ -68,7 +69,7 @@ if TYPE_CHECKING:
 
 _DRAFTS: Final[tuple[str, str]] = ("07-Voice", "Drafts")
 _INVALID: Final[str] = ERROR_MESSAGES[ErrorCode.INVALID_REQUEST]
-_KEYLESS_REFUSAL: Final[str] = "LLM provider unavailable for draft"
+_KEYLESS_REFUSAL: Final[str] = DRAFT_PROVIDER_UNAVAILABLE_REASON
 _WAIT_SECONDS: Final[float] = 10.0
 _POLL_SECONDS: Final[float] = 0.02
 _INTIMATE_SOURCE: Final[str] = "intimate-1967"
@@ -412,7 +413,7 @@ def test_without_a_key_a_managed_draft_is_refused_and_no_vendor_is_dialled(
     result = _call(managed, "creek.draft", {})
 
     assert result["status"] == "refused"
-    assert result["reason"].startswith(_KEYLESS_REFUSAL)
+    assert result["reason"] == _KEYLESS_REFUSAL
     assert "inference_source" not in result
     assert vendor.requests == []
 
@@ -447,7 +448,7 @@ def test_a_self_connected_vault_parses_but_never_spends_a_key(
     result = _call(vault, "creek.draft", {}, _keyed())
 
     assert result["status"] == "refused"
-    assert result["reason"].startswith(_KEYLESS_REFUSAL)
+    assert result["reason"] == _KEYLESS_REFUSAL
     assert vendor.requests == []
 
 
@@ -479,7 +480,7 @@ def test_an_intimate_derived_draft_never_reaches_the_writers_vendor(
     )
 
     assert result["status"] == "refused"
-    assert result["reason"].startswith(_KEYLESS_REFUSAL)
+    assert result["reason"] == _KEYLESS_REFUSAL
     assert vendor.requests == []
     _assert_canary_absent(tmp_path, every_log, result)
 

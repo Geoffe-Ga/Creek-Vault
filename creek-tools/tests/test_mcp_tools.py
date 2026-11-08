@@ -13,7 +13,7 @@ from creek.models import PrivacyTier
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.author import author_tool
-from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.draft import DRAFT_PROVIDER_FAILED_REASON, draft_tool
 from creek_mcp.tools.lint import lint_tool
 from creek_mcp.tools.mine import mine_tool
 from creek_mcp.tools.state import state_render_tool
@@ -466,7 +466,7 @@ def test_draft_refuses_when_llm_returns_empty(
         phase="rising",
     )
     assert result["status"] == "refused"
-    assert "LLM" in result["reason"]
+    assert result["reason"] == DRAFT_PROVIDER_FAILED_REASON
 
 
 def test_draft_refuses_for_out_of_range_index(

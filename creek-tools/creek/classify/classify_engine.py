@@ -210,7 +210,7 @@ from enum import Enum
 from functools import partial
 from itertools import islice
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import frontmatter
 
@@ -322,6 +322,24 @@ class LLMProviderUnavailableError(RuntimeError):
         super().__init__(
             f"LLM provider {provider!r} is unavailable: {detail}",
         )
+
+
+LLM_PROVIDER_UNAVAILABLE_REASON: Final[str] = (
+    "LLM provider unavailable for classification"
+)
+"""What an MCP or ``/v1`` caller is told for :class:`LLMProviderUnavailableError`.
+
+The exception's own message is written for the CLI operator: it names the
+configured provider and the environment variable or config key to fix. That is
+remediation, not something a remote client may be handed (#2073), so
+``creek.classify`` answers this instead — as its refusal ``reason`` and as a
+rules fallback's ``fallback_reason`` — and keeps the detail on the traceback of
+its operator log record. The CLI still prints the full message. Deliberately
+unmapped by :func:`creek_mcp.httpapi.pipeline.pipeline_refusal_code`, so a
+``/v1`` job still fails closed to ``internal_error``. It lives beside the
+exception, as :data:`creek.link.embeddings.EMBEDDING_MODEL_UNAVAILABLE_REASON`
+lives beside its own, so no tool module has to import another (#1772).
+"""
 
 
 class ClassifyOutcome(Enum):

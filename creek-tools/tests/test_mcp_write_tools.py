@@ -18,6 +18,7 @@ import frontmatter
 import pytest
 
 from creek._fslock import VaultLockTimeoutError, vault_lock
+from creek.classify.classify_engine import LLM_PROVIDER_UNAVAILABLE_REASON
 from creek.classify.llm.router import ModelRouter
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
@@ -1064,7 +1065,7 @@ def test_classify_refuses_when_llm_provider_unavailable(vault: Path) -> None:
 
     assert result["status"] == "refused"
     assert result["tool"] == "creek.classify"
-    assert "unavailable" in result["reason"]
+    assert result["reason"] == LLM_PROVIDER_UNAVAILABLE_REASON
 
 
 def test_classify_reports_rule_skips_and_llm_failures_as_separate_fields(
