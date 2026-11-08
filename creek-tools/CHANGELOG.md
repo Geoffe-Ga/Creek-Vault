@@ -28,9 +28,12 @@ to locate the originating commit for any reference below.
   is unchanged (`failed`, `result: null`, `failure_code: null`). `paradox`
   and `synchronicity` are cache-only and never load the model.
 
-- `POST /v1/classifications` and `POST /v1/links` now answer vault
+- The synchronous methods of `POST /v1/classifications` (`rules`) and
+  `POST /v1/links` (`temporal`, `eddies`, `threads`) now answer vault
   content-lock contention with `503 temporarily_unavailable` instead of
-  `500 internal_error` (refs #2066). Both tools already refused a timed-out
+  `500 internal_error` (refs #2066). The durable `llm` and `embeddings` jobs
+  are unchanged: a job that meets contention after its `202` still reads
+  `failed` with a null `failure_code`. Both tools already refused a timed-out
   lock with the fixed `vault content mutation busy` reason, but
   `pipeline_refusal_code` fell through to `internal_error`. It now matches
   that constant by exact equality — the same disposition and envelope

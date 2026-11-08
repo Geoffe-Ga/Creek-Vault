@@ -1022,6 +1022,8 @@ def test_pipeline_is_a_published_capability_at_the_current_minor() -> None:
             f"provider said {EMBEDDING_MODEL_UNAVAILABLE_REASON} at /x",
             ErrorCode.INTERNAL_ERROR,
         ),
+        (f"x {EMBEDDING_MODEL_UNAVAILABLE_REASON}", ErrorCode.INTERNAL_ERROR),
+        (f"{EMBEDDING_MODEL_UNAVAILABLE_REASON} at /x", ErrorCode.INTERNAL_ERROR),
     ],
     ids=[
         "unknown-method",
@@ -1032,6 +1034,8 @@ def test_pipeline_is_a_published_capability_at_the_current_minor() -> None:
         "contains-busy-text",
         "busy-prefixed-text",
         "contains-embedding-text",
+        "embedding-suffixed-text",
+        "embedding-prefixed-text",
     ],
 )
 def test_pipeline_refusal_code_is_total_and_fails_closed(
@@ -1047,12 +1051,58 @@ def test_pipeline_refusal_code_is_total_and_fails_closed(
     code, so the text itself never reaches a body.
 
     The two fixed reasons are matched by **exact equality** (#2065, #2066):
-    the ``contains-*`` and ``busy-prefixed-text`` cases pin that a reason
-    merely *containing* either fixed text — which an ``in``, ``endswith`` or
-    ``startswith`` match would accept — still fails closed, so provider text
-    that happened to quote one is never promoted to a published refusal.
+    the ``contains-*``, ``*-suffixed-text`` and ``*-prefixed-text`` cases pin
+    that a reason merely *containing* either fixed text — which an ``in``,
+    ``endswith`` or ``startswith`` match would accept — still fails closed, so
+    provider text that happened to quote one is never promoted to a published
+    refusal.
     """
     assert pipeline_refusal_code(reason) is expected
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        (CLASSIFICATIONS_PATH, {"method": "rules"}, "classify_tool"),
+        (LINKS_PATH, {"method": "temporal"}, "link_tool"),
+    ],
+    ids=["classifications-rules", "links-temporal"],
+)
+def test_the_adapter_refusal_log_never_carries_the_tool_reason(
+    api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    route: tuple[str, dict[str, str], str],
+) -> None:
+    """The adapter's refusal record names the code and request id, never the reason.
+
+    An unclassified tool refusal can carry arbitrary provider text (an
+    unreachable LLM host, an echoed error). ``_rendered`` logs one warning per
+    refusal; this pins that the reason text never rides along, so a later edit
+    that interpolates it fails here rather than shipping provider text into
+    the operator log on every request.
+    """
+    path, body, tool_attr = route
+    provider_text = f"provider said {_LEAK_MARKER} at http://127.0.0.1:11434"
+    monkeypatch.setattr(
+        pipeline_module,
+        tool_attr,
+        lambda **_kwargs: {"status": "refused", "reason": provider_text},
+    )
+    caplog.set_level(logging.WARNING, logger=_PIPELINE_LOGGER)
+
+    response = api.post(path, json=body, headers=headers())
+
+    assert response.status_code == HTTP_SERVER_FAULT
+    assert response.json()["code"] == ErrorCode.INTERNAL_ERROR.value
+    records = [record for record in caplog.records if record.name == _PIPELINE_LOGGER]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert ErrorCode.INTERNAL_ERROR.value in message
+    assert response.json()["request_id"] in message
+    assert _LEAK_MARKER not in message
+    assert _LEAK_MARKER not in str(records[0].args)
+    assert records[0].exc_info is None
 
 
 @pytest.mark.parametrize(
