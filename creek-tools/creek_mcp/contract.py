@@ -20,8 +20,23 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.28.0"
+CONTRACT_VERSION: Final[str] = "0.29.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.29.0 (#2075, follow-up to #2066): ``GET /v1/jobs/{job_id}``'s closed
+``failure_code`` vocabulary gains ``busy``. A durable ``llm`` classification
+or ``embeddings`` link job whose pass timed out on the vault content-mutation
+lock used to end ``failed`` with ``failure_code: null`` — indistinguishable
+from an operator fault — although the synchronous routes answer the same
+condition ``503 temporarily_unavailable`` since #2066. It now ends ``failed``
+with ``busy``: transient, resubmit the same request. The code is matched by
+exact equality on the tools' fixed busy reason, and the job's private
+``failure_reason`` is unchanged. A caller declaring 0.26 through 0.28 vendored
+a closed vocabulary without ``busy`` and is served the ``null`` it always
+received; below 0.26 the key stays absent; ``request_key_rejected`` is served
+from 0.26 on as before. Every published code carries its own since-minor in
+:data:`~creek_mcp.api.models.JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE`. No MCP
+tool's shape moves. ``0.28`` stays served.
 
 0.28.0 (ADR-0015): a writer's request-scoped key refused by its vendor
 (``401``/``403``) on ``POST /v1/reflections`` or

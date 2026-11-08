@@ -36,6 +36,7 @@ from creek_mcp.api.models import (
     SUPPORTED_CONTRACT_MINORS,
     ErrorCode,
     RetryDisposition,
+    minor_at_least,
 )
 from creek_mcp.httpapi.errors import RETRY_AFTER_HEADER
 from creek_mcp.httpapi.reflect import REFUSAL_LOGGER_NAME
@@ -125,7 +126,7 @@ def test_the_code_is_published_as_a_terminal_424_with_a_constant_message() -> No
 
 def test_the_prior_minor_stays_in_the_served_window() -> None:
     """0.27 callers are served, not refused ``incompatible_version``."""
-    assert CONTRACT_MINOR == "0.28"
+    assert minor_at_least(CONTRACT_MINOR, "0.28")
     assert PRIOR_MINOR in SUPPORTED_CONTRACT_MINORS
 
 
