@@ -265,3 +265,37 @@ def test_the_cause_is_closed_vocabulary(reason: str, cause: str) -> None:
         cause: What the log may say about it.
     """
     assert refusal_cause(reason) == cause
+
+
+_SERVICE_UNAVAILABLE: Final[int] = 503
+
+
+def test_a_syntax_invalid_vault_config_is_a_logged_503_without_its_path(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A vault config YAML cannot parse refuses ``503``, never a ``500`` (#2091).
+
+    The production path, with no injected factory: building the reflection
+    factory reads the vault's own config, and a YAML syntax error raises
+    ``yaml.YAMLError`` — not a ``ValueError`` — which escaped the build's catch
+    and reached the boundary as ``500 internal_error``. Its message names the
+    file's path, so nothing it says may reach the response or any log record.
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    config = vault / "00-Creek-Meta" / "creek_config.yaml"
+    config.write_text("model_router: [unclosed\n  : : x\n", encoding="utf-8")
+    caplog.set_level(logging.DEBUG)
+
+    app = build_app(vault_path=vault)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            REFLECTIONS_PATH, json={"content": _ENTRY}, headers=headers(ceiling="open")
+        )
+
+    assert response.status_code == _SERVICE_UNAVAILABLE
+    assert response.json()["code"] == "temporarily_unavailable"
+    [record] = _refusal_lines(caplog)
+    assert "cause=reflection unavailable: ParserError" in record.getMessage()
+    for leaked in (str(config), "flow sequence"):
+        assert leaked not in caplog.text, leaked
+        assert leaked not in response.text, leaked
