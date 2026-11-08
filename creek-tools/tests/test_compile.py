@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,7 @@ from creek.compile.engine import (
     PARADOX_LOG_RELPATH,
     CompileLLM,
     CompileResult,
+    _load_fragments_for_compile,
     compile_fragments,
     compile_to_vault,
     default_llm,
@@ -2220,6 +2222,39 @@ def test_compile_to_vault_walks_the_vault_exactly_once(
     )
 
     assert calls == [vault / "01-Fragments"]
+
+
+def test_load_fragments_for_compile_keeps_requested_order_and_duplicates(
+    vault: Path,
+) -> None:
+    """The loader's id filter is a characterisation, pinned across #930.
+
+    #930 swapped the loader's list membership for a set. A set has no order
+    and no multiplicity, so this pins the three behaviours a careless swap
+    would quietly change: the result follows the *requested* order and keeps
+    a repeated id once per request; a fragment id claimed by two files
+    resolves to the later file in walk order (last-wins, as the ``by_id``
+    mapping always has); and the not-found message lists every missing id in
+    requested order, repeats included, byte for byte.
+    """
+    _write_fragment_to_vault(vault, _make_fragment(frag_id="a", title="A"), "a")
+    _write_fragment_to_vault(vault, _make_fragment(frag_id="b", title="B"), "b")
+    shadow = _make_fragment(frag_id="b", title="B, written later")
+    post = frontmatter.Post(content="b2", **shadow.model_dump(mode="json"))
+    (vault / "01-Fragments" / "Notes" / "zz-shadow-b.md").write_text(
+        frontmatter.dumps(post),
+        encoding="utf-8",
+    )
+
+    triples, _ancestors = _load_fragments_for_compile(vault, ["b", "a", "b"])
+
+    assert [fragment.id for fragment, _body, _raw in triples] == ["b", "a", "b"]
+    assert [body for _fragment, body, _raw in triples] == ["b2", "a", "b2"]
+    with pytest.raises(
+        ValueError,
+        match=re.escape("Fragment(s) not found in vault: x, y, x"),
+    ):
+        _load_fragments_for_compile(vault, ["x", "a", "y", "x"])
 
 
 def test_compile_to_vault_propagates_the_intimate_routing_refusal(
