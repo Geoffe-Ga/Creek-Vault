@@ -214,7 +214,6 @@ from typing import TYPE_CHECKING, Final
 
 import frontmatter
 
-from creek._fslock import vault_lock
 from creek.classify.audience import AudienceClassifier
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
@@ -254,7 +253,7 @@ from creek.classify.weighted import classify_weighted
 from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
 from creek.time import now_la
-from creek.vault.mutations import content_mutation_lock_path
+from creek.vault.mutations import hold_content_mutation
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, try_load_fragment
 from creek.vault.writer import VaultWriter
 
@@ -713,12 +712,15 @@ def run_classify(
         A :class:`ClassifySummary` reporting per-method counts.
 
     Raises:
-        creek._fslock.VaultLockTimeoutError: When another content mutation
-            holds the shared boundary past its bounded wait.
+        creek.vault.mutations.ContentMutationBusyError: When another content
+            mutation held the shared boundary past its bounded wait, so the
+            pass never started (#2087). A
+            :class:`~creek._fslock.VaultLockTimeoutError` raised *under* the
+            hold — by a lock taken while working — propagates as itself.
         LLMProviderUnavailableError: When the requested provider is
             unavailable.
     """
-    with vault_lock(content_mutation_lock_path(vault_path)):
+    with hold_content_mutation(vault_path):
         return _run_classify_with_content_lock_held(
             vault_path=vault_path,
             config=config,
