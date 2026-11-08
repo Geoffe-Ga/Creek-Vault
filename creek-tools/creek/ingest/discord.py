@@ -817,40 +817,60 @@ def write_fragments(result: IngestResult, vault: Path) -> list[Path]:
     count diff the returned paths against a pre-run snapshot (see
     :func:`run_discord_data_package`).
 
+    **Holds the vault content-mutation lock across the writes (#2086).** Every
+    Discord path writes ``01-Fragments`` here, so this is the one place the
+    boundary can be taken without any of the three callers forgetting it —
+    a deliberate exception to the "lock at the surface" rule in
+    :mod:`creek.vault.mutations`, safe because no caller holds the lock.
+    **Callers must not hold it**: it is not reentrant, so a caller that did
+    would wait out the bound and fail. Parsing and staging stay outside the
+    hold, and so does the exporter's network export.
+
     Args:
         result: The ingestor's result carrying the parsed fragments.
         vault: The Creek vault to write into.
 
     Returns:
         The vault path written for each fragment, in order.
+
+    Raises:
+        ContentMutationBusyError: When another writer held the content lock
+            past the bounded wait; nothing was written. Raised as itself, not
+            as ``typer.Exit``, because :func:`ingest_capture_dir` also runs
+            behind the bot with no Typer context.
     """
     from creek.ingest.base import assemble_ingested_fragment
+    from creek.vault.mutations import hold_content_mutation
     from creek.vault.writer import VaultWriter
 
+    # Constructed before the hold so a vault without its folders is refused
+    # before the lock scaffolds ``00-Creek-Meta/locks/`` into it.
     writer = VaultWriter(vault_path=vault)
     paths: list[Path] = []
-    for parsed in result.fragments:
-        assembled = assemble_ingested_fragment(parsed)
-        # No `record_source_provenance` call here, deliberately (#1575). This
-        # is the third caller of `assemble_ingested_fragment` and it does skip
-        # `run_ingest`, but `DiscordIngestor.parse` writes no
-        # `source.original_file` at all, so there is no host path to redact —
-        # and stamping one in would hand every fragment from a channel the
-        # same non-null source key, which is a grouping signal
-        # `creek/generate/voice_authenticity.py::_conversation_key` reads.
-        # `tests/test_ingest_source_path_privacy.py` pins both halves of that
-        # reasoning, so this exemption fails loudly if Discord ever starts
-        # recording a source path.
-        # Forwarded even though this ingestor emits no passthrough keys today
-        # (#1392): every assemble->write chain carries the same contract, so
-        # Discord capture cannot silently diverge from `creek ingest`.
-        paths.append(
-            writer.write_fragment(
-                assembled.fragment,
-                body=assembled.body,
-                extra_frontmatter=assembled.extra_frontmatter,
+    with hold_content_mutation(vault):
+        for parsed in result.fragments:
+            assembled = assemble_ingested_fragment(parsed)
+            # No `record_source_provenance` call here, deliberately (#1575).
+            # This is the third caller of `assemble_ingested_fragment` and it
+            # does skip `run_ingest`, but `DiscordIngestor.parse` writes no
+            # `source.original_file` at all, so there is no host path to
+            # redact — and stamping one in would hand every fragment from a
+            # channel the same non-null source key, which is a grouping signal
+            # `creek/generate/voice_authenticity.py::_conversation_key` reads.
+            # `tests/test_ingest_source_path_privacy.py` pins both halves of
+            # that reasoning, so this exemption fails loudly if Discord ever
+            # starts recording a source path.
+            # Forwarded even though this ingestor emits no passthrough keys
+            # today (#1392): every assemble->write chain carries the same
+            # contract, so Discord capture cannot silently diverge from
+            # `creek ingest`.
+            paths.append(
+                writer.write_fragment(
+                    assembled.fragment,
+                    body=assembled.body,
+                    extra_frontmatter=assembled.extra_frontmatter,
+                )
             )
-        )
     return paths
 
 
@@ -914,6 +934,12 @@ def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
 
     Returns:
         The number of fragments written this run.
+
+    Raises:
+        ContentMutationBusyError: When another writer held the vault
+            content-mutation lock past the bounded wait (#2086). Propagated
+            for the bot to retry on its next pass, never turned into
+            ``typer.Exit``: this runs with no Typer context.
     """
     # Stable, deterministic staging path (not a random tempdir) so the
     # source-path-derived fragment id stays constant across runs. A kill between
@@ -952,6 +978,14 @@ def run_discord_data_package(vault: Path, package: Path) -> int:
     Returns:
         The number of **newly created** fragments this run (overwrites of
         already-present fragments are not counted).
+
+    Raises:
+        ContentMutationBusyError: When another writer held the vault
+            content-mutation lock past the bounded wait (#2086); nothing was
+            written. The ``before`` snapshot is taken outside that hold, so
+            the advisory "new" count can drift if another writer lands a
+            fragment between the snapshot and the writes; the vault itself
+            cannot.
     """
     fragments_root = vault / "01-Fragments"
     before = set(fragments_root.rglob("*.md")) if fragments_root.is_dir() else set()

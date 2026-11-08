@@ -107,8 +107,10 @@ META_PURGE_KEEP: Final[tuple[MetaKeep, ...]] = (
     ),
     MetaKeep(
         PurePosixPath("locks/content-mutations.lock"),
-        "Empty cross-process coordination file shared by journal upsert and "
-        "withdrawal plus classify, link, compile, and manual-review writes. "
+        "Empty cross-process coordination file shared by every 01-Fragments "
+        "writer: journal upsert and withdrawal, ingest and its vault "
+        "migrations, process, Discord ingest, purge itself, and classify, "
+        "link, compile, and manual-review writes. "
         "Deleting a held advisory-lock path lets a second process create and "
         "lock a different inode, silently splitting the load-to-write "
         "critical section. It contains no vault-derived content.",

@@ -9,6 +9,37 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **The remaining `01-Fragments` writers take the vault content-mutation lock
+  (#2086, follow-up to #2079 and #2087).** `creek purge` (`fragment`, `source`
+  incl. `--source-path`, `classifications`, `daterange`, `vault`) and the five
+  `creek.purge.*` MCP tools now hold the lock around their engine call — after
+  the confirmation prompt, count preview and `purge vault` path phrase, never
+  across them, and for `--dry-run` too. `creek ingest --pin-source-ids` (with
+  or without `--dry-run`), `--refresh-dates` and `--refresh-ai-chat` hold it
+  around the migration, after the vault-exists check. `creek process` holds it
+  across stages 2-4 and releases it before stage 5, whose `run_link` takes it
+  itself. `creek.ingest.discord.write_fragments` holds it around its writes,
+  covering bot capture, the Data Package helper and the exporter (the exporter
+  path was missing from the issue). Before, any of these could write while a
+  `creek classify` or `creek link` pass sat between its load and its write, so
+  the pass could resurrect a purged fragment or overwrite a migration.
+  **Operator-visible:** under contention each CLI path prints the one-line
+  `vault content mutation busy` message and exits 1 having written nothing (a
+  busy exporter run leaves its cursor where it was); `ingest_capture_dir`
+  raises `ContentMutationBusyError` to the bot; the MCP purge tools answer the
+  audited `vault content mutation busy` refusal instead of running. A lock
+  timeout raised under any of these holds still propagates (or, on the MCP
+  purge tools, still reads `purge engine failed: …`). `PurgeEngine`,
+  `pin_ids`, `refresh` and `VaultWriter` stay lock-free, so the `/v1` journal
+  withdraw, which already holds the lock when it calls `PurgeEngine`, does
+  not nest it. Every `creek purge` command now validates `--vault` (it must
+  hold `00-Creek-Meta/` and `01-Fragments/`, and for `purge vault` its
+  `creek_config.yaml` marker) before taking the lock: a
+  mistyped or non-vault path exits 1 with `does not appear to be a Creek
+  vault` and gains neither `00-Creek-Meta/locks/` nor
+  `00-Creek-Meta/audit/purge.jsonl` (re #2098, whose first item this fixes:
+  `purge fragment` and friends used to scaffold that audit log and exit 0).
+
 - **`creek sync` keeps its last-run record when classify or link meets
   content-lock contention (#2087, follow-up to #2079).** `run_classify`,
   `run_link` and `compile_to_vault` now take the vault content-mutation lock

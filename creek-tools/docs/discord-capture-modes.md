@@ -48,6 +48,31 @@ enable. Use it read-only, for your own DMs, at a low request rate.
 creek discord --mode exporter
 ```
 
+## Concurrent writers
+
+All three modes write their fragments through one function,
+`creek.ingest.discord.write_fragments`, and it holds the vault content-mutation
+lock (`00-Creek-Meta/locks/content-mutations.lock`) around those writes — the
+lock `creek ingest`, `creek classify` and `creek link` take — so a classify or
+link pass never loads a `01-Fragments` snapshot a Discord ingest is still
+writing ([#2086](https://github.com/Geoffe-Ga/Creek-Vault/issues/2086)).
+Parsing, staging and the exporter's own network export all happen before the
+lock is taken.
+
+If another writer holds the lock for more than 10 seconds:
+
+- `creek discord --mode data_package` and `--mode exporter` print
+  `vault content mutation busy: another Creek writer holds this vault; retry
+  once it finishes.`, exit **1**, and write nothing. A busy exporter run does
+  **not** advance its `--after` cursor, so the next run re-exports the same
+  window instead of skipping it.
+- `bot_capture`'s `ingest_capture_dir` raises `ContentMutationBusyError` to its
+  caller (it runs with no CLI around it) and writes nothing; the capture files
+  are untouched, so the next pass ingests them.
+
+`write_fragments` takes the lock itself, so nothing that calls it may already
+hold it: the lock is not reentrant.
+
 ## Secrets — non-negotiable
 
 For both token-bearing modes, the Discord token (user **or** bot) lives in the

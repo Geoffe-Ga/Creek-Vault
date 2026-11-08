@@ -299,6 +299,25 @@ still writing ([#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079)).
   over `/v1`) until it finishes.
 - The vault is validated before the lock is taken: a mistyped `--vault` still
   exits `Vault unavailable` and gains no `00-Creek-Meta/locks/` directory.
+- The vault migrations take the lock too
+  ([#2086](https://github.com/Geoffe-Ga/Creek-Vault/issues/2086)):
+  `creek ingest --pin-source-ids` (its `--dry-run` included, because a plan
+  read mid-ingest is wrong), `--refresh-dates` and `--refresh-ai-chat` each
+  hold it around the migration, after the `Vault path does not exist` check,
+  and print the same busy line and exit **1** under contention, having
+  migrated nothing.
+- `creek process` holds the lock across stages 2-4 — ingest, classify and the
+  vault write — and releases it before stage 5, because `run_link` takes the
+  same lock itself and it is not reentrant. Contention at stages 2-4 is the
+  busy line and exit **1** with nothing written; contention at stage 5 comes
+  after stages 2-4 wrote, and a rerun converges.
+- Discord ingest (all three modes) holds the lock around its fragment writes;
+  see [Discord capture modes](discord-capture-modes.md#concurrent-writers).
+  `creek purge` and the `creek.purge.*` tools hold it around the purge itself;
+  see [Cleaning and purge](cleaning-and-purge.md#concurrent-writers).
+- With that, every Creek command and tool that writes `01-Fragments` holds the
+  lock while it writes. Hand edits in a text editor are the one writer it
+  cannot coordinate.
 
 ## Idempotency
 

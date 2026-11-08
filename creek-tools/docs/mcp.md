@@ -642,6 +642,22 @@ over `/v1` are unchanged. Keeping the bare-timeout arm is deliberate: a lock
 timeout raised *under* an engine's hold still reads busy on these three tools,
 as it always has, rather than escaping as a FastMCP error.
 
+The five `creek.purge.*` tools joined in
+[#2086](https://github.com/Geoffe-Ga/Creek-Vault/issues/2086): each runs its
+`PurgeEngine` call — and only that call — inside `hold_content_mutation`, so a
+purge cannot delete a fragment between a `creek.classify` pass's load and its
+write. Losing the acquisition race is the fixed
+`vault content mutation busy` refusal and, unlike `creek.upload`'s, it **is
+audited**: these tools promise an audit row for every call. Only the
+acquisition timeout reads busy here — a `VaultLockTimeoutError` raised under
+the hold keeps its `purge engine failed: …` reason, because by then the purge
+may already have deleted files. `PurgeEngine` itself stays lock-free, since
+the `/v1` journal withdraw calls it while already holding the lock. The same
+release also put the CLI-only `01-Fragments` writers inside the boundary —
+`creek purge`, `creek process` stages 2-4, the `creek ingest` vault
+migrations and every Discord ingest path; see
+[Concurrent writers](ingestion.md#concurrent-writers).
+
 ### Read-side posture (#932)
 
 Every registered tool's relationship to the caller's ceiling is now a
@@ -2054,9 +2070,9 @@ not produce new files, so they omit `created_path` and `created_tier`
 from their audit entry.
 
 Journal upsert/withdrawal, document upload (#2069), classification (and the
-per-entry classification read, #2068), linking, compilation, and the
-write step of manual review share one cross-process vault-content mutation
-boundary. This closes stale load-to-write races: a pipeline pass cannot load a
+per-entry classification read, #2068), linking, compilation, ingest (#2079),
+purge (#2086), and the write step of manual review share one cross-process
+vault-content mutation boundary. This closes stale load-to-write races: a pipeline pass cannot load a
 journal fragment, let withdrawal report success, and then recreate the removed
 fragment or a derived page. A pass that cannot take the boundary within the
 bounded lock wait returns the ordinary structured refusal and is safe to retry.

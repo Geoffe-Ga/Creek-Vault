@@ -61,6 +61,7 @@ from creek.ingest.routing import SKIPPED_DIRECTORY_NAMES, Arbitration, arbitrate
 from creek.link.link_engine import LinkSummary, run_link
 from creek.models import Fragment, Frequency
 from creek.redact.scanner import RedactionScanner
+from creek.vault.mutations import hold_content_mutation
 from creek.vault.writer import VaultWriter
 
 logger = logging.getLogger(__name__)
@@ -485,7 +486,9 @@ class Pipeline:
             2. Ingestion (discover ingestors for source type)
             3. Classification (rule -> LLM -> review queue)
             4. Vault write (persist classified fragments + bodies)
-            5. Linking (eddies then threads, each persisted to the vault)
+               -- stages 2-4 hold the vault content-mutation lock (#2086)
+            5. Linking (eddies then threads, each persisted to the vault;
+               ``run_link`` takes the same lock itself, after it is released)
             6. Index generation
 
         Args:
@@ -494,6 +497,11 @@ class Pipeline:
 
         Returns:
             A :class:`PipelineResult` with aggregate counts.
+
+        Raises:
+            ContentMutationBusyError: When the content-mutation lock stayed
+                held elsewhere past the bounded wait, at stages 2-4 (nothing
+                written) or at stage 5 (stages 2-4 already wrote).
         """
         result = PipelineResult()
 
@@ -514,16 +522,8 @@ class Pipeline:
             result.indexes_generated = index_count
             return result
 
-        # Stage 2: Ingestion
-        ingested = self._run_ingestion(source_path, result, vault_path)
-        result.fragments_created = len(ingested)
-
-        # Stage 3: Classification
-        classified = self._run_classification(ingested, vault_path, result)
-        result.classifications_made = len(classified)
-
-        # Stage 4: Vault write -- persist classified fragments+bodies.
-        self._write_to_vault(classified, vault_path, result)
+        # Stages 2-4 under the content-mutation lock; released before stage 5.
+        classified = self._ingest_classify_write(source_path, vault_path, result)
 
         # Stage 5: Linking
         fragments_only = [item.fragment for item in classified]
@@ -546,6 +546,55 @@ class Pipeline:
 
         logger.info("Pipeline complete: %s", result)
         return result
+
+    def _ingest_classify_write(
+        self,
+        source_path: Path,
+        vault_path: Path,
+        result: PipelineResult,
+    ) -> list[IngestedFragment]:
+        """Run stages 2-4 inside the vault content-mutation lock (#2086).
+
+        Stage 4 writes ``01-Fragments``, the snapshot ``creek classify`` and
+        ``creek link`` load and rewrite under
+        :func:`~creek.vault.mutations.content_mutation_lock_path`, so the
+        write must sit inside that boundary. Stages 2 and 3 sit inside it too,
+        as the load half of the same load-to-write window the module
+        docstring of :mod:`creek.vault.mutations` describes: they build
+        exactly what stage 4 writes, and stage 3 also writes the review queue
+        for those fragments into the vault.
+
+        The hold ends here, before stage 5. :func:`run_link` takes the same
+        lock itself and the lock is not reentrant, so a hold that spanned
+        stage 5 would make every run wait out the bound and fail. None of
+        stages 2-4 takes the lock: stage 3 classifies in-process and never
+        calls :func:`~creek.classify.classify_engine.run_classify`.
+
+        Args:
+            source_path: Directory containing source files to process.
+            vault_path: Obsidian vault root to write results into.
+            result: Pipeline result; mutated with the stage counts and errors.
+
+        Returns:
+            The classified fragment+body bundles stage 4 persisted.
+
+        Raises:
+            ContentMutationBusyError: When another writer held the lock past
+                the bounded wait; stages 2-4 did not run and nothing was
+                written.
+        """
+        with hold_content_mutation(vault_path):
+            # Stage 2: Ingestion
+            ingested = self._run_ingestion(source_path, result, vault_path)
+            result.fragments_created = len(ingested)
+
+            # Stage 3: Classification
+            classified = self._run_classification(ingested, vault_path, result)
+            result.classifications_made = len(classified)
+
+            # Stage 4: Vault write -- persist classified fragments+bodies.
+            self._write_to_vault(classified, vault_path, result)
+        return classified
 
     def _emit_yield_summary(
         self,
