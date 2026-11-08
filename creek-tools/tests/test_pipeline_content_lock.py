@@ -75,18 +75,40 @@ def _invoke_process(source: Path, vault: Path) -> Result:
     )
 
 
-def _probe_vault_write(
+_STAGES: dict[str, str] = {
+    "ingest": "_run_ingestion",
+    "classify": "_run_classification",
+    "write": "_write_to_vault",
+}
+"""Stages 2-4: the label each probe records, and the method it wraps."""
+
+
+def _probe_stage(
+    monkeypatch: pytest.MonkeyPatch, vault: Path, held: list[str], stage: str
+) -> None:
+    """Record ``<stage> held``/``<stage> free`` each time that stage runs.
+
+    The real stage method still runs after the probe, so stage 3 still writes
+    its review queue and stage 4 its fragments.
+    """
+    method = _STAGES[stage]
+    real = getattr(pipeline_mod.Pipeline, method)
+
+    def _probed(self: pipeline_mod.Pipeline, *args: Any, **kwargs: Any) -> Any:
+        """Probe the content lock, then run the real stage."""
+        state = "held" if _content_lock_is_held(vault) else "free"
+        held.append(f"{stage} {state}")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod.Pipeline, method, _probed)
+
+
+def _probe_stages_2_to_4(
     monkeypatch: pytest.MonkeyPatch, vault: Path, held: list[str]
 ) -> None:
-    """Record ``write held``/``write free`` each time stage 4 runs."""
-    real = pipeline_mod.Pipeline._write_to_vault
-
-    def _probed(self: pipeline_mod.Pipeline, *args: Any, **kwargs: Any) -> None:
-        """Probe the content lock, then run the real vault write."""
-        held.append("write held" if _content_lock_is_held(vault) else "write free")
-        real(self, *args, **kwargs)
-
-    monkeypatch.setattr(pipeline_mod.Pipeline, "_write_to_vault", _probed)
+    """Probe ingestion, classification and the vault write alike."""
+    for stage in _STAGES:
+        _probe_stage(monkeypatch, vault, held, stage)
 
 
 def _probe_link_stage(
@@ -116,14 +138,16 @@ def test_stages_2_to_4_write_inside_the_lock_and_stage_5_links_outside_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stage 4 writes under the hold; stage 5 is entered with it released.
+    """Stages 2-4 run under the hold; stage 5 is entered with it released.
 
-    The run also finishes well inside one lock bound: a nested stage 5 would
-    either fail on the non-reentrant lock or wait the whole bound out.
+    Stage 3 is a vault writer too (its review queue), and stage 2 builds what
+    stage 4 writes, so both sit inside the same hold as the write. The run
+    also finishes well inside one lock bound: a nested stage 5 would either
+    fail on the non-reentrant lock or wait the whole bound out.
     """
     source, vault = _seed(tmp_path)
     held: list[str] = []
-    _probe_vault_write(monkeypatch, vault, held)
+    _probe_stages_2_to_4(monkeypatch, vault, held)
     _probe_link_stage(monkeypatch, vault, held)
     started = time.monotonic()
 
@@ -131,7 +155,13 @@ def test_stages_2_to_4_write_inside_the_lock_and_stage_5_links_outside_it(
 
     elapsed = time.monotonic() - started
     assert result.exit_code == 0, result.output
-    assert held == ["write held", "link free", "link free"]
+    assert held == [
+        "ingest held",
+        "classify held",
+        "write held",
+        "link free",
+        "link free",
+    ]
     assert elapsed < DEFAULT_LOCK_TIMEOUT_SECONDS
     assert _content_lock_is_held(vault) is False
     assert len(_fragment_digests(vault)) == 1
@@ -141,10 +171,14 @@ def test_a_busy_vault_stops_creek_process_before_it_writes_a_fragment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Contention at the stage 2-4 hold is the busy line and nothing written."""
+    """Contention at the stage 2-4 hold is the busy line and nothing written.
+
+    None of stages 2-4 may run first: on contention the run must not ingest,
+    classify or write its review queue and only then report busy.
+    """
     source, vault = _seed(tmp_path)
     held: list[str] = []
-    _probe_vault_write(monkeypatch, vault, held)
+    _probe_stages_2_to_4(monkeypatch, vault, held)
     _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
 
     with _content_lock_held_elsewhere(vault):
