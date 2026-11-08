@@ -288,7 +288,10 @@ def _survey_sources(
       :data:`creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` without
       admission ever being evaluated, and that refusal is not audited. It is
       content-free and independent of every tier, so it is no oracle — but a
-      ceiling probe sent while the vault is busy leaves no audit row.
+      ceiling probe sent while the vault is busy leaves no audit row. That gap
+      is accepted (#2071): unaudited busy is the convention ``creek.classify``,
+      ``creek.link`` and ``creek.upload`` already follow, and a busy probe
+      learns nothing because admission never ran.
     - **A refused probe now holds the content lock for one walk**, and so
       creates the zero-byte ``00-Creek-Meta/locks/content-mutations.lock``
       if it did not already exist. The file carries no vault-derived bytes.

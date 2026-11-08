@@ -9,6 +9,25 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`creek.compile` and the `creek.purge.*` MCP tools refuse with fixed text
+  (#2074, #2084; #2071 decided).** `creek.compile` used to answer any engine
+  `ValueError`/`RuntimeError` with its message, so a vendor 4xx text reached
+  the client, and caught no `httpx` error, so an Ollama failure (and an engine
+  `OSError` naming a vault path) escaped as FastMCP `isError` text. It now
+  answers `LLM provider call failed for compile` for any provider failure
+  (`PROVIDER_CALL_FAILURES`, `httpx` included) and `compile failed` for any
+  other engine failure; only the engine's new `CompileRequestError` (a
+  `ValueError`: unknown target kind, unresolved ids, target escape, malformed
+  LLM payload) and the router's `IntimateRoutingError` keep their creek-written
+  text. Each non-echoed failure is logged once on `creek_mcp.tools.compile`
+  with the type name and the traceback. The purge tools' engine-failure
+  refusal is now the fixed `purge engine failed` (it was `purge engine failed:
+  <exception text>`), logged once on `creek_mcp.tools.purge`; the audit row,
+  the audited busy refusal and the under-hold timeout's engine-failure reading
+  are unchanged. `creek compile` on the CLI is unaffected. #2071 is decided as
+  accepted: a busy `creek.compile` stays unaudited, like `creek.classify`,
+  `creek.link` and `creek.upload`, and the docs now say so.
+
 - **The remaining `01-Fragments` writers take the vault content-mutation lock
   (#2086, follow-up to #2079 and #2087).** `creek purge` (`fragment`, `source`
   incl. `--source-path`, `classifications`, `daterange`, `vault`) and the five
@@ -29,7 +48,7 @@ to locate the originating commit for any reference below.
   raises `ContentMutationBusyError` to the bot; the MCP purge tools answer the
   audited `vault content mutation busy` refusal instead of running. A lock
   timeout raised under any of these holds still propagates (or, on the MCP
-  purge tools, still reads `purge engine failed: …`). `PurgeEngine`,
+  purge tools, still reads `purge engine failed`, fixed text since #2084). `PurgeEngine`,
   `pin_ids`, `refresh` and `VaultWriter` stay lock-free, so the `/v1` journal
   withdraw, which already holds the lock when it calls `PurgeEngine`, does
   not nest it. Every `creek purge` command now validates `--vault` (it must
