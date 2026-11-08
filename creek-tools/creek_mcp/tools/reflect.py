@@ -887,9 +887,9 @@ def _admit_entry(
             # infeasible.
             #
             # *Probe cost is not a control either*, and here the property is
-            # the converse of ``creek.compile``'s: its survey walks the
-            # non-short-circuiting :func:`creek.classify.privacy_filter.
-            # ancestry_tiers` (the walk moved out of that module in #958),
+            # the converse of ``creek.compile``'s: its survey ranks the index
+            # the compile engine builds from one non-short-circuiting walk
+            # (``AncestorIndex.chain_tiers`` over that walk since #930),
             # whereas :func:`_resolve_entry` above walks a lazy rglob and
             # returns at the match. So an above-ceiling probe is never *more*
             # expensive than a miss, and is cheaper for every fragment but the

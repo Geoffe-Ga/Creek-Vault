@@ -23,6 +23,24 @@ to locate the originating commit for any reference below.
   published for the operation. `docs/api.md`, the `link_embedder` docstring
   and the DAST 503 allowance list move with it.
 
+- `creek.compile` over MCP walks `01-Fragments` once and decides
+  admission inside the content-mutation lock (#930). The wrapper used to
+  survey the vault for its source-tier gate, outside the lock, and the
+  engine then walked it again to load what it compiled: twice the pre-LLM
+  I/O, and a window in which `creek classify` could raise a tier the gate
+  had already admitted, so the call was compiled under a stale admission.
+  `compile_to_vault` now takes an optional keyword-only `admit_sources`
+  hook (`SourceAdmission`), evaluated on the whole-corpus `AncestorIndex`
+  from its single walk, before the missing-id error, the LLM factory and
+  any write; a refusal raises the content-free
+  `SourceAdmissionRefusedError`, which the MCP tool audits and answers with
+  the unchanged above-ceiling reason. The CLI passes no hook and is
+  unchanged. `privacy_filter.ancestry_tiers`, whose only production caller
+  was the old gate, is removed, and the compile loader tests membership
+  against a set instead of a list. A refused compile now creates the
+  zero-byte content-mutation lock file, and under lock contention a
+  would-be refusal returns the unaudited busy refusal.
+
 - A writer's refused provider key is now reported as refused, not as a wait
   (contract 0.28.0, ADR-0015). When the vendor answered a writer's
   request-scoped key `401`/`403` on `POST /v1/reflections` or
