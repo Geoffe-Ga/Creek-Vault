@@ -83,6 +83,7 @@ from pydantic import BaseModel, ValidationError
 from creek.classify.llm.consent import is_managed_vault
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek.link.embeddings import EmbeddingModelUnavailableError
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     JOB_FAILURE_CODE_SINCE_MINOR,
     OK_STATUS,
@@ -163,6 +164,14 @@ def pipeline_refusal_code(reason: str) -> ErrorCode:
     arbitrary text from a provider client and exactly the material that must
     never reach a body.
 
+    A timed-out vault content lock is the tools' fixed
+    :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` and maps to
+    ``temporarily_unavailable`` (#2066): the other writer finishes and a retry
+    succeeds, the same disposition ``PUT /v1/journal-entries`` gives its own
+    busy refusal (:func:`creek_mcp.httpapi.journal.journal_refusal_code`). The
+    match is exact equality on the imported constant, never a prefix or
+    substring test, so provider text that merely quotes it still fails closed.
+
     Args:
         reason: The ``reason`` field of a structured tool refusal.
 
@@ -171,6 +180,8 @@ def pipeline_refusal_code(reason: str) -> ErrorCode:
     """
     if reason.startswith(_UNKNOWN_METHOD_PREFIX):
         return ErrorCode.INVALID_REQUEST
+    if reason == CONTENT_MUTATION_BUSY_REASON:
+        return ErrorCode.TEMPORARILY_UNAVAILABLE
     return ErrorCode.INTERNAL_ERROR
 
 
