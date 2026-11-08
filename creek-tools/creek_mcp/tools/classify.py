@@ -27,7 +27,10 @@ from creek.classify.llm.providers import (
 from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
 from creek.config import load_vault_config
 from creek.models import PrivacyTier
-from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.model_pin import (
     build_request_scoped_provider,
@@ -355,7 +358,11 @@ def classify_tool(
             ceiling=privacy_tier_ceiling,
             reason=LLM_PROVIDER_UNAVAILABLE_REASON,
         )
-    except VaultLockTimeoutError:
+    except (ContentMutationBusyError, VaultLockTimeoutError):
+        # Acquiring the content lock past its wait is ContentMutationBusyError
+        # (#2087). The bare-timeout arm is kept on purpose: a lock timeout
+        # under the engine's hold still reads busy, as it always has, rather
+        # than escaping as a FastMCP error or a /v1 job `internal_error`.
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,

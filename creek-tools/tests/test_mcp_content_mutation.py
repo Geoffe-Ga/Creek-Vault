@@ -17,6 +17,7 @@ from creek.ingest.pipeline import run_ingest
 from creek.models import Fragment, FragmentSource, PrivacyTier, SourcePlatform
 from creek.vault.mutations import (
     CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
     content_mutation_lock_path,
 )
 from creek_mcp.audit import MCP_AUDIT_RELPATH
@@ -46,6 +47,25 @@ def _raise_lock_timeout(**_kwargs: object) -> object:
     raise VaultLockTimeoutError(_STATIC_BUSY_DETAIL)
 
 
+def _raise_content_busy(**_kwargs: object) -> object:
+    """Model an engine that lost the acquisition race in its hold (#2087)."""
+    raise ContentMutationBusyError(_STATIC_BUSY_DETAIL)
+
+
+_BUSY_SIGNALS = pytest.mark.parametrize(
+    "raise_busy",
+    [_raise_content_busy, _raise_lock_timeout],
+    ids=["content-mutation-busy", "legacy-lock-timeout"],
+)
+"""Both shapes an engine's contention can take reach the MCP tools.
+
+Since #2087 the engines raise :class:`ContentMutationBusyError` when acquiring
+the lock times out. The legacy ``VaultLockTimeoutError`` arm stays beside it,
+so a stub or an older engine raising the bare timeout still reads busy and the
+``/v1`` durable-job ``busy`` mapping keyed on the reason text is unchanged.
+"""
+
+
 def _assert_content_free_refusal(result: dict[str, object]) -> None:
     """Assert a mutation timeout has the stable, content-free MCP shape."""
     assert result["status"] == "refused"
@@ -53,33 +73,39 @@ def _assert_content_free_refusal(result: dict[str, object]) -> None:
     assert _STATIC_BUSY_DETAIL not in str(result["reason"])
 
 
+@_BUSY_SIGNALS
 def test_classify_refuses_when_content_mutation_is_busy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    raise_busy: Callable[..., object],
 ) -> None:
     """A bounded classifier-lock timeout remains a structured refusal."""
     from creek_mcp.tools import classify as classify_mod
 
-    monkeypatch.setattr(classify_mod, "run_classify", _raise_lock_timeout)
+    monkeypatch.setattr(classify_mod, "run_classify", raise_busy)
 
     _assert_content_free_refusal(classify_tool(vault_path=tmp_path, method="rules"))
 
 
+@_BUSY_SIGNALS
 def test_link_refuses_when_content_mutation_is_busy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    raise_busy: Callable[..., object],
 ) -> None:
     """A bounded linker-lock timeout remains a structured refusal."""
     from creek_mcp.tools import link as link_mod
 
-    monkeypatch.setattr(link_mod, "run_link", _raise_lock_timeout)
+    monkeypatch.setattr(link_mod, "run_link", raise_busy)
 
     _assert_content_free_refusal(link_tool(vault_path=tmp_path, method="temporal"))
 
 
+@_BUSY_SIGNALS
 def test_compile_refuses_when_content_mutation_is_busy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    raise_busy: Callable[..., object],
 ) -> None:
     """A bounded compiler-lock timeout remains a structured refusal."""
     fragment = Fragment(
@@ -91,7 +117,7 @@ def test_compile_refuses_when_content_mutation_is_busy(
     write_fragment_file(vault=tmp_path, fragment=fragment, body="synthetic body")
     monkeypatch.setattr(
         "creek_mcp.tools.compile.compile_to_vault",
-        _raise_lock_timeout,
+        raise_busy,
     )
 
     result = compile_tool(
@@ -436,3 +462,61 @@ def test_an_index_lock_timeout_inside_the_ingest_hold_is_not_reported_as_busy(
 
     with pytest.raises(VaultLockTimeoutError, match="id-index lock busy"):
         _ingest(tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# Real contention through the migrated engines (#2087)
+# --------------------------------------------------------------------------- #
+
+
+def _seed_open_fragment(vault: Path) -> Fragment:
+    """Write and return one OPEN journal fragment under *vault*."""
+    fragment = Fragment(
+        id="frag-content-busy-2087",
+        title="Content mutation boundary",
+        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        privacy_tier=PrivacyTier.OPEN,
+    )
+    write_fragment_file(vault=vault, fragment=fragment, body="synthetic body")
+    return fragment
+
+
+def _call_tool(tool: str, vault: Path) -> dict[str, Any]:
+    """Invoke MCP tool *tool* over *vault* with arguments that pass its gates."""
+    if tool == "classify":
+        return classify_tool(vault_path=vault, method="rules")
+    if tool == "link":
+        return link_tool(vault_path=vault, method="temporal")
+    return compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-content-busy-2087"],
+        target_kind="thread",
+        target_id="thread-content-busy-2087",
+        target_title="Content mutation boundary",
+        llm_factory=lambda _tier: lambda _prompt: "not reached",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+@pytest.mark.parametrize("tool", ["classify", "link", "compile"])
+def test_a_tool_meeting_real_contention_refuses_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+) -> None:
+    """The engine's :class:`ContentMutationBusyError` reaches the busy arm.
+
+    No stub: the lock is held by another thread and the engine's own hold
+    loses the race, so the refusal proves the tool catches the type the
+    engines now raise and not only the legacy bare timeout.
+    """
+    _seed_open_fragment(tmp_path)
+    before = _fragment_digests(tmp_path)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+
+    with _content_lock_held_elsewhere(tmp_path):
+        result = _call_tool(tool, tmp_path)
+
+    assert result["status"] == "refused", result
+    assert result["reason"] == CONTENT_MUTATION_BUSY_REASON
+    assert _fragment_digests(tmp_path) == before

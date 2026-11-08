@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Protocol
 import frontmatter
 
 from creek._fsio import atomic_write_text
-from creek._fslock import vault_lock
 from creek._schema import coerce_optional_list
 from creek.audit import AuditLog
 from creek.care.guardrail import CARE_POLICY
@@ -48,7 +47,7 @@ from creek.hierarchy import (
     structural_path_context,
 )
 from creek.models import CompiledPage, CompileTargetKind, Fragment, PrivacyTier
-from creek.vault.mutations import content_mutation_lock_path
+from creek.vault.mutations import hold_content_mutation
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -459,8 +458,11 @@ def compile_to_vault(
         The path of the written compiled-layer page.
 
     Raises:
-        creek._fslock.VaultLockTimeoutError: When another content mutation
-            holds the shared boundary past its bounded wait.
+        creek.vault.mutations.ContentMutationBusyError: When another content
+            mutation held the shared boundary past its bounded wait, so the
+            pass never started (#2087). A
+            :class:`~creek._fslock.VaultLockTimeoutError` raised *under* the
+            hold — by a lock taken while working — propagates as itself.
         SourceAdmissionRefusedError: When *admit_sources* refused the
             compile. Nothing was built, written or logged.
         ValueError: If a requested fragment cannot be resolved or the target
@@ -468,7 +470,7 @@ def compile_to_vault(
         creek.classify.llm.router.IntimateRoutingError: If intimate content
             has no local generation route.
     """
-    with vault_lock(content_mutation_lock_path(vault_path)):
+    with hold_content_mutation(vault_path):
         return _compile_to_vault_with_content_lock_held(
             fragment_ids=fragment_ids,
             vault_path=vault_path,

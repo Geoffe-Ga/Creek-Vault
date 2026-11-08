@@ -11,6 +11,7 @@ traceback, when another writer holds it first.
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 from typer.testing import CliRunner
@@ -269,3 +270,184 @@ def test_a_content_busy_sync_records_the_source_and_still_writes_last_run(
     assert journal["ingested"] == 0
     assert journal["failures"] == [f"skipped: {CONTENT_MUTATION_BUSY_REASON}"]
     assert _fragment_digests(vault) == {}
+
+
+# --------------------------------------------------------------------------- #
+# creek sync: a busy classify / link pass is a skipped step, not a lost tick
+# (#2087)
+# --------------------------------------------------------------------------- #
+
+_CLASSIFY_SKIPPED = f"classify skipped: {CONTENT_MUTATION_BUSY_REASON}"
+"""The ``skipped_steps`` line a busy classify pass records."""
+
+_LINK_SKIPPED = f"link skipped: {CONTENT_MUTATION_BUSY_REASON}"
+"""The ``skipped_steps`` line a busy Tier-B link pass records."""
+_SKIP_LOG_CLASSIFY = "sync.classify.skip reason=content-busy"
+"""The scheduler-log line an operator greps for when sync classify is skipped."""
+_SKIP_LOG_LINK = "sync.link.skip reason=content-busy"
+"""The scheduler-log line an operator greps for when sync link is skipped."""
+
+
+def _read_sync_state(vault: Path) -> dict[str, Any]:
+    """Return the parsed ``last-run.json`` the tick wrote under *vault*."""
+    loaded: dict[str, Any] = json.loads(
+        _sync_state_path(vault).read_text(encoding="utf-8")
+    )
+    return loaded
+
+
+def test_a_content_busy_sync_classify_pass_is_skipped_and_last_run_still_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Tier-A tick whose rules-classify pass meets contention still records.
+
+    ``_sync_classify`` is deliberately not stubbed: the real
+    :func:`~creek.classify.classify_engine.run_classify` takes the content
+    lock, and before #2087 its timeout escaped the tick as a traceback that
+    skipped ``_write_sync_state`` — losing the per-source busy record the
+    ingest step had just made.
+    """
+    vault = _sync_vault(tmp_path, monkeypatch)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+
+    with (
+        _content_lock_held_elsewhere(vault),
+        caplog.at_level(logging.INFO, logger="creek.cli"),
+    ):
+        result = _invoke_sync(vault)
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert f"[sync] {_CLASSIFY_SKIPPED}" in _flat(result.output)
+    assert _SKIP_LOG_CLASSIFY in caplog.messages
+    state = _read_sync_state(vault)
+    assert state["sources"]["journal"]["failures"] == [
+        f"skipped: {CONTENT_MUTATION_BUSY_REASON}"
+    ]
+    assert state["skipped_steps"] == [_CLASSIFY_SKIPPED]
+    assert _fragment_digests(vault) == {}
+
+
+def test_a_clean_sync_tick_writes_an_empty_skipped_steps_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``skipped_steps`` is rewritten every tick, so a clean one clears it."""
+    vault = _sync_vault(tmp_path, monkeypatch)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+    with _content_lock_held_elsewhere(vault):
+        busy = _invoke_sync(vault)
+    assert busy.exit_code == 0, busy.output
+
+    result = _invoke_sync(vault)
+
+    assert result.exit_code == 0, result.output
+    assert _read_sync_state(vault)["skipped_steps"] == []
+
+
+def _invoke_tier_b(vault: Path) -> Result:
+    """Run one confirmed ``creek sync --tier B`` tick over *vault*."""
+    return runner.invoke(app, ["sync", "--tier", "B", "--yes", "--vault", str(vault)])
+
+
+def test_a_busy_tier_b_classify_skips_link_and_index_and_still_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier B stops after a busy classify, records why, and exits 0.
+
+    Link would almost certainly meet the same holder and spend a second
+    bounded wait, so the tick ends there; the next one re-derives the work.
+    """
+    vault = _sync_vault(tmp_path, monkeypatch)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+    later_steps: list[str] = []
+
+    def _link_spy(_vault: Path, _config: CreekConfig) -> None:
+        """Record that link ran."""
+        later_steps.append("link")
+
+    def _index_spy(_vault: Path) -> None:
+        """Record that index ran."""
+        later_steps.append("index")
+
+    monkeypatch.setattr("creek.cli._sync_link", _link_spy)
+    monkeypatch.setattr("creek.cli._sync_index", _index_spy)
+
+    with _content_lock_held_elsewhere(vault):
+        result = _invoke_tier_b(vault)
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert later_steps == []
+    state = _read_sync_state(vault)
+    assert state["tier"] == "B"
+    assert state["skipped_steps"] == [_CLASSIFY_SKIPPED]
+
+
+def test_a_busy_tier_b_link_is_recorded_and_index_still_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A busy link pass is a recorded skip; the index rebuild is not lost.
+
+    Classify is stubbed to a clean pass so the contention lands on the real
+    :func:`~creek.link.link_engine.run_link`, which takes the lock before it
+    loads any embedding model.
+    """
+    vault = _sync_vault(tmp_path, monkeypatch)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+    indexed: list[Path] = []
+
+    def _classify_clean(**_kwargs: object) -> None:
+        """Stand in for a classify pass that met no contention."""
+
+    def _index_spy(vault_path: Path) -> None:
+        """Record that index ran."""
+        indexed.append(vault_path)
+
+    monkeypatch.setattr("creek.classify.classify_engine.run_classify", _classify_clean)
+    monkeypatch.setattr("creek.cli._sync_index", _index_spy)
+
+    with (
+        _content_lock_held_elsewhere(vault),
+        caplog.at_level(logging.INFO, logger="creek.cli"),
+    ):
+        result = _invoke_tier_b(vault)
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert f"[sync] {_LINK_SKIPPED}" in _flat(result.output)
+    assert _SKIP_LOG_LINK in caplog.messages
+    assert indexed == [vault]
+    assert _read_sync_state(vault)["skipped_steps"] == [_LINK_SKIPPED]
+
+
+def test_a_timeout_under_the_sync_classify_hold_is_not_recorded_as_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only acquisition is a skip; an inner timeout fails the tick as itself.
+
+    A timeout under the hold can follow writes the pass already made, so
+    recording ``classify skipped`` — "nothing ran" — would be false.
+    """
+    vault = _sync_vault(tmp_path, monkeypatch)
+    inner = VaultLockTimeoutError("id-index lock busy")
+
+    def _inner_times_out(**_kwargs: object) -> object:
+        """Time out the way a contended inner lock does mid-pass."""
+        raise inner
+
+    monkeypatch.setattr(
+        "creek.classify.classify_engine._run_classify_with_content_lock_held",
+        _inner_times_out,
+    )
+
+    result = _invoke_sync(vault)
+
+    assert result.exception is inner
+    assert _CLASSIFY_SKIPPED not in _flat(result.output)

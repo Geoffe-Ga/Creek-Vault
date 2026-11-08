@@ -9,6 +9,26 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`creek sync` keeps its last-run record when classify or link meets
+  content-lock contention (#2087, follow-up to #2079).** `run_classify`,
+  `run_link` and `compile_to_vault` now take the vault content-mutation lock
+  through `hold_content_mutation`, so an acquisition timeout raises
+  `ContentMutationBusyError` instead of a bare `VaultLockTimeoutError`; a
+  timeout raised *under* the hold still propagates as itself. A sync tick whose
+  classify pass (Tier A or B) or Tier-B link pass is busy no longer tracebacks
+  past `_write_sync_state`: it prints `[sync] <step> skipped: vault content
+  mutation busy`, records the line in a new top-level `skipped_steps` list in
+  `last-run.json` (rewritten every tick, `[]` when clean, absent in older
+  files), and exits 0. In Tier B a busy classify also skips link and the index
+  rebuild; a busy link still rebuilds the index. `creek sync --status` prints
+  each skipped step, even when no source ran. `creek classify`, `creek link`,
+  `creek compile`, `creek fill --upgrade` and `creek process` print the
+  one-line busy message and exit 1 instead of a traceback. The
+  `creek.classify`, `creek.link` and `creek.compile` MCP tools catch both
+  exception types, so their `vault content mutation busy` refusal and the
+  `/v1` durable-job `busy` code are unchanged. `creek review` is unchanged: a
+  busy save is still recorded on the session's error list.
+
 - `creek.author` no longer returns a desk exception's text as its error
   reason, and `creek.reflect`, `/v1/letters` and `/v1/reading-recommendations`
   now catch an Ollama `httpx.HTTPError` (refs #2082, #2083). `creek.author`

@@ -88,10 +88,14 @@ _CONTENT_BUSY_MESSAGE: Final[str] = (
     f"{CONTENT_MUTATION_BUSY_REASON}: another Creek writer holds this vault; "
     "retry once it finishes."
 )
-"""What ``creek ingest`` prints when the content-mutation lock is held (#2079).
+"""What a CLI command prints when the content-mutation lock is held.
 
-Built on the shared reason constant so the CLI and the remote surfaces name the
-condition in the same words; it carries no path and no holder identity.
+``creek ingest`` (#2079) and the engine-backed ``creek classify``,
+``creek link``, ``creek compile``, ``creek fill --upgrade`` and
+``creek process`` (#2087) all print it through
+:func:`_exit_1_when_content_busy`. Built on the shared reason constant so the
+CLI and the remote surfaces name the condition in the same words; it carries
+no path and no holder identity.
 """
 
 _INCLUDE_TIER_HELP = (
@@ -517,20 +521,28 @@ def _print_advisory(message: str) -> None:
 
 @contextlib.contextmanager
 def _exit_1_when_content_busy() -> Iterator[None]:
-    """Turn a busy vault into one line and exit 1 for ``creek ingest`` (#2079).
+    """Turn a busy vault into one line and exit 1 (#2079, #2087).
 
-    Contention is an ordinary operational outcome — a ``creek classify`` pass
-    or a remote journal write holds the vault — so it is a message naming the
-    reason and a retry, never a traceback. Only
+    Wraps every CLI command that takes the content-mutation lock, directly
+    (``creek ingest``) or through an engine that holds it (``creek classify``,
+    ``creek link``, ``creek compile``, ``creek fill --upgrade``,
+    ``creek process``). Contention is an ordinary operational outcome — a
+    ``creek classify`` pass or a remote journal write holds the vault — so it
+    is a message naming the reason and a retry, never a traceback. Only
     :class:`~creek.vault.mutations.ContentMutationBusyError` is translated;
     a lock timeout raised *under* the hold propagates as itself.
 
+    The busy hold itself wrote nothing, but the block may have: ``creek
+    process`` meets the lock at its link stage after its earlier stages ran.
+    Every command wrapped here is idempotent, so the retry the message asks
+    for converges either way.
+
     Yields:
-        Nothing. The block runs the ingest.
+        Nothing. The block runs the command's locked work.
 
     Raises:
         typer.Exit: With code ``1`` when the content-mutation lock stayed
-            held past the bounded wait; nothing was written.
+            held past the bounded wait.
     """
     try:
         yield
@@ -1038,12 +1050,28 @@ class SourceRunRecord:
     failures: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class SyncTickOutcome:
+    """What one sync tick did, as ``last-run.json`` records it (#2087).
+
+    Attributes:
+        records: Per-source records for a real Tier-A run, else ``None``
+            (a dry run, or Tier B, which touches no single source).
+        skipped_steps: One line per global step — classify or link — that
+            met content-lock contention and did not run, in tick order.
+    """
+
+    records: dict[str, SourceRunRecord] | None = None
+    skipped_steps: tuple[str, ...] = ()
+
+
 def _write_sync_state(
     vault_path: Path,
     tier: str,
     *,
     dry_run: bool,
     source_records: dict[str, SourceRunRecord] | None = None,
+    skipped_steps: Sequence[str] = (),
 ) -> dict[str, object] | None:
     """Write the sync last-run state, returning the prior state if any (#676).
 
@@ -1059,6 +1087,22 @@ def _write_sync_state(
     them, so readers must treat them as optional. A whole per-source entry is
     assigned rather than merged into, so a clean re-run of a source clears the
     failures it recorded last tick instead of accumulating them forever.
+
+    The top-level ``skipped_steps`` list (#2087) names each global step —
+    ``"classify skipped: vault content mutation busy"``, say — that met
+    content-lock contention this tick. It is rewritten on every tick, ``[]``
+    on a clean one, because it describes this tick and not a source's
+    history. It is additive too: files written before #2087 lack it.
+
+    Args:
+        vault_path: Vault root whose ``last-run.json`` is written.
+        tier: The tier this tick ran, ``"A"`` or ``"B"``.
+        dry_run: Whether the tick only echoed its plan.
+        source_records: What each touched source did, or ``None``.
+        skipped_steps: The global steps contention skipped, in tick order.
+
+    Returns:
+        The prior state when one was readable, else ``None``.
     """
     state_path = _sync_state_path(vault_path)
     prior: dict[str, object] | None = None
@@ -1081,7 +1125,13 @@ def _write_sync_state(
             "failure_count": len(record.failures),
         }
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state = {"tier": tier, "at": now, "dry_run": dry_run, "sources": sources}
+    state = {
+        "tier": tier,
+        "at": now,
+        "dry_run": dry_run,
+        "sources": sources,
+        "skipped_steps": list(skipped_steps),
+    }
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
     return prior
 
@@ -1142,6 +1192,23 @@ def _print_status_failures(sources: dict[str, object]) -> None:
             console.print(f"[yellow]  {name}: {escape(str(line))}[/yellow]")
 
 
+def _print_status_skipped_steps(skipped: object) -> None:
+    """Print the global steps the last tick skipped under contention (#2087).
+
+    Read as defensively as the per-source block: a state file written before
+    #2087 has no ``skipped_steps``, and a hand-edited one may hold anything,
+    so a non-list value prints nothing rather than killing ``--status``.
+    Each line is escaped for the same reason the failure lines are.
+
+    Args:
+        skipped: The recorded ``skipped_steps`` value, of unverified shape.
+    """
+    if not isinstance(skipped, list):
+        return
+    for line in skipped:
+        console.print(f"[yellow]Skipped last tick: {escape(str(line))}[/yellow]")
+
+
 def _sync_status(vault_path: Path) -> None:
     """Print the per-source last-run + counts from last-run.json (#680)."""
     state_path = _sync_state_path(vault_path)
@@ -1158,14 +1225,17 @@ def _sync_status(vault_path: Path) -> None:
         f"[bold]Last sync:[/bold] tier={state.get('tier')}{dry} at {state.get('at')}",
     )
     sources = state.get("sources", {})
-    if not isinstance(sources, dict) or not sources:
+    if isinstance(sources, dict) and sources:
+        table = Table("source", "last tier", "last run", "ingested", "failed")
+        for name, entry in sorted(sources.items()):
+            table.add_row(*_status_row(name, entry))
+        console.print(table)
+        _print_status_failures(sources)
+    else:
         console.print("[dim](no per-source runs recorded yet)[/dim]")
-        return
-    table = Table("source", "last tier", "last run", "ingested", "failed")
-    for name, entry in sorted(sources.items()):
-        table.add_row(*_status_row(name, entry))
-    console.print(table)
-    _print_status_failures(sources)
+    # Outside the branch on purpose: a Tier-B tick touches no source, so its
+    # skipped classify or link must not hide behind an empty table.
+    _print_status_skipped_steps(state.get("skipped_steps"))
 
 
 def _sync_tier_a(
@@ -1335,18 +1405,74 @@ def _sync_ingest_source(
     return SourceRunRecord(ingested=written, failures=recorded)
 
 
-def _sync_classify(vault_path: Path, config: CreekConfig, method: str) -> None:
-    """Run a classify pass for a sync tier (#678)."""
+_CLASSIFY_STEP: Final = "classify"
+"""How ``last-run.json`` and the console name a sync tick's classify pass."""
+
+_LINK_STEP: Final = "link"
+"""How ``last-run.json`` and the console name a Tier-B link pass."""
+
+
+def _skip_when_content_busy(step: str, run: Callable[[], object]) -> str | None:
+    """Run a global sync step, recording contention instead of raising (#2087).
+
+    ``run_classify`` and ``run_link`` hold the content-mutation lock for their
+    whole pass. When another writer keeps it past the bounded wait, the step
+    did not start; raising would skip ``_write_sync_state`` and lose the
+    per-source records the tick already made, which is exactly what a
+    scheduler log could not recover. Only
+    :class:`~creek.vault.mutations.ContentMutationBusyError` is caught: a lock
+    timeout raised *under* the hold may follow writes, and propagates.
+
+    Args:
+        step: The step's name, :data:`_CLASSIFY_STEP` or :data:`_LINK_STEP`.
+        run: The step itself.
+
+    Returns:
+        ``None`` when the step ran, else the line ``last-run.json`` records
+        under ``skipped_steps``.
+    """
+    try:
+        run()
+    except ContentMutationBusyError:
+        skipped = f"{step} skipped: {CONTENT_MUTATION_BUSY_REASON}"
+        # Escaped: unescaped, Rich reads ``[sync]`` as a markup tag and drops
+        # it, which is how every other ``[sync]`` prefix in this module reads.
+        console.print(f"[yellow]{escape(f'[sync] {skipped}')}[/yellow]")
+        logger.info("sync.%s.skip reason=content-busy", step)
+        return skipped
+    return None
+
+
+def _sync_classify(vault_path: Path, config: CreekConfig, method: str) -> str | None:
+    """Run a classify pass for a sync tier (#678); report a busy skip (#2087).
+
+    Returns:
+        ``None`` when the pass ran, else its ``skipped_steps`` line.
+    """
     from creek.classify.classify_engine import run_classify
 
-    run_classify(vault_path=vault_path, config=config, method=method, force=False)
+    return _skip_when_content_busy(
+        _CLASSIFY_STEP,
+        lambda: run_classify(
+            vault_path=vault_path, config=config, method=method, force=False
+        ),
+    )
 
 
-def _sync_link(vault_path: Path, config: CreekConfig) -> None:
-    """Run the embeddings linker — Tier B only (R6, #678)."""
+def _sync_link(vault_path: Path, config: CreekConfig) -> str | None:
+    """Run the embeddings linker — Tier B only (R6, #678; busy skip #2087).
+
+    Returns:
+        ``None`` when the pass ran, else its ``skipped_steps`` line.
+    """
     from creek.link.link_engine import run_link
 
-    run_link(vault_path=vault_path, config=config, method="embeddings", rebuild=False)
+    return _skip_when_content_busy(
+        _LINK_STEP,
+        lambda: run_link(
+            vault_path=vault_path, config=config, method="embeddings", rebuild=False
+        ),
+    )
 
 
 def _sync_index(vault_path: Path) -> None:
@@ -1360,8 +1486,8 @@ def _sync_run_tier_a(
     config: CreekConfig,
     vault_path: Path,
     sources: list[str],
-) -> dict[str, SourceRunRecord]:
-    """Execute Tier A; return what each source did (#678/#680/#1372).
+) -> SyncTickOutcome:
+    """Execute Tier A; return what each source and the tick did (#678/#2087).
 
     Per source: pull + incremental ingest, then one rules-classify pass.
     Linking and indexing are **never** invoked here (R6: they are O(n²)/global
@@ -1369,7 +1495,9 @@ def _sync_run_tier_a(
 
     A source's pull failures and its ingest failures are merged into one
     record, in that order: they happened to the same source in the same tick,
-    and the operator reads ``last-run.json`` by source, not by step.
+    and the operator reads ``last-run.json`` by source, not by step. A rules
+    pass that meets content-lock contention is a ``skipped_steps`` line, not
+    an exception, so those records still reach ``last-run.json`` (#2087).
     """
     records: dict[str, SourceRunRecord] = {}
     for source in sources:
@@ -1379,17 +1507,34 @@ def _sync_run_tier_a(
             ingested=record.ingested,
             failures=(*pull_failures, *record.failures),
         )
-    _sync_classify(vault_path, config, "rules")
+    classify_skip = _sync_classify(vault_path, config, "rules")
     logger.info("sync.tier_a.done count=%d", len(sources))
-    return records
+    return SyncTickOutcome(
+        records=records,
+        skipped_steps=() if classify_skip is None else (classify_skip,),
+    )
 
 
-def _sync_run_tier_b(config: CreekConfig, vault_path: Path) -> None:
-    """Execute Tier B globally: llm classify -> link -> index (#678)."""
-    _sync_classify(vault_path, config, "llm")
-    _sync_link(vault_path, config)
+def _sync_run_tier_b(config: CreekConfig, vault_path: Path) -> SyncTickOutcome:
+    """Execute Tier B globally: llm classify -> link -> index (#678).
+
+    Contention is recorded, never raised (#2087). A busy classify ends the
+    tick there: link waits on the same lock and would very likely spend a
+    second bounded wait on the same holder, and the next tick re-derives both.
+    A busy link is recorded and the index still rebuilds, since index
+    generation takes no content lock and reflects whatever is on disk.
+
+    Returns:
+        The steps contention skipped; Tier B records no per-source entries.
+    """
+    classify_skip = _sync_classify(vault_path, config, "llm")
+    if classify_skip is not None:
+        logger.info("sync.tier_b.done skipped=classify")
+        return SyncTickOutcome(skipped_steps=(classify_skip,))
+    link_skip = _sync_link(vault_path, config)
     _sync_index(vault_path)
     logger.info("sync.tier_b.done")
+    return SyncTickOutcome(skipped_steps=() if link_skip is None else (link_skip,))
 
 
 def _sync_dispatch(
@@ -1399,25 +1544,25 @@ def _sync_dispatch(
     config: CreekConfig,
     vault_path: Path,
     source: str | None,
-) -> dict[str, SourceRunRecord] | None:
-    """Echo (dry-run) or execute the chosen sync tier; return Tier-A records.
+) -> SyncTickOutcome:
+    """Echo (dry-run) or execute the chosen sync tier; return what it did.
 
-    Returns what each source did on a real Tier-A run (for the status file),
-    or ``None`` for dry-run / Tier-B runs.
+    Returns what each source did on a real Tier-A run and which global steps
+    contention skipped (for the status file); a dry run returns an empty
+    outcome.
     """
     if tier_norm == "A":
         if dry_run:
             _sync_tier_a(config.sync.enabled_sources(), source)
-            return None
+            return SyncTickOutcome()
         # An explicit --source overrides the enable toggle (the operator
         # asked for it by name); otherwise run the enabled set.
         sources = [source] if source is not None else config.sync.enabled_sources()
         return _sync_run_tier_a(config, vault_path, sources)
     if dry_run:
         _sync_tier_b()
-    else:
-        _sync_run_tier_b(config, vault_path)
-    return None
+        return SyncTickOutcome()
+    return _sync_run_tier_b(config, vault_path)
 
 
 def _install_launchd(
@@ -1627,7 +1772,7 @@ def _sync_dispatch_guarded(
     config: CreekConfig,
     vault_path: Path,
     source: str | None,
-) -> dict[str, SourceRunRecord] | None:
+) -> SyncTickOutcome:
     """Dispatch the tier, turning a provider refusal into a legible exit (#1335).
 
     ``creek classify --method llm`` already catches this refusal; the sync path
@@ -1652,8 +1797,13 @@ def _sync_dispatch_guarded(
         vault_path: Vault root to operate on.
         source: Optional single Tier-A source override.
 
+    Content-lock contention is not handled here: the classify and link steps
+    already turn it into ``skipped_steps`` lines (#2087), so a busy tick
+    still reaches ``last-run.json`` and exits 0.
+
     Returns:
-        Per-source run records for a real Tier-A run, else ``None``.
+        What the tick did: per-source records for a real Tier-A run, and the
+        global steps contention skipped.
 
     Raises:
         typer.Exit: With code ``1`` when the configured LLM provider refuses.
@@ -1661,7 +1811,7 @@ def _sync_dispatch_guarded(
     from creek.classify.classify_engine import LLMProviderUnavailableError
 
     try:
-        records = _sync_dispatch(
+        outcome = _sync_dispatch(
             tier_norm,
             dry_run=dry_run,
             config=config,
@@ -1672,7 +1822,7 @@ def _sync_dispatch_guarded(
         console.print(f"[red][sync] tier {tier_norm} aborted: {exc}[/red]")
         raise typer.Exit(code=1) from exc
     else:
-        return records
+        return outcome
 
 
 @app.command()
@@ -1729,6 +1879,8 @@ def sync(
     unprompted. Every run records
     ``00-Creek-Meta/State/sync/last-run.json``; because every step is
     idempotent, a missed tick self-heals on the next run (no catch-up queue).
+    A classify or link pass that meets content-lock contention is recorded
+    there under ``skipped_steps`` and the tick still exits 0 (#2087).
 
     ``--install-schedule launchd|systemd`` emits the host's schedule units and
     exits; ``--status`` prints the per-source last-run table and exits.
@@ -1755,7 +1907,7 @@ def sync(
     # about to be rejected as a usage error would be misleading.
     _sync_gate_tier_b(tier_norm, vault_path, dry_run=dry_run, assume_yes=yes)
 
-    source_records = _sync_dispatch_guarded(
+    outcome = _sync_dispatch_guarded(
         tier_norm,
         dry_run=dry_run,
         config=config,
@@ -1764,7 +1916,11 @@ def sync(
     )
 
     prior = _write_sync_state(
-        vault_path, tier_norm, dry_run=dry_run, source_records=source_records
+        vault_path,
+        tier_norm,
+        dry_run=dry_run,
+        source_records=outcome.records,
+        skipped_steps=outcome.skipped_steps,
     )
     if prior is not None:
         console.print(
@@ -1956,14 +2112,19 @@ def _run_pipeline_or_exit(
         The completed :class:`~creek.pipeline.PipelineResult`.
 
     Raises:
-        typer.Exit: With code ``1`` when the pipeline refuses to run.
+        typer.Exit: With code ``1`` when the pipeline refuses to run, or when
+            its link stage met content-lock contention (#2087); stages before
+            it may already have written, and a re-run converges.
     """
     # Deferred, like every other heavy import in this module: nothing may
     # be imported at CLI import time that builds a Rich console (#1141).
     from creek.link import EmbeddingModelUnavailableError
 
     try:
-        return pipeline.run(source_path=source_path, vault_path=vault_path)
+        # Stage 5 links under the engine's own content-lock hold; a busy vault
+        # there is one line and exit 1, not a traceback (#2087).
+        with _exit_1_when_content_busy():
+            return pipeline.run(source_path=source_path, vault_path=vault_path)
     except RedactionRequiredError as exc:
         console.print(f"[red]Redaction gate: {exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -2873,13 +3034,14 @@ def classify(
     )
 
     try:
-        summary = run_classify(
-            vault_path=vault_path,
-            config=config,
-            method=method,
-            force=force,
-            retier=retier,
-        )
+        with _exit_1_when_content_busy():
+            summary = run_classify(
+                vault_path=vault_path,
+                config=config,
+                method=method,
+                force=force,
+                retier=retier,
+            )
     except LLMProviderUnavailableError as exc:
         # The engine refused to iterate because the configured LLM
         # provider is unreachable. Surface the provider-specific
@@ -3063,12 +3225,13 @@ def link(
     from creek.link.link_engine import run_link
 
     try:
-        summary = run_link(
-            vault_path=vault_path,
-            config=config,
-            method=method,
-            rebuild=rebuild,
-        )
+        with _exit_1_when_content_busy():
+            summary = run_link(
+                vault_path=vault_path,
+                config=config,
+                method=method,
+                rebuild=rebuild,
+            )
     except EmbeddingModelUnavailableError as exc:
         # The sentence-transformer model could not be loaded (GAP-008).
         # The exception message already names the model and spells out
@@ -4057,7 +4220,10 @@ def fill(
     # Quality-aware upgrade (#736): offer/apply re-classification of `rules`
     # fragments before the steps consume them. Safe no-op unless --upgrade or an
     # interactive yes; the ModelRouter keeps Intimate content local.
-    _maybe_upgrade_classification(vault_path, config, upgrade=upgrade)
+    # The upgrade is the one fill step that is not individually non-fatal: a
+    # busy vault stops it before any step runs, as one line and exit 1 (#2087).
+    with _exit_1_when_content_busy():
+        _maybe_upgrade_classification(vault_path, config, upgrade=upgrade)
 
     for label, action in steps:
         console.print(f"[dim][fill] {label} …[/dim]")
@@ -4121,23 +4287,25 @@ def compile_(
     vault_path = _resolve_vault(vault)
     kind = cast("CompileTargetKind", target_kind)
     try:
-        written = compile_to_vault(
-            fragment_ids=[fragment_id],
-            vault_path=vault_path,
-            target_kind=kind,
-            target_id=target_id,
-            target_title=target_title,
-            # The content tier alone, with no ceiling term — unlike
-            # ``creek_mcp.tools.compile``, which reconciles the two via
-            # ``routing_tier``. The CLI operator *is* the vault owner, so
-            # there is no caller declaration to reconcile against. Modelling
-            # the CLI as ``ceiling=all`` would not be conservative but
-            # wrong: ``CEILING_ROUTING_TIER[ALL] == INTIMATE``, which would
-            # pin every compile of every open fragment to the local model.
-            llm_factory=lambda tier: default_llm(
-                config.model_router.resolve("generation", tier),
-            ),
-        )
+        with _exit_1_when_content_busy():
+            written = compile_to_vault(
+                fragment_ids=[fragment_id],
+                vault_path=vault_path,
+                target_kind=kind,
+                target_id=target_id,
+                target_title=target_title,
+                # The content tier alone, with no ceiling term — unlike
+                # ``creek_mcp.tools.compile``, which reconciles the two via
+                # ``routing_tier``. The CLI operator *is* the vault owner, so
+                # there is no caller declaration to reconcile against.
+                # Modelling the CLI as ``ceiling=all`` would not be
+                # conservative but wrong: ``CEILING_ROUTING_TIER[ALL] ==
+                # INTIMATE``, which would pin every compile of every open
+                # fragment to the local model.
+                llm_factory=lambda tier: default_llm(
+                    config.model_router.resolve("generation", tier),
+                ),
+            )
     except IntimateRoutingError as exc:
         # The one refusal that must be legible. Threading the tier through
         # *introduces* this failure mode on a P1 operator path (all-cloud

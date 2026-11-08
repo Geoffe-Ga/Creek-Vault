@@ -30,6 +30,7 @@ from creek_mcp.tools.upload import upload_tool
 from tests.helpers import write_fragment_file
 from tests.test_mcp_content_mutation import (
     _content_lock_held_elsewhere,
+    _fragment_digests,
     _shorten_lock_wait,
 )
 from tests.test_mcp_upload import _content_lock_is_held
@@ -188,6 +189,33 @@ def test_the_hold_runs_its_body_with_the_content_lock_held(tmp_path: Path) -> No
     assert _content_lock_is_held(vault) is False
 
 
+def test_run_link_does_its_work_inside_the_content_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run_link``'s whole pass runs under the hold, not after it (#2087).
+
+    The busy test only proves the wait happens at acquisition; this one fails
+    if the pass is moved out of the ``with`` block, for example to load the
+    embedding model first, which would reopen the #1799 withdraw race for link.
+    """
+    vault = tmp_path / "vault"
+    held: list[bool] = []
+
+    def _recording_pass(**_kwargs: object) -> object:
+        """Record whether the content lock is held while the pass runs."""
+        held.append(_content_lock_is_held(vault))
+        return None
+
+    monkeypatch.setattr(
+        "creek.link.link_engine._run_link_with_content_lock_held", _recording_pass
+    )
+
+    run_link(vault_path=vault, config=CreekConfig(), method="temporal", rebuild=False)
+
+    assert held == [True]
+    assert _content_lock_is_held(vault) is False
+
+
 def test_a_contended_hold_raises_busy_and_never_runs_its_body(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -296,4 +324,96 @@ def test_ingest_then_classify_then_link_in_one_thread_releases_every_lock(
 
     assert ingested["status"] == "ok", ingested
     assert ingested["written"] == 1
+    assert _content_lock_is_held(vault) is False
+
+
+# --------------------------------------------------------------------------- #
+# The three engines take the boundary through the same hold (#2087)
+# --------------------------------------------------------------------------- #
+
+_ENGINES: tuple[str, ...] = ("classify", "link", "compile")
+"""The engines that acquire the content lock themselves, by short name."""
+
+_INNER_BODIES: dict[str, str] = {
+    "classify": "creek.classify.classify_engine._run_classify_with_content_lock_held",
+    "link": "creek.link.link_engine._run_link_with_content_lock_held",
+    "compile": "creek.compile.engine._compile_to_vault_with_content_lock_held",
+}
+"""Where each engine's work runs once it holds the lock."""
+
+
+def _run_engine(name: str, vault: Path) -> object:
+    """Call the public entry point of engine *name* over *vault*."""
+    if name == "classify":
+        return run_classify(
+            vault_path=vault, config=CreekConfig(), method="rules", force=False
+        )
+    if name == "link":
+        return run_link(
+            vault_path=vault, config=CreekConfig(), method="temporal", rebuild=False
+        )
+    return compile_to_vault(
+        fragment_ids=["frag-content-mutation-1799"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-content-mutation-2087",
+        target_title="Content mutation boundary",
+        llm_factory=lambda _tier: lambda _prompt: "not reached",
+    )
+
+
+@pytest.mark.parametrize("engine", _ENGINES)
+def test_a_contended_engine_raises_busy_rather_than_a_bare_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    engine: str,
+) -> None:
+    """Losing the acquisition race is :class:`ContentMutationBusyError` (#2087).
+
+    The patch target is the one in :mod:`creek.vault.mutations`: an engine that
+    still took the raw lock would wait out the production default and raise
+    the bare ``VaultLockTimeoutError`` its callers cannot tell from an inner
+    one.
+    """
+    vault = tmp_path / "vault"
+    _seed_fragment(vault)
+    before = _fragment_digests(vault)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+
+    with (
+        _content_lock_held_elsewhere(vault),
+        pytest.raises(ContentMutationBusyError) as caught,
+    ):
+        _run_engine(engine, vault)
+
+    assert str(caught.value) == CONTENT_MUTATION_BUSY_REASON
+    assert isinstance(caught.value.__cause__, VaultLockTimeoutError)
+    assert _fragment_digests(vault) == before
+
+
+@pytest.mark.parametrize("engine", _ENGINES)
+def test_a_lock_timeout_under_an_engine_hold_propagates_as_itself(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    engine: str,
+) -> None:
+    """A timeout inside the held body is not re-labelled busy (#2087).
+
+    The engine may already have written by then, so reporting "busy — nothing
+    happened" would be false.
+    """
+    vault = tmp_path / "vault"
+    _seed_fragment(vault)
+    inner = VaultLockTimeoutError("id-index lock busy")
+
+    def _inner_times_out(**_kwargs: object) -> object:
+        """Time out the way a contended inner lock does mid-pass."""
+        raise inner
+
+    monkeypatch.setattr(_INNER_BODIES[engine], _inner_times_out)
+
+    with pytest.raises(VaultLockTimeoutError) as caught:
+        _run_engine(engine, vault)
+
+    assert caught.value is inner
     assert _content_lock_is_held(vault) is False
