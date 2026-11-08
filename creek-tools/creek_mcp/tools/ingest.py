@@ -29,6 +29,18 @@ does arm the tomb sweep, and soft-deleting vault content is authority this
 surface has never held. That is closed by passing ``may_tomb=False`` — a
 restrictive conjunct that can only subtract authority — rather than by
 declining to run the pipeline and keeping the three defects above.
+
+**It runs inside the vault content-mutation boundary (#2079).** An ingest
+writes ``01-Fragments``, its ledger and the fragment index, which is exactly the
+state ``creek classify`` and ``creek link`` load and rewrite under
+:func:`creek.vault.mutations.content_mutation_lock_path`. The tool therefore
+holds that lock across the whole ``run_ingest`` call, through
+:func:`~creek.vault.mutations.hold_content_mutation`, waiting at most
+:data:`creek._fslock.DEFAULT_LOCK_TIMEOUT_SECONDS` (10 s) before refusing with
+the content-free :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON`.
+The lock is taken here, at the surface, and never inside ``run_ingest``:
+``creek.upload`` and ``creek.journal`` call ``run_ingest`` while already
+holding it, and it is not reentrant.
 """
 
 from __future__ import annotations
@@ -40,6 +52,11 @@ from creek._containment import EscapingSymlinkError
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.pipeline import run_ingest
 from creek.models import PrivacyTier
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
+    hold_content_mutation,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.path_confinement import resolve_within_vault
 from creek_mcp.tier_ceiling import (
@@ -74,14 +91,23 @@ def ingest_tool(
             vault root. The path must resolve *inside* the vault to prevent
             the MCP surface from ingesting arbitrary disk content. Refusals
             are checked in order: tier ceiling, unknown ``source_type``,
-            path confinement, then existence.
+            path confinement, existence, and only then the content-mutation
+            lock (#2079) — so contention never masks a gate's answer.
         privacy_tier_ceiling: Caller's tier ceiling; the personal-tier
             default is refused when the ceiling is lower.
         consumer: Identifier of the calling client (recorded in audit).
 
     Returns:
         A dict with ``status`` (``ok`` / ``refused``), the count and ids of
-        written fragments, and any per-fragment errors.
+        written fragments, and any per-fragment errors. A refusal with
+        :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` means
+        another writer held the vault past the bounded wait: nothing was
+        written, and only the attempt row was audited. Retry it.
+
+    Raises:
+        VaultLockTimeoutError: When a lock taken *under* the content hold —
+            the writer's ``.id-index.lock`` — times out. Fragments may already
+            have been written by then, so it is never reported as busy.
     """
     # Audit the ATTEMPT, unconditionally, before any gate can refuse it
     # (#885). Four refusal arms below used to return with no entry at all --
@@ -141,13 +167,23 @@ def ingest_tool(
         )
 
     try:
-        result = run_ingest(
-            ingestor_cls=ingestor_cls,
-            source_type=source_type,
-            input_path=resolved,
-            vault_path=vault_path,
-            privacy_tier=DEFAULT_INGEST_TIER,
-            may_tomb=False,
+        with hold_content_mutation(vault_path):
+            result = run_ingest(
+                ingestor_cls=ingestor_cls,
+                source_type=source_type,
+                input_path=resolved,
+                vault_path=vault_path,
+                privacy_tier=DEFAULT_INGEST_TIER,
+                may_tomb=False,
+            )
+    except ContentMutationBusyError:
+        # ACQUISITION only (#2079): the helper raises this solely when taking
+        # the lock timed out, so ``run_ingest`` never started. A timeout from a
+        # lock taken under the hold is a different type and propagates.
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=CONTENT_MUTATION_BUSY_REASON,
         )
     except EscapingSymlinkError as exc:
         # ``resolve_within_vault`` above confines the path the caller NAMED;
