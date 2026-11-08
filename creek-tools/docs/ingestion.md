@@ -251,6 +251,28 @@ creek ingest --type markdown    --input ~/staging/gdrive --vault ~/Obsidian/Cree
 
 Subsequent `--download` runs are **incremental** — unchanged files are skipped, deletions are mirrored as soft deletes (the staging file is removed; the vault fragment isn't, so you can choose whether to `creek purge source` it).
 
+## Concurrent writers
+
+`creek ingest` holds the vault's content-mutation lock
+(`00-Creek-Meta/locks/content-mutations.lock`) for its whole run, the same lock
+`creek classify`, `creek link`, `creek compile` and the remote journal and
+upload paths take, so none of them reads a `01-Fragments` snapshot an ingest is
+still writing ([#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079)).
+
+- If another writer holds the lock for more than 10 seconds, `creek ingest`
+  prints one line — `vault content mutation busy: another Creek writer holds
+  this vault; retry once it finishes.` — exits **1**, and writes nothing. Rerun
+  it once the other writer finishes.
+- `creek sync --tier A` does not exit on contention: the busy source is
+  recorded in `last-run.json` as `skipped: vault content mutation busy`, the
+  rest of the tick runs, and the next tick's incremental ingest picks the
+  source up.
+- A long ingest holds the lock for its whole run, so remote journal writes,
+  uploads, classify and link calls answer `vault content mutation busy` (503
+  over `/v1`) until it finishes.
+- The vault is validated before the lock is taken: a mistyped `--vault` still
+  exits `Vault unavailable` and gains no `00-Creek-Meta/locks/` directory.
+
 ## Idempotency
 
 Fragment IDs are deterministic — `SHA-256(source, timestamp, content)[:12]` — so identity is stable only if `timestamp` is. Every ingestor derives `timestamp` from the source itself rather than from wall clock: the message's own epoch for conversation exports (Claude/ChatGPT/Discord), and the file's own metadata (frontmatter date, creation time, or modification time, depending on the ingestor) for file-based sources. Re-running `creek ingest` against unchanged input reuses the same ids and writes nothing new, which is what lets `creek process` be safe to run on a cron.
