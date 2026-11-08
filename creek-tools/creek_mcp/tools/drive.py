@@ -593,7 +593,8 @@ def _confined_staged_file(staging: Path, entry: object) -> Path | None:
     The sidecar lives in the vault rather than in code, so each entry is
     checked as untrusted: a relative POSIX path that resolves inside
     *staging* and names a file that is still there. A file a Drive deletion
-    has since removed simply drops out.
+    has since removed simply drops out, and so does an entry the OS cannot
+    resolve at all.
 
     Args:
         staging: Where the mirror lives.
@@ -605,9 +606,14 @@ def _confined_staged_file(staging: Path, entry: object) -> Path | None:
     if not isinstance(entry, str):
         return None
     candidate = staging / entry
-    if not candidate.resolve().is_relative_to(staging.resolve()):
+    try:
+        confined = candidate.resolve().is_relative_to(staging.resolve())
+        return candidate if confined and candidate.is_file() else None
+    except (OSError, ValueError):
+        # A path the OS cannot even stat (an embedded NUL, a name past the
+        # length limit) is just another unusable entry: dropping it keeps one
+        # bad line from wedging every later sync on the same sidecar.
         return None
-    return candidate if candidate.is_file() else None
 
 
 def _load_deferred(vault_path: Path, staging: Path) -> tuple[Path, ...]:

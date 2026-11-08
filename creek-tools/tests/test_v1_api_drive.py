@@ -2504,7 +2504,20 @@ def test_the_deferred_ingest_record_admits_only_files_still_inside_staging(
     assert sidecar.parent == (vault_path / _GDRIVE_LEDGER_RELPATH).parent
 
 
-@pytest.mark.parametrize("payload", ["not json {", '{"kept.md": true}'])
+#: A sidecar entry longer than any filesystem's name limit (ENAMETOOLONG).
+_OVERLONG_ENTRY_LENGTH: Final[int] = 5000
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json {",
+        '{"kept.md": true}',
+        json.dumps(["kept\u0000.md"]),
+        json.dumps(["x" * _OVERLONG_ENTRY_LENGTH]),
+    ],
+    ids=["corrupt-json", "wrong-shape", "embedded-nul", "overlong-name"],
+)
 def test_an_unusable_deferred_ingest_record_defers_nothing(
     tmp_path: Path,
     payload: str,
