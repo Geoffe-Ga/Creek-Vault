@@ -6,8 +6,8 @@ a fragment between a ``creek.classify`` pass's load and its write. Losing the
 acquisition race is the fixed, content-free ``vault content mutation busy``
 refusal — audited, like every other purge outcome, because this surface
 promises an audit row for every call. A lock timeout raised *under* the hold
-is not contention for the boundary and keeps its ``purge engine failed: …``
-reason.
+is not contention for the boundary and keeps the fixed ``purge engine failed``
+reason (#2084), its own text withheld.
 """
 
 from __future__ import annotations
@@ -198,7 +198,7 @@ def test_a_timeout_under_the_purge_hold_is_not_reported_as_busy(
     monkeypatch: pytest.MonkeyPatch,
     tool: str,
 ) -> None:
-    """Only acquisition is busy; an inner timeout keeps its engine-failure reason.
+    """Only acquisition is busy; an inner timeout is the fixed engine failure.
 
     By the time an inner lock times out the purge may already have deleted
     files, so telling the caller the vault was busy would be a false account
@@ -215,7 +215,12 @@ def test_a_timeout_under_the_purge_hold_is_not_reported_as_busy(
 
     response = invoke(vault)
 
-    assert response["status"] == "refused"
-    assert response["reason"] == f"purge engine failed: {_INNER_DETAIL}"
+    assert response == {
+        "status": "refused",
+        "tool": tool,
+        "reason": "purge engine failed",
+    }
+    assert response["reason"] != CONTENT_MUTATION_BUSY_REASON
+    assert _INNER_DETAIL not in repr(response)
     assert len(_audit_lines(vault, tool)) == 1
     assert _content_lock_is_held(vault) is False
