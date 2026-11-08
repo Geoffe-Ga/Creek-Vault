@@ -25,6 +25,7 @@ import json
 from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -51,8 +52,6 @@ from tests.v1_api_support import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
-
-    import httpx
 
 _OK: Final[int] = 200
 _INVALID: Final[int] = 422
@@ -601,6 +600,65 @@ def test_an_unavailable_provider_is_temporarily_unavailable_and_names_no_message
     assert envelope(response)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
     assert internal_detail not in response.text
     assert "RuntimeError" not in response.text
+
+
+def test_an_ollama_transport_error_is_temporarily_unavailable_and_names_no_url(
+    vault: Path,
+) -> None:
+    """An ``httpx`` dial failure is the same retryable ``503``, not a ``500`` (#2083).
+
+    ``httpx.HTTPError`` is not a ``RuntimeError``, so before #2083 it escaped
+    ``reflect_tool`` and the error boundary answered ``500 internal_error`` —
+    the wrong code for an outage ``docs/api.md`` promises is retryable.
+
+    Args:
+        vault: A seeded vault.
+    """
+    marker = "zz-ollama-internals-2083-zz"
+    url = "http://10.9.8.7:11434/api/generate"
+
+    class _Unreachable(_FactorySpy):
+        """A factory whose completion cannot reach its Ollama endpoint."""
+
+        def __call__(
+            self, tier: PrivacyTier, *, max_tokens: int
+        ) -> Callable[[str], str]:
+            """Build a completion that fails to connect.
+
+            Args:
+                tier: The routing tier, recorded.
+                max_tokens: The requested output ceiling, recorded.
+
+            Returns:
+                A completion callable that always raises.
+            """
+            self.tiers.append(tier)
+            self.max_tokens.append(max_tokens)
+
+            def _dial(prompt: str) -> str:
+                """Record the prompt, then fail the transport.
+
+                Args:
+                    prompt: The reflection prompt.
+
+                Raises:
+                    httpx.ConnectError: Always, naming the URL and the marker.
+                """
+                self.prompts.append(prompt)
+                msg = f"connect failed for url {url!r} {marker}"
+                raise httpx.ConnectError(msg)
+
+            return _dial
+
+    spy = _Unreachable()
+    response = _post(vault, ceiling="open", factory=spy)
+
+    assert len(spy.prompts) == 1, "the dial never happened; the test is vacuous"
+    assert response.status_code == _UNAVAILABLE
+    assert envelope(response)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert marker not in response.text
+    assert url not in response.text
+    assert "ConnectError" not in response.text
 
 
 # --------------------------------------------------------------------------- #

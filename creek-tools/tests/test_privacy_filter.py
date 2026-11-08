@@ -14,11 +14,9 @@ import frontmatter
 import pytest
 
 from creek.audit import AuditLog
-from creek.classify import privacy_filter
 from creek.classify.privacy_filter import (
     PRIVACY_AUDIT_RELPATH,
     PrivacyTierOverride,
-    ancestry_tiers,
     build_ancestor_index,
     filter_fragments_by_tier,
     max_source_tier,
@@ -38,6 +36,7 @@ from creek.models import (
     PrivacyTier,
     SourcePlatform,
 )
+from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -551,17 +550,34 @@ def test_chain_tiers_surveys_every_requested_id_before_answering() -> None:
     assert set(index.chain_tiers(["l2", "l1"])) == tiers
 
 
-def test_ancestry_tiers_reads_the_vault_in_one_walk(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The MCP entry point surveys ancestry with a single ``01-Fragments`` pass.
+def _vault_chain_tiers(vault: Path, fragment_ids: list[str]) -> list[PrivacyTier]:
+    """Rank *fragment_ids*' ancestry over an index built from a real vault walk.
 
-    ``iter_vault_fragments`` rglobs and parses every file under the root
-    before returning, so a second pass is a real 35k-vault regression rather
-    than a micro-optimisation.
+    The composition ``creek.compile.engine`` performs (#930): one
+    :func:`creek.vault.reader.iter_vault_fragments` pass, the whole corpus
+    into :func:`build_ancestor_index`, then
+    :meth:`~creek.classify.privacy_filter.AncestorIndex.chain_tiers`. It
+    stands in for the walk-it-yourself survey #930 deleted, so the
+    loader-backed rule coverage that survey's tests carried is kept.
+
+    Args:
+        vault: Vault root; fragments are read from ``01-Fragments``.
+        fragment_ids: The ids to rank.
+
+    Returns:
+        The tiers to reduce over, as ``chain_tiers`` returns them.
     """
-    root = tmp_path / "01-Fragments" / "Notes"
+    return build_ancestor_index(
+        (fragment, raw)
+        for _path, fragment, _body, raw in iter_vault_fragments(
+            vault / "01-Fragments",
+        )
+    ).chain_tiers(fragment_ids)
+
+
+def _write_ancestry_files(vault: Path) -> None:
+    """Write an ``intimate`` ancestor and its ``open`` child under ``01-Fragments``."""
+    root = vault / "01-Fragments" / "Notes"
     root.mkdir(parents=True)
     for frag_id, tier, parent in (
         ("frag-anc", PrivacyTier.INTIMATE, None),
@@ -571,22 +587,22 @@ def test_ancestry_tiers_reads_the_vault_in_one_walk(
         post = frontmatter.Post(content="body", **fragment.model_dump(mode="json"))
         (root / f"{frag_id}.md").write_text(frontmatter.dumps(post), encoding="utf-8")
 
-    real = privacy_filter.iter_vault_fragments
-    calls: list[Path] = []
 
-    def _counting(
-        walk_root: Path,
-    ) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
-        """Record the walked root and delegate to the real loader."""
-        calls.append(walk_root)
-        return real(walk_root)
+def test_an_index_from_a_real_walk_ranks_the_unnamed_ancestor(tmp_path: Path) -> None:
+    """Loader-backed records carry the parent link and tier the ranking needs.
 
-    monkeypatch.setattr(privacy_filter, "iter_vault_fragments", _counting)
+    The rule tests above build the index from in-memory pairs. This one feeds
+    it what the shared loader actually yields from disk, so a loader change
+    that dropped ``parent_id`` or misread a tier would surface here rather
+    than only at the compile gate. Only the child is named; the ancestor is
+    found through the corpus-wide index.
+    """
+    _write_ancestry_files(tmp_path)
 
-    tiers = ancestry_tiers(tmp_path, ["frag-kid"])
+    tiers = _vault_chain_tiers(tmp_path, ["frag-kid"])
 
-    assert calls == [tmp_path / "01-Fragments"]
     assert PrivacyTier.INTIMATE in tiers
+    assert PrivacyTier.OPEN in tiers
 
 
 def test_source_tiers_stays_ancestry_blind(tmp_path: Path) -> None:
@@ -598,18 +614,10 @@ def test_source_tiers_stays_ancestry_blind(tmp_path: Path) -> None:
     are deliberately two functions; this pins the difference so a future
     "de-duplication" has to argue with a test.
     """
-    root = tmp_path / "01-Fragments" / "Notes"
-    root.mkdir(parents=True)
-    for frag_id, tier, parent in (
-        ("frag-anc", PrivacyTier.INTIMATE, None),
-        ("frag-kid", PrivacyTier.OPEN, "frag-anc"),
-    ):
-        fragment, _raw = _node(frag_id, tier=tier, parent_id=parent)
-        post = frontmatter.Post(content="body", **fragment.model_dump(mode="json"))
-        (root / f"{frag_id}.md").write_text(frontmatter.dumps(post), encoding="utf-8")
+    _write_ancestry_files(tmp_path)
 
     assert source_tiers(tmp_path, ["frag-kid"]) == [PrivacyTier.OPEN]
-    assert PrivacyTier.INTIMATE in ancestry_tiers(tmp_path, ["frag-kid"])
+    assert PrivacyTier.INTIMATE in _vault_chain_tiers(tmp_path, ["frag-kid"])
 
 
 def _write_node(root: Path, frag_id: str, tier: PrivacyTier) -> None:

@@ -305,6 +305,10 @@ class ExporterConnector:
         Raises:
             EscapingSymlinkError: When the staged tree contains a symlink
                 resolving outside it. Announced first, then re-raised.
+            ContentMutationBusyError: When another writer held the vault
+                content-mutation lock past the bounded wait (#2086). Raised
+                before :meth:`run` saves the cursor, so a busy run leaves it
+                where it was and the next run re-exports the same window.
         """
         from creek._containment import EscapingSymlinkError
         from creek.ingest.discord import (

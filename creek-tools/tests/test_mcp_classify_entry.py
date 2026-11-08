@@ -34,6 +34,9 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
+from creek.vault.mutations import content_mutation_lock_path
+from creek.vault.reader import iter_vault_fragments
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.policy import Transport
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
@@ -44,7 +47,10 @@ from creek_mcp.tools.classify_entry import TOOL_NAME, entry_classification_tool
 from creek_mcp.tools.journal import journal_ingest_tool
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
+
+    from creek.models import Fragment
 
 _TS = "2026-06-20T10:00:00+00:00"
 
@@ -481,7 +487,7 @@ def test_a_fragment_with_no_privacy_tier_key_fails_closed_to_intimate(
     """A *missing* key ranks INTIMATE, distinctly from an explicit unclassified.
 
     This is #1033, and it is the whole reason the gate goes through
-    ``source_tiers``/``fragment_tier`` rather than reading
+    ``fragment_tier`` on the raw frontmatter rather than reading
     ``fragment.privacy_tier`` off the validated model — which defaults to
     ``unclassified`` (rank 1) and therefore fails **open** at
     ``ceiling=personal``. The contrast below is what makes that non-vacuous:
@@ -783,3 +789,210 @@ def test_the_tool_writes_nothing_under_01_fragments(tmp_path: Path) -> None:
     )
     assert refused["status"] == "refused"
     assert _fragment_digests(vault) == before
+
+
+_LOCK_PROBE_TIMEOUT_SECONDS = 0.0
+"""Wait budget for the same-thread content-lock probe: none at all.
+
+:func:`creek._fslock.vault_lock` guards each lock file with a non-reentrant
+per-path :class:`threading.Lock`, so a probe from the thread that already holds
+the lock cannot take it and times out at once. That makes "is the content lock
+held right now?" a deterministic question with no second thread to join — the
+same probe ``tests/test_mcp_write_tools.py`` uses for #930.
+"""
+
+_ENTRY_WALK_TARGETS = (
+    "creek.classify.privacy_filter.iter_vault_fragments",
+    "creek_mcp.tools.classify_entry.iter_vault_fragments",
+)
+"""Every module binding through which ``creek.classify.entry`` could walk.
+
+Patched with ``raising=False`` so a binding the tool stops importing does not
+error the counter, and a binding it starts importing is already counted.
+"""
+
+
+def _content_lock_is_held(vault: Path) -> bool:
+    """Return whether the content-mutation lock is held by this thread now."""
+    try:
+        with vault_lock(
+            content_mutation_lock_path(vault),
+            timeout=_LOCK_PROBE_TIMEOUT_SECONDS,
+        ):
+            return False
+    except VaultLockTimeoutError:
+        return True
+
+
+def _count_entry_walks(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[Path],
+    on_call: Callable[[int], None] | None = None,
+) -> None:
+    """Count every ``01-Fragments`` walk a ``creek.classify.entry`` call makes.
+
+    The shape of ``tests/test_mcp_write_tools.py::_count_walks`` (#930). The
+    real loader materialises the whole directory into a list before it
+    returns, so *on_call* runs strictly **after** the records of that walk
+    exist: a file it rewrites can only be seen by a later walk.
+
+    Args:
+        monkeypatch: Used to replace each binding in
+            :data:`_ENTRY_WALK_TARGETS`.
+        calls: Receives the root of every walk, in order.
+        on_call: Optional hook run after each walk with the walk count so far.
+    """
+    real = iter_vault_fragments
+
+    def _walk(root: Path) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
+        """Delegate to the real loader, then record the walk and run the hook."""
+        records = real(root)
+        calls.append(root)
+        if on_call is not None:
+            on_call(len(calls))
+        return records
+
+    for target in _ENTRY_WALK_TARGETS:
+        monkeypatch.setattr(target, _walk, raising=False)
+
+
+def test_classify_entry_gates_and_resolves_from_one_walk_inside_the_content_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One exhaustive walk serves both the gate and the answer, under the lock.
+
+    Before #2068 the gate read the tier through ``source_tiers`` (walk 1) and
+    the record came from a second ``iter_vault_fragments`` pass (walk 2), with
+    no lock across either — so ``creek classify`` could re-tier the fragment
+    between them. The probe runs *inside* every walk, after its records exist,
+    which pins where the snapshot is taken and not merely how often.
+    """
+    vault = _vault(tmp_path)
+    fragment_id = _seed_classified_fragment(vault, external_id="once-1")
+    calls: list[Path] = []
+    held: list[bool] = []
+    _count_entry_walks(
+        monkeypatch, calls, lambda _walks: held.append(_content_lock_is_held(vault))
+    )
+
+    result = entry_classification_tool(
+        vault_path=vault,
+        entry_ref=fragment_id,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok", result
+    assert calls == [vault / "01-Fragments"]
+    assert held == [True], f"a classify.entry walk ran outside the lock: {held}"
+
+
+def _other(value: str, choices: tuple[str, ...]) -> str:
+    """Return the first of *choices* that differs from *value*."""
+    return next(choice for choice in choices if choice != value)
+
+
+def test_a_retier_after_the_first_walk_is_never_served_as_a_mixed_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-tier landing after the first walk cannot pair an old tier with new data.
+
+    The TOCTOU #2068 names. The hook rewrites the fragment the moment the first
+    walk has returned: tier ``open`` -> ``intimate`` plus a new frequency,
+    phase and method, which is what one ``creek classify`` write does. A
+    two-walk tool gates on the old ``open`` and then serves the *new*
+    classification under it — a response no single state of the vault ever
+    held. One snapshot answers either wholly from before the rewrite or not at
+    all.
+
+    The on-disk assertion is the anti-vacuity: the rewrite really happened, so
+    an unchanged answer is not explained by a hook that never fired.
+    """
+    vault = _vault(tmp_path)
+    fragment_id = _seed_classified_fragment(vault, external_id="mixed-1")
+    path = _fragment_path(vault, fragment_id)
+    before = frontmatter.load(path).metadata
+    frequency_block = before["frequency"]
+    wavelength_block = before["wavelength"]
+    assert isinstance(frequency_block, dict)
+    assert isinstance(wavelength_block, dict)
+    old_frequency = str(frequency_block["primary"])
+    old_phase = str(wavelength_block["phase"])
+    new_frequency = _other(old_frequency, ("F2", "F3"))
+    new_phase = _other(old_phase, ("peaking", "withdrawal"))
+
+    def _retier(walks: int) -> None:
+        """Rewrite the fragment as one classify write would, after walk 1 only."""
+        if walks == 1:
+            _rewrite_metadata(
+                path,
+                privacy_tier="intimate",
+                frequency={**frequency_block, "primary": new_frequency},
+                wavelength={**wavelength_block, "phase": new_phase},
+                classification_method="llm",
+            )
+
+    _count_entry_walks(monkeypatch, [], _retier)
+
+    result = entry_classification_tool(
+        vault_path=vault,
+        entry_ref=fragment_id,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    after = frontmatter.load(path).metadata
+    assert after["privacy_tier"] == "intimate"
+    assert after["frequency"] == {**frequency_block, "primary": new_frequency}
+    assert not (
+        result.get("privacy_tier") == "open"
+        and result.get("frequency") == new_frequency
+    ), f"served a mixed snapshot: {result}"
+    if result["status"] == "refused":
+        assert result["reason"] == GENERIC_ABOVE_CEILING_REASON
+    else:
+        assert result["status"] == "ok"
+        assert result["privacy_tier"] == "open"
+        assert result["frequency"] == old_frequency
+        assert result["phase"] == old_phase
+        assert result["classification_method"] == "rules"
+
+
+@pytest.mark.parametrize(
+    "duplicate_name",
+    ["0000-duplicate.md", "zzzz-duplicate.md"],
+    ids=["intimate-copy-walked-first", "intimate-copy-walked-last"],
+)
+def test_duplicate_ids_gate_on_the_most_sensitive_file(
+    tmp_path: Path,
+    duplicate_name: str,
+) -> None:
+    """Two files carrying one id gate on the MOST sensitive of them.
+
+    The record served is the first in walk order, but the gate must not be:
+    an ``open`` copy walked first must not admit an ``intimate`` twin at
+    ``ceiling=open``. Both orderings are run so a reduction that took the
+    first match's tier — or the last — fails one of them.
+    """
+    vault = _vault(tmp_path)
+    fragment_id = _ingest(vault, content=_UNCLASSIFIABLE, external_id="dup-1")
+    original = _fragment_path(vault, fragment_id)
+    duplicate = original.with_name(duplicate_name)
+    duplicate.write_bytes(original.read_bytes())
+    _rewrite_metadata(duplicate, privacy_tier="intimate")
+
+    refused = entry_classification_tool(
+        vault_path=vault,
+        entry_ref=fragment_id,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    admitted = entry_classification_tool(
+        vault_path=vault,
+        entry_ref=fragment_id,
+        privacy_tier_ceiling=TierCeiling.INTIMATE,
+    )
+
+    assert refused["status"] == "refused"
+    assert refused["reason"] == GENERIC_ABOVE_CEILING_REASON
+    assert admitted["status"] == "ok"
+    assert admitted["privacy_tier"] == "intimate"

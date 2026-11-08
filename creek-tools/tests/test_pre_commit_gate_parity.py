@@ -9,9 +9,10 @@ throughout the repository.  A green canonical gate could therefore be followed
 by a pre-commit failure with no defect in the diff.
 
 These configuration tests keep pre-commit on the provisioned toolchain, exempt
-generated checksum manifests from entropy scanning, and pin the deliberately
-narrow scanners to today's documented scope. Issue #965 owns widening that
-scope after its existing findings are resolved.
+generated checksum manifests from entropy scanning, and pin every scanner hook
+to its canonical script's scope. Issue #965 widened refurb and interrogate to
+``creek_mcp/`` once their findings there were resolved; tryceratops stays on
+``creek/`` alone until #965's remaining backlog is cleared.
 """
 
 from __future__ import annotations
@@ -27,8 +28,12 @@ from tests.shell_command_support import PRE_COMMIT_CONFIG
 PYPROJECT = PRE_COMMIT_CONFIG.parent / "pyproject.toml"
 
 _CANONICAL_SCANNERS = {
-    "refurb": "creek-tools/scripts/lint-refurb.sh",
     "tryceratops": "creek-tools/scripts/lint-tryceratops.sh",
+}
+
+# Scanners whose canonical scripts cover both packages since #965.
+_WIDENED_SCANNERS = {
+    "refurb": "creek-tools/scripts/lint-refurb.sh",
     "interrogate": "creek-tools/scripts/lint-interrogate.sh",
 }
 
@@ -113,7 +118,7 @@ def test_lock_backed_hooks_are_not_described_as_independent_installs() -> None:
     _CANONICAL_SCANNERS.items(),
 )
 def test_narrow_scanners_reuse_their_canonical_scope(hook_id: str, entry: str) -> None:
-    """Advisory hooks stay on ``creek/`` until #965 deliberately widens them."""
+    """Tryceratops stays on ``creek/`` until #965's remaining backlog is fixed."""
     repo, hook = _hooks()[hook_id]
 
     assert repo == "local"
@@ -124,4 +129,23 @@ def test_narrow_scanners_reuse_their_canonical_scope(hook_id: str, entry: str) -
     scope = re.compile(str(hook["files"]))
     assert scope.search("creek-tools/creek/example.py")
     assert not scope.search("creek-tools/creek_mcp/example.py")
+    assert not scope.search("creek-tools/tests/test_example.py")
+
+
+@pytest.mark.parametrize(
+    ("hook_id", "entry"),
+    _WIDENED_SCANNERS.items(),
+)
+def test_widened_scanner_pre_commit_covers_creek_mcp(hook_id: str, entry: str) -> None:
+    """A staged creek_mcp/ change re-runs the gates that now scan it (#965)."""
+    repo, hook = _hooks()[hook_id]
+
+    assert repo == "local"
+    assert hook["entry"] == entry
+    assert hook["language"] == "system"
+    assert hook["pass_filenames"] is False
+    assert hook["types"] == ["python"]
+    scope = re.compile(str(hook["files"]))
+    assert scope.search("creek-tools/creek/example.py")
+    assert scope.search("creek-tools/creek_mcp/example.py")
     assert not scope.search("creek-tools/tests/test_example.py")

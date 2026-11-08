@@ -79,6 +79,7 @@ __all__ = [
     "ANTHROPIC_CLOUD_WARNING",
     "DEFAULT_MODELS",
     "POOL_IDENTITY_SCHEME",
+    "PROVIDER_CALL_FAILURES",
     "AnthropicCompletion",
     "AnthropicProvider",
     "Completion",
@@ -219,6 +220,40 @@ class RequestKeyRejectedError(RuntimeError):
     :func:`_error_detail` gives any request-scoped failure, and the vendor
     error is never chained.
     """
+
+
+REQUEST_KEY_REJECTED_REASON: Final[str] = (
+    "the writer's request-scoped provider key was refused by its vendor"
+)
+"""Why a request-keyed pass stopped on :class:`RequestKeyRejectedError` (#1877).
+
+Fixed text: never the key, the vendor's message or its status. ``creek.classify``
+and ``creek.draft`` both answer it (#2073), and the ``/v1`` job worker matches
+this exact string to publish ``failure_code: request_key_rejected``, so it is a
+constant, not prose. It lives beside the exception rather than in either tool
+module, so neither tool has to import the other (#1772).
+"""
+
+PROVIDER_CALL_FAILURES: Final[tuple[type[Exception], ...]] = (
+    RuntimeError,
+    httpx.HTTPError,
+)
+"""What a dialled provider raises when the call fails, for an ``except`` clause.
+
+The cloud SDK adapters here raise ``RuntimeError`` (and its subclasses
+:class:`ProviderRateLimitError`, :class:`RequestKeyRejectedError` and the
+router's ``IntimateRoutingError``); :class:`OllamaProvider` lets ``httpx``
+raise, and :class:`~creek.classify.llm.local_boundary.NonLoopbackOllamaError`
+is an ``httpx.TransportError``. ``httpx.HTTPError`` is not a ``RuntimeError``,
+so a surface that caught only the latter let an Ollama failure escape: FastMCP
+served it, URL included, as ``isError`` text, and ``/v1`` answered ``500``
+instead of its retryable ``503`` (#2073, #2083).
+
+A surface that must catch provider failures catches this tuple, so the next
+transport swap moves one line. It lives here rather than in a tool module so no
+tool imports another (#1772). Order a narrower clause for a subclass that wants
+its own answer (a cap, a refused key) *before* the one that catches this.
+"""
 
 
 def _retry_after_seconds(exc: object) -> float | None:

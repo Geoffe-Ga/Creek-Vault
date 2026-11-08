@@ -251,6 +251,74 @@ creek ingest --type markdown    --input ~/staging/gdrive --vault ~/Obsidian/Cree
 
 Subsequent `--download` runs are **incremental** — unchanged files are skipped, deletions are mirrored as soft deletes (the staging file is removed; the vault fragment isn't, so you can choose whether to `creek purge source` it).
 
+## Concurrent writers
+
+`creek ingest` holds the vault's content-mutation lock
+(`00-Creek-Meta/locks/content-mutations.lock`) for its whole run, the same lock
+`creek classify`, `creek link`, `creek compile` and the remote journal and
+upload paths take, so none of them reads a `01-Fragments` snapshot an ingest is
+still writing ([#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079)).
+
+- If another writer holds the lock for more than 10 seconds, `creek ingest`
+  prints one line — `vault content mutation busy: another Creek writer holds
+  this vault; retry once it finishes.` — exits **1**, and writes nothing. Rerun
+  it once the other writer finishes.
+- `creek sync --tier A` does not exit when a source's *ingest* meets
+  contention: that source is marked `skipped: vault content mutation busy`, the
+  remaining sources are tried, and the next tick's incremental ingest picks it
+  up. The tick's rules-classify pass takes the same lock with the same
+  10-second bound; if it is busy too, it is skipped rather than raised, the
+  console prints `[sync] classify skipped: vault content mutation busy`, and
+  `last-run.json` records it under a top-level `skipped_steps` list beside the
+  per-source records. The tick exits **0** either way
+  ([#2087](https://github.com/Geoffe-Ga/Creek-Vault/issues/2087)).
+- `creek sync --tier B` records contention the same way, in this order: a busy
+  LLM classify is recorded and the tick stops there — link and the index
+  rebuild do not run, because link waits on the same lock and would very
+  likely spend a second 10-second wait on the same holder, and the next tick
+  re-derives both. A busy link (after a classify that ran) is recorded and the
+  index still rebuilds. `creek sync --status` prints each recorded line as
+  `Skipped last tick: …`, even when no source ran.
+- `creek classify`, `creek link`, `creek compile`, `creek fill --upgrade` and
+  `creek process` print the same busy line and exit **1** when the engine they
+  call cannot take the lock. The engines (`run_classify`, `run_link`,
+  `compile_to_vault`) take it through `hold_content_mutation` and raise
+  `ContentMutationBusyError` on that acquisition timeout. `creek process` meets
+  the lock at its link stage, after its earlier stages ran; every one of these
+  commands is idempotent, so rerunning it converges. `creek fill`'s per-step
+  link stages stay non-fatal: a busy one is reported as `failed` and the
+  sequence continues.
+- `creek review` is unchanged: a manual decision whose save meets contention
+  is recorded as `failed to persist …` on the session's error list (the lock
+  timeout is an `OSError`), and the review carries on.
+- Only a timeout *acquiring* the lock is reported as busy. A lock timeout
+  raised under the hold — the writer's `.id-index.lock`, say, after fragments
+  may already be on disk — propagates as `VaultLockTimeoutError`.
+- A long ingest holds the lock for its whole run, so remote journal writes,
+  uploads, classify and link calls answer `vault content mutation busy` (503
+  over `/v1`) until it finishes.
+- The vault is validated before the lock is taken: a mistyped `--vault` still
+  exits `Vault unavailable` and gains no `00-Creek-Meta/locks/` directory.
+- The vault migrations take the lock too
+  ([#2086](https://github.com/Geoffe-Ga/Creek-Vault/issues/2086)):
+  `creek ingest --pin-source-ids` (its `--dry-run` included, because a plan
+  read mid-ingest is wrong), `--refresh-dates` and `--refresh-ai-chat` each
+  hold it around the migration, after the `Vault path does not exist` check,
+  and print the same busy line and exit **1** under contention, having
+  migrated nothing.
+- `creek process` holds the lock across stages 2-4 — ingest, classify and the
+  vault write — and releases it before stage 5, because `run_link` takes the
+  same lock itself and it is not reentrant. Contention at stages 2-4 is the
+  busy line and exit **1** with nothing written; contention at stage 5 comes
+  after stages 2-4 wrote, and a rerun converges.
+- Discord ingest (all three modes) holds the lock around its fragment writes;
+  see [Discord capture modes](discord-capture-modes.md#concurrent-writers).
+  `creek purge` and the `creek.purge.*` tools hold it around the purge itself;
+  see [Cleaning and purge](cleaning-and-purge.md#concurrent-writers).
+- With that, every Creek command and tool that writes `01-Fragments` holds the
+  lock while it writes. Hand edits in a text editor are the one writer it
+  cannot coordinate.
+
 ## Idempotency
 
 Fragment IDs are deterministic — `SHA-256(source, timestamp, content)[:12]` — so identity is stable only if `timestamp` is. Every ingestor derives `timestamp` from the source itself rather than from wall clock: the message's own epoch for conversation exports (Claude/ChatGPT/Discord), and the file's own metadata (frontmatter date, creation time, or modification time, depending on the ingestor) for file-based sources. Re-running `creek ingest` against unchanged input reuses the same ids and writes nothing new, which is what lets `creek process` be safe to run on a cron.

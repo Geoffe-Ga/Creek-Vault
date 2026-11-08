@@ -9,20 +9,28 @@ not return them today.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from creek._fslock import VaultLockTimeoutError
 from creek.classify.classify_engine import (
+    LLM_PROVIDER_UNAVAILABLE_REASON,
     LLMProviderUnavailableError,
     RequestScopedClassifier,
     run_classify,
 )
 from creek.classify.constants import LLM_METHOD
-from creek.classify.llm.providers import RequestKeyRejectedError
+from creek.classify.llm.providers import (
+    REQUEST_KEY_REJECTED_REASON,
+    RequestKeyRejectedError,
+)
 from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
 from creek.config import load_vault_config
 from creek.models import PrivacyTier
-from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.model_pin import (
     build_request_scoped_provider,
@@ -44,21 +52,15 @@ if TYPE_CHECKING:
     from creek.config import CreekConfig
 
 TOOL_NAME = "creek.classify"
+
+logger = logging.getLogger(__name__)
+
 _VALID_METHODS = ("rules", "llm")
 _UNPINNED_DETAIL = (
     "only the pinned local model may classify while a model package is "
     "configured or the server runs in container mode"
 )
 """Why a pinned-mode LLM pass refused. Fixed text: it never names the URL."""
-
-REQUEST_KEY_REJECTED_REASON = (
-    "the writer's request-scoped provider key was refused by its vendor"
-)
-"""Why a request-keyed LLM pass stopped (#1877). Fixed text: never the key.
-
-The ``/v1`` job worker matches this exact string to publish
-``failure_code: request_key_rejected``, so it is a constant, not prose.
-"""
 
 
 def _require_pinned_classifier(config: CreekConfig) -> None:
@@ -216,7 +218,8 @@ def _rules_fallback(
         retier: Passed through to the rules pass.
         privacy_tier_ceiling: Passed through to the rules pass.
         consumer: Passed through to the rules pass.
-        reason: Why the ``llm`` pass was unavailable — the refusal's text.
+        reason: Why the ``llm`` pass was unavailable — the fixed
+            :data:`LLM_PROVIDER_UNAVAILABLE_REASON`, never the engine's text.
 
     Returns:
         The rules pass's result, marked with ``fallback_from`` and
@@ -301,9 +304,9 @@ def classify_tool(
 
     Returns:
         A structured result: per-method counts on success, or a
-        refusal for an unknown method, an unreachable provider, or a
-        request-scoped key its vendor refused
-        (:data:`REQUEST_KEY_REJECTED_REASON`, #1877).
+        refusal for an unknown method, an unreachable provider
+        (:data:`LLM_PROVIDER_UNAVAILABLE_REASON`, #2073), or a request-scoped
+        key its vendor refused (:data:`REQUEST_KEY_REJECTED_REASON`, #1877).
     """
     if method not in _VALID_METHODS:
         return refusal_response(
@@ -335,7 +338,12 @@ def classify_tool(
     except LLMProviderUnavailableError as exc:
         # The engine refuses to iterate when the configured LLM provider is
         # unreachable. Translate the no-work-started condition to a stable
-        # shape instead of an unhandled ``RuntimeError`` traceback.
+        # shape instead of an unhandled ``RuntimeError`` traceback. The
+        # engine's message is CLI remediation, so it rides only the operator
+        # record's traceback; the caller gets the fixed reason (#2073).
+        logger.exception(
+            "classify refused as provider-unavailable: %s", type(exc).__name__
+        )
         if fallback_to_rules and method == LLM_METHOD:
             return _rules_fallback(
                 vault_path=vault_path,
@@ -343,14 +351,18 @@ def classify_tool(
                 retier=retier,
                 privacy_tier_ceiling=privacy_tier_ceiling,
                 consumer=consumer,
-                reason=str(exc),
+                reason=LLM_PROVIDER_UNAVAILABLE_REASON,
             )
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
-            reason=str(exc),
+            reason=LLM_PROVIDER_UNAVAILABLE_REASON,
         )
-    except VaultLockTimeoutError:
+    except (ContentMutationBusyError, VaultLockTimeoutError):
+        # Acquiring the content lock past its wait is ContentMutationBusyError
+        # (#2087). The bare-timeout arm is kept on purpose: a lock timeout
+        # under the engine's hold still reads busy, as it always has, rather
+        # than escaping as a FastMCP error or a /v1 job `internal_error`.
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,

@@ -14,11 +14,13 @@ only come from the pin's provider check, not from a missing key.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 import yaml
 
+from creek.classify.classify_engine import LLM_PROVIDER_UNAVAILABLE_REASON
 from creek.classify.llm.consent import CLOUD_CONSENT_ENV
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV
 from creek.classify.llm.providers import build_provider
@@ -321,6 +323,42 @@ def _classify(vault: Path, method: str = "llm") -> dict[str, Any]:
     return classify_tool(vault_path=vault, method=method)
 
 
+_CLASSIFY_LOGGER: Final = "creek_mcp.tools.classify"
+_UNPINNED_REASON: Final = (
+    "LLM provider {provider!r} is unavailable: only the pinned local model "
+    "may classify while a model package is configured or the server runs "
+    "in container mode"
+)
+
+
+def _refused_engine_messages(
+    result: dict[str, Any], caplog: pytest.LogCaptureFixture, provider: str
+) -> list[str]:
+    """Assert *result* is the fixed refusal; return the logged engine messages.
+
+    Since #2073 the caller sees only
+    :data:`~creek.classify.classify_engine.LLM_PROVIDER_UNAVAILABLE_REASON`, so
+    *which* refusal fired is read from the operator record's traceback — the
+    engine exception's own message, provider name included.
+
+    Args:
+        result: The classify tool's return value.
+        caplog: pytest's log capture.
+        provider: The configured provider, which the reason must not name.
+
+    Returns:
+        The message of every exception logged on the classify tool's logger.
+    """
+    assert result["status"] == "refused"
+    assert result["reason"] == LLM_PROVIDER_UNAVAILABLE_REASON
+    assert provider not in result["reason"]
+    return [
+        str(record.exc_info[1])
+        for record in caplog.records
+        if record.name == _CLASSIFY_LOGGER and record.exc_info is not None
+    ]
+
+
 def test_classify_llm_runs_against_the_pinned_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -335,7 +373,10 @@ def test_classify_llm_runs_against_the_pinned_digest(
 
 @pytest.mark.parametrize("provider", sorted(_CLOUD_KEYS))
 def test_classify_llm_refuses_a_keyed_cloud_stage_in_container_mode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    provider: str,
 ) -> None:
     """Container mode refuses cloud classification even with a key and consent."""
     _isolate(monkeypatch, tmp_path)
@@ -344,15 +385,18 @@ def test_classify_llm_refuses_a_keyed_cloud_stage_in_container_mode(
     tags = _Tags(monkeypatch, _served())
     vault = _cloud_vault(tmp_path, monkeypatch, provider, "classification")
 
+    caplog.set_level(logging.WARNING, logger=_CLASSIFY_LOGGER)
+
     result = _classify(vault)
 
-    assert result["status"] == "refused"
-    assert result["reason"].startswith(f"LLM provider {provider!r} is unavailable: ")
+    assert _refused_engine_messages(result, caplog, provider) == [
+        _UNPINNED_REASON.format(provider=provider)
+    ]
     assert tags.urls == []
 
 
 def test_classify_llm_refuses_another_model_when_pinned(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A classification stage on another local model is refused under a pin."""
     _isolate(monkeypatch, tmp_path)
@@ -360,10 +404,13 @@ def test_classify_llm_refuses_another_model_when_pinned(
     _Tags(monkeypatch, _tags({"name": "creek-other-model:q4", "digest": "d" * 64}))
     vault = _vault(tmp_path, "classification", model="creek-other-model:q4")
 
+    caplog.set_level(logging.WARNING, logger=_CLASSIFY_LOGGER)
+
     result = _classify(vault)
 
-    assert result["status"] == "refused"
-    assert result["reason"].startswith("LLM provider 'ollama' is unavailable: ")
+    assert _refused_engine_messages(result, caplog, "ollama") == [
+        _UNPINNED_REASON.format(provider="ollama")
+    ]
 
 
 def test_classify_rules_is_unaffected_by_the_pin(
@@ -384,11 +431,6 @@ def test_classify_rules_is_unaffected_by_the_pin(
 
 _KEYLESS_CLOUD: Final = ("anthropic", "openai", "gemini")
 _KEYLESS_ENVS: Final = ("GOOGLE_API_KEY", "GEMINI_API_KEY")
-_UNPINNED_REASON: Final = (
-    "LLM provider {provider!r} is unavailable: only the pinned local model "
-    "may classify while a model package is configured or the server runs "
-    "in container mode"
-)
 
 
 def _keyless_container(
@@ -415,7 +457,10 @@ def _keyless_container(
 
 @pytest.mark.parametrize("provider", _KEYLESS_CLOUD)
 def test_classify_llm_refuses_a_keyless_cloud_stage_as_a_structured_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    provider: str,
 ) -> None:
     """A keyless cloud stage is the usual refusal, never a bare exception."""
     from creek.classify.llm import providers as providers_mod
@@ -429,17 +474,19 @@ def test_classify_llm_refuses_a_keyless_cloud_stage_as_a_structured_refusal(
         return real_build(cfg)
 
     monkeypatch.setattr(providers_mod, "build_provider", _spy)
+    caplog.set_level(logging.WARNING, logger=_CLASSIFY_LOGGER)
 
     result = _classify(vault)
 
-    assert result["status"] == "refused"
-    assert result["reason"] == _UNPINNED_REASON.format(provider=provider)
+    assert _refused_engine_messages(result, caplog, provider) == [
+        _UNPINNED_REASON.format(provider=provider)
+    ]
     assert tags.urls == []
     assert built == [], "a pin-mode cloud stage is refused before it is built"
 
 
 def test_classify_llm_turns_a_failed_provider_build_into_the_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Any other build failure in a pin mode is the same structured refusal."""
     from creek.classify.llm import providers as providers_mod
@@ -454,11 +501,13 @@ def test_classify_llm_turns_a_failed_provider_build_into_the_refusal(
         raise RuntimeError(msg)
 
     monkeypatch.setattr(providers_mod, "build_provider", _fail)
+    caplog.set_level(logging.WARNING, logger=_CLASSIFY_LOGGER)
 
     result = _classify(_vault(tmp_path))
 
-    assert result["status"] == "refused"
-    assert result["reason"] == _UNPINNED_REASON.format(provider="ollama")
+    assert _refused_engine_messages(result, caplog, "ollama") == [
+        _UNPINNED_REASON.format(provider="ollama")
+    ]
     assert tags.urls == []
 
 

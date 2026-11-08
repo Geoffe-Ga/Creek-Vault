@@ -203,6 +203,35 @@ this docstring together.
 """
 
 
+def require_vault_marker(vault_path: Path) -> None:
+    """Refuse a directory that is not a Creek vault (GAP-003).
+
+    Looks for ``<vault>/00-Creek-Meta/creek_config.yaml`` — the per-vault
+    config file that ``creek init`` deploys and that survives every purge
+    operation. Its absence almost always means the operator typoed
+    ``--vault`` and is pointing at an unrelated directory with coincidentally
+    numeric-prefix folders. Reads only, so a caller can run it before taking
+    the content-mutation lock, whose acquisition creates
+    ``00-Creek-Meta/locks/`` (#2086).
+
+    Args:
+        vault_path: Candidate vault root.
+
+    Raises:
+        ValueError: When the marker file is not present. The message names
+            the absolute path of the file looked for so the operator can
+            diagnose the typo.
+    """
+    marker = vault_path.joinpath(*VAULT_MARKER_RELPATH)
+    if not marker.is_file():
+        msg = (
+            f"{vault_path} does not appear to be a Creek vault "
+            f"(missing marker file {marker}). Run `creek init "
+            f"--vault <path>` first, or fix the --vault argument."
+        )
+        raise ValueError(msg)
+
+
 def _warn_frontmatter_defeated_the_parser(path: Path, exc: BaseException) -> None:
     """Report a file whose frontmatter exhausted the YAML parser (#1455).
 
@@ -1605,28 +1634,14 @@ class PurgeEngine:
     def _require_vault_marker(self) -> None:
         """Refuse to operate on a directory that is not a Creek vault (GAP-003).
 
-        Looks for ``<vault>/00-Creek-Meta/creek_config.yaml`` — the
-        per-vault config file that ``creek init`` deploys and that
-        survives every purge operation. Its absence almost always
-        means the operator typoed ``--vault`` and is pointing at an
-        unrelated directory with coincidentally numeric-prefix
-        folders. Raising here, *before* the intent audit line is
-        written, prevents an entry from being committed to a
-        non-vault's would-be audit log.
+        Raising here, *before* the intent audit line is written, prevents
+        an entry from being committed to a non-vault's would-be audit log.
+        See :func:`require_vault_marker` for the check itself.
 
         Raises:
-            ValueError: When the marker file is not present. The
-                message names the absolute path of the file the engine
-                looked for so the operator can diagnose the typo.
+            ValueError: When the marker file is not present.
         """
-        marker = self.vault_path.joinpath(*VAULT_MARKER_RELPATH)
-        if not marker.is_file():
-            msg = (
-                f"{self.vault_path} does not appear to be a Creek vault "
-                f"(missing marker file {marker}). Run `creek init "
-                f"--vault <path>` first, or fix the --vault argument."
-            )
-            raise ValueError(msg)
+        require_vault_marker(self.vault_path)
 
     def _purge_cache_for(self, fragment_ids: list[str]) -> int:
         """Drop matching rows from the embeddings cache (GAP-001).

@@ -491,7 +491,7 @@ Modes are NOT emotions or textures — they are **functional stances** the self 
 | **Green** | Collaborate | Feel | Oversharing | Megalomania | Social Anxiety | Alienation | Isolation | Bitterness |
 | **Yellow** | Integrate | Do | Mischief | Chaos | Discord | Confusion | Bureaucracy | The Aftermath |
 | **Teal** | Integrate | Feel | Delusion | Psychosis | Paranoia | Horror | Despair | Belief Salience |
-| **Ultraviolet** | Absorb | Do/Feel | Worldly Desire | Bliss Addiction | Agitation Due to Worry or Remorse | Doubt | Aversion | Laziness or Lethargy |
+| **Ultraviolet** | Absorb | Do/Feel | Worldly Desire | Transmission Fixation | Agitation Due to Worry or Remorse | Doubt | Aversion | Laziness or Lethargy |
 
 ### 7.4 How to Use Modes for Classification
 

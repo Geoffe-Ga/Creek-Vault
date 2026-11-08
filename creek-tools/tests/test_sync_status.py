@@ -367,3 +367,129 @@ class TestFailureVisibility:
 
         assert result.exit_code == 0, result.output
         assert "gdrive" in _flat(result.output), result.output
+
+
+# ---- skipped steps (#2087) ----------------------------------------------
+
+
+_BUSY_SKIP = "classify skipped: vault content mutation busy"
+"""A ``skipped_steps`` line exactly as a busy Tier-A classify pass records it."""
+
+
+def _status_output(vault: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run ``creek sync --status`` over *vault*; return its flattened output."""
+    monkeypatch.setattr(
+        "creek.cli._load_config_for_vault",
+        lambda _v: CreekConfig(vault_path=vault),
+    )
+    result = runner.invoke(app, ["sync", "--status", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    return _flat(result.output)
+
+
+def _write_state_with(vault: Path, extra: dict[str, object]) -> None:
+    """Write a hand-made ``last-run.json`` with no sources plus *extra* keys."""
+    path = _sync_state_path(vault)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {"tier": "A", "at": _LEGACY_AT, "dry_run": False, "sources": {}}
+    path.write_text(json.dumps({**state, **extra}), encoding="utf-8")
+
+
+class TestSkippedSteps:
+    """A tick records the global steps contention skipped, and ``--status`` shows them.
+
+    ``skipped_steps`` is a top-level key, not a fake source: a classify or link
+    pass is global, and a ``classify`` row in the per-source table would read as
+    a source an operator can enable or disable.
+    """
+
+    def test_a_clean_tick_writes_an_empty_list(self, tmp_path: Path) -> None:
+        """The key is written every tick, so a clean one clears last tick's skips."""
+        vault = tmp_path / "v"
+        (vault / "00-Creek-Meta").mkdir(parents=True)
+        _write_sync_state(vault, "A", dry_run=False, skipped_steps=(_BUSY_SKIP,))
+
+        _write_sync_state(vault, "A", dry_run=False)
+
+        state = json.loads(_sync_state_path(vault).read_text(encoding="utf-8"))
+        assert state["skipped_steps"] == []
+
+    def test_the_recorded_steps_round_trip_in_order(self, tmp_path: Path) -> None:
+        """What the tick skipped is written verbatim, in the order it happened."""
+        vault = tmp_path / "v"
+        (vault / "00-Creek-Meta").mkdir(parents=True)
+        steps = (_BUSY_SKIP, "link skipped: vault content mutation busy")
+
+        _write_sync_state(vault, "B", dry_run=False, skipped_steps=steps)
+
+        state = json.loads(_sync_state_path(vault).read_text(encoding="utf-8"))
+        assert state["skipped_steps"] == list(steps)
+
+    def test_status_prints_skips_even_when_no_source_ran(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Tier-B tick touches no source, so the skip must not hide behind one."""
+        vault = tmp_path / "v"
+        _write_state_with(vault, {"skipped_steps": [_BUSY_SKIP]})
+
+        flat = _status_output(vault, monkeypatch)
+
+        assert "no per-source runs recorded yet" in flat
+        assert f"Skipped last tick: {_BUSY_SKIP}" in flat
+
+    def test_status_prints_skips_beside_the_source_table(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With sources recorded, the skip still prints after the table."""
+        vault = tmp_path / "v"
+        (vault / "00-Creek-Meta").mkdir(parents=True)
+        _write_sync_state(
+            vault,
+            "A",
+            dry_run=False,
+            source_records={"journal": SourceRunRecord(ingested=1)},
+            skipped_steps=(_BUSY_SKIP,),
+        )
+
+        flat = _status_output(vault, monkeypatch)
+
+        assert "journal" in flat
+        assert f"Skipped last tick: {_BUSY_SKIP}" in flat
+
+    def test_a_state_file_without_the_key_prints_no_skip_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every ``last-run.json`` written before #2087 lacks the key."""
+        vault = tmp_path / "v"
+        _write_legacy_state(
+            vault, {"journal": {"tier": "A", "at": _LEGACY_AT, "ingested": 3}}
+        )
+
+        flat = _status_output(vault, monkeypatch)
+
+        assert "journal" in flat
+        assert "Skipped" not in flat
+
+    def test_a_non_list_value_is_tolerated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hand-mangled scalar degrades to no skip line rather than a crash."""
+        vault = tmp_path / "v"
+        _write_state_with(vault, {"skipped_steps": "classify skipped"})
+
+        flat = _status_output(vault, monkeypatch)
+
+        assert "Skipped" not in flat
+
+    def test_recorded_text_is_escaped_not_read_as_markup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An edited line holding Rich markup prints literally and cannot abort."""
+        vault = tmp_path / "v"
+        _write_state_with(vault, {"skipped_steps": ["[/red] oops", 7]})
+
+        flat = _status_output(vault, monkeypatch)
+
+        assert "Skipped last tick: [/red] oops" in flat
+        assert "Skipped last tick: 7" in flat

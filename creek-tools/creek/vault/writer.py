@@ -1292,6 +1292,32 @@ def _apply_other_author_attribution(
     )
 
 
+def require_vault_layout(vault_path: Path) -> None:
+    """Raise unless *vault_path* is a vault :class:`VaultWriter` can open.
+
+    The one spelling of "is this a vault", shared by :class:`VaultWriter` and
+    by any surface that must refuse a mistyped path *before* it does anything
+    that creates directories there — taking the content-mutation lock, whose
+    parent directory :func:`creek._fslock.vault_lock` creates (#2079). Reads
+    only; never writes.
+
+    Args:
+        vault_path: Candidate vault root.
+
+    Raises:
+        FileNotFoundError: If ``vault_path`` does not exist or is missing a
+            required vault directory.
+    """
+    if not vault_path.exists():
+        msg = f"Vault path does not exist: {vault_path}"
+        raise FileNotFoundError(msg)
+
+    for required in (_META_RELPART, _FRAGMENTS_RELPART):
+        if not (vault_path / required).is_dir():
+            msg = f"Required vault directory missing: {required}"
+            raise FileNotFoundError(msg)
+
+
 class VaultWriter:
     """Write Creek ontological primitives to an Obsidian vault.
 
@@ -1326,15 +1352,7 @@ class VaultWriter:
             FileNotFoundError: If the vault path does not exist or
                 required directories are missing.
         """
-        if not vault_path.exists():
-            msg = f"Vault path does not exist: {vault_path}"
-            raise FileNotFoundError(msg)
-
-        required_dirs = [_META_RELPART, _FRAGMENTS_RELPART]
-        for d in required_dirs:
-            if not (vault_path / d).is_dir():
-                msg = f"Required vault directory missing: {d}"
-                raise FileNotFoundError(msg)
+        require_vault_layout(vault_path)
 
         self.vault_path = vault_path
         # Per-directory in-memory caches of the ``id -> filename`` index.

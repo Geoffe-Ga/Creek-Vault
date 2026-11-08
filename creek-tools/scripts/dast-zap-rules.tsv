@@ -1,0 +1,21 @@
+# ZAP alert-rule dispositions for the nightly deep API scan
+# (.github/workflows/dast-deep.yml), passed to the action as rules_file_name.
+#
+# Tab-separated, because that is what ZAP parses: <rule id><TAB><IGNORE |
+# WARN | FAIL><TAB>(reason). A line separated by spaces is read as one field
+# and silently does nothing, so tests/test_dast_workflows.py parses this file
+# the way ZAP does and fails on a malformed line.
+#
+# EVERY LINE IS A NAMED RULE WITH A WRITTEN REASON, and the suite caps how many
+# there may be. ZAP's `-I`, which passes every warning at once, is forbidden: it
+# is every suppression here, un-reviewed and unwritten, and it would silently
+# absorb the next rule that starts firing.
+#
+# NOTHING MAY BE SUPPRESSED HERE FOR BEING INCONVENIENT. The passive header
+# rules in particular stay armed: they are the attacker's-eye view of what the
+# /v1 surface actually sends. The suite names them and fails if any appears
+# below.
+10035	IGNORE	(Strict-Transport-Security Header Not Set - the scan target is a plain-http loopback instance started by the workflow; a deployed vault terminates TLS (creek_mcp/transport_posture.py refuses a routable bind without it), so over loopback http this rule can only report the CI harness back to itself)
+10202	IGNORE	(Absence of Anti-CSRF Tokens - an HTML-form control; /v1 serves no HTML and authenticates every route from an Authorization header that a cross-site form cannot set, and no route accepts a cookie credential)
+10109	IGNORE	(Modern Web Application - informational; it reports that a response looks like a JavaScript-driven page, and /v1 serves only JSON)
+10027	IGNORE	(Information Disclosure - Suspicious Comments - reads HTML and JavaScript comments for developer notes; /v1 serves neither, so its matches are ordinary English words inside JSON error strings)

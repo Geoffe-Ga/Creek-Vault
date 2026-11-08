@@ -117,9 +117,14 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.27.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.29.0.json"
 )
-"""The published document at contract 0.27.0, adding ``GET /v1/export`` (#2033).
+"""The published document at contract 0.29.0: job ``failure_code`` ``busy``.
+
+``JobFailureCode`` gains ``busy`` (#2075), so ``JobStatusResponse`` moves on
+``GET /v1/jobs/{job_id}``. The ``424 request_key_rejected`` 0.28.0 documented
+on ``POST /v1/reflections`` and ``POST /v1/letters/{external_id}`` is
+unchanged.
 
 Regenerate it **only** with a deliberate contract change, and say in that
 change's ADR row what moved:

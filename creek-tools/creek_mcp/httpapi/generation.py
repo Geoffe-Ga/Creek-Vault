@@ -17,7 +17,10 @@ vendored an ``ErrorCode`` enum with no ``rate_limited`` member, so
 always received for a shed request. Both synchronous model-backed routes call
 it since contract 0.21 (#1903 step 6), each passing the since-minor *it* began
 serving the code at, so one per-account cap is reported one way wherever a
-caller meets it.
+caller meets it. Contract 0.28 gives it a second code to withhold,
+``request_key_rejected``, from a caller below
+:data:`~creek_mcp.api.models.REQUEST_KEY_REJECTED_SINCE_MINOR`, by the same
+rule and to the same target.
 
 **The pool request scope.** ADR-0016 Decision 1 item 7: when the vault sheds a
 request at its deadline, the route catches the cancellation at the
@@ -41,7 +44,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, TypeVar
 
 from creek.classify.llm.pool_boundary import PoolRequestScope, pool_request_scope
-from creek_mcp.api.models import PROVENANCE_SINCE_MINOR, ErrorCode, minor_at_least
+from creek_mcp.api.models import (
+    PROVENANCE_SINCE_MINOR,
+    REQUEST_KEY_REJECTED_SINCE_MINOR,
+    ErrorCode,
+    minor_at_least,
+)
 from creek_mcp.api.routes import CONTRACT_VERSION_HEADER
 from creek_mcp.httpapi.deadline import read_off_loop
 
@@ -119,7 +127,9 @@ def declared_minor_at_least(request: Request, required: str) -> bool:
     return declared is not None and minor_at_least(declared, required)
 
 
-def served_error_code(code: ErrorCode, *, serve_rate_limited: bool) -> ErrorCode:
+def served_error_code(
+    code: ErrorCode, *, serve_rate_limited: bool, serve_request_key_rejected: bool
+) -> ErrorCode:
     """Return *code*, downgraded when the caller's vocabulary cannot name it.
 
     ``rate_limited`` arrived at contract 0.19 (ADR-0016 Decision 1 item 4).
@@ -136,6 +146,14 @@ def served_error_code(code: ErrorCode, *, serve_rate_limited: bool) -> ErrorCode
     target, the envelope and the ``Retry-After`` are one implementation they
     share (#1903 step 6).
 
+    ``request_key_rejected`` arrived at contract 0.28 and takes the same
+    downgrade to the same target, for the same reason: a caller below
+    :data:`~creek_mcp.api.models.REQUEST_KEY_REJECTED_SINCE_MINOR` vendored an
+    ``ErrorCode`` without it, and ``temporarily_unavailable`` is exactly what
+    it was served for a refused request key before 0.28. Both flags are
+    required keywords, so a route cannot forget one and silently serve a code
+    its caller cannot parse.
+
     Args:
         code: The code the route decided on.
         serve_rate_limited: Whether the caller's declared minor is at or past
@@ -144,11 +162,16 @@ def served_error_code(code: ErrorCode, *, serve_rate_limited: bool) -> ErrorCode
             ``POST /v1/reflections``,
             :data:`~creek_mcp.api.models.LETTER_RATE_LIMITED_SINCE_MINOR` for
             ``POST /v1/letters/{external_id}``.
+        serve_request_key_rejected: Whether the caller's declared minor is at
+            or past :data:`~creek_mcp.api.models.REQUEST_KEY_REJECTED_SINCE_MINOR`,
+            on either route.
 
     Returns:
         The code to actually serve.
     """
     if code is ErrorCode.RATE_LIMITED and not serve_rate_limited:
+        return ErrorCode.TEMPORARILY_UNAVAILABLE
+    if code is ErrorCode.REQUEST_KEY_REJECTED and not serve_request_key_rejected:
         return ErrorCode.TEMPORARILY_UNAVAILABLE
     return code
 
@@ -164,6 +187,22 @@ def serves_provenance(request: Request) -> bool:
         :data:`~creek_mcp.api.models.PROVENANCE_SINCE_MINOR`.
     """
     return declared_minor_at_least(request, PROVENANCE_SINCE_MINOR)
+
+
+def serves_request_key_rejected(request: Request) -> bool:
+    """Whether this caller may be told its request key was refused (0.28).
+
+    One answer for both synchronous model-backed routes, because both began
+    serving ``request_key_rejected`` in the same change.
+
+    Args:
+        request: The request in flight.
+
+    Returns:
+        ``True`` only when the declared minor is at or past
+        :data:`~creek_mcp.api.models.REQUEST_KEY_REJECTED_SINCE_MINOR`.
+    """
+    return declared_minor_at_least(request, REQUEST_KEY_REJECTED_SINCE_MINOR)
 
 
 async def generate_off_loop(

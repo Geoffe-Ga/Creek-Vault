@@ -67,6 +67,7 @@ from creek.ingest.archive import (
     UNRECOGNISED_EXPORT_REASON,
     UNSAFE_ENTRY_REASON,
 )
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     OK_STATUS,
     ErrorCode,
@@ -187,11 +188,17 @@ def upload_refusal_code(reason: str) -> ErrorCode:
 
     The reasons are spelled as constants above rather than imported because
     :func:`creek_mcp.tools.upload.upload_tool` composes most of them inline as
-    f-strings, so there is nothing to import — with two exceptions that *are*
-    imported, for the two cases where a copy would be actively dangerous:
+    f-strings, so there is nothing to import — with three exceptions that
+    *are* imported, for the cases where a copy would be actively dangerous:
     :data:`~creek_mcp.tier_ceiling.TIER_REQUIRED_REASON`, one shared literal
-    read by all three write verbs, and the three ``#1526`` guidance strings,
-    whose drift would silently downgrade a ``415``-with-a-remedy into a ``500``.
+    read by all three write verbs; the three ``#1526`` guidance strings, whose
+    drift would silently downgrade a ``415``-with-a-remedy into a ``500``; and
+    :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` (#2069), the
+    one literal every content-lock participant refuses with, whose drift would
+    turn a retryable ``503 temporarily_unavailable`` into a ``500``. It is
+    matched by exact equality, as ``pipeline_refusal_code`` matches it
+    (#2066): a reason that merely *contains* the phrase is a composed string
+    this adapter must not narrate, and stays ``internal_error``.
 
     Args:
         reason: The ``reason`` field of a structured tool refusal.
@@ -214,7 +221,7 @@ def upload_refusal_code(reason: str) -> ErrorCode:
         return ErrorCode.INVALID_REQUEST
     if reason == GENERIC_ABOVE_CEILING_REASON or reason.endswith(_ABOVE_CEILING_SUFFIX):
         return ErrorCode.PRIVACY_REFUSED
-    if reason == _VAULT_UNAVAILABLE_REASON:
+    if reason in (_VAULT_UNAVAILABLE_REASON, CONTENT_MUTATION_BUSY_REASON):
         return ErrorCode.TEMPORARILY_UNAVAILABLE
     return ErrorCode.INTERNAL_ERROR
 

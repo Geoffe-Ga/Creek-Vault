@@ -501,8 +501,7 @@ def _rollback_one(
 ) -> AllocationReport | None:
     """Plan one journaled allocation's rollback and, when applying, restore it."""
     allocation_id = allocation.provider_allocation_id
-    journal = batch.require_journal()
-    entry = journal.entry(allocation_id)
+    entry = batch.require_journal().entry(allocation_id)
     if entry is None:
         return None
     plan = batch.driver.plan_vault_machine(allocation)

@@ -20,6 +20,274 @@ to locate the originating commit for any reference below.
   resolving the wrong stage fails those tests. `creek draft` on a config that
   sets no `generation` stage falls back to `default`, as every other stage does.
 
+- **`creek.reflect` refuses a vault config that cannot load by type name,
+  never as `isError` text naming its path (#2091, follow-up to #2083).** The
+  MCP tool built its LLM factory and grounding route before `reflect_tool`'s
+  catch, so a stale `CREEK_CONFIG` (`FileNotFoundError`), a schema-invalid
+  config (`ValidationError`) and a config YAML cannot parse (`ParserError`)
+  each reached the client as `Error executing tool creek.reflect: ...` with the
+  server's config path in it. Both seams are now built by one helper,
+  `creek_mcp.tools.reflect.build_reflect_seams`, whose catch is
+  `(RuntimeError, OSError, ValueError, YAMLError)`; a failure answers
+  `reflection unavailable: <TypeName>` and logs one type-name-only WARNING on
+  `creek_mcp.tools.reflect`. `YAMLError` is listed because it is not a
+  `ValueError`: `POST /v1/reflections`, which already caught the other three,
+  now shares the helper, so a YAML-syntax-invalid config there is
+  `503 temporarily_unavailable` instead of `500 internal_error` when the vault
+  resolves and its own `00-Creek-Meta/creek_config.yaml` fails to load (or the
+  app was built with an explicit vault path). A broken `CREEK_CONFIG` on the
+  production entry points, which build the app with no vault path, resolves no
+  vault and was and remains `503 unavailable`. A build
+  failure's reason is the literal type-name reason on both surfaces, so a
+  rate-limit or rejected-key error raised while *building* keeps `/v1`'s
+  existing `503`. An injected `reflect_llm_factory` now gets no grounding route
+  on MCP, as on `/v1`, so it never reads the config to build one. A
+  build refusal is decided before `reflect_tool` runs and so, as on `/v1`
+  before, appends no line to the MCP audit log. The same pattern in
+  `creek.classify`, `creek.link`, `creek.redact.scan`, `creek.report`,
+  `creek.draft`, `creek.compile` and the `/v1` letter and reading routes is
+  left to follow-ups.
+
+- **The remaining `01-Fragments` writers take the vault content-mutation lock
+  (#2086, follow-up to #2079 and #2087).** `creek purge` (`fragment`, `source`
+  incl. `--source-path`, `classifications`, `daterange`, `vault`) and the five
+  `creek.purge.*` MCP tools now hold the lock around their engine call — after
+  the confirmation prompt, count preview and `purge vault` path phrase, never
+  across them, and for `--dry-run` too. `creek ingest --pin-source-ids` (with
+  or without `--dry-run`), `--refresh-dates` and `--refresh-ai-chat` hold it
+  around the migration, after the vault-exists check. `creek process` holds it
+  across stages 2-4 and releases it before stage 5, whose `run_link` takes it
+  itself. `creek.ingest.discord.write_fragments` holds it around its writes,
+  covering bot capture, the Data Package helper and the exporter (the exporter
+  path was missing from the issue). Before, any of these could write while a
+  `creek classify` or `creek link` pass sat between its load and its write, so
+  the pass could resurrect a purged fragment or overwrite a migration.
+  **Operator-visible:** under contention each CLI path prints the one-line
+  `vault content mutation busy` message and exits 1 having written nothing (a
+  busy exporter run leaves its cursor where it was); `ingest_capture_dir`
+  raises `ContentMutationBusyError` to the bot; the MCP purge tools answer the
+  audited `vault content mutation busy` refusal instead of running. A lock
+  timeout raised under any of these holds still propagates (or, on the MCP
+  purge tools, still reads `purge engine failed: …`). `PurgeEngine`,
+  `pin_ids`, `refresh` and `VaultWriter` stay lock-free, so the `/v1` journal
+  withdraw, which already holds the lock when it calls `PurgeEngine`, does
+  not nest it. Every `creek purge` command now validates `--vault` (it must
+  hold `00-Creek-Meta/` and `01-Fragments/`, and for `purge vault` its
+  `creek_config.yaml` marker) before taking the lock: a
+  mistyped or non-vault path exits 1 with `does not appear to be a Creek
+  vault` and gains neither `00-Creek-Meta/locks/` nor
+  `00-Creek-Meta/audit/purge.jsonl` (re #2098, whose first item this fixes:
+  `purge fragment` and friends used to scaffold that audit log and exit 0).
+
+
+- **`creek sync` keeps its last-run record when classify or link meets
+  content-lock contention (#2087, follow-up to #2079).** `run_classify`,
+  `run_link` and `compile_to_vault` now take the vault content-mutation lock
+  through `hold_content_mutation`, so an acquisition timeout raises
+  `ContentMutationBusyError` instead of a bare `VaultLockTimeoutError`; a
+  timeout raised *under* the hold still propagates as itself. A sync tick whose
+  classify pass (Tier A or B) or Tier-B link pass is busy no longer tracebacks
+  past `_write_sync_state`: it prints `[sync] <step> skipped: vault content
+  mutation busy`, records the line in a new top-level `skipped_steps` list in
+  `last-run.json` (rewritten every tick, `[]` when clean, absent in older
+  files), and exits 0. In Tier B a busy classify also skips link and the index
+  rebuild; a busy link still rebuilds the index. `creek sync --status` prints
+  each skipped step, even when no source ran. `creek classify`, `creek link`,
+  `creek compile`, `creek fill --upgrade` and `creek process` print the
+  one-line busy message and exit 1 instead of a traceback. The
+  `creek.classify`, `creek.link` and `creek.compile` MCP tools catch both
+  exception types, so their `vault content mutation busy` refusal and the
+  `/v1` durable-job `busy` code are unchanged. `creek review` is unchanged: a
+  busy save is still recorded on the session's error list.
+
+- `creek.author` no longer returns a desk exception's text as its error
+  reason, and `creek.reflect`, `/v1/letters` and `/v1/reading-recommendations`
+  now catch an Ollama `httpx.HTTPError` (refs #2082, #2083). `creek.author`
+  was a real leak: its broad boundary catch answered `reason=str(exc)`, so a
+  vendor 4xx message, an Ollama URL, the `CREEK_CONFIG points to <server
+  path>` `FileNotFoundError` and a YAML error quoting the config file all
+  reached the client, on the draft and the `dry_run` alike. It now answers
+  `LLM provider call failed for author` (`AUTHOR_PROVIDER_FAILED_REASON`) for
+  a provider failure and `writing desk failed for author`
+  (`AUTHOR_DESK_FAILED_REASON`) for anything else, and logs one `ERROR` record
+  naming the exception type, with the traceback, on `creek_mcp.tools.author`.
+  The residuals match `creek.draft`: the unsupported-medium message, the
+  router's `IntimateRoutingError` message, and the shared
+  `REQUEST_KEY_REJECTED_REASON` for a vendor-refused writer's key.
+  `creek.reflect` caught only `RuntimeError` at its dial, so an Ollama
+  `httpx.HTTPError` (including `NonLoopbackOllamaError`) escaped and FastMCP
+  served it, URL included, as `isError` text; it is now the structured
+  `reflection unavailable: <TypeName>` refusal, logged as one `WARNING` on
+  `creek_mcp.tools.reflect` carrying the **type name only** — no message and
+  no traceback, because the `/v1` refusal-log contract forbids provider text
+  in any record on that path. `/v1/letters` and `/v1/reading-recommendations`
+  never leaked (the error boundary answers a constant body), but answered
+  `500 internal_error` where `docs/api.md` promises a retryable `503`.
+  **Operator-visible:** an Ollama transport or status failure on
+  `POST /v1/reflections`, `POST /v1/letters/{external_id}` and
+  `POST /v1/reading-recommendations` now answers `503
+  temporarily_unavailable` instead of `500 internal_error`; the codes already
+  match `docs/api.md`, so there is no contract-minor bump. The shared
+  `creek.classify.llm.providers.PROVIDER_CALL_FAILURES` (`(RuntimeError,
+  httpx.HTTPError)`) replaces `creek.draft`'s private tuple, so the next
+  transport swap moves one line.
+
+- **Contract 0.29.0: a durable job that meets content-lock contention reads
+  `busy` (#2075, follow-up to #2066).** An `llm` classification or
+  `embeddings` link job whose pass timed out on the vault content-mutation
+  lock used to end `failed` with `failure_code: null` — indistinguishable from
+  an operator fault — while the synchronous routes answer the same condition
+  `503 temporarily_unavailable`. `JobFailureCode` gains `busy`, produced by
+  exact equality on the tools' fixed `CONTENT_MUTATION_BUSY_REASON` for both
+  job kinds (the link job used to hard-code a null code); resubmit the same
+  request with backoff. Each code now carries its own since-minor in
+  `JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE`, served through
+  `pipeline._served_failure_code`: a caller declaring `0.26`–`0.28` is served
+  `failure_code: null` for a busy job, byte-identical to before, below `0.26`
+  the key stays absent, and `request_key_rejected` is still served from
+  `0.26`. `0.28` joins `SUPPORTED_CONTRACT_MINORS`; the OpenAPI golden
+  (`openapi-0.29.0.json`) and the `adepthood-v1` bundle are regenerated.
+  **Operator-visible:** the job's private `failure_reason` is unchanged
+  (`refused: vault content mutation busy`), and the record now stores
+  `failure_code: "busy"`. **Rollback hazard:** a pre-0.29 binary cannot parse
+  a stored `busy` record, so polling such a job after a rollback answers
+  `503 unavailable`. **Consumer:** adepthood's `VaultJobFailureCode` must
+  vendor `busy`, treated as retryable, before it declares `0.29`.
+- `creek.draft` and `creek.classify` no longer return provider error text as
+  their refusal reason (refs #2073). `creek.draft` was a real leak: a vendor
+  4xx message (which `providers._error_detail` forwards) or a rejected request
+  key's text became the refusal `reason`, and an Ollama `httpx.HTTPError` —
+  not a `RuntimeError` — escaped the tool so FastMCP served it, provider URL
+  included, as an `isError` result. It now catches `(RuntimeError,
+  httpx.HTTPError)` at both sites and answers fixed reasons:
+  `LLM provider unavailable for draft` when the provider cannot be built,
+  `LLM provider call failed for draft` when the call fails, and
+  `REQUEST_KEY_REJECTED_REASON` for a vendor-refused writer's key. The
+  router's `IntimateRoutingError` message is kept, the documented residual.
+  `creek.classify` is hardening: its refusal and a rules fallback's
+  `fallback_reason` are now the fixed `LLM provider unavailable for
+  classification` instead of the engine's CLI message (provider name and
+  env-var remediation), which the CLI still prints. Both tools log the
+  exception type with the traceback on their own module logger. The new
+  classify constant `LLM_PROVIDER_UNAVAILABLE_REASON` lives beside its
+  exception in `creek.classify.classify_engine`, and
+  `REQUEST_KEY_REJECTED_REASON` moved beside `RequestKeyRejectedError` in
+  `creek.classify.llm.providers` (still importable from
+  `creek_mcp.tools.classify`), so `creek.draft` imports no sibling tool
+  module. `/v1` is unchanged: `pipeline_refusal_code` deliberately leaves the
+  classify constant unmapped, so an `llm` job still fails closed to
+  `internal_error`, and `docs/api.md` needs no edit. **Operator-visible:** a
+  failed `llm` classification job now records `failure_reason: "refused: LLM
+  provider unavailable for classification"` instead of the engine's message;
+  a managed vault's fallback records the same fixed `fallback_reason`; and the
+  keyless-draft remediation hint (`Check Ollama or ANTHROPIC_API_KEY
+  configuration.`) and any vendor message now appear only in the server log
+  (`creek_mcp.tools.draft` / `creek_mcp.tools.classify`), not on the wire.
+
+- `creek.classify.entry` and `creek.upload` now decide their privacy gate
+  inside the vault content-mutation lock, finishing the sweep #930 started
+  for `creek.compile` (refs #2068, #2069, #930). `classify.entry` used to
+  gate on one walk of `01-Fragments` and serve the record from a second,
+  with no lock across either, so a `creek classify` re-tier between them
+  could be answered as the old tier beside the new classification; it now
+  gates and answers from one exhaustive snapshot taken under the lock (an id
+  on several files still gates on the strictest). `upload` used to run its
+  #970 overwrite gate with no lock held, so a concurrent escalation could
+  land between admission and the overwrite; it now holds the lock once from
+  that gate through staging, ingest and the success audit. Contention past
+  the lock's bound answers the content-free `vault content mutation busy`
+  refusal on both tools — unaudited and with nothing staged on `upload`,
+  where only a timeout acquiring the lock is reported that way — and
+  `POST /v1/uploads` maps it by exact equality to `503
+  temporarily_unavailable` instead of `500 internal_error`.
+  **Operator-visible:** both tools may now create the zero-byte
+  `00-Creek-Meta/locks/content-mutations.lock`, and either can wait up to the
+  lock's 10-second bound behind another content writer (a large upload or OCR
+  run likewise makes other writers wait). No contract version change: `503`
+  is already published on every route and the busy reason is a free-text
+  `reason` value, as in #2066.
+
+- `creek.link` and `creek.report unnamed` now answer an embedding model that
+  cannot load with the fixed, content-free refusal `embedding model
+  unavailable` instead of raising (refs #2065). `EmbeddingLinker.load_model`'s
+  error message names the configured model, the cache directory and the
+  loader's own error, and FastMCP 1.x served that `str(exc)` to MCP clients as
+  an `isError` result on the `embeddings` (the default), `eddies` and
+  `threads` stages and on `unnamed`. Both tools log the exception type with
+  the traceback on their own module logger, and write no audit entry and no
+  partial artefact. The reason constant `EMBEDDING_MODEL_UNAVAILABLE_REASON`
+  lives beside the exception in `creek.link.embeddings`, and
+  `pipeline_refusal_code` maps it by exact equality to `503 unavailable`, so
+  `POST /v1/links` keeps #2060's answer; the adapter now logs one
+  code-and-`request_id` record per tool refusal. **Operator-visible:** a
+  durable `embeddings` link job that fails this way records
+  `failure_reason: "refused: embedding model unavailable"` where it used to
+  record `"exception: EmbeddingModelUnavailableError"`; the public job body
+  is unchanged (`failed`, `result: null`, `failure_code: null`). `paradox`
+  and `synchronicity` are cache-only and never load the model.
+
+- The synchronous methods of `POST /v1/classifications` (`rules`) and
+  `POST /v1/links` (`temporal`, `eddies`, `threads`) now answer vault
+  content-lock contention with `503 temporarily_unavailable` instead of
+  `500 internal_error` (refs #2066). The durable `llm` and `embeddings` jobs
+  are unchanged: a job that meets contention after its `202` still reads
+  `failed` with a null `failure_code`. Both tools already refused a timed-out
+  lock with the fixed `vault content mutation busy` reason, but
+  `pipeline_refusal_code` fell through to `internal_error`. It now matches
+  that constant by exact equality — the same disposition and envelope
+  `PUT /v1/journal-entries` gives its own busy refusal — and keeps the
+  fail-closed fall-through for every other reason. No contract bump: `503`
+  is already published on every operation, and the DAST allowance list is
+  unchanged.
+
+- `POST /v1/links` now refuses `eddies` and `threads` with the static
+  `503 unavailable` instead of `500 internal_error` when the local embedding
+  model cannot load (refs #2060). The shipped image installs no `embeddings`
+  extra, so on any vault with uncached fragments the lazy
+  `sentence_transformers` import failed inside `EmbeddingLinker.load_model`
+  and the typed `EmbeddingModelUnavailableError` (and its
+  `EmbeddingRefusedError` subclass) escaped to the error boundary. The route
+  now catches it in the HTTP adapter and logs the type name and `request_id`,
+  with the model name, cache path and underlying error carried only by the
+  traceback in the operator log. `unavailable`, not `temporarily_unavailable`,
+  because only operator action clears it. No contract bump: `503` is already
+  published for the operation. `docs/api.md`, the `link_embedder` docstring
+  and the DAST 503 allowance list move with it.
+
+- `creek.compile` over MCP walks `01-Fragments` once and decides
+  admission inside the content-mutation lock (#930). The wrapper used to
+  survey the vault for its source-tier gate, outside the lock, and the
+  engine then walked it again to load what it compiled: twice the pre-LLM
+  I/O, and a window in which `creek classify` could raise a tier the gate
+  had already admitted, so the call was compiled under a stale admission.
+  `compile_to_vault` now takes an optional keyword-only `admit_sources`
+  hook (`SourceAdmission`), evaluated on the whole-corpus `AncestorIndex`
+  from its single walk, before the missing-id error, the LLM factory and
+  any write; a refusal raises the content-free
+  `SourceAdmissionRefusedError`, which the MCP tool audits and answers with
+  the unchanged above-ceiling reason. The CLI passes no hook and is
+  unchanged. `privacy_filter.ancestry_tiers`, whose only production caller
+  was the old gate, is removed, and the compile loader tests membership
+  against a set instead of a list. A refused compile now creates the
+  zero-byte content-mutation lock file, and under lock contention a
+  would-be refusal returns the unaudited busy refusal.
+
+- A writer's refused provider key is now reported as refused, not as a wait
+  (contract 0.28.0, ADR-0015). When the vendor answered a writer's
+  request-scoped key `401`/`403` on `POST /v1/reflections` or
+  `POST /v1/letters/{external_id}`, both routes caught the typed
+  `RequestKeyRejectedError` as a plain `RuntimeError` and served
+  `503 temporarily_unavailable`. The consumer then told the writer to try
+  again, which can never clear a rejected key. Both routes now serve the new
+  closed code `request_key_rejected` at `424 Failed Dependency`, disposition
+  `terminal`, with one constant message about the key. A caller declaring a
+  minor below 0.28 is still served the `503` it was served before,
+  byte-identical but for the correlation id, through the shared
+  `served_error_code` and `REQUEST_KEY_REJECTED_SINCE_MINOR`. The operator's
+  own refused key is unchanged. `0.27` stays served. The bundle
+  (`retry-policy.json`, the `ErrorEnvelope` schema, the manifest), the OpenAPI
+  golden, both contract ADRs, ADR-0015 and `docs/api.md` move with it.
+
 - Docs: the fleet-alert receiver is described as it is now. The
   `pool_admin_key` module docstring and `docs/pool-measurement-pin.md` said
   adepthood's receiver "admits six kinds and not even `pool_credential_orphan`"

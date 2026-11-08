@@ -64,6 +64,7 @@ through the validated model, which fails open on a missing key.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any, Final
@@ -83,7 +84,11 @@ from creek.generate.wavelength import (
     generate_phase_map,
     resolve_period,
 )
-from creek.link.embeddings import EmbeddingLinker
+from creek.link.embeddings import (
+    EMBEDDING_MODEL_UNAVAILABLE_REASON,
+    EmbeddingLinker,
+    EmbeddingModelUnavailableError,
+)
 from creek.surface_modes import REPORT_TYPES
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
@@ -95,6 +100,8 @@ if TYPE_CHECKING:
     from creek.classify.privacy_filter import PrivacyTierOverride
 
 TOOL_NAME = "creek.report"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -179,14 +186,10 @@ def _generate_voice(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per rendered profile.
     """
-    return list(
-        VoiceProfileGenerator(
-            override=request.override,
-            audience_weighting=_vault_config(request).voice_audience_weighting,
-        ).generate_all_profiles(
-            request.vault_path,
-        ),
-    )
+    return VoiceProfileGenerator(
+        override=request.override,
+        audience_weighting=_vault_config(request).voice_audience_weighting,
+    ).generate_all_profiles(request.vault_path)
 
 
 def _generate_lexicon(request: _ReportRequest) -> list[Path]:
@@ -202,7 +205,7 @@ def _generate_lexicon(request: _ReportRequest) -> list[Path]:
         request.vault_path,
         override=request.override,
     )
-    return list(written_paths)
+    return written_paths
 
 
 def _generate_decisions(request: _ReportRequest) -> list[Path]:
@@ -244,14 +247,10 @@ def _generate_rhetorical_patterns(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per rendered note.
     """
-    return list(
-        VoiceProfileGenerator(
-            override=request.override,
-            audience_weighting=_vault_config(request).voice_audience_weighting,
-        ).generate_rhetorical_patterns(
-            request.vault_path,
-        ),
-    )
+    return VoiceProfileGenerator(
+        override=request.override,
+        audience_weighting=_vault_config(request).voice_audience_weighting,
+    ).generate_rhetorical_patterns(request.vault_path)
 
 
 def _generate_mode_profiles(request: _ReportRequest) -> list[Path]:
@@ -263,11 +262,9 @@ def _generate_mode_profiles(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per rendered profile.
     """
-    return list(
-        ModeProfileGenerator().generate_mode_profiles(
-            request.vault_path,
-            override=request.override,
-        ),
+    return ModeProfileGenerator().generate_mode_profiles(
+        request.vault_path,
+        override=request.override,
     )
 
 
@@ -349,9 +346,7 @@ def _generate_paradox(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per written note; empty when no contradictory pair is found.
     """
-    return list(
-        generate_paradoxes(request.vault_path, _vault_config(request).embeddings),
-    )
+    return generate_paradoxes(request.vault_path, _vault_config(request).embeddings)
 
 
 def _generate_synchronicity(request: _ReportRequest) -> list[Path]:
@@ -363,8 +358,8 @@ def _generate_synchronicity(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per written note; empty when no pair qualifies.
     """
-    return list(
-        generate_synchronicities(request.vault_path, _vault_config(request).embeddings),
+    return generate_synchronicities(
+        request.vault_path, _vault_config(request).embeddings
     )
 
 
@@ -441,6 +436,15 @@ def report_tool(
     all come before the ceiling is converted and before the vault is touched,
     so a refused call writes nothing at all, not even an audit entry.
 
+    A fourth comes after the vault is read and before anything is written:
+    ``unnamed`` embeds the week's fragments before it writes its digest or
+    history record, so a local model that cannot load answers the fixed
+    :data:`~creek.link.embeddings.EMBEDDING_MODEL_UNAVAILABLE_REASON` rather
+    than letting the exception's message — model name, cache directory, the
+    loader's own error — reach the client through FastMCP (#2065). It, too,
+    writes no audit entry. ``paradox`` and ``synchronicity`` read only the
+    parquet cache and never load the model, so they cannot reach it.
+
     Args:
         vault_path: Vault root.
         report_type: One of :data:`creek.surface_modes.REPORT_TYPES`.
@@ -478,13 +482,24 @@ def report_tool(
                 f"got {period!r}"
             ),
         )
-    written_paths = _MCP_REPORTS[report_type](
-        _ReportRequest(
-            vault_path=vault_path,
-            override=to_privacy_override(privacy_tier_ceiling),
-            period=period,
-        ),
-    )
+    try:
+        written_paths = _MCP_REPORTS[report_type](
+            _ReportRequest(
+                vault_path=vault_path,
+                override=to_privacy_override(privacy_tier_ceiling),
+                period=period,
+            ),
+        )
+    except EmbeddingModelUnavailableError as exc:
+        # Type name in the message, the engine's detail on the traceback only.
+        logger.exception(
+            "report %s refused as unavailable: %s", report_type, type(exc).__name__
+        )
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=EMBEDDING_MODEL_UNAVAILABLE_REASON,
+        )
     relative_paths = [str(p.relative_to(vault_path)) for p in written_paths]
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
