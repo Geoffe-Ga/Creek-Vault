@@ -21,8 +21,12 @@ to locate the originating commit for any reference below.
   `reflection unavailable: <TypeName>` and logs one type-name-only WARNING on
   `creek_mcp.tools.reflect`. `YAMLError` is listed because it is not a
   `ValueError`: `POST /v1/reflections`, which already caught the other three,
-  now shares the helper, so a YAML-syntax-invalid vault config there is
-  `503 temporarily_unavailable` instead of `500 internal_error`. A build
+  now shares the helper, so a YAML-syntax-invalid config there is
+  `503 temporarily_unavailable` instead of `500 internal_error` when the vault
+  resolves and its own `00-Creek-Meta/creek_config.yaml` fails to load (or the
+  app was built with an explicit vault path). A broken `CREEK_CONFIG` on the
+  production entry points, which build the app with no vault path, resolves no
+  vault and was and remains `503 unavailable`. A build
   failure's reason is the literal type-name reason on both surfaces, so a
   rate-limit or rejected-key error raised while *building* keeps `/v1`'s
   existing `503`. An injected `reflect_llm_factory` now gets no grounding route

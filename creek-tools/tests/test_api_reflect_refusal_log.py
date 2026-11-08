@@ -337,3 +337,139 @@ def test_a_rate_limit_raised_while_building_keeps_the_unavailable_503(
     assert "code=temporarily_unavailable" in message
     assert "cause=reflection unavailable: ProviderRateLimitError" in message
     assert _INTERNAL_DETAIL not in caplog.text
+
+
+_YAML_INVALID_CONFIG: Final[str] = "model_router: [unclosed\n  : : x\n"
+"""A config body YAML cannot parse; ``yaml`` says "flow sequence" about it."""
+
+_YAML_LEAK: Final[str] = "flow sequence"
+"""The parser's own wording, which names nothing a client may see."""
+
+
+def _missing_creek_config(tmp_path: Path, vault_path: Path) -> Path:
+    """Name a ``CREEK_CONFIG`` file that does not exist.
+
+    Args:
+        tmp_path: The test's scratch root.
+        vault_path: The seeded vault, unused: nothing names it.
+
+    Returns:
+        A path under a distinctive directory, so a leak of it is checkable.
+    """
+    del vault_path
+    return tmp_path / "zz-secret-config-dir" / "creek_config.yaml"
+
+
+def _yaml_invalid_creek_config(tmp_path: Path, vault_path: Path) -> Path:
+    """Write a ``CREEK_CONFIG`` that names the vault but YAML cannot parse.
+
+    Args:
+        tmp_path: The test's scratch root.
+        vault_path: The vault the config would name if it parsed.
+
+    Returns:
+        The written config's path.
+    """
+    config = tmp_path / "zz-secret-config-dir" / "creek_config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        f"vault_path: {vault_path}\n{_YAML_INVALID_CONFIG}", encoding="utf-8"
+    )
+    return config
+
+
+def _post_reflection(app_kwargs: dict[str, object]) -> httpx.Response:
+    """Send one open-ceiling reflection to an app built from *app_kwargs*.
+
+    Args:
+        app_kwargs: Passed through to :func:`build_app`.
+
+    Returns:
+        The response; a server exception is rendered, never raised.
+    """
+    app = build_app(**app_kwargs)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response: httpx.Response = client.post(
+            REFLECTIONS_PATH, json={"content": _ENTRY}, headers=headers(ceiling="open")
+        )
+    return response
+
+
+@pytest.mark.parametrize(
+    "write_config",
+    [_missing_creek_config, _yaml_invalid_creek_config],
+    ids=["missing", "yaml-invalid"],
+)
+def test_an_unreadable_creek_config_without_a_vault_path_is_unavailable(
+    tmp_path: Path,
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    write_config: Callable[[Path, Path], Path],
+) -> None:
+    """Production resolves no vault from a broken ``CREEK_CONFIG``: ``unavailable``.
+
+    Every production entry point builds the app with no ``vault_path``, so the
+    vault is resolved from ``CREEK_CONFIG``. A file that is missing or that
+    YAML cannot parse resolves no vault, which is the operator-action
+    ``503 unavailable`` (cause ``no_vault``), not the retryable
+    ``temporarily_unavailable`` a vault whose own config fails to load earns.
+    Pins the ``docs/api.md`` ``POST /v1/reflections`` row (#2091), and that
+    neither the response nor any log record names the config's path.
+
+    Args:
+        tmp_path: The test's scratch root.
+        vault: A seeded vault the broken config would otherwise name.
+        monkeypatch: Points ``CREEK_CONFIG`` at the broken file.
+        caplog: The log capture, at ``DEBUG`` on every logger.
+        write_config: Builds the broken config and returns its path.
+    """
+    config = write_config(tmp_path, vault)
+    monkeypatch.setenv("CREEK_CONFIG", str(config))
+    caplog.set_level(logging.DEBUG)
+
+    response = _post_reflection({})
+
+    assert response.status_code == _SERVICE_UNAVAILABLE
+    assert response.json()["code"] == "unavailable"
+    [record] = _refusal_lines(caplog)
+    message = record.getMessage()
+    assert "code=unavailable" in message
+    assert "cause=no_vault" in message
+    for leaked in (str(config), "zz-secret-config-dir", _YAML_LEAK):
+        assert leaked not in caplog.text, leaked
+        assert leaked not in response.text, leaked
+
+
+def test_a_stale_creek_config_beside_an_explicit_vault_is_temporarily_unavailable(
+    tmp_path: Path,
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A vault that resolves but whose config cannot load is retryable (#2091).
+
+    With an explicit ``vault_path`` the vault resolves without reading
+    ``CREEK_CONFIG``; building the reflection's factory then reads it and
+    fails, which is the ``temporarily_unavailable`` refusal the
+    ``docs/api.md`` row names for that case, type name only.
+
+    Args:
+        tmp_path: The test's scratch root.
+        vault: The explicitly configured vault.
+        monkeypatch: Points ``CREEK_CONFIG`` at a file that does not exist.
+        caplog: The log capture, at ``DEBUG`` on every logger.
+    """
+    config = _missing_creek_config(tmp_path, vault)
+    monkeypatch.setenv("CREEK_CONFIG", str(config))
+    caplog.set_level(logging.DEBUG)
+
+    response = _post_reflection({"vault_path": vault})
+
+    assert response.status_code == _SERVICE_UNAVAILABLE
+    assert response.json()["code"] == "temporarily_unavailable"
+    [record] = _refusal_lines(caplog)
+    assert "cause=reflection unavailable: FileNotFoundError" in record.getMessage()
+    for leaked in (str(config), "zz-secret-config-dir"):
+        assert leaked not in caplog.text, leaked
+        assert leaked not in response.text, leaked
