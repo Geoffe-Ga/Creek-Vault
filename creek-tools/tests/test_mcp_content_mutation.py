@@ -1,4 +1,4 @@
-"""MCP refusals for the shared vault-content mutation boundary (#1799)."""
+"""MCP refusals for the shared vault-content mutation boundary (#1799, #2079)."""
 
 from __future__ import annotations
 
@@ -8,11 +8,12 @@ import functools
 import hashlib
 import json
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from creek._fslock import VaultLockTimeoutError, vault_lock
+from creek.ingest.pipeline import run_ingest
 from creek.models import Fragment, FragmentSource, PrivacyTier, SourcePlatform
 from creek.vault.mutations import (
     CONTENT_MUTATION_BUSY_REASON,
@@ -20,12 +21,15 @@ from creek.vault.mutations import (
 )
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools import ingest as ingest_mod
 from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.classify_entry import entry_classification_tool
 from creek_mcp.tools.compile import compile_tool
+from creek_mcp.tools.ingest import ingest_tool
 from creek_mcp.tools.link import link_tool
 from creek_mcp.tools.upload import _upload_staged_path, upload_tool
 from tests.helpers import write_fragment_file
+from tests.test_mcp_upload import _content_lock_is_held
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -290,3 +294,145 @@ def test_an_index_lock_timeout_inside_the_upload_hold_is_not_reported_as_busy(
             b"bytes staged before the inner timeout",
             run=_index_lock_times_out,
         )
+
+
+# --------------------------------------------------------------------------- #
+# creek.ingest joins the boundary (#2079)
+# --------------------------------------------------------------------------- #
+
+
+def _seed_ingest_vault(vault: Path) -> None:
+    """Scaffold *vault* and stage ``inbox/note.md`` for ``creek.ingest``."""
+    for sub in ("00-Creek-Meta/State", "00-Creek-Meta/audit", "01-Fragments"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+    (vault / "inbox").mkdir(exist_ok=True)
+    (vault / "inbox" / "note.md").write_text(
+        "# Note\n\nA synthetic sentence about the creek at dawn.\n"
+    )
+
+
+def _ingest(
+    vault: Path,
+    *,
+    source_type: str = "markdown",
+    input_path: str = "inbox/note.md",
+    ceiling: TierCeiling = TierCeiling.ALL,
+) -> dict[str, object]:
+    """Call ``creek.ingest`` on the staged note (by default) at ceiling ALL."""
+    return ingest_tool(
+        vault_path=vault,
+        source_type=source_type,
+        input_path=input_path,
+        privacy_tier_ceiling=ceiling,
+    )
+
+
+def test_ingest_refuses_when_content_mutation_is_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek.ingest`` behind a held content lock refuses, content-free (#2079).
+
+    Only the #885 attempt row is audited: the success row carries write-side
+    facts, and nothing was written. ``01-Fragments`` is byte-identical.
+    """
+    _seed_ingest_vault(tmp_path)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+    before = _fragment_digests(tmp_path)
+
+    with _content_lock_held_elsewhere(tmp_path):
+        result = _ingest(tmp_path)
+
+    assert result == {
+        "status": "refused",
+        "tool": "creek.ingest",
+        "tier_ceiling": "all",
+        "reason": CONTENT_MUTATION_BUSY_REASON,
+    }
+    assert _fragment_digests(tmp_path) == before
+    assert len(_audit_lines(tmp_path, "creek.ingest")) == 1
+
+
+def test_ingest_runs_run_ingest_inside_the_content_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole ``run_ingest`` call — writes, ledger, tombs — is inside the hold."""
+    _seed_ingest_vault(tmp_path)
+    held: list[bool] = []
+
+    def _probed(**kwargs: Any) -> IngestRunResult:
+        """Probe the content lock, then run the real pipeline."""
+        held.append(_content_lock_is_held(tmp_path))
+        return run_ingest(**kwargs)
+
+    monkeypatch.setattr(ingest_mod, "run_ingest", _probed)
+
+    result = _ingest(tmp_path)
+
+    assert result["status"] == "ok", result
+    assert held == [True]
+    assert _content_lock_is_held(tmp_path) is False
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        (
+            {"ceiling": TierCeiling.OPEN},
+            "ingest default tier 'personal' exceeds ceiling 'open'",
+        ),
+        ({"source_type": "no-such-type"}, "unknown source_type 'no-such-type'"),
+        (
+            {"input_path": "../outside.md"},
+            "input_path '../outside.md' resolves outside the vault root; "
+            "the ingest tool only operates on vault-relative paths.",
+        ),
+        (
+            {"input_path": "inbox/missing.md"},
+            "input path not found: inbox/missing.md",
+        ),
+    ],
+)
+def test_ingest_gate_refusals_precede_the_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, Any],
+    reason: str,
+) -> None:
+    """Every gate refuses as it always has, even while the lock is contended.
+
+    The busy refusal comes *after* the tier, source_type, confinement and
+    existence gates, so contention never masks — or reveals — what they decide.
+    """
+    vault = tmp_path / "vault"
+    _seed_ingest_vault(vault)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+
+    with _content_lock_held_elsewhere(vault):
+        result = _ingest(vault, **overrides)
+
+    assert result["status"] == "refused"
+    assert result["reason"] == reason
+
+
+def test_an_index_lock_timeout_inside_the_ingest_hold_is_not_reported_as_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``VaultLockTimeoutError`` raised under the hold propagates (#2079).
+
+    Fragments may already be written when the writer's ``.id-index.lock``
+    times out, so answering ``vault content mutation busy`` would be false.
+    """
+    _seed_ingest_vault(tmp_path)
+
+    def _index_lock_times_out(**_kwargs: object) -> IngestRunResult:
+        """Time out the way a contended id-index lock does mid-ingest."""
+        msg = "id-index lock busy"
+        raise VaultLockTimeoutError(msg)
+
+    monkeypatch.setattr(ingest_mod, "run_ingest", _index_lock_times_out)
+
+    with pytest.raises(VaultLockTimeoutError, match="id-index lock busy"):
+        _ingest(tmp_path)
