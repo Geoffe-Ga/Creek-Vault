@@ -90,12 +90,13 @@ _CONTENT_BUSY_MESSAGE: Final[str] = (
 )
 """What a CLI command prints when the content-mutation lock is held.
 
-``creek ingest`` (#2079) and the engine-backed ``creek classify``,
+``creek ingest`` (#2079), the engine-backed ``creek classify``,
 ``creek link``, ``creek compile``, ``creek fill --upgrade`` and
-``creek process`` (#2087) all print it through
-:func:`_exit_1_when_content_busy`. Built on the shared reason constant so the
-CLI and the remote surfaces name the condition in the same words; it carries
-no path and no holder identity.
+``creek process`` (#2087), and the ``creek purge`` commands, the
+``creek ingest`` vault migrations and the ``creek discord`` exporter and Data
+Package paths (#2086) all print it through :func:`_exit_1_when_content_busy`.
+Built on the shared reason constant so the CLI and the remote surfaces name the
+condition in the same words; it carries no path and no holder identity.
 """
 
 _INCLUDE_TIER_HELP = (
@@ -524,16 +525,19 @@ def _exit_1_when_content_busy() -> Iterator[None]:
     """Turn a busy vault into one line and exit 1 (#2079, #2087).
 
     Wraps every CLI command that takes the content-mutation lock, directly
-    (``creek ingest``) or through an engine that holds it (``creek classify``,
-    ``creek link``, ``creek compile``, ``creek fill --upgrade``,
-    ``creek process``). Contention is an ordinary operational outcome — a
-    ``creek classify`` pass or a remote journal write holds the vault — so it
-    is a message naming the reason and a retry, never a traceback. Only
+    (``creek ingest`` and its vault migrations, the ``creek purge`` commands,
+    via :func:`_hold_content_or_exit_1` where they take it themselves) or
+    through code that holds it (``creek classify``, ``creek link``,
+    ``creek compile``, ``creek fill --upgrade``, ``creek process``, and the
+    ``creek discord`` exporter and Data Package paths). Contention is an
+    ordinary operational outcome — a ``creek classify`` pass or a remote
+    journal write holds the vault — so it is a message naming the reason and a
+    retry, never a traceback. Only
     :class:`~creek.vault.mutations.ContentMutationBusyError` is translated;
     a lock timeout raised *under* the hold propagates as itself.
 
     The busy hold itself wrote nothing, but the block may have: ``creek
-    process`` meets the lock at its link stage after its earlier stages ran.
+    process`` can meet the lock at its link stage after its stages 2-4 wrote.
     Every command wrapped here is idempotent, so the retry the message asks
     for converges either way.
 
@@ -549,6 +553,37 @@ def _exit_1_when_content_busy() -> Iterator[None]:
     except ContentMutationBusyError as exc:
         console.print(f"[red]{_CONTENT_BUSY_MESSAGE}[/red]")
         raise typer.Exit(code=1) from exc
+
+
+@contextlib.contextmanager
+def _hold_content_or_exit_1(vault_path: Path) -> Iterator[None]:
+    """Hold *vault_path*'s content-mutation lock, or exit 1 when it is busy (#2086).
+
+    For a CLI command whose writer is lock-free by design and so must take
+    the boundary itself — the ``creek purge`` commands around
+    :class:`~creek.purge.engine.PurgeEngine`, and the ``creek ingest``
+    vault migrations. Contention goes through the one translator,
+    :func:`_exit_1_when_content_busy`; a lock timeout raised under the hold
+    propagates as itself.
+
+    Callers validate the vault first: acquiring the lock creates
+    ``00-Creek-Meta/locks/`` and a mistyped ``--vault`` must not gain one.
+    Nothing that waits on a human — a confirmation prompt, the ``purge vault``
+    path phrase — may run inside the block, or an operator reading it would
+    stall every other writer for as long as they read.
+
+    Args:
+        vault_path: Root of the vault the block mutates.
+
+    Yields:
+        Nothing. The block runs with the lock held.
+
+    Raises:
+        typer.Exit: With code ``1`` when the lock stayed held elsewhere past
+            the bounded wait; the block never ran.
+    """
+    with _exit_1_when_content_busy(), hold_content_mutation(vault_path):
+        yield
 
 
 def _print_ingest_warning(message: str) -> None:
@@ -1960,7 +1995,11 @@ def _run_discord_exporter(
         binary, timeout_seconds=config.discord.exporter_timeout_seconds
     )
     try:
-        ExporterConnector(config.discord, runner, vault_path).run()
+        # ``write_fragments`` holds the content lock around the ingest only,
+        # never the export; busy is one line and exit 1, with the cursor
+        # left where it was (#2086).
+        with _exit_1_when_content_busy():
+            ExporterConnector(config.discord, runner, vault_path).run()
     except TokenMissingError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -1987,7 +2026,9 @@ def _run_discord_data_package(vault_path: Path, package: Path) -> None:
             f"not a file: {package}[/red]"
         )
         raise typer.Exit(code=1)
-    new_count = run_discord_data_package(vault_path, package)
+    # ``write_fragments`` holds the content lock around its writes (#2086).
+    with _exit_1_when_content_busy():
+        new_count = run_discord_data_package(vault_path, package)
     console.print(
         f"[green][discord] data_package ingested {new_count} new fragment(s).[/green]"
     )
@@ -2113,16 +2154,18 @@ def _run_pipeline_or_exit(
 
     Raises:
         typer.Exit: With code ``1`` when the pipeline refuses to run, or when
-            its link stage met content-lock contention (#2087); stages before
-            it may already have written, and a re-run converges.
+            it met content-lock contention — at its stage 2-4 hold (#2086),
+            where nothing was written, or at its link stage (#2087), where
+            stages 2-4 may already have written and a re-run converges.
     """
     # Deferred, like every other heavy import in this module: nothing may
     # be imported at CLI import time that builds a Rich console (#1141).
     from creek.link import EmbeddingModelUnavailableError
 
     try:
-        # Stage 5 links under the engine's own content-lock hold; a busy vault
-        # there is one line and exit 1, not a traceback (#2087).
+        # Stages 2-4 hold the content lock (#2086) and stage 5 links under the
+        # engine's own hold (#2087); a busy vault at either is one line and
+        # exit 1, not a traceback.
         with _exit_1_when_content_busy():
             return pipeline.run(source_path=source_path, vault_path=vault_path)
     except RedactionRequiredError as exc:
@@ -2565,6 +2608,31 @@ def _render_pin_summary(result: PinResult, *, dry_run: bool) -> None:
     _print_pin_findings("Unpinnable", result.unpinnable)
 
 
+def _resolve_existing_vault(vault: Path | None) -> Path:
+    """Resolve a vault migration's target and refuse one that does not exist.
+
+    Shared by the three ``creek ingest`` vault migrations. It runs before
+    :func:`_hold_content_or_exit_1` on purpose (#2086): acquiring the lock
+    creates ``00-Creek-Meta/locks/``, so a mistyped ``--vault`` must be
+    refused before it can gain one.
+
+    Args:
+        vault: ``--vault``, or ``None`` to use the configured vault.
+
+    Returns:
+        The resolved, existing vault root.
+
+    Raises:
+        typer.Exit: With code ``1`` when the resolved path does not exist.
+    """
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    if not vault_path.exists():
+        console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
+        raise typer.Exit(code=1)
+    return vault_path
+
+
 def _run_pin_source_ids(vault: Path | None, *, dry_run: bool) -> None:
     """Execute the #1329 ``--pin-source-ids`` ledger back-fill.
 
@@ -2572,7 +2640,7 @@ def _run_pin_source_ids(vault: Path | None, *, dry_run: bool) -> None:
     :func:`creek.ingest.pin_ids.pin_source_ids`, and renders a one-screen
     summary. Exit codes mirror the rest of the CLI: 0 on success (regardless
     of how many fragments were pinned, conflicted or were unpinnable), 1 if
-    the vault path is unusable.
+    the vault path is unusable or its content-mutation lock is busy (#2086).
 
     Args:
         vault: ``--vault``, or ``None`` to use the configured vault.
@@ -2581,13 +2649,12 @@ def _run_pin_source_ids(vault: Path | None, *, dry_run: bool) -> None:
     """
     from creek.ingest.pin_ids import pin_source_ids
 
-    config = _load_config_for_vault(vault)
-    vault_path = vault or config.vault_path
-    if not vault_path.exists():
-        console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
-        raise typer.Exit(code=1)
-
-    _render_pin_summary(pin_source_ids(vault_path, dry_run=dry_run), dry_run=dry_run)
+    vault_path = _resolve_existing_vault(vault)
+    # Held for --dry-run as well: the plan is read from the same ledger and
+    # frontmatter a real run rewrites, and a plan read mid-ingest is wrong.
+    with _hold_content_or_exit_1(vault_path):
+        result = pin_source_ids(vault_path, dry_run=dry_run)
+    _render_pin_summary(result, dry_run=dry_run)
 
 
 def _run_refresh_dates(vault: Path | None) -> None:
@@ -2597,17 +2664,13 @@ def _run_refresh_dates(vault: Path | None) -> None:
     :func:`creek.ingest.refresh.refresh_authored_dates`, and renders a
     one-screen summary. Exit codes mirror the rest of the CLI: 0 on
     success (regardless of how many fragments were updated), 1 if the
-    vault path is unusable.
+    vault path is unusable or its content-mutation lock is busy (#2086).
     """
     from creek.ingest.refresh import refresh_authored_dates
 
-    config = _load_config_for_vault(vault)
-    vault_path = vault or config.vault_path
-    if not vault_path.exists():
-        console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
-        raise typer.Exit(code=1)
-
-    result = refresh_authored_dates(vault_path)
+    vault_path = _resolve_existing_vault(vault)
+    with _hold_content_or_exit_1(vault_path):
+        result = refresh_authored_dates(vault_path)
     console.print(
         f"[bold green]Refreshed authored_at on {result.updated} "
         "fragment(s).[/bold green]"
@@ -2629,17 +2692,13 @@ def _run_refresh_ai_chat(vault: Path | None) -> None:
     Resolves the vault path (CLI flag → configured default), invokes
     :func:`creek.ingest.refresh.resplit_merged_ai_chat`, and renders a
     one-screen summary. Exit codes: 0 on success, 1 if the vault path is
-    unusable.
+    unusable or its content-mutation lock is busy (#2086).
     """
     from creek.ingest.refresh import resplit_merged_ai_chat
 
-    config = _load_config_for_vault(vault)
-    vault_path = vault or config.vault_path
-    if not vault_path.exists():
-        console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
-        raise typer.Exit(code=1)
-
-    result = resplit_merged_ai_chat(vault_path)
+    vault_path = _resolve_existing_vault(vault)
+    with _hold_content_or_exit_1(vault_path):
+        result = resplit_merged_ai_chat(vault_path)
     console.print(
         f"[bold green]Re-split {result.resplit} merged AI-chat "
         "fragment(s).[/bold green]",
@@ -7513,16 +7572,41 @@ def _build_engine(
 ) -> PurgeEngine:
     """Construct a :class:`PurgeEngine` rooted at the resolved vault.
 
+    The engine is lock-free by design — the ``/v1`` journal withdraw calls it
+    while already holding the content-mutation lock, which is not reentrant —
+    so every ``creek purge`` command takes that boundary itself, around its
+    engine call only, through :func:`_hold_content_or_exit_1` (#2086).
+
+    The vault layout is validated here, before any command can reach that
+    hold: acquiring the lock creates ``00-Creek-Meta/locks/`` and the engine
+    writes ``00-Creek-Meta/audit/purge.jsonl``, so a mistyped ``--vault``
+    must be refused while it is still untouched (#2086, #2098). The refusal
+    keeps the wording the engine's own marker check uses, so every purge
+    names a mistyped vault the same way.
+
     Args:
         vault: Optional explicit vault override.
         dry_run: Whether to preview changes only.
 
     Returns:
         A ready-to-use :class:`PurgeEngine`.
+
+    Raises:
+        typer.Exit: With code ``1`` when the resolved path is not a vault.
     """
     from creek.purge import PurgeEngine as _Engine
+    from creek.vault.writer import require_vault_layout
 
     vault_path = _resolve_vault(vault)
+    try:
+        require_vault_layout(vault_path)
+    except FileNotFoundError as exc:
+        console.print(
+            f"[red]Aborted: {escape(str(vault_path))} does not appear to be a "
+            f"Creek vault ({escape(str(exc))}). Run `creek init --vault <path>` "
+            "first, or fix the --vault argument.[/red]",
+        )
+        raise typer.Exit(code=1) from exc
     return _Engine(vault_path, dry_run=dry_run)
 
 
@@ -7556,7 +7640,8 @@ def purge_fragment(
     ):
         console.print("[yellow]Aborted.[/yellow]")
         return
-    result = engine.purge_fragment(fragment_id)
+    with _hold_content_or_exit_1(engine.vault_path):
+        result = engine.purge_fragment(fragment_id)
     _render_purge_result(result)
 
 
@@ -7662,13 +7747,14 @@ def purge_source(
     if not dry_run and not _confirm("Continue?", assume_yes=yes):
         console.print("[yellow]Aborted.[/yellow]")
         return
-    if source_path is not None:
-        result = engine.purge_source_path(source_path, match=match)
-    else:
-        assert source_type is not None, (  # nosec B101
-            "XOR guard failed: source_type required when source_path is None"
-        )
-        result = engine.purge_source(source_type)
+    with _hold_content_or_exit_1(engine.vault_path):
+        if source_path is not None:
+            result = engine.purge_source_path(source_path, match=match)
+        else:
+            assert source_type is not None, (  # nosec B101
+                "XOR guard failed: source_type required when source_path is None"
+            )
+            result = engine.purge_source(source_type)
     _render_purge_result(result)
 
 
@@ -7691,7 +7777,8 @@ def purge_classifications(
     ):
         console.print("[yellow]Aborted.[/yellow]")
         return
-    result = engine.purge_classifications()
+    with _hold_content_or_exit_1(engine.vault_path):
+        result = engine.purge_classifications()
     _render_purge_result(result)
 
 
@@ -7730,7 +7817,8 @@ def purge_daterange(
     ):
         console.print("[yellow]Aborted.[/yellow]")
         return
-    result = engine.purge_daterange(start_date, end_date)
+    with _hold_content_or_exit_1(engine.vault_path):
+        result = engine.purge_daterange(start_date, end_date)
     _render_purge_result(result)
 
 
@@ -7766,10 +7854,12 @@ def purge_vault(
     from creek.purge.engine import VAULT_PURGE_CONFIRMATION
 
     engine = _build_engine(vault, dry_run=dry_run)
+    _require_purge_vault_marker(engine.vault_path)
 
     if dry_run:
         try:
-            result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+            with _hold_content_or_exit_1(engine.vault_path):
+                result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
         except ValueError as exc:
             console.print(f"[red]Aborted: {exc}[/red]")
             raise typer.Exit(code=1) from exc
@@ -7800,11 +7890,38 @@ def purge_vault(
         raise typer.Exit(code=1)
 
     try:
-        result = engine.purge_vault(phrase)
+        # After the phrase, never around it: on a TTY the phrase is a human
+        # typing the vault path, and the lock must not wait on them (#2086).
+        with _hold_content_or_exit_1(engine.vault_path):
+            result = engine.purge_vault(phrase)
     except ValueError as exc:
         console.print(f"[red]Aborted: {exc}[/red]")
         raise typer.Exit(code=1) from exc
     _render_purge_result(result)
+
+
+def _require_purge_vault_marker(vault_path: Path) -> None:
+    """Refuse ``purge vault`` on a tree without its vault marker, before the hold.
+
+    ``purge vault`` alone demands ``00-Creek-Meta/creek_config.yaml`` (GAP-003)
+    on top of the layout :func:`_build_engine` checks. The engine checks it
+    too, but only once the content lock is held, and acquiring the lock
+    creates ``00-Creek-Meta/locks/``: checked here first, a tree the command
+    refuses is left exactly as it was (#2086).
+
+    Args:
+        vault_path: Root the purge would wipe.
+
+    Raises:
+        typer.Exit: With code ``1`` when the marker file is missing.
+    """
+    from creek.purge.engine import require_vault_marker
+
+    try:
+        require_vault_marker(vault_path)
+    except ValueError as exc:
+        console.print(f"[red]Aborted: {escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
 
 
 def _resolve_purge_phrase(

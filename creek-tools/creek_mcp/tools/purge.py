@@ -17,6 +17,13 @@ The five tools mirror the CLI:
 * ``creek.purge.daterange`` — delete fragments inside a date window.
 * ``creek.purge.vault`` — destroy all vault content (preserves folders).
 
+Each tool runs its engine call — and only its engine call — inside the vault
+content-mutation lock (:func:`~creek.vault.mutations.hold_content_mutation`,
+#2086), so a purge cannot delete a fragment between a ``creek.classify``
+pass's load and its write. :class:`PurgeEngine` itself stays lock-free: the
+``/v1`` journal withdraw calls it while already holding that non-reentrant
+lock. A busy vault is the audited ``vault content mutation busy`` refusal.
+
 ``creek.purge.vault`` additionally requires the caller to echo the
 absolute path of the target vault back via ``confirm_vault_path``,
 mirroring the CLI's interactive prompt. Both the token and the
@@ -39,6 +46,11 @@ from typing import TYPE_CHECKING, Any, Final
 
 from creek.purge import PurgeEngine
 from creek.purge.engine import VAULT_PURGE_CONFIRMATION, PurgeResult
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
+    hold_content_mutation,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.auth import is_elevated
 from creek_mcp.tier_ceiling import TierCeiling
@@ -231,8 +243,19 @@ def _audit_engine_error(
 
     ``BaseException`` is left uncaught so ``KeyboardInterrupt`` and
     ``SystemExit`` still propagate as the operator expects.
+
+    Losing the race for the vault content-mutation lock (#2086) arrives here
+    too, as :class:`~creek.vault.mutations.ContentMutationBusyError`, and is
+    answered with the fixed, content-free
+    :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` every other
+    surface uses — still audited, like every other outcome. Only that
+    acquisition timeout reads busy: a ``VaultLockTimeoutError`` raised under
+    the hold may follow deletions that already landed, so it keeps the
+    ``purge engine failed: …`` reason rather than claim nothing was touched.
     """
     _audit_refusal(vault_path, tool=tool, args=args, consumer=consumer)
+    if isinstance(exc, ContentMutationBusyError):
+        return _refusal(tool=tool, reason=CONTENT_MUTATION_BUSY_REASON)
     return _refusal(tool=tool, reason=f"purge engine failed: {exc}")
 
 
@@ -277,7 +300,8 @@ def purge_fragment_tool(
         return refusal
     engine = PurgeEngine(vault_path, dry_run=dry_run)
     try:
-        result = engine.purge_fragment(fragment_id)
+        with hold_content_mutation(vault_path):
+            result = engine.purge_fragment(fragment_id)
     except Exception as exc:
         return _audit_engine_error(
             vault_path,
@@ -317,7 +341,8 @@ def purge_source_tool(
         return refusal
     engine = PurgeEngine(vault_path, dry_run=dry_run)
     try:
-        result = engine.purge_source(source_type)
+        with hold_content_mutation(vault_path):
+            result = engine.purge_source(source_type)
     except Exception as exc:
         return _audit_engine_error(
             vault_path,
@@ -356,7 +381,8 @@ def purge_classifications_tool(
         return refusal
     engine = PurgeEngine(vault_path, dry_run=dry_run)
     try:
-        result = engine.purge_classifications()
+        with hold_content_mutation(vault_path):
+            result = engine.purge_classifications()
     except Exception as exc:
         return _audit_engine_error(
             vault_path,
@@ -412,7 +438,8 @@ def purge_daterange_tool(
         return _refusal(tool=_DATERANGE_TOOL, reason=str(exc))
     engine = PurgeEngine(vault_path, dry_run=dry_run)
     try:
-        result = engine.purge_daterange(start_date, end_date)
+        with hold_content_mutation(vault_path):
+            result = engine.purge_daterange(start_date, end_date)
     except Exception as exc:
         return _audit_engine_error(
             vault_path,
@@ -479,7 +506,8 @@ def purge_vault_tool(
         )
     engine = PurgeEngine(vault_path, dry_run=dry_run)
     try:
-        result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+        with hold_content_mutation(vault_path):
+            result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
     except Exception as exc:
         return _audit_engine_error(
             vault_path,
