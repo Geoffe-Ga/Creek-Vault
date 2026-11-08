@@ -61,7 +61,9 @@ fixed :data:`~creek.link.embeddings.EMBEDDING_MODEL_UNAVAILABLE_REASON` refusal
 (#2065), which this adapter maps to the static ``503 unavailable``; the model
 name, cache path and underlying error stay in the tool's operator log (#2060).
 A timed-out vault content lock is the tools' busy refusal and answers ``503
-temporarily_unavailable``, as ``/v1/journal-entries`` does for its own (#2066).
+temporarily_unavailable``, as ``/v1/journal-entries`` does for its own (#2066);
+a durable job that meets it ends ``failed`` with ``failure_code: "busy"``, the
+same resubmit advice in the job's vocabulary (#2075).
 
 **Both passes are idempotent and resumable**, which is what makes a synchronous
 route honest despite that deadline. ``run_classify`` short-circuits on the
@@ -93,6 +95,7 @@ from creek.link.embeddings import (
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     JOB_FAILURE_CODE_SINCE_MINOR,
+    JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE,
     OK_STATUS,
     PROVENANCE_SINCE_MINOR,
     ClassificationMethod,
@@ -536,28 +539,70 @@ def _link_outcome(vault: Path, claimed: StoredJob) -> _PipelineOutcome:
         consumer=claimed.consumer,
     )
     if raw.get("status") != OK_STATUS:
-        return None, _refusal_reason(raw), None
+        return None, _refusal_reason(raw), _failure_code(raw)
     return _link_model(raw), None, None
 
 
 def _failure_code(raw: dict[str, Any]) -> JobFailureCode | None:
     """Return the published code for a tool's non-ok result, or ``None``.
 
-    Only a refusal the caller can remedy earns one (#1877): today that is the
-    writer's request key being refused by its vendor, matched on the tool's
-    fixed reason constant rather than on any text the vendor wrote.
+    Only a refusal the caller can remedy earns one (#1877), and each is matched
+    by **exact equality** on the tool's fixed reason constant, never on any
+    text a vendor or the engine wrote — the rule
+    :func:`pipeline_refusal_code` applies on the synchronous path, so provider
+    text that merely quotes a fixed reason still fails closed to ``None``:
+
+    * the writer's request key refused by its vendor is
+      :attr:`JobFailureCode.REQUEST_KEY_REJECTED` — replace the key;
+    * a timed-out vault content lock is :attr:`JobFailureCode.BUSY` (#2075) —
+      the condition the synchronous routes answer ``503
+      temporarily_unavailable`` (#2066), so resubmit.
+
+    The operator-side fixed reasons — an unloadable embedding model, an
+    unreachable LLM provider — are deliberately left codeless: no resubmit
+    clears them, and their detail stays in the server log.
 
     Args:
         raw: The tool's non-ok result.
 
     Returns:
-        :attr:`JobFailureCode.REQUEST_KEY_REJECTED`, or ``None``.
+        The published :class:`JobFailureCode`, or ``None``.
     """
-    if raw.get("status") == "refused" and raw.get("reason") == (
-        REQUEST_KEY_REJECTED_REASON
-    ):
+    if raw.get("status") != "refused":
+        return None
+    reason = raw.get("reason")
+    if reason == REQUEST_KEY_REJECTED_REASON:
         return JobFailureCode.REQUEST_KEY_REJECTED
+    if reason == CONTENT_MUTATION_BUSY_REASON:
+        return JobFailureCode.BUSY
     return None
+
+
+def _served_failure_code(
+    request: Request, code: JobFailureCode | None
+) -> JobFailureCode | None:
+    """Return *code* as this caller may be shown it, or ``None``.
+
+    A caller whose declared minor is below the code's own entry in
+    :data:`~creek_mcp.api.models.JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE`
+    vendored a closed vocabulary without it, so it is served the ``null`` it
+    always received for that failure — never a value its schema rejects
+    (#2075). Whether the key appears at all is
+    :data:`~creek_mcp.api.models.JOB_FAILURE_CODE_SINCE_MINOR`'s decision,
+    taken separately by :func:`handle_job_status`.
+
+    Args:
+        request: The status request in flight.
+        code: The stored job's code.
+
+    Returns:
+        *code*, or ``None`` when the caller's minor predates it.
+    """
+    if code is None or not declared_minor_at_least(
+        request, JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE[code]
+    ):
+        return None
+    return code
 
 
 def _refusal_reason(raw: dict[str, Any]) -> str:
@@ -771,7 +816,10 @@ async def handle_job_status(request: Request) -> Response:
     status = await write_off_loop(_job_status, request, context, active_job_ids)
     if status is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    body = status.model_dump(mode="json")
+    served_code = _served_failure_code(request, status.failure_code)
+    body = status.model_copy(update={"failure_code": served_code}).model_dump(
+        mode="json"
+    )
     if not declared_minor_at_least(request, JOB_FAILURE_CODE_SINCE_MINOR):
         # A caller below 0.26 vendored a closed body without the key (#1877).
         body.pop("failure_code")

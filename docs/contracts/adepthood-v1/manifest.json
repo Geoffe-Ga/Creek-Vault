@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.28.0",
+  "contract_version": "0.29.0",
   "files": [
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-ready.json",
-      "sha256": "bcb756d6101b5fc5672d0617d51bc1c2d31417d23c5e3b2a662ff995118f816e",
+      "sha256": "72223537eed7b460b533b99f667567000084ee5b69477bef5cb1c56edb6cfd0f",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-unavailable.json",
-      "sha256": "126137687e8f06b82e87dfe031e1f79ea1175ed14c0c933b715b4bd1b581044f",
+      "sha256": "981f36232a7f2744c962ad19bcf8e1d092e24953dd614becbcb46c7ce111cb7c",
       "state": null
     },
     {
@@ -76,7 +76,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "1d9e10532858afdb7fce3afd83782b210e1d5b2e517f47d5c6896a0c1ce74cef",
+      "sha256": "f98cc925862fd75af8e4edfcf2afd81423a26bd39e2f57f23a6d66f8f8ea2f90",
       "state": "empty"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "bcb756d6101b5fc5672d0617d51bc1c2d31417d23c5e3b2a662ff995118f816e",
+      "sha256": "72223537eed7b460b533b99f667567000084ee5b69477bef5cb1c56edb6cfd0f",
       "state": "success"
     },
     {
@@ -818,7 +818,7 @@
       "capability": null,
       "model": "JobStatusResponse",
       "path": "schemas/JobStatusResponse.schema.json",
-      "sha256": "489b35c0bbbcee35838312ba3f8a7d418fef4e4243206951d2e13590bf595411",
+      "sha256": "f85e90e7b3483ad2c6ffed3ebdf64be69358d95855f78fd5ddb088578d51e9d7",
       "state": null
     },
     {

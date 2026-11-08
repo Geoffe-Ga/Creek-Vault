@@ -61,10 +61,13 @@ from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     CONTRACT_MINOR,
     ERROR_MESSAGES,
+    JOB_FAILURE_CODE_SINCE_MINOR,
     RETRY_POLICY,
+    SUPPORTED_CONTRACT_MINORS,
     Capability,
     ErrorCode,
     ErrorEnvelope,
+    JobFailureCode,
     RetryDisposition,
     minor_at_least,
 )
@@ -1838,6 +1841,31 @@ def test_the_job_failure_code_is_exact_and_fails_closed(
     deliberately codeless: resubmitting cannot clear them.
     """
     assert pipeline_module._failure_code(raw) == expected
+
+
+def test_every_job_failure_code_has_a_served_since_minor() -> None:
+    """Each published job code names the first minor that may be shown it.
+
+    The table is total over :class:`JobFailureCode`, so a member added without
+    an entry fails here instead of being served to every ``0.26``+ consumer
+    whose vendored, closed vocabulary would reject it. Every entry is a minor
+    this server still serves, and none predates the ``failure_code`` key
+    itself.
+
+    The table is imported in the body, not at the top of the module, so that
+    the red-to-green proof against a tree without it fails this test alone
+    rather than every test in the module at collection.
+    """
+    from creek_mcp.api.models import JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE
+
+    assert set(JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE) == set(JobFailureCode)
+    for since in JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE.values():
+        assert since in SUPPORTED_CONTRACT_MINORS
+        assert minor_at_least(since, JOB_FAILURE_CODE_SINCE_MINOR)
+    assert dict(JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE) == {
+        JobFailureCode.REQUEST_KEY_REJECTED: "0.26",
+        JobFailureCode.BUSY: _BUSY_JOB_MINOR,
+    }
 
 
 _PIPELINE_FIXED_REASONS: Final[tuple[str, ...]] = (
