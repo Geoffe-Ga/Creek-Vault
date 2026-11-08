@@ -20,6 +20,7 @@ runtime, never pasted as an opaque literal.
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import shutil
@@ -31,14 +32,17 @@ import pytest
 from docx import Document as DocxDocument
 from openpyxl import Workbook
 
+from creek import _fslock
 from creek.ingest import route_to_ingestor
 from creek.ingest.journal_staging import UPLOAD_STAGING_RELDIR
-from creek.ingest.pipeline import IngestRunResult
+from creek.ingest.pipeline import IngestRunResult, run_ingest
 from creek.purge import PurgeEngine
+from creek.vault.mutations import content_mutation_lock_path
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 from creek_mcp.staged_names import MAX_SUFFIX_CHARS, safe_stem
 from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools import upload as upload_mod
 from creek_mcp.tools.upload import (
     _MAX_ENCODED_CHARS,
     MAX_UPLOAD_BYTES,
@@ -48,7 +52,10 @@ from creek_mcp.tools.upload import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
+
+    from creek.models import PrivacyTier
 
 _TS = "2026-06-20T10:00:00+00:00"
 _REFUSAL_KEYS = {"status", "tool", "tier_ceiling", "reason"}
@@ -1551,3 +1558,144 @@ def test_a_plain_text_upload_still_takes_the_generic_fallback(
     assert result["status"] == "ok"
     assert result["source_type"] == "generic"
     assert len(_fragments(vault)) == 1
+
+
+_LOCK_PROBE_TIMEOUT_SECONDS = 0.0
+"""Wait budget for the same-thread content-lock probe: none at all.
+
+:func:`creek._fslock.vault_lock` guards each lock file with a non-reentrant
+per-path :class:`threading.Lock`, so a probe from the thread that already holds
+the lock times out at once — "is the content lock held right now?" becomes a
+deterministic question with no second thread to join (#930's probe).
+"""
+
+
+def _content_lock_is_held(vault: Path) -> bool:
+    """Return whether this thread holds *vault*'s content-mutation lock now."""
+    try:
+        with _fslock.vault_lock(
+            content_mutation_lock_path(vault),
+            timeout=_LOCK_PROBE_TIMEOUT_SECONDS,
+        ):
+            return False
+    except _fslock.VaultLockTimeoutError:
+        return True
+
+
+def _probe_the_970_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    vault: Path,
+    events: list[str],
+    held: list[bool],
+) -> None:
+    """Wrap the #970 gate's tier read so it records ``gate`` and probes the lock."""
+    real = upload_mod._existing_tier
+
+    def _probed(vault_path: Path, fragment_ids: list[str]) -> PrivacyTier:
+        """Probe the content lock, record the gate, then read the real tier."""
+        held.append(_content_lock_is_held(vault))
+        events.append("gate")
+        return real(vault_path, fragment_ids)
+
+    monkeypatch.setattr(upload_mod, "_existing_tier", _probed)
+
+
+def _seed_lock_upload(vault: Path) -> None:
+    """Upload ``u-lock`` at tier open, so a re-send has a fragment to gate on."""
+    seeded = upload_tool(
+        vault_path=vault,
+        filename="lock.txt",
+        content_base64=_b64(b"the first sentence the lock tests overwrite"),
+        external_id="u-lock",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert seeded["action"] == "created", seeded
+
+
+def test_the_970_overwrite_gate_runs_inside_the_content_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #970 tier read happens while the content-mutation lock is held (#2069).
+
+    ``creek classify`` escalates tiers under that lock. A gate that reads the
+    tier outside it can admit an overwrite on a tier a concurrent pass is
+    about to raise, and the overwrite then lands on a fragment the caller
+    could never have read.
+    """
+    vault = _vault(tmp_path)
+    _seed_lock_upload(vault)
+    events: list[str] = []
+    held: list[bool] = []
+    _probe_the_970_gate(monkeypatch, vault, events, held)
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="lock.txt",
+        content_base64=_b64(b"a replacement sentence for the lock test"),
+        external_id="u-lock",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok", result
+    assert events, "the #970 gate never read a tier"
+    assert all(held), f"the #970 gate ran outside the content lock: {held}"
+
+
+def test_the_970_gate_and_the_ingest_share_one_content_lock_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admission and the overwrite it admits sit in ONE critical section (#2069).
+
+    Two holds — one around the gate, another around the ingest — would still
+    leave a window between them for a re-tier, so this pins the shape and not
+    just the lock: ``enter, gate, run, exit``, in that order and exactly once.
+    ``status == "ok"`` is the no-deadlock evidence: ``vault_lock`` is
+    non-reentrant, so anything under the hold that re-took the content lock
+    would time out instead of answering.
+    """
+    vault = _vault(tmp_path)
+    _seed_lock_upload(vault)
+    events: list[str] = []
+    held: list[bool] = []
+    real_lock = _fslock.vault_lock
+
+    @contextlib.contextmanager
+    def _recording_lock(lock_path: Path, **kwargs: float) -> Iterator[None]:
+        """Take the real lock, recording the hold's entry and exit."""
+        with real_lock(lock_path, **kwargs):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    def _probed_run(**kwargs: Any) -> IngestRunResult:
+        """Probe the content lock, record the ingest, then run the real one."""
+        held.append(_content_lock_is_held(vault))
+        events.append("run")
+        return run_ingest(**kwargs)
+
+    monkeypatch.setattr(upload_mod, "vault_lock", _recording_lock, raising=False)
+    _probe_the_970_gate(monkeypatch, vault, events, held)
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="lock.txt",
+        content_base64=_b64(b"a replacement sentence for the hold test"),
+        external_id="u-lock",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        run=_probed_run,
+    )
+
+    assert result["status"] == "ok", result
+    assert result["action"] == "updated"
+    assert events == ["enter", "gate", "run", "exit"]
+    assert held == [True, True]

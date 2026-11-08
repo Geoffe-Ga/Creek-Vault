@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, Any, Final
 import frontmatter
 import pytest
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.archive import (
     MAX_EXTRACTED_BYTES,
@@ -69,6 +70,7 @@ from creek.ingest.journal_staging import (
 )
 from creek.ingest.pipeline import run_ingest
 from creek.models import PrivacyTier
+from creek.vault.mutations import content_mutation_lock_path
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.upload import TOOL_NAME, upload_tool
@@ -91,6 +93,8 @@ from tests.archive_export_support import (
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
+
+    from creek.ingest.pipeline import IngestRunResult
 
 _TS: Final[str] = "2026-08-19T10:00:00+00:00"
 _REFUSAL_KEYS: Final[set[str]] = {"status", "tool", "tier_ceiling", "reason"}
@@ -452,12 +456,12 @@ def test_a_refusal_names_no_archive_member_or_vault_path(tmp_path: Path) -> None
         tmp_path: pytest's per-test directory.
     """
     vault = _vault(tmp_path)
-    secret = "a-member-name-that-must-not-be-echoed"
+    member_name = "a-member-name-that-must-not-be-echoed"
 
-    result = _upload(vault, zip_slip_archive(f"../{secret}.txt", _ESCAPE_MARKER))
+    result = _upload(vault, zip_slip_archive(f"../{member_name}.txt", _ESCAPE_MARKER))
 
     assert result["status"] == "refused"
-    assert secret not in result["reason"]
+    assert member_name not in result["reason"]
     assert str(vault) not in result["reason"]
 
 
@@ -850,3 +854,58 @@ def test_a_directory_already_at_this_ids_unpack_path_is_adopted(
     payload = _upload(vault, chatgpt_archive(), external_id="adepthood:export:1525")
 
     assert payload.get("status") == "ok", payload
+
+
+_LOCK_PROBE_TIMEOUT_SECONDS: Final[float] = 0.0
+"""Wait budget for the same-thread content-lock probe: none at all.
+
+:func:`creek._fslock.vault_lock` is non-reentrant per path, so a probe from the
+thread that holds the lock times out at once and the question "is the content
+lock held right now?" needs no second thread (#930's probe).
+"""
+
+
+def test_an_archive_ingest_runs_inside_the_content_lock(
+    tmp_path: Path,
+) -> None:
+    """The archive fork's ingest shares the #970 gate's content-lock hold (#2069).
+
+    The archive twin of
+    ``tests/test_mcp_upload.py::test_the_970_gate_and_the_ingest_share_one_content_lock_hold``:
+    the fork leaves the single-document path *below* the gate, so it has to
+    stay inside the same critical section. ``status == "ok"`` is also the
+    no-deadlock evidence for the unpack/ingest/erase path, which must not
+    re-take the non-reentrant content lock.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+    """
+    vault = _vault(tmp_path)
+    held: list[bool] = []
+
+    def _probed_run(**kwargs: Any) -> IngestRunResult:
+        """Probe the content lock, then run the real ledger-free ingest."""
+        try:
+            with vault_lock(
+                content_mutation_lock_path(vault),
+                timeout=_LOCK_PROBE_TIMEOUT_SECONDS,
+            ):
+                held.append(False)
+        except VaultLockTimeoutError:
+            held.append(True)
+        return run_ingest(**kwargs)
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="export.zip",
+        content_base64=_b64(chatgpt_archive()),
+        external_id="adepthood:export:2069",
+        timestamp=_TS,
+        tier="personal",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+        run=_probed_run,
+    )
+
+    assert result["status"] == "ok", result
+    assert result["source_type"] == "chatgpt"
+    assert held == [True], f"the archive ingest ran outside the content lock: {held}"
