@@ -314,10 +314,11 @@ _PINNED_GATE_ROWS = [
     # argument rather than a fourth shape: an ``entry_ref`` is caller-ADDRESSED
     # and singular, so there is nothing to partially admit — you cannot return
     # half a fragment's frequency. Pinned as its own row because the pair is
-    # the checkable part: the tool also imports ``source_tiers`` and
-    # ``max_source_tier``, and a manifest re-pointed at either of those would
-    # read as a gate while naming a function that only *reads a tier* and
-    # decides nothing.
+    # the checkable part: the tool also imports ``fragment_tier`` and
+    # ``max_source_tier`` (since #2068 it reads its tier from one locked walk
+    # rather than through ``source_tiers``), and a manifest re-pointed at
+    # either of those would read as a gate while naming a function that only
+    # *reads a tier* and decides nothing.
     (
         "creek.classify.entry",
         "creek_mcp.tools.classify_entry",

@@ -48,17 +48,20 @@ from typing import TYPE_CHECKING, Any, Final
 import frontmatter
 import pytest
 
+from creek._fslock import VaultLockTimeoutError
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.archive import ARCHIVE_SUFFIXES
 from creek.ingest.gdrive import _EXTENSION_ROUTES, _Refuse
 from creek.ingest.pipeline import run_ingest
 from creek.models import PrivacyTier
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     CAPABILITY_SINCE_MINOR,
     ERROR_MESSAGES,
     ERROR_STATUS,
     Capability,
     ErrorCode,
+    ErrorEnvelope,
     UploadResponse,
     minor_at_least,
 )
@@ -929,6 +932,12 @@ def test_no_refusal_body_carries_a_path_or_the_document(vault: Path) -> None:
         # fragment nor its tier.
         (GENERIC_ABOVE_CEILING_REASON, ErrorCode.PRIVACY_REFUSED),
         ("vault unavailable", ErrorCode.TEMPORARILY_UNAVAILABLE),
+        # Content-lock contention (#2069): retryable, and matched by EXACT
+        # equality, so a reason that merely contains the phrase — which could
+        # only be a composed string carrying something else — stays closed.
+        (CONTENT_MUTATION_BUSY_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
+        (f"x {CONTENT_MUTATION_BUSY_REASON}", ErrorCode.INTERNAL_ERROR),
+        (f"{CONTENT_MUTATION_BUSY_REASON} at /x", ErrorCode.INTERNAL_ERROR),
         (
             f"encoded upload exceeds the {MAX_UPLOAD_BYTES}-byte cap",
             ErrorCode.INVALID_REQUEST,
@@ -955,6 +964,56 @@ def test_upload_refusal_code_is_total(reason: str, expected: ErrorCode) -> None:
         expected: The wire code it must become.
     """
     assert upload_refusal_code(reason) is expected
+
+
+_BUSY_MARKER: Final[str] = "synthetic-lock-detail-2069"
+"""A token the lock error carries and the response must never echo."""
+
+
+def test_upload_lock_contention_is_temporarily_unavailable(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded content-lock timeout is a retryable ``503``, not a ``500`` (#2069).
+
+    Since #2069 ``creek.upload`` takes the vault content-mutation lock across
+    its #970 gate and the ingest, and refuses with the fixed
+    :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` when another
+    writer holds it past its bound. Without an adapter mapping that reason fell
+    through to ``500 internal_error``; it is the same back-off-and-retry
+    ``503 temporarily_unavailable`` the pipeline routes answer (#2066), in the
+    same closed envelope, carrying none of the lock's detail.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Replaces the tool's lock binding with one that times out.
+    """
+
+    def _lock_times_out(*_args: object, **_kwargs: object) -> object:
+        """Time out the way a second writer holding the content lock does.
+
+        Raises:
+            VaultLockTimeoutError: Always, naming a marker that must not leak.
+        """
+        msg = f"busy at {vault} {_BUSY_MARKER}"
+        raise VaultLockTimeoutError(msg)
+
+    monkeypatch.setattr(
+        "creek_mcp.tools.upload.vault_lock", _lock_times_out, raising=False
+    )
+
+    response = _post(vault, _body())
+
+    assert response.status_code == ERROR_STATUS[ErrorCode.TEMPORARILY_UNAVAILABLE]
+    payload = envelope(response)
+    assert payload["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert payload["message"] == ERROR_MESSAGES[ErrorCode.TEMPORARILY_UNAVAILABLE]
+    ErrorEnvelope.model_validate(payload)
+    assert set(payload) == {"code", "message", "request_id"}
+    assert _BUSY_MARKER not in response.text
+    assert str(vault) not in response.text
+    assert not contains_a_path(response.text)
+    assert _fragments(vault) == []
 
 
 def test_an_absent_vault_is_a_refusal_and_not_a_crash(tmp_path: Path) -> None:
