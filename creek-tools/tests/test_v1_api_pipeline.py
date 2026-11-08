@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import time
 from functools import partial
 from threading import Event
@@ -47,8 +48,9 @@ import pytest
 from creek.classify.classify_engine import run_classify
 from creek.classify.llm import LLMClassificationResult
 from creek.classify.rules import FREQUENCY_SIGNALS, WAVELENGTH_PHASE_SIGNALS
-from creek.config import load_vault_config
+from creek.config import EmbeddingsConfig, load_vault_config
 from creek.link import embeddings as embeddings_module
+from creek.link.embeddings import EmbeddingRefusedError
 from creek.models import Frequency, Phase, PrivacyTier
 from creek_mcp.api.models import (
     CONTRACT_MINOR,
@@ -92,6 +94,12 @@ HTTP_UNAVAILABLE: Final[int] = 503
 
 HTTP_SERVER_FAULT: Final[int] = 500
 """What a tool success this contract cannot express earns."""
+
+_LEAK_MARKER: Final[str] = "LEAK-MARKER"
+"""A token planted in an injected loader failure that must never reach the wire."""
+
+_PIPELINE_LOGGER: Final[str] = "creek_mcp.httpapi.pipeline"
+"""The operator log the embedding-model refusal is recorded on (#2060)."""
 
 PIPELINE_MINOR: Final[str] = "0.10"
 """The contract minor ``pipeline`` was published at.
@@ -1220,3 +1228,119 @@ def test_the_cluster_stages_run_a_local_embedding_pass(
     assert response.status_code == HTTP_OK
     assert response.json()["fragment_count"] == 3
     assert loaded, f"{method} reached no embedding model at all"
+
+
+def _assert_static_unavailable_refusal(response: Any, vault: Path) -> None:
+    """Assert *response* is the closed ``503 unavailable`` envelope and leaks nothing.
+
+    The engine's :class:`~creek.link.embeddings.EmbeddingModelUnavailableError`
+    message names the model, the cache directory and the third-party error
+    text. None of that may cross the wire: the envelope carries only the
+    static :data:`creek_mcp.api.models.ERROR_MESSAGES` text.
+
+    Args:
+        response: The ``POST /v1/links`` response under test.
+        vault: The vault root, whose path must not be echoed.
+    """
+    assert response.status_code == HTTP_UNAVAILABLE
+    body = response.json()
+    assert body["code"] == ErrorCode.UNAVAILABLE.value
+    for leaked in (
+        _LEAK_MARKER,
+        "sentence-transformers",
+        "Underlying error",
+        "Traceback",
+        EmbeddingsConfig().model,
+        str(vault),
+    ):
+        assert leaked not in response.text
+
+
+@pytest.mark.parametrize("method", ["eddies", "threads"], ids=["eddies", "threads"])
+def test_an_unloadable_embedding_model_is_a_published_refusal_not_a_server_fault(
+    api: TestClient,
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+) -> None:
+    """A cluster stage that cannot load its local model answers ``503 unavailable``.
+
+    The shipped single-vault image installs no ``embeddings`` extra, so the
+    lazy ``sentence_transformers`` import inside
+    :meth:`~creek.link.embeddings.EmbeddingLinker.load_model` fails on the
+    first uncached fragment and ``eddies``/``threads`` used to escape to the
+    error boundary as a generic ``500 internal_error`` (#2060). Only an
+    operator can clear it — install the extra, populate the cache offline, or
+    pin a pool embedding — so the refusal is ``unavailable`` (retry after
+    operator action), not ``temporarily_unavailable`` (back off and retry).
+
+    The remediation the engine's message carries stays in the operator log:
+    the record names the exception type and the request id the client was
+    handed, and the third-party text rides only on the attached traceback.
+    """
+    caplog.set_level(logging.WARNING, logger=_PIPELINE_LOGGER)
+
+    def _raise(_model_name: str, _cache_folder: str | None = None) -> object:
+        """Fail the way a missing extra or a blocked download does.
+
+        Args:
+            _model_name: Unread.
+            _cache_folder: Unread.
+
+        Raises:
+            OSError: Always, carrying a marker that must not be served.
+        """
+        msg = f"ProxyError: 403 {_LEAK_MARKER}"
+        raise OSError(msg)
+
+    monkeypatch.setattr(embeddings_module, "_load_sentence_transformer", _raise)
+    for index in range(3):
+        _write_fragment(vault, f"f{index}", _signal_body(), tier="personal")
+
+    response = api.post(LINKS_PATH, json={"method": method}, headers=headers())
+
+    _assert_static_unavailable_refusal(response, vault)
+    records = [
+        record
+        for record in caplog.records
+        if record.name == _PIPELINE_LOGGER
+        and "EmbeddingModelUnavailableError" in record.getMessage()
+    ]
+    assert len(records) == 1
+    (record,) = records
+    assert getattr(record, "request_id", None) == response.json()["request_id"]
+    assert response.json()["request_id"] in record.getMessage()
+    assert record.exc_info is not None
+    assert _LEAK_MARKER not in record.getMessage()
+
+
+def test_an_embedding_refusal_on_the_link_route_is_the_same_refusal(
+    api: TestClient, vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-local route's refused embedding answers the same ``503 unavailable``.
+
+    :class:`~creek.link.embeddings.EmbeddingRefusedError` subclasses the
+    unavailable-model error so every caller degrades identically. The bulk
+    sync path drops refused vectors rather than raising, so the refusal is
+    injected at ``link_tool`` — the seam the route hands the request to.
+    """
+
+    def _raise_refused(**_kwargs: object) -> object:
+        """Refuse the way a pool route that produced no vector does.
+
+        Args:
+            **_kwargs: The route's tool arguments, unread.
+
+        Raises:
+            EmbeddingRefusedError: Always, with fixed text.
+        """
+        msg = f"fixed text {_LEAK_MARKER}"
+        raise EmbeddingRefusedError(msg)
+
+    monkeypatch.setattr(pipeline_module, "link_tool", _raise_refused)
+    _write_fragment(vault, "f0", _signal_body(), tier="personal")
+
+    response = api.post(LINKS_PATH, json={"method": "eddies"}, headers=headers())
+
+    _assert_static_unavailable_refusal(response, vault)
