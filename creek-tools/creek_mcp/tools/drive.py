@@ -67,6 +67,7 @@ single-file input is what this path actually relies on.)
 from __future__ import annotations
 
 import logging
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -87,10 +88,17 @@ from creek.ingest.gdrive import (
 )
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import run_ingest
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
+    hold_content_mutation,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from creek.config import CreekConfig, GoogleDriveConfig
     from creek.ingest.gdrive import DriveClient, TokenInspection
 
@@ -199,6 +207,18 @@ and because a queued sync did nothing wrong.
 Carries no path, no file name and no consumer id: like every reason here it
 is a constant, not a composition.
 """
+
+
+class _SyncLockBusyError(Exception):
+    """Another sync of this vault held ``gdrive.lock`` past the bounded wait.
+
+    Raised only when *acquiring* the connector lock times out, so it can never
+    be confused with a :class:`~creek._fslock.VaultLockTimeoutError` raised by
+    a lock taken under it (#2079) — which used to be reported as
+    :data:`SYNC_BUSY_REASON` too, telling a caller that another sync was
+    running when it was the fragment index that had timed out.
+    """
+
 
 ERASE_FAILED_REASON: Final[str] = "cached credential could not be erased"
 """The local token file survived :func:`~creek.ingest.gdrive.revoke_token`.
@@ -503,13 +523,20 @@ def _sync_lock_path(vault_path: Path) -> Path:
     ``00-Creek-Meta/State/ingest/gdrive.lock`` beside
     ``…/gdrive.jsonl``.
 
-    Naming the *connector* rather than the vault is the whole scoping
-    decision. A vault-wide lock would make a journal write, an upload and
-    a ``creek ingest`` wait on a Drive sync that has nothing to do with
-    them; this one is contended only by two syncs of the same Drive into
-    the same vault, which have no useful parallelism anyway —
-    :meth:`~creek.ingest.gdrive.GoogleDriveDownloader.download_all` is a
-    serial loop.
+    Naming the *connector* rather than the vault is the scoping decision
+    for the **download**: this lock is contended only by two syncs of the
+    same Drive into the same vault, which have no useful parallelism anyway
+    — :meth:`~creek.ingest.gdrive.GoogleDriveDownloader.download_all` is a
+    serial loop — so a journal write, an upload or a ``creek ingest`` never
+    waits on a sync's network phase.
+
+    The **ingest** phase is different (#2079). It writes ``01-Fragments``
+    and its ledger, which is what ``creek classify`` and ``creek link``
+    load and rewrite, so it additionally takes the vault content-mutation
+    lock — and therefore waits on, and is waited on by, every other content
+    writer for as long as the ingest runs. The order is always this lock
+    first, the content lock second, and no content-lock holder ever takes
+    this one, so the two cannot invert.
 
     Args:
         vault_path: Vault root.
@@ -520,6 +547,26 @@ def _sync_lock_path(vault_path: Path) -> Path:
     return SourceLedger.path_for(vault_path, DRIVE_LEDGER_SOURCE).with_suffix(".lock")
 
 
+def _discard_unconsumed(paths: Iterable[Path]) -> None:
+    """Remove staged files this run fetched but could not ingest (#2079).
+
+    The downloader stamps each file with Drive's ``modified_time`` and skips any
+    staged file at least that new, so a file left behind by a run whose ingest
+    was refused would be skipped by every later sync and never become a
+    fragment. Unlinking makes the next sync fetch it again.
+
+    Rewinding the mtime instead would be unsafe: the ingestors derive a unit's
+    timestamp — and with it the fragment id — from the file's ``st_mtime``
+    (``creek/ingest/base.py``), so anything reading staging before the next
+    sync would mint epoch-dated fragments.
+
+    Args:
+        paths: The files this run downloaded.
+    """
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
 def _locked_download_and_ingest(
     *,
     client: DriveClient,
@@ -527,15 +574,21 @@ def _locked_download_and_ingest(
     staging: Path,
     vault_path: Path,
 ) -> tuple[tuple[tuple[Path, ...], int, int] | None, dict[str, int] | None]:
-    """Mirror Drive and ingest the result as **one** locked window.
+    """Mirror Drive and ingest the result as **one** connector-locked window.
 
-    The download and the ingest are held together on purpose. Locking only
-    the ingest would still let two runs both pass the downloader's
-    incremental mtime check against a staging file neither had written
-    yet, and locking only the download would still let two ingests race
-    the fragment index. Measured before the lock existed, two overlapping
-    syncs of one Drive file produced two notes carrying one fragment id
-    and two ledger rows for one ``source_key`` (#1590).
+    The download and the ingest are held together under ``gdrive.lock`` on
+    purpose. Locking only the ingest would still let two runs both pass the
+    downloader's incremental mtime check against a staging file neither had
+    written yet, and locking only the download would still let two ingests
+    race the fragment index. Measured before the lock existed, two
+    overlapping syncs of one Drive file produced two notes carrying one
+    fragment id and two ledger rows for one ``source_key`` (#1590).
+
+    Only the ingest additionally holds the vault content-mutation lock
+    (#2079), nested inside ``gdrive.lock`` and never around the download, so
+    the network phase cannot stall journal writes, uploads, classify or link.
+    When that lock is busy, the files this run fetched are discarded (see
+    :func:`_discard_unconsumed`) so the next sync fetches them again.
 
     Args:
         client: The Drive backend.
@@ -550,17 +603,35 @@ def _locked_download_and_ingest(
         vault vanished mid-ingest.
 
     Raises:
-        VaultLockTimeoutError: If another sync of this vault held the lock
+        _SyncLockBusyError: If another sync of this vault held ``gdrive.lock``
             for longer than :data:`_SYNC_LOCK_TIMEOUT_SECONDS`.
+        ContentMutationBusyError: If another content writer held the vault
+            past the bounded wait; nothing was ingested.
+        VaultLockTimeoutError: If a lock taken *under* the ingest — the
+            writer's ``.id-index.lock`` — timed out. It is neither busy reason,
+            and fragments may already be written, so it propagates.
     """
-    with vault_lock(
-        _sync_lock_path(vault_path),
-        timeout=_SYNC_LOCK_TIMEOUT_SECONDS,
-    ):
+    with ExitStack() as hold:
+        try:
+            hold.enter_context(
+                vault_lock(
+                    _sync_lock_path(vault_path),
+                    timeout=_SYNC_LOCK_TIMEOUT_SECONDS,
+                )
+            )
+        except VaultLockTimeoutError as exc:
+            raise _SyncLockBusyError from exc
         fetched = _download(client, drive, staging)
         if fetched is None:
             return None, None
-        return fetched, _ingest_downloaded(fetched[0], vault_path)
+        try:
+            with hold_content_mutation(vault_path):
+                return fetched, _ingest_downloaded(fetched[0], vault_path)
+        except ContentMutationBusyError:
+            # Acquisition only: the ingest never started, so every file this
+            # run fetched is still unconsumed.
+            _discard_unconsumed(fetched[0])
+            raise
 
 
 def drive_sync_tool(
@@ -592,7 +663,14 @@ def drive_sync_tool(
     The lock is POSIX advisory (``fcntl``): on Windows, and on network mounts
     that do not implement ``flock``, it degrades to serialising the threads of
     one process — see :mod:`creek._fslock`. It is scoped to this connector, so
-    a journal write, an upload or a ``creek ingest`` never waits on a sync.
+    a journal write, an upload or a ``creek ingest`` never waits on a sync's
+    *download*. The ingest phase is another matter (#2079): it holds the vault
+    content-mutation lock, nested inside the connector lock, so it waits on —
+    and is waited on by — every other content writer while it runs. A sync
+    that cannot take that lock within the bound is refused with
+    :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON`, distinct from
+    :data:`SYNC_BUSY_REASON`, and leaves nothing staged for the skip check to
+    starve; a lock timeout raised *under* the ingest propagates.
 
     An earlier version of this note went on to say those three "still race
     each other through the same ``run_ingest`` seam". That was wrong twice
@@ -652,7 +730,7 @@ def drive_sync_tool(
             staging=config.source_drive / drive.staging_dir,
             vault_path=vault_path,
         )
-    except VaultLockTimeoutError:
+    except _SyncLockBusyError:
         # Logged without the vault path: the refusal itself is constant, and
         # the operator-facing detail belongs in the server log, not the wire.
         logger.info("Drive sync refused: another sync of this vault holds the lock")
@@ -660,6 +738,13 @@ def drive_sync_tool(
             tool=SYNC_TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason=SYNC_BUSY_REASON,
+        )
+    except ContentMutationBusyError:
+        logger.info("Drive sync refused: another writer holds the vault content")
+        return refusal_response(
+            tool=SYNC_TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=CONTENT_MUTATION_BUSY_REASON,
         )
     if fetched is None:
         return refusal_response(

@@ -37,12 +37,13 @@ from typing import TYPE_CHECKING, Any, Final
 import frontmatter
 import pytest
 
-from creek._fslock import vault_lock
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.config import _READONLY_SCOPES, GoogleDriveConfig
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest import gdrive as gdrive_module
 from creek.ingest.gdrive import _REVOKE_URL, DriveFile, RevokeResult
 from creek.ingest.pipeline import run_ingest
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.bundle import build_bundle
 from creek_mcp.api.models import (
     CAPABILITY_SINCE_MINOR,
@@ -58,7 +59,14 @@ from creek_mcp.api.models import (
 )
 from creek_mcp.api.openapi import build_openapi
 from creek_mcp.httpapi import drive as drive_module
+from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools import drive as drive_tools
+from tests.test_mcp_content_mutation import (
+    _content_lock_held_elsewhere,
+    _fragment_digests,
+    _shorten_lock_wait,
+)
+from tests.test_mcp_upload import _content_lock_is_held
 from tests.v1_api_support import (
     DRIVE_CONNECTOR_PATH,
     DRIVE_SYNC_PATH,
@@ -1357,6 +1365,7 @@ def _published_reasons() -> tuple[str, ...]:
         (drive_tools.SYNC_FAILED_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
         (drive_tools.SYNC_BUSY_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
         (drive_tools.VAULT_UNAVAILABLE_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
+        (CONTENT_MUTATION_BUSY_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
         ("something this adapter has never heard of", ErrorCode.INTERNAL_ERROR),
         ("", ErrorCode.INTERNAL_ERROR),
     ],
@@ -2132,3 +2141,251 @@ def test_a_sync_that_cannot_take_the_lock_is_refused_rather_than_queued(
     assert stub.downloads == []
     assert _fragments(vault) == []
     assert str(vault) not in response.text
+
+
+# --------------------------------------------------------------------------- #
+# The ingest phase joins the vault content-mutation boundary (#2079)
+# --------------------------------------------------------------------------- #
+
+
+class _ProbingDrive(_StubDrive):
+    """A stub that records whether the content lock is held while it downloads.
+
+    Attributes:
+        vault_path: The vault whose content-mutation lock is probed.
+        held_during_download: One entry per streamed file.
+    """
+
+    def __init__(self, vault_path: Path) -> None:
+        """Build a one-file stub over *vault_path*.
+
+        Args:
+            vault_path: The vault whose content lock each download probes.
+        """
+        super().__init__([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
+        self.vault_path = vault_path
+        self.held_during_download: list[bool] = []
+
+    def download_to(
+        self,
+        file_id: str,
+        destination: Path,
+        *,
+        export_mime: str | None = None,
+    ) -> None:
+        """Probe the content lock, then stream the stubbed bytes.
+
+        Args:
+            file_id: The Drive file id.
+            destination: Where to stream it.
+            export_mime: Unused; no stubbed file is Google-native.
+        """
+        self.held_during_download.append(_content_lock_is_held(self.vault_path))
+        super().download_to(file_id, destination, export_mime=export_mime)
+
+
+def _sync_tool(vault_path: Path) -> dict[str, Any]:
+    """Run one sync through the tool itself, at ceiling ALL.
+
+    Args:
+        vault_path: The vault to sync into.
+
+    Returns:
+        The tool's payload or refusal.
+    """
+    return drive_tools.drive_sync_tool(
+        vault_path=vault_path,
+        privacy_tier_ceiling=TierCeiling.ALL,
+        consumer="test-2079",
+    )
+
+
+def test_drive_sync_ingest_runs_inside_the_content_lock(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every ``run_ingest`` of a sync runs with the content lock held.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    _connect(token_path)
+    _stubbed(
+        monkeypatch,
+        _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY}),
+    )
+    held: list[bool] = []
+
+    def _probed(**kwargs: Any) -> Any:
+        """Probe the content lock, then run the real pipeline.
+
+        Args:
+            **kwargs: ``run_ingest``'s arguments.
+
+        Returns:
+            The real ingest result.
+        """
+        held.append(_content_lock_is_held(vault))
+        return run_ingest(**kwargs)
+
+    monkeypatch.setattr(drive_tools, "run_ingest", _probed)
+
+    result = _sync_tool(vault)
+
+    assert result["status"] == "ok", result
+    assert result["fragments_created"] == 1
+    assert held == [True]
+    assert _content_lock_is_held(vault) is False
+
+
+def test_drive_download_runs_outside_the_content_lock(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The network phase never holds the vault's content lock.
+
+    A Drive download is unbounded; holding the content lock across it would
+    make every journal write, upload, classify and link wait on the network.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    _connect(token_path)
+    stub = _ProbingDrive(vault)
+    _stubbed(monkeypatch, stub)
+
+    result = _sync_tool(vault)
+
+    assert result["status"] == "ok", result
+    assert stub.held_during_download == [False]
+
+
+def test_a_busy_content_lock_refuses_with_its_own_reason_and_refetches_next_time(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Content-busy is not sync-busy, and it cannot starve the file forever.
+
+    The downloader skips any staged file at least as new as Drive's
+    ``modified_time``, so a file fetched by a run that then could not ingest
+    it would be skipped by every later sync. The refused run therefore removes
+    what it fetched, and the next uncontended sync fetches and ingests it.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    _connect(token_path)
+    stub = _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
+    _stubbed(monkeypatch, stub)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+    before = _fragment_digests(vault)
+
+    with _content_lock_held_elsewhere(vault):
+        refused = _sync_tool(vault)
+
+    assert refused == {
+        "status": "refused",
+        "tool": drive_tools.SYNC_TOOL_NAME,
+        "tier_ceiling": "all",
+        "reason": CONTENT_MUTATION_BUSY_REASON,
+    }
+    assert refused["reason"] != drive_tools.SYNC_BUSY_REASON
+    assert _fragment_digests(vault) == before
+    assert not (configured / "ridge.md").exists()
+
+    retried = _sync_tool(vault)
+
+    assert retried["status"] == "ok", retried
+    assert retried["fragments_created"] == 1
+    assert stub.downloads == ["id-1", "id-1"]
+
+
+def test_a_content_busy_sync_answers_503_temporarily_unavailable(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over ``/v1`` content-busy is retryable, and names no vault path.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    _connect(token_path)
+    _stubbed(
+        monkeypatch,
+        _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY}),
+    )
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+
+    with (
+        _content_lock_held_elsewhere(vault),
+        client(vault_path=vault) as test_client,
+    ):
+        response = _sync(test_client)
+
+    assert response.status_code == _UNAVAILABLE_STATUS, response.text
+    assert envelope(response)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert str(vault) not in response.text
+    assert _fragments(vault) == []
+
+
+def test_an_index_lock_timeout_inside_the_sync_hold_is_not_reported_as_busy(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lock timeout raised *under* the content hold propagates as itself.
+
+    Fragments may already be written when the writer's ``.id-index.lock``
+    times out, so neither busy reason — "another drive sync is already
+    running" nor "vault content mutation busy" — would be true.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    _connect(token_path)
+    _stubbed(
+        monkeypatch,
+        _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY}),
+    )
+
+    def _index_lock_times_out(**_kwargs: Any) -> None:
+        """Time out the way a contended id-index lock does mid-ingest.
+
+        Raises:
+            VaultLockTimeoutError: Always.
+        """
+        msg = "id-index lock busy"
+        raise VaultLockTimeoutError(msg)
+
+    monkeypatch.setattr(drive_tools, "run_ingest", _index_lock_times_out)
+
+    with pytest.raises(VaultLockTimeoutError, match="id-index lock busy"):
+        _sync_tool(vault)

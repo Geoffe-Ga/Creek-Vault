@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Final, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     OK_STATUS,
     DriveConnectionState,
@@ -90,15 +91,25 @@ that tells a client its own request was fine when it was not.
 """
 
 _TRANSIENT_REASONS: Final[frozenset[str]] = frozenset(
-    {SYNC_BUSY_REASON, SYNC_FAILED_REASON, VAULT_UNAVAILABLE_REASON}
+    {
+        SYNC_BUSY_REASON,
+        SYNC_FAILED_REASON,
+        VAULT_UNAVAILABLE_REASON,
+        CONTENT_MUTATION_BUSY_REASON,
+    }
 )
 """The refusals a backoff can genuinely clear, so ``503 temporarily_unavailable``.
 
 A quota ceiling, a network blip, a vault directory that is momentarily not
 there, or a second sync of the same vault arriving while the first still holds
-the connector's lock (#1590) — the last of which clears the instant the holder
-finishes, which is precisely what a backoff is for. None of them carries any
-detail about what failed — see
+the connector's lock (#1590) — which clears the instant the holder finishes,
+precisely what a backoff is for. The same holds for
+:data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` (#2079): the
+ingest phase found another content writer (a journal write, an upload, a
+classify or link pass) holding the vault, and the files it fetched were
+discarded so the retried sync fetches and ingests them. That constant is
+imported from :mod:`creek.vault.mutations`, its home, rather than through the
+tool module. None of them carries any detail about what failed — see
 :data:`~creek_mcp.tools.drive.SYNC_FAILED_REASON` for why the detail stays in
 the server log.
 """
