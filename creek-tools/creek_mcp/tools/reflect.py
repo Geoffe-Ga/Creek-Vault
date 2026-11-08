@@ -58,7 +58,17 @@ Underneath those guarantees, every read and parse failure answers with a
 structured dict rather than raising: a malformed or unreadable file under
 ``01-Fragments`` is skipped during ``entry_ref`` resolution (#847), and a
 malformed model turn degrades to no notes. No parse error crosses the MCP
-boundary.
+boundary. Nor does a failed model dial: anything in
+:data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` — an Ollama
+``httpx`` error included, which once escaped as FastMCP ``isError`` text with
+its URL (#2083) — is a structured refusal naming the exception's type only.
+
+That dial failure is logged as one WARNING carrying the **type name only**: no
+message, no ``exc_info``, no ``logger.exception``. This is deliberately
+narrower than the traceback-bearing record ``creek.draft`` and
+``creek.author`` keep, because the ``/v1`` refusal-log contract
+(``tests/test_api_reflect_refusal_log.py``) forbids provider text in any
+record on this path, a formatted traceback included.
 
 The LLM and retrieval are both injectable seams so the tool is unit-testable
 with no live calls. ``build_server`` supplies the production LLM factory and
@@ -76,6 +86,7 @@ from creek._containment import escaping_child
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
 from creek.classify.llm.pool_boundary import pool_prompt_within_cap
 from creek.classify.llm.providers import (
+    PROVIDER_CALL_FAILURES,
     ProviderRateLimitError,
     RequestKeyRejectedError,
 )
@@ -1221,7 +1232,11 @@ def reflect_tool(
         max_tokens = _reflection_output_token_budget(max_notes)
         llm = llm_factory(tier, max_tokens=max_tokens)
         response_text = llm(prompt)
-    except RuntimeError as exc:
+    except PROVIDER_CALL_FAILURES as exc:
+        # Type name only — see the module docstring (#2083).
+        logger.warning(
+            "reflection refused on a provider dial failure: %s", type(exc).__name__
+        )
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
@@ -1246,7 +1261,7 @@ def reflect_tool(
     )
 
 
-def _dial_refusal_reason(exc: RuntimeError) -> str:
+def _dial_refusal_reason(exc: Exception) -> str:
     """Return the published refusal reason for a failed model dial.
 
     Three outcomes, distinguished because each wants different client
@@ -1265,8 +1280,10 @@ def _dial_refusal_reason(exc: RuntimeError) -> str:
       raises the first rather than egressing intimate content when no local
       backend exists, and the pool boundary raises the last when its one
       destination refuses, is unreachable, or dies mid-request after
-      accepting the connection (#1894). Its reason carries only the
-      exception's type name, never its message.
+      accepting the connection (#1894) — and every Ollama ``httpx.HTTPError``,
+      :class:`~creek.classify.llm.local_boundary.NonLoopbackOllamaError`
+      among them (#2083). Its reason carries only the exception's type name,
+      never its message.
 
     Args:
         exc: What the factory or the completion raised.

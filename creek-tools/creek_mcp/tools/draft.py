@@ -85,9 +85,9 @@ import logging
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import frontmatter
-import httpx
 
 from creek.classify.llm.providers import (
+    PROVIDER_CALL_FAILURES,
     REQUEST_KEY_REJECTED_REASON,
     RequestKeyRejectedError,
 )
@@ -147,16 +147,6 @@ answered with a 4xx, returned an empty body or dropped the connection is not
 one that is missing. The vendor's own message — which
 :func:`creek.classify.llm.providers._error_detail` forwards for a 4xx — and an
 Ollama URL ride only the operator log's traceback, never the refusal.
-"""
-
-_PROVIDER_FAILURES: Final[tuple[type[Exception], ...]] = (RuntimeError, httpx.HTTPError)
-"""What a draft provider raises: SDK errors as ``RuntimeError``, Ollama's as ``httpx``.
-
-``httpx.HTTPError`` is not a ``RuntimeError``, so before #2073 an Ollama
-transport or status error — including
-:class:`~creek.classify.llm.local_boundary.NonLoopbackOllamaError` — escaped
-this tool and FastMCP served it, URL and all, as
-``Error executing tool creek.draft: ...``.
 """
 
 DRAFT_STAGES: Final[tuple[CompositionStage, ...]] = tuple(CompositionStage)
@@ -397,7 +387,7 @@ def draft_tool(
     tier = _source_routing_tier(vault_path, idea, privacy_tier_ceiling)
     try:
         llm = llm_factory(tier)
-    except _PROVIDER_FAILURES as exc:
+    except PROVIDER_CALL_FAILURES as exc:
         # ``IntimateRoutingError`` is a ``RuntimeError`` subclass, so this is
         # what turns "intimate content and no local backend configured" into a
         # structured refusal rather than an exception across the MCP boundary
@@ -427,7 +417,7 @@ def draft_tool(
     )
     try:
         draft = generator.generate_draft(idea, vault_path=vault_path)
-    except _PROVIDER_FAILURES as exc:
+    except PROVIDER_CALL_FAILURES as exc:
         return _provider_refusal(
             exc, privacy_tier_ceiling, default=DRAFT_PROVIDER_FAILED_REASON
         )
