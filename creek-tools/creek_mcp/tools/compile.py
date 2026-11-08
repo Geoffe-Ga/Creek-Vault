@@ -71,11 +71,15 @@ Engine-side LLM-call dedup is tracked separately as a follow-up.
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, cast
 
 from creek._fslock import VaultLockTimeoutError
+from creek.classify.llm.providers import PROVIDER_CALL_FAILURES
+from creek.classify.llm.router import IntimateRoutingError
 from creek.compile.engine import (
     TARGET_KINDS,
+    CompileRequestError,
     SourceAdmissionRefusedError,
     compile_to_vault,
 )
@@ -100,6 +104,35 @@ if TYPE_CHECKING:
     from creek.models import CompileTargetKind, PrivacyTier
 
 TOOL_NAME = "creek.compile"
+
+logger = logging.getLogger(__name__)
+
+COMPILE_PROVIDER_FAILED_REASON: Final[str] = "LLM provider call failed for compile"
+"""The fixed refusal when the compile LLM provider failed (#2074).
+
+Answered for every member of
+:data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` other than the
+router's :class:`~creek.classify.llm.router.IntimateRoutingError`: a vendor 4xx
+whose own message :func:`creek.classify.llm.providers._error_detail` forwards,
+an Ollama ``httpx`` error carrying its URL, a provider that could not be built.
+That text rides only the operator log's traceback.
+
+There is deliberately no separate "unavailable" constant, as ``creek.draft``
+has: the engine both builds the client (through the factory this tool wraps)
+and calls it, inside one ``compile_to_vault`` call, so this boundary cannot tell
+a provider that was never built from one that failed mid-call.
+"""
+
+COMPILE_FAILED_REASON: Final[str] = "compile failed"
+"""The fixed refusal for any other engine failure (#2074).
+
+The fail-closed fallback: an ``OSError`` from resolving or writing the target
+page (whose text names a vault path), a pydantic ``ValidationError`` raised
+while reading a page's existing provenance (whose text can quote vault
+frontmatter), or any other exception creek did not phrase for a client. Only
+:class:`~creek.compile.engine.CompileRequestError` is echoed; everything else
+answers this and leaves its text on the operator log's traceback.
+"""
 
 # The above-ceiling refusal reason is a fixed string naming no fragment id, no
 # title, no tier, and no count. Echoing the offending ids would turn a single
@@ -346,6 +379,64 @@ def _ceiling_admission(ceiling: TierCeiling) -> SourceAdmission:
     return _admit
 
 
+def _compile_reason(exc: Exception) -> str:
+    """Return the refusal reason for an engine failure (#2074).
+
+    Args:
+        exc: What ``compile_to_vault`` raised, past the admission and busy
+            arms.
+
+    Returns:
+        The exception's own text for the two creek-written cases — a
+        :class:`~creek.compile.engine.CompileRequestError`, and the router's
+        :class:`~creek.classify.llm.router.IntimateRoutingError`, the residual
+        ``creek.draft`` and ``creek.author`` keep too — then
+        :data:`COMPILE_PROVIDER_FAILED_REASON` for any other
+        :data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` member,
+        and :data:`COMPILE_FAILED_REASON` for everything else. The router's
+        error is a ``RuntimeError``, so it is named before the provider tuple
+        would claim it. There is no
+        :class:`~creek.classify.llm.providers.RequestKeyRejectedError` branch:
+        compile takes no request-scoped key, so that error cannot arise here,
+        and were it to it is a ``RuntimeError`` that reads as a provider
+        failure.
+    """
+    if isinstance(exc, (CompileRequestError, IntimateRoutingError)):
+        return str(exc)
+    if isinstance(exc, PROVIDER_CALL_FAILURES):
+        return COMPILE_PROVIDER_FAILED_REASON
+    return COMPILE_FAILED_REASON
+
+
+def _compile_refusal(exc: Exception, ceiling: TierCeiling) -> dict[str, Any]:
+    """Log an engine failure for the operator and return its refusal (#2074).
+
+    A :class:`~creek.compile.engine.CompileRequestError` is the caller's own
+    malformed or unresolvable request, answered in creek-written text and not
+    logged: it is no operator signal, as the argument-validation refusals in
+    :func:`compile_tool` are not. Every other failure is logged exactly once,
+    with a message carrying the exception's type name only; its text — a
+    vendor 4xx message, an Ollama URL, a vault path — rides the traceback,
+    passed explicitly rather than read from the handler's context.
+
+    Args:
+        exc: What ``compile_to_vault`` raised.
+        ceiling: The caller's declared tier ceiling, echoed by the refusal.
+
+    Returns:
+        The structured ``refused`` response; see :func:`_compile_reason`.
+    """
+    if not isinstance(exc, CompileRequestError):
+        logger.exception(
+            "compile refused on an engine failure: %s",
+            type(exc).__name__,
+            exc_info=exc,
+        )
+    return refusal_response(
+        tool=TOOL_NAME, ceiling=ceiling, reason=_compile_reason(exc)
+    )
+
+
 def compile_tool(
     *,
     vault_path: Path,
@@ -388,11 +479,17 @@ def compile_tool(
         unknown *target_kind*; an empty *fragment_ids*; a source
         fragment above *privacy_tier_ceiling*
         (:data:`_ABOVE_CEILING_REASON`, #848 — the only refusal that is
-        audited); or an engine ``ValueError`` / ``RuntimeError``, such
-        as a fragment id that does not resolve in the vault, an
-        unavailable provider, or the router's
-        :class:`~creek.classify.llm.router.IntimateRoutingError` when
-        intimate sources have no local backend to fall back to.
+        audited); a busy vault
+        (:data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON`,
+        unaudited by decision, #2071); or an engine failure, answered by
+        :func:`_compile_refusal` — a
+        :class:`~creek.compile.engine.CompileRequestError` (an id that
+        does not resolve, a target that escapes its directory, a
+        malformed LLM payload) and the router's
+        :class:`~creek.classify.llm.router.IntimateRoutingError` keep
+        their creek-written text, a provider failure is
+        :data:`COMPILE_PROVIDER_FAILED_REASON`, and anything else is
+        :data:`COMPILE_FAILED_REASON` (#2074).
     """
     if target_kind not in TARGET_KINDS:
         return refusal_response(
@@ -510,22 +607,24 @@ def compile_tool(
         return refusal_response(
             tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason=_ABOVE_CEILING_REASON
         )
-    except (ValueError, RuntimeError) as exc:
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            reason=str(exc),
-        )
     except (ContentMutationBusyError, VaultLockTimeoutError):
         # Acquiring the content lock past its wait is ContentMutationBusyError
         # (#2087). The bare-timeout arm is kept on purpose: a lock timeout
         # under the engine's hold still reads busy, as it always has, rather
         # than escaping as a FastMCP error or a /v1 job `internal_error`.
+        # Unaudited, and accepted as such (#2071): see ``_survey_sources``.
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason=CONTENT_MUTATION_BUSY_REASON,
         )
+    except Exception as exc:
+        # Fail closed (#2074). This arm must stay *below* the two above:
+        # neither SourceAdmissionRefusedError nor ContentMutationBusyError is a
+        # ValueError or RuntimeError, so a catch-all placed first would answer
+        # the audited ceiling refusal and the busy refusal with the generic
+        # reason. BaseException (KeyboardInterrupt, SystemExit) still escapes.
+        return _compile_refusal(exc, privacy_tier_ceiling)
 
     relative = str(written.relative_to(vault_path))
     post_hash = _fingerprint(written)
