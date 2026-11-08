@@ -409,3 +409,30 @@ def test_a_busy_tier_b_link_is_recorded_and_index_still_runs(
     assert f"[sync] {_LINK_SKIPPED}" in _flat(result.output)
     assert indexed == [vault]
     assert _read_sync_state(vault)["skipped_steps"] == [_LINK_SKIPPED]
+
+
+def test_a_timeout_under_the_sync_classify_hold_is_not_recorded_as_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only acquisition is a skip; an inner timeout fails the tick as itself.
+
+    A timeout under the hold can follow writes the pass already made, so
+    recording ``classify skipped`` — "nothing ran" — would be false.
+    """
+    vault = _sync_vault(tmp_path, monkeypatch)
+    inner = VaultLockTimeoutError("id-index lock busy")
+
+    def _inner_times_out(**_kwargs: object) -> object:
+        """Time out the way a contended inner lock does mid-pass."""
+        raise inner
+
+    monkeypatch.setattr(
+        "creek.classify.classify_engine._run_classify_with_content_lock_held",
+        _inner_times_out,
+    )
+
+    result = _invoke_sync(vault)
+
+    assert result.exception is inner
+    assert _CLASSIFY_SKIPPED not in _flat(result.output)
