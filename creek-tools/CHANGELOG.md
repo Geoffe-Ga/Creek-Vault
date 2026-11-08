@@ -9,6 +9,38 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `creek.author` no longer returns a desk exception's text as its error
+  reason, and `creek.reflect`, `/v1/letters` and `/v1/reading-recommendations`
+  now catch an Ollama `httpx.HTTPError` (refs #2082, #2083). `creek.author`
+  was a real leak: its broad boundary catch answered `reason=str(exc)`, so a
+  vendor 4xx message, an Ollama URL, the `CREEK_CONFIG points to <server
+  path>` `FileNotFoundError` and a YAML error quoting the config file all
+  reached the client, on the draft and the `dry_run` alike. It now answers
+  `LLM provider call failed for author` (`AUTHOR_PROVIDER_FAILED_REASON`) for
+  a provider failure and `writing desk failed for author`
+  (`AUTHOR_DESK_FAILED_REASON`) for anything else, and logs one `ERROR` record
+  naming the exception type, with the traceback, on `creek_mcp.tools.author`.
+  The residuals match `creek.draft`: the unsupported-medium message, the
+  router's `IntimateRoutingError` message, and the shared
+  `REQUEST_KEY_REJECTED_REASON` for a vendor-refused writer's key.
+  `creek.reflect` caught only `RuntimeError` at its dial, so an Ollama
+  `httpx.HTTPError` (including `NonLoopbackOllamaError`) escaped and FastMCP
+  served it, URL included, as `isError` text; it is now the structured
+  `reflection unavailable: <TypeName>` refusal, logged as one `WARNING` on
+  `creek_mcp.tools.reflect` carrying the **type name only** — no message and
+  no traceback, because the `/v1` refusal-log contract forbids provider text
+  in any record on that path. `/v1/letters` and `/v1/reading-recommendations`
+  never leaked (the error boundary answers a constant body), but answered
+  `500 internal_error` where `docs/api.md` promises a retryable `503`.
+  **Operator-visible:** an Ollama transport or status failure on
+  `POST /v1/reflections`, `POST /v1/letters/{external_id}` and
+  `POST /v1/reading-recommendations` now answers `503
+  temporarily_unavailable` instead of `500 internal_error`; the codes already
+  match `docs/api.md`, so there is no contract-minor bump. The shared
+  `creek.classify.llm.providers.PROVIDER_CALL_FAILURES` (`(RuntimeError,
+  httpx.HTTPError)`) replaces `creek.draft`'s private tuple, so the next
+  transport swap moves one line.
+
 - **Contract 0.29.0: a durable job that meets content-lock contention reads
   `busy` (#2075, follow-up to #2066).** An `llm` classification or
   `embeddings` link job whose pass timed out on the vault content-mutation

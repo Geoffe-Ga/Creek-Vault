@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Final
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -24,8 +25,6 @@ from tests.v1_api_support import REFLECTIONS_PATH, build_app, headers, seed_vaul
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
-
-    import httpx
 
     from creek.models import PrivacyTier
 
@@ -39,6 +38,9 @@ _INTERNAL_DETAIL: Final[str] = "zz-provider-internals-zz"
 
 _FAKE_KEY: Final[str] = "sk-ant-zzrefusallogfakekeyzz0123456789"
 """A key-shaped request key, so the vault parses it and the log must hide it."""
+
+_OLLAMA_URL: Final[str] = "http://10.9.8.7:11434/api/generate"
+"""A non-loopback Ollama URL an ``httpx`` error names; never logged (#2083)."""
 
 
 def _raising_factory(tier: PrivacyTier, *, max_tokens: int) -> Callable[[str], str]:
@@ -176,6 +178,55 @@ def test_the_log_carries_no_entry_text_and_no_exception_message(
     assert _INTERNAL_DETAIL not in caplog.text
 
 
+def _unreachable_factory(tier: PrivacyTier, *, max_tokens: int) -> Callable[[str], str]:
+    """Build a completion whose Ollama endpoint cannot be reached (#2083).
+
+    Args:
+        tier: The routing tier, unused.
+        max_tokens: The output ceiling, unused.
+
+    Returns:
+        A completion callable that raises an ``httpx`` transport error.
+    """
+    del tier, max_tokens
+
+    def _dial(prompt: str) -> str:
+        """Fail the transport, naming a URL and a detail the log must not repeat.
+
+        Args:
+            prompt: Unread.
+
+        Raises:
+            httpx.ConnectError: Always.
+        """
+        del prompt
+        msg = f"connect failed for url {_OLLAMA_URL!r} {_INTERNAL_DETAIL}"
+        raise httpx.ConnectError(msg)
+
+    return _dial
+
+
+def test_an_ollama_transport_error_logs_its_type_and_no_url(
+    vault: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An ``httpx`` dial failure is logged as a ``503`` refusal, type name only.
+
+    Before #2083 the error escaped the tool and the boundary logged a ``500``;
+    now it is the same closed-vocabulary line any outage gets, and nothing on
+    any logger — tracebacks included — carries the URL or the message.
+    """
+    caplog.set_level(logging.DEBUG)
+
+    _post(vault, _unreachable_factory)
+
+    [record] = _refusal_lines(caplog)
+    message = record.getMessage()
+    assert "code=temporarily_unavailable" in message
+    assert "cause=reflection unavailable: ConnectError" in message
+    assert _INTERNAL_DETAIL not in caplog.text
+    assert _OLLAMA_URL not in caplog.text
+
+
 def test_an_answered_reflection_logs_no_refusal(
     vault: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -197,6 +248,10 @@ def test_an_answered_reflection_logs_no_refusal(
         (
             "reflection unavailable: IntimateRoutingError",
             "reflection unavailable: IntimateRoutingError",
+        ),
+        (
+            "reflection unavailable: ConnectError",
+            "reflection unavailable: ConnectError",
         ),
         ("reflection unavailable: not an identifier!", "unrecognised"),
         ("a reason this module has never published", "unrecognised"),
