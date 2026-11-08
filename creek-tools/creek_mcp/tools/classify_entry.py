@@ -139,6 +139,7 @@ reachable at strictly broader granularity through ``creek.state.render``,
 from __future__ import annotations
 
 from contextlib import ExitStack
+from itertools import starmap
 from typing import TYPE_CHECKING, Any, Final
 
 from creek._fslock import VaultLockTimeoutError, vault_lock
@@ -238,7 +239,7 @@ def _read_entry(
         )
         if fragment.id == entry_ref
     ]
-    tier = max_source_tier(fragment_tier(fragment, raw) for fragment, raw in matches)
+    tier = max_source_tier(starmap(fragment_tier, matches))
     return tier, (matches[0] if matches else None)
 
 
