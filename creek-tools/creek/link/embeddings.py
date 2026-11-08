@@ -173,6 +173,21 @@ class EmbeddingModelUnavailableError(RuntimeError):
     """
 
 
+EMBEDDING_MODEL_UNAVAILABLE_REASON: Final[str] = "embedding model unavailable"
+"""The fixed refusal a tool answers when :class:`EmbeddingModelUnavailableError` fires.
+
+Content-free by construction: the exception's own message names the configured
+model, the cache directory and the third-party loader error verbatim, which is
+operator remediation, not something an MCP or ``/v1`` client may be handed
+(#2065). ``creek.link`` and ``creek.report`` return this instead and keep the
+detail on their operator log record's traceback;
+:func:`creek_mcp.httpapi.pipeline.pipeline_refusal_code` maps it, by exact
+equality, to ``503 unavailable``. It lives beside the exception, as
+:data:`creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` lives beside its
+lock, so neither tool module has to import the other (#1772).
+"""
+
+
 class EmbeddingRefusedError(EmbeddingModelUnavailableError):
     """A non-local embedding route produced no vector for a required text.
 

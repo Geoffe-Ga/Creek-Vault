@@ -94,6 +94,17 @@ The state lives in `00-Creek-Meta/State/sync/last-run.json`. Each tick also
 emits structured `creek.cli` log lines (`sync.tier_a.ingest source=… ingested=…`,
 `sync.tier_a.done`, `sync.tier_b.done`) for log-based monitoring.
 
+Besides the per-source `sources` block, every tick rewrites a top-level
+`skipped_steps` list: one line per global step — the classify pass, or Tier B's
+link pass — that met vault content-lock contention and did not run, for
+example `"classify skipped: vault content mutation busy"`. A clean tick writes
+`[]`. A busy step is recorded rather than raised, so the tick still exits 0 and
+still writes this file; the next tick redoes the work. In Tier B a skipped
+classify also means link and the index rebuild did not run. `--status` prints
+each line as `Skipped last tick: …`, and a file written before this key existed
+simply shows none ([#2087](https://github.com/Geoffe-Ga/Creek-Vault/issues/2087)).
+The matching log line is `sync.<step>.skip reason=content-busy`.
+
 ## Scheduling it
 
 See [sync-scheduling.md](sync-scheduling.md) for emitting and activating the

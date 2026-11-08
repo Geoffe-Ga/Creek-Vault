@@ -290,8 +290,9 @@ def _parser() -> argparse.ArgumentParser:
     """Build the ``verify`` command-line parser."""
     parser = argparse.ArgumentParser(prog="creek-model-package")
     commands = parser.add_subparsers(dest="command", required=True)
-    verify = commands.add_parser("verify", help="verify weights against the pin")
-    verify.add_argument("--weights", type=Path, required=True)
+    commands.add_parser("verify", help="verify weights against the pin").add_argument(
+        "--weights", type=Path, required=True
+    )
     return parser
 
 

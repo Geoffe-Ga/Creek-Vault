@@ -113,9 +113,10 @@
       "type": "object"
     },
     "JobFailureCode": {
-      "description": "Why a ``failed`` pipeline job failed, when the caller can act on it (#1877).\n\nClosed and deliberately small: a code is published only for a failure the\n*caller* can remedy, never for an operator-side fault, whose detail stays\nin the server log. Any other failure is ``failure_code: null``.\n\nAttributes:\n    REQUEST_KEY_REJECTED: The writer's request-scoped provider key\n        (ADR-0015) was refused by its vendor with ``401``/``403``. The\n        pass stopped at the first refusal, without retrying, and nothing\n        it had not yet started was sent. Retrying with the same key will\n        fail the same way; the writer must replace the key.",
+      "description": "Why a ``failed`` pipeline job failed, when the caller can act on it (#1877).\n\nClosed and deliberately small: a code is published only for a failure the\n*caller* can remedy \u2014 including by resubmitting the same request \u2014 never\nfor an operator-side fault, whose detail stays in the server log. Any other\nfailure is ``failure_code: null``. Each member is served only to a caller\ndeclaring at least the minor it was published at, named below; an earlier\ncaller is served ``null`` for the same failure.\n\nAttributes:\n    REQUEST_KEY_REJECTED: The writer's request-scoped provider key\n        (ADR-0015) was refused by its vendor with ``401``/``403``. The\n        pass stopped at the first refusal, without retrying, and nothing\n        it had not yet started was sent. Retrying with the same key will\n        fail the same way; the writer must replace the key. Since\n        contract 0.26.\n    BUSY: Another writer held the vault content-mutation lock past its\n        bounded wait (#2075). The pass takes that lock before touching any\n        fragment, so a timeout taking it means nothing was written; and\n        both passes are idempotent and resumable, so a resubmit converges\n        either way. The condition is transient \u2014 the same one the\n        synchronous routes answer ``503 temporarily_unavailable`` \u2014 so\n        resubmit the same request, with backoff. Since contract 0.29.",
       "enum": [
-        "request_key_rejected"
+        "request_key_rejected",
+        "busy"
       ],
       "title": "JobFailureCode",
       "type": "string"
@@ -227,7 +228,7 @@
         }
       ],
       "default": null,
-      "description": "Why a failed job failed, when the caller can remedy it; null otherwise. Since contract 0.26."
+      "description": "Why a failed job failed, when the caller can remedy it, including by resubmitting: request_key_rejected since contract 0.26, busy since 0.29; null otherwise. Since contract 0.26."
     },
     "job_id": {
       "description": "Opaque server-generated job identifier.",

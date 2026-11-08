@@ -232,7 +232,7 @@ def _verify_preflight_state(
         run,
         ["fly", "volumes", "list", "--app", coordinates.app, "--json"],
     )
-    if machines == [] and volumes == []:
+    if machines == volumes == []:
         return
     if machines == []:
         _verify_precreated_volume(volumes, coordinates)
@@ -373,8 +373,7 @@ def _read_token_file(path: Path) -> str:
         token = raw.decode("ascii")
     except UnicodeError as exc:
         raise ValueError("Fly pilot token file is invalid") from exc
-    if token.endswith("\n"):
-        token = token[:-1]
+    token = token.removesuffix("\n")
     if not token.startswith(_FLY_TOKEN_PREFIX):
         raise ValueError("Fly pilot token file is invalid")
     payload = token[len(_FLY_TOKEN_PREFIX) :]

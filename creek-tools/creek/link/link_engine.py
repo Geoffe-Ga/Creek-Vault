@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import frontmatter
 
-from creek._fslock import vault_lock
 from creek.link.eddies import EddyDetector
 from creek.link.embeddings import (
     CachedEmbedding,
@@ -34,7 +33,7 @@ from creek.link.embeddings import (
 )
 from creek.link.temporal import TemporalLinker
 from creek.link.threads import ThreadDetector
-from creek.vault.mutations import content_mutation_lock_path
+from creek.vault.mutations import hold_content_mutation
 from creek.vault.reader import iter_vault_fragments
 from creek.vault.writer import VaultWriter
 
@@ -206,10 +205,13 @@ def run_link(
         A :class:`LinkSummary` capturing per-method counts.
 
     Raises:
-        creek._fslock.VaultLockTimeoutError: When another content mutation
-            holds the shared boundary past its bounded wait.
+        creek.vault.mutations.ContentMutationBusyError: When another content
+            mutation held the shared boundary past its bounded wait, so the
+            pass never started (#2087). A
+            :class:`~creek._fslock.VaultLockTimeoutError` raised *under* the
+            hold — by a lock taken while working — propagates as itself.
     """
-    with vault_lock(content_mutation_lock_path(vault_path)):
+    with hold_content_mutation(vault_path):
         return _run_link_with_content_lock_held(
             vault_path=vault_path,
             config=config,

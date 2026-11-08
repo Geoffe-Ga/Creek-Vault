@@ -5,9 +5,12 @@ on disk**: its frequency, its wavelength phase, its privacy tier, and how that
 classification was last produced. It is a sibling of
 :mod:`creek_mcp.tools.classify` rather than an addition to it, and the split is
 the point: ``creek.classify`` is the whole-vault corpus-maintenance *pass* that
-writes labels, this is a per-entry *read* that writes nothing. Folding the two
-into one tool would blur a pass that mutates every fragment into a lookup that
-mutates none.
+writes labels, this is a per-entry *read* that writes no vault content.
+Folding the two into one tool would blur a pass that mutates every fragment
+into a lookup that mutates none. (Since #2068 it does take the shared
+content-mutation lock, so a call may create the zero-byte
+``00-Creek-Meta/locks/content-mutations.lock`` — an advisory lock file that
+holds no vault-derived bytes — beside the audit line it already appends.)
 
 **It computes nothing, deliberately.** No ``RuleClassifier`` on demand, no LLM,
 no persisted verdict. A per-fragment classify-and-write is a new mutation
@@ -52,11 +55,24 @@ never retrofitted, and adopting a tool-specific reason here would mint a
 synonym for a refusal that must stay byte-identical across every above-ceiling
 tier.
 
-The tier the gate compares is read through the shared
-:func:`creek.classify.privacy_filter.source_tiers` walk and reduced by
-:func:`~creek.classify.privacy_filter.max_source_tier` — the body of
-``creek_mcp.tools.journal._existing_tier``. Three properties come with it and
-none are re-derived here:
+**One snapshot, inside the content lock (#2068).** The tier the gate compares
+and the record the answer is built from come from **one** exhaustive
+:func:`creek.vault.reader.iter_vault_fragments` pass, taken while
+:func:`creek.vault.mutations.content_mutation_lock_path` is held — the lock
+``creek classify`` and the ``creek.classify`` MCP tool rewrite tiers and
+labels under. Before #2068 the gate read the tier through
+:func:`creek.classify.privacy_filter.source_tiers` (one walk) and the record
+came from a second walk, with no lock across either, so a re-tier landing
+between them was served as the *old* tier paired with the *new*
+classification — a response no single state of the vault ever held. The same
+TOCTOU #930 closed for compile.
+
+Each matching file's tier is read with
+:func:`~creek.classify.privacy_filter.fragment_tier` — the per-file primitive
+``source_tiers`` itself applies — and reduced by
+:func:`~creek.classify.privacy_filter.max_source_tier`, so the gate keeps the
+exact rules ``creek_mcp.tools.journal._existing_tier`` has. Three properties
+come with it and none are re-derived here:
 
 * it is the fragment's **current persisted** tier, never a caller-supplied one
   and never a staged-frontmatter one, both of which are stale the moment
@@ -67,7 +83,9 @@ none are re-derived here:
   which is why :func:`creek_mcp.read_gate.iter_admitted_fragments` is not the
   primitive for this tool;
 * an id resolving to **nothing** reduces to ``INTIMATE`` as well, so every
-  locator divergence fails safe.
+  locator divergence fails safe — and an id carried by **several** files
+  gates on the most sensitive of them, whichever one the answer is served
+  from.
 
 Note that an explicit ``privacy_tier: unclassified`` ranks with ``personal``
 (#961), so it is **admitted at ``ceiling=personal``** and **refused at
@@ -79,17 +97,28 @@ ACCEPTED RESIDUAL RISK
 Two ways this tool is better than the nearest existing oracle, and one way it
 is no better.
 
-*Better, and by construction rather than by care.* The gate walk never
+*Better, and by construction rather than by care.* The one walk never
 short-circuits — ``iter_vault_fragments`` materialises the whole directory
-before returning, a property ``source_tiers`` documents as load-bearing — so a
-not-found id and a refused id cost the same, and the refusal cannot leak
-*where* the protected fragment sits through timing. Contrast
-``creek_mcp.tools.reflect._resolve_entry``, which walks a raw lazy ``rglob``
-and returns at the match: a genuine timing channel. The resolution walk below
-is exhaustive for the same reason, and it sits **beneath** the gate on purpose
-— hoisting it above is an easy, natural-looking edit that reintroduces exactly
-that channel. And the refusal is the generic one, so it names neither the
-fragment nor its tier.
+before returning, a property ``source_tiers`` documents as load-bearing, and
+the match list is built to completion before anything is decided — so one
+exhaustive snapshot precedes the gate, a not-found id and a refused id cost
+the same, and the refusal cannot leak *where* the protected fragment sits
+through timing. Contrast ``creek_mcp.tools.reflect._resolve_entry``, which
+walks a raw lazy ``rglob`` and returns at the match: a genuine timing channel.
+Turning the snapshot into a lazy search that stops at the first match is an
+easy, natural-looking edit that reintroduces exactly that channel. And the
+refusal is the generic one, so it names neither the fragment nor its tier.
+
+*The cost of the lock (#2068), accepted as #930 accepted it for compile.* A
+call now creates the zero-byte lock file if it is absent (it holds no vault
+content); it can wait up to
+:data:`creek._fslock.DEFAULT_LOCK_TIMEOUT_SECONDS` behind a whole-vault
+classify, link, compile, journal or upload that holds the lock; and on that
+timeout it answers the content-free
+:data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` refusal. That
+refusal says only that *some* writer was busy, which every MCP write tool
+already publishes, and it is decided before the snapshot is taken, so it
+carries nothing about the addressed fragment.
 
 *What is still published.* At ``ceiling=intimate`` or ``all``, ``"entry_ref not
 found"`` and the generic refusal are distinguishable, which makes this a coarse
@@ -109,15 +138,22 @@ reachable at strictly broader granularity through ``creek.state.render``,
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+from itertools import starmap
 from typing import TYPE_CHECKING, Any, Final
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
     LLM_METHOD,
     MANUAL_METHOD,
     RULES_METHOD,
 )
-from creek.classify.privacy_filter import max_source_tier, source_tiers
+from creek.classify.privacy_filter import fragment_tier, max_source_tier
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    content_mutation_lock_path,
+)
 from creek.vault.reader import iter_vault_fragments
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.read_gate import refuse_above_ceiling
@@ -160,47 +196,41 @@ ENTRY_REF_NOT_FOUND_REASON: Final[str] = "entry_ref not found"
 """Verbatim ``creek.reflect``'s spelling, so the surface keeps one vocabulary."""
 
 
-def _gate_tier(vault_path: Path, entry_ref: str) -> PrivacyTier:
-    """Return the CURRENT persisted tier of *entry_ref*, failing closed.
-
-    The body of ``creek_mcp.tools.journal._existing_tier``, reached through the
-    shared walk so this gate inspects exactly the files the rest of the
-    pipeline treats as fragments. An id that resolves to nothing reduces to
-    ``INTIMATE``: with no evidence about what it holds, the safe assumption is
-    the worst one.
-
-    Args:
-        vault_path: Vault root; fragments are read from ``01-Fragments``.
-        entry_ref: The fragment id the caller addressed.
-
-    Returns:
-        The fragment's current tier, or ``PrivacyTier.INTIMATE`` when the id
-        resolves to no readable fragment.
-    """
-    return max_source_tier(source_tiers(vault_path, [entry_ref]))
+_Record = tuple["Fragment", dict[str, object]]
+"""One resolved fragment and its raw frontmatter, as the walk yields them."""
 
 
-def _resolve_record(
+def _read_entry(
     vault_path: Path,
     entry_ref: str,
-) -> tuple[Fragment, dict[str, object]] | None:
-    """Return the fragment *entry_ref* names, plus its raw frontmatter.
+) -> tuple[PrivacyTier, _Record | None]:
+    """Return the gate tier and the record of *entry_ref*, from ONE walk.
+
+    The caller holds the content-mutation lock, so this is one consistent
+    snapshot of the fragment: the tier the gate compares and the
+    classification the answer reports cannot come from two different states
+    of the file (#2068).
 
     One **exhaustive** pass — no ``break``, no early return. The list
-    comprehension runs the whole walk before choosing, so the cost of a call
-    does not depend on where in the corpus the fragment sits. This runs
-    strictly *below* the ceiling gate; hoisting it above would make that
-    uniform cost irrelevant and reopen reflect's timing channel.
+    comprehension runs the whole walk before anything is decided, so the cost
+    of a call does not depend on where in the corpus the fragment sits, or on
+    whether it is there at all.
 
     Args:
         vault_path: Vault root; fragments are read from ``01-Fragments``.
         entry_ref: The fragment id the caller addressed.
 
     Returns:
-        The first match in vault walk order as ``(fragment, raw)``, or ``None``
-        when no readable fragment carries that id. A vault holding two files
-        with the same id is the caller's problem, not this function's; walk
-        order is the same order every other consumer of the shared loader sees.
+        ``(tier, record)``. ``tier`` is the most sensitive CURRENT persisted
+        tier across every file carrying *entry_ref* — read by
+        :func:`~creek.classify.privacy_filter.fragment_tier`, so a missing
+        key ranks ``INTIMATE`` (#1033) — or ``INTIMATE`` when none does: with
+        no evidence about what an id holds, the safe assumption is the worst
+        one. ``record`` is the first match in vault walk order as
+        ``(fragment, raw)``, or ``None``. A vault holding two files with the
+        same id gates on the stricter of them and answers from the first;
+        walk order is the same order every other consumer of the shared
+        loader sees.
     """
     matches = [
         (fragment, raw)
@@ -209,7 +239,8 @@ def _resolve_record(
         )
         if fragment.id == entry_ref
     ]
-    return matches[0] if matches else None
+    tier = max_source_tier(starmap(fragment_tier, matches))
+    return tier, (matches[0] if matches else None)
 
 
 def _classification_method(raw: dict[str, object]) -> str:
@@ -261,9 +292,11 @@ def _payload(
             tier.
         fragment: The resolved fragment.
         raw: That fragment's raw frontmatter, for the provenance clamp.
-        tier: The tier the ceiling gate already ran against, so the reported
-            ``privacy_tier`` is by construction the one that was gated on
-            rather than a second, possibly divergent reading.
+        tier: The tier the ceiling gate already ran against, read from the
+            same locked snapshot as *fragment* and *raw* (#2068), so the
+            reported ``privacy_tier`` is by construction the one that was
+            gated on and belongs to the same state of the file as the
+            classification beside it.
 
     Returns:
         The eight published keys, no more and no fewer. Every value is a
@@ -279,6 +312,54 @@ def _payload(
         "privacy_tier": str(tier),
         "classification_method": _classification_method(raw),
     }
+
+
+def _answer(
+    vault_path: Path,
+    entry_ref: str,
+    ceiling: TierCeiling,
+) -> dict[str, Any]:
+    """Gate *entry_ref* and answer it, from one snapshot; call under the lock.
+
+    Must run while the vault content-mutation lock is held: the gate, the
+    not-found refusal and the payload all read the one snapshot
+    :func:`_read_entry` takes, and the lock is what keeps a concurrent
+    ``creek classify`` from rewriting the fragment while that snapshot is
+    being taken (#2068).
+
+    Args:
+        vault_path: Vault root.
+        entry_ref: The fragment id the caller addressed.
+        ceiling: The caller's declared ceiling.
+
+    Returns:
+        The success payload, the generic above-ceiling refusal, or the
+        not-found refusal — the last reachable only at a ceiling that admits
+        ``INTIMATE``, because an unresolvable id reduces to it.
+    """
+    tier, record = _read_entry(vault_path, entry_ref)
+    if (
+        refusal := refuse_above_ceiling(
+            tool=TOOL_NAME,
+            content_tier=tier,
+            ceiling=ceiling,
+        )
+    ) is not None:
+        return refusal
+    if record is None:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            reason=ENTRY_REF_NOT_FOUND_REASON,
+        )
+    fragment, raw = record
+    return _payload(
+        entry_ref=entry_ref,
+        ceiling=ceiling,
+        fragment=fragment,
+        raw=raw,
+        tier=tier,
+    )
 
 
 def entry_classification_tool(
@@ -305,8 +386,13 @@ def entry_classification_tool(
        64 characters through **verbatim**, and a ``frag-`` id is about 17, so
        naming it would write every probed target into
        ``00-Creek-Meta/audit/mcp.jsonl``;
-    3. read the fragment's current persisted tier and run the ceiling gate;
-    4. **only then** resolve the record and answer.
+    3. under the vault content-mutation lock, take **one** exhaustive
+       snapshot of the fragment — its current persisted tier and its record
+       together (#2068) — refusing
+       :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` if the
+       lock cannot be acquired within its bound;
+    4. still inside that hold, run the ceiling gate on the snapshot's tier,
+       and **only then** answer from the same snapshot.
 
     Args:
         vault_path: Root of the Obsidian vault.
@@ -320,8 +406,10 @@ def entry_classification_tool(
     Returns:
         ``status="ok"`` with the eight published keys when the fragment is
         within the ceiling, else the canonical four-key refusal carrying one of
-        :data:`BLANK_ENTRY_REF_REASON`, :data:`ENTRY_REF_NOT_FOUND_REASON` or
-        :data:`~creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`. No other
+        :data:`BLANK_ENTRY_REF_REASON`, :data:`ENTRY_REF_NOT_FOUND_REASON`,
+        :data:`~creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON` or
+        :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` (another
+        writer held the content lock past its bound; retry). No other
         reason, and no extra key: anything further would be derived from
         content the caller is not admitted to.
     """
@@ -338,27 +426,16 @@ def entry_classification_tool(
         consumer=consumer,
         affected_fragment_ids=[],
     )
-    gate_tier = _gate_tier(vault_path, entry_ref)
-    if (
-        refusal := refuse_above_ceiling(
-            tool=TOOL_NAME,
-            content_tier=gate_tier,
-            ceiling=privacy_tier_ceiling,
-        )
-    ) is not None:
-        return refusal
-    record = _resolve_record(vault_path, entry_ref)
-    if record is None:
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            reason=ENTRY_REF_NOT_FOUND_REASON,
-        )
-    fragment, raw = record
-    return _payload(
-        entry_ref=entry_ref,
-        ceiling=privacy_tier_ceiling,
-        fragment=fragment,
-        raw=raw,
-        tier=gate_tier,
-    )
+    with ExitStack() as hold:
+        # The catch covers ACQUISITION only: nothing below raises
+        # VaultLockTimeoutError, and a busy answer must never stand in for a
+        # snapshot that was taken.
+        try:
+            hold.enter_context(vault_lock(content_mutation_lock_path(vault_path)))
+        except VaultLockTimeoutError:
+            return refusal_response(
+                tool=TOOL_NAME,
+                ceiling=privacy_tier_ceiling,
+                reason=CONTENT_MUTATION_BUSY_REASON,
+            )
+        return _answer(vault_path, entry_ref, privacy_tier_ceiling)

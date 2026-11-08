@@ -247,3 +247,27 @@ Creek. **Creek's custody does not change.**
 The custody that does change is adepthood's. Its stored copy is encrypted
 under the operator's key, and it is not operator-blind. Adepthood ADR 0009
 records that limit; this record does not repeat it as Creek's.
+
+## Amendment (2026-11-04, contract 0.28.0): a refused key on a synchronous route
+
+The 2026-10-28 amendment made a refused key fatal for a classification run.
+The two synchronous routes that accept a key did not follow. A reflection or a
+letter whose key the vendor answered `401`/`403` already raised the typed
+`RequestKeyRejectedError`. Both tools then caught it as a plain `RuntimeError`.
+The reflection route served `503 temporarily_unavailable` and the letter route
+served the same through `provider_unavailable`, so a consumer told the writer
+to wait and try again. Waiting never clears a refused key. A production
+reflection failed exactly this way.
+
+- **The code.** `POST /v1/reflections` and `POST /v1/letters/{external_id}` now
+  serve `request_key_rejected` at HTTP `424 Failed Dependency`, disposition
+  `terminal`. The message is one constant about the key: "the writer's own
+  provider key was refused by its vendor". The vendor is dialled once.
+- **Older callers.** A caller declaring a minor below `0.28` is served the
+  `503 temporarily_unavailable` it was served before, byte-identical but for
+  the correlation id.
+- **The operator's key.** It is unchanged. With no request key, a vendor
+  `401` is still the generic refusal, because only the writer can replace the
+  writer's key.
+- **Pinned by** `tests/test_request_key_rejected_route.py`, through the real
+  SDKs with only the socket replaced, on both routes and both minors.

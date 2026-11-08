@@ -21,16 +21,15 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import frontmatter
 
 from creek._fsio import atomic_write_text
-from creek._fslock import vault_lock
 from creek._schema import coerce_optional_list
 from creek.audit import AuditLog
 from creek.care.guardrail import CARE_POLICY
@@ -48,7 +47,7 @@ from creek.hierarchy import (
     structural_path_context,
 )
 from creek.models import CompiledPage, CompileTargetKind, Fragment, PrivacyTier
-from creek.vault.mutations import content_mutation_lock_path
+from creek.vault.mutations import hold_content_mutation
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -81,6 +80,48 @@ and hands it over. Whatever the factory decides — including raising
 :class:`~creek.classify.llm.router.IntimateRoutingError` when there is no
 local backend to fall back to — propagates to the caller untouched.
 """
+
+
+class SourceAdmission(Protocol):
+    """Caller-supplied admission decision, evaluated inside the engine's one walk.
+
+    ``admit(ancestors, fragment_ids)`` returns ``True`` to let the compile
+    proceed and ``False`` to refuse it. The engine owns *when* it runs: after
+    :func:`_load_fragments_for_compile` has walked ``01-Fragments`` exactly
+    once, inside the content-mutation lock :func:`compile_to_vault` already
+    holds, and before the missing-id ``ValueError``, the LLM factory, the
+    target-directory ``mkdir`` and any write. The decision and the content it
+    admits are therefore read from one snapshot, serialised against every
+    other content mutation that takes the same lock (#930).
+
+    The engine knows nothing about what the decision means — tier ceilings
+    are the MCP layer's policy (``creek_mcp.tools.compile``), and ``creek``
+    may never import ``creek_mcp`` — so it hands over the whole-corpus
+    :class:`~creek.classify.privacy_filter.AncestorIndex` built from that walk
+    and the ids exactly as requested, and reads back one bool.
+    """
+
+    def __call__(
+        self,
+        ancestors: AncestorIndex,
+        fragment_ids: Sequence[str],
+        /,
+    ) -> bool:
+        """Return whether a compile of *fragment_ids* may proceed."""
+        ...  # pragma: no cover - protocol signature only
+
+
+class SourceAdmissionRefusedError(Exception):
+    """A :class:`SourceAdmission` hook refused the compile.
+
+    Deliberately content-free: no message, no ids, no tiers. The caller that
+    supplied the hook already knows why it refused, and anything the engine
+    attached here would be one more surface a refused call could leak
+    through. It subclasses neither ``ValueError`` nor ``RuntimeError`` so a
+    caller's existing ``except (ValueError, RuntimeError)`` — which echoes the
+    message back as a refusal reason — can never swallow it by accident.
+    """
+
 
 PARADOX_LOG_RELPATH = Path(
     "00-Creek-Meta/Processing-Log/paradoxes-during-compile.jsonl",
@@ -396,6 +437,7 @@ def compile_to_vault(
     target_title: str,
     llm_factory: CompileLLMFactory,
     level_policy: LevelPolicy = "leaves",
+    admit_sources: SourceAdmission | None = None,
 ) -> Path:
     """Compile sources inside the shared load-to-write mutation boundary.
 
@@ -407,19 +449,28 @@ def compile_to_vault(
         target_title: Human-readable title for the page.
         llm_factory: Tier-keyed builder for the compile LLM client.
         level_policy: Hierarchy policy applied to the source fragments.
+        admit_sources: Optional admission decision, evaluated on the one
+            walk this compile makes and inside the lock it holds (#930).
+            ``None`` — what ``creek compile`` passes — admits everything.
+            See :class:`SourceAdmission`.
 
     Returns:
         The path of the written compiled-layer page.
 
     Raises:
-        creek._fslock.VaultLockTimeoutError: When another content mutation
-            holds the shared boundary past its bounded wait.
+        creek.vault.mutations.ContentMutationBusyError: When another content
+            mutation held the shared boundary past its bounded wait, so the
+            pass never started (#2087). A
+            :class:`~creek._fslock.VaultLockTimeoutError` raised *under* the
+            hold — by a lock taken while working — propagates as itself.
+        SourceAdmissionRefusedError: When *admit_sources* refused the
+            compile. Nothing was built, written or logged.
         ValueError: If a requested fragment cannot be resolved or the target
             escapes its compiled-layer directory.
         creek.classify.llm.router.IntimateRoutingError: If intimate content
             has no local generation route.
     """
-    with vault_lock(content_mutation_lock_path(vault_path)):
+    with hold_content_mutation(vault_path):
         return _compile_to_vault_with_content_lock_held(
             fragment_ids=fragment_ids,
             vault_path=vault_path,
@@ -428,6 +479,7 @@ def compile_to_vault(
             target_title=target_title,
             llm_factory=llm_factory,
             level_policy=level_policy,
+            admit_sources=admit_sources,
         )
 
 
@@ -440,6 +492,7 @@ def _compile_to_vault_with_content_lock_held(
     target_title: str,
     llm_factory: CompileLLMFactory,
     level_policy: LevelPolicy = "leaves",
+    admit_sources: SourceAdmission | None = None,
 ) -> Path:
     """Implement :func:`compile_to_vault` while its content lock is held.
 
@@ -449,12 +502,21 @@ def _compile_to_vault_with_content_lock_held(
     ``target_kind``-specific directory, and appends any paradoxes to
     the side-channel JSONL log.
 
-    The step order is load-bearing, not incidental. The factory is invoked
-    **after** the load — so an unresolvable id gets the ``ValueError``
-    below rather than whatever the factory would have raised — and
-    **before** :func:`_resolve_target_path`, which unconditionally creates
-    the target directory. A compile refused on privacy grounds must leave
-    zero state on disk, not an empty ``02-Threads/Active``.
+    The step order is load-bearing, not incidental: load, admit, resolve
+    ids, build the client, resolve the target, write.
+
+    - *admit_sources* runs on the load's own records, **before** the
+      missing-id ``ValueError`` — so a caller cannot pair one refused id
+      with a batch of guesses and read back from the not-found list which
+      guesses exist — and before everything below it (#930).
+    - The factory is invoked **after** the load — so an unresolvable id
+      gets the ``ValueError`` rather than whatever the factory would have
+      raised — and **before** :func:`_resolve_target_path`, which
+      unconditionally creates the target directory. A compile refused on
+      privacy grounds must leave zero content-bearing state on disk, not an
+      empty ``02-Threads/Active``. (The one file a refused compile does
+      create is the zero-byte lock file :func:`compile_to_vault` took
+      before calling this; it holds no vault-derived bytes.)
 
     Args:
         fragment_ids: IDs of source fragments to roll up.
@@ -471,11 +533,15 @@ def _compile_to_vault_with_content_lock_held(
             fragments. Passed through to :func:`compile_fragments`;
             defaults to ``"leaves"``. It deliberately does not narrow the
             routing tier; see :func:`_routing_tier_for`.
+        admit_sources: Optional admission decision; see
+            :class:`SourceAdmission` and :func:`compile_to_vault`.
 
     Returns:
         The path of the written compiled-layer page.
 
     Raises:
+        SourceAdmissionRefusedError: When *admit_sources* returned
+            ``False``.
         ValueError: If a requested fragment cannot be found in the vault,
             or if *target_id* escapes the compiled-layer directory.
         creek.classify.llm.router.IntimateRoutingError: Raised by the
@@ -489,7 +555,11 @@ def _compile_to_vault_with_content_lock_held(
             credential — propagates untouched for the same reason: the
             engine takes no view on how a client is built.
     """
-    pairs_with_raw, ancestors = _load_fragments_for_compile(vault_path, fragment_ids)
+    pairs_with_raw, ancestors = _load_fragments_for_compile(
+        vault_path,
+        fragment_ids,
+        admit_sources,
+    )
     tier = _routing_tier_for(pairs_with_raw, ancestors.chain_tiers(fragment_ids))
     llm = llm_factory(tier)
     target_path = _resolve_target_path(vault_path, target_kind, target_id)
@@ -734,6 +804,7 @@ def _render_body(title: str, claims: list[dict[str, object]]) -> str:
 def _load_fragments_for_compile(
     vault_path: Path,
     fragment_ids: list[str],
+    admit_sources: SourceAdmission | None = None,
 ) -> tuple[list[tuple[Fragment, str, dict[str, object]]], AncestorIndex]:
     """Load the requested fragments from the vault and preserve order.
 
@@ -760,9 +831,23 @@ def _load_fragments_for_compile(
     ``test_compile_to_vault_walks_the_vault_exactly_once`` pins the single
     walk so a future lane cannot quietly reintroduce the second one.
 
+    The same walk is where *admit_sources* is decided (#930). Before that
+    fix the MCP wrapper surveyed the corpus itself, outside the content lock,
+    and this function then walked it again inside: twice the I/O, and a
+    window in which ``creek classify`` could raise a tier the survey had
+    already admitted. Deciding admission here, on the index just built and
+    before anything is resolved, makes admission and content one snapshot.
+
+    Membership is tested against a **set** of the requested ids, so a wide
+    request costs one walk rather than one walk times the request; the
+    result and the not-found message still iterate *fragment_ids* itself, so
+    requested order and repeats survive.
+
     Args:
         vault_path: Vault root; fragments are read from ``01-Fragments``.
         fragment_ids: The ids to load, in the order the caller wants them.
+        admit_sources: Optional admission decision, handed the whole-corpus
+            index and *fragment_ids* exactly as requested.
 
     Returns:
         A ``(triples, ancestor_index)`` pair: one ``(fragment, body, raw)``
@@ -770,9 +855,11 @@ def _load_fragments_for_compile(
         spanning every fragment in the corpus.
 
     Raises:
+        SourceAdmissionRefusedError: If *admit_sources* returned ``False``.
+            Raised ahead of the not-found check below, deliberately.
         ValueError: If any requested id has no matching fragment.
     """
-    requested = fragment_ids.copy()
+    requested = set(fragment_ids)
     records = iter_vault_fragments(vault_path / "01-Fragments")
     by_id: dict[str, tuple[Fragment, str, dict[str, object]]] = {
         fragment.id: (fragment, body, raw)
@@ -782,11 +869,13 @@ def _load_fragments_for_compile(
     ancestors = build_ancestor_index(
         (fragment, raw) for _path, fragment, _body, raw in records
     )
-    missing = [fid for fid in requested if fid not in by_id]
+    if admit_sources is not None and not admit_sources(ancestors, fragment_ids):
+        raise SourceAdmissionRefusedError
+    missing = [fid for fid in fragment_ids if fid not in by_id]
     if missing:
         msg = f"Fragment(s) not found in vault: {', '.join(missing)}"
         raise ValueError(msg)
-    return [by_id[fid] for fid in requested], ancestors
+    return [by_id[fid] for fid in fragment_ids], ancestors
 
 
 def _resolve_target_path(

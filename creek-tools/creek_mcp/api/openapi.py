@@ -139,8 +139,8 @@ actually produce.
 
 _CAPABILITY_ERROR_CODES: Final[dict[Capability, tuple[ErrorCode, ...]]] = {
     Capability.UPLOAD: (ErrorCode.UNSUPPORTED_SOURCE,),
-    Capability.REFLECTIONS: (ErrorCode.RATE_LIMITED,),
-    Capability.LETTERS: (ErrorCode.RATE_LIMITED,),
+    Capability.REFLECTIONS: (ErrorCode.RATE_LIMITED, ErrorCode.REQUEST_KEY_REJECTED),
+    Capability.LETTERS: (ErrorCode.RATE_LIMITED, ErrorCode.REQUEST_KEY_REJECTED),
     Capability.READING_RECOMMENDATIONS: (ErrorCode.RATE_LIMITED,),
 }
 """Refusals only one capability can produce, keyed by that capability.
@@ -168,6 +168,13 @@ not the other published two different stories about one budget. It stays off
 the remaining capabilities because they reach no model, and off
 ``POST /v1/classifications``, whose own model work is accepted as a ``202`` job
 and so cannot refuse admission in the response that admits it.
+
+:attr:`~creek_mcp.api.models.ErrorCode.REQUEST_KEY_REJECTED` (contract 0.28)
+joins the same two rows and no others: they are the only synchronous routes
+that dial a vendor on the writer's request key. ``reading-recommendations``
+never accepts a request key, and ``POST /v1/classifications`` reports a refused
+key on its job (``failure_code``, 0.26) rather than in the ``202`` that
+accepted it.
 """
 
 SECURITY_SCHEME_NAME: Final[str] = "bearerAuth"
@@ -379,7 +386,7 @@ def _components() -> dict[str, Any]:
         schema = model.model_json_schema(ref_template=COMPONENT_REF_TEMPLATE)
         hoisted.update(schema.get(_DEFS_KEY, {}))
         models[name] = {key: value for key, value in schema.items() if key != _DEFS_KEY}
-    return {**hoisted, **models}
+    return hoisted | models
 
 
 def _is_unbuilt(spec: RouteSpec) -> bool:

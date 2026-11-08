@@ -54,9 +54,11 @@ over every module in :mod:`creek_mcp` pins the modules that may name
 from __future__ import annotations
 
 import re
+from contextlib import suppress
 from enum import StrEnum
 from ipaddress import ip_address
-from typing import Final, Literal, Self, TypeAlias
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal, Self, TypeAlias
 from urllib.parse import urlparse, urlsplit
 from uuid import UUID
 
@@ -81,6 +83,9 @@ from creek_mcp.contract import CONTRACT_VERSION
 from creek_mcp.mcp_path import is_resource_path
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 # --------------------------------------------------------------------------
 # Version vocabulary
 # --------------------------------------------------------------------------
@@ -100,6 +105,8 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.28",
+    "0.27",
     "0.26",
     "0.25",
     "0.24",
@@ -255,6 +262,20 @@ Contract 0.22 (#1968) adds the ``agent-activity`` capability, one read route
 and three wire models. Every older response is byte-identical, and the
 since-minor gate both withholds the capability from a ``0.21`` caller's
 handshake and refuses it the route, so ``0.21`` stays in the window.
+
+Contract 0.28 adds one error code, ``request_key_rejected``, and with it
+``424`` joining the published status set. It is served only to callers
+declaring :data:`REQUEST_KEY_REJECTED_SINCE_MINOR`; a ``0.27`` caller meeting
+the same refused key is served the ``503 temporarily_unavailable`` it always
+was, so every response it can reach is byte-identical and ``0.27`` stays in
+the window.
+
+Contract 0.29 (#2075) adds one member, ``busy``, to the closed
+:class:`JobFailureCode` vocabulary ``GET /v1/jobs/{job_id}`` serves. It is
+served only to callers declaring :data:`BUSY_FAILURE_CODE_SINCE_MINOR`; a
+``0.28`` caller whose job met the same content-lock contention is served the
+``failure_code: null`` it always was, so every response it can reach is
+byte-identical and ``0.28`` stays in the window.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -526,12 +547,38 @@ the current contract, so an application can learn this optional connection
 without changing the minor it already speaks on the content routes.
 """
 
+REQUEST_KEY_REJECTED_SINCE_MINOR: Final[str] = "0.28"
+"""First minor that may meet ``request_key_rejected`` on a synchronous route.
+
+``POST /v1/reflections`` and ``POST /v1/letters/{external_id}`` serve the code
+when the vendor refuses the writer's request-scoped key (ADR-0015). A caller
+declaring an earlier minor vendored a closed :class:`ErrorCode` without it, and
+the document that minor published records no ``424`` on either route, so it is
+served ``temporarily_unavailable`` — exactly what it received for the same
+refused key before — by
+:func:`creek_mcp.httpapi.generation.served_error_code`. One constant for both
+routes, because both began serving the code in the same change. It is a
+literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
 JOB_FAILURE_CODE_SINCE_MINOR: Final[str] = "0.26"
 """First minor whose ``GET /v1/jobs/{job_id}`` body carries ``failure_code`` (#1877).
 
 Older declared minors vendored a closed :class:`JobStatusResponse` without it,
 so the key is omitted for them and their failed body is byte-identical. It is
 a literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
+BUSY_FAILURE_CODE_SINCE_MINOR: Final[str] = "0.29"
+"""First minor that may be served ``failure_code: "busy"`` on a job (#2075).
+
+A caller declaring 0.26 through 0.28 vendored a closed :class:`JobFailureCode`
+holding only ``request_key_rejected``, so a job that ended busy is served to it
+as ``failure_code: null`` — exactly what it received for the same failure
+before — and below 0.26 the key is omitted altogether
+(:data:`JOB_FAILURE_CODE_SINCE_MINOR`). The stored record keeps ``busy``
+whichever minor reads it: the downgrade is a property of the response. It is a
+literal for the reason :data:`_UPLOAD_MINOR` is.
 """
 
 AGENT_MCP_URL_MAX_CHARS: Final[int] = 2048
@@ -564,10 +611,8 @@ def _public_agent_host(host: str) -> bool:
     canonical = host.rstrip(".").lower()
     if "%" in canonical:
         return False
-    try:
+    with suppress(ValueError):
         return ip_address(canonical).is_global
-    except ValueError:
-        pass
     numeric = all(
         part.isdecimal() or part.startswith("0x") for part in canonical.split(".")
     )
@@ -873,7 +918,7 @@ class PraxisLifecycle(StrEnum):
 
 
 class ErrorCode(StrEnum):
-    """The eleven wire error codes: nine from 0.2, one at 0.8, one at 0.19.
+    """The twelve wire error codes: nine from 0.2, one each at 0.8, 0.19 and 0.28.
 
     There is deliberately **no** ``care_escalation`` member: an escalation is a
     successful, 200-shaped :class:`CareEscalationResponse`, because a person in
@@ -925,6 +970,19 @@ class ErrorCode(StrEnum):
             budget cannot exist even in principle. Whether the budget is scoped
             per vault or per account is a pool-side fact this contract does not
             publish.
+        REQUEST_KEY_REJECTED: The vendor refused the writer's own
+            request-scoped provider key (ADR-0015) with ``401``/``403``. A
+            statement about the key the caller sent on this request and
+            nothing else — never about the vault, the pool or the operator's
+            key, whose refusal stays ``temporarily_unavailable``. Retrying with
+            the same key fails the same way, so it is terminal: the writer
+            must replace the key. Added at contract 0.28 and served only to
+            callers declaring :data:`REQUEST_KEY_REJECTED_SINCE_MINOR` or
+            later; an older caller receives ``temporarily_unavailable``, which
+            is what it has always received for the same refusal. Reachable on
+            ``POST /v1/reflections`` and ``POST /v1/letters/{external_id}``;
+            the asynchronous classification pass reports the same fact as
+            :attr:`JobFailureCode.REQUEST_KEY_REJECTED` (0.26) instead.
         INTERNAL_ERROR: An unexpected server fault.
     """
 
@@ -938,6 +996,7 @@ class ErrorCode(StrEnum):
     UNAVAILABLE = "unavailable"
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
     RATE_LIMITED = "rate_limited"
+    REQUEST_KEY_REJECTED = "request_key_rejected"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -972,6 +1031,7 @@ ERROR_STATUS: Final[dict[ErrorCode, int]] = {
     ErrorCode.UNAVAILABLE: 503,
     ErrorCode.TEMPORARILY_UNAVAILABLE: 503,
     ErrorCode.RATE_LIMITED: 429,
+    ErrorCode.REQUEST_KEY_REJECTED: 424,
     ErrorCode.INTERNAL_ERROR: 500,
 }
 """HTTP status for each wire error code.
@@ -980,8 +1040,8 @@ Total over :class:`ErrorCode`, so no dispatch path can ``KeyError`` while
 building a response. As prose: 401 Unauthorized, 422 Unprocessable Content, 409
 Conflict, 403 Forbidden, 404 Not Found, 501 Not Implemented, 415 Unsupported
 Media Type, 503 Service Unavailable (twice — the two 503s differ only in retry
-disposition, which is the distinction that actually matters to a client) and
-500 Internal Server Error.
+disposition, which is the distinction that actually matters to a client), 429
+Too Many Requests, 424 Failed Dependency and 500 Internal Server Error.
 
 ``415`` is the one status contract 0.8 added to the published set, and it is a
 status of its own rather than a second ``422`` on purpose: the OpenAPI document
@@ -995,6 +1055,17 @@ exactly: a client's "the service is briefly down" handling is the wrong
 handling for "you are over your own cap", and a code sharing ``503`` with
 ``TEMPORARILY_UNAVAILABLE`` could not be documented at all, because the
 OpenAPI document carries one response object per status.
+
+``424`` is the one status contract 0.28 added, for
+:attr:`ErrorCode.REQUEST_KEY_REJECTED`, and the same reasoning picks it. It
+cannot share ``503``: that is ``TEMPORARILY_UNAVAILABLE``'s, and "briefly
+unable, retry" is precisely the advice a rejected key must not be given. It
+cannot be ``401`` or ``403`` either, because both are taken —
+``UNAUTHENTICATED`` and ``PRIVACY_REFUSED`` — and either would also misstate
+*whose* credential failed: the caller's consumer token was accepted. ``502``
+would read as a gateway fault a client retries. ``424 Failed Dependency``
+(RFC 4918 §11.4) says what happened: this request failed because the request
+it depended on — the vendor call made with the writer's key — failed.
 
 ``PRIVACY_REFUSED`` is 403 rather than 404 on purpose. 404 would be the very
 oracle :attr:`ErrorCode.NOT_FOUND` is fenced off to avoid: a caller able to
@@ -1034,6 +1105,12 @@ ERROR_MESSAGES: Final[dict[ErrorCode, str]] = {
     # vault's own recent model use would be a usage oracle on a shared pool,
     # and the retry hint is the advisory ``Retry-After`` header's job.
     ErrorCode.RATE_LIMITED: "this vault is over its model-call allowance",
+    # About the key and nothing else. Not the vendor's own error text, not the
+    # status it answered, and never any part of the key: the redaction that
+    # keeps the key out of the log keeps it out of the wire too.
+    ErrorCode.REQUEST_KEY_REJECTED: (
+        "the writer's own provider key was refused by its vendor"
+    ),
     ErrorCode.INTERNAL_ERROR: "the server failed to complete this request",
 }
 """The one message per error code, and the only text an envelope may carry.
@@ -1061,6 +1138,7 @@ RETRY_POLICY: Final[dict[ErrorCode, RetryDisposition]] = {
     ErrorCode.UNAVAILABLE: RetryDisposition.RETRY_AFTER_OPERATOR_ACTION,
     ErrorCode.TEMPORARILY_UNAVAILABLE: RetryDisposition.RETRY_WITH_BACKOFF,
     ErrorCode.RATE_LIMITED: RetryDisposition.RETRY_WITH_BACKOFF,
+    ErrorCode.REQUEST_KEY_REJECTED: RetryDisposition.TERMINAL,
     ErrorCode.INTERNAL_ERROR: RetryDisposition.RETRY_WITH_BACKOFF,
 }
 """Retryability, keyed on the code alone — the #1082 answer.
@@ -1082,6 +1160,13 @@ cap.
 "above your ceiling" with "unresolvable" — purged, orphaned, schema-invalid,
 deleted out of band. Reading ``TERMINAL`` as "therefore intimate" reconstructs
 exactly the bit the blur exists to withhold.
+
+**Why ``REQUEST_KEY_REJECTED`` is ``TERMINAL``.** The same key fails the same
+way on every attempt, so a resend of this request can only spend another vendor
+call and is never answered differently. Not ``RETRY_AFTER_OPERATOR_ACTION``
+either: the operator cannot fix a writer's key. The one remedy is the writer
+sending a different key, which is a different request, so the client should
+stop and ask the writer rather than back off.
 
 **Why a table and not a field.** Retryability is carried by this static table,
 keyed on the code, and never by a per-response ``retryable`` boolean. A
@@ -1356,8 +1441,7 @@ class AgentMcpDiscovery(_WireModel):
                 parsed.scheme == "https"
                 and parsed.hostname is not None
                 and _public_agent_host(parsed.hostname)
-                and parsed.username is None
-                and parsed.password is None
+                and parsed.username is parsed.password is None
                 and not parsed.query
                 and not parsed.fragment
                 and parsed.port != 0
@@ -2465,18 +2549,48 @@ class JobFailureCode(StrEnum):
     """Why a ``failed`` pipeline job failed, when the caller can act on it (#1877).
 
     Closed and deliberately small: a code is published only for a failure the
-    *caller* can remedy, never for an operator-side fault, whose detail stays
-    in the server log. Any other failure is ``failure_code: null``.
+    *caller* can remedy — including by resubmitting the same request — never
+    for an operator-side fault, whose detail stays in the server log. Any other
+    failure is ``failure_code: null``. Each member is served only to a caller
+    declaring at least the minor it was published at, named below; an earlier
+    caller is served ``null`` for the same failure.
 
     Attributes:
         REQUEST_KEY_REJECTED: The writer's request-scoped provider key
             (ADR-0015) was refused by its vendor with ``401``/``403``. The
             pass stopped at the first refusal, without retrying, and nothing
             it had not yet started was sent. Retrying with the same key will
-            fail the same way; the writer must replace the key.
+            fail the same way; the writer must replace the key. Since
+            contract 0.26.
+        BUSY: Another writer held the vault content-mutation lock past its
+            bounded wait (#2075). The pass takes that lock before touching any
+            fragment, so a timeout taking it means nothing was written; and
+            both passes are idempotent and resumable, so a resubmit converges
+            either way. The condition is transient — the same one the
+            synchronous routes answer ``503 temporarily_unavailable`` — so
+            resubmit the same request, with backoff. Since contract 0.29.
     """
 
     REQUEST_KEY_REJECTED = "request_key_rejected"
+    BUSY = "busy"
+
+
+JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE: Final[Mapping[JobFailureCode, str]] = (
+    MappingProxyType(
+        {
+            JobFailureCode.REQUEST_KEY_REJECTED: JOB_FAILURE_CODE_SINCE_MINOR,
+            JobFailureCode.BUSY: BUSY_FAILURE_CODE_SINCE_MINOR,
+        }
+    )
+)
+"""The first minor each :class:`JobFailureCode` member may be served at.
+
+Total over the enum (a test pins it), so a new member cannot ship without a
+since-minor: a caller whose declared minor is below a member's entry vendored
+a closed vocabulary without it and is served ``failure_code: null`` instead,
+by :func:`creek_mcp.httpapi.pipeline._served_failure_code`. Read-only, because
+the window it encodes is a published fact rather than runtime state.
+"""
 
 
 JobId: TypeAlias = UUID
@@ -2504,8 +2618,9 @@ class JobStatusResponse(_WireModel):
     failure_code: JobFailureCode | None = Field(
         default=None,
         description=(
-            "Why a failed job failed, when the caller can remedy it; null "
-            "otherwise. Since contract 0.26."
+            "Why a failed job failed, when the caller can remedy it, "
+            "including by resubmitting: request_key_rejected since contract "
+            "0.26, busy since 0.29; null otherwise. Since contract 0.26."
         ),
     )
 

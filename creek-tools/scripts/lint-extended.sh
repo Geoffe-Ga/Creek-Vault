@@ -72,14 +72,15 @@ run_or_skip() {
 
 echo "=== Extended Lint Suite ==="
 
-# Only pylint targets creek_mcp/ so far (issue #925). refurb,
-# tryceratops, vulture and interrogate stay on creek/ until their
-# creek_mcp backlog is groomed — widening them here would fail this
-# suite on findings nobody has triaged yet.
+# pylint targets creek_mcp/ here directly (issue #925). refurb, vulture
+# and interrogate cover it by routing through their single wrapper scripts
+# (#965, #1395), so this suite asks exactly the question check-all.sh and CI
+# ask. tryceratops stays on creek/ until #965's remaining creek_mcp backlog
+# is fixed — widening it here would fail this suite on untriaged findings.
 run_or_skip "pylint"      pylint        \
     pylint creek/ creek_mcp/ --fail-under="$PYLINT_FAIL_UNDER"
 run_or_skip "refurb"      refurb        \
-    refurb creek/
+    ./scripts/lint-refurb.sh
 run_or_skip "tryceratops" tryceratops   \
     tryceratops creek/
 # Dead code routes through the single wrapper (issue #1395) rather than
@@ -88,8 +89,11 @@ run_or_skip "tryceratops" tryceratops   \
 # incapable of failing; scripts/lint_vulture.py owns the real policy now.
 run_or_skip "vulture"     vulture       \
     ./scripts/lint-vulture.sh
+# The wrapper holds creek/ and creek_mcp/ to the threshold separately;
+# INTERROGATE_FAIL_UNDER stays this suite's knob for it.
 run_or_skip "interrogate" interrogate   \
-    interrogate -vv --fail-under="$INTERROGATE_FAIL_UNDER" creek/
+    env DOCSTRING_COVERAGE_THRESHOLD="$INTERROGATE_FAIL_UNDER" \
+    ./scripts/lint-interrogate.sh
 # Note: the shellcheck binary takes a list of files directly; the shell
 # expands the glob before run_or_skip sees it. (Do not start this comment
 # with the tool's name — shellcheck parses `# shellcheck ...` as a

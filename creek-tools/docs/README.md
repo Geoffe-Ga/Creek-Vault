@@ -18,5 +18,6 @@ Task-oriented how-to guides for the `creek-tools` pipeline. The top-level [`cree
 | [managed-vault-fly-pilot.md](managed-vault-fly-pilot.md) | Authorization, deployment, cap/alert, backup/restore, emergency-stop, invoice, and sanitized-evidence checklist for the bounded Fly pilot (#1806). |
 | [pool-measurement-pin.md](pool-measurement-pin.md) | Pinning and re-pinning the attested inference pool's measurement set, the Decision 3.3 condition verdicts and their open owner gates, key custody, and the warm-minimum evidence T19 asks for (#1901). |
 | [bench.md](bench.md) | Running the hermetic model-capacity, latency and concurrency harness, reading its content-free report, and modelling USD per account-month from a dated price sheet (#1850). |
+| [security/dast.md](security/dast.md) | What the two DAST workflows attack, how to read and replay a red contract-fuzz gate, and where the nightly ZAP findings land. |
 
 Every guide is intentionally task-oriented: it answers "how do I do X" rather than "what classes does the module contain" — for the latter, read the module docstrings in [`creek/`](../creek/), which are kept above the 95% interrogate threshold.

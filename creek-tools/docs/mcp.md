@@ -54,17 +54,29 @@ cross-repo contract is
 | `creek.lint`          | Run the unified hygiene lint pass (FEAT-008).              |
 | `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
 | `creek.wheel`         | Return a per-frequency balance read of the corpus for the Map: an ordered `F1..F10` map of `{name, count, share}`, where `share` is the fraction of *classified* fragments at that frequency. A corpus walk (the same shape as `state.render` and `report`), so it **excludes** above-ceiling fragments from the tally rather than refusing (#969). |
-| `creek.draft`         | Draft an essay from a mined idea (requires an LLM). Streams progress, and past the server deadline answers with a job handle — see [Long calls](#long-calls-progress-a-deadline-and-job-handles-1966). |
+| `creek.draft`         | Draft an essay from a mined idea (requires an LLM). Streams progress, and past the server deadline answers with a job handle — see [Long calls](#long-calls-progress-a-deadline-and-job-handles-1966). A provider failure is a structured refusal with a fixed reason: `LLM provider unavailable for draft` when the provider cannot be built, `LLM provider call failed for draft` when the call itself fails (a vendor 4xx, an empty body, an Ollama transport or HTTP error), and `the writer's request-scoped provider key was refused by its vendor` for a rejected request key. The vendor's message and any provider URL stay on the server's `creek_mcp.tools.draft` log record and are never returned; an Ollama `httpx` error used to escape as FastMCP `isError` text naming the URL ([#2073](https://github.com/Geoffe-Ga/Creek-Vault/issues/2073)). The router's intimate-routing refusal keeps its own message, the residual documented in `creek_mcp/tools/draft.py`. |
 | `creek.redact.scan`   | Regex-scan a path for secrets/PII (FEAT-027); scoped to `00-Creek-Meta/Inbound/` at every ceiling, `intimate`/`all` elsewhere in the vault (#972). |
 | `creek.classify.entry` | Report the ontology classification one named fragment **already carries on disk** (#874). Takes `entry_ref` plus `ceiling`; computes nothing. |
 
 #### `creek.classify.entry` reads a classification; it never makes one (#874)
 
-`creek.classify.entry(entry_ref, privacy_tier_ceiling)` is a **pure read**. It
+`creek.classify.entry(entry_ref, privacy_tier_ceiling)` is a **read**. It
 is a sibling of the `creek.classify` corpus pass, not part of it: the pass is
 whole-vault, idempotent and takes no fragment selector, while this addresses one
-fragment by id and writes nothing at all — no rule classifier on demand, no LLM,
-no persisted verdict.
+fragment by id and writes no vault content — no rule classifier on demand, no
+LLM, no persisted verdict. The only bytes a call may leave are its MCP audit
+line and, since #2068, the zero-byte
+`00-Creek-Meta/locks/content-mutations.lock` (it holds no vault content).
+
+Since #2068 the tier the gate compares and the classification it reports come
+from **one** exhaustive walk of `01-Fragments`, taken inside the vault
+content-mutation lock that `creek classify` writes under. Before, the gate and
+the answer read two separate walks with no lock across either, so a re-tier
+landing between them could be served as the *old* tier beside the *new*
+classification. The cost, accepted as #930 accepted it for `creek.compile`: a
+call can wait up to the lock's 10-second bound behind a whole-vault classify,
+link, compile, journal or upload, and past it answers the content-free
+`vault content mutation busy` refusal — retry later.
 
 A successful call returns **exactly eight keys**:
 
@@ -103,7 +115,7 @@ collapse the exact distinction the field exists to draw. The value is also
 **clamped** to the three published methods rather than echoed from frontmatter,
 which is arbitrary user-controlled bytes.
 
-There are **three refusal reasons and no others**, each carrying the canonical
+There are **four refusal reasons and no others**, each carrying the canonical
 four keys (`status`, `tool`, `tier_ceiling`, `reason`) and nothing else:
 
 | Reason | When | Audited? |
@@ -111,14 +123,16 @@ four keys (`status`, `tool`, `tier_ceiling`, `reason`) and nothing else:
 | `entry_ref must not be blank` | A blank or whitespace-only `entry_ref`. Refused before any vault read. | **No** — a malformed call, matching the `creek.journal` / `creek.save` / `creek.ingest` convention. |
 | `entry_ref not found` | The id resolves to no readable fragment. Reachable only at `ceiling=intimate` or `all`, because the fail-closed rule below already refused it everywhere lower. | Yes |
 | `resolved content exceeds the declared tier ceiling` | The fragment's persisted tier is above your ceiling. Names neither the fragment nor its tier. | Yes |
+| `vault content mutation busy` | Another writer held the vault content-mutation lock past its bound (#2068). Decided before the fragment is read, so it says nothing about it. Retry. | Yes — the attempt is audited above the lock, as on every other path past the blank check. |
 
-The gate compares the fragment's **current persisted** tier, read through the
-shared source-tier walk — never a tier you supplied, and never one staged on
+The gate compares the fragment's **current persisted** tier, read from that one
+locked walk with the shared per-file tier rule — never a tier you supplied, and never one staged on
 the entry, both of which are stale the moment `creek classify` escalates the
 fragment. It fails closed twice over: a fragment whose `privacy_tier` key is
 **missing entirely** ranks `intimate`, distinctly from an explicit
 `unclassified`; and an id that resolves to **nothing** ranks `intimate` too, so
-every locator divergence is refused rather than answered. Note that an explicit
+every locator divergence is refused rather than answered. An id carried by
+several files gates on the most sensitive of them. Note that an explicit
 `unclassified` ranks with `personal` (#961) — admitted at `ceiling=personal`,
 refused at `ceiling=open`.
 
@@ -271,7 +285,7 @@ confinement boundary.
 
 | Tool           | Inputs                                                                  | Purpose                                                                       |
 |----------------|------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). |
+| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). A failure answers `status: error` with a fixed `reason` (`LLM provider call failed for author` / `writing desk failed for author`), never the exception's text ([#2082](https://github.com/Geoffe-Ga/Creek-Vault/issues/2082)). |
 | `creek.revoice` | `text`, `register?`, `phase?` | Rewrite supplied text in the owner's voice, preserving meaning and claims without saving. Requires `vault:desk`. |
 | `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` / `creek.revoice` job handle to `{status, job_id, state, result?}`. |
 
@@ -324,6 +338,28 @@ Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
 All six mediums in `creek.author.SUPPORTED_MEDIUMS` (`research`,
 `research-piece`, `essay`, `chat`, `how-to`, `book-report`) are wired — any
 other `medium` returns `status: error` naming the wired set.
+
+**A failed run answers a fixed reason, never the exception's text
+([#2082](https://github.com/Geoffe-Ga/Creek-Vault/issues/2082)).** Any other
+desk failure — on the draft and the `dry_run` alike — answers `status: error`
+with one of two fixed `reason`s:
+
+- `LLM provider call failed for author` (`AUTHOR_PROVIDER_FAILED_REASON`) when
+  the voice provider's call failed: a vendor 4xx, an empty body, a dropped
+  connection, an unreachable Ollama endpoint (anything in
+  `creek.classify.llm.providers.PROVIDER_CALL_FAILURES`);
+- `writing desk failed for author` (`AUTHOR_DESK_FAILED_REASON`) for anything
+  else — a stale `CREEK_CONFIG`, a config pydantic rejects, unparseable YAML.
+
+Until #2082 the reason was `str(exc)`, so a vendor's own error message, an
+Ollama URL and a server config path all reached the client. The detail now
+rides only the traceback of one `ERROR` record on the `creek_mcp.tools.author`
+logger, whose message names the exception's type. Three residuals are
+deliberate, as on `creek.draft`: the unsupported-medium error above still
+names the wired set; the router's `IntimateRoutingError` keeps its own
+creek-written message (the configured provider and the remedy); and a writer's
+key its vendor refused answers the shared `REQUEST_KEY_REJECTED_REASON`
+(`the writer's request-scoped provider key was refused by its vendor`).
 
 **A condemned draft is refused, not returned ([#1353](https://github.com/Geoffe-Ga/Creek-Vault/issues/1353)).**
 When the Writing Desk's HARD privacy check raises a `privacy_compliance`
@@ -453,14 +489,14 @@ Jobs reuse the `/v1` durable job store (`creek_mcp/httpapi/jobs.py`, kinds
 | Tool                    | Inputs                                                      | Write-side tier rule                                              |
 |-------------------------|-------------------------------------------------------------|-------------------------------------------------------------------|
 | `creek.save`            | `target`, `body`, `title?`, `tier`, `provenance?`           | `tier` is **required** on every call and is never inferred from `provenance` or the source fragments; an omitted `tier` is refused outright (`status: refused`), not defaulted. Caller's `ceiling` must admit the supplied `tier` — intimate via open refused. |
-| `creek.ingest`          | `source_type`, `input_path`                                 | Default ingest tier is `personal`; `ceiling=open` is refused. **Never served to a gated remote agent** (#2006): refused before dispatch with `this tool is not served to a remote agent` — see [Opting an agent into journal and pipeline](#opting-an-agent-into-journal-and-pipeline-r3-5-2006). |
-| `creek.classify`        | `method` (`rules`\|`llm`), `force`, `retier`                | **Any ceiling permitted — and with `method="llm"` that is a whole-corpus prompt-channel egress** ([#1274](https://github.com/Geoffe-Ga/Creek-Vault/issues/1274)). Every fragment's **title and body** under `01-Fragments` is handed to the configured classification provider whatever ceiling was declared, `open` included (both are interpolated by `build_classification_prompt`, each capped at 8192 chars by `_sanitise_for_prompt`); the ceiling reaches only the audit line and the response envelope. The familiar justification — rewrites in place, no new tier produced — is about the response and the frontmatter, and it does not extend to this channel. The controls on that walk are `ModelRouter._enforce_local_for_intimate` (#647/#666), which redirects `intimate` to a local provider and leaves `personal` alone — the tier split is binary and made in the engine, so `personal` is never presented to the router at all — plus two **host-operator** gates (`has_cloud_consent`, `_assert_classifiers_available`) that answer "may this machine reach a cloud" rather than "may this caller, at this ceiling". Gating the walk on the ceiling is deliberately not done: `unclassified` ranks equal to `personal`, so refusing to classify above the ceiling would preserve an exposure rather than prevent one. See the Model-prompt row below and `read_gate._CLASSIFY_PROMPT_CHANNEL_RATIONALE`. `retier` re-derives an already-recorded privacy tier and persists it only when the new verdict is **stricter** (#1106), so it can tighten a tier a write verb's caller declared wrongly and can never loosen one (#1570). |
-| `creek.link`            | `method` (`embeddings`\|`temporal`\|`eddies`\|`threads`), `rebuild` | Links existing artefacts in place — any ceiling permitted. The method list is `creek.surface_modes.LINK_METHODS`, the same declaration `creek link` reads; until [#1252](https://github.com/Geoffe-Ga/Creek-Vault/issues/1252) this tool carried a retyped copy that had lost `threads`, putting the whole thread half of #880 out of an MCP caller's reach. The response also carries `largest_cluster_fragments`, `clusters_split` and `oversized_discarded` — the cluster-health counts `creek link` has always printed to its console (`creek.cli._format_cluster_stats`), while the MCP caller was told only `link_count` and so read a `status: ok` degenerate pass as a clean one ([#1372](https://github.com/Geoffe-Ga/Creek-Vault/issues/1372)). `oversized_discarded` in particular is data loss — those fragments carry no wiki-link at all. All three are plain ints on `LinkSummary`, a frozen dataclass of counts; none can ever name a fragment, so unlike the ingest advisories below they need no ceiling gate. |
-| `creek.report`          | `report_type` (all eleven of `creek.surface_modes.REPORT_TYPES`), `period` (`wavelength` only) | The accepted types are the CLI's, derived not retyped ([#1253](https://github.com/Geoffe-Ga/Creek-Vault/issues/1253)); this tool used to advertise six of eleven, so `unnamed`, `fingerprint`, `paradox`, `synchronicity` and `wavelength` read to a caller as though they were not report types at all. Reachable is not the same as served: the four generators behind `unnamed`, `fingerprint`, `paradox` and `synchronicity` accept no `PrivacyTierOverride`, so they are served **only at `ceiling=all`** — the ceiling `creek report` itself runs them under — and refused below it by name, naming the generator to widen. `wavelength` takes a `period` (`weekly`\|`monthly`\|`YYYY-Www`\|`YYYY-MM`) and shares `creek.generate.wavelength.generate_phase_map` with the CLI. Ceiling is enforced on the *inputs* of every filterable generator (#968): a note enters the artifact only if its raw front matter is within `ceiling`, and a missing `privacy_tier` fails closed to `intimate`. Consequence for `tags`: the Tag Garden scans five directories, and the four beyond `01-Fragments` hold note types with no `privacy_tier` field at all, so **a ceiling-filtered tag garden is fragment-derived only**. `tag-history.json` entries record the `tier_ceiling` they were taken under, and growth is only ever compared between entries at the same ceiling. |
+| `creek.ingest`          | `source_type`, `input_path`                                 | Default ingest tier is `personal`; `ceiling=open` is refused. After the tier, `source_type`, confinement and existence gates, the whole ingest runs inside the vault content-mutation lock ([#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079)); when another writer holds it past its 10-second bound (`DEFAULT_LOCK_TIMEOUT_SECONDS`) the call answers the content-free `vault content mutation busy` refusal (retry later), writes nothing, and leaves only the attempt row in the audit trail. A lock timeout raised *under* the hold (the writer's `.id-index.lock`) propagates rather than being reported as busy. **Never served to a gated remote agent** (#2006): refused before dispatch with `this tool is not served to a remote agent` — see [Opting an agent into journal and pipeline](#opting-an-agent-into-journal-and-pipeline-r3-5-2006). |
+| `creek.classify`        | `method` (`rules`\|`llm`), `force`, `retier`                | **Any ceiling permitted — and with `method="llm"` that is a whole-corpus prompt-channel egress** ([#1274](https://github.com/Geoffe-Ga/Creek-Vault/issues/1274)). Every fragment's **title and body** under `01-Fragments` is handed to the configured classification provider whatever ceiling was declared, `open` included (both are interpolated by `build_classification_prompt`, each capped at 8192 chars by `_sanitise_for_prompt`); the ceiling reaches only the audit line and the response envelope. The familiar justification — rewrites in place, no new tier produced — is about the response and the frontmatter, and it does not extend to this channel. The controls on that walk are `ModelRouter._enforce_local_for_intimate` (#647/#666), which redirects `intimate` to a local provider and leaves `personal` alone — the tier split is binary and made in the engine, so `personal` is never presented to the router at all — plus two **host-operator** gates (`has_cloud_consent`, `_assert_classifiers_available`) that answer "may this machine reach a cloud" rather than "may this caller, at this ceiling". Gating the walk on the ceiling is deliberately not done: `unclassified` ranks equal to `personal`, so refusing to classify above the ceiling would preserve an exposure rather than prevent one. See the Model-prompt row below and `read_gate._CLASSIFY_PROMPT_CHANNEL_RATIONALE`. `retier` re-derives an already-recorded privacy tier and persists it only when the new verdict is **stricter** (#1106), so it can tighten a tier a write verb's caller declared wrongly and can never loosen one (#1570). When the `llm` pass cannot reach its provider the call is refused with the fixed `LLM provider unavailable for classification` (also the `fallback_reason` of a managed vault's rules fallback); the engine's message — provider name and remediation — stays on the server's `creek_mcp.tools.classify` log record and the CLI's output, never in the response ([#2073](https://github.com/Geoffe-Ga/Creek-Vault/issues/2073)). |
+| `creek.link`            | `method` (`embeddings`\|`temporal`\|`eddies`\|`threads`), `rebuild` | Links existing artefacts in place — any ceiling permitted. The method list is `creek.surface_modes.LINK_METHODS`, the same declaration `creek link` reads; until [#1252](https://github.com/Geoffe-Ga/Creek-Vault/issues/1252) this tool carried a retyped copy that had lost `threads`, putting the whole thread half of #880 out of an MCP caller's reach. The response also carries `largest_cluster_fragments`, `clusters_split` and `oversized_discarded` — the cluster-health counts `creek link` has always printed to its console (`creek.cli._format_cluster_stats`), while the MCP caller was told only `link_count` and so read a `status: ok` degenerate pass as a clean one ([#1372](https://github.com/Geoffe-Ga/Creek-Vault/issues/1372)). `oversized_discarded` in particular is data loss — those fragments carry no wiki-link at all. All three are plain ints on `LinkSummary`, a frozen dataclass of counts; none can ever name a fragment, so unlike the ingest advisories below they need no ceiling gate. Two structured refusals come after the vault is read and before anything is written or audited: `vault content mutation busy` when another writer holds the vault content lock past its bound (retry later), and `embedding model unavailable` when the `embeddings`, `eddies` or `threads` stage cannot load its local model or a non-local route refuses a text. The latter is fixed and content-free: the engine's message — model name, cache directory, the loader's own error — stays on the server's `creek_mcp.tools.link` log record and is never returned, where it used to reach the client as FastMCP `isError` text ([#2065](https://github.com/Geoffe-Ga/Creek-Vault/issues/2065)). `temporal` loads no model. |
+| `creek.report`          | `report_type` (all eleven of `creek.surface_modes.REPORT_TYPES`), `period` (`wavelength` only) | The accepted types are the CLI's, derived not retyped ([#1253](https://github.com/Geoffe-Ga/Creek-Vault/issues/1253)); this tool used to advertise six of eleven, so `unnamed`, `fingerprint`, `paradox`, `synchronicity` and `wavelength` read to a caller as though they were not report types at all. Reachable is not the same as served: the four generators behind `unnamed`, `fingerprint`, `paradox` and `synchronicity` accept no `PrivacyTierOverride`, so they are served **only at `ceiling=all`** — the ceiling `creek report` itself runs them under — and refused below it by name, naming the generator to widen. `wavelength` takes a `period` (`weekly`\|`monthly`\|`YYYY-Www`\|`YYYY-MM`) and shares `creek.generate.wavelength.generate_phase_map` with the CLI. Ceiling is enforced on the *inputs* of every filterable generator (#968): a note enters the artifact only if its raw front matter is within `ceiling`, and a missing `privacy_tier` fails closed to `intimate`. Consequence for `tags`: the Tag Garden scans five directories, and the four beyond `01-Fragments` hold note types with no `privacy_tier` field at all, so **a ceiling-filtered tag garden is fragment-derived only**. `tag-history.json` entries record the `tier_ceiling` they were taken under, and growth is only ever compared between entries at the same ceiling. `unnamed` embeds the week's fragments before it writes, so when the local embedding model cannot load it answers the fixed `embedding model unavailable` refusal — no digest, no history record, no audit entry, and none of the engine's model or cache detail ([#2065](https://github.com/Geoffe-Ga/Creek-Vault/issues/2065)). `paradox` and `synchronicity` are **cache-only**: they score the parquet embeddings cache and never load the model, so they cannot reach that refusal. |
 | `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen. The ceiling is converted with `to_privacy_override` and threaded into `SkillTreeGenerator` as a **hard rank cutoff** (#971): an above-ceiling fragment is **omitted** from exemplar harvesting, never summarised, because a `[Personal-tier summary: <title>]` stub written into `## Exemplar Passages` would be a fabricated voice exemplar carrying the very title it claims to protect. **Thread and eddy skills are gated too, on a derived tier** ([#1284](https://github.com/Geoffe-Ga/Creek-Vault/issues/1284)): `Thread` and `Eddy` carry no `privacy_tier` field, but their titles, descriptions and member lists are computed from their member fragments, so each is ranked at the maximum tier of every fragment whose `threads`/`eddies` wikilinks name its title — equivalently, a thread or eddy skill is written only when **every fragment naming it** clears the ceiling. The reduction runs over the *unfiltered* corpus (an eddy with one `open` and one `intimate` member is `intimate`), empty evidence reduces to `intimate` (so an orphaned thread left behind by a partial `creek link` needs `ceiling=intimate`), `skill_count` no longer moves with above-ceiling thread/eddy cardinality, and an admitted eddy's rendered "Member threads" line lists only threads that were themselves admitted. That last detail matters on the response, not just on disk: a thread's slugified title *is* its filename, so those `skill_paths` entries were the one place this tool's envelope carried content. For the four fragment-derived categories it returns only a count and fixed skill names, so their evidence is the bytes under the untiered `<vault>/creek-skills`. `unclassified` ranks with `personal` (#876), so a vault that has never been through `creek classify` yields a complete tree whose `## Exemplar Passages` sections all carry the "no qualifying exemplars" placeholder at `ceiling=open`; a broader ceiling recovers them. `intimate` needs more than a ceiling: it additionally requires the Python-API `allow_intimate` consent opt-in, which this tool never passes, so intimate exemplars are unreachable over MCP at **every** ceiling, `all` included. |
 | `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Gates the *source* fragments' tier, not the compiled page's tier — a source above `ceiling` refuses the whole call (#848). Idempotent per FEAT-003; no-op re-runs do not log a duplicate. |
 | `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier`              | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key. `tier` is **required** on every call; an omitted `tier` is refused outright (`status: refused`), not defaulted ([#1494](https://github.com/Geoffe-Ga/Creek-Vault/issues/1494)). Two gates, in this order. (1) The *incoming* entry's tier is honored — a ceiling that would not admit it is refused, never downgraded. (2) An `external_id` that already maps to a fragment is an **update-in-place**, so the tier of the fragment it would destroy is ranked too: **you may only overwrite what you could have read** (#970). That second gate reads the fragment's *current* vault tier (not the caller's declared tier, not the staged copy's stamp) and refuses through the shared `read_gate.refuse_above_ceiling`, so the refusal names neither the fragment nor its tier. It sits **above** staging, so a refusal leaves the staged entry under `00-Creek-Meta/adepthood/journal/` untouched as well. Fail-closed rules: an `external_id` with no ledger record at all is a plain **creation** and still works at every ceiling; an `external_id` whose ledger record points at a fragment that no longer resolves ranks as `intimate` and is refused below `ceiling=intimate` — recovery is one re-send at a broader ceiling from a **local stdio** caller only (remote consumers cannot; see "INTIMATE is never reachable remotely" and the consequence spelled out under "Read-side posture" below), not a ledger hand-edit. The success response also carries `warnings` — the ingest run's content-free advisory channel ([#1372](https://github.com/Geoffe-Ga/Creek-Vault/issues/1372)). An advisory that crosses this boundary is content-free **by construction at the producer**: `run_ingest`'s internal `warn` closure requires every advisory it records to state a `ceiling_safe` rendering or `None`, and this tool's response is built only from `IngestRunResult.ceiling_safe_warnings` — the operator-facing `warnings`, which may name real vault fragment ids, is never echoed over MCP. `warnings` is an empty list, never omitted, when the run produced no advisory. |
-| `creek.upload`          | `filename`, `content_base64`, `external_id`, `timestamp?`, `tier` | Stages one Adepthood **document**'s base64 bytes then ledger-ingests them (#1023) — the `creek.journal` shape for things that are not text. The bytes are written verbatim, **flat**, under `00-Creek-Meta/adepthood/uploads/` at `safe_stem(external_id)` plus the sanitised suffix of `filename`; only that suffix is trusted, and only to pick an ingestor via `route_to_ingestor` — there is deliberately **no** `source_type` override, because the directory-only ingestors would discover nothing from a single file and report it as a silent success. `tier` is **required** on every call; an omitted `tier` is refused outright (`status: refused`), not defaulted ([#1494](https://github.com/Geoffe-Ga/Creek-Vault/issues/1494)). Four gates, in this order. (1) The *incoming* `tier` is checked by `write_tier_allowed` **before a single byte is decoded**, so an `intimate` upload at `ceiling=open` never materialises in memory. (2) A `MAX_UPLOAD_BYTES` (10 MiB) cap — encoded length first, then decoded length — before anything is written. (3) The same **you may only overwrite what you could have read** gate `creek.journal` uses (#970), on the *current vault tier* of the fragment the `external_id` already resolves to, refused through `read_gate.refuse_above_ceiling` so the refusal names neither fragment nor tier. (4) The unsupported-format gate ([#1526](https://github.com/Geoffe-Ga/Creek-Vault/issues/1526)): an extension `route_to_ingestor` refuses — a `.json` conversation export, a `.tar`/`.gz`/`.7z` archive, a legacy binary `.doc`/`.xls`/`.ppt` — is turned away with a remedy naming `creek ingest --type <chatgpt|claude|discord|substack> --input <export-dir>`, instead of routing to `generic` and filing the whole export as one undifferentiated blob. A `.zip` is the documented exception: the archive fork (#1525) claims it *above* this gate and unpacks it, so on this surface it is expanded rather than turned away, even though `route_to_ingestor` alone would refuse it. All four sit **above** staging, so a refusal leaves previously staged bytes untouched — and the refused export's bytes never reach the staging directory at all. The declared tier reaches a *binary* fragment only through `run_ingest(privacy_tier=...)` — no ingestor emits `privacy_tier` and a `.docx` has no frontmatter to carry one — and that channel is escalate-only and effectively **create-branch-only**: an update preserves the on-disk frontmatter, so a re-upload at a higher tier does not rewrite the persisted one. Ingest runs against the upload's own `00-Creek-Meta/State/ingest/upload.jsonl` ledger, which is what stamps `source.origin_key` on the fragment — and that key is what puts the staged bytes inside the RTBF purge sweep (see [Cleaning and purge](./cleaning-and-purge.md)); without it the sweep would silently no-op. An identical re-send is a true no-op (the staged bytes are compared and left alone, preserving mtime, which the fragment id is derived from). `generic` remains the right ingestor for genuinely plain-text-ish content under an extension nothing else claims (`.yaml`, `.log`, an extensionless `README`) — #1526 refuses *unrecognised structured* formats, it does not retire the fallback. A file that yields no fragment anyway — an unmapped binary extension — is an honest **refusal**, never `status: ok` with `written: 0`. **Staged upload bytes are NOT redacted before ingest**: the ingest pipeline offers no redaction hook and `creek redact --apply` would corrupt a `.docx`/`.xlsx` ZIP container, so the plaintext sits under the staging dir until purged — tracked in [#1228](https://github.com/Geoffe-Ga/Creek-Vault/issues/1228). The success response also carries `warnings` — the ingest run's content-free advisory channel, sourced from `IngestRunResult.ceiling_safe_warnings` and never from the operator-facing `warnings`, which may name real vault fragment ids and is never echoed over MCP ([#1372](https://github.com/Geoffe-Ga/Creek-Vault/issues/1372)). This is the surface that most needs it: the pre-#1305 collapsed-unit advisory reports actual data loss — a fragment written before #1305, when every sheet of a multi-sheet workbook shared one id and only the first reached disk — and it fires precisely on the multi-sheet-workbook path, which is this tool's path. |
+| `creek.upload`          | `filename`, `content_base64`, `external_id`, `timestamp?`, `tier` | Stages one Adepthood **document**'s base64 bytes then ledger-ingests them (#1023) — the `creek.journal` shape for things that are not text. The bytes are written verbatim, **flat**, under `00-Creek-Meta/adepthood/uploads/` at `safe_stem(external_id)` plus the sanitised suffix of `filename`; only that suffix is trusted, and only to pick an ingestor via `route_to_ingestor` — there is deliberately **no** `source_type` override, because the directory-only ingestors would discover nothing from a single file and report it as a silent success. `tier` is **required** on every call; an omitted `tier` is refused outright (`status: refused`), not defaulted ([#1494](https://github.com/Geoffe-Ga/Creek-Vault/issues/1494)). Four gates, in this order. (1) The *incoming* `tier` is checked by `write_tier_allowed` **before a single byte is decoded**, so an `intimate` upload at `ceiling=open` never materialises in memory. (2) A `MAX_UPLOAD_BYTES` (10 MiB) cap — encoded length first, then decoded length — before anything is written. (3) The same **you may only overwrite what you could have read** gate `creek.journal` uses (#970), on the *current vault tier* of the fragment the `external_id` already resolves to, refused through `read_gate.refuse_above_ceiling` so the refusal names neither fragment nor tier. (4) The unsupported-format gate ([#1526](https://github.com/Geoffe-Ga/Creek-Vault/issues/1526)): an extension `route_to_ingestor` refuses — a `.json` conversation export, a `.tar`/`.gz`/`.7z` archive, a legacy binary `.doc`/`.xls`/`.ppt` — is turned away with a remedy naming `creek ingest --type <chatgpt|claude|discord|substack> --input <export-dir>`, instead of routing to `generic` and filing the whole export as one undifferentiated blob. A `.zip` is the documented exception: the archive fork (#1525) claims it *above* this gate and unpacks it, so on this surface it is expanded rather than turned away, even though `route_to_ingestor` alone would refuse it. All four sit **above** staging, so a refusal leaves previously staged bytes untouched — and the refused export's bytes never reach the staging directory at all. Since [#2069](https://github.com/Geoffe-Ga/Creek-Vault/issues/2069) everything from gate (3) through the ingest — the #970 tier read, the extension-conflict check, the archive fork, gate (4), staging, the ingest, the discard of bytes that produced nothing, and the success audit — runs inside **one** hold of the vault content-mutation lock, the lock `creek classify` escalates tiers under, so a concurrent escalation cannot land between the #970 admission and the overwrite it admitted. When another writer holds that lock past its 10-second bound the call answers `vault content mutation busy` (retry later): **not audited**, and nothing is staged or ingested. Only a timeout *acquiring* that lock is reported that way; a timeout raised under the hold, after staging, propagates as it always did rather than claiming nothing was written. The declared tier reaches a *binary* fragment only through `run_ingest(privacy_tier=...)` — no ingestor emits `privacy_tier` and a `.docx` has no frontmatter to carry one — and that channel is escalate-only and effectively **create-branch-only**: an update preserves the on-disk frontmatter, so a re-upload at a higher tier does not rewrite the persisted one. Ingest runs against the upload's own `00-Creek-Meta/State/ingest/upload.jsonl` ledger, which is what stamps `source.origin_key` on the fragment — and that key is what puts the staged bytes inside the RTBF purge sweep (see [Cleaning and purge](./cleaning-and-purge.md)); without it the sweep would silently no-op. An identical re-send is a true no-op (the staged bytes are compared and left alone, preserving mtime, which the fragment id is derived from). `generic` remains the right ingestor for genuinely plain-text-ish content under an extension nothing else claims (`.yaml`, `.log`, an extensionless `README`) — #1526 refuses *unrecognised structured* formats, it does not retire the fallback. A file that yields no fragment anyway — an unmapped binary extension — is an honest **refusal**, never `status: ok` with `written: 0`. **Staged upload bytes are NOT redacted before ingest**: the ingest pipeline offers no redaction hook and `creek redact --apply` would corrupt a `.docx`/`.xlsx` ZIP container, so the plaintext sits under the staging dir until purged — tracked in [#1228](https://github.com/Geoffe-Ga/Creek-Vault/issues/1228). The success response also carries `warnings` — the ingest run's content-free advisory channel, sourced from `IngestRunResult.ceiling_safe_warnings` and never from the operator-facing `warnings`, which may name real vault fragment ids and is never echoed over MCP ([#1372](https://github.com/Geoffe-Ga/Creek-Vault/issues/1372)). This is the surface that most needs it: the pre-#1305 collapsed-unit advisory reports actual data loss — a fragment written before #1305, when every sheet of a multi-sheet workbook shared one id and only the first reached disk — and it fires precisely on the multi-sheet-workbook path, which is this tool's path. |
 
 ### Purge tools (FEAT-012, elevated authorization required)
 
@@ -555,6 +591,72 @@ source fragment's tier exceeds `ceiling`, the whole call is refused
 before the compile LLM is invoked or the page is written — so an
 intimate fragment can never be laundered into an open-tier compiled
 page. The refusal is audited but names no fragment ids and no tiers.
+
+Since #930 that admission is decided inside the content-mutation lock,
+from the same single `01-Fragments` load that is then compiled: the
+engine evaluates the source-tier gate (ancestry included, #931) on the
+records it walked, before it resolves ids or builds an LLM client. The
+decision is therefore serialised against `creek classify` and the
+`creek.classify` MCP tool, which take the same lock, and an admitted
+compile parses the corpus once rather than twice. Hand edits in a text
+editor are not coordinated by the lock, but they can no longer split
+admission from content — a write after the load is simply not part of
+that compile. Under lock contention the call returns the content-free
+`vault content mutation busy` refusal instead, which is not audited, and
+a refused call now leaves the zero-byte
+`00-Creek-Meta/locks/content-mutations.lock` behind (it holds no vault
+content).
+
+The same rule now holds for the two other tools that gated on a tier and
+acted outside the lock. `creek.classify.entry` takes its one gate-and-answer
+snapshot inside it ([#2068](https://github.com/Geoffe-Ga/Creek-Vault/issues/2068)),
+and `creek.upload` holds it from the #970 overwrite gate through the ingest
+([#2069](https://github.com/Geoffe-Ga/Creek-Vault/issues/2069)). Both answer
+`vault content mutation busy` under contention; `upload`'s is unaudited and
+stages nothing, while `classify.entry`'s follows its audit-every-attempt rule.
+
+Ingest joined the boundary in
+[#2079](https://github.com/Geoffe-Ga/Creek-Vault/issues/2079): `creek ingest`,
+the `creek sync` Tier-A ingest, the `creek.ingest` tool and the ingest phase of
+a Drive sync each hold the lock across their whole `run_ingest` call, so
+`creek classify` and `creek link` never load a `01-Fragments` snapshot an
+ingest is still writing. The lock is taken at those surfaces and never inside
+`run_ingest`, because `creek.upload` and `creek.journal` already call it while
+holding the lock and it is not reentrant. Each waits at most 10 seconds
+(`DEFAULT_LOCK_TIMEOUT_SECONDS`) before answering `vault content mutation busy`;
+`creek.ingest`'s refusal comes after every gate and audits only the attempt
+row. A Drive sync takes the lock *inside* its own `gdrive.lock` and only around
+the ingest, never around the network download — the order is always connector
+first, content second. A long ingest holds the lock for its whole run, so remote
+journal, upload, classify and link calls answer `vault content mutation busy`
+(503 over `/v1`) during that window.
+
+The classify, link and compile engines take the lock through the same
+`hold_content_mutation` since
+[#2087](https://github.com/Geoffe-Ga/Creek-Vault/issues/2087), so losing the
+acquisition race raises `ContentMutationBusyError` rather than a bare
+`VaultLockTimeoutError`. `creek.classify`, `creek.link` and `creek.compile`
+catch both types and answer the same fixed `vault content mutation busy`
+refusal, so their responses, the durable-job `busy` failure code and the 503
+over `/v1` are unchanged. Keeping the bare-timeout arm is deliberate: a lock
+timeout raised *under* an engine's hold still reads busy on these three tools,
+as it always has, rather than escaping as a FastMCP error.
+
+The five `creek.purge.*` tools joined in
+[#2086](https://github.com/Geoffe-Ga/Creek-Vault/issues/2086): each runs its
+`PurgeEngine` call — and only that call — inside `hold_content_mutation`, so a
+purge cannot delete a fragment between a `creek.classify` pass's load and its
+write. Losing the acquisition race is the fixed
+`vault content mutation busy` refusal and, unlike `creek.upload`'s, it **is
+audited**: these tools promise an audit row for every call. Only the
+acquisition timeout reads busy here — a `VaultLockTimeoutError` raised under
+the hold keeps its `purge engine failed: …` reason, because by then the purge
+may already have deleted files. `PurgeEngine` itself stays lock-free, since
+the `/v1` journal withdraw calls it while already holding the lock. The same
+release also put the CLI-only `01-Fragments` writers inside the boundary —
+`creek purge`, `creek process` stages 2-4, the `creek ingest` vault
+migrations and every Discord ingest path; see
+[Concurrent writers](ingestion.md#concurrent-writers).
 
 ### Read-side posture (#932)
 
@@ -957,7 +1059,7 @@ What a granted agent gets from each tool, as pinned by
 |---|---|---|
 | `creek.journal` | `vault:journal` | Served. Files an entry at the `tier` it names, which may not exceed `personal`. |
 | `creek.upload` | `vault:journal` | Served. Stages a document and ingests it. This is how a remote agent puts a source into the vault. |
-| `creek.classify` | `vault:pipeline` | Served. `method="rules"` runs in the vault. `method="llm"` uses the vault's model; a managed vault never reaches a cloud vendor, and the call is refused with the provider's reason when no local model is available. |
+| `creek.classify` | `vault:pipeline` | Served. `method="rules"` runs in the vault. `method="llm"` uses the vault's model; a managed vault never reaches a cloud vendor, and the call is refused with the fixed `LLM provider unavailable for classification` when no local model is available — the detail stays in the server log, and the `/v1` job fails closed as `internal_error` ([#2073](https://github.com/Geoffe-Ga/Creek-Vault/issues/2073)). |
 | `creek.link` | `vault:pipeline` | Served. `method="temporal"` runs in the vault; `embeddings` (the default) uses the vault's own embedding backend. |
 | `creek.compile` | `vault:pipeline` | Served. Its own source-tier gate refuses an id above the agent's ceiling, so an intimate fragment never reaches the summary. |
 | `creek.report` | `vault:pipeline` | Served, at the agent's ceiling. |
@@ -1967,12 +2069,17 @@ that update artefacts **in place** (`creek.classify`, `creek.link`) do
 not produce new files, so they omit `created_path` and `created_tier`
 from their audit entry.
 
-Journal upsert/withdrawal, classification, linking, compilation, and the
-write step of manual review share one cross-process vault-content mutation
-boundary. This closes stale load-to-write races: a pipeline pass cannot load a
+Journal upsert/withdrawal, document upload (#2069), classification (and the
+per-entry classification read, #2068), linking, compilation, ingest (#2079),
+purge (#2086), and the write step of manual review share one cross-process
+vault-content mutation boundary. This closes stale load-to-write races: a pipeline pass cannot load a
 journal fragment, let withdrawal report success, and then recreate the removed
 fragment or a derived page. A pass that cannot take the boundary within the
 bounded lock wait returns the ordinary structured refusal and is safe to retry.
+Inside the engines that wait is `hold_content_mutation`, whose acquisition
+timeout is `ContentMutationBusyError` (#2087); manual review keeps its raw
+acquisition, so a busy save is recorded on the review's error list instead of
+ending the session.
 
 For tools that accept a `body` argument (`creek.save`), the audit entry
 records `body_len` rather than `body` — on both the success and the

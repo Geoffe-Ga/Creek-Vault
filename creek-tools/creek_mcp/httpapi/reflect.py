@@ -62,12 +62,15 @@ from creek_mcp.httpapi.generation import (
     generate_off_loop,
     served_error_code,
     serves_provenance,
+    serves_request_key_rejected,
 )
 from creek_mcp.httpapi.vault import configured_vault, request_key_of
 from creek_mcp.provenance import InferenceProvenance
 from creek_mcp.tools.reflect import (
     PROMPT_TOO_LONG_REASON,
     RATE_LIMITED_REASON,
+    REQUEST_KEY_REJECTED_REASON,
+    build_reflect_seams,
     reflect_tool,
 )
 
@@ -128,6 +131,7 @@ _PUBLISHED_REASONS: Final[frozenset[str]] = frozenset(
         _NO_CONTENT_REASON,
         PROMPT_TOO_LONG_REASON,
         RATE_LIMITED_REASON,
+        REQUEST_KEY_REJECTED_REASON,
     }
 )
 """The tool's constant refusal reasons, safe to log verbatim."""
@@ -180,6 +184,11 @@ def reflect_refusal_code(reason: str) -> ErrorCode:
     :func:`~creek_mcp.httpapi.generation.served_error_code`, since its
     vendored vocabulary cannot name the former.
 
+    A request key its vendor refused is ``request_key_rejected`` rather than
+    the ``temporarily_unavailable`` every other provider failure earns,
+    because no amount of waiting clears it; a caller below contract 0.28 is
+    downgraded to the latter by the same shared function.
+
     Args:
         reason: The ``reason`` field of a structured tool refusal.
 
@@ -195,6 +204,8 @@ def reflect_refusal_code(reason: str) -> ErrorCode:
         return ErrorCode.INVALID_REQUEST
     if reason == RATE_LIMITED_REASON:
         return ErrorCode.RATE_LIMITED
+    if reason == REQUEST_KEY_REJECTED_REASON:
+        return ErrorCode.REQUEST_KEY_REJECTED
     if reason.startswith(_UNAVAILABLE_PREFIX):
         return ErrorCode.TEMPORARILY_UNAVAILABLE
     return ErrorCode.INTERNAL_ERROR
@@ -343,27 +354,26 @@ def _reflect(
             then omitted rather than guessed.
 
     Returns:
-        The tool's return dict, a synthetic refusal when the factory itself
-        could not be built, or ``None`` when there is no readable vault to
-        reflect against, which the caller renders as the ``unavailable``
-        refusal.
+        The tool's return dict; the
+        :func:`~creek_mcp.tools.reflect.build_reflect_seams` refusal when the
+        factory or the grounding route could not be built — a vault config
+        YAML cannot parse included, which once escaped as a ``500`` (#2091);
+        or ``None`` when there is no readable vault to reflect against, which
+        the caller renders as the ``unavailable`` refusal.
     """
     vault = configured_vault(request)
     if vault is None:
         return None
-    try:
-        factory = (
-            build_factory
-            or partial(_default_llm_factory, vault, request_key, provenance)
-        )()
-        grounding_route = (
-            None if build_factory is not None else _grounding_route(vault, request_key)
-        )
-    except (RuntimeError, OSError, ValueError) as exc:
-        return {
-            "status": "refused",
-            "reason": f"{_UNAVAILABLE_PREFIX}{type(exc).__name__}",
-        }
+    seams = build_reflect_seams(
+        build_factory or partial(_default_llm_factory, vault, request_key, provenance),
+        None
+        if build_factory is not None
+        else partial(_grounding_route, vault, request_key),
+        ceiling=context.ceiling,
+    )
+    if isinstance(seams, dict):
+        return seams
+    factory, grounding_route = seams
     return reflect_tool(
         vault_path=vault,
         llm_factory=factory,
@@ -541,6 +551,7 @@ def _render(
     serve_related: bool,
     provenance: InferenceProvenance,
     serve_provenance: bool,
+    serve_request_key_rejected: bool,
     request_key: str,
 ) -> Response:
     """Project the tool's result onto the published response, or a refusal.
@@ -553,6 +564,8 @@ def _render(
         provenance: The request's recorder, holding the route that answered.
         serve_provenance: Whether the caller declared a minor that can
             describe ``inference_source`` and name ``rate_limited``.
+        serve_request_key_rejected: Whether the caller declared a minor that
+            can name ``request_key_rejected``.
         request_key: The request key's provider, or :data:`_NO_REQUEST_KEY`,
             for the refusal log.
 
@@ -572,7 +585,11 @@ def _render(
     reason = str(result.get("reason", ""))
     code = reflect_refusal_code(reason)
     return _refused(
-        served_error_code(code, serve_rate_limited=serve_provenance),
+        served_error_code(
+            code,
+            serve_rate_limited=serve_provenance,
+            serve_request_key_rejected=serve_request_key_rejected,
+        ),
         context,
         cause=refusal_cause(reason),
         request_key=request_key,
@@ -640,5 +657,6 @@ async def handle_reflection(request: Request) -> Response:
         serve_related=_serves_related(request),
         provenance=provenance,
         serve_provenance=serves_provenance(request),
+        serve_request_key_rejected=serves_request_key_rejected(request),
         request_key=key_provider,
     )

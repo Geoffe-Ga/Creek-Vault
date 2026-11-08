@@ -767,24 +767,6 @@ def test_a_managed_reflection_without_a_key_is_still_unavailable(
     assert vendor.requests == []
 
 
-def test_a_rejected_key_is_unavailable_and_never_echoed(
-    tmp_path: Path,
-    managed: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    every_log: pytest.LogCaptureFixture,
-) -> None:
-    """A vendor 401 quoting the key surfaces as the fixed refusal only."""
-    _Vendor(monkeypatch, status=HTTP_UNAUTHORIZED)
-
-    with _client(managed) as http:
-        response = http.post(
-            REFLECTIONS_PATH, json={"content": ENTRY}, headers=_key_headers()
-        )
-
-    assert response.status_code == HTTP_SERVICE_UNAVAILABLE
-    _assert_canary_absent(tmp_path, every_log, response)
-
-
 @pytest.mark.parametrize(
     ("method", "path", "body"),
     [
@@ -1262,3 +1244,18 @@ def test_a_caller_below_the_failure_code_minor_is_not_shown_it(
 
     assert polled.json()["state"] == "failed"
     assert "failure_code" not in polled.json()
+
+
+def test_a_rejected_key_is_still_named_to_a_caller_before_busy(
+    managed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``request_key_rejected`` is served at ``0.28``, not re-gated with ``busy``.
+
+    Contract 0.29 adds ``busy`` (#2075) and withholds it below its own minor;
+    the code ``0.26`` published must keep being served to every caller from
+    ``0.26`` on, or a ``0.28`` writer stops being told to replace its key.
+    """
+    _, polled, _ = _rejected_job(managed, monkeypatch, minor="0.28")
+
+    assert polled.json()["state"] == "failed"
+    assert polled.json()["failure_code"] == "request_key_rejected"

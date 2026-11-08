@@ -44,7 +44,7 @@ _NEEDS_RESULT_RE = re.compile(r"needs\.([A-Za-z0-9_-]+)\.result")
 _REQUIRED_GATES: dict[str, str] = {
     r"ruff check \.": "ruff lint",
     r"ruff format --check": "ruff format check",
-    r"interrogate ": "docstring coverage",
+    r"lint-interrogate\.sh": "docstring coverage",
     r"lint-tryceratops\.sh": "tryceratops exception hygiene",
     r"bandit -r creek/ creek_mcp/ -ll": "bandit medium-severity gate",
     r"lint-refurb\.sh": "refurb modernisation gate",

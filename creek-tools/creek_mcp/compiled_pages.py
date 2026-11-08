@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime
+from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from creek.models import PraxisStatus, PraxisType
@@ -499,7 +500,7 @@ def _select_praxis(
         if not _provenance_admitted(page.derived_from, corpus, ceiling):
             continue
         ranked.append((-overlap, page.title, page))
-    ranked.sort(key=lambda row: (row[0], row[1]))
+    ranked.sort(key=itemgetter(0, 1))
     return [
         {
             "title": page.title,

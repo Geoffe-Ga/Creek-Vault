@@ -210,11 +210,10 @@ from enum import Enum
 from functools import partial
 from itertools import islice
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import frontmatter
 
-from creek._fslock import vault_lock
 from creek.classify.audience import AudienceClassifier
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
@@ -254,7 +253,7 @@ from creek.classify.weighted import classify_weighted
 from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
 from creek.time import now_la
-from creek.vault.mutations import content_mutation_lock_path
+from creek.vault.mutations import hold_content_mutation
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, try_load_fragment
 from creek.vault.writer import VaultWriter
 
@@ -322,6 +321,24 @@ class LLMProviderUnavailableError(RuntimeError):
         super().__init__(
             f"LLM provider {provider!r} is unavailable: {detail}",
         )
+
+
+LLM_PROVIDER_UNAVAILABLE_REASON: Final[str] = (
+    "LLM provider unavailable for classification"
+)
+"""What an MCP or ``/v1`` caller is told for :class:`LLMProviderUnavailableError`.
+
+The exception's own message is written for the CLI operator: it names the
+configured provider and the environment variable or config key to fix. That is
+remediation, not something a remote client may be handed (#2073), so
+``creek.classify`` answers this instead — as its refusal ``reason`` and as a
+rules fallback's ``fallback_reason`` — and keeps the detail on the traceback of
+its operator log record. The CLI still prints the full message. Deliberately
+unmapped by :func:`creek_mcp.httpapi.pipeline.pipeline_refusal_code`, so a
+``/v1`` job still fails closed to ``internal_error``. It lives beside the
+exception, as :data:`creek.link.embeddings.EMBEDDING_MODEL_UNAVAILABLE_REASON`
+lives beside its own, so no tool module has to import another (#1772).
+"""
 
 
 class ClassifyOutcome(Enum):
@@ -695,12 +712,15 @@ def run_classify(
         A :class:`ClassifySummary` reporting per-method counts.
 
     Raises:
-        creek._fslock.VaultLockTimeoutError: When another content mutation
-            holds the shared boundary past its bounded wait.
+        creek.vault.mutations.ContentMutationBusyError: When another content
+            mutation held the shared boundary past its bounded wait, so the
+            pass never started (#2087). A
+            :class:`~creek._fslock.VaultLockTimeoutError` raised *under* the
+            hold — by a lock taken while working — propagates as itself.
         LLMProviderUnavailableError: When the requested provider is
             unavailable.
     """
-    with vault_lock(content_mutation_lock_path(vault_path)):
+    with hold_content_mutation(vault_path):
         return _run_classify_with_content_lock_held(
             vault_path=vault_path,
             config=config,

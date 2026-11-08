@@ -377,7 +377,7 @@ _DOSAGE_TOXIC: dict[Frequency, list[str]] = {
     ],
     Frequency.F9: [
         "Worldly Desire",
-        "Bliss Addiction",
+        "Transmission Fixation",
         "Agitation Due to Worry or Remorse",
         "Doubt",
         "Aversion",

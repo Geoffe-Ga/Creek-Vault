@@ -111,17 +111,18 @@ repos:
     types: [python]
     pass_filenames: false
     files: ^creek-tools/(creek|creek_mcp|tests|scripts)/
-  # These three scanners deliberately still gate creek/ alone. #965 owns the
-  # ordered cleanup and widening into creek_mcp/; until then pre-commit must
-  # ask the same question as their canonical scripts instead of surprising a
-  # staged creek_mcp/ or tests/ change with out-of-scope backlog (#1759).
+  # Each scanner hook triggers on exactly the trees its canonical script
+  # scans, so pre-commit asks the same question as check-all.sh and CI
+  # instead of surprising a staged change with out-of-scope backlog (#1759).
+  # refurb and interrogate cover creek_mcp/ since #965; tryceratops alone
+  # still gates creek/ only, until #965's remaining creek_mcp backlog is fixed.
   - id: refurb
     name: refurb (canonical scope)
     entry: creek-tools/scripts/lint-refurb.sh
     language: system
     types: [python]
     pass_filenames: false
-    files: ^creek-tools/creek/
+    files: ^creek-tools/(creek|creek_mcp)/
   - id: tryceratops
     name: tryceratops (canonical scope)
     entry: creek-tools/scripts/lint-tryceratops.sh
@@ -135,7 +136,7 @@ repos:
     language: system
     types: [python]
     pass_filenames: false
-    files: ^creek-tools/creek/
+    files: ^creek-tools/(creek|creek_mcp)/
   - id: vulture
     name: vulture (dead code, per-type confidence floors)
     entry: creek-tools/scripts/lint-vulture.sh

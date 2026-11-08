@@ -1,0 +1,68 @@
+# Schemathesis configuration for scripts/dast-contract-fuzz.sh.
+#
+# Each block below teaches the server-error check that ONE operation's published
+# 503 is part of its wire on the throwaway DAST instance. Everything else about
+# the operation is still fuzzed and every other check still runs, and a 500 on
+# any of them still fails the gate: tests/test_dast_contract_fuzz_script.py
+# asserts every block names a published operation and allows 503 and nothing
+# else from the 5xx range, and caps how many blocks there may be.
+#
+# A 503 may be allowed here only when docs/api.md publishes it as the route's
+# deliberate refusal for a condition the throwaway instance cannot satisfy. A
+# 503 that is not a documented refusal is a finding, not an entry.
+
+# Anti-enumeration by design: an unknown job id and another consumer's job id
+# both receive the same 503 unavailable (docs/api.md, GET /v1/jobs/{job_id}).
+# The fuzzer can only ever generate ids this instance never issued.
+[[operations]]
+include-name = "GET /v1/jobs/{job_id}"
+
+[operations.checks.not_a_server_error]
+expected-statuses = ["2xx", "3xx", "4xx", "503"]
+
+# Drive is never authorised on the throwaway instance (no `creek gdrive
+# --download` has run, and no Google OAuth client is configured), which
+# creek_mcp/httpapi/drive.py publishes as 503 unavailable: a refusal that needs
+# a human on the host.
+[[operations]]
+include-name = "POST /v1/connectors/drive/syncs"
+
+[operations.checks.not_a_server_error]
+expected-statuses = ["2xx", "3xx", "4xx", "503"]
+
+[[operations]]
+include-name = "POST /v1/connectors/drive/authorizations/{state}"
+
+[operations.checks.not_a_server_error]
+expected-statuses = ["2xx", "3xx", "4xx", "503"]
+
+# No model provider is reachable from the throwaway instance, and a generation
+# route publishes that as 503 temporarily_unavailable
+# (creek_mcp/httpapi/generation.py) rather than fabricating prose.
+[[operations]]
+include-name = "POST /v1/reflections"
+
+[operations.checks.not_a_server_error]
+expected-statuses = ["2xx", "3xx", "4xx", "503"]
+
+[[operations]]
+include-name = "POST /v1/letters/{external_id}"
+
+[operations.checks.not_a_server_error]
+expected-statuses = ["2xx", "3xx", "4xx", "503"]
+
+[[operations]]
+include-name = "POST /v1/reading-recommendations"
+
+[operations.checks.not_a_server_error]
+expected-statuses = ["2xx", "3xx", "4xx", "503"]
+
+# The fuzzed POST /v1/uploads seeds fragments, and the throwaway instance has no
+# reachable embedding model (no `embeddings` extra, and no download). docs/api.md
+# publishes that as POST /v1/links's 503 unavailable for eddies/threads: only an
+# operator can install the extra or populate the cache (#2060).
+[[operations]]
+include-name = "POST /v1/links"
+
+[operations.checks.not_a_server_error]
+expected-statuses = ["2xx", "3xx", "4xx", "503"]

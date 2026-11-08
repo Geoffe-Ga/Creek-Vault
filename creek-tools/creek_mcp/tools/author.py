@@ -11,10 +11,23 @@ three content keys (#1353). Returning a ``privacy_compliance`` finding
 *alongside* the protected text it just caught hands the caller the very breach
 the gate detected; the finding travels, the corpus does not. Existing MCP verbs
 are untouched.
+
+A desk failure answers ``status: "error"`` with a **fixed** reason, never the
+exception's text (#2082): :data:`AUTHOR_PROVIDER_FAILED_REASON` for a failed
+provider call and :data:`AUTHOR_DESK_FAILED_REASON` for anything else. That
+text used to be the reason, so a vendor's 4xx message, an Ollama URL and a
+server config path all reached the client. The detail now rides only the
+traceback of one operator log record. Three residuals are deliberate, as in
+``creek.draft``: an unsupported medium echoes its own message (it names the
+supported media), the router's
+:class:`~creek.classify.llm.router.IntimateRoutingError` keeps its
+creek-written text, and a writer's refused key answers the shared
+:data:`~creek.classify.llm.providers.REQUEST_KEY_REJECTED_REASON`.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
@@ -22,6 +35,12 @@ import frontmatter
 
 from creek.author import plan_author, require_supported_medium, run_author
 from creek.author.models import ZERO_EVIDENCE_WARNING, has_zero_evidence
+from creek.classify.llm.providers import (
+    PROVIDER_CALL_FAILURES,
+    REQUEST_KEY_REJECTED_REASON,
+    RequestKeyRejectedError,
+)
+from creek.classify.llm.router import IntimateRoutingError
 from creek.generate.drafts import INFERENCE_SOURCE_FRONTMATTER_KEY, reserve_draft_path
 from creek.progress import CompositionStage, StageCallback, ignore_stage
 from creek_mcp.audit import MCPAuditLog
@@ -37,6 +56,31 @@ if TYPE_CHECKING:
     from creek_mcp.provenance import InferenceProvenance
 
 TOOL_NAME = "creek.author"
+
+logger = logging.getLogger(__name__)
+
+AUTHOR_PROVIDER_FAILED_REASON: Final[str] = "LLM provider call failed for author"
+"""The fixed ``reason`` when the desk's provider call failed (#2082).
+
+Answered for anything in
+:data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` other than the two
+residuals the module docstring names: a vendor 4xx, an empty body, a dropped
+connection, an unreachable Ollama endpoint. The vendor's own message — which
+:func:`creek.classify.llm.providers._error_detail` forwards for a 4xx — and an
+Ollama URL ride only the operator log's traceback. The sibling of
+:data:`creek_mcp.tools.draft.DRAFT_PROVIDER_FAILED_REASON`, worded alike.
+"""
+
+AUTHOR_DESK_FAILED_REASON: Final[str] = "writing desk failed for author"
+"""The fixed ``reason`` for any other desk failure (#2082).
+
+A stale ``CREEK_CONFIG`` (whose ``FileNotFoundError`` names a server path), a
+config pydantic rejects, unparseable YAML (whose message names the file and
+quotes it), a missing contract: none of it is the caller's to read, and all of
+it reaches the operator log's traceback instead. Distinct from
+:data:`AUTHOR_PROVIDER_FAILED_REASON` so a caller can tell "retry later" from
+"the vault needs its operator".
+"""
 
 AUTHOR_STAGES: Final[tuple[CompositionStage, ...]] = (
     CompositionStage.SOURCES,
@@ -165,12 +209,11 @@ def _privacy_refusal_response(
         The canonical refusal keys plus this verb's own non-content metadata and
         the privacy findings.
     """
-    return {
-        **refusal_response(
-            tool=TOOL_NAME,
-            ceiling=tier_ceiling,
-            reason=_PRIVACY_REFUSAL_REASON.format(count=len(leaks)),
-        ),
+    return refusal_response(
+        tool=TOOL_NAME,
+        ceiling=tier_ceiling,
+        reason=_PRIVACY_REFUSAL_REASON.format(count=len(leaks)),
+    ) | {
         # "refused" with "enforced: True" is not a contradiction. This flag is a
         # claim about the #660 retrieval filter, which ran and did its job: at
         # ceiling=all the caller *is* admitted to intimate content, so no
@@ -318,7 +361,9 @@ def author_tool(
         the desk's privacy check condemned yields ``status: refused`` instead,
         carrying the ``privacy_findings`` but none of the three content keys
         (#1353); see :func:`_draft_response`. An unsupported medium, or any
-        desk failure, yields ``status: error`` with a ``reason``.
+        desk failure, yields ``status: error`` with a ``reason``: the medium's
+        own message, or the fixed reason :func:`_desk_failure_reason` picks —
+        never a desk exception's text (#2082).
     """
     # #660: the ceiling is enforced — converted to a PrivacyTierOverride below
     # and threaded into the specialists, which exclude above-ceiling fragments
@@ -344,7 +389,8 @@ def author_tool(
     # Any desk failure (bad config, provider error, missing contract, a
     # downstream validation error, ...) must surface as a structured envelope,
     # never an unhandled exception across the MCP boundary. This mirrors the
-    # broad boundary catch the other MCP write tools use (e.g. purge).
+    # broad boundary catch the other MCP write tools use (e.g. purge), but
+    # answers a fixed reason rather than the exception's text (#2082).
     # #660: enforce the ceiling by converting it to the core privacy override
     # threaded into the specialists.
     override = to_privacy_override(privacy_tier_ceiling)
@@ -381,14 +427,46 @@ def author_tool(
             on_stage=on_stage,
         )
     except Exception as exc:
+        # Type name in the message; the text — a vendor message, a URL, a
+        # server path — rides only the traceback, passed explicitly (#2082).
+        logger.exception("author failed: %s", type(exc).__name__, exc_info=exc)
         return _error_response(
-            str(exc), tier_ceiling=privacy_tier_ceiling, dry_run=dry_run
+            _desk_failure_reason(exc),
+            tier_ceiling=privacy_tier_ceiling,
+            dry_run=dry_run,
         )
     response = _draft_response(draft, tier_ceiling=privacy_tier_ceiling)
     source = None if provenance is None else provenance.source
     if response["status"] == "ok" and source is not None:
         response[INFERENCE_SOURCE_FRONTMATTER_KEY] = source
     return response
+
+
+def _desk_failure_reason(exc: Exception) -> str:
+    """Return the ``reason`` a failed desk run answers (#2082).
+
+    The sibling of :func:`creek_mcp.tools.draft._provider_reason`, re-stated
+    rather than imported so no tool imports another (#1772).
+
+    Args:
+        exc: What ``run_author`` or ``plan_author`` raised.
+
+    Returns:
+        The router's own message for
+        :class:`~creek.classify.llm.router.IntimateRoutingError` — the residual
+        the module docstring documents, deliberately not widened —
+        :data:`~creek.classify.llm.providers.REQUEST_KEY_REJECTED_REASON` for a
+        writer's key its vendor refused, :data:`AUTHOR_PROVIDER_FAILED_REASON`
+        for any other provider failure, and :data:`AUTHOR_DESK_FAILED_REASON`
+        for everything else.
+    """
+    if isinstance(exc, IntimateRoutingError):
+        return str(exc)
+    if isinstance(exc, RequestKeyRejectedError):
+        return REQUEST_KEY_REJECTED_REASON
+    if isinstance(exc, PROVIDER_CALL_FAILURES):
+        return AUTHOR_PROVIDER_FAILED_REASON
+    return AUTHOR_DESK_FAILED_REASON
 
 
 def save_authored_draft(vault_path: Path, response: dict[str, Any]) -> Path:

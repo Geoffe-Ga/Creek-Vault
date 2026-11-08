@@ -21,7 +21,10 @@ from pydantic import ValidationError
 
 from creek.care.guardrail import CARE_POLICY, acute_distress_guard
 from creek.classify.llm.pool_boundary import current_pool_scope, pool_prompt_within_cap
-from creek.classify.llm.providers import ProviderRateLimitError
+from creek.classify.llm.providers import (
+    PROVIDER_CALL_FAILURES,
+    ProviderRateLimitError,
+)
 from creek.models import PrivacyTier
 from creek_mcp.api.reading_recommendations import (
     ReadingRecommendation,
@@ -40,6 +43,19 @@ MAX_OUTPUT_TOKENS: Final = 512
 CACHE_TTL_SECONDS: Final = 600
 MAX_CACHE_ENTRIES: Final = 128
 PROMPT_VERSION: Final = "reading-recommendation-1"
+
+_UNAVAILABLE_FAILURES: Final[tuple[type[Exception], ...]] = (
+    *PROVIDER_CALL_FAILURES,
+    OSError,
+    ValueError,
+)
+"""What the recommendation dial raises that means the model is unavailable.
+
+:data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` — an Ollama
+``httpx.HTTPError`` included since #2083, which used to escape as a ``500`` —
+plus the ``OSError`` and ``ValueError`` a broken provider configuration raises
+while the shared letter factory is built.
+"""
 
 
 class RecommendationUnavailableError(RuntimeError):
@@ -249,7 +265,7 @@ def _generate_recommendation(
         completion = build_factory()(tier, max_tokens=MAX_OUTPUT_TOKENS)(prompt)
     except ProviderRateLimitError:
         raise
-    except (RuntimeError, OSError, ValueError):
+    except _UNAVAILABLE_FAILURES:
         raise RecommendationUnavailableError(
             "recommendation inference unavailable"
         ) from None

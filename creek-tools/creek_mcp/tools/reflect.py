@@ -58,7 +58,25 @@ Underneath those guarantees, every read and parse failure answers with a
 structured dict rather than raising: a malformed or unreadable file under
 ``01-Fragments`` is skipped during ``entry_ref`` resolution (#847), and a
 malformed model turn degrades to no notes. No parse error crosses the MCP
-boundary.
+boundary. Nor does a failed model dial: anything in
+:data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` — an Ollama
+``httpx`` error included, which once escaped as FastMCP ``isError`` text with
+its URL (#2083) — is a structured refusal naming the exception's type only.
+Nor does a failed *build* of the LLM factory or grounding route: a stale
+``CREEK_CONFIG``, a schema-invalid config, or a config YAML cannot parse —
+each of whose messages names the config path — once escaped as ``isError``
+text, because both were built before this module's catch (#2091).
+:func:`build_reflect_seams` builds them for the MCP tool and ``POST
+/v1/reflections`` alike and refuses with the type name. That refusal is decided
+before :func:`reflect_tool` runs, so it appends no audit line: nothing was
+reflected, and the one audit append lives inside the tool.
+
+A dial or build failure is logged as one WARNING carrying the **type name
+only**: no message, no ``exc_info``, no ``logger.exception``. This is deliberately
+narrower than the traceback-bearing record ``creek.draft`` and
+``creek.author`` keep, because the ``/v1`` refusal-log contract
+(``tests/test_api_reflect_refusal_log.py``) forbids provider text in any
+record on this path, a formatted traceback included.
 
 The LLM and retrieval are both injectable seams so the tool is unit-testable
 with no live calls. ``build_server`` supplies the production LLM factory and
@@ -72,10 +90,16 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol
 
+from yaml import YAMLError
+
 from creek._containment import escaping_child
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
 from creek.classify.llm.pool_boundary import pool_prompt_within_cap
-from creek.classify.llm.providers import ProviderRateLimitError
+from creek.classify.llm.providers import (
+    PROVIDER_CALL_FAILURES,
+    ProviderRateLimitError,
+    RequestKeyRejectedError,
+)
 from creek.vault.reader import CORPUS_SUBDIRS, try_validate_fragment
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
@@ -142,6 +166,22 @@ pool-capped one should. The ``retry_after`` such an error may carry is **not**
 forwarded: the published ``Retry-After`` is a constant, because a wait derived
 from a vendor's own response would relay upstream detail this surface never
 relays.
+"""
+
+REQUEST_KEY_REJECTED_REASON: Final[str] = "reflection request key rejected"
+"""The refusal reason for a writer's request key its vendor refused (0.28).
+
+Separated from the generic provider-failure refusal for the reason
+:data:`RATE_LIMITED_REASON` is: the two want different client behaviour. An
+outage may clear on retry; a key the vendor answered ``401``/``403`` fails the
+same way every time, and only the writer replacing it helps (ADR-0015).
+:func:`creek_mcp.httpapi.reflect.reflect_refusal_code` maps it to
+``request_key_rejected``. Raised only for a call that carried a request key, so
+the operator's own refused key still reaches the generic refusal. Fixed text:
+never the key, the vendor's message or its status.
+
+Imported by the HTTP adapter rather than respelled there, like
+:data:`PROMPT_TOO_LONG_REASON`.
 """
 
 _DEFAULT_MAX_NOTES = 6
@@ -676,7 +716,7 @@ def _capped_prompt(
         The prompt to send, or ``None`` when even the ungrounded prompt
         exceeds the cap.
     """
-    snippets = list(grounding)
+    snippets = grounding.copy()
     while True:
         prompt = _build_prompt(entry, snippets, max_notes=max_notes)
         if pool_prompt_within_cap(prompt):
@@ -868,9 +908,9 @@ def _admit_entry(
             # infeasible.
             #
             # *Probe cost is not a control either*, and here the property is
-            # the converse of ``creek.compile``'s: its survey walks the
-            # non-short-circuiting :func:`creek.classify.privacy_filter.
-            # ancestry_tiers` (the walk moved out of that module in #958),
+            # the converse of ``creek.compile``'s: its survey ranks the index
+            # the compile engine builds from one non-short-circuiting walk
+            # (``AncestorIndex.chain_tiers`` over that walk since #930),
             # whereas :func:`_resolve_entry` above walks a lazy rglob and
             # returns at the match. So an above-ceiling probe is never *more*
             # expensive than a miss, and is cheaper for every fragment but the
@@ -1202,26 +1242,15 @@ def reflect_tool(
         max_tokens = _reflection_output_token_budget(max_notes)
         llm = llm_factory(tier, max_tokens=max_tokens)
         response_text = llm(prompt)
-    except ProviderRateLimitError:
-        # A cap, not an outage. Separated from the refusal below because only
-        # one of the two is cleared by waiting, and contract 0.19 gives them
-        # different wire codes.
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            reason=RATE_LIMITED_REASON,
+    except PROVIDER_CALL_FAILURES as exc:
+        # Type name only — see the module docstring (#2083).
+        logger.warning(
+            "reflection refused on a provider dial failure: %s", type(exc).__name__
         )
-    except RuntimeError as exc:
-        # Covers a missing/unavailable provider, ``IntimateRoutingError`` and
-        # every ``PoolBoundaryError`` — the router raises the first rather
-        # than egressing intimate content when no local backend exists, and
-        # the pool boundary raises the last when its one destination refuses,
-        # is unreachable, or dies mid-request after accepting the connection
-        # (#1894: that last path used to escape as an unhandled ``OSError``).
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
-            reason=f"reflection unavailable: {type(exc).__name__}",
+            reason=_dial_refusal_reason(exc),
         )
 
     raw_notes, essay = _parse_notes(response_text)
@@ -1240,6 +1269,111 @@ def reflect_tool(
         ceiling=privacy_tier_ceiling,
         tier=tier,
     )
+
+
+_SEAM_BUILD_FAILURES: Final[tuple[type[Exception], ...]] = (
+    RuntimeError,
+    OSError,
+    ValueError,
+    YAMLError,
+)
+"""What building a reflection's LLM factory or grounding route may raise (#2091).
+
+:data:`creek_mcp.httpapi.vault.UNREADABLE_CONFIG` — ``OSError`` for a missing
+or stale ``CREEK_CONFIG``, ``ValueError`` for a config that fails validation,
+``YAMLError`` for one YAML cannot parse — plus ``RuntimeError`` for a provider
+that cannot be built. Restated rather than imported for the layering reason
+:mod:`creek_mcp.tools.drive` gives: a tool module does not reach up into the
+HTTP adapter. ``YAMLError`` is listed explicitly because it is *not* a
+``ValueError``, and its message embeds the config file's path.
+"""
+
+
+def build_reflect_seams(
+    build_factory: Callable[[], _LLMFactory],
+    build_route: Callable[[], GroundingRoute] | None,
+    *,
+    ceiling: TierCeiling,
+) -> tuple[_LLMFactory, GroundingRoute | None] | dict[str, Any]:
+    """Build one reflection's LLM factory and grounding route, or refuse (#2091).
+
+    Both production builders read the served vault's config, so either can
+    fail on a config that cannot load. The MCP tool and ``POST
+    /v1/reflections`` both build through here, so the two surfaces refuse that
+    failure one way, and both pass ``build_route=None`` for an injected
+    factory: an injected factory resolves no stage, so it cannot say whether
+    the pool answers the request, and grounding keeps the local route.
+
+    The refusal reason is ``reflection unavailable: <TypeName>`` for every
+    failure — a rate-limit or rejected-key error raised while *building* is not
+    relabelled the way :func:`_dial_refusal_reason` labels one raised by the
+    dial, so ``/v1``'s wire code for a build failure is unchanged. The failure
+    is logged as one WARNING carrying the type name only, for the reason the
+    module docstring gives; on ``/v1`` it sits beside, and does not replace,
+    the refusal logger's own closed-vocabulary line.
+
+    Args:
+        build_factory: Builds the tier-keyed LLM factory.
+        build_route: Builds the per-tier embedding-route decision, or ``None``
+            to keep grounding on the local route.
+        ceiling: The call's privacy-tier ceiling, echoed by a refusal.
+
+    Returns:
+        ``(factory, route)``, *route* ``None`` when *build_route* is; or a
+        structured refusal when either build raised.
+    """
+    try:
+        factory = build_factory()
+        route = None if build_route is None else build_route()
+    except _SEAM_BUILD_FAILURES as exc:
+        # Type name only — see the module docstring (#2083, #2091).
+        logger.warning(
+            "reflection refused on a seam build failure: %s", type(exc).__name__
+        )
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            reason=f"reflection unavailable: {type(exc).__name__}",
+        )
+    return factory, route
+
+
+def _dial_refusal_reason(exc: Exception) -> str:
+    """Return the published refusal reason for a failed model dial.
+
+    Three outcomes, distinguished because each wants different client
+    behaviour and, on ``/v1``, a different wire code:
+
+    - :class:`~creek.classify.llm.providers.ProviderRateLimitError` is a cap,
+      not an outage: only waiting clears it (contract 0.19).
+    - :class:`~creek.classify.llm.providers.RequestKeyRejectedError` is the
+      writer's own key refused by its vendor: nothing but a new key clears it
+      (contract 0.28). Both subclass ``RuntimeError``, which is why they are
+      tested here first rather than falling through to the generic reason —
+      the fall-through once told a writer to retry a key that will never be
+      accepted.
+    - Anything else covers a missing/unavailable provider,
+      ``IntimateRoutingError`` and every ``PoolBoundaryError`` — the router
+      raises the first rather than egressing intimate content when no local
+      backend exists, and the pool boundary raises the last when its one
+      destination refuses, is unreachable, or dies mid-request after
+      accepting the connection (#1894) — and every Ollama ``httpx.HTTPError``,
+      :class:`~creek.classify.llm.local_boundary.NonLoopbackOllamaError`
+      among them (#2083). Its reason carries only the exception's type name,
+      never its message.
+
+    Args:
+        exc: What the factory or the completion raised.
+
+    Returns:
+        :data:`RATE_LIMITED_REASON`, :data:`REQUEST_KEY_REJECTED_REASON`, or
+        ``"reflection unavailable: <TypeName>"``.
+    """
+    if isinstance(exc, ProviderRateLimitError):
+        return RATE_LIMITED_REASON
+    if isinstance(exc, RequestKeyRejectedError):
+        return REQUEST_KEY_REJECTED_REASON
+    return f"reflection unavailable: {type(exc).__name__}"
 
 
 def _related(
