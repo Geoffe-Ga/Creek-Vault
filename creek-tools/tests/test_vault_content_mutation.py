@@ -1,4 +1,4 @@
-"""Shared writer-boundary regressions for journal withdrawal (#1799)."""
+"""Shared writer-boundary regressions: journal withdrawal (#1799), ingest (#2079)."""
 
 from __future__ import annotations
 
@@ -7,16 +7,32 @@ import json
 import threading
 from typing import TYPE_CHECKING
 
-from creek._fslock import vault_lock
+import pytest
+
+from creek._fslock import VaultLockTimeoutError, vault_lock
+from creek.classify.classify_engine import run_classify
 from creek.compile.engine import compile_to_vault
 from creek.config import CreekConfig
+from creek.ingest import INGESTOR_REGISTRY
+from creek.ingest.pipeline import run_ingest
 from creek.link.link_engine import run_link
 from creek.models import Fragment, FragmentSource, SourcePlatform
-from creek.vault.mutations import content_mutation_lock_path
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    ContentMutationBusyError,
+    content_mutation_lock_path,
+    hold_content_mutation,
+)
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.classify_entry import entry_classification_tool
+from creek_mcp.tools.ingest import ingest_tool
 from creek_mcp.tools.upload import upload_tool
 from tests.helpers import write_fragment_file
+from tests.test_mcp_content_mutation import (
+    _content_lock_held_elsewhere,
+    _shorten_lock_wait,
+)
+from tests.test_mcp_upload import _content_lock_is_held
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -153,3 +169,131 @@ def test_classify_entry_waits_at_the_shared_content_mutation_boundary(
             privacy_tier_ceiling=TierCeiling.ALL,
         ),
     )
+
+
+# --------------------------------------------------------------------------- #
+# The acquisition-only hold every ingest surface takes (#2079)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_hold_runs_its_body_with_the_content_lock_held(tmp_path: Path) -> None:
+    """The body of :func:`hold_content_mutation` is inside the boundary."""
+    vault = tmp_path / "vault"
+    held: list[bool] = []
+
+    with hold_content_mutation(vault):
+        held.append(_content_lock_is_held(vault))
+
+    assert held == [True]
+    assert _content_lock_is_held(vault) is False
+
+
+def test_a_contended_hold_raises_busy_and_never_runs_its_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the race is the typed busy signal, not a bare lock timeout.
+
+    ``ContentMutationBusyError`` is deliberately *not* a
+    ``VaultLockTimeoutError``: no existing ``except VaultLockTimeoutError`` arm
+    may absorb it, and an inner timeout must never be mistaken for it.
+    """
+    vault = tmp_path / "vault"
+    ran: list[bool] = []
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+
+    with (
+        _content_lock_held_elsewhere(vault),
+        pytest.raises(ContentMutationBusyError) as caught,
+        hold_content_mutation(vault),
+    ):
+        ran.append(True)
+
+    assert ran == []
+    assert str(caught.value) == CONTENT_MUTATION_BUSY_REASON
+    assert not isinstance(caught.value, VaultLockTimeoutError)
+    assert isinstance(caught.value.__cause__, VaultLockTimeoutError)
+
+
+def test_a_lock_timeout_inside_the_hold_propagates_unchanged(tmp_path: Path) -> None:
+    """Only *acquisition* is busy; a timeout raised under the hold is not.
+
+    The writer's ``.id-index.lock`` can time out mid-ingest, after fragments
+    may already be on disk. Re-labelling that as "busy" would tell a caller
+    nothing was written when something was.
+    """
+    vault = tmp_path / "vault"
+    inner = VaultLockTimeoutError("id-index lock busy")
+
+    with pytest.raises(VaultLockTimeoutError) as caught, hold_content_mutation(vault):
+        raise inner
+
+    assert caught.value is inner
+    assert not isinstance(caught.value, ContentMutationBusyError)
+
+
+def test_the_hold_releases_the_lock_when_its_body_raises(tmp_path: Path) -> None:
+    """An exception in the body cannot strand the boundary."""
+    vault = tmp_path / "vault"
+
+    msg = "body failed"
+    with pytest.raises(RuntimeError, match=msg), hold_content_mutation(vault):
+        raise RuntimeError(msg)
+
+    assert _content_lock_is_held(vault) is False
+
+
+def test_run_ingest_itself_takes_no_content_lock(tmp_path: Path) -> None:
+    """``run_ingest`` stays lock-free: its callers own the boundary (#2079).
+
+    ``creek.upload`` and ``creek.journal`` already call ``run_ingest`` while
+    holding the non-reentrant content lock. Were ``run_ingest`` to take it as
+    well, this same-thread call would wait out the timeout and fail.
+    """
+    vault = tmp_path / "vault"
+    for sub in ("00-Creek-Meta", "01-Fragments"):
+        (vault / sub).mkdir(parents=True)
+    source = tmp_path / "src" / "note.md"
+    source.parent.mkdir()
+    source.write_text("# Note\n\nA sentence written under the caller's hold.\n")
+
+    with hold_content_mutation(vault):
+        result = run_ingest(
+            ingestor_cls=INGESTOR_REGISTRY["markdown"],
+            source_type="markdown",
+            input_path=source,
+            vault_path=vault,
+        )
+
+    assert result.written == 1
+    assert result.errors == []
+
+
+def test_ingest_then_classify_then_link_in_one_thread_releases_every_lock(
+    tmp_path: Path,
+) -> None:
+    """The three surfaces run back to back in one thread without deadlock.
+
+    Each takes the non-reentrant content lock in turn; none may still hold it
+    when the next starts, and nothing may hold it at the end.
+    """
+    vault = tmp_path / "vault"
+    for sub in ("00-Creek-Meta/State", "00-Creek-Meta/audit", "01-Fragments"):
+        (vault / sub).mkdir(parents=True)
+    (vault / "inbox").mkdir()
+    (vault / "inbox" / "note.md").write_text(
+        "# Note\n\nA morning walk along the creek before work.\n"
+    )
+
+    ingested = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path="inbox/note.md",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    run_classify(vault_path=vault, config=CreekConfig(), method="rules", force=False)
+    run_link(vault_path=vault, config=CreekConfig(), method="temporal", rebuild=False)
+
+    assert ingested["status"] == "ok", ingested
+    assert ingested["written"] == 1
+    assert _content_lock_is_held(vault) is False
