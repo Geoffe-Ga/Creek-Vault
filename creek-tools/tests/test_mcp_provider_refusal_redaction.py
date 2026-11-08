@@ -236,7 +236,12 @@ def _assert_one_operator_record(
     records = [record for record in caplog.records if record.name == logger_name]
     assert len(records) == 1, [r.getMessage() for r in caplog.records]
     (record,) = records
-    assert record.exc_info is not None
+    # A real ``(type, value, traceback)`` triple carrying the logged exception:
+    # ``is not None`` alone would accept the ``False`` that
+    # ``logger.exception(..., exc_info=False)`` stores, a record with no
+    # traceback at all.
+    assert isinstance(record.exc_info, tuple), record.exc_info
+    assert type(record.exc_info[1]).__name__ == type_name
     assert type_name in record.getMessage()
     assert _MARKER not in record.getMessage()
     assert _URL not in record.getMessage()
