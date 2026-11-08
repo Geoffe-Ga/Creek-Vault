@@ -46,6 +46,17 @@ Gate ordering, all of it load-bearing and asserted from outside:
    is no meaningful tier to record yet;
 2. ``write_tier_allowed`` on the *incoming* tier — audited, then refused;
 3. the encoded-length cap, then the decode, then the decoded-size cap;
+
+   — then the vault content-mutation lock is taken, **once** (#2069). Every
+   step below runs inside that one hold, so the tier the #970 gate reads and
+   the overwrite it admits cannot be split by a concurrent ``creek classify``
+   escalation. Contention past the lock's bound refuses with
+   :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON`, **unaudited**
+   and before anything is staged; the catch covers acquiring the lock and
+   nothing else, so a timeout raised *under* the hold (the writer's
+   ``.id-index.lock``) still propagates rather than being reported as a busy
+   vault over bytes that were already staged —
+
 4. the #970 overwrite gate on the tier of the *resolved existing* fragment —
    audited, then refused;
 5. the archive fork (#1525) — a ``.zip`` leaves the single-document path
@@ -59,7 +70,9 @@ Gate ordering, all of it load-bearing and asserted from outside:
    or a legacy ``.doc`` is refused *with a remedy* rather than routed to
    ``generic`` (#1526), and it sits here, above the write, so the refused
    bytes never reach the staging directory at all;
-7. **only then** :func:`_stage_upload` writes anything.
+7. **only then** :func:`_stage_upload` writes anything, and the ingest, the
+   unreferenced-bytes discard and the success audit follow it inside the
+   same hold.
 
 Gate 2 sitting above gate 3 is the sharp edge: an ``intimate`` upload at
 ``ceiling=open`` must never decode a byte, and a refused overwrite must leave
@@ -72,10 +85,12 @@ from __future__ import annotations
 import base64
 import binascii
 import shutil
+from contextlib import ExitStack
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.classify.privacy_filter import max_source_tier, source_tiers
 from creek.ingest import (
     INGESTOR_REGISTRY,
@@ -98,6 +113,10 @@ from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import derive_source_key, run_ingest
 from creek.ingest.source_unit import split_source_unit
 from creek.models import PrivacyTier
+from creek.vault.mutations import (
+    CONTENT_MUTATION_BUSY_REASON,
+    content_mutation_lock_path,
+)
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.read_gate import refuse_above_ceiling
 from creek_mcp.staged_names import safe_stem, safe_suffix
@@ -1086,6 +1105,177 @@ def _archive_outcome(
     )
 
 
+def _admitted_upload_outcome(
+    *,
+    vault_path: Path,
+    audit_args: dict[str, Any],
+    external_id: str,
+    filename: str,
+    raw: bytes,
+    upload_tier: PrivacyTier,
+    ceiling: TierCeiling,
+    consumer: str,
+    timestamp: str | None,
+    run: _Runner | None,
+) -> dict[str, Any]:
+    """Run gates 4-7 and the ingest for a decoded upload; call under the lock.
+
+    **Must be called only while the vault content-mutation lock is held**
+    (:func:`creek.vault.mutations.content_mutation_lock_path`), which
+    :func:`upload_tool` takes once, directly above this call (#2069). That
+    one hold is the point: ``creek classify`` escalates tiers under the same
+    lock, so the tier the #970 gate reads here is still the tier on disk when
+    the overwrite it admitted lands. Nothing below re-takes that lock —
+    :func:`creek._fslock.vault_lock` is non-reentrant, so doing so would time
+    out — and the writer's own ``.id-index.lock`` is only ever taken *inside*
+    it, the order ``creek classify`` uses too.
+
+    The body is :func:`upload_tool`'s gate ordering 4-7, verbatim and in the
+    same order: the #970 overwrite gate, the extension-conflict check, the
+    archive fork, the unsupported-format gate, then staging, ingest, the
+    unreferenced-bytes discard and the success audit.
+
+    Args:
+        vault_path: Vault root.
+        audit_args: The sanitised argument summary for the audit trail.
+        external_id: The caller's idempotency key.
+        filename: The caller's original filename.
+        raw: The decoded document bytes, already admitted by gates 1-3.
+        upload_tier: The parsed tier the caller declared.
+        ceiling: The caller's admission ceiling.
+        consumer: Free-form consumer id for the audit log.
+        timestamp: The caller's upload time, echoed only.
+        run: Ingest-runner seam; ``None`` selects
+            :func:`creek.ingest.pipeline.run_ingest`.
+
+    Returns:
+        :func:`upload_tool`'s success response, or a structured refusal.
+    """
+    # The #970 overwrite gate, above the staging write below it: a refusal
+    # must leave the previously staged bytes intact as well as the fragment.
+    # Its audit entry carries the caller's own arguments and nothing else —
+    # no created_tier, no ids — because the resolved fragment id and the
+    # protected tier must not enter a trail served onward through other
+    # surfaces.
+    refusal = _refuse_unadmitted_overwrite(vault_path, external_id, filename, ceiling)
+    if refusal is not None:
+        MCPAuditLog(vault_path).append(
+            tool=TOOL_NAME,
+            args=audit_args,
+            tier_ceiling=ceiling,
+            consumer=consumer,
+        )
+        return refusal
+
+    # Below the #970 gate, so a conflicting extension is disclosed only to a
+    # caller already admitted to this id's content; above the staging write,
+    # so the refusal leaves no second staged file behind.
+    conflict = _refuse_extension_conflict(vault_path, external_id, filename, ceiling)
+    if conflict is not None:
+        MCPAuditLog(vault_path).append(
+            tool=TOOL_NAME,
+            args=audit_args,
+            tier_ceiling=ceiling,
+            consumer=consumer,
+        )
+        return conflict
+
+    # The archive fork (#1525), below every privacy gate above it and above
+    # the single-document format gate below it. Placed here, not earlier, so
+    # an archive is admitted by exactly the gates a document is: the write
+    # ceiling, the #970 overwrite gate on whatever this id already owns, and
+    # the one-id-one-extension rule. Placed here, not later, so it is reached
+    # before `route_to_ingestor` — which still refuses ``.zip``, correctly, as
+    # a *single document*, and whose refusal was the only answer this surface
+    # had until now.
+    if is_supported_archive(filename):
+        return _archive_outcome(
+            vault_path=vault_path,
+            audit_args=audit_args,
+            external_id=external_id,
+            filename=filename,
+            raw=raw,
+            upload_tier=upload_tier,
+            ceiling=ceiling,
+            consumer=consumer,
+            timestamp=timestamp,
+            run=run,
+        )
+
+    # The unsupported-format gate (#1526), above the staging write: an
+    # extension the ``generic`` fallback would flatten into one blob is
+    # refused with a remedy, and refused before its bytes touch disk. It is
+    # decidable from the caller's own filename, so it discloses nothing
+    # about the vault; it sits below the #970 gate anyway, so it cannot
+    # answer for an id whose content the ceiling may not read.
+    routed = _routed_source_type(
+        vault_path=vault_path,
+        audit_args=audit_args,
+        external_id=external_id,
+        filename=filename,
+        upload_tier=upload_tier,
+        ceiling=ceiling,
+        consumer=consumer,
+    )
+    if not isinstance(routed, str):
+        return routed
+    source_type = routed
+
+    staged = _stage_upload(vault_path, external_id, filename, raw)
+    result = _ingest_outcome(
+        vault_path=vault_path,
+        audit_args=audit_args,
+        staged=staged,
+        source_type=source_type,
+        upload_tier=upload_tier,
+        ceiling=ceiling,
+        consumer=consumer,
+        run=run,
+    )
+    if isinstance(result, dict):
+        _discard_unreferenced(vault_path, staged)
+        return result
+
+    # Every fragment the staged document produced, in ledger-key order, so
+    # an RTBF request answered from this audit entry reaches all of them
+    # (#1305). ``fragment_id`` keeps its singular contract by naming the
+    # first in that order — deterministic across runs, and for the
+    # one-fragment-per-file majority it is still simply *the* fragment.
+    affected = _resolve_fragment_ids(vault_path, staged)
+    fragment_id = affected[0] if affected else None
+    MCPAuditLog(vault_path).append(
+        tool=TOOL_NAME,
+        args=audit_args,
+        tier_ceiling=ceiling,
+        consumer=consumer,
+        created_path=str(_FRAGMENT_ROUTING_DIR),
+        created_tier=upload_tier.value,
+        affected_fragment_ids=affected,
+    )
+    return {
+        "status": "ok",
+        "tool": TOOL_NAME,
+        "tier_ceiling": ceiling.value,
+        "external_id": external_id,
+        "filename": filename,
+        "timestamp": timestamp,
+        "source_type": source_type,
+        "fragment_id": fragment_id,
+        "affected_fragment_ids": affected,
+        "action": _action_of(result),
+        "tier": upload_tier.value,
+        "size_bytes": len(raw),
+        # ``ceiling_safe_warnings``, never ``warnings``: it is the only ingest
+        # advisory channel that may cross this boundary, because the operator
+        # channel interpolates real vault fragment ids this caller's ceiling
+        # may not admit. See the ``warn`` doctrine in creek/ingest/pipeline.py
+        # for why that call is made at the producer (#1372). This is the
+        # surface that most needs it — the collapsed-unit advisory reports
+        # actual data loss and fires on the multi-sheet-workbook path.
+        "warnings": list(result.ceiling_safe_warnings),
+    }
+
+
 def upload_tool(
     *,
     vault_path: Path,
@@ -1167,7 +1357,10 @@ def upload_tool(
         when the run was quiet), or a structured four-key refusal — carrying
         :data:`~creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`, naming
         neither the protected fragment nor its tier, when the overwrite gate
-        fires (#970).
+        fires (#970) — or carrying
+        :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON`, unaudited
+        and with nothing staged, when another writer held the vault
+        content-mutation lock past its bound (#2069; retry).
     """
     upload_tier = _validated_upload(
         filename=filename,
@@ -1216,49 +1409,20 @@ def upload_tool(
     if not isinstance(raw, bytes):
         return raw
 
-    # The #970 overwrite gate, above the staging write below it: a refusal
-    # must leave the previously staged bytes intact as well as the fragment.
-    # Its audit entry carries the caller's own arguments and nothing else —
-    # no created_tier, no ids — because the resolved fragment id and the
-    # protected tier must not enter a trail served onward through other
-    # surfaces.
-    refusal = _refuse_unadmitted_overwrite(
-        vault_path, external_id, filename, privacy_tier_ceiling
-    )
-    if refusal is not None:
-        MCPAuditLog(vault_path).append(
-            tool=TOOL_NAME,
-            args=audit_args,
-            tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
-        )
-        return refusal
-
-    # Below the #970 gate, so a conflicting extension is disclosed only to a
-    # caller already admitted to this id's content; above the staging write,
-    # so the refusal leaves no second staged file behind.
-    conflict = _refuse_extension_conflict(
-        vault_path, external_id, filename, privacy_tier_ceiling
-    )
-    if conflict is not None:
-        MCPAuditLog(vault_path).append(
-            tool=TOOL_NAME,
-            args=audit_args,
-            tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
-        )
-        return conflict
-
-    # The archive fork (#1525), below every privacy gate above it and above
-    # the single-document format gate below it. Placed here, not earlier, so
-    # an archive is admitted by exactly the gates a document is: the write
-    # ceiling, the #970 overwrite gate on whatever this id already owns, and
-    # the one-id-one-extension rule. Placed here, not later, so it is reached
-    # before `route_to_ingestor` — which still refuses ``.zip``, correctly, as
-    # a *single document*, and whose refusal was the only answer this surface
-    # had until now.
-    if is_supported_archive(filename):
-        return _archive_outcome(
+    with ExitStack() as hold:
+        # ACQUISITION only (#2069). Everything under the hold may raise its own
+        # VaultLockTimeoutError — the writer's `.id-index.lock` — after
+        # `_stage_upload` has written; that must propagate as it always has,
+        # not be reported as a busy vault over bytes that are already staged.
+        try:
+            hold.enter_context(vault_lock(content_mutation_lock_path(vault_path)))
+        except VaultLockTimeoutError:
+            return refusal_response(
+                tool=TOOL_NAME,
+                ceiling=privacy_tier_ceiling,
+                reason=CONTENT_MUTATION_BUSY_REASON,
+            )
+        return _admitted_upload_outcome(
             vault_path=vault_path,
             audit_args=audit_args,
             external_id=external_id,
@@ -1270,76 +1434,3 @@ def upload_tool(
             timestamp=timestamp,
             run=run,
         )
-
-    # The unsupported-format gate (#1526), above the staging write: an
-    # extension the ``generic`` fallback would flatten into one blob is
-    # refused with a remedy, and refused before its bytes touch disk. It is
-    # decidable from the caller's own filename, so it discloses nothing
-    # about the vault; it sits below the #970 gate anyway, so it cannot
-    # answer for an id whose content the ceiling may not read.
-    routed = _routed_source_type(
-        vault_path=vault_path,
-        audit_args=audit_args,
-        external_id=external_id,
-        filename=filename,
-        upload_tier=upload_tier,
-        ceiling=privacy_tier_ceiling,
-        consumer=consumer,
-    )
-    if not isinstance(routed, str):
-        return routed
-    source_type = routed
-
-    staged = _stage_upload(vault_path, external_id, filename, raw)
-    result = _ingest_outcome(
-        vault_path=vault_path,
-        audit_args=audit_args,
-        staged=staged,
-        source_type=source_type,
-        upload_tier=upload_tier,
-        ceiling=privacy_tier_ceiling,
-        consumer=consumer,
-        run=run,
-    )
-    if isinstance(result, dict):
-        _discard_unreferenced(vault_path, staged)
-        return result
-
-    # Every fragment the staged document produced, in ledger-key order, so
-    # an RTBF request answered from this audit entry reaches all of them
-    # (#1305). ``fragment_id`` keeps its singular contract by naming the
-    # first in that order — deterministic across runs, and for the
-    # one-fragment-per-file majority it is still simply *the* fragment.
-    affected = _resolve_fragment_ids(vault_path, staged)
-    fragment_id = affected[0] if affected else None
-    MCPAuditLog(vault_path).append(
-        tool=TOOL_NAME,
-        args=audit_args,
-        tier_ceiling=privacy_tier_ceiling,
-        consumer=consumer,
-        created_path=str(_FRAGMENT_ROUTING_DIR),
-        created_tier=upload_tier.value,
-        affected_fragment_ids=affected,
-    )
-    return {
-        "status": "ok",
-        "tool": TOOL_NAME,
-        "tier_ceiling": privacy_tier_ceiling.value,
-        "external_id": external_id,
-        "filename": filename,
-        "timestamp": timestamp,
-        "source_type": source_type,
-        "fragment_id": fragment_id,
-        "affected_fragment_ids": affected,
-        "action": _action_of(result),
-        "tier": upload_tier.value,
-        "size_bytes": len(raw),
-        # ``ceiling_safe_warnings``, never ``warnings``: it is the only ingest
-        # advisory channel that may cross this boundary, because the operator
-        # channel interpolates real vault fragment ids this caller's ceiling
-        # may not admit. See the ``warn`` doctrine in creek/ingest/pipeline.py
-        # for why that call is made at the producer (#1372). This is the
-        # surface that most needs it — the collapsed-unit advisory reports
-        # actual data loss and fires on the multi-sheet-workbook path.
-        "warnings": list(result.ceiling_safe_warnings),
-    }
