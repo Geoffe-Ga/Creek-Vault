@@ -472,7 +472,7 @@ def compile_tool(
     kind = cast("CompileTargetKind", target_kind)
     try:
         written = compile_to_vault(
-            fragment_ids=list(fragment_ids),
+            fragment_ids=fragment_ids.copy(),
             vault_path=vault_path,
             target_kind=kind,
             target_id=target_id,
@@ -499,7 +499,7 @@ def compile_tool(
             args={
                 "target_kind": target_kind,
                 "target_id": target_id,
-                "fragment_ids": list(fragment_ids),
+                "fragment_ids": fragment_ids.copy(),
             },
             tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
@@ -536,7 +536,7 @@ def compile_tool(
             "tool": TOOL_NAME,
             "tier_ceiling": privacy_tier_ceiling.value,
             "compiled_path": relative,
-            "affected_fragment_ids": list(fragment_ids),
+            "affected_fragment_ids": fragment_ids.copy(),
         }
 
     pre_hash_marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -549,13 +549,13 @@ def compile_tool(
             "target_kind": target_kind,
             "target_id": target_id,
             "target_title": target_title,
-            "fragment_ids": list(fragment_ids),
+            "fragment_ids": fragment_ids.copy(),
         },
         tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,
         created_path=relative,
         created_tier=None,
-        affected_fragment_ids=list(fragment_ids),
+        affected_fragment_ids=fragment_ids.copy(),
     )
     return {
         "status": "ok",
@@ -564,5 +564,5 @@ def compile_tool(
         "compiled_path": relative,
         "target_kind": target_kind,
         "target_id": target_id,
-        "affected_fragment_ids": list(fragment_ids),
+        "affected_fragment_ids": fragment_ids.copy(),
     }

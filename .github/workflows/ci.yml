@@ -133,9 +133,10 @@ jobs:
         run: ruff format --check .
 
       - name: Check docstring coverage
-        run: |
-          interrogate -vv \
-            --fail-under=${{ env.DOCSTRING_COVERAGE_THRESHOLD }} creek/
+        # The wrapper is the single definition of this gate (GAP-007 parity,
+        # #965): it holds creek/ and creek_mcp/ to the threshold separately,
+        # reading DOCSTRING_COVERAGE_THRESHOLD from the workflow env above.
+        run: ./scripts/lint-interrogate.sh
 
       - name: Run Tryceratops (STYLE-001 exception-hygiene gate)
         # Backlog closed in STYLE-001 (21 → 0). Any new violation
@@ -157,7 +158,8 @@ jobs:
           bandit -r creek/ creek_mcp/ -ll
 
       - name: Run Refurb (STYLE-001 modernisation gate)
-        # Backlog closed in STYLE-001 (148 → 0). Any new violation
+        # Backlog closed in STYLE-001 (148 → 0) for creek/ and in #965
+        # (60 → 0) for creek_mcp/; the wrapper scans both. Any new violation
         # blocks CI; `# noqa: FURB…` is available for documented
         # carve-outs (see creek-tools/CLAUDE.md §6.1).
         #

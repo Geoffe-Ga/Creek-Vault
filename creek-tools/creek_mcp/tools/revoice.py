@@ -65,6 +65,15 @@ def _error(ceiling: TierCeiling, reason: str) -> dict[str, Any]:
     }
 
 
+def _local_provider_refusal(ceiling: TierCeiling) -> dict[str, Any]:
+    """Return the canonical refusal for a ceiling no local provider can serve."""
+    return refusal_response(
+        tool=TOOL_NAME,
+        ceiling=ceiling,
+        reason="The declared ceiling requires an available local provider",
+    )
+
+
 def _rewrite(
     *,
     vault_path: Path,
@@ -150,13 +159,7 @@ def revoice_tool(
                 provenance=provenance,
             )
     except IntimateRoutingError:
-        response = dict(
-            refusal_response(
-                tool=TOOL_NAME,
-                ceiling=privacy_tier_ceiling,
-                reason="The declared ceiling requires an available local provider",
-            )
-        )
+        response = _local_provider_refusal(privacy_tier_ceiling)
     except Exception:
         # Providers may quote the request in their exceptions. Nothing derived
         # from one may cross a response, audit entry, or process log here.

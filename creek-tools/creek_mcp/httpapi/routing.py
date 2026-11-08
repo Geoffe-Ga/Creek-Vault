@@ -669,7 +669,7 @@ def build_fly_replay_routing_app(
         routes.append(
             _mcp_replay_route(router, _ALLOCATION_MCP_ROUTE, "allocation_mcp")
         )
-    replay_caps = {**ROUTE_BODY_CAPS, "/v1/uploads": DEFAULT_MAX_BODY_BYTES}
+    replay_caps = ROUTE_BODY_CAPS | {"/v1/uploads": DEFAULT_MAX_BODY_BYTES}
     app = Starlette(
         routes=routes,
         middleware=[
