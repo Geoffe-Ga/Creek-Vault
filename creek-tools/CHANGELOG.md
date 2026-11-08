@@ -9,6 +9,34 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`creek.reflect` refuses a vault config that cannot load by type name,
+  never as `isError` text naming its path (#2091, follow-up to #2083).** The
+  MCP tool built its LLM factory and grounding route before `reflect_tool`'s
+  catch, so a stale `CREEK_CONFIG` (`FileNotFoundError`), a schema-invalid
+  config (`ValidationError`) and a config YAML cannot parse (`ParserError`)
+  each reached the client as `Error executing tool creek.reflect: ...` with the
+  server's config path in it. Both seams are now built by one helper,
+  `creek_mcp.tools.reflect.build_reflect_seams`, whose catch is
+  `(RuntimeError, OSError, ValueError, YAMLError)`; a failure answers
+  `reflection unavailable: <TypeName>` and logs one type-name-only WARNING on
+  `creek_mcp.tools.reflect`. `YAMLError` is listed because it is not a
+  `ValueError`: `POST /v1/reflections`, which already caught the other three,
+  now shares the helper, so a YAML-syntax-invalid config there is
+  `503 temporarily_unavailable` instead of `500 internal_error` when the vault
+  resolves and its own `00-Creek-Meta/creek_config.yaml` fails to load (or the
+  app was built with an explicit vault path). A broken `CREEK_CONFIG` on the
+  production entry points, which build the app with no vault path, resolves no
+  vault and was and remains `503 unavailable`. A build
+  failure's reason is the literal type-name reason on both surfaces, so a
+  rate-limit or rejected-key error raised while *building* keeps `/v1`'s
+  existing `503`. An injected `reflect_llm_factory` now gets no grounding route
+  on MCP, as on `/v1`, so it never reads the config to build one. A
+  build refusal is decided before `reflect_tool` runs and so, as on `/v1`
+  before, appends no line to the MCP audit log. The same pattern in
+  `creek.classify`, `creek.link`, `creek.redact.scan`, `creek.report`,
+  `creek.draft`, `creek.compile` and the `/v1` letter and reading routes is
+  left to follow-ups.
+
 - **The remaining `01-Fragments` writers take the vault content-mutation lock
   (#2086, follow-up to #2079 and #2087).** `creek purge` (`fragment`, `source`
   incl. `--source-path`, `classifications`, `daterange`, `vault`) and the five
@@ -39,6 +67,7 @@ to locate the originating commit for any reference below.
   vault` and gains neither `00-Creek-Meta/locks/` nor
   `00-Creek-Meta/audit/purge.jsonl` (re #2098, whose first item this fixes:
   `purge fragment` and friends used to scaffold that audit log and exit 0).
+
 
 - **`creek sync` keeps its last-run record when classify or link meets
   content-lock contention (#2087, follow-up to #2079).** `run_classify`,
