@@ -29,8 +29,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
@@ -2148,6 +2150,83 @@ def test_a_sync_that_cannot_take_the_lock_is_refused_rather_than_queued(
 # --------------------------------------------------------------------------- #
 
 
+_DAWN_BODY: Final[bytes] = (
+    b"# Dawn notes\n\nsynthetic-dawn-marker-2079 saw first light.\n"
+)
+"""A second Drive file, staged up to date so the downloader skips it."""
+
+_EDITED_BODY: Final[bytes] = (
+    b"# Ridge notes\n\nsynthetic-edited-marker-2079 walked the ridge after dusk.\n"
+)
+""":data:`_PLAIN_BODY` after an edit in Drive."""
+
+_EDITED_MARKER: Final[bytes] = b"synthetic-edited-marker-2079"
+"""The sentinel inside :data:`_EDITED_BODY`."""
+
+_EDITED: Final[datetime] = _MODIFIED + timedelta(hours=1)
+"""Drive's ``modified_time`` once a file has been edited after :data:`_MODIFIED`."""
+
+_UNRELATED_BYTES: Final[bytes] = b"\x00synthetic-unrelated-2079"
+"""A staged file no Drive listing names, kept for a manual ``creek ingest``."""
+
+
+def _stage_up_to_date(path: Path, body: bytes) -> Path:
+    """Stage *body* at *path* exactly as an earlier sync left it.
+
+    Stamped with :data:`_MODIFIED`, which is what the downloader itself does,
+    so a listing naming the file at that ``modified_time`` skips it.
+
+    Args:
+        path: The staged file.
+        body: Its bytes.
+
+    Returns:
+        *path*, for chaining.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    os.utime(path, (_MODIFIED.timestamp(), _MODIFIED.timestamp()))
+    return path
+
+
+def _edited_in_drive(stub: _StubDrive, file_id: str, body: bytes) -> None:
+    """Edit *file_id* in *stub*'s Drive: new bytes, later ``modified_time``.
+
+    Args:
+        stub: The Drive backend to edit.
+        file_id: The file to edit.
+        body: Its new bytes.
+    """
+    stub.listing = [
+        replace(entry, modified_time=_EDITED) if entry.id == file_id else entry
+        for entry in stub.listing
+    ]
+    stub.bodies[file_id] = body
+
+
+def _fragments_carrying(vault_path: Path, marker: bytes) -> list[Path]:
+    """Return the fragments in *vault_path* whose bytes contain *marker*.
+
+    Args:
+        vault_path: The vault root.
+        marker: The sentinel to look for.
+
+    Returns:
+        The matching fragment paths, sorted.
+    """
+    return [path for path in _fragments(vault_path) if marker in path.read_bytes()]
+
+
+def _index_lock_times_out(**_kwargs: Any) -> None:
+    """Time out the way a contended id-index lock does mid-ingest.
+
+    Raises:
+        VaultLockTimeoutError: Always.
+    """
+    msg = "id-index lock busy"
+    raise VaultLockTimeoutError(msg)
+
+
 class _ProbingDrive(_StubDrive):
     """A stub that records whether the content lock is held while it downloads.
 
@@ -2283,7 +2362,13 @@ def test_a_busy_content_lock_refuses_with_its_own_reason_and_refetches_next_time
     The downloader skips any staged file at least as new as Drive's
     ``modified_time``, so a file fetched by a run that then could not ingest
     it would be skipped by every later sync. The refused run therefore removes
-    what it fetched, and the next uncontended sync fetches and ingests it.
+    the file it newly fetched, and the next uncontended sync fetches and
+    ingests it.
+
+    The discard is scoped to that one file: an up-to-date staged file the run
+    skipped, and an unrelated file the listing does not name (an unsupported
+    file kept for ``creek ingest``), both survive byte-for-byte. A discard
+    that wiped the whole staging directory would pass the rest of this test.
 
     Args:
         vault: A seeded vault.
@@ -2292,9 +2377,15 @@ def test_a_busy_content_lock_refuses_with_its_own_reason_and_refetches_next_time
         monkeypatch: The active monkeypatch fixture.
     """
     _connect(token_path)
-    stub = _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
+    stub = _StubDrive(
+        [_drive_file("id-1", "ridge.md"), _drive_file("id-2", "dawn.md")],
+        {"id-1": _PLAIN_BODY, "id-2": _DAWN_BODY},
+    )
     _stubbed(monkeypatch, stub)
     _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+    up_to_date = _stage_up_to_date(configured / "dawn.md", _DAWN_BODY)
+    unrelated = configured / "keep.bin"
+    unrelated.write_bytes(_UNRELATED_BYTES)
     before = _fragment_digests(vault)
 
     with _content_lock_held_elsewhere(vault):
@@ -2309,6 +2400,9 @@ def test_a_busy_content_lock_refuses_with_its_own_reason_and_refetches_next_time
     assert refused["reason"] != drive_tools.SYNC_BUSY_REASON
     assert _fragment_digests(vault) == before
     assert not (configured / "ridge.md").exists()
+    assert up_to_date.read_bytes() == _DAWN_BODY
+    assert up_to_date.stat().st_mtime == _MODIFIED.timestamp()
+    assert unrelated.read_bytes() == _UNRELATED_BYTES
 
     retried = _sync_tool(vault)
 
@@ -2375,17 +2469,202 @@ def test_an_index_lock_timeout_inside_the_sync_hold_is_not_reported_as_busy(
         monkeypatch,
         _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY}),
     )
-
-    def _index_lock_times_out(**_kwargs: Any) -> None:
-        """Time out the way a contended id-index lock does mid-ingest.
-
-        Raises:
-            VaultLockTimeoutError: Always.
-        """
-        msg = "id-index lock busy"
-        raise VaultLockTimeoutError(msg)
-
     monkeypatch.setattr(drive_tools, "run_ingest", _index_lock_times_out)
 
     with pytest.raises(VaultLockTimeoutError, match="id-index lock busy"):
         _sync_tool(vault)
+
+
+def test_the_deferred_ingest_record_admits_only_files_still_inside_staging(
+    tmp_path: Path,
+) -> None:
+    """The sidecar is vault data, so every entry is confined before it is trusted.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+    """
+    vault_path = tmp_path / "vault"
+    staging = tmp_path / "staging"
+    (staging / "sub").mkdir(parents=True)
+    (staging / "kept.md").write_bytes(_PLAIN_BODY)
+    (staging / "sub" / "nested.md").write_bytes(_DAWN_BODY)
+    (tmp_path / "outside.md").write_bytes(_EDITED_BODY)
+    sidecar = drive_tools._deferred_ingest_path(vault_path)
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(
+        json.dumps(["kept.md", "../outside.md", "gone.md", 7, "sub/nested.md"]),
+        encoding="utf-8",
+    )
+
+    loaded = drive_tools._load_deferred(vault_path, staging)
+
+    assert loaded == (staging / "kept.md", staging / "sub" / "nested.md")
+    assert sidecar.name == "gdrive.pending.json"
+    assert sidecar.parent == (vault_path / _GDRIVE_LEDGER_RELPATH).parent
+
+
+@pytest.mark.parametrize("payload", ["not json {", '{"kept.md": true}'])
+def test_an_unusable_deferred_ingest_record_defers_nothing(
+    tmp_path: Path,
+    payload: str,
+) -> None:
+    """A corrupt or wrongly shaped sidecar is read as empty, never as a crash.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+        payload: The sidecar's bytes.
+    """
+    vault_path = tmp_path / "vault"
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "kept.md").write_bytes(_PLAIN_BODY)
+    sidecar = drive_tools._deferred_ingest_path(vault_path)
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(payload, encoding="utf-8")
+
+    assert drive_tools._load_deferred(vault_path, staging) == ()
+
+
+def test_saving_an_empty_deferral_clears_the_record(tmp_path: Path) -> None:
+    """Entries are stored relative to staging, and nothing owed removes the file.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+    """
+    vault_path = tmp_path / "vault"
+    staging = tmp_path / "staging"
+    sidecar = drive_tools._deferred_ingest_path(vault_path)
+
+    drive_tools._save_deferred(
+        vault_path,
+        staging,
+        [staging / "b.md", staging / "a" / "c.md", staging / "b.md"],
+    )
+
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == ["a/c.md", "b.md"]
+
+    drive_tools._save_deferred(vault_path, staging, ())
+
+    assert not sidecar.exists()
+
+
+def test_a_content_busy_sync_keeps_an_overwritten_staged_file_and_ingests_it_next(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy refusal never removes a staged file an earlier sync left there.
+
+    A file edited in Drive is re-downloaded *over* its staged copy. Unlinking
+    it on a content-busy refusal would send the one signal staging reserves
+    for a Drive deletion, and a ``creek ingest --type markdown`` of staging
+    would then soft-tomb its fragment. So the refused run discards only the
+    file it newly created; the overwritten one keeps its new bytes and Drive's
+    own ``modified_time`` (never a rewound mtime, which the fragment id is
+    derived from), and the next sync ingests it even though the downloader's
+    mtime check now skips it. An up-to-date skipped file and an unrelated
+    staged file are untouched throughout.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    _connect(token_path)
+    stub = _StubDrive(
+        [_drive_file("id-1", "ridge.md"), _drive_file("id-2", "dawn.md")],
+        {"id-1": _PLAIN_BODY, "id-2": _DAWN_BODY},
+    )
+    _stubbed(monkeypatch, stub)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+    first = _sync_tool(vault)
+    assert first["fragments_created"] == 2, first
+    unrelated = configured / "keep.bin"
+    unrelated.write_bytes(_UNRELATED_BYTES)
+    _edited_in_drive(stub, "id-1", _EDITED_BODY)
+    stub.listing.append(_drive_file("id-3", "fresh.md"))
+    stub.bodies["id-3"] = _DAWN_BODY.replace(b"dawn", b"fresh")
+    before = _fragment_digests(vault)
+
+    with _content_lock_held_elsewhere(vault):
+        refused = _sync_tool(vault)
+
+    assert refused["reason"] == CONTENT_MUTATION_BUSY_REASON, refused
+    assert _fragment_digests(vault) == before
+    overwritten = configured / "ridge.md"
+    assert overwritten.read_bytes() == _EDITED_BODY
+    assert overwritten.stat().st_mtime == _EDITED.timestamp()
+    assert not (configured / "fresh.md").exists()
+    assert (configured / "dawn.md").read_bytes() == _DAWN_BODY
+    assert unrelated.read_bytes() == _UNRELATED_BYTES
+
+    retried = _sync_tool(vault)
+
+    assert retried["status"] == "ok", retried
+    assert retried["fragments_created"] == 1
+    assert retried["fragments_updated"] == 1
+    assert len(_fragments_carrying(vault, _EDITED_MARKER)) == 1
+    assert stub.downloads == ["id-1", "id-2", "id-1", "id-3", "id-3"]
+    assert unrelated.read_bytes() == _UNRELATED_BYTES
+
+    settled = _sync_tool(vault)
+
+    assert settled["files_fetched"] == 0, settled
+    assert settled["fragments_created"] == 0
+    assert settled["fragments_updated"] == 0
+    assert settled["fragments_unchanged"] == 0
+
+
+def test_a_content_busy_sync_never_reads_as_a_deletion_to_a_staging_ingest(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented ``creek ingest --type markdown`` of staging tombs nothing.
+
+    The end-to-end shape of the hazard: staging is ingested as a markdown
+    directory, the file is edited in Drive, a sync is refused as content-busy,
+    and staging is ingested again before any later sync. Had the refusal
+    unlinked the overwritten file, that second directory pass would see it
+    missing and soft-tomb a fragment nobody deleted.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    _connect(token_path)
+    stub = _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
+    _stubbed(monkeypatch, stub)
+    _shorten_lock_wait(monkeypatch, "creek.vault.mutations")
+    assert _sync_tool(vault)["status"] == "ok"
+
+    def _ingest_staging() -> Any:
+        """Run the documented markdown directory ingest over staging.
+
+        Returns:
+            The ingest result.
+        """
+        return run_ingest(
+            ingestor_cls=INGESTOR_REGISTRY["markdown"],
+            source_type="markdown",
+            input_path=configured,
+            vault_path=vault,
+        )
+
+    assert _ingest_staging().created == 1
+    _edited_in_drive(stub, "id-1", _EDITED_BODY)
+
+    with _content_lock_held_elsewhere(vault):
+        refused = _sync_tool(vault)
+    assert refused["reason"] == CONTENT_MUTATION_BUSY_REASON, refused
+
+    again = _ingest_staging()
+
+    orphaned = vault / "10-Liminal" / "Orphaned"
+    assert again.tombed == 0
+    assert sorted(orphaned.rglob("*.md")) == []

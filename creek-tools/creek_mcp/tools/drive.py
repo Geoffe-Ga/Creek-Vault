@@ -66,6 +66,7 @@ single-file input is what this path actually relies on.)
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import ExitStack
 from pathlib import Path
@@ -73,6 +74,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from yaml import YAMLError
 
+from creek._fsio import atomic_write_text
 from creek._fslock import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     VaultLockTimeoutError,
@@ -547,24 +549,153 @@ def _sync_lock_path(vault_path: Path) -> Path:
     return SourceLedger.path_for(vault_path, DRIVE_LEDGER_SOURCE).with_suffix(".lock")
 
 
-def _discard_unconsumed(paths: Iterable[Path]) -> None:
-    """Remove staged files this run fetched but could not ingest (#2079).
+def _deferred_ingest_path(vault_path: Path) -> Path:
+    """Return the sidecar listing staged files a refused sync could not ingest.
 
-    The downloader stamps each file with Drive's ``modified_time`` and skips any
-    staged file at least that new, so a file left behind by a run whose ingest
-    was refused would be skipped by every later sync and never become a
-    fragment. Unlinking makes the next sync fetch it again.
-
-    Rewinding the mtime instead would be unsafe: the ingestors derive a unit's
-    timestamp — and with it the fragment id — from the file's ``st_mtime``
-    (``creek/ingest/base.py``), so anything reading staging before the next
-    sync would mint epoch-dated fragments.
+    Beside the Drive ledger and ``gdrive.lock``
+    (``00-Creek-Meta/State/ingest/gdrive.pending.json``) and, like the ledger,
+    only ever read or written under ``gdrive.lock``. Its suffix is not
+    ``.jsonl``, so nothing that enumerates ledgers mistakes it for one.
 
     Args:
-        paths: The files this run downloaded.
+        vault_path: Vault root.
+
+    Returns:
+        The sidecar path. It need not exist.
     """
-    for path in paths:
-        path.unlink(missing_ok=True)
+    return SourceLedger.path_for(vault_path, DRIVE_LEDGER_SOURCE).with_suffix(
+        ".pending.json"
+    )
+
+
+def _staged_files(staging: Path) -> frozenset[Path]:
+    """Snapshot every file currently staged under *staging*.
+
+    Taken before a download so that a refused run can tell the files it
+    *created* from the ones it overwrote (#2079). One ``stat`` per staged file,
+    the same order of work the downloader's own skip check already does.
+
+    Args:
+        staging: Where the mirror lives.
+
+    Returns:
+        The staged files, spelled as the downloader spells them
+        (``staging / relative path``), or an empty set before the first sync.
+    """
+    if not staging.is_dir():
+        return frozenset()
+    return frozenset(path for path in staging.rglob("*") if path.is_file())
+
+
+def _confined_staged_file(staging: Path, entry: object) -> Path | None:
+    """Return *entry* as a staged file, or ``None`` if it is not one.
+
+    The sidecar lives in the vault rather than in code, so each entry is
+    checked as untrusted: a relative POSIX path that resolves inside
+    *staging* and names a file that is still there. A file a Drive deletion
+    has since removed simply drops out.
+
+    Args:
+        staging: Where the mirror lives.
+        entry: One decoded sidecar entry.
+
+    Returns:
+        The staged path, or ``None``.
+    """
+    if not isinstance(entry, str):
+        return None
+    candidate = staging / entry
+    if not candidate.resolve().is_relative_to(staging.resolve()):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _load_deferred(vault_path: Path, staging: Path) -> tuple[Path, ...]:
+    """Return the staged files earlier refused syncs left for this one to ingest.
+
+    Args:
+        vault_path: Vault root.
+        staging: Where the mirror lives.
+
+    Returns:
+        The deferred files that still exist in *staging*, in recorded order.
+        Empty when there is no sidecar, or when it cannot be read — logged,
+        because the files then wait for their next edit in Drive.
+    """
+    sidecar = _deferred_ingest_path(vault_path)
+    try:
+        entries = json.loads(sidecar.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+    except (OSError, ValueError):
+        logger.warning("Drive sync could not read its deferred-ingest list")
+        return ()
+    if not isinstance(entries, list):
+        return ()
+    confined = (_confined_staged_file(staging, entry) for entry in entries)
+    return tuple(path for path in confined if path is not None)
+
+
+def _save_deferred(vault_path: Path, staging: Path, paths: Iterable[Path]) -> None:
+    """Record *paths* for the next sync to ingest, or clear the record.
+
+    Args:
+        vault_path: Vault root.
+        staging: Where the mirror lives; entries are stored relative to it.
+        paths: The staged files still owed an ingest. Empty clears the sidecar.
+    """
+    sidecar = _deferred_ingest_path(vault_path)
+    entries = sorted({path.relative_to(staging).as_posix() for path in paths})
+    if not entries:
+        sidecar.unlink(missing_ok=True)
+        return
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(sidecar, json.dumps(entries, indent=2) + "\n")
+
+
+def _defer_unconsumed(
+    fetched: Iterable[Path],
+    *,
+    existed: frozenset[Path],
+    deferred: Iterable[Path],
+    staging: Path,
+    vault_path: Path,
+) -> None:
+    """Set aside what a content-busy run fetched but could not ingest (#2079).
+
+    The downloader stamps each file with Drive's ``modified_time`` and skips any
+    staged file at least that new, so a fetched file left as it is would be
+    skipped by every later sync and never become a fragment. The two kinds of
+    fetched file are therefore handled differently:
+
+    * A file this run **created** is unlinked. Staging is exactly as it was
+      before the run, and the next sync fetches the file again.
+    * A file this run **overwrote** — already staged, edited in Drive since —
+      is kept, with its new bytes and Drive's own ``modified_time``, and
+      recorded in the deferred-ingest sidecar so the next sync ingests it
+      although the skip check passes over it. Unlinking it instead would send
+      the signal staging reserves for a Drive *deletion*: a ``creek ingest
+      --type markdown`` of staging would soft-tomb its fragment.
+
+    Rewinding the mtime instead would be unsafe either way: the ingestors
+    derive a unit's timestamp — and with it the fragment id — from the file's
+    ``st_mtime`` (``creek/ingest/base.py``), so anything reading staging before
+    the next sync would mint wrongly dated fragments.
+
+    Args:
+        fetched: The files this run downloaded.
+        existed: Every file staged before this run's download began.
+        deferred: Files earlier refused runs deferred; still owed an ingest.
+        staging: Where the mirror lives.
+        vault_path: Vault root.
+    """
+    overwritten: list[Path] = []
+    for path in fetched:
+        if path in existed:
+            overwritten.append(path)
+        else:
+            path.unlink(missing_ok=True)
+    _save_deferred(vault_path, staging, (*deferred, *overwritten))
 
 
 def _locked_download_and_ingest(
@@ -587,8 +718,11 @@ def _locked_download_and_ingest(
     Only the ingest additionally holds the vault content-mutation lock
     (#2079), nested inside ``gdrive.lock`` and never around the download, so
     the network phase cannot stall journal writes, uploads, classify or link.
-    When that lock is busy, the files this run fetched are discarded (see
-    :func:`_discard_unconsumed`) so the next sync fetches them again.
+    When that lock is busy, what this run fetched is set aside (see
+    :func:`_defer_unconsumed`): a file it created is unlinked so the next sync
+    fetches it again, and a file it overwrote is kept and recorded so the next
+    sync ingests it. That next ingest covers this run's downloads plus every
+    file a refused run deferred.
 
     Args:
         client: The Drive backend.
@@ -621,17 +755,31 @@ def _locked_download_and_ingest(
             )
         except VaultLockTimeoutError as exc:
             raise _SyncLockBusyError from exc
+        existed = _staged_files(staging)
         fetched = _download(client, drive, staging)
         if fetched is None:
             return None, None
+        deferred = _load_deferred(vault_path, staging)
         try:
             with hold_content_mutation(vault_path):
-                return fetched, _ingest_downloaded(fetched[0], vault_path)
+                tally = _ingest_downloaded(
+                    tuple(dict.fromkeys((*fetched[0], *deferred))), vault_path
+                )
         except ContentMutationBusyError:
             # Acquisition only: the ingest never started, so every file this
-            # run fetched is still unconsumed.
-            _discard_unconsumed(fetched[0])
+            # run fetched — and every file an earlier refusal deferred — is
+            # still unconsumed.
+            _defer_unconsumed(
+                fetched[0],
+                existed=existed,
+                deferred=deferred,
+                staging=staging,
+                vault_path=vault_path,
+            )
             raise
+        if tally is not None:
+            _save_deferred(vault_path, staging, ())
+        return fetched, tally
 
 
 def drive_sync_tool(
@@ -669,8 +817,10 @@ def drive_sync_tool(
     and is waited on by — every other content writer while it runs. A sync
     that cannot take that lock within the bound is refused with
     :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON`, distinct from
-    :data:`SYNC_BUSY_REASON`, and leaves nothing staged for the skip check to
-    starve; a lock timeout raised *under* the ingest propagates.
+    :data:`SYNC_BUSY_REASON`. It leaves nothing for the skip check to starve
+    and removes no file an earlier sync staged: a file it newly fetched is
+    discarded, one it overwrote is kept and ingested by the next sync. A lock
+    timeout raised *under* the ingest propagates.
 
     An earlier version of this note went on to say those three "still race
     each other through the same ``run_ingest`` seam". That was wrong twice
