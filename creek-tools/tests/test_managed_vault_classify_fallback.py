@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Final
 import frontmatter
 import pytest
 
+from creek.classify.classify_engine import LLM_PROVIDER_UNAVAILABLE_REASON
 from creek.classify.llm.consent import MANAGED_VAULT_ENV
 from creek.models import Frequency
 from creek_mcp.httpapi import pipeline as pipeline_module
@@ -184,7 +185,7 @@ def test_an_unavailable_llm_pass_is_still_refused_without_the_fallback(
     )
 
     assert result["status"] == "refused"
-    assert "unavailable" in str(result["reason"])
+    assert result["reason"] == LLM_PROVIDER_UNAVAILABLE_REASON
     assert _frequency_of(fragment) == Frequency.UNCLASSIFIED.value
 
 
@@ -201,7 +202,7 @@ def test_the_fallback_runs_the_rules_pass_and_says_so(vault: Path) -> None:
 
     assert result["status"] == "ok"
     assert result["fallback_from"] == "llm"
-    assert "unavailable" in str(result["fallback_reason"])
+    assert result["fallback_reason"] == LLM_PROVIDER_UNAVAILABLE_REASON
     assert result["classified"] == 1
     assert result["inference_source"] is None
     assert _frequency_of(fragment) == Frequency.F3.value
@@ -265,8 +266,7 @@ def test_a_self_hosted_vault_llm_job_fails_and_records_the_refusal(
     }
     record = _stored_job(vault, job_id)
     assert record["state"] == "failed"
-    assert record["failure_reason"].startswith("refused: ")
-    assert "unavailable" in record["failure_reason"]
+    assert record["failure_reason"] == f"refused: {LLM_PROVIDER_UNAVAILABLE_REASON}"
     assert _frequency_of(fragment) == Frequency.UNCLASSIFIED.value
 
 

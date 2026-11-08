@@ -84,6 +84,7 @@ from uuid import UUID
 from pydantic import BaseModel, ValidationError
 
 from creek.classify.llm.consent import is_managed_vault
+from creek.classify.llm.providers import REQUEST_KEY_REJECTED_REASON
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek.link.embeddings import (
     EMBEDDING_MODEL_UNAVAILABLE_REASON,
@@ -123,7 +124,7 @@ from creek_mcp.httpapi.jobs import (
 )
 from creek_mcp.httpapi.vault import configured_vault, request_key_of
 from creek_mcp.tier_ceiling import TierCeiling
-from creek_mcp.tools.classify import REQUEST_KEY_REJECTED_REASON, classify_tool
+from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.handshake import vault_available
 from creek_mcp.tools.link import link_tool
 
@@ -165,10 +166,13 @@ def pipeline_refusal_code(reason: str) -> ErrorCode:
 
     Total over what they can return, and failing closed to ``internal_error``:
     a reason this adapter cannot classify is one it must not narrate. That
-    fallthrough is load-bearing rather than defensive — ``classify_tool``
-    renders an unreachable LLM provider by returning ``str(exc)``, which is
-    arbitrary text from a provider client and exactly the material that must
-    never reach a body.
+    fallthrough is load-bearing rather than defensive. ``classify_tool`` now
+    answers an unreachable LLM provider with the fixed
+    :data:`~creek.classify.classify_engine.LLM_PROVIDER_UNAVAILABLE_REASON`
+    (#2073), not the engine's ``str(exc)``, and that constant is deliberately
+    left unmapped here so it still fails closed; the fallthrough is what keeps
+    any future reason — fixed or not — from being narrated before someone
+    decides on purpose what it should publish.
 
     A timed-out vault content lock is the tools' fixed
     :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON` and maps to

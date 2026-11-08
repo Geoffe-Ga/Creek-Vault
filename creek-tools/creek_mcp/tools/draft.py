@@ -81,10 +81,17 @@ site, all of them load-bearing:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import frontmatter
+import httpx
 
+from creek.classify.llm.providers import (
+    REQUEST_KEY_REJECTED_REASON,
+    RequestKeyRejectedError,
+)
+from creek.classify.llm.router import IntimateRoutingError
 from creek.classify.privacy_filter import max_source_tier, source_tiers
 from creek.config import load_vault_config
 from creek.generate.ai_style.guard import VOICE_GUARD_STATUS_KEY
@@ -118,6 +125,39 @@ if TYPE_CHECKING:
     from creek_mcp.provenance import InferenceProvenance
 
 TOOL_NAME = "creek.draft"
+
+logger = logging.getLogger(__name__)
+
+DRAFT_PROVIDER_UNAVAILABLE_REASON: Final[str] = "LLM provider unavailable for draft"
+"""The fixed refusal when the draft provider could not be built (#2073).
+
+Answered for any failure of the tier-keyed factory other than the router's
+:class:`~creek.classify.llm.router.IntimateRoutingError`: a provider that is
+unavailable or not the pinned model, or a constructor that refused (a missing
+key or consent). It is the prefix of the server's own
+``LLM provider unavailable for draft. Check ...`` text on purpose; the
+remediation half of that text now rides only the operator log's traceback.
+"""
+
+DRAFT_PROVIDER_FAILED_REASON: Final[str] = "LLM provider call failed for draft"
+"""The fixed refusal when the draft provider was built but the call failed (#2073).
+
+Distinct from :data:`DRAFT_PROVIDER_UNAVAILABLE_REASON` because a provider that
+answered with a 4xx, returned an empty body or dropped the connection is not
+one that is missing. The vendor's own message — which
+:func:`creek.classify.llm.providers._error_detail` forwards for a 4xx — and an
+Ollama URL ride only the operator log's traceback, never the refusal.
+"""
+
+_PROVIDER_FAILURES: Final[tuple[type[Exception], ...]] = (RuntimeError, httpx.HTTPError)
+"""What a draft provider raises: SDK errors as ``RuntimeError``, Ollama's as ``httpx``.
+
+``httpx.HTTPError`` is not a ``RuntimeError``, so before #2073 an Ollama
+transport or status error — including
+:class:`~creek.classify.llm.local_boundary.NonLoopbackOllamaError` — escaped
+this tool and FastMCP served it, URL and all, as
+``Error executing tool creek.draft: ...``.
+"""
 
 DRAFT_STAGES: Final[tuple[CompositionStage, ...]] = tuple(CompositionStage)
 """The six boundaries a ``creek.draft`` call reports, in order (#1966)."""
@@ -315,11 +355,14 @@ def draft_tool(
         when recorded, ``inference_source``), ``empty`` when mining surfaced
         no seeds, or a
         structured ``refused`` response for an out-of-range *index*, an
-        unavailable provider, the router's
-        :class:`~creek.classify.llm.router.IntimateRoutingError` when
-        intimate sources have no local backend to fall back to, or a
-        generator ``RuntimeError``. No refusal reason names a fragment or
-        its tier.
+        unavailable provider (:data:`DRAFT_PROVIDER_UNAVAILABLE_REASON`), the
+        router's :class:`~creek.classify.llm.router.IntimateRoutingError`
+        when intimate sources have no local backend to fall back to, a
+        writer's key its vendor refused
+        (:data:`~creek.classify.llm.providers.REQUEST_KEY_REJECTED_REASON`),
+        or a failed provider call (:data:`DRAFT_PROVIDER_FAILED_REASON`). No
+        refusal reason names a fragment, its tier, or the provider's own
+        error text (#2073).
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
@@ -354,17 +397,15 @@ def draft_tool(
     tier = _source_routing_tier(vault_path, idea, privacy_tier_ceiling)
     try:
         llm = llm_factory(tier)
-    except RuntimeError as exc:
+    except _PROVIDER_FAILURES as exc:
         # ``IntimateRoutingError`` is a ``RuntimeError`` subclass, so this is
         # what turns "intimate content and no local backend configured" into a
         # structured refusal rather than an exception across the MCP boundary
-        # (#958). A plainly unavailable provider takes the same path. Kept as
-        # its own narrow ``try`` so ``generator`` below cannot be
-        # possibly-unbound.
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            reason=str(exc),
+        # (#958). A plainly unavailable provider takes the same path, with a
+        # fixed reason (#2073). Kept as its own narrow ``try`` so ``generator``
+        # below cannot be possibly-unbound.
+        return _provider_refusal(
+            exc, privacy_tier_ceiling, default=DRAFT_PROVIDER_UNAVAILABLE_REASON
         )
     # The vault's own ``creek_config.yaml`` (not the bare process-wide
     # ``load_config()`` the other tool wrappers use) so an operator's
@@ -386,11 +427,9 @@ def draft_tool(
     )
     try:
         draft = generator.generate_draft(idea, vault_path=vault_path)
-    except RuntimeError as exc:
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            reason=str(exc),
+    except _PROVIDER_FAILURES as exc:
+        return _provider_refusal(
+            exc, privacy_tier_ceiling, default=DRAFT_PROVIDER_FAILED_REASON
         )
     source = None if provenance is None else provenance.source
     saved = generator.save_draft(draft, vault_path, inference_source=source)
@@ -408,6 +447,54 @@ def draft_tool(
     if source is not None:
         response[INFERENCE_SOURCE_FRONTMATTER_KEY] = source
     return response
+
+
+def _provider_reason(exc: Exception, *, default: str) -> str:
+    """Return the refusal reason for a draft provider failure.
+
+    Args:
+        exc: What the factory or the generate call raised.
+        default: The fixed reason for the branch that caught it.
+
+    Returns:
+        The router's own message for
+        :class:`~creek.classify.llm.router.IntimateRoutingError` — the residual
+        the module docstring documents, deliberately not widened —
+        :data:`~creek.classify.llm.providers.REQUEST_KEY_REJECTED_REASON` for a
+        writer's key its vendor refused, and *default* for anything else.
+    """
+    if isinstance(exc, IntimateRoutingError):
+        return str(exc)
+    if isinstance(exc, RequestKeyRejectedError):
+        return REQUEST_KEY_REJECTED_REASON
+    return default
+
+
+def _provider_refusal(
+    exc: Exception, ceiling: TierCeiling, *, default: str
+) -> dict[str, Any]:
+    """Log a provider failure for the operator and return its fixed refusal.
+
+    The record's message carries the exception's type name only; its text — a
+    vendor 4xx message, an Ollama URL — rides the traceback, which is passed
+    explicitly rather than read from the handler's context (#2073).
+
+    Args:
+        exc: What the factory or the generate call raised.
+        ceiling: The caller's declared tier ceiling, echoed by the refusal.
+        default: The fixed reason for the branch that caught it.
+
+    Returns:
+        The structured ``refused`` response.
+    """
+    logger.exception(
+        "draft refused on a provider failure: %s", type(exc).__name__, exc_info=exc
+    )
+    return refusal_response(
+        tool=TOOL_NAME,
+        ceiling=ceiling,
+        reason=_provider_reason(exc, default=default),
+    )
 
 
 def _voice_guard_status(saved: Path) -> str | None:

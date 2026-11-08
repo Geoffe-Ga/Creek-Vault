@@ -46,7 +46,7 @@ import frontmatter
 import pytest
 
 from creek._fslock import VaultLockTimeoutError
-from creek.classify.classify_engine import run_classify
+from creek.classify.classify_engine import LLM_PROVIDER_UNAVAILABLE_REASON, run_classify
 from creek.classify.llm import LLMClassificationResult
 from creek.classify.rules import FREQUENCY_SIGNALS, WAVELENGTH_PHASE_SIGNALS
 from creek.config import EmbeddingsConfig, load_vault_config
@@ -1024,6 +1024,13 @@ def test_pipeline_is_a_published_capability_at_the_current_minor() -> None:
         ),
         (f"x {EMBEDDING_MODEL_UNAVAILABLE_REASON}", ErrorCode.INTERNAL_ERROR),
         (f"{EMBEDDING_MODEL_UNAVAILABLE_REASON} at /x", ErrorCode.INTERNAL_ERROR),
+        (LLM_PROVIDER_UNAVAILABLE_REASON, ErrorCode.INTERNAL_ERROR),
+        (
+            f"provider said {LLM_PROVIDER_UNAVAILABLE_REASON} at /x",
+            ErrorCode.INTERNAL_ERROR,
+        ),
+        (f"x {LLM_PROVIDER_UNAVAILABLE_REASON}", ErrorCode.INTERNAL_ERROR),
+        (f"{LLM_PROVIDER_UNAVAILABLE_REASON} at /x", ErrorCode.INTERNAL_ERROR),
     ],
     ids=[
         "unknown-method",
@@ -1036,6 +1043,10 @@ def test_pipeline_is_a_published_capability_at_the_current_minor() -> None:
         "contains-embedding-text",
         "embedding-suffixed-text",
         "embedding-prefixed-text",
+        "llm-provider-unavailable",
+        "contains-llm-unavailable-text",
+        "llm-unavailable-suffixed-text",
+        "llm-unavailable-prefixed-text",
     ],
 )
 def test_pipeline_refusal_code_is_total_and_fails_closed(
@@ -1043,10 +1054,13 @@ def test_pipeline_refusal_code_is_total_and_fails_closed(
 ) -> None:
     """Every refusal maps, and an unrecognised one becomes a server fault.
 
-    The provider case is the one that matters: ``classify_tool`` renders an
-    unreachable LLM provider as ``str(exc)``, which is arbitrary text from a
-    provider client. Falling through to ``internal_error`` is what keeps it
-    from being narrated as a plausible caller-facing refusal — and
+    The provider cases are the ones that matter. ``classify_tool`` used to
+    render an unreachable LLM provider as ``str(exc)``; since #2073 it answers
+    the fixed
+    :data:`~creek.classify.classify_engine.LLM_PROVIDER_UNAVAILABLE_REASON`,
+    which is deliberately left unmapped, so it — and any provider text, fixed
+    or not — still falls through to ``internal_error`` rather than being
+    narrated as a plausible caller-facing refusal. And
     :func:`~creek_mcp.httpapi.errors.error_response` renders one constant per
     code, so the text itself never reaches a body.
 
@@ -1055,7 +1069,9 @@ def test_pipeline_refusal_code_is_total_and_fails_closed(
     that a reason merely *containing* either fixed text — which an ``in``,
     ``endswith`` or ``startswith`` match would accept — still fails closed, so
     provider text that happened to quote one is never promoted to a published
-    refusal.
+    refusal. The ``llm-*`` cases pin the unmapped classify constant the same
+    way: exact, contained, suffixed and prefixed, it fails closed — so the day
+    someone maps it, they must do so by exact equality and edit this table.
     """
     assert pipeline_refusal_code(reason) is expected
 
