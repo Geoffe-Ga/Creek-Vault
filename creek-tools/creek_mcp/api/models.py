@@ -57,7 +57,8 @@ import re
 from contextlib import suppress
 from enum import StrEnum
 from ipaddress import ip_address
-from typing import Final, Literal, Self, TypeAlias
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal, Self, TypeAlias
 from urllib.parse import urlparse, urlsplit
 from uuid import UUID
 
@@ -82,6 +83,9 @@ from creek_mcp.contract import CONTRACT_VERSION
 from creek_mcp.mcp_path import is_resource_path
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 # --------------------------------------------------------------------------
 # Version vocabulary
 # --------------------------------------------------------------------------
@@ -101,6 +105,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.28",
     "0.27",
     "0.26",
     "0.25",
@@ -264,6 +269,13 @@ declaring :data:`REQUEST_KEY_REJECTED_SINCE_MINOR`; a ``0.27`` caller meeting
 the same refused key is served the ``503 temporarily_unavailable`` it always
 was, so every response it can reach is byte-identical and ``0.27`` stays in
 the window.
+
+Contract 0.29 (#2075) adds one member, ``busy``, to the closed
+:class:`JobFailureCode` vocabulary ``GET /v1/jobs/{job_id}`` serves. It is
+served only to callers declaring :data:`BUSY_FAILURE_CODE_SINCE_MINOR`; a
+``0.28`` caller whose job met the same content-lock contention is served the
+``failure_code: null`` it always was, so every response it can reach is
+byte-identical and ``0.28`` stays in the window.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -555,6 +567,18 @@ JOB_FAILURE_CODE_SINCE_MINOR: Final[str] = "0.26"
 Older declared minors vendored a closed :class:`JobStatusResponse` without it,
 so the key is omitted for them and their failed body is byte-identical. It is
 a literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
+BUSY_FAILURE_CODE_SINCE_MINOR: Final[str] = "0.29"
+"""First minor that may be served ``failure_code: "busy"`` on a job (#2075).
+
+A caller declaring 0.26 through 0.28 vendored a closed :class:`JobFailureCode`
+holding only ``request_key_rejected``, so a job that ended busy is served to it
+as ``failure_code: null`` — exactly what it received for the same failure
+before — and below 0.26 the key is omitted altogether
+(:data:`JOB_FAILURE_CODE_SINCE_MINOR`). The stored record keeps ``busy``
+whichever minor reads it: the downgrade is a property of the response. It is a
+literal for the reason :data:`_UPLOAD_MINOR` is.
 """
 
 AGENT_MCP_URL_MAX_CHARS: Final[int] = 2048
@@ -2525,18 +2549,48 @@ class JobFailureCode(StrEnum):
     """Why a ``failed`` pipeline job failed, when the caller can act on it (#1877).
 
     Closed and deliberately small: a code is published only for a failure the
-    *caller* can remedy, never for an operator-side fault, whose detail stays
-    in the server log. Any other failure is ``failure_code: null``.
+    *caller* can remedy — including by resubmitting the same request — never
+    for an operator-side fault, whose detail stays in the server log. Any other
+    failure is ``failure_code: null``. Each member is served only to a caller
+    declaring at least the minor it was published at, named below; an earlier
+    caller is served ``null`` for the same failure.
 
     Attributes:
         REQUEST_KEY_REJECTED: The writer's request-scoped provider key
             (ADR-0015) was refused by its vendor with ``401``/``403``. The
             pass stopped at the first refusal, without retrying, and nothing
             it had not yet started was sent. Retrying with the same key will
-            fail the same way; the writer must replace the key.
+            fail the same way; the writer must replace the key. Since
+            contract 0.26.
+        BUSY: Another writer held the vault content-mutation lock past its
+            bounded wait (#2075). The pass takes that lock before touching any
+            fragment, so a timeout taking it means nothing was written; and
+            both passes are idempotent and resumable, so a resubmit converges
+            either way. The condition is transient — the same one the
+            synchronous routes answer ``503 temporarily_unavailable`` — so
+            resubmit the same request, with backoff. Since contract 0.29.
     """
 
     REQUEST_KEY_REJECTED = "request_key_rejected"
+    BUSY = "busy"
+
+
+JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE: Final[Mapping[JobFailureCode, str]] = (
+    MappingProxyType(
+        {
+            JobFailureCode.REQUEST_KEY_REJECTED: JOB_FAILURE_CODE_SINCE_MINOR,
+            JobFailureCode.BUSY: BUSY_FAILURE_CODE_SINCE_MINOR,
+        }
+    )
+)
+"""The first minor each :class:`JobFailureCode` member may be served at.
+
+Total over the enum (a test pins it), so a new member cannot ship without a
+since-minor: a caller whose declared minor is below a member's entry vendored
+a closed vocabulary without it and is served ``failure_code: null`` instead,
+by :func:`creek_mcp.httpapi.pipeline._served_failure_code`. Read-only, because
+the window it encodes is a published fact rather than runtime state.
+"""
 
 
 JobId: TypeAlias = UUID
@@ -2564,8 +2618,9 @@ class JobStatusResponse(_WireModel):
     failure_code: JobFailureCode | None = Field(
         default=None,
         description=(
-            "Why a failed job failed, when the caller can remedy it; null "
-            "otherwise. Since contract 0.26."
+            "Why a failed job failed, when the caller can remedy it, "
+            "including by resubmitting: request_key_rejected since contract "
+            "0.26, busy since 0.29; null otherwise. Since contract 0.26."
         ),
     )
 

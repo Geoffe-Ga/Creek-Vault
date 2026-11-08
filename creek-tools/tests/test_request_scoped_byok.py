@@ -1244,3 +1244,18 @@ def test_a_caller_below_the_failure_code_minor_is_not_shown_it(
 
     assert polled.json()["state"] == "failed"
     assert "failure_code" not in polled.json()
+
+
+def test_a_rejected_key_is_still_named_to_a_caller_before_busy(
+    managed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``request_key_rejected`` is served at ``0.28``, not re-gated with ``busy``.
+
+    Contract 0.29 adds ``busy`` (#2075) and withholds it below its own minor;
+    the code ``0.26`` published must keep being served to every caller from
+    ``0.26`` on, or a ``0.28`` writer stops being told to replace its key.
+    """
+    _, polled, _ = _rejected_job(managed, monkeypatch, minor="0.28")
+
+    assert polled.json()["state"] == "failed"
+    assert polled.json()["failure_code"] == "request_key_rejected"

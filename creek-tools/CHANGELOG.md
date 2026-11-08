@@ -9,6 +9,27 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Contract 0.29.0: a durable job that meets content-lock contention reads
+  `busy` (#2075, follow-up to #2066).** An `llm` classification or
+  `embeddings` link job whose pass timed out on the vault content-mutation
+  lock used to end `failed` with `failure_code: null` — indistinguishable from
+  an operator fault — while the synchronous routes answer the same condition
+  `503 temporarily_unavailable`. `JobFailureCode` gains `busy`, produced by
+  exact equality on the tools' fixed `CONTENT_MUTATION_BUSY_REASON` for both
+  job kinds (the link job used to hard-code a null code); resubmit the same
+  request with backoff. Each code now carries its own since-minor in
+  `JOB_FAILURE_CODE_SINCE_MINOR_BY_CODE`, served through
+  `pipeline._served_failure_code`: a caller declaring `0.26`–`0.28` is served
+  `failure_code: null` for a busy job, byte-identical to before, below `0.26`
+  the key stays absent, and `request_key_rejected` is still served from
+  `0.26`. `0.28` joins `SUPPORTED_CONTRACT_MINORS`; the OpenAPI golden
+  (`openapi-0.29.0.json`) and the `adepthood-v1` bundle are regenerated.
+  **Operator-visible:** the job's private `failure_reason` is unchanged
+  (`refused: vault content mutation busy`), and the record now stores
+  `failure_code: "busy"`. **Rollback hazard:** a pre-0.29 binary cannot parse
+  a stored `busy` record, so polling such a job after a rollback answers
+  `503 unavailable`. **Consumer:** adepthood's `VaultJobFailureCode` must
+  vendor `busy`, treated as retryable, before it declares `0.29`.
 - `creek.draft` and `creek.classify` no longer return provider error text as
   their refusal reason (refs #2073). `creek.draft` was a real leak: a vendor
   4xx message (which `providers._error_detail` forwards) or a rejected request
