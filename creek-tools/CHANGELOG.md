@@ -9,6 +9,18 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `bench eval --reasoning-effort low|medium|high` (OpenAI provider only). A
+  reasoning model behind an OpenAI-compatible endpoint can spend the whole
+  `--max-tokens` budget on hidden reasoning and answer with nothing. Through
+  Privatemode, `glm-5.3` and `glm-5.3-flash` did so even at the 2,048-token
+  ceiling, so an owner-run voice review showed two blank candidates out of three.
+  `LLMConfig` gains an optional `reasoning_effort`, which `OpenAIProvider` sends
+  only when it is set. With no value it passes the SDK's `omit`, so no field
+  reaches the wire and the default request is unchanged. The flag applies to
+  every candidate alike and is refused outside `--mode live --provider openai`
+  rather than ignored. `docs/bench.md` now gives the verified Privatemode proxy
+  steps in place of its placeholder.
+
 - **`creek.reflect` refuses a vault config that cannot load by type name,
   never as `isError` text naming its path (#2091, follow-up to #2083).** The
   MCP tool built its LLM factory and grounding route before `reflect_tool`'s

@@ -229,6 +229,38 @@ class TestOpenAIComplete:
             provider.complete("p", max_tokens=256)
         assert client.chat.completions.create.call_args.kwargs["max_tokens"] == 256
 
+    def test_complete_omits_reasoning_effort_by_default(self, openai_env: None) -> None:
+        """No configured effort passes the SDK's ``omit``, so no field is sent.
+
+        A non-reasoning OpenAI model rejects the field, so the default request
+        must be exactly what it was before the knob existed.
+        """
+        from openai import omit
+
+        client = _make_mock_openai_client("x")
+        with patch("openai.OpenAI", return_value=client):
+            provider = OpenAIProvider(LLMConfig(provider="openai"))
+            provider.complete("p")
+            provider.complete("p", system="be terse")
+        calls = client.chat.completions.create.call_args_list
+        assert len(calls) == 2
+        for call in calls:
+            assert call.kwargs.get("reasoning_effort", omit) is omit
+
+    @pytest.mark.parametrize("system", [None, "be terse"])
+    def test_complete_threads_configured_reasoning_effort(
+        self, openai_env: None, system: str | None
+    ) -> None:
+        """A configured effort reaches the SDK on both message shapes."""
+        client = _make_mock_openai_client("x")
+        with patch("openai.OpenAI", return_value=client):
+            provider = OpenAIProvider(
+                LLMConfig(provider="openai", reasoning_effort="low")
+            )
+            provider.complete("p", system=system)
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "low"
+
     def test_complete_includes_system_message(self, openai_env: None) -> None:
         """A system prefix is sent as a leading system message."""
         client = _make_mock_openai_client("x")
