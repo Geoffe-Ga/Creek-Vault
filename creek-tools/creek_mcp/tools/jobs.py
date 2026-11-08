@@ -61,8 +61,7 @@ def unavailable_refusal(tool: str, ceiling: TierCeiling) -> dict[str, Any]:
     Returns:
         The refusal payload.
     """
-    return {
-        **refusal_response(tool=tool, ceiling=ceiling, reason=UNAVAILABLE_REASON),
+    return refusal_response(tool=tool, ceiling=ceiling, reason=UNAVAILABLE_REASON) | {
         "code": ErrorCode.UNAVAILABLE.value,
     }
 

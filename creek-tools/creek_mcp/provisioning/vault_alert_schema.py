@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum, unique
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from creek_mcp.provisioning.fleet_schema import timestamp
 
@@ -188,8 +188,8 @@ def list_vault_alert_status(
 
 def _owed_counts(stored: str) -> dict[str, int]:
     """Decode one stored owed-count column."""
-    decoded: dict[str, int] = json.loads(stored)
-    return {str(kind): int(count) for kind, count in decoded.items()}
+    decoded: dict[str, Any] = json.loads(stored)
+    return {kind: int(count) for kind, count in decoded.items()}
 
 
 def running_allocation_ids(connection: sqlite3.Connection) -> frozenset[str]:

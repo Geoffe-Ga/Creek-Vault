@@ -494,7 +494,7 @@ def _ingest_validated_entry(
         "fragment_id": fragment_id,
         "action": _action_of(result),
         "tier": entry_tier.value,
-        "warnings": list(result.ceiling_safe_warnings),
+        "warnings": result.ceiling_safe_warnings.copy(),
     }
 
 

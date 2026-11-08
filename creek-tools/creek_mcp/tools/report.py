@@ -186,14 +186,10 @@ def _generate_voice(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per rendered profile.
     """
-    return list(
-        VoiceProfileGenerator(
-            override=request.override,
-            audience_weighting=_vault_config(request).voice_audience_weighting,
-        ).generate_all_profiles(
-            request.vault_path,
-        ),
-    )
+    return VoiceProfileGenerator(
+        override=request.override,
+        audience_weighting=_vault_config(request).voice_audience_weighting,
+    ).generate_all_profiles(request.vault_path)
 
 
 def _generate_lexicon(request: _ReportRequest) -> list[Path]:
@@ -209,7 +205,7 @@ def _generate_lexicon(request: _ReportRequest) -> list[Path]:
         request.vault_path,
         override=request.override,
     )
-    return list(written_paths)
+    return written_paths
 
 
 def _generate_decisions(request: _ReportRequest) -> list[Path]:
@@ -251,14 +247,10 @@ def _generate_rhetorical_patterns(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per rendered note.
     """
-    return list(
-        VoiceProfileGenerator(
-            override=request.override,
-            audience_weighting=_vault_config(request).voice_audience_weighting,
-        ).generate_rhetorical_patterns(
-            request.vault_path,
-        ),
-    )
+    return VoiceProfileGenerator(
+        override=request.override,
+        audience_weighting=_vault_config(request).voice_audience_weighting,
+    ).generate_rhetorical_patterns(request.vault_path)
 
 
 def _generate_mode_profiles(request: _ReportRequest) -> list[Path]:
@@ -270,11 +262,9 @@ def _generate_mode_profiles(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per rendered profile.
     """
-    return list(
-        ModeProfileGenerator().generate_mode_profiles(
-            request.vault_path,
-            override=request.override,
-        ),
+    return ModeProfileGenerator().generate_mode_profiles(
+        request.vault_path,
+        override=request.override,
     )
 
 
@@ -356,9 +346,7 @@ def _generate_paradox(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per written note; empty when no contradictory pair is found.
     """
-    return list(
-        generate_paradoxes(request.vault_path, _vault_config(request).embeddings),
-    )
+    return generate_paradoxes(request.vault_path, _vault_config(request).embeddings)
 
 
 def _generate_synchronicity(request: _ReportRequest) -> list[Path]:
@@ -370,8 +358,8 @@ def _generate_synchronicity(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per written note; empty when no pair qualifies.
     """
-    return list(
-        generate_synchronicities(request.vault_path, _vault_config(request).embeddings),
+    return generate_synchronicities(
+        request.vault_path, _vault_config(request).embeddings
     )
 
 
