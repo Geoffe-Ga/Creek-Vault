@@ -26,12 +26,14 @@ import frontmatter
 import pytest
 from typer.testing import CliRunner
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.classify.llm.router import IntimateRoutingError, ModelRouter
 from creek.cli import app
 from creek.compile.engine import (
     PARADOX_LOG_RELPATH,
     CompileLLM,
     CompileResult,
+    SourceAdmissionRefusedError,
     _load_fragments_for_compile,
     compile_fragments,
     compile_to_vault,
@@ -49,11 +51,17 @@ from creek.models import (
     PrivacyTier,
     SourcePlatform,
 )
+from creek.vault.mutations import (
+    CONTENT_MUTATION_LOCK_RELPATH,
+    content_mutation_lock_path,
+)
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
+
+    from creek.classify.privacy_filter import AncestorIndex
 
 
 # ---- Helpers ---------------------------------------------------------------
@@ -2255,6 +2263,187 @@ def test_load_fragments_for_compile_keeps_requested_order_and_duplicates(
         match=re.escape("Fragment(s) not found in vault: x, y, x"),
     ):
         _load_fragments_for_compile(vault, ["x", "a", "y", "x"])
+
+
+class _RecordingAdmission:
+    """A :class:`~creek.compile.engine.SourceAdmission` that records every call.
+
+    Returns a fixed *verdict* and keeps what the engine handed it, so a test
+    can pin both halves of the hook contract (#930): what the engine asks with
+    — the whole-corpus index from its one walk and the ids exactly as
+    requested — and what it does with the answer. ``lock_held`` records,
+    per call, whether the content-mutation lock was held at that moment,
+    probed from the same thread exactly as
+    ``tests/test_mcp_write_tools.py``'s lock test does.
+    """
+
+    def __init__(self, *, verdict: bool, vault: Path) -> None:
+        """Answer every call with *verdict*; probe *vault*'s content lock."""
+        self.verdict = verdict
+        self.vault = vault
+        self.calls: list[tuple[AncestorIndex, list[str]]] = []
+        self.lock_held: list[bool] = []
+
+    def __call__(
+        self, ancestors: AncestorIndex, fragment_ids: Sequence[str], /
+    ) -> bool:
+        """Record the call and the lock state, then return the fixed verdict."""
+        self.calls.append((ancestors, list(fragment_ids)))
+        try:
+            with vault_lock(content_mutation_lock_path(self.vault), timeout=0.0):
+                self.lock_held.append(False)
+        except VaultLockTimeoutError:
+            self.lock_held.append(True)
+        return self.verdict
+
+
+def _vault_files(vault: Path) -> set[Path]:
+    """Return every file under *vault*, vault-relative."""
+    return {path.relative_to(vault) for path in vault.rglob("*") if path.is_file()}
+
+
+def test_compile_to_vault_admission_refusal_precedes_factory_and_target_dir(
+    tmp_path: Path,
+) -> None:
+    """A refusing hook stops the compile before the client, the mkdir and any write.
+
+    Uses a bare ``tmp_path`` rather than the ``vault`` fixture, which
+    pre-creates ``02-Threads/Active``: here the absence of the target
+    directory is the evidence that :func:`_resolve_target_path` never ran.
+    The stub LLM would write a page *and* a paradox, so each missing artefact
+    means the engine stopped, not that it ran and found nothing to write. The
+    one file a refusal may leave is the zero-byte content-mutation lock the
+    engine took before walking.
+    """
+    sealed = _make_fragment(frag_id="frag-sealed", privacy=PrivacyTier.INTIMATE)
+    _write_fragment_to_vault(tmp_path, sealed, _INTIMATE_BODY)
+    before = _vault_files(tmp_path)
+    factory = _TierRecordingFactory(
+        response=_llm_response(
+            [{"id": "c1", "text": "A claim.", "fragment_ids": ["frag-sealed"]}],
+            [{"description": "A tension.", "fragment_ids": ["frag-sealed"]}],
+        ),
+    )
+    admission = _RecordingAdmission(verdict=False, vault=tmp_path)
+
+    with pytest.raises(SourceAdmissionRefusedError) as refused:
+        compile_to_vault(
+            fragment_ids=["frag-sealed"],
+            vault_path=tmp_path,
+            target_kind="thread",
+            target_id="thread-refused",
+            target_title="Refused",
+            llm_factory=factory,
+            admit_sources=admission,
+        )
+
+    assert str(refused.value) == ""
+    assert not isinstance(refused.value, ValueError | RuntimeError)
+    assert len(admission.calls) == 1
+    assert factory.tiers == []
+    assert not (tmp_path / "02-Threads").exists()
+    assert not (tmp_path / PARADOX_LOG_RELPATH).exists()
+    assert _vault_files(tmp_path) - before == {CONTENT_MUTATION_LOCK_RELPATH}
+    assert (tmp_path / CONTENT_MUTATION_LOCK_RELPATH).stat().st_size == 0
+
+
+def test_compile_to_vault_admission_wins_over_missing_id(vault: Path) -> None:
+    """A refusal is raised ahead of the not-found ``ValueError`` (#930).
+
+    The ordering ``creek_mcp.tools.compile`` relies on: were not-found first,
+    a caller could pair one refused id with a batch of guesses and read back
+    which guesses exist.
+    """
+    sealed = _make_fragment(frag_id="frag-sealed", privacy=PrivacyTier.INTIMATE)
+    _write_fragment_to_vault(vault, sealed, _INTIMATE_BODY)
+
+    with pytest.raises(SourceAdmissionRefusedError):
+        compile_to_vault(
+            fragment_ids=["frag-sealed", "frag-missing"],
+            vault_path=vault,
+            target_kind="thread",
+            target_id="thread-x",
+            target_title="X",
+            llm_factory=_TierRecordingFactory(),
+            admit_sources=_RecordingAdmission(verdict=False, vault=vault),
+        )
+
+
+def test_compile_to_vault_admission_sees_the_walked_index_and_requested_ids(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hook gets the one walk's whole-corpus index, the ids as asked, the lock.
+
+    Only the child is named, so the ancestor in the index is evidence the
+    index spans the corpus rather than the request — which #931's ranking
+    needs. The ids keep their order and their repeat, because the hook is
+    handed the request itself, not the loader's internal set. The hook runs
+    exactly once, on the engine's one walk, with the content lock held; and an
+    admitting hook leaves the compile to proceed as before.
+    """
+    _write_ancestry_pair(
+        vault,
+        ancestor_tier=PrivacyTier.OPEN,
+        child_tier=PrivacyTier.OPEN,
+    )
+    real = iter_vault_fragments
+    walks: list[Path] = []
+
+    def _counting(root: Path) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
+        """Record the walked root and delegate to the real loader."""
+        walks.append(root)
+        return real(root)
+
+    monkeypatch.setattr("creek.compile.engine.iter_vault_fragments", _counting)
+    admission = _RecordingAdmission(verdict=True, vault=vault)
+    factory = _TierRecordingFactory()
+
+    compile_to_vault(
+        fragment_ids=["frag-child", "frag-child"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-admitted",
+        target_title="Admitted",
+        llm_factory=factory,
+        admit_sources=admission,
+    )
+
+    assert walks == [vault / "01-Fragments"]
+    assert len(admission.calls) == 1
+    ancestors, requested = admission.calls[0]
+    assert requested == ["frag-child", "frag-child"]
+    assert set(ancestors.entries) == {"frag-ancestor", "frag-child"}
+    assert admission.lock_held == [True]
+    assert factory.tiers == [PrivacyTier.OPEN]
+
+
+def test_compile_to_vault_admitting_hook_reports_missing_ids_unchanged(
+    vault: Path,
+) -> None:
+    """An admitting hook leaves the not-found message byte-identical.
+
+    Rule (b) of ``AncestorIndex.chain_tiers`` lets an unresolvable id through
+    admission precisely so this message still reaches the caller.
+    """
+    _write_fragment_to_vault(vault, _make_fragment(frag_id="frag-open"), "body")
+    factory = _TierRecordingFactory()
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape("Fragment(s) not found in vault: frag-missing"),
+    ):
+        compile_to_vault(
+            fragment_ids=["frag-open", "frag-missing"],
+            vault_path=vault,
+            target_kind="thread",
+            target_id="thread-x",
+            target_title="X",
+            llm_factory=factory,
+            admit_sources=_RecordingAdmission(verdict=True, vault=vault),
+        )
+
+    assert factory.tiers == []
 
 
 def test_compile_to_vault_propagates_the_intimate_routing_refusal(
