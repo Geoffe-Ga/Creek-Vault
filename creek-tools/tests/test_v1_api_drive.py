@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
 import pytest
+from starlette.testclient import TestClient
 
 from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.config import _READONLY_SCOPES, GoogleDriveConfig
@@ -72,6 +73,7 @@ from tests.test_mcp_upload import _content_lock_is_held
 from tests.v1_api_support import (
     DRIVE_CONNECTOR_PATH,
     DRIVE_SYNC_PATH,
+    build_app,
     client,
     envelope,
     headers,
@@ -82,7 +84,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import httpx
-    from starlette.testclient import TestClient
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -2546,6 +2547,101 @@ def test_saving_an_empty_deferral_clears_the_record(tmp_path: Path) -> None:
     drive_tools._save_deferred(vault_path, staging, ())
 
     assert not sidecar.exists()
+
+
+def test_an_index_lock_timeout_under_a_v1_sync_still_answers_503(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On the wire an inner lock timeout is still a retryable 503, not a 500.
+
+    At the tool it propagates rather than claiming either busy reason (see the
+    test above). Over ``/v1`` the request-deadline middleware maps every
+    ``TimeoutError`` that escapes the app — and ``VaultLockTimeoutError`` is
+    one — to ``503 temporarily_unavailable``, which this pins so the published
+    answer cannot drift silently in either direction.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    _connect(token_path)
+    _stubbed(
+        monkeypatch,
+        _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY}),
+    )
+    monkeypatch.setattr(drive_tools, "run_ingest", _index_lock_times_out)
+
+    with TestClient(
+        build_app(vault_path=vault), raise_server_exceptions=False
+    ) as test_client:
+        response = _sync(test_client)
+
+    assert response.status_code == _UNAVAILABLE_STATUS, response.text
+    assert envelope(response)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert str(vault) not in response.text
+    assert "id-index" not in response.text
+
+
+def test_a_held_sync_lock_is_refused_as_sync_busy_at_the_tool(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``gdrive.lock`` timeout is the structured ``SYNC_BUSY_REASON`` refusal.
+
+    Asserted at the tool, not over ``/v1``: there a raw ``VaultLockTimeoutError``
+    escaping the tool is *also* served as ``503 temporarily_unavailable`` by
+    the request-deadline middleware, so the HTTP test cannot tell the refusal
+    apart from the translation having been lost.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    _connect(token_path)
+    stub = _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
+    _stubbed(monkeypatch, stub)
+    monkeypatch.setattr(drive_tools, "_SYNC_LOCK_TIMEOUT_SECONDS", 0.05)
+    content_holds: list[Path] = []
+    real_hold = drive_tools.hold_content_mutation
+
+    def _recorded_hold(vault_path: Path) -> Any:
+        """Record a content-lock acquisition, then take it for real.
+
+        Args:
+            vault_path: The vault whose content lock is taken.
+
+        Returns:
+            The real hold's context manager.
+        """
+        content_holds.append(vault_path)
+        return real_hold(vault_path)
+
+    monkeypatch.setattr(drive_tools, "hold_content_mutation", _recorded_hold)
+    lock_path = vault / "00-Creek-Meta" / "State" / "ingest" / "gdrive.lock"
+
+    with vault_lock(lock_path, timeout=_HELD_LOCK_SECONDS):
+        refused = _sync_tool(vault)
+
+    assert refused == {
+        "status": "refused",
+        "tool": drive_tools.SYNC_TOOL_NAME,
+        "tier_ceiling": "all",
+        "reason": drive_tools.SYNC_BUSY_REASON,
+    }
+    assert stub.downloads == []
+    assert _fragments(vault) == []
+    assert content_holds == []
 
 
 def test_a_content_busy_sync_keeps_an_overwritten_staged_file_and_ingests_it_next(
