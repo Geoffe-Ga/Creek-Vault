@@ -15,6 +15,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
+import httpx
 import pytest
 import yaml
 from starlette.testclient import TestClient
@@ -68,8 +69,6 @@ from tests.v1_api_support import (
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
-
-    import httpx
 
 _OK: Final[int] = 200
 _PRIVACY_REFUSED: Final[int] = 403
@@ -466,6 +465,50 @@ def test_a_factory_that_cannot_be_built_is_retryable(tmp_path: Path) -> None:
 
     assert _code(response) == (_UNAVAILABLE, ErrorCode.TEMPORARILY_UNAVAILABLE.value)
     assert _draft_files(vault) == []
+
+
+_OLLAMA_LEAK: Final[str] = "zz-letter-leak-zz"
+"""A detail an Ollama ``httpx`` error carries that must never be served (#2083)."""
+
+_OLLAMA_URL: Final[str] = "http://10.9.8.7:11434/api/generate"
+"""The non-loopback URL an Ollama ``httpx`` error names; never served (#2083)."""
+
+
+def _ollama_connect_error() -> httpx.ConnectError:
+    """Return the error an unreachable Ollama endpoint raises.
+
+    Returns:
+        An :class:`httpx.ConnectError` naming :data:`_OLLAMA_URL`.
+    """
+    return httpx.ConnectError(f"connect failed for url {_OLLAMA_URL!r} {_OLLAMA_LEAK}")
+
+
+@pytest.mark.parametrize(
+    "spy",
+    [
+        pytest.param(
+            _FactorySpy(completion_error=_ollama_connect_error()), id="completion"
+        ),
+        pytest.param(_FactorySpy(error=_ollama_connect_error()), id="factory-build"),
+    ],
+)
+def test_an_ollama_transport_error_is_retryable_and_stores_nothing(
+    tmp_path: Path, spy: _FactorySpy
+) -> None:
+    """An ``httpx`` failure is the documented retryable ``503``, not a ``500``.
+
+    ``httpx.HTTPError`` is not a ``RuntimeError``, so before #2083 it escaped
+    the letter's dial and the error boundary answered ``500 internal_error``,
+    where ``docs/api.md`` promises an unavailable provider is retryable.
+    """
+    vault = seed_vault(tmp_path / "vault")
+    with _client(vault, spy) as test_client:
+        response = _post(test_client)
+
+    assert _code(response) == (_UNAVAILABLE, ErrorCode.TEMPORARILY_UNAVAILABLE.value)
+    assert _draft_files(vault) == []
+    assert _OLLAMA_LEAK not in response.text
+    assert _OLLAMA_URL not in response.text
 
 
 def _cloud_generation_vault(tmp_path: Path) -> Path:

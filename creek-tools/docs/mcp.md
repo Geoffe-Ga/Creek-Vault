@@ -285,7 +285,7 @@ confinement boundary.
 
 | Tool           | Inputs                                                                  | Purpose                                                                       |
 |----------------|------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). |
+| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). A failure answers `status: error` with a fixed `reason` (`LLM provider call failed for author` / `writing desk failed for author`), never the exception's text ([#2082](https://github.com/Geoffe-Ga/Creek-Vault/issues/2082)). |
 | `creek.revoice` | `text`, `register?`, `phase?` | Rewrite supplied text in the owner's voice, preserving meaning and claims without saving. Requires `vault:desk`. |
 | `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` / `creek.revoice` job handle to `{status, job_id, state, result?}`. |
 
@@ -338,6 +338,28 @@ Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
 All six mediums in `creek.author.SUPPORTED_MEDIUMS` (`research`,
 `research-piece`, `essay`, `chat`, `how-to`, `book-report`) are wired — any
 other `medium` returns `status: error` naming the wired set.
+
+**A failed run answers a fixed reason, never the exception's text
+([#2082](https://github.com/Geoffe-Ga/Creek-Vault/issues/2082)).** Any other
+desk failure — on the draft and the `dry_run` alike — answers `status: error`
+with one of two fixed `reason`s:
+
+- `LLM provider call failed for author` (`AUTHOR_PROVIDER_FAILED_REASON`) when
+  the voice provider's call failed: a vendor 4xx, an empty body, a dropped
+  connection, an unreachable Ollama endpoint (anything in
+  `creek.classify.llm.providers.PROVIDER_CALL_FAILURES`);
+- `writing desk failed for author` (`AUTHOR_DESK_FAILED_REASON`) for anything
+  else — a stale `CREEK_CONFIG`, a config pydantic rejects, unparseable YAML.
+
+Until #2082 the reason was `str(exc)`, so a vendor's own error message, an
+Ollama URL and a server config path all reached the client. The detail now
+rides only the traceback of one `ERROR` record on the `creek_mcp.tools.author`
+logger, whose message names the exception's type. Three residuals are
+deliberate, as on `creek.draft`: the unsupported-medium error above still
+names the wired set; the router's `IntimateRoutingError` keeps its own
+creek-written message (the configured provider and the remedy); and a writer's
+key its vendor refused answers the shared `REQUEST_KEY_REJECTED_REASON`
+(`the writer's request-scoped provider key was refused by its vendor`).
 
 **A condemned draft is refused, not returned ([#1353](https://github.com/Geoffe-Ga/Creek-Vault/issues/1353)).**
 When the Writing Desk's HARD privacy check raises a `privacy_compliance`

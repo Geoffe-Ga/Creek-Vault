@@ -6,6 +6,7 @@ import json
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -317,7 +318,18 @@ def test_reading_recommendation_missing_vault_stays_missing(tmp_path: Path) -> N
 
 @pytest.mark.parametrize(
     "failure,status",
-    [(RuntimeError("offline"), 503), (ProviderRateLimitError("busy"), 429)],
+    [
+        (RuntimeError("offline"), 503),
+        (ProviderRateLimitError("busy"), 429),
+        # #2083: an Ollama transport failure is an outage too, not a 500.
+        (
+            httpx.ConnectError(
+                "connect failed for url 'http://10.9.8.7:11434/api/generate' offline"
+            ),
+            503,
+        ),
+    ],
+    ids=["runtime", "rate-limited", "ollama-connect"],
 )
 def test_reading_recommendation_provider_outage_is_not_empty(
     tmp_path: Path, failure: Exception, status: int
@@ -334,6 +346,7 @@ def test_reading_recommendation_provider_outage_is_not_empty(
         )
     assert response.status_code == status
     assert "offline" not in response.text
+    assert "10.9.8.7" not in response.text
 
 
 def test_reading_recommendation_real_pool_factory_provenance_and_cache(
