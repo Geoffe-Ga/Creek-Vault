@@ -51,7 +51,10 @@ from creek.classify.llm import LLMClassificationResult
 from creek.classify.rules import FREQUENCY_SIGNALS, WAVELENGTH_PHASE_SIGNALS
 from creek.config import EmbeddingsConfig, load_vault_config
 from creek.link import embeddings as embeddings_module
-from creek.link.embeddings import EmbeddingRefusedError
+from creek.link.embeddings import (
+    EMBEDDING_MODEL_UNAVAILABLE_REASON,
+    EmbeddingRefusedError,
+)
 from creek.models import Frequency, Phase, PrivacyTier
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
@@ -103,7 +106,10 @@ _LEAK_MARKER: Final[str] = "LEAK-MARKER"
 """A token planted in an injected loader failure that must never reach the wire."""
 
 _PIPELINE_LOGGER: Final[str] = "creek_mcp.httpapi.pipeline"
-"""The operator log the embedding-model refusal is recorded on (#2060)."""
+"""The adapter's operator log: one code-only record per tool refusal (#2065)."""
+
+_LINK_TOOL_LOGGER: Final[str] = "creek_mcp.tools.link"
+"""Where the embedding-model refusal's traceback is recorded (#2065)."""
 
 PIPELINE_MINOR: Final[str] = "0.10"
 """The contract minor ``pipeline`` was published at.
@@ -1009,8 +1015,13 @@ def test_pipeline_is_a_published_capability_at_the_current_minor() -> None:
         ("ollama at http://127.0.0.1:11434 is unreachable", ErrorCode.INTERNAL_ERROR),
         ("", ErrorCode.INTERNAL_ERROR),
         (CONTENT_MUTATION_BUSY_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
-        ("embedding model unavailable", ErrorCode.UNAVAILABLE),
+        (EMBEDDING_MODEL_UNAVAILABLE_REASON, ErrorCode.UNAVAILABLE),
         (f"x {CONTENT_MUTATION_BUSY_REASON}", ErrorCode.INTERNAL_ERROR),
+        (f"{CONTENT_MUTATION_BUSY_REASON} at /x", ErrorCode.INTERNAL_ERROR),
+        (
+            f"provider said {EMBEDDING_MODEL_UNAVAILABLE_REASON} at /x",
+            ErrorCode.INTERNAL_ERROR,
+        ),
     ],
     ids=[
         "unknown-method",
@@ -1019,6 +1030,8 @@ def test_pipeline_is_a_published_capability_at_the_current_minor() -> None:
         "content-mutation-busy",
         "embedding-model-unavailable",
         "contains-busy-text",
+        "busy-prefixed-text",
+        "contains-embedding-text",
     ],
 )
 def test_pipeline_refusal_code_is_total_and_fails_closed(
@@ -1034,10 +1047,10 @@ def test_pipeline_refusal_code_is_total_and_fails_closed(
     code, so the text itself never reaches a body.
 
     The two fixed reasons are matched by **exact equality** (#2065, #2066):
-    the ``contains-busy-text`` case pins that a reason merely *containing* the
-    busy text — which a ``startswith``/``in`` match would accept — still fails
-    closed, so provider text that happened to quote it is never promoted to a
-    retryable refusal.
+    the ``contains-*`` and ``busy-prefixed-text`` cases pin that a reason
+    merely *containing* either fixed text — which an ``in``, ``endswith`` or
+    ``startswith`` match would accept — still fails closed, so provider text
+    that happened to quote one is never promoted to a published refusal.
     """
     assert pipeline_refusal_code(reason) is expected
 
@@ -1355,11 +1368,19 @@ def test_an_unloadable_embedding_model_is_a_published_refusal_not_a_server_fault
     pin a pool embedding — so the refusal is ``unavailable`` (retry after
     operator action), not ``temporarily_unavailable`` (back off and retry).
 
-    The remediation the engine's message carries stays in the operator log:
-    the record names the exception type and the request id the client was
-    handed, and the third-party text rides only on the attached traceback.
+    The remediation the engine's message carries stays in the operator log,
+    now split across two records (#2065). ``creek.link`` itself catches the
+    error and returns a fixed refusal — it had to, because over MCP the
+    uncaught exception reached the client as FastMCP's ``isError`` text — so
+    the record carrying the exception type and the traceback moved to the
+    tool's own ``creek_mcp.tools.link`` logger, which knows no request id. The
+    adapter adds the correlation: one ``creek_mcp.httpapi.pipeline`` record
+    naming the published code and the request id the client was handed. The
+    third-party text rides only on the tool record's traceback; neither
+    message carries it.
     """
     caplog.set_level(logging.WARNING, logger=_PIPELINE_LOGGER)
+    caplog.set_level(logging.WARNING, logger=_LINK_TOOL_LOGGER)
 
     def _raise(_model_name: str, _cache_folder: str | None = None) -> object:
         """Fail the way a missing extra or a blocked download does.
@@ -1381,18 +1402,26 @@ def test_an_unloadable_embedding_model_is_a_published_refusal_not_a_server_fault
     response = api.post(LINKS_PATH, json={"method": method}, headers=headers())
 
     _assert_static_unavailable_refusal(response, vault)
-    records = [
+    request_id = response.json()["request_id"]
+    tool_records = [
         record
         for record in caplog.records
-        if record.name == _PIPELINE_LOGGER
+        if record.name == _LINK_TOOL_LOGGER
         and "EmbeddingModelUnavailableError" in record.getMessage()
     ]
-    assert len(records) == 1
-    (record,) = records
-    assert getattr(record, "request_id", None) == response.json()["request_id"]
-    assert response.json()["request_id"] in record.getMessage()
-    assert record.exc_info is not None
-    assert _LEAK_MARKER not in record.getMessage()
+    assert len(tool_records) == 1
+    (tool_record,) = tool_records
+    assert tool_record.exc_info is not None
+    assert _LEAK_MARKER not in tool_record.getMessage()
+    adapter_records = [
+        record for record in caplog.records if record.name == _PIPELINE_LOGGER
+    ]
+    assert len(adapter_records) == 1
+    (adapter_record,) = adapter_records
+    assert getattr(adapter_record, "request_id", None) == request_id
+    assert request_id in adapter_record.getMessage()
+    assert ErrorCode.UNAVAILABLE.value in adapter_record.getMessage()
+    assert _LEAK_MARKER not in adapter_record.getMessage()
 
 
 def test_an_embedding_refusal_on_the_link_route_is_the_same_refusal(
@@ -1518,6 +1547,8 @@ def test_an_embeddings_job_whose_model_cannot_load_records_a_fixed_refusal(
         "failure_code": None,
     }
     record = _stored_job(vault, job_id)
+    # Spelled out, not built from the constant: this is the string the
+    # CHANGELOG tells operators to expect in a job record.
     assert record["failure_reason"] == "refused: embedding model unavailable"
     assert _LEAK_MARKER not in json.dumps(record)
     assert _LEAK_MARKER not in json.dumps(body)

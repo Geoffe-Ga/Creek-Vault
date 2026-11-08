@@ -39,7 +39,10 @@ import pytest
 
 from creek.config import CreekConfig, EmbeddingsConfig
 from creek.link import embeddings as embeddings_module
-from creek.link.embeddings import EmbeddingRefusedError
+from creek.link.embeddings import (
+    EMBEDDING_MODEL_UNAVAILABLE_REASON,
+    EmbeddingRefusedError,
+)
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.server import Transport, build_server
 from creek_mcp.tier_ceiling import TierCeiling
@@ -56,8 +59,6 @@ if TYPE_CHECKING:
 _MARKER: Final[str] = "EMBED-LEAK-MARKER"
 """A token planted in the injected loader failure that must never be served."""
 
-_REASON: Final[str] = "embedding model unavailable"
-"""The fixed refusal both tools answer with."""
 
 _LINK_LOGGER: Final[str] = "creek_mcp.tools.link"
 """The operator log ``creek.link`` records the refusal on."""
@@ -218,7 +219,7 @@ def _assert_fixed_refusal(result: object, setup: _Setup) -> None:
     """
     assert isinstance(result, dict), result
     assert result["status"] == "refused"
-    assert result["reason"] == _REASON
+    assert result["reason"] == EMBEDDING_MODEL_UNAVAILABLE_REASON
     rendered = str(result)
     for leaked in setup.leaks():
         assert leaked not in rendered, leaked

@@ -14,10 +14,15 @@ caller's reach, with *"unknown method 'threads'"* as the only symptom.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from creek._fslock import VaultLockTimeoutError
 from creek.config import load_vault_config
+from creek.link.embeddings import (
+    EMBEDDING_MODEL_UNAVAILABLE_REASON,
+    EmbeddingModelUnavailableError,
+)
 from creek.link.link_engine import run_link
 from creek.surface_modes import LINK_METHODS
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
@@ -29,6 +34,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 TOOL_NAME = "creek.link"
+
+logger = logging.getLogger(__name__)
 
 
 def link_tool(
@@ -50,6 +57,15 @@ def link_tool(
     prints — ``largest_cluster_fragments``, ``clusters_split`` and
     ``oversized_discarded`` — because a discarded fragment is data loss and
     a caller who cannot see it reads a lossy pass as a clean one (#1372).
+
+    Two refusals come after the vault is read and before anything is written
+    or audited: a timed-out content lock answers
+    :data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON`, and an
+    embedding model that cannot load — or a non-local route that refused a
+    text (:class:`~creek.link.embeddings.EmbeddingRefusedError`) — answers
+    :data:`~creek.link.embeddings.EMBEDDING_MODEL_UNAVAILABLE_REASON` on the
+    ``embeddings``, ``eddies`` and ``threads`` stages (#2065). Each stage
+    embeds before it writes, so neither leaves a partial pass behind.
     """
     if method not in LINK_METHODS:
         return refusal_response(
@@ -75,6 +91,19 @@ def link_tool(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason=CONTENT_MUTATION_BUSY_REASON,
+        )
+    except EmbeddingModelUnavailableError as exc:
+        # The engine's message names the model, the cache directory and the
+        # loader's own error; FastMCP would serve ``str(exc)`` to the client
+        # as an ``isError`` result (#2065). The type name goes in the message
+        # and the detail rides only the traceback, into the operator log.
+        logger.exception(
+            "link stage %s refused as unavailable: %s", method, type(exc).__name__
+        )
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=EMBEDDING_MODEL_UNAVAILABLE_REASON,
         )
     # Linking updates existing artefacts in place; no new file is
     # produced, so ``created_path`` is omitted per the audit-schema
