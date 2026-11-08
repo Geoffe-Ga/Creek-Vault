@@ -19,12 +19,13 @@ malformed or unreachable config, so the fix cannot smuggle in a swallowing
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 from unittest.mock import MagicMock
 
 import pytest
 
 from creek.author.conductor import run_author
+from creek_mcp.tools import author as author_mod
 from creek_mcp.tools.author import author_tool
 
 if TYPE_CHECKING:
@@ -284,6 +285,10 @@ def test_mcp_author_defaults_to_three_without_config(
 # --- 6. the existing error semantics, pinned -------------------------------
 
 
+_STALE_CONFIG_PATH: Final[str] = "/definitely/not/here/creek_config.yaml"
+"""Where the ``stale-env`` case points ``CREEK_CONFIG``; never served (#2082)."""
+
+
 def _apply_broken_config(
     case: str,
     vault: Path,
@@ -297,7 +302,7 @@ def _apply_broken_config(
     parse at all.
     """
     if case == "stale-env":
-        monkeypatch.setenv("CREEK_CONFIG", "/definitely/not/here/creek_config.yaml")
+        monkeypatch.setenv("CREEK_CONFIG", _STALE_CONFIG_PATH)
         return
     if case == "out-of-range":
         _write_config(vault, 99)
@@ -308,27 +313,32 @@ def _apply_broken_config(
 
 
 @pytest.mark.parametrize(
-    ("case", "expected_in_reason"),
+    ("case", "absent_from_reason"),
     [
-        ("stale-env", "CREEK_CONFIG points to"),
-        ("out-of-range", "1 validation error for CreekConfig"),
-        # The YAML parser's own message text is a library detail that varies
-        # between the C and pure-Python loaders, so this row asserts only the
-        # status plus a non-empty reason (checked unconditionally below).
-        ("malformed-yaml", ""),
+        ("stale-env", _STALE_CONFIG_PATH),
+        ("out-of-range", "validation error for CreekConfig"),
+        # The YAML parser's message also names the config file's own path.
+        ("malformed-yaml", "unclosed"),
     ],
+    ids=["stale-env", "out-of-range", "malformed-yaml"],
 )
 def test_malformed_config_keeps_yielding_an_error_envelope(
     case: str,
-    expected_in_reason: str,
+    absent_from_reason: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A broken config still surfaces as ``status: "error"``, not a default.
 
-    Green at HEAD and green after the fix — this pins behaviour rather than
-    demanding new behaviour, and it is here to stop the fix from adding a
-    guard.
+    This pins behaviour rather than demanding new behaviour, and it is here to
+    stop a guard being added around the config read.
+
+    Since #2082 the envelope's reason is the fixed
+    :data:`~creek_mcp.tools.author.AUTHOR_DESK_FAILED_REASON` for every case,
+    never the exception's text. That text is what this test used to pin — the
+    ``CREEK_CONFIG points to ...`` ``FileNotFoundError`` that names a **server
+    filesystem path**, and pydantic's validation message — and each case now
+    asserts its own detail is *absent* from what the client is served.
 
     The issue's AC #2 ("must not *start* returning ``status: error``") rests on
     a false premise: a stale ``CREEK_CONFIG`` already errors at HEAD, because
@@ -361,6 +371,5 @@ def test_malformed_config_keeps_yielding_an_error_envelope(
 
     assert result["status"] == "error"
     reason = result["reason"]
-    assert isinstance(reason, str)
-    assert reason
-    assert expected_in_reason in reason
+    assert reason == getattr(author_mod, "AUTHOR_DESK_FAILED_REASON", None)
+    assert absent_from_reason not in reason

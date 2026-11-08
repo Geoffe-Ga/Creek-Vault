@@ -12,6 +12,7 @@ import pytest
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools import author as author_mod
 from creek_mcp.tools.author import author_tool
 from creek_mcp.tools.draft import DRAFT_PROVIDER_FAILED_REASON, draft_tool
 from creek_mcp.tools.lint import lint_tool
@@ -1117,7 +1118,12 @@ def test_author_tool_forwards_max_rounds(
 def test_author_tool_wraps_desk_errors(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A desk failure surfaces as a structured envelope, not an exception."""
+    """A desk failure surfaces as a structured envelope, not an exception.
+
+    The envelope carries the fixed provider-failure reason, never the
+    exception's own text (#2082): a vendor 4xx message or an Ollama URL in that
+    text used to reach the MCP client verbatim.
+    """
 
     def boom(**_kwargs: object) -> object:
         msg = "provider unavailable"
@@ -1132,4 +1138,7 @@ def test_author_tool_wraps_desk_errors(
     assert result["status"] == "error"
     assert result["tool"] == "creek.author"
     assert result["tier_ceiling_enforced"] is False
-    assert "provider unavailable" in result["reason"]
+    assert result["reason"] == getattr(
+        author_mod, "AUTHOR_PROVIDER_FAILED_REASON", None
+    )
+    assert "provider unavailable" not in result["reason"]
