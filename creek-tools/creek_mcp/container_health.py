@@ -198,10 +198,7 @@ def _v1_is_ready(settings: ContainerSettings) -> bool:
             }
         response = httpx.get(
             f"{scheme}://{settings.probe_host}:{settings.port}/v1/health",
-            headers={
-                "Authorization": f"Bearer {secret.tokens[0]}",
-                **replay_headers,
-            },
+            headers={"Authorization": f"Bearer {secret.tokens[0]}"} | replay_headers,
             timeout=_PROBE_TIMEOUT,
             verify=verify,
         )

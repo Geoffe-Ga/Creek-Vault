@@ -54,6 +54,7 @@ over every module in :mod:`creek_mcp` pins the modules that may name
 from __future__ import annotations
 
 import re
+from contextlib import suppress
 from enum import StrEnum
 from ipaddress import ip_address
 from typing import Final, Literal, Self, TypeAlias
@@ -586,10 +587,8 @@ def _public_agent_host(host: str) -> bool:
     canonical = host.rstrip(".").lower()
     if "%" in canonical:
         return False
-    try:
+    with suppress(ValueError):
         return ip_address(canonical).is_global
-    except ValueError:
-        pass
     numeric = all(
         part.isdecimal() or part.startswith("0x") for part in canonical.split(".")
     )
@@ -1418,8 +1417,7 @@ class AgentMcpDiscovery(_WireModel):
                 parsed.scheme == "https"
                 and parsed.hostname is not None
                 and _public_agent_host(parsed.hostname)
-                and parsed.username is None
-                and parsed.password is None
+                and parsed.username is parsed.password is None
                 and not parsed.query
                 and not parsed.fragment
                 and parsed.port != 0

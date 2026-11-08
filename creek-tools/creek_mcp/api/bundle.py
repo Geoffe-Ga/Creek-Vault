@@ -242,8 +242,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
 writer's own Anthropic or OpenAI key accepted per request (#1873), and model
 calls answered from the shared confidential inference pool (#1894)."""
 
-_CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
-    **_CAPABILITIES_SUCCESS,
+_CAPABILITIES_EMPTY: Final[dict[str, Any]] = _CAPABILITIES_SUCCESS | {
     "status": CapabilitiesStatus.UNINITIALIZED.value,
     "vault": {"available": False},
     "capabilities": [],
@@ -284,8 +283,7 @@ _JOURNAL_SUCCESS: Final[dict[str, Any]] = {
 }
 """A first write. The fixture is the *response*, so no entry body is published."""
 
-_JOURNAL_EMPTY: Final[dict[str, Any]] = {
-    **_JOURNAL_SUCCESS,
+_JOURNAL_EMPTY: Final[dict[str, Any]] = _JOURNAL_SUCCESS | {
     "action": JournalAction.UNCHANGED.value,
 }
 """A re-sync that changed nothing: a success, not an error."""
@@ -321,8 +319,7 @@ _VOICE_DRAFT_SUCCESS: Final[dict[str, Any]] = {
 }
 """A first Voice Draft write; no generated prose is published in the fixture."""
 
-_VOICE_DRAFT_EMPTY: Final[dict[str, Any]] = {
-    **_VOICE_DRAFT_SUCCESS,
+_VOICE_DRAFT_EMPTY: Final[dict[str, Any]] = _VOICE_DRAFT_SUCCESS | {
     "action": JournalAction.UNCHANGED.value,
 }
 """An idempotent Voice Draft re-sync that wrote no new document."""
@@ -396,8 +393,7 @@ a document's own frontmatter can escalate the fragment above the declared tier,
 so any tier field here would be either a false claim or an oracle.
 """
 
-_UPLOAD_EMPTY: Final[dict[str, Any]] = {
-    **_UPLOAD_SUCCESS,
+_UPLOAD_EMPTY: Final[dict[str, Any]] = _UPLOAD_SUCCESS | {
     "action": JournalAction.UNCHANGED.value,
 }
 """A re-send of identical bytes under the same id: a success, not an error.
@@ -711,8 +707,7 @@ _WHEEL_SUCCESS: Final[dict[str, Any]] = {
 }
 """An evenly-spread wheel, with the canonical frequency names read off the spec."""
 
-_WHEEL_EMPTY: Final[dict[str, Any]] = {
-    **_WHEEL_SUCCESS,
+_WHEEL_EMPTY: Final[dict[str, Any]] = _WHEEL_SUCCESS | {
     "total_classified": _EMPTY_COUNT,
     "wheel": {
         frequency.value: {
@@ -1097,7 +1092,7 @@ def _agent_discovery_files() -> list[_BundleFile]:
     """
     payloads = {
         "agent-mcp-ready": _CAPABILITIES_SUCCESS,
-        "agent-mcp-unavailable": {**_CAPABILITIES_SUCCESS, "agent_mcp": None},
+        "agent-mcp-unavailable": _CAPABILITIES_SUCCESS | {"agent_mcp": None},
     }
     return [
         _BundleFile(

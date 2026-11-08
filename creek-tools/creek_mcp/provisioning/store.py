@@ -1126,8 +1126,7 @@ class ProvisioningStore:
                 raise InvalidJobTransitionError("job is not a recoverable create")
             if (
                 row["state"] == JobState.PENDING.value
-                and int(row["attempts"]) == 1
-                and int(row["retry_count"]) == 1
+                and int(row["attempts"]) == int(row["retry_count"]) == 1
             ):
                 return self._from_row(row)
             if (

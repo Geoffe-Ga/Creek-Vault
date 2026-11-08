@@ -517,7 +517,7 @@ def _parsed(raw: bytes) -> tuple[str, dict[str, object]] | None:
         post = frontmatter.loads(text)
     except FRONTMATTER_LOAD_ERRORS:
         return None
-    return text, dict(post.metadata)
+    return text, post.metadata.copy()
 
 
 def _record(

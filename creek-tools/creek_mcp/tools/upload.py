@@ -72,6 +72,7 @@ from __future__ import annotations
 import base64
 import binascii
 import shutil
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -373,11 +374,9 @@ def _refuse_unadmitted_overwrite(
     # survey is a flat union over units; and a ledger record outlives the
     # staged file, so purging one sheet — which deletes the shared workbook
     # while its siblings stay live and intimate — cannot blind this gate.
-    ids = [
-        fragment_id
-        for fragment_ids in _ledgered_names_for_id(vault_path, external_id).values()
-        for fragment_id in fragment_ids
-    ]
+    ids = list(
+        chain.from_iterable(_ledgered_names_for_id(vault_path, external_id).values())
+    )
     existing = None if not ids else _existing_tier(vault_path, ids)
     return refuse_above_ceiling(tool=TOOL_NAME, content_tier=existing, ceiling=ceiling)
 
@@ -890,7 +889,7 @@ def _archive_warnings(result: IngestRunResult, source_type: str) -> list[str]:
     Returns:
         Advisory strings, none of which names an archive member or a path.
     """
-    advisories = list(result.ceiling_safe_warnings)
+    advisories = result.ceiling_safe_warnings.copy()
     if result.errors:
         advisories.append(
             _ARCHIVE_PARTIAL_TEMPLATE.format(
@@ -946,7 +945,7 @@ def _archive_response(
         "timestamp": timestamp,
         "source_type": source_type,
         "fragment_id": result.fragment_ids[0] if result.fragment_ids else None,
-        "affected_fragment_ids": list(result.fragment_ids),
+        "affected_fragment_ids": result.fragment_ids.copy(),
         "action": action,
         "tier": upload_tier.value,
         "size_bytes": size_bytes,
@@ -1072,7 +1071,7 @@ def _archive_outcome(
         consumer=consumer,
         created_path=str(_FRAGMENT_ROUTING_DIR),
         created_tier=upload_tier.value,
-        affected_fragment_ids=list(result.fragment_ids),
+        affected_fragment_ids=result.fragment_ids.copy(),
     )
     return _archive_response(
         external_id=external_id,

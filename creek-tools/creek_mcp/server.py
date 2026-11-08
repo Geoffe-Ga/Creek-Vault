@@ -836,13 +836,12 @@ def _resolve_generation_stage(
         request_key.stage_config(), request_key
     ):
         return router.resolve("generation", tier)
-    keyed = ModelRouter(
+    return ModelRouter(
         LLMRoutingConfig(
             default=router.routing.for_stage("default"),
             generation=request_key.stage_config(),
         )
-    )
-    return keyed.resolve("generation", tier)
+    ).resolve("generation", tier)
 
 
 def _complete_generation(
@@ -1284,7 +1283,7 @@ def _labelled(
         *response*, with ``inference_source`` when it is ``ok`` and labelled.
     """
     if response.get("status") == "ok" and provenance.source is not None:
-        return {**response, "inference_source": provenance.source}
+        return response | {"inference_source": provenance.source}
     return response
 
 
