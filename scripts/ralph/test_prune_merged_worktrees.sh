@@ -4,9 +4,9 @@
 # Suite for scripts/ralph/prune-merged-worktrees.sh, the Claude Code
 # PostToolUse/PostToolUseFailure hook that removes a worktree once its PR has
 # merged. Every case builds a real throwaway repo with real worktrees and puts
-# a stub `gh` first on PATH that answers "which head commits merged for this
-# branch?" from a fixture file — so the assertions are on what git actually
-# has left on disk, not on what the script printed.
+# a stub `gh` first on PATH that answers "which PRs merged for this branch?"
+# from a fixture file — so the assertions are on what git actually has left on
+# disk, not on what the script printed.
 #
 # Run:  bash scripts/ralph/test_prune_merged_worktrees.sh
 set -euo pipefail
@@ -21,13 +21,20 @@ ok()  { PASS=$((PASS + 1)); printf '  ok  - %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL  - %s\n' "$1"; }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+BG_PIDS=()
+cleanup() {
+  for p in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 TMP="$(cd "$TMP" && pwd -P)"
 
 # --- stub gh -----------------------------------------------------------------
-# `gh pr list --head <branch> --state merged ...` prints every merged head OID
-# recorded for <branch> in $GH_FIXTURE ("<branch> <oid>" per line). GH_FAIL=1
-# makes it behave like an unauthenticated / offline gh.
+# `gh pr list --head <branch> --state merged ...` prints one line per merged PR
+# recorded for <branch> in $GH_FIXTURE, as the real call's --jq renders it:
+# "<head oid> <seconds since merge> <PR number>". The fixture holds
+# "<branch> <oid> <age> <number>" per line. GH_FAIL=1 makes it behave like an
+# unauthenticated / offline gh.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -38,7 +45,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 [[ -f "${GH_FIXTURE:-/nonexistent}" ]] || exit 0
-awk -v b="$head" '$1 == b { print $2 }' "$GH_FIXTURE"
+awk -v b="$head" '$1 == b { print $2, $3, $4 }' "$GH_FIXTURE"
 STUB
 chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH"
@@ -70,27 +77,32 @@ add_wt() {
   printf '%s\n' "$path"
 }
 
-# mark_merged <repo> <branch>: record the branch's current tip as a merged
-# PR head, which is what GitHub reports for a squash-merged PR.
+# mark_merged <repo> <branch> [age-seconds] [pr-number]: record the branch's
+# current tip as a merged PR head, which is what GitHub reports for a
+# squash-merged PR. The default age is a day — well past any grace period.
 mark_merged() {
-  printf '%s %s\n' "$2" "$(git -C "$TMP/$1" rev-parse "$2")" >> "$TMP/$1.fixture"
+  printf '%s %s %s %s\n' "$2" "$(git -C "$TMP/$1" rev-parse "$2")" "${3:-86400}" "${4:-1}" \
+    >> "$TMP/$1.fixture"
 }
 
 has_worktree() { git -C "$TMP/$1" worktree list --porcelain | grep -qxF "worktree $2"; }
 has_branch()   { git -C "$TMP/$1" show-ref -q --verify "refs/heads/$2"; }
 
-# hook_input <command> <cwd>: the JSON Claude Code feeds a PostToolUse hook.
+# hook_input <command> <cwd> [stdout]: the JSON Claude Code feeds the hook.
 hook_input() {
-  jq -n --arg c "$1" --arg d "$2" \
-    '{hook_event_name: "PostToolUse", tool_name: "Bash", cwd: $d, tool_input: {command: $c}}'
+  jq -n --arg c "$1" --arg d "$2" --arg o "${3:-}" \
+    '{hook_event_name: "PostToolUse", tool_name: "Bash", cwd: $d,
+      tool_input: {command: $c}, tool_response: {stdout: $o, stderr: ""}}'
 }
 
-# run_hook <repo> <command> [cwd]: invoke the script exactly as Claude Code
-# does — no arguments, hook JSON on stdin.
+# run_hook <repo> <command> [cwd] [stdout]: invoke the script exactly as
+# Claude Code does — no arguments, hook JSON on stdin.
 run_hook() {
-  local repo="$1" cmd="$2" cwd="${3:-$TMP/$1}"
-  hook_input "$cmd" "$cwd" | GH_FIXTURE="$TMP/$repo.fixture" bash "$SCRIPT"
+  local repo="$1" cmd="$2" cwd="${3:-$TMP/$1}" stdout="${4:-}"
+  hook_input "$cmd" "$cwd" "$stdout" | GH_FIXTURE="$TMP/$repo.fixture" bash "$SCRIPT"
 }
+
+context_of() { jq -r '.hookSpecificOutput.additionalContext' <<<"$1" 2>/dev/null || true; }
 
 echo "prune-merged-worktrees.sh"
 
@@ -127,7 +139,7 @@ mark_merged r2 feat/here
 git -C "$TMP/r2" checkout -q -b feat/main-checkout   # main checkout on a merged branch
 mark_merged r2 feat/main-checkout
 out="$(run_hook r2 'gh pr merge 7 --squash' "$wt_here/subdir-does-not-matter")"
-report="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out" 2>/dev/null || true)"
+report="$(context_of "$out")"
 
 if has_worktree r2 "$wt_open"; then ok "unmerged worktree is kept"; else bad "unmerged worktree was removed"; fi
 if has_worktree r2 "$wt_dirty" && grep -q edit "$wt_dirty/work.txt"; then ok "dirty merged worktree is kept with its edits"; else bad "dirty merged worktree was removed"; fi
@@ -174,7 +186,68 @@ rc=0
 echo 'not json' | bash "$SCRIPT" >/dev/null 2>&1 || rc=$?
 if [[ $rc -eq 0 ]]; then ok "malformed hook input exits 0"; else bad "malformed hook input exited $rc"; fi
 
-# 7. The hook is actually wired: both Bash post-tool events invoke this script.
+# 7. Concurrent sessions. The sweep runs on ANY session's merge and covers
+#    every worktree, so a sibling lane that is still alive must survive it.
+new_repo r6
+# 7a. A worktree another live process is sitting in is kept.
+wt_busy="$(add_wt r6 feat/busy)"
+mark_merged r6 feat/busy
+(cd "$wt_busy" && exec sleep 300) &
+BG_PIDS+=("$!")
+# 7b. A worktree the fleet has locked is kept.
+wt_locked="$(add_wt r6 feat/locked)"
+mark_merged r6 feat/locked
+git -C "$TMP/r6" worktree lock "$wt_locked"
+# 7c. A sibling PR that merged moments ago (auto-merge) gets a grace period...
+wt_fresh="$(add_wt r6 feat/fresh)"
+mark_merged r6 feat/fresh 120 900
+# 7d. ...but the PR THIS command merged is collected immediately, whether the
+#     number is on the command line or only in gh's output.
+wt_this="$(add_wt r6 feat/this)"
+mark_merged r6 feat/this 5 41
+wt_var="$(add_wt r6 feat/var)"
+mark_merged r6 feat/var 5 55
+sleep 1   # let the background process settle into its cwd
+out="$(run_hook r6 'gh pr merge 41 --squash')"
+report="$(context_of "$out")"
+if has_worktree r6 "$wt_busy" && grep -q "feat/busy): a running process is using it" <<<"$report"; then
+  ok "worktree with a live process inside is kept and reported"
+else
+  bad "worktree with a live process was removed or unreported: $report"
+fi
+if has_worktree r6 "$wt_locked" && grep -q "feat/locked): locked" <<<"$report"; then
+  ok "locked worktree is kept and reported"
+else
+  bad "locked worktree was removed or unreported: $report"
+fi
+if has_worktree r6 "$wt_fresh" && grep -q "feat/fresh): PR #900 merged 2m ago" <<<"$report"; then
+  ok "sibling PR merged inside the grace period is kept and reported"
+else
+  bad "freshly merged sibling was removed or unreported: $report"
+fi
+if ! has_worktree r6 "$wt_this"; then ok "the PR named on the command line is pruned immediately"; else bad "the just-merged PR (#41) was held by the grace period"; fi
+run_hook r6 "gh pr merge \"\$PR_NUM\" --squash" "$TMP/r6" "✓ Squashed and merged pull request Geoffe-Ga/x#55 (feat: var)" >/dev/null
+if ! has_worktree r6 "$wt_var"; then ok "the PR named only in gh's output is pruned immediately"; else bad "the just-merged PR (#55, from stdout) was held by the grace period"; fi
+PRUNE_GRACE_MINUTES=1 run_hook r6 'gh pr merge 2' >/dev/null
+if ! has_worktree r6 "$wt_fresh"; then ok "PRUNE_GRACE_MINUTES shortens the grace period"; else bad "PRUNE_GRACE_MINUTES=1 did not release a 2-minute-old merge"; fi
+if has_worktree r6 "$wt_busy" && has_worktree r6 "$wt_locked"; then ok "live and locked worktrees survive a second sweep"; else bad "a second sweep removed a live or locked worktree"; fi
+
+# 8. A merged head that is not in the local object store is not guessed at.
+new_repo r7
+wt_r7="$(add_wt r7 feat/r7)"
+printf '%s %s %s %s\n' feat/r7 1111111111111111111111111111111111111111 86400 3 > "$TMP/r7.fixture"
+run_hook r7 'gh pr merge 3' >/dev/null
+if has_worktree r7 "$wt_r7"; then ok "unknown merged head keeps the worktree"; else bad "worktree removed against a merged head git does not have"; fi
+
+# 9. --help prints the whole header, however long it grows.
+help="$(bash "$SCRIPT" --help)"
+if grep -q "^Usage:" <<<"$help" && grep -q "Always exits 0" <<<"$help" && ! grep -q "set -uo pipefail" <<<"$help"; then
+  ok "--help prints the full header comment and nothing past it"
+else
+  bad "--help output is truncated or overruns the header: $help"
+fi
+
+# 10. The hook is actually wired: both Bash post-tool events invoke this script.
 SETTINGS="$REPO_ROOT/.claude/settings.json"
 for event in PostToolUse PostToolUseFailure; do
   if jq -e --arg e "$event" \
