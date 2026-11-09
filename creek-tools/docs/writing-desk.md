@@ -14,7 +14,12 @@ The desk is a `Conductor` that orchestrates four kinds of collaborator:
 
 - **Specialists** — `graph`, `retrieval`, and `ontology`. Each reads the vault
   and returns *structured evidence* (claims traced to fragment ids), never free
-  prose.
+  prose. `graph` seeds its link walk from the fragment whose title shares the
+  most non-stopwords with the request, and contributes nothing when no title
+  does. `retrieval` ranks by embedding similarity (computed from fragment
+  titles) fused with a keyword (BM25) score over each fragment's title and
+  body, so fragments sharing a generic title such as `messages` are told apart
+  by what they say.
 - **Synthesis** — merges every specialist's bundle into one grounded bundle.
   Any claim that does not trace to a source fragment is dropped (and logged),
   never fabricated.
