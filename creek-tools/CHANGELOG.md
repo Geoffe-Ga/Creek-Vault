@@ -9,6 +9,41 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Writing Desk and `creek draft` essays: complete, grounded in the owner's
+  words, and free of the pipeline's vocabulary. Read against four drafts an
+  agent wrote over MCP on 2026-11-09.
+  - **No more mid-sentence endings.** Neither the desk's voice call nor the
+    `creek.draft` MCP factory passed `max_tokens`, so both took the provider's
+    1,024-token default (about 750 words), and the MCP factory dropped the stop
+    reason, so a cut-off draft was saved as `truncated: false`. Both now ask for
+    4,096 tokens (`DEFAULT_DRAFT_MAX_TOKENS`, which `creek draft` also uses
+    when `draft.max_tokens` is unset) and carry the stop reason. A cut-off
+    desk draft is flagged `truncated` on the response, the job result and the
+    saved file.
+  - **`source_fragments` lists what the draft drew on, not the vault.** The
+    ontology specialist emitted one summary claim that cited every scanned
+    fragment, so one essay listed 30,404 sources (a 600 KB frontmatter), and
+    the voice prompt carried every id. The specialist now returns its analysis
+    only. On the owner's vault the same query's prompt fell from 585 KB to 8 KB.
+  - **The voice agent sees the owner's words.** An evidence claim was the
+    fragment's title alone. Graph and retrieval claims now carry a
+    sentence-bounded excerpt of up to 700 characters. It is quoted in the voice
+    prompt and excluded from every serialisation (`Field(exclude=True)`).
+  - **The essay no longer narrates its instructions.** The summary claim
+    ("Across these 30404 notes, Purple (F2) is the frequency I keep coming back
+    to") and the gloss steer, which told the model to use the framework's terms
+    and explain them, made essays describe the classification system: "F1, the
+    Agency/Survival register", "a rising period". `GLOSS_STEER` now forbids
+    introducing that vocabulary unless a source passage uses it, and forbids
+    `F1`-style codes. A new `NO_SELF_REFERENCE_STEER`, on both the draft and
+    voice prompts, says the style guidance is how to write, never what to
+    write about.
+  - **Colour names, not codes.** Unexplored-ontology idea titles and
+    dimensional seed titles name a frequency by its colour: `rising x Beige x
+    inhabit …`, not `rising x F1 x inhabit …`.
+  - **A saved desk draft is titled by its own `# heading`**, not by the
+    caller's query, which from an agent is a page of instructions.
+
 - `creek draft` now writes with the `generation` model. The CLI draft
   factory resolved the `classification` stage, so a vault routing
   `classification` to a small labelling model (Haiku, say) and `generation` to

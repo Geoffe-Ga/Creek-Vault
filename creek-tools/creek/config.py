@@ -1602,10 +1602,10 @@ class DraftConfig(BaseModel):
     max_tokens: int | None = Field(default=None, gt=0)
     """Default ``max_tokens`` ceiling for the draft LLM call.
 
-    ``None`` keeps the provider's built-in default (1024 for the
-    Anthropic provider). Operators who routinely want longer essays set
-    this so they don't have to pass ``--max-tokens`` on every run; the
-    CLI flag overrides it per invocation. A draft cut off at this ceiling
+    ``None`` selects :data:`creek.generate.drafts.DEFAULT_DRAFT_MAX_TOKENS`
+    (4096) on both ``creek draft`` and the ``creek.draft`` MCP tool. It used
+    to keep the provider's built-in 1024, which stopped essays mid-sentence.
+    The CLI flag overrides it per invocation. A draft cut off at this ceiling
     is flagged ``truncated`` in frontmatter and warned about on stderr."""
 
     cohesion: bool = Field(default=False)

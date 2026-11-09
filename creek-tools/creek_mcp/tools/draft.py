@@ -103,6 +103,7 @@ from creek.generate.compile_routing import (
 from creek.generate.drafts import (
     INFERENCE_SOURCE_FRONTMATTER_KEY,
     DraftGenerator,
+    DraftLLMResponse,
     rendered_compiled_sources,
 )
 from creek.generate.grounding import GroundingThresholds, default_embedding_fn
@@ -179,8 +180,8 @@ class _DraftLLM(Protocol):
     # ``DraftGenerator`` likewise calls ``self._llm(prompt)`` positionally.
     # Without the `/` this Protocol would demand a keyword every real
     # implementor is free not to offer — do not drop it.
-    def __call__(self, prompt: str, /) -> str:
-        """Return the completion for *prompt*."""
+    def __call__(self, prompt: str, /) -> str | DraftLLMResponse:
+        """Return the completion for *prompt*, with its stop reason when known."""
 
 
 class DraftLLMFactory(Protocol):

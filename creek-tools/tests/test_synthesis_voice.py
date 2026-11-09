@@ -336,3 +336,91 @@ def test_voice_render_survives_non_utf8_voice_core(tmp_path: Path) -> None:
     body = agent.render("q", evidence, tmp_path, medium="research")
 
     assert body == "Voiced."
+
+
+def test_evidence_section_quotes_each_claims_excerpt() -> None:
+    """The voice prompt carries the fragment's own words under its claim."""
+    evidence = EvidenceBundle(
+        claims=[
+            EvidenceClaim(
+                claim="Agents ignore skills",
+                source_fragments=["f1"],
+                excerpt="Third time, I hit Esc and ask for a skill file.",
+            ),
+            EvidenceClaim(claim="Bare title", source_fragments=["f2"]),
+        ]
+    )
+
+    section = _evidence_section(evidence)
+
+    assert section.splitlines() == [
+        "## Evidence (grounded)",
+        "- Agents ignore skills [fragments: f1]",
+        "  > Third time, I hit Esc and ask for a skill file.",
+        "- Bare title [fragments: f2]",
+    ]
+
+
+def test_voice_ask_forbids_describing_the_style_guidance(tmp_path: Path) -> None:
+    """The ask tells the model its conditioning is HOW to write, never WHAT.
+
+    Without it the essays narrated their own instructions ("F1, the
+    Agency/Survival register", "a rising period").
+    """
+    from creek.generate.ontology_glossary import NO_SELF_REFERENCE_STEER
+
+    _seed_voice_core(tmp_path, "core")
+    client, provider = _mock_client("voiced output")
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a grounded claim", source_fragments=["f1"])]
+    )
+
+    VoiceAgent(llm_client=client).render("q", evidence, tmp_path, medium="essay")
+
+    assert NO_SELF_REFERENCE_STEER in provider.complete.call_args.args[0]
+    assert "never WHAT you write about" in NO_SELF_REFERENCE_STEER
+
+
+def test_voice_render_sends_the_essay_ceiling(tmp_path: Path) -> None:
+    """The voice call asks for room for an essay, not the provider's 1024."""
+    from creek.author.voice import VOICE_MAX_TOKENS
+
+    client, provider = _mock_client("voiced output")
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a grounded claim", source_fragments=["f1"])]
+    )
+
+    agent = VoiceAgent(llm_client=client)
+    agent.render("q", evidence, tmp_path, medium="essay")
+
+    assert provider.complete.call_args.kwargs["max_tokens"] == VOICE_MAX_TOKENS == 4096
+    assert agent.last_truncated is False
+
+
+def test_voice_render_flags_a_cut_off_body_and_conductor_carries_it(
+    tmp_path: Path,
+) -> None:
+    """A render stopped at the ceiling is flagged, and the draft says so."""
+    from creek.classify.llm.completion import Completion
+
+    client, provider = _mock_client("unused")
+    provider.complete.return_value = Completion(
+        text="Then the redirect. Then", stop_reason="max_tokens"
+    )
+    agent = VoiceAgent(llm_client=client)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a grounded claim", source_fragments=["f1"])]
+    )
+
+    agent.render("q", evidence, tmp_path, medium="essay")
+    assert agent.last_truncated is True
+
+    # A later deterministic render resets the flag rather than inheriting it.
+    agent.render("q", evidence, None, medium="essay")
+    assert agent.last_truncated is False
+
+    conductor = build_default_conductor(max_rounds=1, llm_client=client)
+    conductor.gather_evidence = lambda *_a, **_k: evidence  # type: ignore[method-assign]
+    draft = conductor.run(medium="essay", query="q", vault=tmp_path)
+    assert draft.truncated is True
+    assert draft.body == "Then the redirect. Then"

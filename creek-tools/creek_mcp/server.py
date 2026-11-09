@@ -136,6 +136,7 @@ if TYPE_CHECKING:
     from creek.classify.llm.router import ModelRouter
     from creek.compile.engine import CompileLLM
     from creek.config import LLMConfig
+    from creek.generate.drafts import DraftLLMResponse
     from creek.models import PrivacyTier
     from creek_mcp.oauth_resource import ResourceServerConfig
     from creek_mcp.tools.author import AuthorLLMFactory
@@ -503,7 +504,7 @@ def _build_draft_llm(
     *,
     request_key: RequestKey | None = None,
     provenance: InferenceProvenance | None = None,
-) -> Callable[[str], str]:
+) -> Callable[[str], DraftLLMResponse]:
     """Return the draft-side LLM callable, routed for *tier* (#958).
 
     Mirrors :func:`_build_compile_llm`: the ``generation`` stage is resolved
@@ -538,7 +539,10 @@ def _build_draft_llm(
         provenance: The call's route recorder, or ``None``.
 
     Returns:
-        A prompt → completion-text callable bound to the resolved provider.
+        A prompt → :class:`~creek.generate.drafts.DraftLLMResponse` callable
+        bound to the resolved provider, capped at the vault's
+        ``draft.max_tokens`` (or the shared default) and carrying the stop
+        reason so a cut-off draft is flagged ``truncated``.
 
     Raises:
         RuntimeError: When the resolved provider is unavailable or is not the
@@ -547,12 +551,22 @@ def _build_draft_llm(
             subclass — when intimate content has no local backend to fall
             back to. ``draft_tool`` turns either into a refusal.
     """
-    router = load_vault_config(vault).model_router
-    provider = _generation_provider(router, tier, "draft", request_key, provenance)
+    from creek.generate.drafts import DEFAULT_DRAFT_MAX_TOKENS
+    from creek.generate.drafts import DraftLLMResponse as _Response
 
-    def _draft(prompt: str) -> str:
+    config = load_vault_config(vault)
+    provider = _generation_provider(
+        config.model_router, tier, "draft", request_key, provenance
+    )
+    # The CLI's ceiling, not the provider's 1024-token default: without it every
+    # MCP draft stopped at ~750 words. The stop reason is carried through so the
+    # generator flags a cut-off draft ``truncated`` instead of reporting it whole.
+    max_tokens = config.draft.max_tokens or DEFAULT_DRAFT_MAX_TOKENS
+
+    def _draft(prompt: str) -> DraftLLMResponse:
         with declared_pool_request(tier):
-            return provider.complete(prompt).text
+            completion = provider.complete(prompt, max_tokens=max_tokens)
+        return _Response(text=completion.text, stop_reason=completion.stop_reason)
 
     return _draft
 

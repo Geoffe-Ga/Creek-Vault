@@ -28,7 +28,6 @@ from creek.author.models import (
 from creek.classify.privacy_filter import PrivacyTierOverride, tier_within_override
 from creek.classify.rules import RuleClassifier
 from creek.classify.weighted import WeightedDimension
-from creek.generate.indexes import FREQUENCY_COLORS
 from creek.generate.paradox import OPPOSITE_CONFIDENCE_PAIRS, OPPOSITE_PHASE_PAIRS
 from creek.link.embeddings import (
     LOCAL_EMBEDDING_ROUTE,
@@ -183,12 +182,43 @@ def fragment_tier_map(
     }
 
 
-def _fragment_claim(fragment: Fragment) -> EvidenceClaim:
-    """Render a fragment as a structured claim, carrying its attribution."""
+EXCERPT_MAX_CHARS: Final[int] = 700
+"""Upper bound on the fragment text one evidence claim carries to the voice agent.
+
+Enough for a paragraph of the owner's own phrasing; small enough that the
+graph walk's breadth x depth bound keeps the whole evidence block to tens of
+kilobytes rather than the corpus.
+"""
+
+_WHITESPACE_RUN: Final[re.Pattern[str]] = re.compile(r"\s+")
+
+
+def _excerpt(body: str) -> str | None:
+    """Return a whitespace-collapsed, sentence-bounded excerpt of *body*.
+
+    Cut at the last sentence end inside :data:`EXCERPT_MAX_CHARS` so the voice
+    agent never imitates a sentence that stops mid-thought; a body with no
+    sentence end in range is cut at the last word and marked with an ellipsis.
+    """
+    text = _WHITESPACE_RUN.sub(" ", body).strip()
+    if not text:
+        return None
+    if len(text) <= EXCERPT_MAX_CHARS:
+        return text
+    window = text[:EXCERPT_MAX_CHARS]
+    end = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
+    if end > 0:
+        return window[: end + 1]
+    return window.rsplit(" ", 1)[0] + " …"
+
+
+def _fragment_claim(fragment: Fragment, body: str = "") -> EvidenceClaim:
+    """Render a fragment as a structured claim, carrying attribution and text."""
     return EvidenceClaim(
         claim=fragment.title,
         source_fragments=[fragment.id],
         author_slug=fragment.source.author_slug,
+        excerpt=_excerpt(body),
     )
 
 
@@ -843,8 +873,19 @@ class RetrievalSpecialist:
             )
         except EmbeddingModelUnavailableError:
             return EvidenceBundle()
-        top = ranked[: config.author.retrieval_top_k]
-        return EvidenceBundle(claims=[_fragment_claim(fragment) for fragment in top])
+        return _ranked_bundle(ranked[: config.author.retrieval_top_k], admitted)
+
+
+def _ranked_bundle(
+    top: Sequence[Fragment], admitted: Sequence[tuple[Fragment, str]]
+) -> EvidenceBundle:
+    """Return the retrieval bundle for *top*, each claim carrying its excerpt."""
+    bodies = {fragment.id: body for fragment, body in admitted}
+    return EvidenceBundle(
+        claims=[
+            _fragment_claim(fragment, bodies.get(fragment.id, "")) for fragment in top
+        ]
+    )
 
 
 def _resolve_seed(query: str, corpus: list[tuple[Fragment, str]]) -> str:
@@ -967,6 +1008,7 @@ class GraphSpecialist:
         config = _load_config(vault)
         corpus = _load_corpus(vault, override)
         by_id = {fragment.id: fragment for fragment, _ in corpus}
+        bodies = {fragment.id: body for fragment, body in corpus}
         if not by_id:
             return EvidenceBundle(walk_stats=WalkStats())
         graph = _build_link_graph(corpus)
@@ -977,7 +1019,9 @@ class GraphSpecialist:
             config.author.graph_breadth_bound,
             config.author.graph_depth_bound,
         )
-        claims = [_fragment_claim(by_id[fid]) for fid in visited if fid in by_id]
+        claims = [
+            _fragment_claim(by_id[fid], bodies[fid]) for fid in visited if fid in by_id
+        ]
         return EvidenceBundle(
             claims=claims,
             walk_stats=WalkStats(max_depth=max_depth, fragments_visited=len(visited)),
@@ -1217,61 +1261,6 @@ def _detect_confidence_paradoxes(
     return paradoxes
 
 
-def _ontology_claim(
-    analysis: OntologyAnalysis,
-    fragment_ids: list[str],
-) -> EvidenceClaim:
-    """Render a grounded, single-sentence summary claim from *analysis*.
-
-    The claim always traces to every scanned fragment so the desk's
-    fragment-grounding invariant holds even on an all-unclassified corpus.
-
-    Args:
-        analysis: The aggregated ontological analysis.
-        fragment_ids: Every scanned fragment id.
-
-    Returns:
-        One :class:`EvidenceClaim` summarising the dominant signal.
-    """
-    count = len(fragment_ids)
-    scope = "In this one note" if count == 1 else f"Across these {count} notes"
-    if analysis.frequencies:
-        freq = _frequency_name(analysis.frequencies[0].value)
-        phase_clause = (
-            f", and most of it was written in the "
-            f"{_phase_name(analysis.phases[0].value)} phase"
-            if analysis.phases
-            else ", with no single phase standing out"
-        )
-        summary = (
-            f"{scope}, {freq} is the frequency I keep coming back to{phase_clause}."
-        )
-    else:
-        summary = (
-            f"{scope}, no single frequency stands out — "
-            "the writing moves between several."
-        )
-    return EvidenceClaim(claim=summary, source_fragments=fragment_ids.copy())
-
-
-def _frequency_name(freq: Frequency) -> str:
-    """Return the colour name a reader knows a frequency by, e.g. ``Yellow (F7)``.
-
-    The desk's summary claim is rendered into the owner's draft, so it names
-    the frequency the way the course does — by colour — and keeps the ``F``
-    code in brackets so the claim still ties back to the classified axis.
-    """
-    colour = FREQUENCY_COLORS.get(freq)
-    if colour is None:
-        return freq.value
-    return f"{colour.replace('_', ' ').title()} ({freq.value})"
-
-
-def _phase_name(phase: Phase) -> str:
-    """Return a Wavelength phase as prose, e.g. ``Bottoming Out``."""
-    return phase.value.replace("_", " ").title()
-
-
 _CONFIDENCE_SENTINELS: tuple[tuple[str, object], ...] = (
     ("frequency", Frequency.UNCLASSIFIED),
     ("phase", Phase.UNCLASSIFIED),
@@ -1379,9 +1368,11 @@ class OntologySpecialist:
         """Return canonical ontological analysis grounded in corpus fragments.
 
         Degrades to an empty bundle when the corpus is empty so the desk never
-        crashes on a thin vault. When the corpus is non-empty it always emits
-        at least one claim, traced to the scanned fragments. Fragments above
-        *override* are excluded from the corpus (#660).
+        crashes on a thin vault. It emits the analysis and **no claims**: a
+        corpus-wide statistic is not evidence for the query, and voicing it
+        made the draft describe the owner's classification system instead of
+        the subject. Fragments above *override* are excluded from the corpus
+        (#660).
 
         Args:
             query: The user query (unused — analysis is corpus-wide).
@@ -1389,8 +1380,8 @@ class OntologySpecialist:
             override: The privacy admission ceiling; ``None`` defaults to OPEN.
 
         Returns:
-            An :class:`EvidenceBundle` carrying the analysis and a grounded
-            summary claim, or an empty bundle for an empty corpus.
+            An :class:`EvidenceBundle` carrying only the analysis, or an empty
+            bundle for an empty corpus.
         """
         corpus = _load_corpus(vault, override)
         if not corpus:
@@ -1398,12 +1389,14 @@ class OntologySpecialist:
         signals = [
             (fragment.id, _FragmentSignal(fragment, body)) for fragment, body in corpus
         ]
-        analysis = _build_analysis(signals)
-        fragment_ids = [fid for fid, _sig in signals]
-        return EvidenceBundle(
-            claims=[_ontology_claim(analysis, fragment_ids)],
-            ontology=analysis,
-        )
+        # Analysis only, never a claim. The analysis steers which phase and
+        # register skills condition the voice; it is not evidence about the
+        # query. It used to ride along as one summary claim citing EVERY
+        # scanned fragment ("Across these 30404 notes, Purple (F2) is the
+        # frequency I keep coming back to"), which put the whole corpus's ids
+        # into the voice prompt and the saved draft's ``source_fragments``,
+        # and which the model then voiced as the essay's subject.
+        return EvidenceBundle(ontology=_build_analysis(signals))
 
 
 def default_specialists() -> list[Specialist]:

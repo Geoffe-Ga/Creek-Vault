@@ -357,16 +357,39 @@ def ontology_term_registry() -> Mapping[str, OntologyTerm]:
     return MappingProxyType(_build_registry(iter_ontology_terms()))
 
 
-#: Prompt steer asking the model to gloss each bespoke term in the owner's voice
-#: on its *first* mention. Appended to every ``## Ask`` variant on both the draft
-#: and voice surfaces and pinned by structure tests so it can never silently drop
-#: out of the prompt. Phrased as a request for an appositive/short clause — not a
-#: textbook definition — and explicitly first-mention-only ("only once").
+#: Prompt steer governing the owner's bespoke ontology vocabulary. Appended to
+#: every ``## Ask`` variant on both the draft and voice surfaces and pinned by
+#: structure tests so it can never silently drop out of the prompt.
+#:
+#: The vocabulary is the pipeline's, not the owner's prose: the owner does not
+#: write "F1" or "the inhabit mode", so the model must not *introduce* a term.
+#: It used to be told to use the terms and gloss them, which put the
+#: classification system into every essay. A term the source passages
+#: themselves use is kept as the owner used it, glossed once on first mention.
+#: Frequency codes (``F1``..``F10``) are never written; the owner names a
+#: frequency by its colour, as :data:`~creek.generate.indexes.FREQUENCY_COLORS`.
 GLOSS_STEER: str = (
-    "The first time you use one of my bespoke terms (a Frequency, Phase, Mode, "
+    "Do not bring in my framework vocabulary (a Frequency, Phase, Mode, "
     "colour name like Teal or Ultraviolet, or named concept like APTITUDE / "
-    "Whole Adept / Archetypal "
-    "Wavelength), weave in a brief plain-English gloss in my voice so a newcomer "
-    "can follow — an appositive or short clause, not a dictionary definition, "
-    "and don't lecture. Gloss each term only once."
+    "Whole Adept / Archetypal Wavelength) unless the source passages "
+    "themselves use the term. If one does, use it the way I did and, the "
+    "first time, weave in a brief plain-English gloss in my voice — an "
+    "appositive or short clause, not a definition. Gloss each term only once. "
+    "Never write frequency codes like F1 or F7."
 )
+
+
+NO_SELF_REFERENCE_STEER: str = (
+    "The style guidance before this request shapes HOW you write; it is never "
+    "WHAT you write about. Do not mention, name or describe it: no talk of "
+    "frequencies, colours, phases, modes, registers, energy levels, 'my "
+    "system', or how this piece is being written. Write about the subject "
+    "itself, the way I would."
+)
+"""Keeps the voice and skill conditioning out of the essay's content.
+
+Appended beside :data:`GLOSS_STEER` on the draft and voice ``## Ask`` blocks.
+
+Without it the model narrated its own instructions — "F1, the Agency/Survival
+register", "a rising period", "the inhabit mode" — instead of writing in them.
+"""
