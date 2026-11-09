@@ -80,6 +80,7 @@ class _FixedVoice:
     """A voice renderer that always returns a chosen body (test double)."""
 
     last_usage: dict[str, int] | None = None
+    last_truncated: bool = False
 
     def __init__(self, body: str) -> None:
         """Store the body every :meth:`render` will return.

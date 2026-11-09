@@ -1553,7 +1553,9 @@ class TestResolveSeedDimensional:
             vault_path=vault,
         )
         assert "From the" in idea.title
-        assert "F1" in idea.title
+        # Named by colour, the way the owner says it — never the F1 code.
+        assert "Beige" in idea.title
+        assert "F1" not in idea.title
         assert "rising" in idea.title
         assert "integrate" in idea.title
 

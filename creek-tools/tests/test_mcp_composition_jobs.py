@@ -460,6 +460,8 @@ def test_an_author_past_the_deadline_files_its_body_in_the_vault(
         gate.release()
         return await _settled(server, accepted["job_id"])
 
+    from creek_mcp.tools.author import draft_title
+
     settled = asyncio.run(_scenario())
     assert settled["state"] == "succeeded"
     result = settled["result"]
@@ -469,6 +471,10 @@ def test_an_author_past_the_deadline_files_its_body_in_the_vault(
     saved = frontmatter.load(vault / result["draft_path"])
     assert saved.content.strip()
     assert saved["idea_strategy"] == "writing_desk"
+    # The title is the body's own heading (the offline desk heads its body
+    # with the query, so here they coincide); see the unit test below.
+    assert saved["title"] == draft_title(saved.content, "research")
+    assert saved["truncated"] is result["truncated"] is False
     assert saved["verdict"] == result["verdict"]
     assert result["claim_count"] >= 0
     assert result["source_count"] == len(saved["source_fragments"])
@@ -911,6 +917,7 @@ def test_author_projection_counts_distinct_cited_fragments_and_drops_content() -
         "medium": "research",
         "verdict": "PASS",
         "rounds": 2,
+        "truncated": False,
         "draft_path": "07-Voice/Drafts/x.md",
         "claim_count": 2,
         "source_count": 3,
@@ -938,3 +945,49 @@ def test_an_unreadable_or_unstamped_draft_has_no_voice_status(tmp_path: Path) ->
     odd = tmp_path / "odd.md"
     odd.write_text("---\nvoice_guard_status: 3\n---\nbody\n", encoding="utf-8")
     assert _voice_guard_status(odd) is None
+
+
+def test_a_saved_author_draft_is_titled_by_its_heading_and_flags_truncation(
+    tmp_path: Path,
+) -> None:
+    """The saved draft's title is the body's ``# heading``, not the query.
+
+    An agent's query is a page of instructions; it used to become the title of
+    every draft it wrote.
+    """
+    from creek_mcp.tools.author import save_authored_draft
+
+    (tmp_path / "07-Voice" / "Drafts").mkdir(parents=True)
+    response = {
+        "medium": "essay",
+        "query": "You are writing a post IN MY OWN VOICE. FIDELITY: …",
+        "body": "Intro line\n\n# Misbehaving Agents\n\nThen the redirect. Then",
+        "verdict": "PASS",
+        "rounds": 1,
+        "truncated": True,
+        "claims": [{"claim": "c", "source_fragments": ["frag-a", "frag-b"]}],
+    }
+
+    saved = frontmatter.load(save_authored_draft(tmp_path, response))
+
+    assert saved["title"] == "Misbehaving Agents"
+    assert saved["truncated"] is True
+    assert saved["source_fragments"] == ["frag-a", "frag-b"]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("# Title here  \n\nbody", "Title here"),
+        ("## Only a subheading\n\nbody", "Writing Desk essay"),
+        ("no heading at all", "Writing Desk essay"),
+        ("#   \n\nbody", "Writing Desk essay"),
+    ],
+)
+def test_draft_title_takes_the_first_top_level_heading(
+    body: str, expected: str
+) -> None:
+    """Only a non-empty ``#`` heading names the draft; otherwise the desk does."""
+    from creek_mcp.tools.author import draft_title
+
+    assert draft_title(body, "essay") == expected

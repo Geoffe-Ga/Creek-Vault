@@ -28,6 +28,7 @@ creek-written text, and a writer's refused key answers the shared
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
@@ -296,6 +297,8 @@ def _draft_response(
         "body": draft.body,
         "verdict": draft.verdict,
         "rounds": draft.rounds,
+        # The voice call stopped at its output ceiling: the body ends mid-thought.
+        "truncated": draft.truncated,
         "provenance": [entry.model_dump(mode="json") for entry in draft.provenance],
         "claims": [
             {"claim": entry.claim_excerpt, "source_fragments": entry.fragment_ids}
@@ -496,12 +499,13 @@ def save_authored_draft(vault_path: Path, response: dict[str, Any]) -> Path:
     post = frontmatter.Post(
         content=str(response["body"]),
         type="draft",
-        title=str(response["query"]),
+        title=draft_title(str(response["body"]), str(response["medium"])),
         status="draft",
         idea_strategy=_AUTHORED_DRAFT_STRATEGY,
         medium=response["medium"],
         verdict=response["verdict"],
         rounds=response["rounds"],
+        truncated=bool(response.get("truncated", False)),
         source_fragments=_cited_fragment_ids(response),
         generated_date=generated.isoformat(),
     )
@@ -511,6 +515,31 @@ def save_authored_draft(vault_path: Path, response: dict[str, Any]) -> Path:
         ]
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
     return target
+
+
+_H1: Final[re.Pattern[str]] = re.compile(r"^#[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)
+
+
+def draft_title(body: str, medium: str) -> str:
+    """Return a saved draft's ``title``: the essay's own first ``# heading``.
+
+    It used to be the caller's query — which, from an agent, is a page of
+    instructions ("You are writing a post for my blog IN MY OWN VOICE…"), so
+    the vault listed every draft under its prompt. A body with no top-level
+    heading falls back to the desk and medium, the same prose-free name the
+    file path already carries.
+
+    Args:
+        body: The drafted markdown.
+        medium: The medium the desk drafted for.
+
+    Returns:
+        The heading text, or ``"Writing Desk <medium>"``.
+    """
+    match = _H1.search(body)
+    if match is not None and match.group(1).strip():
+        return match.group(1).strip()
+    return f"Writing Desk {medium}"
 
 
 def _cited_fragment_ids(response: dict[str, Any]) -> list[str]:
@@ -550,6 +579,7 @@ def author_job_result(
         "medium": response["medium"],
         "verdict": response["verdict"],
         "rounds": response["rounds"],
+        "truncated": bool(response.get("truncated", False)),
         "draft_path": draft_path,
         "claim_count": len(response["claims"]),
         "source_count": len(_cited_fragment_ids(response)),

@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import frontmatter
 
@@ -31,7 +31,7 @@ from creek.author.skills import (
     read_skill,
 )
 from creek.care.guardrail import CARE_POLICY
-from creek.generate.ontology_glossary import GLOSS_STEER
+from creek.generate.ontology_glossary import GLOSS_STEER, NO_SELF_REFERENCE_STEER
 from creek.generate.skills import render_voice_signature
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
@@ -52,6 +52,16 @@ _LIGHT_TOUCH_NOTE: str = (
     "This is a research medium: voice with a light touch — clarity over "
     "flourish. Tighten and connect the evidence; do not embellish."
 )
+
+VOICE_MAX_TOKENS: Final[int] = 4096
+"""Output-token ceiling for one owner-voiced render.
+
+Passed explicitly because the providers' built-in default is 1024 tokens —
+roughly 750 words — which cut every essay off mid-sentence. 4096 leaves room
+for a full essay; a render that still reaches it is flagged ``truncated``.
+"""
+
+_MAX_TOKENS_STOP_REASON: Final[str] = "max_tokens"
 
 _EXEMPLAR_BOUNDARY: re.Pattern[str] = re.compile(
     r"^[ \t]*(?:(?:#{1,6}[ \t]*|\*\*|__)[^\n]*\bexemplars?\b|exemplars?\b)",
@@ -80,6 +90,9 @@ class VoiceAgent:
         #: deterministic/no-client path ran. The conductor reads this to
         #: surface a run's cost and cache-hit rate (#474).
         self.last_usage: dict[str, int] | None = None
+        #: Whether the most recent LLM render stopped at
+        #: :data:`VOICE_MAX_TOKENS`; ``False`` after a deterministic render.
+        self.last_truncated: bool = False
 
     def render(
         self,
@@ -114,13 +127,17 @@ class VoiceAgent:
         # Reset first so a deterministic render never leaks a prior LLM call's
         # usage if this agent instance is reused (#474 review).
         self.last_usage = None
+        self.last_truncated = False
         effective_client = client if client is not None else self.llm_client
         deterministic = _deterministic_body(query, evidence)
         if effective_client is None or vault is None:
             return deterministic
         static, dynamic = _split_voice_prompt(query, evidence, vault, medium, contract)
-        completion = effective_client.complete_with_usage(dynamic, system=static)
+        completion = effective_client.complete_with_usage(
+            dynamic, system=static, max_tokens=VOICE_MAX_TOKENS
+        )
         self.last_usage = completion.usage
+        self.last_truncated = completion.stop_reason == _MAX_TOKENS_STOP_REASON
         voiced = completion.text.strip()
         return voiced or deterministic
 
@@ -375,13 +392,18 @@ def _dominant_register(evidence: EvidenceBundle) -> str | None:
 def _evidence_section(evidence: EvidenceBundle) -> str:
     """Return the grounded ``## Evidence`` block for the voice prompt.
 
-    Each line pairs a grounded claim with its source fragment ids so the model
-    can trace every statement; borrowed-author claims are already excluded.
+    Each entry pairs a grounded claim with its source fragment ids so the model
+    can trace every statement, followed by the fragment's own words when the
+    specialist captured an excerpt — the material the model imitates, which a
+    bare title never gave it. Borrowed-author claims are already excluded.
     """
-    lines = [
-        f"- {claim.claim} [fragments: {', '.join(claim.source_fragments)}]"
-        for claim in _owner_claims(evidence)
-    ]
+    lines: list[str] = []
+    for claim in _owner_claims(evidence):
+        lines.append(
+            f"- {claim.claim} [fragments: {', '.join(claim.source_fragments)}]"
+        )
+        if claim.excerpt:
+            lines.append(f"  > {claim.excerpt}")
     body = "\n".join(lines) if lines else "(no grounded evidence)"
     return f"## Evidence (grounded)\n{body}"
 
@@ -411,7 +433,11 @@ def _ask_section(
         "journal, note, or entry, and never narrate that you are quoting "
         "yourself. State the idea, not its provenance.",
         "Do not quote borrowed authors as my own words.",
+        "The quoted passages under the evidence come from my own notes and "
+        "conversations. Where they are in my voice, borrow their phrasing, "
+        "rhythm and specifics, and say something concrete.",
         GLOSS_STEER,
+        NO_SELF_REFERENCE_STEER,
     ]
     if contract is not None and contract.structure:
         order = " → ".join(contract.structure)

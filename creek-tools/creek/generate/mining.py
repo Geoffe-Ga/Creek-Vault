@@ -49,7 +49,7 @@ from creek.generate.compile_routing import (
     load_compiled_pages,
     record_compile_gap,
 )
-from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES
+from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES, frequency_colour_name
 from creek.models import (
     Dosage,
     Eddy,
@@ -320,10 +320,15 @@ class OntologyTuple:
     dosage: Dosage
 
     def label(self) -> str:
-        """Return ``"phase x frequency x mode x register x dosage"`` for display."""
+        """Return ``"phase x colour x mode x register x dosage"`` for display.
+
+        The frequency is named by its colour (``Beige``), never its ``F1``
+        code: the label becomes the idea's title, the draft's title and its
+        filename, all of which a person reads.
+        """
         return (
-            f"{self.phase.value} x {self.frequency.value} x {self.mode.value} "
-            f"x {self.voice_register.value} x {self.dosage.value}"
+            f"{self.phase.value} x {frequency_colour_name(self.frequency)} x "
+            f"{self.mode.value} x {self.voice_register.value} x {self.dosage.value}"
         )
 
 
