@@ -2,7 +2,8 @@
 
 The Graph, Retrieval, and Ontology specialists are real: Graph walks a
 bounded backlink graph over the vault; Retrieval ranks fragments by semantic
-similarity to the query, reusing :mod:`creek.link.embeddings`; Ontology runs
+similarity to the query, reusing :mod:`creek.link.embeddings`, fused with a
+lexical score over each fragment's text (:mod:`creek.author.lexical`); Ontology runs
 the deterministic rule classifier over the corpus and aggregates canonical
 APTITUDE frequencies / phases / modes / dosages, surfacing — never resolving —
 the paradoxes it finds. Every specialist returns structured,
@@ -18,6 +19,7 @@ import re
 from collections import Counter
 from typing import TYPE_CHECKING, Final, Protocol, TypeVar, runtime_checkable
 
+from creek.author.lexical import bm25_scores, fuse_rankings
 from creek.author.models import (
     EvidenceBundle,
     EvidenceClaim,
@@ -38,6 +40,7 @@ from creek.link.embeddings import (
     embeddings_cache_path,
     fragment_embedding_text,
 )
+from creek.link.naming import STOPWORDS
 from creek.models import (
     Confidence,
     Dosage,
@@ -486,7 +489,7 @@ def _rank_fragments(
     *,
     query_vec: list[float] | None = None,
     query_tier: object = None,
-) -> list[Fragment]:
+) -> list[tuple[float, Fragment]]:
     """Rank *corpus* fragments by semantic similarity to *query* (descending).
 
     Embeds the query once with the reused *linker* and scores each fragment
@@ -545,7 +548,9 @@ def _rank_fragments(
             chokepoint (ignored by the local route).
 
     Returns:
-        Fragments ordered by cosine similarity descending, id tie-break.
+        ``(cosine, fragment)`` pairs ordered by similarity descending, id
+        tie-break. The scores are kept so :func:`_relevance_order` can tell a
+        genuine tie (identical titles embed identically) from a ranking.
     """
     if query_vec is None:
         query_vec = _embed_one(linker, query, query_tier)
@@ -589,7 +594,7 @@ def _rank_fragments(
             max_live_embeds,
         )
     scored.sort(key=lambda item: (-item[0], item[1]))
-    return [fragment for _score, _id, fragment in scored]
+    return [(score, fragment) for score, _id, fragment in scored]
 
 
 class RetrievalSpecialist:
@@ -860,7 +865,7 @@ class RetrievalSpecialist:
             )
             if not admitted:
                 return EvidenceBundle()
-            ranked = _rank_fragments(
+            scored = _rank_fragments(
                 query,
                 admitted,
                 linker,
@@ -873,7 +878,35 @@ class RetrievalSpecialist:
             )
         except EmbeddingModelUnavailableError:
             return EvidenceBundle()
+        ranked = _relevance_order(query, scored, admitted)
         return _ranked_bundle(ranked[: config.author.retrieval_top_k], admitted)
+
+
+def _relevance_order(
+    query: str,
+    scored: Sequence[tuple[float, Fragment]],
+    admitted: Sequence[tuple[Fragment, str]],
+) -> list[Fragment]:
+    """Order the embedding-scored fragments by fused embedding + lexical relevance.
+
+    The embedding scores a fragment by its title alone, so fragments sharing a
+    generic title tie and would otherwise be ordered by id, the same few for
+    every query. A BM25 score over each admitted fragment's title and body
+    breaks those ties by what the fragment says (:mod:`creek.author.lexical`).
+    Only fragments the embedding pass scored are ranked, so a fragment dropped
+    by the live-embed budget stays dropped.
+    """
+    by_id = {fragment.id: fragment for _score, fragment in scored}
+    lexical = bm25_scores(
+        query,
+        [
+            (fragment.id, f"{fragment.title}\n{body}")
+            for fragment, body in admitted
+            if fragment.id in by_id
+        ],
+    )
+    embedding = {fragment.id: score for score, fragment in scored}
+    return [by_id[doc_id] for doc_id in fuse_rankings(embedding, lexical)]
 
 
 def _ranked_bundle(
@@ -888,14 +921,28 @@ def _ranked_bundle(
     )
 
 
+def _seed_words(text: str) -> set[str]:
+    """Return *text*'s lowercase words, stopwords dropped, for seed matching."""
+    return {
+        word
+        for word in (match.group(0).lower() for match in _WORD.finditer(text))
+        if word not in STOPWORDS
+    }
+
+
 def _resolve_seed(query: str, corpus: list[tuple[Fragment, str]]) -> str:
-    """Pick the seed fragment whose title best matches *query* (id tie-break)."""
-    words = {match.group(0).lower() for match in _WORD.finditer(query)}
+    """Pick the seed fragment whose title best matches *query* (id tie-break).
+
+    Matching is on lowercase words with stopwords dropped. When no title shares
+    a word with *query* there is no seed and this returns ``""``: seeding from
+    the lowest id instead would hand the walk the same arbitrary fragment for
+    every unrelated query.
+    """
+    words = _seed_words(query)
     best_id = ""
-    best_score = -1
+    best_score = 0
     for fragment, _body in sorted(corpus, key=lambda item: item[0].id):
-        title_words = {m.group(0).lower() for m in _WORD.finditer(fragment.title)}
-        score = len(words & title_words)
+        score = len(words & _seed_words(fragment.title))
         if score > best_score:
             best_score, best_id = score, fragment.id
     return best_id
@@ -1003,7 +1050,9 @@ class GraphSpecialist:
         The walk respects ``author.graph_breadth_bound`` / ``graph_depth_bound``
         and reports its reach in ``walk_stats``. Fragments above *override* are
         excluded from the corpus before the graph is built (#660), so the walk
-        never traverses or surfaces above-ceiling content.
+        never traverses or surfaces above-ceiling content. When no title shares
+        a non-stopword with *query* there is no seed, and the bundle is empty
+        rather than a walk from an arbitrary fragment.
         """
         config = _load_config(vault)
         corpus = _load_corpus(vault, override)
@@ -1011,8 +1060,10 @@ class GraphSpecialist:
         bodies = {fragment.id: body for fragment, body in corpus}
         if not by_id:
             return EvidenceBundle(walk_stats=WalkStats())
-        graph = _build_link_graph(corpus)
         seed = _resolve_seed(query, corpus)
+        if not seed:
+            return EvidenceBundle(walk_stats=WalkStats())
+        graph = _build_link_graph(corpus)
         visited, max_depth = _bounded_walk(
             seed,
             graph,

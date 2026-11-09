@@ -9,6 +9,22 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- Writing Desk retrieval follows the topic. Three essays on unrelated
+  subjects, written over MCP on 2026-11-09, all cited the same six `messages`
+  fragments. A fragment's embedding is computed from its title alone, and
+  thousands of fragments share the title `messages`, so they tied on similarity
+  and the fragment-id tie-break picked the lowest ids for every query. The
+  graph walk had the same flaw: with no title overlap it seeded from the lowest
+  id.
+  - **Retrieval** now fuses the embedding ranking with a BM25 keyword score
+    over each fragment's title and body (`creek/author/lexical.py`), using
+    reciprocal-rank fusion over *tied* ranks, so a tie is broken by what the
+    fragments say rather than by id. Fusion only reorders what the embedding
+    pass scored; a fragment dropped by the live-embed budget stays dropped.
+    `creek.reflect` grounding uses the same specialist and benefits too.
+  - **Graph** seeds only from a title sharing a non-stopword with the request,
+    and otherwise contributes no claims.
+
 - Writing Desk and `creek draft` essays: complete, grounded in the owner's
   words, and free of the pipeline's vocabulary. Read against four drafts an
   agent wrote over MCP on 2026-11-09.
