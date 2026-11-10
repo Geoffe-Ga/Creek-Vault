@@ -18,8 +18,11 @@ reached seven more MCP tools and four more ``/v1`` routes:
   at all, so every broken config was a ``500`` there. All four now answer the
   ``503 temporarily_unavailable`` ``POST /v1/reflections`` gives the same fault.
 
-``creek.compile`` is deliberately absent: its catch is rewritten by #2074, and
-whichever of the two lands second aligns it with this shape.
+``creek.compile`` is deliberately absent. #2107 (#2074) already answers its
+config-load failure with the fixed ``compile failed`` refusal; its operator
+record keeps ``exc_info``, so that traceback may name the config path in the
+operator log. It is not moved to the ``compile unavailable: <TypeName>`` shape
+here.
 """
 
 from __future__ import annotations
@@ -208,7 +211,12 @@ def _files(vault: Path) -> set[str]:
 
 
 def _assert_refused(
-    answer: Any, *, tool: str, reason: str, leaks: tuple[str, ...]
+    answer: Any,
+    *,
+    tool: str,
+    reason: str,
+    leaks: tuple[str, ...],
+    ceiling: str | None = None,
 ) -> None:
     """Assert *answer* is the fixed refusal and carries none of *leaks*.
 
@@ -217,11 +225,14 @@ def _assert_refused(
         tool: The tool name the refusal echoes.
         reason: The exact refusal reason.
         leaks: Strings neither the payload nor its rendering may carry.
+        ceiling: The caller's tier ceiling the refusal must echo, when given.
     """
     payload = _structured(answer)
     assert payload["status"] == "refused"
     assert payload["tool"] == tool
     assert payload["reason"] == reason
+    if ceiling is not None:
+        assert payload["tier_ceiling"] == ceiling
     rendered = (json.dumps(payload), str(answer))
     for leaked in leaks:
         for text in rendered:
@@ -229,7 +240,11 @@ def _assert_refused(
 
 
 def _assert_one_type_name_record(
-    caplog: pytest.LogCaptureFixture, type_name: str, leaks: tuple[str, ...]
+    caplog: pytest.LogCaptureFixture,
+    type_name: str,
+    leaks: tuple[str, ...],
+    *,
+    tool: str | None = None,
 ) -> None:
     """Assert one WARNING on the refusal logger, type name only, and no leak.
 
@@ -237,6 +252,8 @@ def _assert_one_type_name_record(
         caplog: pytest's log capture.
         type_name: The exception class name the record must end with.
         leaks: Strings no captured record may carry.
+        tool: When given, the tool the record must name — its whole message is
+            then pinned, so it carries the tool and the type and nothing else.
     """
     records = [r for r in caplog.records if r.name == _REFUSAL_LOGGER]
     assert len(records) == 1, [(r.name, r.getMessage()) for r in caplog.records]
@@ -244,6 +261,10 @@ def _assert_one_type_name_record(
     assert record.levelno == logging.WARNING
     assert record.exc_info is None
     assert record.getMessage().endswith(f": {type_name}"), record.getMessage()
+    if tool is not None:
+        assert record.getMessage() == (
+            f"{tool} refused on an unloadable vault config: {type_name}"
+        )
     for leaked in leaks:
         assert leaked not in caplog.text, leaked
 
@@ -338,7 +359,7 @@ def test_mcp_tool_refuses_an_unloadable_config_without_its_path(
 
     leaks = (str(config_path), *_LEAKS)
     _assert_refused(answer, tool=tool, reason=prefix + type_name, leaks=leaks)
-    _assert_one_type_name_record(caplog, type_name, leaks)
+    _assert_one_type_name_record(caplog, type_name, leaks, tool=tool)
     audited = 1 if tool == "creek.redact.scan" else 0
     assert _audit_lines(vault) == audit_before + audited
     assert _files(vault) == files_before
@@ -415,6 +436,32 @@ def test_redact_scan_answers_its_gates_before_the_config_refusal(
     assert payload["reason"] == reason
 
 
+@pytest.mark.parametrize("ceiling", ["open", "personal"])
+def test_the_config_refusal_echoes_the_callers_ceiling(
+    vault: Path, ceiling: str
+) -> None:
+    """The refusal carries the ceiling the caller asked for, never a fixed one."""
+    (vault / _INBOUND_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (vault / _INBOUND_FILE).write_text("nothing sensitive here\n", encoding="utf-8")
+    _vault_file_config("yaml-syntax-invalid", vault)
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
+
+    answer = asyncio.run(
+        server.call_tool(
+            "creek.redact.scan",
+            {"input_path": _INBOUND_FILE, "privacy_tier_ceiling": ceiling},
+        )
+    )
+
+    _assert_refused(
+        answer,
+        tool="creek.redact.scan",
+        reason="redaction scan unavailable: ParserError",
+        leaks=_LEAKS,
+        ceiling=ceiling,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # MCP (#2096): the catch is narrowed to the config read
 # --------------------------------------------------------------------------- #
@@ -463,10 +510,19 @@ def test_an_unrelated_classify_engine_os_error_still_escapes(
         asyncio.run(server.call_tool("creek.classify", {"method": "rules"}))
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("write bug"), ValueError("write bug"), yaml.YAMLError("write bug")],
+    ids=["os-error", "value-error", "yaml-error"],
+)
 def test_a_report_generator_os_error_after_a_good_config_still_escapes(
-    vault: Path, monkeypatch: pytest.MonkeyPatch
+    vault: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
 ) -> None:
-    """The report sentinel wraps the config read alone, never the generator."""
+    """The report sentinel wraps the config read alone, never the generator.
+
+    Every type in ``CONFIG_LOAD_FAILURES`` is tried, so a catch widened over the
+    generator for any one of them is caught.
+    """
 
     class _BrokenVoice:
         """A voice generator whose write fails after the config loaded."""
@@ -475,13 +531,12 @@ def test_a_report_generator_os_error_after_a_good_config_still_escapes(
             """Accept the real constructor's keywords."""
 
         def generate_all_profiles(self, _vault: Path) -> list[Path]:
-            """Fail the way a full disk does.
+            """Fail the way a full disk, or a generator bug, does.
 
             Raises:
-                OSError: Always.
+                Exception: Always, *failure*.
             """
-            msg = "write bug"
-            raise OSError(msg)
+            raise failure
 
     monkeypatch.setattr(report_mod, "VoiceProfileGenerator", _BrokenVoice)
     server = build_server(transport=Transport.STDIO, vault_path=vault)
@@ -493,6 +548,45 @@ def test_a_report_generator_os_error_after_a_good_config_still_escapes(
                 {"report_type": "voice", "privacy_tier_ceiling": "all"},
             )
         )
+
+
+def test_a_redact_scan_os_error_after_a_good_config_still_escapes(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the config read is caught; a scan's own I/O fault is a bug.
+
+    It escapes as it did before #2096, and is never relabelled as
+    ``redaction scan unavailable: PermissionError``.
+    """
+    (vault / _INBOUND_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (vault / _INBOUND_FILE).write_text("nothing sensitive here\n", encoding="utf-8")
+    monkeypatch.setattr(
+        redact_mod.RedactionScanner, "scan_file", _raising(PermissionError("scan bug"))
+    )
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
+
+    with pytest.raises(ToolError, match="scan bug"):
+        asyncio.run(
+            server.call_tool(
+                "creek.redact.scan",
+                {"input_path": _INBOUND_FILE, "privacy_tier_ceiling": "all"},
+            )
+        )
+
+
+def test_a_lint_write_os_error_after_a_good_config_still_escapes(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The paradox preflight wraps the config read alone, never the run or write.
+
+    A full disk under ``00-Creek-Meta/Reports`` is not a config fault, so it
+    escapes rather than reading ``lint unavailable: OSError``.
+    """
+    monkeypatch.setattr(LintRunner, "write", _raising(OSError("disk full")))
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
+
+    with pytest.raises(ToolError, match="disk full"):
+        asyncio.run(server.call_tool("creek.lint", {"checks": ["paradox"]}))
 
 
 # --------------------------------------------------------------------------- #
@@ -766,6 +860,10 @@ def test_an_unloadable_vault_config_is_a_503_without_its_path(
         ("linking unavailable: /etc/x", ErrorCode.INTERNAL_ERROR),
         ("linking unavailable: ", ErrorCode.INTERNAL_ERROR),
         ("linking unavailable: Parser Error", ErrorCode.INTERNAL_ERROR),
+        ("linking unavailable: " + "A" * 64, ErrorCode.TEMPORARILY_UNAVAILABLE),
+        ("linking unavailable: " + "A" * 65, ErrorCode.INTERNAL_ERROR),
+        ("linking unavailable: yaml.ParserError", ErrorCode.INTERNAL_ERROR),
+        ("linking unavailable: 9Error", ErrorCode.INTERNAL_ERROR),
         ("classification unavailable: ParserError\n", ErrorCode.INTERNAL_ERROR),
         ("report unavailable: ParserError", ErrorCode.INTERNAL_ERROR),
         ("provider said: classification unavailable: X", ErrorCode.INTERNAL_ERROR),
