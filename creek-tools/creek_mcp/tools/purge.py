@@ -41,6 +41,7 @@ incomplete erasure looked clean. See :data:`_ENGINE_STATUS_TO_WIRE`.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Final
 
@@ -59,6 +60,21 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.purge.audit import PurgeOutcomeStatus
+
+logger = logging.getLogger(__name__)
+
+PURGE_ENGINE_FAILED_REASON: Final[str] = "purge engine failed"
+"""The fixed refusal when a :class:`PurgeEngine` call raised (#2084).
+
+Before #2084 the refusal was ``purge engine failed: {exc}``, so an ``OSError``
+served the vault path it failed on and any other engine exception its own
+text. The text now rides only the ``creek_mcp.tools.purge`` operator record's
+traceback, whose message names the tool and the exception type alone. It is
+deliberately distinct from
+:data:`~creek.vault.mutations.CONTENT_MUTATION_BUSY_REASON`: a lock timeout
+raised *under* the hold may follow deletions that already landed, so it reads
+as this engine failure, never as "busy, nothing touched".
+"""
 
 _FRAGMENT_TOOL = "creek.purge.fragment"
 _SOURCE_TOOL = "creek.purge.source"
@@ -231,7 +247,7 @@ def _audit_engine_error(
     tool: str,
     args: dict[str, Any],
     consumer: str,
-    exc: BaseException,
+    exc: Exception,
 ) -> dict[str, Any]:
     """Audit an engine-side exception and return a structured refusal.
 
@@ -251,12 +267,19 @@ def _audit_engine_error(
     surface uses — still audited, like every other outcome. Only that
     acquisition timeout reads busy: a ``VaultLockTimeoutError`` raised under
     the hold may follow deletions that already landed, so it keeps the
-    ``purge engine failed: …`` reason rather than claim nothing was touched.
+    :data:`PURGE_ENGINE_FAILED_REASON` reason rather than claim nothing was
+    touched.
+
+    Every other failure answers that fixed reason too (#2084). The exception's
+    own text — an ``OSError``'s vault path, whatever else the engine raised —
+    is logged once on the operator record's traceback, whose message names the
+    tool and the exception type only; it never reaches the caller.
     """
     _audit_refusal(vault_path, tool=tool, args=args, consumer=consumer)
     if isinstance(exc, ContentMutationBusyError):
         return _refusal(tool=tool, reason=CONTENT_MUTATION_BUSY_REASON)
-    return _refusal(tool=tool, reason=f"purge engine failed: {exc}")
+    logger.exception("%s engine failed: %s", tool, type(exc).__name__, exc_info=exc)
+    return _refusal(tool=tool, reason=PURGE_ENGINE_FAILED_REASON)
 
 
 def _gate(

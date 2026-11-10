@@ -40,7 +40,7 @@ import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import frontmatter
 from pydantic import ValidationError
@@ -87,7 +87,8 @@ from creek.generate.grounding import (
     scan_biographical_sentences,
     score_draft,
 )
-from creek.generate.ontology_glossary import GLOSS_STEER
+from creek.generate.indexes import frequency_colour_name
+from creek.generate.ontology_glossary import GLOSS_STEER, NO_SELF_REFERENCE_STEER
 from creek.generate.outline import (
     OutlineSection,
     build_stitch_prompt,
@@ -266,6 +267,14 @@ deterministic and provider-free — the CLI passes a closure over
 
 
 _MAX_TOKENS_STOP_REASON: str = "max_tokens"
+
+DEFAULT_DRAFT_MAX_TOKENS: Final[int] = 4096
+"""Draft output ceiling when neither ``--max-tokens`` nor ``draft.max_tokens`` sets one.
+
+The providers' own default is 1024 tokens — about 750 words — which stopped
+every essay mid-sentence. Both the ``creek draft`` CLI and the ``creek.draft``
+MCP tool fall back to this, so the two surfaces cannot drift apart again.
+"""
 """Stop reason the LLM reports when output was cut off at the token ceiling."""
 
 _TRUNCATION_WARNING: str = (
@@ -909,10 +918,16 @@ def _topic_matches_fragment(fragment: Fragment, body: str, topic: str) -> bool:
 
 
 def _seed_dimension_descriptor(spec: SeedSpec) -> str:
-    """Render the dimensional intersection of *spec* as ``F1 x rising x inhabit``."""
+    """Render the dimensional intersection of *spec* as ``Beige x rising x inhabit``.
+
+    Frequencies are named by colour, not ``F1`` code, because the descriptor
+    is read by a person in the draft's title.
+    """
     parts: list[str] = []
     if spec.frequencies:
-        parts.append(" / ".join(freq.value for freq in spec.frequencies))
+        parts.append(
+            " / ".join(frequency_colour_name(freq) for freq in spec.frequencies)
+        )
     if spec.phases:
         parts.append(" / ".join(ph.value for ph in spec.phases))
     if spec.modes:
@@ -3062,13 +3077,15 @@ _NO_PROVENANCE_STEER = (
     "State the idea, not its provenance."
 )
 
-#: Prompt steer asking the model to gloss each bespoke ontology term in the
-#: owner's voice on its first mention so a newcomer can follow. Appended to every
-#: ``## Ask`` variant and pinned by a structure test so it can never silently
-#: drop out of the prompt. Sourced from the glossary registry's
-#: :data:`~creek.generate.ontology_glossary.GLOSS_STEER` so the draft and voice
-#: surfaces carry identical wording.
-_GLOSS_STEER = GLOSS_STEER
+#: Prompt steer keeping the pipeline's vocabulary out of the essay: never
+#: introduce a bespoke ontology term or an ``F1`` code, gloss a term once only
+#: where a source passage already uses it, and never describe the activated
+#: skills or how the piece is written. Appended to every ``## Ask`` variant and
+#: pinned by a structure test so it can never silently drop out of the prompt.
+#: Sourced from :data:`~creek.generate.ontology_glossary.GLOSS_STEER` and
+#: :data:`~creek.generate.ontology_glossary.NO_SELF_REFERENCE_STEER` so the
+#: draft and voice surfaces carry identical wording.
+_GLOSS_STEER = f"{GLOSS_STEER} {NO_SELF_REFERENCE_STEER}"
 
 
 def _compose_ask_section(

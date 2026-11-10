@@ -30,7 +30,7 @@ from creek.author.models import (
     ReflectionVerdict,
 )
 from creek.author.reflection import ReflectionNode
-from creek.author.voice import VoiceAgent
+from creek.author.voice import VOICE_MAX_TOKENS, VoiceAgent
 from creek.compile.provenance import ProvenanceEntry
 from creek.models import PrivacyTier
 from creek.progress import (
@@ -122,6 +122,7 @@ class VoiceRenderer(Protocol):
     #: was made (the deterministic path). The conductor reads this to surface a
     #: run's cost and cache-hit rate on the draft (#474).
     last_usage: dict[str, int] | None
+    last_truncated: bool
 
     def render(
         self,
@@ -454,6 +455,13 @@ class Conductor:
             if verdict != "REVISE":
                 break
 
+        if self.voice.last_truncated:
+            logger.warning(
+                "Writing Desk draft stopped at the voice output ceiling "
+                "(%d tokens); the body ends mid-thought.",
+                VOICE_MAX_TOKENS,
+            )
+
         # Never ship a sub-threshold draft: a still-REVISE verdict after the
         # round budget is exhausted escalates to a human (#473). Carry the
         # findings on the draft (and log them) so the escalation is actionable.
@@ -474,6 +482,7 @@ class Conductor:
             rounds=rounds,
             findings=findings,
             usage=self.voice.last_usage,
+            truncated=self.voice.last_truncated,
         )
 
 

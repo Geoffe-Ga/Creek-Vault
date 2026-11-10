@@ -22,9 +22,10 @@ reason.
 THE ANTI-VACUITY RULE for everything below, inherited from
 ``tests/test_compile.py``'s #962 suite: a test asserting "intimate content
 routes local" passes for free on a config whose stage is already local.
-Every routing test here therefore uses ``classification=anthropic`` (cloud)
-with ``default=ollama`` (local) AND asserts explicitly that the *unrouted*
-resolution really would have picked the cloud one. Without that line the
+Every routing test here therefore uses ``generation=anthropic`` (cloud) — the
+stage ``creek draft`` resolves — with ``default=ollama`` (local) AND asserts
+explicitly that the *unrouted* resolution really would have picked the cloud
+one. Without that line the
 test proves nothing; do not drop it.
 """
 
@@ -87,14 +88,18 @@ def _write_routing_config(
     default_model: str,
     classification_model: str,
 ) -> Path:
-    """Write a two-stage routing config: local ``default``, cloud ``classification``.
+    """Write a routing config: local ``default``, cloud ``generation``.
+
+    ``classification`` names a different cloud model, so a draft that resolved
+    the wrong stage would surface as the wrong model name.
 
     Args:
         path: Destination config file (parents are created).
         default_model: Model name for the local ``default`` stage — the
             backend the ``Intimate``-never-cloud rule redirects to.
-        classification_model: Model name for the cloud ``classification``
-            stage, which is the stage ``creek draft`` resolves.
+        classification_model: Model name for the cloud ``generation``
+            stage, which is the stage ``creek draft`` resolves. The
+            ``classification`` stage gets ``<name>-labelling``.
 
     Returns:
         The path written, for the anti-vacuity ``load_config`` assertion.
@@ -104,6 +109,8 @@ def _write_routing_config(
         "llm:\n"
         f"  default:\n    provider: ollama\n    model: {default_model}\n"
         f"  classification:\n"
+        f"    provider: anthropic\n    model: {classification_model}-labelling\n"
+        f"  generation:\n"
         f"    provider: anthropic\n    model: {classification_model}\n",
         encoding="utf-8",
     )
@@ -216,17 +223,17 @@ def _seed_vault(tmp_path: Path, *, tier: str = "intimate") -> Path:
 
 
 def _assert_unrouted_resolution_is_cloud(vault: Path) -> None:
-    """Pin that this vault's config resolves ``classification`` to the cloud.
+    """Pin that this vault's config resolves ``generation`` to the cloud.
 
     The anti-vacuity half of every routing assertion below: without it,
     "intimate routed local" would pass for free on a config whose
-    classification stage was local to begin with.
+    generation stage was local to begin with.
 
     Args:
         vault: Vault whose ``creek_config.yaml`` is under test.
     """
     config = load_config(vault / "00-Creek-Meta" / "creek_config.yaml")
-    unrouted = config.model_router.resolve("classification", PrivacyTier.OPEN)
+    unrouted = config.model_router.resolve("generation", PrivacyTier.OPEN)
     assert unrouted.provider == "anthropic"
     assert unrouted.model == _VAULT_CLOUD_MODEL
 
@@ -466,7 +473,7 @@ def test_cli_draft_refuses_intimate_when_no_local_backend_exists(
     (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
         "llm:\n"
         "  default:\n    provider: anthropic\n    model: cloud-default\n"
-        "  classification:\n    provider: anthropic\n    model: cloud-stage\n",
+        "  generation:\n    provider: anthropic\n    model: cloud-stage\n",
         encoding="utf-8",
     )
 
@@ -938,7 +945,7 @@ def test_cli_draft_does_not_refuse_when_the_filter_removed_the_intimate_source(
     (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
         "llm:\n"
         "  default:\n    provider: anthropic\n    model: cloud-default\n"
-        "  classification:\n    provider: anthropic\n    model: cloud-stage\n",
+        "  generation:\n    provider: anthropic\n    model: cloud-stage\n",
         encoding="utf-8",
     )
     _stub_miner(monkeypatch, _INTIMATE_ID, _INTIMATE_TITLE)
@@ -1108,7 +1115,7 @@ def test_cli_draft_refusal_prints_no_blank_line_before_exiting(
     (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
         "llm:\n"
         "  default:\n    provider: anthropic\n    model: cloud-default\n"
-        "  classification:\n    provider: anthropic\n    model: cloud-stage\n",
+        "  generation:\n    provider: anthropic\n    model: cloud-stage\n",
         encoding="utf-8",
     )
     _stub_ontology_detector(monkeypatch)

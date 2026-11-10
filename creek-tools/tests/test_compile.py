@@ -32,6 +32,7 @@ from creek.cli import app
 from creek.compile.engine import (
     PARADOX_LOG_RELPATH,
     CompileLLM,
+    CompileRequestError,
     CompileResult,
     SourceAdmissionRefusedError,
     _load_fragments_for_compile,
@@ -448,7 +449,7 @@ def test_compile_to_vault_is_idempotent(vault: Path) -> None:
 def test_compile_to_vault_unknown_fragment_raises(vault: Path) -> None:
     """A missing fragment ID surfaces as a clear error rather than a silent skip."""
     llm, _ = _make_llm([])
-    with pytest.raises(ValueError, match="not found"):
+    with pytest.raises(CompileRequestError, match="not found"):
         compile_to_vault(
             fragment_ids=["frag-missing"],
             vault_path=vault,
@@ -510,7 +511,7 @@ def test_cli_compile_writes_thread_with_provenance(
 def test_compile_fragments_unknown_target_kind_raises() -> None:
     """An unsupported target_kind surfaces as ValueError before LLM dispatch."""
     llm, _ = _make_llm([])
-    with pytest.raises(ValueError, match="Unknown target_kind"):
+    with pytest.raises(CompileRequestError, match="Unknown target_kind"):
         compile_fragments(
             [],
             llm=llm,
@@ -548,7 +549,7 @@ def test_compile_fragments_rejects_non_json_response() -> None:
     """Non-JSON payloads from the LLM raise a clear ValueError."""
     frag = _make_fragment(frag_id="frag-aaa")
     llm, _ = _make_llm(["not json at all"])
-    with pytest.raises(ValueError, match="non-JSON"):
+    with pytest.raises(CompileRequestError, match="non-JSON"):
         compile_fragments(
             [(frag, "body")],
             llm=llm,
@@ -678,7 +679,7 @@ def test_compile_fragments_rejects_unterminated_object_in_fence() -> None:
     """An unterminated JSON object — even inside a fence — still raises."""
     frag = _make_fragment(frag_id="frag-aaa")
     llm, _ = _make_llm(['```json\n{"claims": [{"id": "c1"\n```'])
-    with pytest.raises(ValueError, match="non-JSON"):
+    with pytest.raises(CompileRequestError, match="non-JSON"):
         compile_fragments(
             [(frag, "body")],
             llm=llm,
@@ -716,7 +717,7 @@ def test_compile_fragments_rejects_non_object_payload() -> None:
     """A JSON array (rather than an object) at the top level is rejected."""
     frag = _make_fragment(frag_id="frag-aaa")
     llm, _ = _make_llm([json.dumps(["not", "an", "object"])])
-    with pytest.raises(ValueError, match="JSON object"):
+    with pytest.raises(CompileRequestError, match="JSON object"):
         compile_fragments(
             [(frag, "body")],
             llm=llm,
@@ -731,7 +732,7 @@ def test_compile_fragments_rejects_non_array_claims() -> None:
     frag = _make_fragment(frag_id="frag-aaa")
     bad = json.dumps({"claims": "not a list", "paradoxes": []})
     llm, _ = _make_llm([bad])
-    with pytest.raises(ValueError, match="must be arrays"):
+    with pytest.raises(CompileRequestError, match="must be arrays"):
         compile_fragments(
             [(frag, "body")],
             llm=llm,
@@ -754,7 +755,7 @@ def test_compile_fragments_rejects_string_claim_elements() -> None:
     frag = _make_fragment(frag_id="frag-aaa")
     bad = json.dumps({"claims": ["insight one", "insight two"], "paradoxes": []})
     llm, _ = _make_llm([bad])
-    with pytest.raises(ValueError, match="must contain JSON objects"):
+    with pytest.raises(CompileRequestError, match="must contain JSON objects"):
         compile_fragments(
             [(frag, "body")],
             llm=llm,
@@ -780,7 +781,7 @@ def test_compile_fragments_rejects_string_paradox_elements() -> None:
         },
     )
     llm, _ = _make_llm([bad])
-    with pytest.raises(ValueError, match="must contain JSON objects"):
+    with pytest.raises(CompileRequestError, match="must contain JSON objects"):
         compile_fragments(
             [(frag, "body")],
             llm=llm,
@@ -816,7 +817,7 @@ def test_compile_fragments_rejects_mixed_claim_elements() -> None:
         "paradoxes": [],
     }
     llm, _ = _make_llm([json.dumps(payload)])
-    with pytest.raises(ValueError, match="must contain JSON objects"):
+    with pytest.raises(CompileRequestError, match="must contain JSON objects"):
         compile_fragments(
             [(frag, "body")],
             llm=llm,
@@ -863,7 +864,7 @@ def test_compile_to_vault_leaves_existing_page_untouched_on_string_claims(
     before = target.read_text(encoding="utf-8")
     assert "Stable claim." in before
 
-    with pytest.raises(ValueError, match="must contain JSON objects"):
+    with pytest.raises(CompileRequestError, match="must contain JSON objects"):
         compile_to_vault(
             fragment_ids=["frag-aaa"],
             vault_path=vault,
@@ -897,7 +898,7 @@ def test_compile_fragments_rejects_falsy_wrong_typed_arrays(
     payload: dict[str, object] = {"claims": [], "paradoxes": []}
     payload[field] = falsy
     llm, _ = _make_llm([json.dumps(payload)])
-    with pytest.raises(ValueError, match="must be arrays"):
+    with pytest.raises(CompileRequestError, match="must be arrays"):
         compile_fragments(
             [(frag, "body")],
             llm=llm,
@@ -963,7 +964,7 @@ def test_compile_to_vault_leaves_existing_page_untouched_on_falsy_claims(
     before = target.read_bytes()
     assert b"Stable claim." in before
 
-    with pytest.raises(ValueError, match="must be arrays"):
+    with pytest.raises(CompileRequestError, match="must be arrays"):
         compile_to_vault(
             fragment_ids=["frag-aaa"],
             vault_path=vault,
@@ -1184,7 +1185,9 @@ def test_resolve_target_path_rejects_escaping_target_id(vault: Path) -> None:
     """
     from creek.compile import engine as engine_module
 
-    with pytest.raises(ValueError, match="escapes the compiled-layer directory"):
+    with pytest.raises(
+        CompileRequestError, match="escapes the compiled-layer directory"
+    ):
         engine_module._resolve_target_path(vault, "thread", "../escape")
     # No file should have been written under the target directory.
     assert not (vault / "02-Threads" / "Active" / "..escape.md").exists()
@@ -1199,7 +1202,9 @@ def test_compile_to_vault_rejects_escaping_target_id(vault: Path) -> None:
         claims=[{"id": "claim-001", "text": "X", "fragment_ids": ["frag-aaa"]}],
     )
     llm, _ = _make_llm([response])
-    with pytest.raises(ValueError, match="escapes the compiled-layer directory"):
+    with pytest.raises(
+        CompileRequestError, match="escapes the compiled-layer directory"
+    ):
         compile_to_vault(
             fragment_ids=["frag-aaa"],
             vault_path=vault,
@@ -2571,3 +2576,13 @@ def test_cli_compile_refuses_intimate_when_no_local_backend_exists(
     # A refused compile writes no page AND creates no target directory.
     assert not (bare / "02-Threads").exists()
     assert not (bare / "00-Creek-Meta" / "Processing-Log").exists()
+
+
+def test_compile_request_error_stays_a_value_error() -> None:
+    """``CompileRequestError`` subclasses ``ValueError`` (#2074).
+
+    The engine tests above pin the narrower type, so a raise site downgraded
+    to a bare ``ValueError`` fails them; this pins the other half of the
+    promise, that every caller catching ``ValueError`` still catches it.
+    """
+    assert issubclass(CompileRequestError, ValueError)

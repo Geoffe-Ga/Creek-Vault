@@ -634,6 +634,16 @@ in CI does either:
 | --- | --- | --- |
 | `--mode live` | `--provider openai\|anthropic\|gemini`, `--api-key-env NAME` (and `--api-base URL` for an OpenAI-compatible endpoint) | either flag is absent, or the variable `NAME` is unset |
 | `--judge routed` | `--judge-provider`, `--judge-api-key-env NAME` (optionally `--judge-model`, `--judge-api-base`) | the same; the artifact records `judge: routed` |
+| `--reasoning-effort low\|medium\|high` | `--mode live --provider openai` | any other mode or provider: only the OpenAI provider sends it |
+
+**Reasoning models need `--reasoning-effort`.** A reasoning model can spend the
+whole `--max-tokens` budget on hidden reasoning and return empty content. Through
+Privatemode on 2026-11-04, `glm-5.3` and `glm-5.3-flash` did so even at the
+2,048-token ceiling, and their candidates came back blank. `--reasoning-effort`
+sends the OpenAI `reasoning_effort` field with every candidate's request, so all
+of them run under the same setting. Without the flag, no field is sent, because a
+non-reasoning OpenAI model rejects it. This is the OpenAI-side counterpart of the
+`think: False` the Ollama provider sends on bounded calls.
 
 Live-only flags given without their mode are refused rather than ignored.
 Every source is built before the first call, and each provider still applies
@@ -691,20 +701,23 @@ print(result.quality.verdict, result.quality.per_dimension)
 The synthetic corpus can say whether a model follows instructions and cites
 honestly; it cannot say whether a model sounds like *you*. For that, #1875's
 owner runs `bench eval --corpus-vault` against his own vault, **on his own
-computer**. Nothing in this repository, its CI, or any agent session ever runs
-it: the tests build synthetic vault fixtures, and the command refuses outright
-when the `CI` environment variable is set.
+computer**, by hand or through an agent session he starts there and asks to
+run it. Nothing in this repository or its CI runs it: the tests build synthetic
+vault fixtures, and the command refuses outright when the `CI` environment
+variable is set.
 
 ```bash
 # On your own machine, from creek-tools/, with your vault at ~/Creek.
-# PLACEHOLDER — Privatemode specifics are not yet documented here:
-#   start the vendor's proxy per its docs; then pass
-#   --api-base http://127.0.0.1:<port>/v1
+# Start Privatemode's attesting proxy, published on loopback only. No key is
+# given to it: the harness sends the key on each request.
+docker run -d --rm --name privatemode-proxy -p 127.0.0.1:8080:8080 \
+    ghcr.io/edgelesssys/privatemode/privatemode-proxy:latest
 export CREEK_CLOUD_CONSENT=1
 export PRIVATEMODE_KEY=...          # the key, held only in the environment
 ./scripts/bench.sh eval --models gpt-oss-120b,glm-5.3,glm-5.3-flash \
-    --mode live --provider openai --api-base http://127.0.0.1:<port>/v1 \
-    --api-key-env PRIVATEMODE_KEY --max-tokens 800 --seed 17 \
+    --mode live --provider openai --api-base http://127.0.0.1:8080/v1 \
+    --api-key-env PRIVATEMODE_KEY --reasoning-effort low \
+    --max-tokens 800 --seed 17 \
     --corpus-vault ~/Creek --i-own-this-vault \
     --review-out ~/creek-eval/review.md \
     --unblind-out ~/creek-eval/unblind.json \

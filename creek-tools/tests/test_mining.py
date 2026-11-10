@@ -1300,8 +1300,9 @@ class TestOntologyTuple:
             voice_register=VoiceRegister.PROPHETIC,
             dosage=Dosage.MEDICINE,
         ).label()
-        assert "peaking" in label
-        assert "F7" in label
+        assert label == "peaking x Yellow x express x prophetic x medicine"
+        # Named by colour, the way the owner says it — never the F7 code.
+        assert "F7" not in label
         assert "express" in label
         assert "prophetic" in label
         assert "medicine" in label

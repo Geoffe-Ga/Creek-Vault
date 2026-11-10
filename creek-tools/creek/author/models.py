@@ -88,6 +88,11 @@ class EvidenceClaim(BaseModel):
     Attributes:
         claim: The asserted statement, in one short sentence.
         source_fragments: Ordered fragment ids backing the claim.
+        excerpt: A bounded passage of the backing fragment's own text, so the
+            voice agent has the owner's actual words to write from rather than
+            a bare title. ``exclude=True`` keeps it out of every
+            ``model_dump``: it reaches the voice prompt and nothing else — not
+            an MCP envelope, not provenance, not a saved draft's frontmatter.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -97,6 +102,7 @@ class EvidenceClaim(BaseModel):
     # When a claim is drawn from `11-Other-Authors/`, the author slug travels
     # with it so downstream citation can attribute it correctly.
     author_slug: str | None = None
+    excerpt: str | None = Field(default=None, exclude=True)
 
 
 class WalkStats(BaseModel):
@@ -214,6 +220,9 @@ class AuthoredDraft(BaseModel):
             ``output_tokens`` and, with prompt caching, the ``cache_*`` reads),
             or ``None`` when the run took the deterministic/offline path. Lets a
             caller observe a run's cost and cache-hit rate (#474).
+        truncated: Whether the final voice call stopped at its output-token
+            ceiling, so the body ends wherever the model was cut off. Surfaced
+            rather than hidden, the way ``creek draft`` flags its own.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -226,6 +235,7 @@ class AuthoredDraft(BaseModel):
     rounds: int = Field(ge=1)
     findings: list[ReflectionFinding] = Field(default_factory=list)
     usage: dict[str, int] | None = None
+    truncated: bool = False
 
     # BUG-009: the ``[prop-decorator]`` suppression is the known mypy /
     # Pydantic-v2 limitation when stacking ``@computed_field`` over

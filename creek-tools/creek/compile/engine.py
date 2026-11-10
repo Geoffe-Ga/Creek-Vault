@@ -117,9 +117,30 @@ class SourceAdmissionRefusedError(Exception):
     Deliberately content-free: no message, no ids, no tiers. The caller that
     supplied the hook already knows why it refused, and anything the engine
     attached here would be one more surface a refused call could leak
-    through. It subclasses neither ``ValueError`` nor ``RuntimeError`` so a
-    caller's existing ``except (ValueError, RuntimeError)`` — which echoes the
-    message back as a refusal reason — can never swallow it by accident.
+    through. It subclasses neither ``ValueError`` nor ``RuntimeError``, so it
+    can never be mistaken for a :class:`CompileRequestError` — the one
+    failure ``creek_mcp.tools.compile`` echoes back as a refusal reason — nor
+    for the provider failures that tool answers with a fixed reason (#2074).
+    """
+
+
+class CompileRequestError(ValueError):
+    """A compile the engine refused, in creek-written text safe to echo (#2074).
+
+    Raised only where the engine composes the message itself: an unknown
+    *target_kind*, requested ids that do not resolve, a *target_id* that
+    escapes its compiled-layer directory, and a compile LLM payload that is
+    not the ``{claims, paradoxes}`` shape. The text is fixed prose plus, at
+    most, ids and the target the caller sent — never fragment content, a
+    vault path or a provider's own message — so ``creek_mcp.tools.compile``
+    may hand it to the client verbatim.
+
+    Every other ``ValueError`` the engine can let through (a pydantic
+    ``ValidationError`` raised while reading a page's existing provenance
+    frontmatter, for one) carries text creek did not write, and that tool
+    answers it with its fixed ``COMPILE_FAILED_REASON``. Subclassing
+    ``ValueError`` keeps every existing ``except ValueError`` and
+    ``pytest.raises(ValueError)`` caller unchanged.
     """
 
 
@@ -201,7 +222,7 @@ def compile_fragments(
         reported (empty when synthesis succeeded cleanly).
 
     Raises:
-        ValueError: If *target_kind* is not one of the supported
+        CompileRequestError: If *target_kind* is not one of the supported
             compiled-page surfaces, or if the LLM payload's ``claims``
             or ``paradoxes`` are not arrays of JSON objects.
     """
@@ -251,7 +272,7 @@ def _validate_target_kind(target_kind: str) -> None:
             f"Unknown target_kind {target_kind!r}; "
             f"supported: {', '.join(TARGET_KINDS)}."
         )
-        raise ValueError(msg)
+        raise CompileRequestError(msg)
 
 
 def _apply_level_policy(
@@ -465,8 +486,9 @@ def compile_to_vault(
             hold — by a lock taken while working — propagates as itself.
         SourceAdmissionRefusedError: When *admit_sources* refused the
             compile. Nothing was built, written or logged.
-        ValueError: If a requested fragment cannot be resolved or the target
-            escapes its compiled-layer directory.
+        CompileRequestError: If a requested fragment cannot be resolved, the
+            target escapes its compiled-layer directory, or the LLM payload
+            is malformed. A ``ValueError``, in creek-written text (#2074).
         creek.classify.llm.router.IntimateRoutingError: If intimate content
             has no local generation route.
     """
@@ -542,18 +564,21 @@ def _compile_to_vault_with_content_lock_held(
     Raises:
         SourceAdmissionRefusedError: When *admit_sources* returned
             ``False``.
-        ValueError: If a requested fragment cannot be found in the vault,
-            or if *target_id* escapes the compiled-layer directory.
+        CompileRequestError: If a requested fragment cannot be found in the
+            vault, if *target_id* escapes the compiled-layer directory, or if
+            the LLM payload is malformed — the creek-written failures
+            ``creek_mcp.tools.compile`` echoes verbatim (#2074).
         creek.classify.llm.router.IntimateRoutingError: Raised by the
             production *llm_factory* when the sources route ``INTIMATE``
-            and no local backend exists to fall back to. It subclasses
-            ``RuntimeError``, so ``creek_mcp.tools.compile``'s existing
-            ``except (ValueError, RuntimeError)`` keeps converting it into
-            a structured refusal; the CLI catches it by name so a privacy
-            refusal reads as a refusal rather than a traceback. Anything
-            else *llm_factory* raises — an unreachable provider, a missing
-            credential — propagates untouched for the same reason: the
-            engine takes no view on how a client is built.
+            and no local backend exists to fall back to.
+            ``creek_mcp.tools.compile`` names it before its provider-failure
+            catch, so its creek-written text stays the refusal reason; the
+            CLI catches it by name so a privacy refusal reads as a refusal
+            rather than a traceback. Anything else *llm_factory* or the
+            client raises — an unreachable provider, a missing credential, a
+            vendor 4xx — propagates untouched: the engine takes no view on
+            how a client is built, and the MCP tool answers it with a fixed
+            reason that withholds the provider's text.
     """
     pairs_with_raw, ancestors = _load_fragments_for_compile(
         vault_path,
@@ -726,7 +751,7 @@ def _decode_json_tolerant(raw: str) -> object:
         except json.JSONDecodeError as exc:
             last_error = exc
     msg = "Compile LLM returned non-JSON output."
-    raise ValueError(msg) from last_error
+    raise CompileRequestError(msg) from last_error
 
 
 def _parse_llm_payload(raw: str) -> dict[str, list[dict[str, object]]]:
@@ -734,7 +759,7 @@ def _parse_llm_payload(raw: str) -> dict[str, list[dict[str, object]]]:
     decoded = _decode_json_tolerant(raw)
     if not isinstance(decoded, dict):
         msg = "Compile LLM payload must be a JSON object."
-        raise ValueError(msg)  # noqa: TRY004  # ValueError unifies all LLM-payload schema errors with the JSONDecodeError branch above.
+        raise CompileRequestError(msg)  # noqa: TRY004  # Not TypeError: every LLM-payload schema error is the one echoable CompileRequestError, like the non-JSON branch above (#2074).
     claims = _require_array(decoded.get("claims"))
     paradoxes = _require_array(decoded.get("paradoxes"))
     return {
@@ -753,14 +778,14 @@ def _require_array(value: object) -> list[object]:
         The list *value* denotes; ``[]`` when it is absent or ``null``.
 
     Raises:
-        ValueError: When *value* is any other non-list — the falsy ones
+        CompileRequestError: When *value* is any other non-list — the falsy ones
             (``0``, ``""``, ``false``, ``{}``) included, which the old
             ``or []`` coerced away before the guard could see them.
     """
     items = coerce_optional_list(value)
     if items is None:
         msg = "Compile LLM payload claims/paradoxes must be arrays."
-        raise ValueError(msg)
+        raise CompileRequestError(msg)
     return items
 
 
@@ -778,14 +803,14 @@ def _require_object_array(items: list[object]) -> list[dict[str, object]]:
         The same elements, typed as JSON objects.
 
     Raises:
-        ValueError: When any element is not a JSON object.
+        CompileRequestError: When any element is not a JSON object.
     """
     objects: list[dict[str, object]] = [
         item for item in items if isinstance(item, dict)
     ]
     if len(objects) != len(items):
         msg = "Compile LLM payload claims/paradoxes must contain JSON objects."
-        raise ValueError(msg)
+        raise CompileRequestError(msg)
     return objects
 
 
@@ -857,7 +882,7 @@ def _load_fragments_for_compile(
     Raises:
         SourceAdmissionRefusedError: If *admit_sources* returned ``False``.
             Raised ahead of the not-found check below, deliberately.
-        ValueError: If any requested id has no matching fragment.
+        CompileRequestError: If any requested id has no matching fragment.
     """
     requested = set(fragment_ids)
     records = iter_vault_fragments(vault_path / "01-Fragments")
@@ -874,7 +899,7 @@ def _load_fragments_for_compile(
     missing = [fid for fid in fragment_ids if fid not in by_id]
     if missing:
         msg = f"Fragment(s) not found in vault: {', '.join(missing)}"
-        raise ValueError(msg)
+        raise CompileRequestError(msg)
     return [by_id[fid] for fid in fragment_ids], ancestors
 
 
@@ -886,7 +911,7 @@ def _resolve_target_path(
     """Resolve the on-disk path for a compiled-layer target.
 
     Raises:
-        ValueError: If *target_id* resolves to a path outside the
+        CompileRequestError: If *target_id* resolves to a path outside the
             compiled-layer subdirectory (e.g. ``"../escape"``). The
             CLI passes ``target_id`` straight through from operator
             input, so a one-line guard here prevents accidental
@@ -898,7 +923,7 @@ def _resolve_target_path(
     candidate = (target_dir / f"{target_id}.md").resolve()
     if candidate.parent != target_dir.resolve():
         msg = f"target_id {target_id!r} escapes the compiled-layer directory"
-        raise ValueError(msg)
+        raise CompileRequestError(msg)
     return candidate
 
 

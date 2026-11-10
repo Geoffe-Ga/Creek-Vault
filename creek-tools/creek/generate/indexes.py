@@ -144,6 +144,20 @@ FREQUENCY_COLORS: dict[Frequency, str] = {
 }
 """Mapping from Frequency enum values to their ontology color designations."""
 
+
+def frequency_colour_name(freq: Frequency) -> str:
+    """Return the colour a person calls *freq* by — ``Beige``, ``Clear Light``.
+
+    The owner names a frequency by its colour, never its ``F1``..``F10`` code,
+    so anything a person reads (an idea title, a draft filename) uses this.
+    A frequency with no colour (``UNCLASSIFIED``) keeps its own value.
+    """
+    colour = FREQUENCY_COLORS.get(freq)
+    if colour is None:
+        return freq.value
+    return colour.replace("_", " ").title()
+
+
 FREQUENCY_THEMES: dict[Frequency, str] = {
     Frequency.F1: "Survival, intentional action, willpower, initiative",
     Frequency.F2: (
