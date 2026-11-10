@@ -62,9 +62,17 @@ boundary. Nor does a failed model dial: anything in
 :data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` — an Ollama
 ``httpx`` error included, which once escaped as FastMCP ``isError`` text with
 its URL (#2083) — is a structured refusal naming the exception's type only.
+Nor does a failed *build* of the LLM factory or grounding route: a stale
+``CREEK_CONFIG``, a schema-invalid config, or a config YAML cannot parse —
+each of whose messages names the config path — once escaped as ``isError``
+text, because both were built before this module's catch (#2091).
+:func:`build_reflect_seams` builds them for the MCP tool and ``POST
+/v1/reflections`` alike and refuses with the type name. That refusal is decided
+before :func:`reflect_tool` runs, so it appends no audit line: nothing was
+reflected, and the one audit append lives inside the tool.
 
-That dial failure is logged as one WARNING carrying the **type name only**: no
-message, no ``exc_info``, no ``logger.exception``. This is deliberately
+A dial or build failure is logged as one WARNING carrying the **type name
+only**: no message, no ``exc_info``, no ``logger.exception``. This is deliberately
 narrower than the traceback-bearing record ``creek.draft`` and
 ``creek.author`` keep, because the ``/v1`` refusal-log contract
 (``tests/test_api_reflect_refusal_log.py``) forbids provider text in any
@@ -81,6 +89,8 @@ from __future__ import annotations
 import logging
 import threading
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol
+
+from yaml import YAMLError
 
 from creek._containment import escaping_child
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
@@ -1259,6 +1269,73 @@ def reflect_tool(
         ceiling=privacy_tier_ceiling,
         tier=tier,
     )
+
+
+_SEAM_BUILD_FAILURES: Final[tuple[type[Exception], ...]] = (
+    RuntimeError,
+    OSError,
+    ValueError,
+    YAMLError,
+)
+"""What building a reflection's LLM factory or grounding route may raise (#2091).
+
+:data:`creek_mcp.httpapi.vault.UNREADABLE_CONFIG` — ``OSError`` for a missing
+or stale ``CREEK_CONFIG``, ``ValueError`` for a config that fails validation,
+``YAMLError`` for one YAML cannot parse — plus ``RuntimeError`` for a provider
+that cannot be built. Restated rather than imported for the layering reason
+:mod:`creek_mcp.tools.drive` gives: a tool module does not reach up into the
+HTTP adapter. ``YAMLError`` is listed explicitly because it is *not* a
+``ValueError``, and its message embeds the config file's path.
+"""
+
+
+def build_reflect_seams(
+    build_factory: Callable[[], _LLMFactory],
+    build_route: Callable[[], GroundingRoute] | None,
+    *,
+    ceiling: TierCeiling,
+) -> tuple[_LLMFactory, GroundingRoute | None] | dict[str, Any]:
+    """Build one reflection's LLM factory and grounding route, or refuse (#2091).
+
+    Both production builders read the served vault's config, so either can
+    fail on a config that cannot load. The MCP tool and ``POST
+    /v1/reflections`` both build through here, so the two surfaces refuse that
+    failure one way, and both pass ``build_route=None`` for an injected
+    factory: an injected factory resolves no stage, so it cannot say whether
+    the pool answers the request, and grounding keeps the local route.
+
+    The refusal reason is ``reflection unavailable: <TypeName>`` for every
+    failure — a rate-limit or rejected-key error raised while *building* is not
+    relabelled the way :func:`_dial_refusal_reason` labels one raised by the
+    dial, so ``/v1``'s wire code for a build failure is unchanged. The failure
+    is logged as one WARNING carrying the type name only, for the reason the
+    module docstring gives; on ``/v1`` it sits beside, and does not replace,
+    the refusal logger's own closed-vocabulary line.
+
+    Args:
+        build_factory: Builds the tier-keyed LLM factory.
+        build_route: Builds the per-tier embedding-route decision, or ``None``
+            to keep grounding on the local route.
+        ceiling: The call's privacy-tier ceiling, echoed by a refusal.
+
+    Returns:
+        ``(factory, route)``, *route* ``None`` when *build_route* is; or a
+        structured refusal when either build raised.
+    """
+    try:
+        factory = build_factory()
+        route = None if build_route is None else build_route()
+    except _SEAM_BUILD_FAILURES as exc:
+        # Type name only — see the module docstring (#2083, #2091).
+        logger.warning(
+            "reflection refused on a seam build failure: %s", type(exc).__name__
+        )
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            reason=f"reflection unavailable: {type(exc).__name__}",
+        )
+    return factory, route
 
 
 def _dial_refusal_reason(exc: Exception) -> str:

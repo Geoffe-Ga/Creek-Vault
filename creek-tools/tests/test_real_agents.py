@@ -19,12 +19,11 @@ from creek.author.agents import (
     OntologySpecialist,
     RetrievalSpecialist,
     _build_link_graph,
+    _excerpt,
     _load_config,
     _load_corpus,
-    _ontology_claim,
 )
-from creek.author.models import EvidenceBundle, OntologyAnalysis
-from creek.classify.weighted import WeightedDimension
+from creek.author.models import EvidenceBundle
 from creek.link.embeddings import (
     CachedEmbedding,
     EmbeddingLinker,
@@ -237,34 +236,10 @@ def test_ontology_returns_canonical_taxonomy(tmp_path: Path) -> None:
     for entry in bundle.ontology.phases:
         assert entry.value in canonical_phases
     assert any(e.value is Phase.RISING for e in bundle.ontology.phases)
-    # Claims are grounded in the scanned fragments.
-    assert bundle.claims
-    assert all(claim.source_fragments for claim in bundle.claims)
-    cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
-    assert cited == {"frag-f6", "frag-rise"}
-    # The summary claim is voiced into the owner's draft, so it reads as a
-    # human thought — colour name, plain phase — never as a classifier report.
-    summary = bundle.claims[0].claim
-    assert summary == (
-        "Across these 2 notes, Green (F6) is the frequency I keep coming back "
-        "to, and most of it was written in the Rising phase."
-    )
-    assert "Ontological scan" not in summary
-
-
-def test_ontology_claim_without_phase_says_so_plainly() -> None:
-    """A frequency with no phase signal renders the no-phase clause."""
-    analysis = OntologyAnalysis(
-        frequencies=(WeightedDimension(value=Frequency.F7, weight=1.0),),
-    )
-
-    claim = _ontology_claim(analysis, ["frag-a"])
-
-    assert claim.claim == (
-        "In this one note, Yellow (F7) is the frequency I keep coming back to, "
-        "with no single phase standing out."
-    )
-    assert claim.source_fragments == ["frag-a"]
+    # The analysis is not evidence for the query, so it emits no claim: the
+    # old corpus-wide summary claim cited every scanned fragment and was voiced
+    # into the draft as its subject ("Across these 30404 notes, Purple (F2)…").
+    assert bundle.claims == []
 
 
 def test_ontology_surfaces_dosage_paradox_without_resolving(tmp_path: Path) -> None:
@@ -357,8 +332,10 @@ def test_ontology_empty_vault_returns_empty_bundle(tmp_path: Path) -> None:
     assert bundle.claims == []
 
 
-def test_ontology_unclassified_corpus_still_grounds_claim(tmp_path: Path) -> None:
-    """Even an all-unclassified corpus emits a fragment-grounded claim."""
+def test_ontology_unclassified_corpus_yields_analysis_and_no_claim(
+    tmp_path: Path,
+) -> None:
+    """An all-unclassified corpus yields a zero-confidence analysis, no claim."""
     _write(tmp_path, "01-Fragments/Notes", "frag-a", "Alpha note about q")
     _write(tmp_path, "01-Fragments/Notes", "frag-b", "Beta note")
 
@@ -366,13 +343,57 @@ def test_ontology_unclassified_corpus_still_grounds_claim(tmp_path: Path) -> Non
 
     assert bundle.ontology is not None
     assert bundle.ontology.overall_confidence == 0.0
-    assert bundle.claims
-    cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
-    assert cited == {"frag-a", "frag-b"}
-    assert bundle.claims[0].claim == (
-        "Across these 2 notes, no single frequency stands out — the writing "
-        "moves between several."
-    )
+    assert bundle.claims == []
+    assert bundle.all_source_fragments() == []
+
+
+def test_graph_and_retrieval_claims_carry_the_fragment_text(tmp_path: Path) -> None:
+    """Each evidence claim carries an excerpt of its fragment's own words.
+
+    A claim used to be the fragment's title alone, so the voice agent had none
+    of the owner's phrasing to imitate.
+    """
+    body = "I keep correcting the agent and it keeps doing the same thing."
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Agents and q", body=body)
+
+    for specialist in (GraphSpecialist(), RetrievalSpecialist()):
+        bundle = specialist.gather("q", tmp_path)
+        assert [claim.excerpt for claim in bundle.claims] == [body]
+
+
+def test_excerpt_never_reaches_a_serialised_claim(tmp_path: Path) -> None:
+    """The excerpt is prompt-only: no ``model_dump`` of a claim carries it."""
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Alpha q", body="SECRET-BODY")
+
+    bundle = RetrievalSpecialist().gather("q", tmp_path)
+
+    assert bundle.claims[0].excerpt == "SECRET-BODY"
+    assert "SECRET-BODY" not in bundle.model_dump_json()
+    assert "excerpt" not in bundle.claims[0].model_dump()
+
+
+def test_excerpt_is_bounded_at_a_sentence_end() -> None:
+    """A long body is cut at its last sentence end inside the bound."""
+    sentence = "This is one whole sentence of mine. "
+    excerpt = _excerpt(sentence * 100)
+
+    assert excerpt is not None
+    assert len(excerpt) <= 700
+    assert excerpt.endswith("mine.")
+
+
+def test_excerpt_without_sentence_end_cuts_at_a_word() -> None:
+    """A long body with no sentence end is cut at a word and marked."""
+    excerpt = _excerpt("word " * 400)
+
+    assert excerpt is not None
+    assert excerpt.endswith("word …")
+    assert len(excerpt) <= 702
+
+
+def test_excerpt_of_a_blank_body_is_none() -> None:
+    """A whitespace-only body yields no excerpt rather than an empty quote."""
+    assert _excerpt("  \n\t ") is None
 
 
 def test_retrieval_reuses_linker_across_gather_calls(

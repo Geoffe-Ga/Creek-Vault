@@ -29,7 +29,6 @@ from creek.author import (
 )
 from creek.author.agents import (
     GraphSpecialist,
-    OntologySpecialist,
     RetrievalSpecialist,
 )
 from creek.author.models import EvidenceClaim, ReflectionFinding, ReflectionResult
@@ -72,10 +71,10 @@ def _seed_fragment(vault: Path, frag_id: str, title: str) -> None:
 
 @pytest.mark.parametrize(
     "specialist",
-    [GraphSpecialist(), RetrievalSpecialist(), OntologySpecialist()],
+    [GraphSpecialist(), RetrievalSpecialist()],
 )
 def test_each_specialist_returns_structured_evidence(
-    specialist: GraphSpecialist | RetrievalSpecialist | OntologySpecialist,
+    specialist: GraphSpecialist | RetrievalSpecialist,
     tmp_path: Path,
 ) -> None:
     """Each specialist returns structured evidence, never free prose."""

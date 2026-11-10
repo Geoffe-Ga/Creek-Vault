@@ -28,6 +28,108 @@ to locate the originating commit for any reference below.
   accepted: a busy `creek.compile` stays unaudited, like `creek.classify`,
   `creek.link` and `creek.upload`, and the docs now say so.
 
+- Writing Desk retrieval follows the topic. Three essays on unrelated
+  subjects, written over MCP on 2026-11-09, all cited the same six `messages`
+  fragments. A fragment's embedding is computed from its title alone, and
+  thousands of fragments share the title `messages`, so they tied on similarity
+  and the fragment-id tie-break picked the lowest ids for every query. The
+  graph walk had the same flaw: with no title overlap it seeded from the lowest
+  id.
+  - **Retrieval** now fuses the embedding ranking with a BM25 keyword score
+    over each fragment's title and body (`creek/author/lexical.py`), using
+    reciprocal-rank fusion over *tied* ranks, so a tie is broken by what the
+    fragments say rather than by id. Fusion only reorders what the embedding
+    pass scored; a fragment dropped by the live-embed budget stays dropped.
+    `creek.reflect` grounding uses the same specialist and benefits too.
+  - **Graph** seeds only from a title sharing a non-stopword with the request,
+    and otherwise contributes no claims.
+
+- Writing Desk and `creek draft` essays: complete, grounded in the owner's
+  words, and free of the pipeline's vocabulary. Read against four drafts an
+  agent wrote over MCP on 2026-11-09.
+  - **No more mid-sentence endings.** Neither the desk's voice call nor the
+    `creek.draft` MCP factory passed `max_tokens`, so both took the provider's
+    1,024-token default (about 750 words), and the MCP factory dropped the stop
+    reason, so a cut-off draft was saved as `truncated: false`. Both now ask for
+    4,096 tokens (`DEFAULT_DRAFT_MAX_TOKENS`, which `creek draft` also uses
+    when `draft.max_tokens` is unset) and carry the stop reason. A cut-off
+    desk draft is flagged `truncated` on the response, the job result and the
+    saved file.
+  - **`source_fragments` lists what the draft drew on, not the vault.** The
+    ontology specialist emitted one summary claim that cited every scanned
+    fragment, so one essay listed 30,404 sources (a 600 KB frontmatter), and
+    the voice prompt carried every id. The specialist now returns its analysis
+    only. On the owner's vault the same query's prompt fell from 585 KB to 8 KB.
+  - **The voice agent sees the owner's words.** An evidence claim was the
+    fragment's title alone. Graph and retrieval claims now carry a
+    sentence-bounded excerpt of up to 700 characters. It is quoted in the voice
+    prompt and excluded from every serialisation (`Field(exclude=True)`).
+  - **The essay no longer narrates its instructions.** The summary claim
+    ("Across these 30404 notes, Purple (F2) is the frequency I keep coming back
+    to") and the gloss steer, which told the model to use the framework's terms
+    and explain them, made essays describe the classification system: "F1, the
+    Agency/Survival register", "a rising period". `GLOSS_STEER` now forbids
+    introducing that vocabulary unless a source passage uses it, and forbids
+    `F1`-style codes. A new `NO_SELF_REFERENCE_STEER`, on both the draft and
+    voice prompts, says the style guidance is how to write, never what to
+    write about.
+  - **Colour names, not codes.** Unexplored-ontology idea titles and
+    dimensional seed titles name a frequency by its colour: `rising x Beige x
+    inhabit …`, not `rising x F1 x inhabit …`.
+  - **A saved desk draft is titled by its own `# heading`**, not by the
+    caller's query, which from an agent is a page of instructions.
+
+- `creek draft` now writes with the `generation` model. The CLI draft
+  factory resolved the `classification` stage, so a vault routing
+  `classification` to a small labelling model (Haiku, say) and `generation` to
+  a drafting model (Sonnet) had every essay written by the labelling model. The
+  bug predates #1031 and survived it, because the tier-routing tests put their
+  only cloud model on `classification`. The factory resolves `generation`, the
+  stage `creek compile` and the config comments already promised. The routing
+  fixtures now give `classification` and `generation` different model names, so
+  resolving the wrong stage fails those tests. `creek draft` on a config that
+  sets no `generation` stage falls back to `default`, as every other stage does.
+
+- `bench eval --reasoning-effort low|medium|high` (OpenAI provider only). A
+  reasoning model behind an OpenAI-compatible endpoint can spend the whole
+  `--max-tokens` budget on hidden reasoning and answer with nothing. Through
+  Privatemode, `glm-5.3` and `glm-5.3-flash` did so even at the 2,048-token
+  ceiling, so an owner-run voice review showed two blank candidates out of three.
+  `LLMConfig` gains an optional `reasoning_effort`, which `OpenAIProvider` sends
+  only when it is set. With no value it passes the SDK's `omit`, so no field
+  reaches the wire and the default request is unchanged. The flag applies to
+  every candidate alike and is refused outside `--mode live --provider openai`
+  rather than ignored. `docs/bench.md` now gives the verified Privatemode proxy
+  steps in place of its placeholder.
+
+- **`creek.reflect` refuses a vault config that cannot load by type name,
+  never as `isError` text naming its path (#2091, follow-up to #2083).** The
+  MCP tool built its LLM factory and grounding route before `reflect_tool`'s
+  catch, so a stale `CREEK_CONFIG` (`FileNotFoundError`), a schema-invalid
+  config (`ValidationError`) and a config YAML cannot parse (`ParserError`)
+  each reached the client as `Error executing tool creek.reflect: ...` with the
+  server's config path in it. Both seams are now built by one helper,
+  `creek_mcp.tools.reflect.build_reflect_seams`, whose catch is
+  `(RuntimeError, OSError, ValueError, YAMLError)`; a failure answers
+  `reflection unavailable: <TypeName>` and logs one type-name-only WARNING on
+  `creek_mcp.tools.reflect`. `YAMLError` is listed because it is not a
+  `ValueError`: `POST /v1/reflections`, which already caught the other three,
+  now shares the helper, so a YAML-syntax-invalid config there is
+  `503 temporarily_unavailable` instead of `500 internal_error` when the vault
+  resolves and its own `00-Creek-Meta/creek_config.yaml` fails to load (or the
+  app was built with an explicit vault path). A broken `CREEK_CONFIG` on the
+  production entry points, which build the app with no vault path, resolves no
+  vault and was and remains `503 unavailable`. A build
+  failure's reason is the literal type-name reason on both surfaces, so a
+  rate-limit or rejected-key error raised while *building* keeps `/v1`'s
+  existing `503`. An injected `reflect_llm_factory` now gets no grounding route
+  on MCP, as on `/v1`, so it never reads the config to build one. A
+  build refusal is decided before `reflect_tool` runs and so, as on `/v1`
+  before, appends no line to the MCP audit log. The same pattern in
+  `creek.classify`, `creek.link`, `creek.redact.scan`, `creek.report`,
+  `creek.draft`, `creek.compile` and the `/v1` letter and reading routes is
+  left to follow-ups.
+
 - **The remaining `01-Fragments` writers take the vault content-mutation lock
   (#2086, follow-up to #2079 and #2087).** `creek purge` (`fragment`, `source`
   incl. `--source-path`, `classifications`, `daterange`, `vault`) and the five
@@ -58,6 +160,7 @@ to locate the originating commit for any reference below.
   vault` and gains neither `00-Creek-Meta/locks/` nor
   `00-Creek-Meta/audit/purge.jsonl` (re #2098, whose first item this fixes:
   `purge fragment` and friends used to scaffold that audit log and exit 0).
+
 
 - **`creek sync` keeps its last-run record when classify or link meets
   content-lock contention (#2087, follow-up to #2079).** `run_classify`,

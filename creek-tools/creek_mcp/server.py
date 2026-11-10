@@ -114,7 +114,7 @@ from creek_mcp.tools import (
 )
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.handshake import AuthMode
-from creek_mcp.tools.reflect import GroundingSession
+from creek_mcp.tools.reflect import GroundingSession, build_reflect_seams
 from creek_mcp.tools.revoice import revoice_tool
 from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
@@ -136,6 +136,7 @@ if TYPE_CHECKING:
     from creek.classify.llm.router import ModelRouter
     from creek.compile.engine import CompileLLM
     from creek.config import LLMConfig
+    from creek.generate.drafts import DraftLLMResponse
     from creek.models import PrivacyTier
     from creek_mcp.oauth_resource import ResourceServerConfig
     from creek_mcp.tools.author import AuthorLLMFactory
@@ -503,7 +504,7 @@ def _build_draft_llm(
     *,
     request_key: RequestKey | None = None,
     provenance: InferenceProvenance | None = None,
-) -> Callable[[str], str]:
+) -> Callable[[str], DraftLLMResponse]:
     """Return the draft-side LLM callable, routed for *tier* (#958).
 
     Mirrors :func:`_build_compile_llm`: the ``generation`` stage is resolved
@@ -538,7 +539,10 @@ def _build_draft_llm(
         provenance: The call's route recorder, or ``None``.
 
     Returns:
-        A prompt → completion-text callable bound to the resolved provider.
+        A prompt → :class:`~creek.generate.drafts.DraftLLMResponse` callable
+        bound to the resolved provider, capped at the vault's
+        ``draft.max_tokens`` (or the shared default) and carrying the stop
+        reason so a cut-off draft is flagged ``truncated``.
 
     Raises:
         RuntimeError: When the resolved provider is unavailable or is not the
@@ -547,12 +551,22 @@ def _build_draft_llm(
             subclass — when intimate content has no local backend to fall
             back to. ``draft_tool`` turns either into a refusal.
     """
-    router = load_vault_config(vault).model_router
-    provider = _generation_provider(router, tier, "draft", request_key, provenance)
+    from creek.generate.drafts import DEFAULT_DRAFT_MAX_TOKENS
+    from creek.generate.drafts import DraftLLMResponse as _Response
 
-    def _draft(prompt: str) -> str:
+    config = load_vault_config(vault)
+    provider = _generation_provider(
+        config.model_router, tier, "draft", request_key, provenance
+    )
+    # The CLI's ceiling, not the provider's 1024-token default: without it every
+    # MCP draft stopped at ~750 words. The stop reason is carried through so the
+    # generator flags a cut-off draft ``truncated`` instead of reporting it whole.
+    max_tokens = config.draft.max_tokens or DEFAULT_DRAFT_MAX_TOKENS
+
+    def _draft(prompt: str) -> DraftLLMResponse:
         with declared_pool_request(tier):
-            return provider.complete(prompt).text
+            completion = provider.complete(prompt, max_tokens=max_tokens)
+        return _Response(text=completion.text, stop_reason=completion.stop_reason)
 
     return _draft
 
@@ -1153,6 +1167,13 @@ def build_server(
     revoice_factory = partial(_author_factory_for, vault, revoice_llm_factory)
     compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
     reflect_factory = partial(_reflect_factory_for, vault, reflect_llm_factory)
+    # As on ``/v1`` (#2091): an injected factory resolves no stage, so it cannot
+    # say whether the pool answers a call, and grounding keeps the local route.
+    reflect_route = (
+        None
+        if reflect_llm_factory is not None
+        else partial(_build_reflect_grounding_route, vault)
+    )
 
     # One grounding session per server (#1034): ``creek.reflect``'s retrieval
     # specialist is built and warmed once here rather than per call, so the
@@ -1165,6 +1186,7 @@ def build_server(
         transport=transport,
         auth=_auth_mode(named, resource_server),
         reflect_factory=reflect_factory,
+        reflect_route=reflect_route,
         grounding_session=GroundingSession(),
     )
     _register_authoring_tools(
@@ -1329,6 +1351,7 @@ def _register_conversation_tools(
     transport: Transport,
     auth: AuthMode,
     reflect_factory: _ScopedFactory[_LLMFactory],
+    reflect_route: Callable[[RequestKey | None], GroundingRoute] | None,
     grounding_session: GroundingSession,
 ) -> None:
     """Register the five conversational tools on *server*.
@@ -1356,7 +1379,14 @@ def _register_conversation_tools(
             ``creek.handshake`` publishes (#1963).
         reflect_factory: Builds the tier-keyed LLM factory for one
             ``creek.reflect`` call from its request-scoped key and route
-            recorder (#1967). Invoked lazily per call.
+            recorder (#1967). Invoked lazily per call, inside
+            :func:`~creek_mcp.tools.reflect.build_reflect_seams`' catch, so a
+            vault config that cannot load is a type-name refusal rather than
+            FastMCP ``isError`` text naming its path (#2091).
+        reflect_route: Builds one ``creek.reflect`` call's embedding-route
+            decision from its request-scoped key, under the same catch; or
+            ``None`` when the factory was injected, so grounding keeps the
+            local route exactly as ``POST /v1/reflections`` does (#2091).
         grounding_session: The server-scoped :class:`GroundingSession` whose
             warmed retrieval specialist every ``creek.reflect`` call reuses
             (#1034). Constructed by ``build_server`` and threaded in rather
@@ -1390,16 +1420,24 @@ def _register_conversation_tools(
         """Return anchored Higher-Self margin notes on a single journal entry."""
         provenance = InferenceProvenance()
         request_key = bound_request_key()
+        seams = build_reflect_seams(
+            partial(reflect_factory, request_key, provenance),
+            None if reflect_route is None else partial(reflect_route, request_key),
+            ceiling=privacy_tier_ceiling,
+        )
+        if isinstance(seams, dict):
+            return _labelled(seams, provenance)
+        llm_factory, grounding_route = seams
         response = reflect_tool(
             vault_path=vault,
-            llm_factory=reflect_factory(request_key, provenance),
+            llm_factory=llm_factory,
             content=content,
             entry_ref=entry_ref,
             care_guard=acute_distress_guard,
             session=grounding_session,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
-            grounding_route=_build_reflect_grounding_route(vault, request_key),
+            grounding_route=grounding_route,
         )
         return _labelled(response, provenance)
 

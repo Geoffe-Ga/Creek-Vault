@@ -277,6 +277,16 @@ class TestGlossSteerPinned:
         assert "first time" in lowered
         assert "once" in lowered
 
+    def test_steer_forbids_introducing_vocabulary_and_f_codes(self) -> None:
+        """The model may not bring the framework in, nor write ``F1`` codes.
+
+        It used to be told to use the terms and gloss them, so every essay
+        explained the classification system the owner never writes about.
+        """
+        assert GLOSS_STEER.startswith("Do not bring in my framework vocabulary")
+        assert "unless the source passages themselves use the term" in GLOSS_STEER
+        assert "Never write frequency codes like F1 or F7." in GLOSS_STEER
+
     def test_steer_names_mode_not_mood(self) -> None:
         """The steer names ``Mode`` — the concept the registry/detector covers."""
         assert "Mode" in GLOSS_STEER

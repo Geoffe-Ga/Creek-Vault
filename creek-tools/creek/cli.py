@@ -6094,13 +6094,15 @@ def _build_draft_llm_factory(
     """
     from creek.classify.llm import LLMClassifier
     from creek.classify.llm.router import IntimateRoutingError
-    from creek.generate.drafts import DraftLLMResponse
+    from creek.generate.drafts import DEFAULT_DRAFT_MAX_TOKENS, DraftLLMResponse
 
     # The explicit flag wins; otherwise honour the config default. Both
     # the provider settings and this ceiling come from the same loaded
     # config so they cannot diverge.
     effective_max_tokens = (
-        max_tokens if max_tokens is not None else config.draft.max_tokens
+        max_tokens
+        if max_tokens is not None
+        else config.draft.max_tokens or DEFAULT_DRAFT_MAX_TOKENS
     )
     clients: dict[PrivacyTier, DraftLLM] = {}
 
@@ -6110,7 +6112,8 @@ def _build_draft_llm_factory(
         if cached is not None:
             return cached
         try:
-            resolved = config.model_router.resolve("classification", tier)
+            # A draft is generation: ``classification`` names the labelling model.
+            resolved = config.model_router.resolve("generation", tier)
         except IntimateRoutingError as exc:
             # The one refusal that must be legible, exactly as on ``creek
             # compile`` (#962): keying the call by tier *introduces* this

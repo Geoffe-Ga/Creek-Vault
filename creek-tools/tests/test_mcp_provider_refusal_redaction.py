@@ -55,9 +55,14 @@ import pytest
 from creek.author.client import AuthorLLMClient
 from creek.classify.classify_engine import LLMProviderUnavailableError
 from creek.classify.llm.local_boundary import LOOPBACK_ONLY_ENV, NonLoopbackOllamaError
-from creek.classify.llm.providers import RequestKeyRejectedError
+from creek.classify.llm.providers import (
+    ProviderRateLimitError,
+    RequestKeyRejectedError,
+)
 from creek.classify.llm.router import IntimateRoutingError
 from creek.generate.mining import IdeaSeed, MiningStrategy
+from creek_mcp import server as server_mod
+from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.model_package import MODEL_PACKAGE_FILE_ENV
 from creek_mcp.server import Transport, build_server
 from creek_mcp.tools import author as author_mod
@@ -798,6 +803,253 @@ def test_mcp_reflect_logs_a_runtime_dial_failure_by_type_name_only(
     assert structured["reason"] == "reflection unavailable: RuntimeError"
     _assert_no_leak(answer)
     _assert_one_type_name_record(caplog, _REFLECT_LOGGER, "RuntimeError")
+
+
+# --------------------------------------------------------------------------- #
+# creek.reflect: an unloadable vault config (#2091)
+# --------------------------------------------------------------------------- #
+
+_UNLOADABLE_CONFIGS: Final[list[tuple[str, str]]] = [
+    ("stale-creek-config", "FileNotFoundError"),
+    ("schema-invalid", "ValidationError"),
+    ("yaml-syntax-invalid", "ParserError"),
+]
+"""Each way a served vault's config fails to load, and the type it raises.
+
+A YAML syntax error raises ``yaml.YAMLError`` (here ``ParserError``), which is
+*not* a ``ValueError``: the ``(RuntimeError, OSError, ValueError)`` tuple #2091
+first proposed would leave that case escaping, its message naming the path.
+"""
+
+
+def _unloadable_config(
+    case: str, vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Arrange a vault config that fails to load the way *case* names.
+
+    Args:
+        case: One of :data:`_UNLOADABLE_CONFIGS`' case ids.
+        vault: The served vault.
+        tmp_path: pytest's per-test directory, outside the vault.
+        monkeypatch: pytest's patcher.
+
+    Returns:
+        The config path, which must never be served or logged.
+    """
+    if case == "stale-creek-config":
+        path = tmp_path / "secret" / "creek_config.yaml"
+        monkeypatch.setenv("CREEK_CONFIG", str(path))
+        return path
+    if case == "schema-invalid":
+        path = tmp_path / "bad" / "creek_config.yaml"
+        path.parent.mkdir(parents=True)
+        path.write_text("not_a_real_key_xyz: 1\n", encoding="utf-8")
+        monkeypatch.setenv("CREEK_CONFIG", str(path))
+        return path
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    path = vault / "00-Creek-Meta" / "creek_config.yaml"
+    path.write_text("model_router: [unclosed\n  : : x\n", encoding="utf-8")
+    return path
+
+
+_CONFIG_LEAKS: Final[tuple[str, ...]] = (
+    "CREEK_CONFIG",
+    "creek_config.yaml",
+    "flow sequence",
+    "validation error",
+)
+"""Fragments of each config-load exception's message; none may be served."""
+
+
+@pytest.mark.parametrize(
+    ("case", "type_name"),
+    _UNLOADABLE_CONFIGS,
+    ids=[case for case, _ in _UNLOADABLE_CONFIGS],
+)
+def test_mcp_reflect_refuses_an_unloadable_config_without_its_path(
+    vault: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+    type_name: str,
+) -> None:
+    """A config that cannot load is a type-name refusal, not ``isError`` text.
+
+    Before #2091 ``creek.reflect`` built its LLM factory and grounding route
+    before ``reflect_tool`` ran, outside every catch, so FastMCP served
+    ``Error executing tool creek.reflect: CREEK_CONFIG points to /...`` — here
+    ``call_tool`` would raise ``ToolError``. The ``yaml-syntax-invalid`` case
+    stays red under the issue's original ``(RuntimeError, OSError,
+    ValueError)`` tuple, because ``ParserError`` is not a ``ValueError``.
+
+    The refusal is decided before ``reflect_tool`` runs, so — like ``/v1``'s
+    build refusal — it appends no audit line: nothing was reflected, and the
+    audit append lives inside the tool.
+    """
+    config_path = _unloadable_config(case, vault, tmp_path, monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=_REFLECT_LOGGER)
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
+
+    answer = asyncio.run(
+        server.call_tool("creek.reflect", {"content": "I walked to the river."})
+    )
+
+    payload = _structured(answer)
+    assert payload["status"] == "refused"
+    assert payload["tool"] == "creek.reflect"
+    assert payload["reason"] == f"reflection unavailable: {type_name}"
+    _assert_no_leak(answer, str(config_path), *_CONFIG_LEAKS)
+    _assert_one_type_name_record(caplog, _REFLECT_LOGGER, type_name)
+    for leaked in (str(config_path), *_CONFIG_LEAKS):
+        assert leaked not in caplog.text, leaked
+    assert not (vault / MCP_AUDIT_RELPATH).exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "type_name"),
+    _UNLOADABLE_CONFIGS,
+    ids=[case for case, _ in _UNLOADABLE_CONFIGS],
+)
+def test_mcp_reflect_with_an_injected_factory_never_builds_the_route(
+    vault: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+    type_name: str,
+) -> None:
+    """An injected factory gets no grounding route, as on ``/v1`` (#2091).
+
+    Before #2091 the MCP surface still built the production grounding route
+    beside an injected factory, so an unloadable config failed the call with
+    ``ToolError`` through the route alone. ``POST /v1/reflections`` has never
+    built that route for an injected factory. Now neither surface does, so the
+    call reaches ``reflect_tool``: its default grounder meets the same config,
+    degrades to no grounding inside its own catch (one DEBUG record, type name
+    only), and the injected factory's dial then fails with the ordinary
+    type-name refusal. Never a ``ToolError``, and never the path.
+    """
+    config_path = _unloadable_config(case, vault, tmp_path, monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=_REFLECT_LOGGER)
+    factory = _reflect_factory(RuntimeError(_MARKER))
+    server = build_server(
+        transport=Transport.STDIO, vault_path=vault, reflect_llm_factory=lambda: factory
+    )
+
+    answer = asyncio.run(
+        server.call_tool("creek.reflect", {"content": "I walked to the river."})
+    )
+
+    payload = _structured(answer)
+    assert payload["status"] == "refused"
+    assert payload["reason"] == "reflection unavailable: RuntimeError"
+    _assert_no_leak(answer, str(config_path), *_CONFIG_LEAKS)
+    records = [r for r in caplog.records if r.name == _REFLECT_LOGGER]
+    assert [(r.levelno, r.getMessage(), r.exc_info) for r in records] == [
+        (logging.DEBUG, f"Grounding degraded to none ({type_name})", None),
+        (
+            logging.WARNING,
+            "reflection refused on a provider dial failure: RuntimeError",
+            None,
+        ),
+    ]
+    for leaked in (_MARKER, str(config_path), *_CONFIG_LEAKS):
+        assert leaked not in caplog.text, leaked
+
+
+def _raising_thunk(exc: Exception) -> Callable[[], Callable[..., Any]]:
+    """Return a ``reflect_llm_factory`` thunk that raises *exc* while building.
+
+    Args:
+        exc: What building the factory raises.
+
+    Returns:
+        A zero-argument thunk that never returns a factory.
+    """
+
+    def _thunk() -> Callable[..., Any]:
+        """Fail to build the factory.
+
+        Raises:
+            Exception: Always, *exc*.
+        """
+        raise exc
+
+    return _thunk
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ProviderRateLimitError(f"{_MARKER} {_URL}"),
+        RequestKeyRejectedError(f"{_MARKER} {_URL}"),
+    ],
+    ids=["rate-limited", "request-key-rejected"],
+)
+def test_mcp_reflect_names_a_build_failure_by_type_not_by_dial_reason(
+    vault: Path, caplog: pytest.LogCaptureFixture, exc: Exception
+) -> None:
+    """A build failure is ``reflection unavailable: <Type>``, whatever its type.
+
+    A rate-limit or rejected-key error raised while *building* the factory is
+    not relabelled the way the dial relabels one (``reflection rate limited``,
+    ``reflection request key rejected``): ``/v1`` has always answered a build
+    failure with the type-name reason, and #2091 changes no wire code. Before
+    #2091 this escaped the MCP tool as ``ToolError``.
+    """
+    caplog.set_level(logging.DEBUG, logger=_REFLECT_LOGGER)
+    server = build_server(
+        transport=Transport.STDIO,
+        vault_path=vault,
+        reflect_llm_factory=_raising_thunk(exc),
+    )
+
+    answer = asyncio.run(
+        server.call_tool("creek.reflect", {"content": "I walked to the river."})
+    )
+
+    payload = _structured(answer)
+    assert payload["status"] == "refused"
+    assert payload["reason"] == f"reflection unavailable: {type(exc).__name__}"
+    _assert_no_leak(answer)
+    _assert_one_type_name_record(caplog, _REFLECT_LOGGER, type(exc).__name__)
+    assert not (vault / MCP_AUDIT_RELPATH).exists()
+
+
+def test_mcp_reflect_refuses_a_route_build_failure_after_the_factory_built(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The grounding route is built under the same catch as the factory (#2091).
+
+    The factory builds — the vault has no config, so it routes on defaults —
+    and only the route fails, so a catch that covered the factory alone would
+    still let the route's error escape as ``ToolError`` text.
+    """
+    secret = "/srv/secret/creek_config.yaml"
+
+    def _route(_vault: Path, _request_key: object = None) -> Any:
+        """Fail the way an unreadable config does, naming a path.
+
+        Raises:
+            OSError: Always.
+        """
+        raise OSError(f"{secret} {_MARKER}")
+
+    monkeypatch.setattr(server_mod, "_build_reflect_grounding_route", _route)
+    caplog.set_level(logging.DEBUG, logger=_REFLECT_LOGGER)
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
+
+    answer = asyncio.run(
+        server.call_tool("creek.reflect", {"content": "I walked to the river."})
+    )
+
+    payload = _structured(answer)
+    assert payload["status"] == "refused"
+    assert payload["reason"] == "reflection unavailable: OSError"
+    _assert_no_leak(answer, secret)
+    _assert_one_type_name_record(caplog, _REFLECT_LOGGER, "OSError")
+    assert secret not in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -911,11 +911,12 @@ def test_build_reflect_llm_factory_routes_then_degrades(
 
 
 class _CompletionStub:
-    """A provider completion exposing only the ``.text`` field callers read."""
+    """A provider completion exposing the ``.text`` and ``.stop_reason`` fields."""
 
-    def __init__(self, text: str) -> None:
-        """Store the completion *text*."""
+    def __init__(self, text: str, stop_reason: str = "end_turn") -> None:
+        """Store the completion *text* and why the model stopped."""
         self.text = text
+        self.stop_reason = stop_reason
 
 
 class _ProviderSpy:
@@ -927,22 +928,33 @@ class _ProviderSpy:
     degraded path can be exercised without a live backend.
     """
 
-    def __init__(self, *, available: bool = True, text: str = "{}") -> None:
+    def __init__(
+        self,
+        *,
+        available: bool = True,
+        text: str = "{}",
+        stop_reason: str = "end_turn",
+    ) -> None:
         """Start with empty recordings, the given availability and response."""
         self.configs: list[object] = []
         self.prompts: list[str] = []
+        self.max_tokens: list[int | None] = []
         self.available = available
         self.text = text
+        self.stop_reason = stop_reason
 
     def build(self, config: object) -> _ProviderSpy:
         """Record *config* and return this spy as the constructed provider."""
         self.configs.append(config)
         return self
 
-    def complete(self, prompt: str) -> _CompletionStub:
-        """Record *prompt* and return the canned completion."""
+    def complete(
+        self, prompt: str, *, max_tokens: int | None = None
+    ) -> _CompletionStub:
+        """Record *prompt* and its ceiling, and return the canned completion."""
         self.prompts.append(prompt)
-        return _CompletionStub(self.text)
+        self.max_tokens.append(max_tokens)
+        return _CompletionStub(self.text, self.stop_reason)
 
     @property
     def provider_names(self) -> list[object]:
@@ -978,7 +990,7 @@ def _split_routing_config(*_args: object, **_kwargs: object) -> object:
     irrelevant to what these tests assert.
     """
     from creek.classify.llm.router import ModelRouter
-    from creek.config import AuthorConfig, LLMConfig, LLMRoutingConfig
+    from creek.config import AuthorConfig, DraftConfig, LLMConfig, LLMRoutingConfig
 
     routing = LLMRoutingConfig(
         default=LLMConfig(provider="ollama"),
@@ -994,6 +1006,8 @@ def _split_routing_config(*_args: object, **_kwargs: object) -> object:
         # ``voice_model`` fallback; the defaults leave the routing above in
         # charge, which is what these assertions are about.
         author = AuthorConfig()
+        # ``_build_draft_llm`` reads the draft block for its output ceiling.
+        draft = DraftConfig()
 
     return _Config()
 
@@ -1248,11 +1262,14 @@ def test_build_draft_llm_routes_by_tier_then_degrades(
     _patch_build_provider(monkeypatch, spy)
 
     # INTIMATE: the cloud ``generation`` stage is redirected to local default.
-    assert server_mod._build_draft_llm(tmp_path, PrivacyTier.INTIMATE)("p") == "drafted"
+    draft = server_mod._build_draft_llm(tmp_path, PrivacyTier.INTIMATE)
+    assert draft("p").text == "drafted"
     assert spy.provider_names == ["ollama"]
 
     # OPEN: no redirect, and the ``generation`` stage (not ``default``) wins.
-    assert server_mod._build_draft_llm(tmp_path, PrivacyTier.OPEN)("p") == "drafted"
+    assert server_mod._build_draft_llm(tmp_path, PrivacyTier.OPEN)("p").text == (
+        "drafted"
+    )
     assert spy.provider_names == ["ollama", "anthropic"]
     assert spy.prompts == ["p", "p"]
 
@@ -1284,7 +1301,7 @@ def test_build_server_wires_the_production_draft_llm_factory(
     scaffolding, the factory is never invoked, and every provider assertion
     below would hold vacuously while the production path stayed dead.
     """
-    from creek.generate.drafts import Draft
+    from creek.generate.drafts import Draft, DraftLLMResponse
     from creek_mcp import server as server_mod
 
     _write_open_fragment(vault, "frag-open")
@@ -1293,12 +1310,14 @@ def test_build_server_wires_the_production_draft_llm_factory(
     spy = _ProviderSpy(text="drafted body")
     _patch_build_provider(monkeypatch, spy)
 
-    recorded: list[Callable[[str], str]] = []
+    recorded: list[Callable[[str], DraftLLMResponse]] = []
 
     class _RecordingGenerator:
         """A ``DraftGenerator`` stand-in recording the llm it was built with."""
 
-        def __init__(self, *, llm: Callable[[str], str], **kwargs: object) -> None:
+        def __init__(
+            self, *, llm: Callable[[str], DraftLLMResponse], **kwargs: object
+        ) -> None:
             """Record *llm*; the remaining generator options are irrelevant."""
             del kwargs
             self._llm = llm
@@ -1354,7 +1373,7 @@ def test_build_server_wires_the_production_draft_llm_factory(
     # not some other object that merely happens to be callable.
     assert spy.prompts == ["draft prompt"]
     assert len(recorded) == 1
-    assert recorded[0]("second prompt") == "drafted body"
+    assert recorded[0]("second prompt").text == "drafted body"
     assert spy.prompts == ["draft prompt", "second prompt"]
 
 
@@ -1790,3 +1809,30 @@ def test_main_hands_build_server_the_network_transport_it_dispatched_on(
     server_module.main(["--transport", "network", "--host", "127.0.0.1"])
 
     assert captured == [Transport.NETWORK]
+
+
+def test_build_draft_llm_sends_an_essay_ceiling_and_reports_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An MCP draft gets the essay ceiling and keeps the provider's stop reason.
+
+    Before this, ``_build_draft_llm`` called ``provider.complete(prompt)`` with
+    no ``max_tokens`` — the provider's 1024-token default, about 750 words — and
+    returned only ``.text``, so every ``creek.draft`` essay stopped mid-sentence
+    while its frontmatter said ``truncated: false``.
+    """
+    from creek.generate.drafts import DEFAULT_DRAFT_MAX_TOKENS
+    from creek.models import PrivacyTier
+    from creek_mcp import server as server_mod
+
+    monkeypatch.setattr(server_mod, "load_vault_config", _split_routing_config)
+    spy = _ProviderSpy(text="cut off mid", stop_reason="max_tokens")
+    _patch_build_provider(monkeypatch, spy)
+
+    response = server_mod._build_draft_llm(tmp_path, PrivacyTier.OPEN)("p")
+
+    assert spy.max_tokens == [DEFAULT_DRAFT_MAX_TOKENS]
+    assert DEFAULT_DRAFT_MAX_TOKENS == 4096
+    assert response.text == "cut off mid"
+    assert response.stop_reason == "max_tokens"
