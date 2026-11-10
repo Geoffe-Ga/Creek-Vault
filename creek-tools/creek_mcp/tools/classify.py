@@ -25,7 +25,7 @@ from creek.classify.llm.providers import (
     RequestKeyRejectedError,
 )
 from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
-from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
+from creek.config import CONFIG_LOAD_FAILURES, CreekConfig, load_vault_config
 from creek.models import PrivacyTier
 from creek.vault.mutations import (
     CONTENT_MUTATION_BUSY_REASON,
@@ -50,7 +50,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.classify.llm.request_key import RequestKey
-    from creek.config import CreekConfig
 
 TOOL_NAME = "creek.classify"
 
@@ -248,6 +247,45 @@ def _rules_fallback(
     return result
 
 
+def _classifiable_config(
+    vault_path: Path, method: str, ceiling: TierCeiling
+) -> CreekConfig | dict[str, Any]:
+    """Return the vault's config for a *method* pass, or the refusal instead.
+
+    The two refusals that come before the vault is read or audited: an
+    unknown method, and a vault config that cannot load (#2096). This config
+    selects ``llm.provider`` — which model is shown the vault's text — so it
+    must be the classified vault's own file (#1409). The ``try`` covers the
+    config read alone, so an engine fault in the pass that follows still
+    escapes as the bug it is.
+
+    Args:
+        vault_path: The vault being classified.
+        method: The requested pass.
+        ceiling: The caller's ceiling, echoed by either refusal.
+
+    Returns:
+        The loaded config, or a structured refusal.
+    """
+    if method not in _VALID_METHODS:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            reason=(
+                f"unknown method {method!r}; supported: {', '.join(_VALID_METHODS)}"
+            ),
+        )
+    try:
+        return load_vault_config(vault_path)
+    except CONFIG_LOAD_FAILURES as exc:
+        return config_unavailable_refusal(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            prefix=CONFIG_UNAVAILABLE_PREFIX,
+            exc=exc,
+        )
+
+
 def classify_tool(
     *,
     vault_path: Path,
@@ -318,28 +356,9 @@ def classify_tool(
         or a vault config that cannot load
         (:data:`CONFIG_UNAVAILABLE_PREFIX` plus its type name, #2096).
     """
-    if method not in _VALID_METHODS:
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            reason=(
-                f"unknown method {method!r}; supported: {', '.join(_VALID_METHODS)}"
-            ),
-        )
-    # This config selects llm.provider — i.e. which model is shown the
-    # vault's text — so it must be the classified vault's own file (#1409).
-    # Its own narrow ``try``: a config that cannot load is refused by type name
-    # before anything is read or audited (#2096), while an engine fault below
-    # still escapes as the bug it is.
-    try:
-        config = load_vault_config(vault_path)
-    except CONFIG_LOAD_FAILURES as exc:
-        return config_unavailable_refusal(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            prefix=CONFIG_UNAVAILABLE_PREFIX,
-            exc=exc,
-        )
+    config = _classifiable_config(vault_path, method, privacy_tier_ceiling)
+    if not isinstance(config, CreekConfig):
+        return config
     try:
         request_scoped = (
             _request_scoped_classifier(config, request_key)
