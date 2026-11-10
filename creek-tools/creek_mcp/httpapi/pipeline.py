@@ -111,6 +111,7 @@ from creek_mcp.api.models import (
     LinkResponse,
     WireTierCeiling,
 )
+from creek_mcp.config_refusal import is_config_unavailable
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
@@ -127,8 +128,10 @@ from creek_mcp.httpapi.jobs import (
 )
 from creek_mcp.httpapi.vault import configured_vault, request_key_of
 from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools.classify import CONFIG_UNAVAILABLE_PREFIX as CLASSIFY_CONFIG_PREFIX
 from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.handshake import vault_available
+from creek_mcp.tools.link import CONFIG_UNAVAILABLE_PREFIX as LINK_CONFIG_PREFIX
 from creek_mcp.tools.link import link_tool
 
 if TYPE_CHECKING:
@@ -155,6 +158,15 @@ method either tool would reject — and mapped anyway, for the reason
 :mod:`creek_mcp.httpapi.journal` maps ``TIER_REQUIRED_REASON``: the day a
 relaxed field or a new caller path does produce it, it is published as the
 caller error it is rather than as a server fault.
+"""
+
+_CONFIG_UNAVAILABLE_PREFIXES: Final[tuple[str, ...]] = (
+    CLASSIFY_CONFIG_PREFIX,
+    LINK_CONFIG_PREFIX,
+)
+"""The two tools' prefixes for a vault config that cannot load (#2097).
+
+Each is followed by the exception's bare type name and nothing else.
 """
 
 _Request = TypeVar("_Request", bound=BaseModel)
@@ -191,6 +203,16 @@ def pipeline_refusal_code(reason: str) -> ErrorCode:
     missing extra or unblocks a download, so the client must stop backing off
     until an operator acts — the code #2060 published for the same condition.
 
+    A vault config that cannot load is ``classification unavailable:
+    <TypeName>`` or ``linking unavailable: <TypeName>`` and maps to
+    ``temporarily_unavailable`` (#2097), the code ``POST /v1/reflections``
+    gives the same fault (#2091). It is the one non-constant reason mapped
+    here, and the match stays closed: a creek-owned prefix **and** a tail that
+    is a bare type name (:func:`~creek_mcp.config_refusal.is_config_unavailable`),
+    never a bare prefix test, so text that merely starts with the prefix — a
+    path, a sentence, a newline — still fails closed. Before #2097 neither
+    route caught the failure at all, and every broken config was a ``500``.
+
     Args:
         reason: The ``reason`` field of a structured tool refusal.
 
@@ -203,6 +225,8 @@ def pipeline_refusal_code(reason: str) -> ErrorCode:
         return ErrorCode.TEMPORARILY_UNAVAILABLE
     if reason == EMBEDDING_MODEL_UNAVAILABLE_REASON:
         return ErrorCode.UNAVAILABLE
+    if is_config_unavailable(reason, _CONFIG_UNAVAILABLE_PREFIXES):
+        return ErrorCode.TEMPORARILY_UNAVAILABLE
     return ErrorCode.INTERNAL_ERROR
 
 
@@ -558,9 +582,10 @@ def _failure_code(raw: dict[str, Any]) -> JobFailureCode | None:
       the condition the synchronous routes answer ``503
       temporarily_unavailable`` (#2066), so resubmit.
 
-    The operator-side fixed reasons — an unloadable embedding model, an
-    unreachable LLM provider — are deliberately left codeless: no resubmit
-    clears them, and their detail stays in the server log.
+    The operator-side reasons — an unloadable embedding model, an
+    unreachable LLM provider, a vault config that cannot load (#2097) — are
+    deliberately left codeless: no resubmit clears them, and their detail
+    stays in the server log.
 
     Args:
         raw: The tool's non-ok result.

@@ -25,6 +25,7 @@ from creek.classify.llm.providers import (
     PROVIDER_CALL_FAILURES,
     ProviderRateLimitError,
 )
+from creek.config import CONFIG_LOAD_FAILURES
 from creek.models import PrivacyTier
 from creek_mcp.api.reading_recommendations import (
     ReadingRecommendation,
@@ -46,15 +47,16 @@ PROMPT_VERSION: Final = "reading-recommendation-1"
 
 _UNAVAILABLE_FAILURES: Final[tuple[type[Exception], ...]] = (
     *PROVIDER_CALL_FAILURES,
-    OSError,
-    ValueError,
+    *CONFIG_LOAD_FAILURES,
 )
 """What the recommendation dial raises that means the model is unavailable.
 
 :data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` — an Ollama
 ``httpx.HTTPError`` included since #2083, which used to escape as a ``500`` —
-plus the ``OSError`` and ``ValueError`` a broken provider configuration raises
-while the shared letter factory is built.
+plus :data:`~creek.config.CONFIG_LOAD_FAILURES`, what a vault config that
+cannot load raises while the shared letter factory is built. Its
+``yaml.YAMLError`` is not a ``ValueError`` and was the same ``500`` until
+#2097.
 """
 
 

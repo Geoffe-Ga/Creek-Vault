@@ -15,6 +15,10 @@ and no traceback, since either carries the same text the response withholds.
 The record lives on this module's logger rather than each tool's so an
 operator has one place to look for "the served config does not load".
 
+:func:`is_config_unavailable` is the matching read side for an adapter that
+maps a reason to a wire code: a creek-owned prefix *and* a closed type-name
+tail, so free text that merely starts with the prefix still fails closed.
+
 This module imports only :mod:`creek_mcp.tier_ceiling`, so a tool importing it
 adds no edge into :mod:`creek_mcp.httpapi`.
 """
@@ -22,14 +26,24 @@ adds no edge into :mod:`creek_mcp.httpapi`.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+import re
+from typing import TYPE_CHECKING, Any, Final
 
 from creek_mcp.tier_ceiling import refusal_response
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from creek_mcp.tier_ceiling import TierCeiling
 
 logger = logging.getLogger(__name__)
+
+TYPE_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+"""A bare Python class name — the only tail a config-unavailable reason carries.
+
+Bounded so a reason is never an unbounded string, and closed so nothing but an
+identifier (no path separator, space, quote or newline) can follow the prefix.
+"""
 
 
 def config_unavailable_refusal(
@@ -50,3 +64,21 @@ def config_unavailable_refusal(
     # Type name only: the message names the path, a YAML snippet or the key.
     logger.warning("%s refused on an unloadable vault config: %s", tool, type_name)
     return refusal_response(tool=tool, ceiling=ceiling, reason=prefix + type_name)
+
+
+def is_config_unavailable(reason: str, prefixes: Iterable[str]) -> bool:
+    """Return whether *reason* is a config refusal under one of *prefixes*.
+
+    Args:
+        reason: A tool refusal's ``reason``.
+        prefixes: The ``"<surface> unavailable: "`` prefixes the caller maps.
+
+    Returns:
+        ``True`` only when *reason* is exactly one prefix followed by a bare
+        type name matching :data:`TYPE_NAME_PATTERN`.
+    """
+    return any(
+        reason.startswith(prefix)
+        and TYPE_NAME_PATTERN.fullmatch(reason[len(prefix) :]) is not None
+        for prefix in prefixes
+    )
