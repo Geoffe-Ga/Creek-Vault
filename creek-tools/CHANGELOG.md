@@ -9,6 +9,42 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Seven more MCP tools and four more `/v1` routes refuse a vault config
+  that cannot load by type name (#2096, #2097, follow-ups to #2091).**
+  `creek.classify`, `creek.link`, `creek.redact.scan`, `creek.report` (the
+  six config-reading types: `voice`, `rhetorical-patterns`, `unnamed`,
+  `fingerprint`, `paradox`, `synchronicity`), `creek.draft` and `creek.lint`
+  (when its `paradox` check runs) read the served vault's config outside any
+  catch, so a stale `CREEK_CONFIG` (`FileNotFoundError`), a schema-invalid
+  config (`ValidationError`, whose text names the forbidden key and value)
+  and a config YAML cannot parse (`ParserError`, whose text quotes the file
+  and its path) each reached the client as FastMCP `isError` text. Each now
+  answers `<surface> unavailable: <TypeName>` — `classification`, `linking`,
+  `redaction scan`, `report`, `draft`, `lint` — and logs one WARNING carrying
+  the tool and type name only on the new `creek_mcp.config_refusal` logger.
+  Each catch covers the config read alone, so an engine or generator fault
+  still escapes; `creek.draft` now reads its config before building the
+  provider, so a provider-build fault is never relabelled as a config
+  failure; the `creek lint` CLI still propagates the raw error. On `/v1`,
+  `yaml.YAMLError` is not a `ValueError`, so `POST /v1/letters/{external_id}`
+  and `POST /v1/reading-recommendations` answered a YAML-invalid config with
+  `500 internal_error`; they now give their documented `503
+  temporarily_unavailable`. `POST /v1/classifications` and `POST /v1/links`
+  had no config catch at all and answered every broken config with `500`;
+  they now answer `503 temporarily_unavailable`, matching `POST
+  /v1/reflections`, and an `llm` / `embeddings` job that meets one fails
+  with `failure_code: null` and the private reason
+  `refused: classification unavailable: <TypeName>` (or `linking`) rather
+  than `exception: <TypeName>` plus a traceback. One shared
+  `creek.config.CONFIG_LOAD_FAILURES = (OSError, ValueError, yaml.YAMLError)`
+  replaces the three restated copies (`creek_mcp.httpapi.vault.UNREADABLE_CONFIG`,
+  the drive tools' config catch and `creek.reflect`'s seam tuple).
+  `creek.compile` is not changed here: #2107 (#2074) already answers its
+  config-load failure with the fixed `compile failed` refusal, logged with the
+  type name and an `exc_info` traceback that can name the config path in the
+  operator log; it is deliberately not moved to the `compile unavailable:
+  <TypeName>` shape.
+
 - **`creek.compile` and the `creek.purge.*` MCP tools refuse with fixed text
   (#2074, #2084; #2071 decided).** `creek.compile` used to answer any engine
   `ValueError`/`RuntimeError` with its message, so a vendor 4xx text reached

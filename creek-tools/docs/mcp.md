@@ -2117,6 +2117,25 @@ an identical target page.
 - **`creek.draft` returns "LLM provider unavailable":** the server
   loads the LLM lazily so only `draft` requires it. Configure
   `ANTHROPIC_API_KEY` or a running Ollama instance.
+- **A tool answers `<surface> unavailable: <TypeName>`:** the served
+  vault's config does not load — a `CREEK_CONFIG` naming a missing file
+  (`FileNotFoundError`), a key the schema forbids (`ValidationError`), or a
+  document YAML cannot parse (`ParserError`, `ScannerError`). The reasons are
+  `classification unavailable:` (`creek.classify`), `linking unavailable:`
+  (`creek.link`), `redaction scan unavailable:` (`creek.redact.scan`),
+  `report unavailable:` (`creek.report` types `voice`,
+  `rhetorical-patterns`, `unnamed`, `fingerprint`, `paradox` and
+  `synchronicity`; the other five read no config), `draft unavailable:`
+  (`creek.draft`) and `lint unavailable:` (`creek.lint`, only when the
+  `paradox` check runs — named, or in the default set once `since` is given;
+  it reads `00-Creek-Meta/creek_config.yaml` and ignores `CREEK_CONFIG`),
+  each followed by the exception's type name. The response never carries
+  the path, the YAML snippet or the offending key, and the server logs one
+  WARNING on `creek_mcp.config_refusal` naming the tool and the type only —
+  fix the config and retry. `creek.reflect` answers `reflection unavailable:`
+  the same way (#2091), logging on `creek_mcp.tools.reflect`. Before
+  [#2096](https://github.com/Geoffe-Ga/Creek-Vault/issues/2096) each served
+  the exception's text, path included, as FastMCP `isError` text.
 - **`--transport network` exits with "refusing to serve on non-loopback
   host ... without TLS":** bind `127.0.0.1`/`localhost` for local dev, or
   pass `--tls-cert`/`--tls-key` (both, pointing at existing files) for a

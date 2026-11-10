@@ -90,8 +90,6 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol
 
-from yaml import YAMLError
-
 from creek._containment import escaping_child
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
 from creek.classify.llm.pool_boundary import pool_prompt_within_cap
@@ -100,6 +98,7 @@ from creek.classify.llm.providers import (
     ProviderRateLimitError,
     RequestKeyRejectedError,
 )
+from creek.config import CONFIG_LOAD_FAILURES
 from creek.vault.reader import CORPUS_SUBDIRS, try_validate_fragment
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
@@ -1273,19 +1272,16 @@ def reflect_tool(
 
 _SEAM_BUILD_FAILURES: Final[tuple[type[Exception], ...]] = (
     RuntimeError,
-    OSError,
-    ValueError,
-    YAMLError,
+    *CONFIG_LOAD_FAILURES,
 )
 """What building a reflection's LLM factory or grounding route may raise (#2091).
 
-:data:`creek_mcp.httpapi.vault.UNREADABLE_CONFIG` — ``OSError`` for a missing
-or stale ``CREEK_CONFIG``, ``ValueError`` for a config that fails validation,
-``YAMLError`` for one YAML cannot parse — plus ``RuntimeError`` for a provider
-that cannot be built. Restated rather than imported for the layering reason
-:mod:`creek_mcp.tools.drive` gives: a tool module does not reach up into the
-HTTP adapter. ``YAMLError`` is listed explicitly because it is *not* a
-``ValueError``, and its message embeds the config file's path.
+:data:`creek.config.CONFIG_LOAD_FAILURES` — ``OSError`` for a missing or stale
+``CREEK_CONFIG``, ``ValueError`` for a config that fails validation,
+``yaml.YAMLError`` for one YAML cannot parse — plus ``RuntimeError`` for a
+provider that cannot be built. The config half is the tuple shared with every
+other MCP tool and the HTTP adapter (#2096), defined in :mod:`creek.config` so
+a tool module never reaches up into :mod:`creek_mcp.httpapi`.
 """
 
 

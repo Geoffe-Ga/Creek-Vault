@@ -93,7 +93,7 @@ from creek.classify.llm.providers import (
 )
 from creek.classify.llm.router import IntimateRoutingError
 from creek.classify.privacy_filter import max_source_tier, source_tiers
-from creek.config import load_vault_config
+from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
 from creek.generate.ai_style.guard import VOICE_GUARD_STATUS_KEY
 from creek.generate.compile_routing import (
     NO_COMPILED_SOURCES,
@@ -112,6 +112,7 @@ from creek.models import Phase, PrivacyTier
 from creek.progress import CompositionStage, StageCallback, ignore_stage
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.config_refusal import config_unavailable_refusal
 from creek_mcp.tier_ceiling import (
     TierCeiling,
     refusal_response,
@@ -149,6 +150,9 @@ one that is missing. The vendor's own message — which
 :func:`creek.classify.llm.providers._error_detail` forwards for a 4xx — and an
 Ollama URL ride only the operator log's traceback, never the refusal.
 """
+
+_CONFIG_UNAVAILABLE_PREFIX: Final[str] = "draft unavailable: "
+"""How a refusal for an unloadable vault config opens; a type name follows (#2096)."""
 
 DRAFT_STAGES: Final[tuple[CompositionStage, ...]] = tuple(CompositionStage)
 """The six boundaries a ``creek.draft`` call reports, in order (#1966)."""
@@ -351,9 +355,10 @@ def draft_tool(
         when intimate sources have no local backend to fall back to, a
         writer's key its vendor refused
         (:data:`~creek.classify.llm.providers.REQUEST_KEY_REJECTED_REASON`),
-        or a failed provider call (:data:`DRAFT_PROVIDER_FAILED_REASON`). No
-        refusal reason names a fragment, its tier, or the provider's own
-        error text (#2073).
+        a failed provider call (:data:`DRAFT_PROVIDER_FAILED_REASON`), or a
+        vault config that cannot load (``draft unavailable: <TypeName>``,
+        #2096). No refusal reason names a fragment, its tier, the provider's
+        own error text (#2073) or the config's path.
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
@@ -382,6 +387,28 @@ def draft_tool(
         )
     idea = seeds[index]
     on_stage(CompositionStage.SEED)
+    # The vault's own ``creek_config.yaml`` (not the bare process-wide
+    # ``load_config()`` the other tool wrappers use) so an operator's
+    # calibrated grounding thresholds apply to MCP drafts too. The
+    # missing-file warning is suppressed because this is a per-call hot path,
+    # not a setup surface — ``creek init`` is where a missing config is worth
+    # saying out loud, and :mod:`creek.lint.checks.draft_grounding` resolves
+    # the same section the same quiet way.
+    #
+    # Read here, before the factory is built, and in its own narrow ``try``
+    # (#2096): the production factory re-reads the same file, so a config that
+    # cannot load is refused by type name before any provider is resolved,
+    # and a fault raised while *building* a provider is never relabelled as a
+    # config failure — it keeps the provider arm below, or escapes.
+    try:
+        config = load_vault_config(vault_path)
+    except CONFIG_LOAD_FAILURES as exc:
+        return config_unavailable_refusal(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            prefix=_CONFIG_UNAVAILABLE_PREFIX,
+            exc=exc,
+        )
     # Deriving the tier and building the client sit here — below both
     # non-drafting exits, above anything that touches a model — so a call that
     # produces no prompt never reaches a provider.
@@ -398,14 +425,6 @@ def draft_tool(
         return _provider_refusal(
             exc, privacy_tier_ceiling, default=DRAFT_PROVIDER_UNAVAILABLE_REASON
         )
-    # The vault's own ``creek_config.yaml`` (not the bare process-wide
-    # ``load_config()`` the other tool wrappers use) so an operator's
-    # calibrated grounding thresholds apply to MCP drafts too. The
-    # missing-file warning is suppressed because this is a per-call hot path,
-    # not a setup surface — ``creek init`` is where a missing config is worth
-    # saying out loud, and :mod:`creek.lint.checks.draft_grounding` resolves
-    # the same section the same quiet way.
-    config = load_vault_config(vault_path)
     generator = DraftGenerator(
         llm=llm,
         skills_root=skills_dir,

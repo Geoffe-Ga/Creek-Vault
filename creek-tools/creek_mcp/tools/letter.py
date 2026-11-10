@@ -49,6 +49,7 @@ from creek.classify.llm.providers import (
     ProviderRateLimitError,
     RequestKeyRejectedError,
 )
+from creek.config import CONFIG_LOAD_FAILURES
 from creek.voice_drafts import (
     VoiceDraftAccessDeniedError,
     VoiceDraftAction,
@@ -102,15 +103,16 @@ _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 _UNAVAILABLE_FAILURES: Final[tuple[type[Exception], ...]] = (
     *PROVIDER_CALL_FAILURES,
-    OSError,
-    ValueError,
+    *CONFIG_LOAD_FAILURES,
 )
 """What a letter's dial raises that means "no provider can write it now".
 
 :data:`~creek.classify.llm.providers.PROVIDER_CALL_FAILURES` — an Ollama
-``httpx.HTTPError`` included since #2083 — plus the ``OSError`` and
-``ValueError`` a broken provider configuration raises while the factory is
-built. Named rather than starred inline because mypy rejects a starred
+``httpx.HTTPError`` included since #2083 — plus
+:data:`~creek.config.CONFIG_LOAD_FAILURES`, what a vault config that cannot
+load raises while the factory is built: ``OSError``, ``ValueError`` and, since
+#2097, ``yaml.YAMLError``, which is not a ``ValueError`` and used to escape as
+a ``500``. Named rather than starred inline because mypy rejects a starred
 ``except`` tuple.
 """
 

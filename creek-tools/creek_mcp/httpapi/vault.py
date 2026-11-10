@@ -23,15 +23,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
-from yaml import YAMLError
-
 from creek.classify.llm.consent import admits_request_keys
 from creek.classify.llm.request_key import (
     REQUEST_KEY_PROVIDERS,
     RequestKey,
     parse_request_key,
 )
-from creek.config import load_config
+from creek.config import CONFIG_LOAD_FAILURES, load_config
 from creek_mcp.api.routes import PROVIDER_HEADER, PROVIDER_KEY_HEADER
 
 if TYPE_CHECKING:
@@ -39,12 +37,14 @@ if TYPE_CHECKING:
 
     from starlette.requests import Request
 
-UNREADABLE_CONFIG: Final = (OSError, ValueError, YAMLError)
+UNREADABLE_CONFIG: Final = CONFIG_LOAD_FAILURES
 """"The vault is not usable" when it is raised rather than returned.
 
-:class:`FileNotFoundError` and a permission error are :class:`OSError`; a
-malformed ``vault_path`` and every :class:`pydantic.ValidationError` are
-:class:`ValueError`; an unparseable document is a :class:`yaml.YAMLError`.
+The shared :data:`creek.config.CONFIG_LOAD_FAILURES`, kept under this name for
+its callers here: :class:`FileNotFoundError` and a permission error are
+:class:`OSError`; a malformed ``vault_path`` and every
+:class:`pydantic.ValidationError` are :class:`ValueError`; an unparseable
+document is a :class:`yaml.YAMLError`.
 """
 
 
