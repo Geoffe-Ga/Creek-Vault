@@ -72,15 +72,13 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from yaml import YAMLError
-
 from creek._fsio import atomic_write_text
 from creek._fslock import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     VaultLockTimeoutError,
     vault_lock,
 )
-from creek.config import load_vault_config
+from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
 from creek.ingest import INGESTOR_REGISTRY, UnsupportedSourceError, route_to_ingestor
 from creek.ingest.gdrive import (
     GoogleApiDriveClient,
@@ -291,15 +289,15 @@ def _loaded_config(vault_path: Path) -> CreekConfig | None:
         vault_path: The vault the calling tool was asked to act on.
 
     Returns:
-        The validated configuration, or ``None`` when it cannot be read. The
-        exception groups are the three
-        :data:`creek_mcp.httpapi.vault.UNREADABLE_CONFIG` names, restated
-        rather than imported because this module is the MCP side and must not
-        depend on the HTTP adapter.
+        The validated configuration, or ``None`` when it cannot be read: any
+        of :data:`creek.config.CONFIG_LOAD_FAILURES`, the tuple the HTTP
+        adapter's ``UNREADABLE_CONFIG`` also names. It lives in
+        :mod:`creek.config` because this module is the MCP side and must not
+        depend on the HTTP adapter (#2096).
     """
     try:
         return load_vault_config(vault_path)
-    except (OSError, ValueError, YAMLError):
+    except CONFIG_LOAD_FAILURES:
         return None
 
 

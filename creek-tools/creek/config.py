@@ -16,7 +16,7 @@ import re
 from contextlib import suppress
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -2685,6 +2685,33 @@ def load_config(
     return CreekConfig()
 
 
+CONFIG_LOAD_FAILURES: Final[tuple[type[Exception], ...]] = (
+    OSError,
+    ValueError,
+    yaml.YAMLError,
+)
+"""Everything :func:`load_vault_config` raises for a config that cannot load.
+
+- :class:`OSError` — a ``CREEK_CONFIG`` naming a missing file
+  (:class:`FileNotFoundError`), or a file the process cannot read.
+- :class:`ValueError` — a document the schema rejects: every
+  :class:`pydantic.ValidationError` *is* a ``ValueError``.
+- :class:`yaml.YAMLError` — a document YAML cannot parse. It is **not** a
+  ``ValueError``, so a ``(OSError, ValueError)`` catch lets it escape; that gap
+  is #2097, and #2091 before it.
+
+Every message names something an MCP client or ``/v1`` caller must not be
+handed: the stale path, the parser's quoted snippet of the file, or the
+forbidden key and its value. A surface that catches this tuple therefore
+refuses by the exception's *type name* alone (#2096).
+
+Defined here rather than in :mod:`creek_mcp` because both of its layers need
+it and neither may import the other: :mod:`creek_mcp.tools` must not reach up
+into the HTTP adapter :mod:`creek_mcp.httpapi`, and this module sits below
+both.
+"""
+
+
 def load_vault_config(
     vault: Path | None,
     *,
@@ -2709,9 +2736,10 @@ def load_vault_config(
     behaving as its parent intended.
 
     Neither a stale nor a malformed vault config is swallowed here. A key the
-    schema forbids raises ``pydantic.ValidationError`` and a dangling
-    ``CREEK_CONFIG`` raises ``FileNotFoundError``; callers that have a reason
-    to continue anyway catch them at their own level. Silent fallback is the
+    schema forbids raises ``pydantic.ValidationError``, a document YAML cannot
+    parse raises ``yaml.YAMLError`` and a dangling ``CREEK_CONFIG`` raises
+    ``FileNotFoundError``; callers that have a reason to continue anyway catch
+    :data:`CONFIG_LOAD_FAILURES` at their own level. Silent fallback is the
     exact failure class this function exists to end.
 
     The one thing it cannot fix is a vault with no config file at all: that
@@ -2731,6 +2759,8 @@ def load_vault_config(
 
     Raises:
         FileNotFoundError: When ``CREEK_CONFIG`` names a missing path.
+        pydantic.ValidationError: When the document fails the schema.
+        yaml.YAMLError: When the document does not parse.
     """
     return load_config(
         resolve_config_path(vault, explicit),
