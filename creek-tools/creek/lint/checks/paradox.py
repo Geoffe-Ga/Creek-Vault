@@ -65,14 +65,18 @@ def _load_fragments(vault_path: Path) -> list[Fragment]:
     return fragments
 
 
-def _resolve_cross_level(vault_path: Path) -> bool:
+def resolve_cross_level(vault_path: Path) -> bool:
     """Read the FEAT-025 ``lint.paradox_cross_level`` knob, defaulting to False.
 
     Looks for ``00-Creek-Meta/creek_config.yaml`` inside *vault_path* —
     the same canonical location ``creek init`` writes. A missing file
     is silently treated as "use defaults"; config-load errors propagate
     so an operator notices a malformed YAML rather than silently
-    getting the wrong policy.
+    getting the wrong policy. ``CREEK_CONFIG`` is not consulted.
+
+    Public so the ``creek.lint`` MCP tool can read it ahead of the run and
+    refuse a config that cannot load by type name (#2096); the ``creek lint``
+    CLI keeps the propagation described above.
     """
     config_path = vault_path / "00-Creek-Meta" / "creek_config.yaml"
     config = load_config(config_path, warn_on_missing=False)
@@ -87,7 +91,7 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     """
     del since  # ParadoxDetector does not support incremental scans today
     fragments = _load_fragments(vault_path)
-    cross_level = _resolve_cross_level(vault_path)
+    cross_level = resolve_cross_level(vault_path)
     paradoxes = ParadoxDetector().detect_paradoxes(
         fragments,
         cross_level=cross_level,

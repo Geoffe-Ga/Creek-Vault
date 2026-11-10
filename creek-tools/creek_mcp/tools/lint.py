@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
+from creek.config import CONFIG_LOAD_FAILURES
 from creek.lint import LintRunner, parse_since
+from creek.lint.checks.paradox import resolve_cross_level
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.config_refusal import config_unavailable_refusal
 from creek_mcp.tier_ceiling import TierCeiling
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 TOOL_NAME = "creek.lint"
+
+_PARADOX_CHECK: Final[str] = "paradox"
+"""The one lint check that reads the vault config and lets its failure escape.
+
+``draft-grounding`` and ``voice-fidelity`` read it too, but already degrade to
+defaults on :data:`~creek.config.CONFIG_LOAD_FAILURES`.
+"""
+
+_CONFIG_UNAVAILABLE_PREFIX: Final[str] = "lint unavailable: "
+"""How a refusal for an unloadable vault config opens; a type name follows (#2096)."""
 
 
 def lint_tool(
@@ -37,6 +50,11 @@ def lint_tool(
     written markdown report *does* embed titles and paths, but it is a
     vault-internal artifact no MCP tool reads back. The ceiling parameter
     is still required per FEAT-010 to keep tool signatures uniform.
+
+    When ``paradox`` is selected — by name, or by the default set once
+    ``since`` is given — a vault config it cannot load is refused as
+    ``lint unavailable: <TypeName>`` (#2096) after the audit line and before
+    any check runs or any report is written.
     """
     resolved_checks = list(checks) if checks is not None else None
     MCPAuditLog(vault_path).append(
@@ -50,6 +68,21 @@ def lint_tool(
     )
     since_dt = parse_since(since) if since else None
     runner = LintRunner(vault_path=vault_path, since=since_dt, since_text=since)
+    # Selecting the checks stays outside the catch, so an unknown name still
+    # raises as it always has. Only when ``paradox`` will run is its config
+    # read here first: a config it cannot load is refused by type name rather
+    # than served as ``isError`` text naming the path (#2096). The CLI runs
+    # the same runner without this preflight and keeps propagating the error.
+    if _PARADOX_CHECK in runner.resolve_checks(resolved_checks):
+        try:
+            resolve_cross_level(vault_path)
+        except CONFIG_LOAD_FAILURES as exc:
+            return config_unavailable_refusal(
+                tool=TOOL_NAME,
+                ceiling=privacy_tier_ceiling,
+                prefix=_CONFIG_UNAVAILABLE_PREFIX,
+                exc=exc,
+            )
     report = runner.run(checks=resolved_checks)
     written = runner.write(report)
     return {

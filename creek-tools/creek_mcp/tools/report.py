@@ -69,7 +69,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
-from creek.config import CreekConfig, load_vault_config
+from creek.config import CONFIG_LOAD_FAILURES, CreekConfig, load_vault_config
 from creek.generate.ai_style.fingerprint import build_fingerprint, save_fingerprint
 from creek.generate.decisions import generate_decisions
 from creek.generate.lexicon import generate_lexicon
@@ -91,6 +91,7 @@ from creek.link.embeddings import (
 )
 from creek.surface_modes import REPORT_TYPES
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.config_refusal import config_unavailable_refusal
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
 
 if TYPE_CHECKING:
@@ -102,6 +103,30 @@ if TYPE_CHECKING:
 TOOL_NAME = "creek.report"
 
 logger = logging.getLogger(__name__)
+
+_CONFIG_UNAVAILABLE_PREFIX: Final[str] = "report unavailable: "
+"""How a refusal for an unloadable vault config opens; a type name follows (#2096)."""
+
+
+class _ConfigUnavailableError(Exception):
+    """The served vault's config failed to load inside a report generator.
+
+    Raised only by :func:`_vault_config`, so :func:`report_tool`'s catch for it
+    covers the config read alone and never a generator's own ``OSError`` or
+    ``ValueError``, which still escape as the bugs they are.
+
+    Attributes:
+        cause: What :func:`~creek.config.load_vault_config` raised.
+    """
+
+    def __init__(self, cause: Exception) -> None:
+        """Carry *cause*, whose type name is all the refusal may say.
+
+        Args:
+            cause: The config-load failure.
+        """
+        super().__init__(type(cause).__name__)
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -156,8 +181,16 @@ def _vault_config(request: _ReportRequest) -> CreekConfig:
 
     Returns:
         The vault's fully-validated :class:`~creek.config.CreekConfig`.
+
+    Raises:
+        _ConfigUnavailableError: When the config cannot load (#2096), so
+            :func:`report_tool` refuses by type name without catching any
+            generator's own failures.
     """
-    return load_vault_config(request.vault_path)
+    try:
+        return load_vault_config(request.vault_path)
+    except CONFIG_LOAD_FAILURES as exc:
+        raise _ConfigUnavailableError(exc) from exc
 
 
 def _generate_tags(request: _ReportRequest) -> list[Path]:
@@ -445,6 +478,12 @@ def report_tool(
     writes no audit entry. ``paradox`` and ``synchronicity`` read only the
     parquet cache and never load the model, so they cannot reach it.
 
+    A fifth sits in the same place: the six types that read the vault config
+    (``voice``, ``rhetorical-patterns``, ``unnamed``, ``fingerprint``,
+    ``paradox``, ``synchronicity``) refuse a config that cannot load as
+    ``report unavailable: <TypeName>`` (#2096), again before any write and
+    with no audit entry. The other five read no config and are unaffected.
+
     Args:
         vault_path: Vault root.
         report_type: One of :data:`creek.surface_modes.REPORT_TYPES`.
@@ -499,6 +538,15 @@ def report_tool(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason=EMBEDDING_MODEL_UNAVAILABLE_REASON,
+        )
+    except _ConfigUnavailableError as exc:
+        # Every config-reading generator reads before it writes, so a refusal
+        # here leaves no file and, like the others, no audit entry (#2096).
+        return config_unavailable_refusal(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            prefix=_CONFIG_UNAVAILABLE_PREFIX,
+            exc=exc.cause,
         )
     relative_paths = [str(p.relative_to(vault_path)) for p in written_paths]
     MCPAuditLog(vault_path).append(

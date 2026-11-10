@@ -10,7 +10,7 @@ not return them today.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from creek._fslock import VaultLockTimeoutError
 from creek.classify.classify_engine import (
@@ -25,13 +25,14 @@ from creek.classify.llm.providers import (
     RequestKeyRejectedError,
 )
 from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
-from creek.config import load_vault_config
+from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
 from creek.models import PrivacyTier
 from creek.vault.mutations import (
     CONTENT_MUTATION_BUSY_REASON,
     ContentMutationBusyError,
 )
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.config_refusal import config_unavailable_refusal
 from creek_mcp.model_pin import (
     build_request_scoped_provider,
     model_pin_enforced,
@@ -52,6 +53,13 @@ if TYPE_CHECKING:
     from creek.config import CreekConfig
 
 TOOL_NAME = "creek.classify"
+
+CONFIG_UNAVAILABLE_PREFIX: Final[str] = "classification unavailable: "
+"""How a refusal for an unloadable vault config opens; a type name follows (#2096).
+
+Public because ``/v1`` maps it: :func:`creek_mcp.httpapi.pipeline.pipeline_refusal_code`
+answers it ``503 temporarily_unavailable`` (#2097).
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -305,8 +313,10 @@ def classify_tool(
     Returns:
         A structured result: per-method counts on success, or a
         refusal for an unknown method, an unreachable provider
-        (:data:`LLM_PROVIDER_UNAVAILABLE_REASON`, #2073), or a request-scoped
-        key its vendor refused (:data:`REQUEST_KEY_REJECTED_REASON`, #1877).
+        (:data:`LLM_PROVIDER_UNAVAILABLE_REASON`, #2073), a request-scoped
+        key its vendor refused (:data:`REQUEST_KEY_REJECTED_REASON`, #1877),
+        or a vault config that cannot load
+        (:data:`CONFIG_UNAVAILABLE_PREFIX` plus its type name, #2096).
     """
     if method not in _VALID_METHODS:
         return refusal_response(
@@ -318,7 +328,18 @@ def classify_tool(
         )
     # This config selects llm.provider — i.e. which model is shown the
     # vault's text — so it must be the classified vault's own file (#1409).
-    config = load_vault_config(vault_path)
+    # Its own narrow ``try``: a config that cannot load is refused by type name
+    # before anything is read or audited (#2096), while an engine fault below
+    # still escapes as the bug it is.
+    try:
+        config = load_vault_config(vault_path)
+    except CONFIG_LOAD_FAILURES as exc:
+        return config_unavailable_refusal(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            prefix=CONFIG_UNAVAILABLE_PREFIX,
+            exc=exc,
+        )
     try:
         request_scoped = (
             _request_scoped_classifier(config, request_key)

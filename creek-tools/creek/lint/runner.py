@@ -287,7 +287,7 @@ class LintRunner:
         Raises:
             ValueError: If *checks* contains an unknown name.
         """
-        selected = self._resolve_checks(checks)
+        selected = self.resolve_checks(checks)
         index: LinkIndex | None = None
         results: list[CheckResult] = []
         for name in selected:
@@ -310,12 +310,23 @@ class LintRunner:
         target.write_text(report.render(), encoding="utf-8")
         return target
 
-    def _resolve_checks(self, checks: list[str] | None) -> list[str]:
+    def resolve_checks(self, checks: list[str] | None) -> list[str]:
         """Decide which checks to run.
 
         Explicit ``--check`` overrides everything; otherwise the default
         set is all deterministic checks, augmented with semantic checks
-        whenever :attr:`since` is set.
+        whenever :attr:`since` is set. Public so the ``creek.lint`` MCP tool
+        can see, before it runs anything, whether ``paradox`` is selected
+        (#2096).
+
+        Args:
+            checks: Explicit check names, or ``None`` for the default set.
+
+        Returns:
+            The selected check names, in :data:`ALL_CHECKS` order.
+
+        Raises:
+            ValueError: If *checks* contains an unknown name.
         """
         if checks is not None:
             unknown = [name for name in checks if name not in _REGISTRY]

@@ -95,16 +95,25 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
-from creek.config import load_vault_config
+from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
 from creek.models import PrivacyTier
 from creek.redact.scanner import RedactionMatch, RedactionScanner, ScanSummary
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.config_refusal import config_unavailable_refusal
 from creek_mcp.path_confinement import resolve_within_vault
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, tier_allowed
 
 TOOL_NAME = "creek.redact.scan"
+
+_CONFIG_UNAVAILABLE_PREFIX: Final[str] = "redaction scan unavailable: "
+"""How a refusal for an unloadable vault config opens; a type name follows (#2096).
+
+It sits below the scope and existence gates and is the same for every target
+that clears them, so it answers nothing about a target those gates do not
+already answer: it adds no oracle beyond today's ``ok`` / not-found split.
+"""
 
 _STAGING_SUBDIR = Path("00-Creek-Meta/Inbound")
 """The FEAT-027 staging subtree — the one scope admitted at every ceiling."""
@@ -175,7 +184,9 @@ def redact_scan_tool(
     Returns:
         A dict with ``status`` (``ok`` / ``empty`` / ``refused``), the scan
         statistics, a list of findings (hash + location + severity — never
-        the matched text), and a human-readable markdown summary. Every path
+        the matched text), and a human-readable markdown summary. A vault
+        config that cannot load is refused as ``redaction scan unavailable:
+        <TypeName>`` (#2096), after the audit line and both gates. Every path
         in it is vault-relative and rendered as scanned, except the
         ``input_path`` echo, which renders the already-resolved target — see
         the module docstring for why that is safe here and not in general.
@@ -218,7 +229,15 @@ def redact_scan_tool(
     # redaction.custom_patterns is how an operator names the secrets specific
     # to their own material; read from anywhere else the scan reports a file
     # clean that their own rule matches (#1409).
-    config = load_vault_config(vault_path)
+    try:
+        config = load_vault_config(vault_path)
+    except CONFIG_LOAD_FAILURES as exc:
+        return config_unavailable_refusal(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            prefix=_CONFIG_UNAVAILABLE_PREFIX,
+            exc=exc,
+        )
     scanner = RedactionScanner(config.redaction)
 
     if resolved.is_file():
