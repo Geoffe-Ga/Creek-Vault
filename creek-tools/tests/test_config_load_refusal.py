@@ -48,6 +48,7 @@ from creek_mcp.server import Transport, build_server
 from creek_mcp.tools import classify as classify_mod
 from creek_mcp.tools import draft as draft_mod
 from creek_mcp.tools import link as link_mod
+from creek_mcp.tools import redact as redact_mod
 from creek_mcp.tools import report as report_mod
 from tests.test_mcp_provider_refusal_redaction import (
     _CONFIG_LEAKS,
@@ -373,6 +374,45 @@ def test_a_report_that_reads_no_config_is_unaffected_by_a_broken_one(
     )
 
     assert _structured(answer)["status"] == "ok"
+
+
+@pytest.mark.parametrize(
+    ("input_path", "ceiling", "reason"),
+    [
+        (
+            "01-Fragments/Notes/x.md",
+            "open",
+            redact_mod._OUT_OF_SCOPE_REASON,
+        ),
+        (
+            "00-Creek-Meta/Inbound/missing.md",
+            "open",
+            "input_path not found: 00-Creek-Meta/Inbound/missing.md",
+        ),
+    ],
+    ids=["out-of-scope", "missing"],
+)
+def test_redact_scan_answers_its_gates_before_the_config_refusal(
+    vault: Path, input_path: str, ceiling: str, reason: str
+) -> None:
+    """The config refusal sits below the scope and existence gates.
+
+    So it is the same answer for every target that clears them, and a broken
+    config adds no oracle over which staged or scoped paths exist.
+    """
+    _vault_file_config("yaml-syntax-invalid", vault)
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
+
+    answer = asyncio.run(
+        server.call_tool(
+            "creek.redact.scan",
+            {"input_path": input_path, "privacy_tier_ceiling": ceiling},
+        )
+    )
+
+    payload = _structured(answer)
+    assert payload["status"] == "refused"
+    assert payload["reason"] == reason
 
 
 # --------------------------------------------------------------------------- #
