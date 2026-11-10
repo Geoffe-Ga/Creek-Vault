@@ -9,6 +9,21 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`creek mission` and `creek.mission` draft a personal mission and values
+  document for Reconcile.** Both pick the owner's own
+  fragments (never another author's, an AI's, or a `reference`), ranking the
+  ones that state a value first, and ask the `generation` model for a mission
+  paragraph and three to seven values in the owner's voice. Creek renders the
+  JSON answer into Markdown Reconcile accepts as it stands: a title of at most
+  120 code points, and a body whose Atoms split at blank lines. Admission is
+  `tier_within_override`'s hard cutoff, so an above-ceiling fragment adds
+  nothing to the prompt, and the call is routed by the most sensitive source
+  (with the ceiling, on MCP). The result is saved to `07-Voice/Mission/` with
+  its `source_fragments` and `privacy_tier`. The MCP tool needs `vault:desk`,
+  is response-, prompt- and artifact-probed by the read gate, and returns the
+  Markdown. `creek.generate.drafts.reserve_dated_path` now holds the dated
+  naming rule both writers share.
+
 - **Seven more MCP tools and four more `/v1` routes refuse a vault config
   that cannot load by type name (#2096, #2097, follow-ups to #2091).**
   `creek.classify`, `creek.link`, `creek.redact.scan`, `creek.report` (the

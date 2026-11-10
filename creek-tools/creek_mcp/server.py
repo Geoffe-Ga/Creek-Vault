@@ -114,6 +114,7 @@ from creek_mcp.tools import (
 )
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.handshake import AuthMode
+from creek_mcp.tools.mission import DEFAULT_MISSION_LIMIT, mission_tool
 from creek_mcp.tools.reflect import GroundingSession, build_reflect_seams
 from creek_mcp.tools.revoice import revoice_tool
 from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
@@ -142,6 +143,7 @@ if TYPE_CHECKING:
     from creek_mcp.tools.author import AuthorLLMFactory
     from creek_mcp.tools.compile import CompileLLMFactory
     from creek_mcp.tools.draft import DraftLLMFactory
+    from creek_mcp.tools.mission import MissionLLMFactory
     from creek_mcp.tools.reflect import _LLM, GroundingRoute, _LLMFactory
     from creek_mcp.tools.revoice import RevoiceLLMFactory
 
@@ -1045,6 +1047,7 @@ def build_server(
     draft_llm_factory: DraftLLMFactory | None = None,
     compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
+    mission_llm_factory: MissionLLMFactory | None = None,
     token_verifier: TokenVerifier | None = None,
     resource_server: ResourceServerConfig | None = None,
     job_runtime: JobRuntime | None = None,
@@ -1082,6 +1085,10 @@ def build_server(
         reflect_llm_factory: Optional thunk returning the tier-keyed LLM
             factory for ``creek.reflect``. Invoked lazily per call so only
             ``creek.reflect`` needs an LLM provider.
+        mission_llm_factory: Optional tier-keyed factory for
+            ``creek.mission`` — ``factory(tier, *, max_tokens)``. Invoked once
+            per call, and only when the vault holds sources to draw on, so
+            only ``creek.mission`` needs an LLM provider.
         token_verifier: When set, the server serves the network transport
             authenticated — every request must present a bearer token the
             verifier accepts (no anonymous access), and remote calls are
@@ -1167,6 +1174,7 @@ def build_server(
     revoice_factory = partial(_author_factory_for, vault, revoice_llm_factory)
     compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
     reflect_factory = partial(_reflect_factory_for, vault, reflect_llm_factory)
+    mission_factory = partial(_mission_factory_for, vault, mission_llm_factory)
     # As on ``/v1`` (#2091): an injected factory resolves no stage, so it cannot
     # say whether the pool answers a call, and grounding keeps the local route.
     reflect_route = (
@@ -1196,6 +1204,7 @@ def build_server(
         draft_factory=draft_factory,
         author_factory=author_factory,
         revoice_factory=revoice_factory,
+        mission_factory=mission_factory,
         jobs=CompositionJobs(
             vault=vault,
             runtime=job_runtime if job_runtime is not None else JobRuntime(),
@@ -1236,6 +1245,42 @@ def _draft_factory_for(
     return partial(
         _build_draft_llm, vault, request_key=request_key, provenance=provenance
     )
+
+
+def _mission_factory_for(
+    vault: Path,
+    injected: MissionLLMFactory | None,
+    request_key: RequestKey | None,
+    provenance: InferenceProvenance,
+) -> MissionLLMFactory:
+    """Return one ``creek.mission`` call's tier-keyed factory.
+
+    The default is the same output-bounded ``generation`` chokepoint the
+    reflection and the letter use (:func:`_bounded_generation_factory`), so a
+    mission is exactly as local as a reflection on the same vault. It is built
+    on the factory's first call rather than here: building it reads the vault
+    config, and a call that answers ``empty`` should read nothing it does not
+    need, while a config that cannot load must surface inside the tool's
+    refusal rather than as FastMCP error text naming its path.
+
+    Args:
+        vault: The served vault, bound by ``build_server`` (#1409).
+        injected: A factory the caller handed ``build_server``, which wins and
+            sees neither the key nor the recorder.
+        request_key: The call's bound request-scoped key, or ``None``.
+        provenance: The call's route recorder.
+
+    Returns:
+        *injected*, or a lazily built generation factory bound to this call.
+    """
+    if injected is not None:
+        return injected
+
+    def _factory(tier: PrivacyTier, *, max_tokens: int) -> _LLM:
+        built = _bounded_generation_factory(vault, "mission", request_key, provenance)
+        return built(tier, max_tokens=max_tokens)
+
+    return _factory
 
 
 def _author_factory_for(
@@ -1501,16 +1546,18 @@ def _register_authoring_tools(
     draft_factory: _ScopedFactory[DraftLLMFactory],
     author_factory: _ScopedFactory[AuthorLLMFactory],
     revoice_factory: _ScopedFactory[RevoiceLLMFactory],
+    mission_factory: _ScopedFactory[MissionLLMFactory],
     jobs: CompositionJobs,
 ) -> None:
     """Register state/authoring tools, delegating model compositions separately.
 
     ``creek.state.read``, ``creek.state.render``, ``creek.lint``,
     ``creek.mine``, ``creek.draft``, ``creek.author``, ``creek.revoice``,
-    ``creek.save`` and ``creek.jobs.read`` -- state operations, three model-backed
-    compositions, and their job-handle reader.
+    ``creek.mission``, ``creek.save`` and ``creek.jobs.read`` -- state
+    operations, four model-backed compositions, and the job-handle reader for
+    the three that run as jobs.
 
-    The three model-backed composition closures live in a separate registrar
+    The four model-backed composition closures live in a separate registrar
     so each registrar stays below the nested-definition ceiling.
 
     Args:
@@ -1525,6 +1572,8 @@ def _register_authoring_tools(
         author_factory: Builds one ``creek.author`` call's tier-keyed voice
             factory the same way; invoked lazily inside the run and not at
             all on the ``dry_run`` path.
+        mission_factory: Builds one ``creek.mission`` call's tier-keyed
+            factory the same way; invoked only when there are sources.
         jobs: The server's :class:`~creek_mcp.composition_jobs.CompositionJobs`:
             ``creek.draft``, ``creek.revoice`` and a non-dry-run ``creek.author``
             run through it for admission, progress and the deadline, and
@@ -1590,6 +1639,7 @@ def _register_authoring_tools(
         draft_factory=draft_factory,
         author_factory=author_factory,
         revoice_factory=revoice_factory,
+        mission_factory=mission_factory,
         jobs=jobs,
     )
 
@@ -1643,9 +1693,15 @@ def _register_composition_tools(
     draft_factory: _ScopedFactory[DraftLLMFactory],
     author_factory: _ScopedFactory[AuthorLLMFactory],
     revoice_factory: _ScopedFactory[RevoiceLLMFactory],
+    mission_factory: _ScopedFactory[MissionLLMFactory],
     jobs: CompositionJobs,
 ) -> None:
-    """Register the three model-backed desk compositions in their existing order.
+    """Register the four model-backed desk compositions in their existing order.
+
+    ``creek.draft``, ``creek.author`` and ``creek.revoice`` run through *jobs*.
+    ``creek.mission`` answers synchronously, as ``creek.reflect`` does: it is
+    one model turn with a bounded output, so it has no progress to report and
+    no handle worth minting.
 
     Args:
         server: The server being assembled.
@@ -1654,6 +1710,7 @@ def _register_composition_tools(
         draft_factory: Request-scoped drafting factory builder.
         author_factory: Request-scoped authoring voice factory builder.
         revoice_factory: Request-scoped revoice factory builder.
+        mission_factory: Request-scoped mission factory builder.
         jobs: Shared composition admission, progress and deadline wrapper.
     """
     factory = draft_factory
@@ -1745,6 +1802,22 @@ def _register_composition_tools(
         )
         return await jobs.run(
             revoice_call(work, consumer=caller, ceiling=privacy_tier_ceiling), ctx
+        )
+
+    @server.tool(name="creek.mission")
+    def _mission(
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+        limit: int = DEFAULT_MISSION_LIMIT,
+    ) -> dict[str, Any]:
+        """Draft the owner's mission and values as a Reconcile personal document."""
+        provenance = InferenceProvenance()
+        return mission_tool(
+            vault_path=vault,
+            llm_factory=mission_factory(bound_request_key(), provenance),
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            limit=limit,
+            consumer=_effective_consumer(consumer),
+            provenance=provenance,
         )
 
 

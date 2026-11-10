@@ -486,6 +486,24 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         gate_module="creek_mcp.tools.draft",
         gate_symbol="to_privacy_override",
     ),
+    "creek.mission": ToolPosture(
+        posture=ReadPosture.GATED,
+        grant=Grant.DESK,
+        rationale=(
+            "Converts the ceiling with to_privacy_override and hands it to "
+            "creek.generate.mission.select_mission_sources, whose admission is "
+            "tier_within_override's hard rank cutoff over fragment_tier: an "
+            "above-ceiling fragment contributes nothing to the prompt, not even "
+            "a title, and a fragment with no privacy_tier key ranks as intimate. "
+            "That exclusion is why the response may carry the document's "
+            "markdown: every byte the model saw was admitted. The routing tier "
+            "is routing_tier(ceiling, content_tier(sources)) and is never "
+            "echoed; the saved 07-Voice/Mission note stamps the sources' own "
+            "most sensitive tier as its privacy_tier."
+        ),
+        gate_module="creek_mcp.tools.mission",
+        gate_symbol="to_privacy_override",
+    ),
     "creek.author": ToolPosture(
         posture=ReadPosture.GATED,
         grant=Grant.DESK,

@@ -125,6 +125,7 @@ Running Creek on a server, for yourself or for other people? See
 | `creek skills sync` | Re-deploy the canonical schema-skill tree and medium contracts from `creek-tools/creek/templates/skills/` into `<vault>/00-Creek-Meta/Skills/` (including `mediums/*.MEDIUM.md`). Won't overwrite a built-in skill or medium file you've edited unless you pass `--force` — and even then it keeps your version next to it as `<name>.bak`. Files you wrote yourself are left alone. | [generation](docs/generation.md#voice-skill-tree) |
 | `creek mine`     | Mine blog/essay seed ideas from the vault using four discovery strategies (liminal cross-eddy, thread terminus, resonance chain, wavelength-phase window). | [generation](docs/generation.md#mining) |
 | `creek draft`    | Draft an essay from a mined idea, in your voice. Saves to `07-Voice/Drafts/` along with a note of which fragments it drew on. | [generation](docs/generation.md#drafting) |
+| `creek mission`  | Draft your personal mission statement and values, in your voice, from your own fragments. Saves to `07-Voice/Mission/` and prints a title and Markdown body ready to paste into Reconcile's Personal page. | [generation](docs/generation.md#mission-and-values-for-reconcile) |
 
 ### Vault hygiene
 

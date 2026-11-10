@@ -1002,10 +1002,28 @@ def reserve_draft_path(vault_path: Path, title: str, generated: datetime) -> Pat
     Returns:
         An absolute path that does not exist yet.
     """
-    drafts_dir = vault_path / DRAFTS_SUBDIR
-    drafts_dir.mkdir(parents=True, exist_ok=True)
+    return reserve_dated_path(vault_path / DRAFTS_SUBDIR, title, generated)
+
+
+def reserve_dated_path(directory: Path, title: str, generated: datetime) -> Path:
+    """Return a non-colliding ``YYYY-MM-DD-{slug}.md`` path under *directory*.
+
+    The naming rule :func:`reserve_draft_path` applies to drafts, for any
+    other dated note written beside them (``creek mission`` writes to
+    ``07-Voice/Mission``), so the two layouts cannot drift. The directory is
+    created if it is missing.
+
+    Args:
+        directory: The folder the note goes in.
+        title: The note's title; slugified into the filename.
+        generated: When the note was generated; its date prefixes the name.
+
+    Returns:
+        An absolute path that does not exist yet.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
     return _next_available_draft_path(
-        drafts_dir, generated.strftime("%Y-%m-%d"), _slugify(title)
+        directory, generated.strftime("%Y-%m-%d"), _slugify(title)
     )
 
 
