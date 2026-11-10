@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 import pytest
+import yaml
 
 from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.classify.classify_engine import LLM_PROVIDER_UNAVAILABLE_REASON
@@ -1680,28 +1681,41 @@ def _compile_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord
     return [r for r in caplog.records if r.name == _COMPILE_LOGGER]
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ValueError(f"engine boom {_COMPILE_LEAK_MARKER}"),
+        # Neither is a ValueError, RuntimeError, OSError or httpx error: only
+        # the fail-closed ``except Exception`` arm keeps them from escaping as
+        # FastMCP isError text. A malformed vault config read inside the
+        # engine raises the first; a frontmatter lookup the second.
+        yaml.YAMLError(f"while parsing a flow sequence {_COMPILE_LEAK_MARKER}"),
+        KeyError(f"/home/owner/vault/01-Fragments/x.md {_COMPILE_LEAK_MARKER}"),
+    ],
+    ids=["value-error", "yaml-error", "key-error"],
+)
 def test_compile_refuses_an_unknown_engine_error_with_a_fixed_reason(
     vault: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    exc: Exception,
 ) -> None:
-    """An engine ``ValueError`` nothing names is the fixed refusal (#2074).
+    """An engine error nothing names is the fixed refusal (#2074).
 
-    Before #2074 its text was the reason. A pydantic ``ValidationError`` — a
+    Before #2074 a ``ValueError``'s text was the reason and anything outside
+    ``(ValueError, RuntimeError)`` escaped. A pydantic ``ValidationError`` — a
     ``ValueError`` — can carry vault frontmatter, so only creek's own typed
     ``CompileRequestError`` is echoed; anything else stays on the log.
     """
     caplog.set_level(logging.WARNING, logger=_COMPILE_LOGGER)
 
-    result = _compile_with_engine_raising(
-        vault, monkeypatch, ValueError(f"engine boom {_COMPILE_LEAK_MARKER}")
-    )
+    result = _compile_with_engine_raising(vault, monkeypatch, exc)
 
     assert result["status"] == "refused"
     assert result["reason"] == _compile_reason("COMPILE_FAILED_REASON")
     assert _COMPILE_LEAK_MARKER not in repr(result)
     (record,) = _compile_records(caplog)
-    assert "ValueError" in record.getMessage()
+    assert type(exc).__name__ in record.getMessage()
     assert _COMPILE_LEAK_MARKER not in record.getMessage()
 
 

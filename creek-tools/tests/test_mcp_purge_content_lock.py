@@ -12,6 +12,7 @@ reason (#2084), its own text withheld.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +49,9 @@ _FRAGMENT_ID = "frag-mcp-purge-lock-2086"
 
 _INNER_DETAIL = "id-index lock busy"
 """The message of a timeout raised under the purge's hold."""
+
+_PURGE_LOGGER = "creek_mcp.tools.purge"
+"""The operator logger ``creek_mcp.tools.purge`` writes to."""
 
 
 def _fragment_tool(vault: Path) -> dict[str, Any]:
@@ -170,9 +174,15 @@ def test_each_purge_tool_runs_its_engine_call_inside_the_content_lock(
 def test_a_busy_vault_is_an_audited_busy_refusal_that_purges_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     tool: str,
 ) -> None:
-    """Contention is the canonical refusal, audited, with the engine never run."""
+    """Contention is the canonical refusal, audited, with the engine never run.
+
+    Busy is ordinary contention, not an engine failure, so it leaves no
+    operator record: only the generic arm logs (#2084).
+    """
+    caplog.set_level(logging.DEBUG, logger=_PURGE_LOGGER)
     vault = _seed_vault(tmp_path)
     before = _fragment_digests(vault)
     method, invoke = _TOOLS[tool]
@@ -190,6 +200,7 @@ def test_a_busy_vault_is_an_audited_busy_refusal_that_purges_nothing(
     assert held == []
     assert len(_audit_lines(vault, tool)) == 1
     assert _fragment_digests(vault) == before
+    assert [r for r in caplog.records if r.name == _PURGE_LOGGER] == []
 
 
 @_EACH_TOOL

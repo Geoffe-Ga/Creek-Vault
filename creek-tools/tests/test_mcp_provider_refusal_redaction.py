@@ -830,13 +830,17 @@ def _write_open_fragment(vault: Path, frag_id: str = "frag-1") -> None:
 
 
 def _call_compile(
-    vault: Path, factory: Callable[[object], Callable[[str], str]]
+    vault: Path,
+    factory: Callable[[object], Callable[[str], str]],
+    *,
+    target_id: str = "thread-x",
 ) -> Any:
     """Call the registered ``creek.compile`` tool and return FastMCP's answer.
 
     Args:
         vault: The vault root, holding ``frag-1``.
         factory: The injected tier-keyed compile LLM factory.
+        target_id: The compile target's id.
 
     Returns:
         FastMCP's raw ``call_tool`` answer.
@@ -850,7 +854,7 @@ def _call_compile(
             {
                 "fragment_ids": ["frag-1"],
                 "target_kind": "thread",
-                "target_id": "thread-x",
+                "target_id": target_id,
                 "target_title": "Thread X",
             },
         )
@@ -928,8 +932,19 @@ _COMPILE_PROVIDER_FAILURES: Final = pytest.mark.parametrize(
         # Its message is already fixed and URL-free; the defect was that, as an
         # ``httpx.TransportError``, it escaped ``compile_tool`` altogether.
         (NonLoopbackOllamaError, "NonLoopbackOllamaError"),
+        # ``raise_for_status()`` on an Ollama 4xx/5xx: an ``httpx.HTTPError``
+        # that is *not* a ``TransportError``, so a catch narrowed to transport
+        # failures would mislabel it as the generic "compile failed".
+        (
+            lambda: httpx.HTTPStatusError(
+                f"Server error '500' for url {_URL!r} {_MARKER}",
+                request=httpx.Request("POST", _URL),
+                response=httpx.Response(500),
+            ),
+            "HTTPStatusError",
+        ),
     ],
-    ids=["vendor-4xx", "ollama-connect-error", "non-loopback-ollama"],
+    ids=["vendor-4xx", "ollama-connect-error", "non-loopback-ollama", "ollama-5xx"],
 )
 
 
@@ -1002,4 +1017,58 @@ def test_mcp_compile_echoes_a_caller_error_without_logging_it(
     structured = _structured(answer)
     assert structured["status"] == "refused"
     assert structured["reason"] == "Fragment(s) not found in vault: frag-1"
+    assert [r for r in caplog.records if r.name == _COMPILE_LOGGER] == []
+
+
+def _answering(text: str) -> Callable[[object], Callable[[str], str]]:
+    """Return a compile LLM factory whose client always answers *text*.
+
+    Args:
+        text: The raw completion the compile LLM returns.
+
+    Returns:
+        A tier → client factory.
+    """
+    return lambda _tier: lambda _prompt: text
+
+
+@pytest.mark.parametrize(
+    ("factory", "target_id", "reason"),
+    [
+        (
+            _answering("not json at all"),
+            "thread-x",
+            "Compile LLM returned non-JSON output.",
+        ),
+        (
+            _answering('{"claims": [], "paradoxes": []}'),
+            "../escape",
+            "target_id '../escape' escapes the compiled-layer directory",
+        ),
+    ],
+    ids=["non-json-payload", "target-escape"],
+)
+def test_mcp_compile_echoes_every_creek_written_engine_refusal(
+    vault: Path,
+    caplog: pytest.LogCaptureFixture,
+    factory: Callable[[object], Callable[[str], str]],
+    target_id: str,
+    reason: str,
+) -> None:
+    """The payload and target-escape refusals reach the caller verbatim (#2074).
+
+    ``docs/mcp.md`` promises the engine's own not-found, target-escape and
+    malformed-LLM-payload text is echoed. Each is a ``CompileRequestError``;
+    were one downgraded to a bare ``ValueError`` the caller would get the
+    generic "compile failed" and the operator log a record it should not
+    carry, so both halves are pinned here at the MCP boundary.
+    """
+    caplog.set_level(logging.DEBUG, logger=_COMPILE_LOGGER)
+    _write_open_fragment(vault)
+
+    answer = _call_compile(vault, factory, target_id=target_id)
+
+    structured = _structured(answer)
+    assert structured["status"] == "refused"
+    assert structured["reason"] == reason
     assert [r for r in caplog.records if r.name == _COMPILE_LOGGER] == []
