@@ -16,6 +16,7 @@ an ordinary one so the lockout never becomes an oracle.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,7 @@ import pytest
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog
 from creek.purge.engine import PurgeResult
 from creek_mcp.audit import MCP_AUDIT_RELPATH
+from creek_mcp.tools import purge as purge_mod
 from creek_mcp.tools.purge import (
     _MAX_DELETED_FILE_PATHS,
     _REFUSAL_NO_TOKEN,
@@ -353,12 +355,45 @@ def test_purge_audit_entry_records_operation_and_consumer(vault: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-_EXPLOSIVE_FAILURE = "engine boom"
+_EXPLOSIVE_FAILURE = "engine boom PURGE-LEAK-MARKER"
+"""The engine failure's text: audited as a refusal, never served (#2084)."""
+
+_PURGE_LOGGER = "creek_mcp.tools.purge"
+"""The operator log a purge engine failure is recorded on (#2084)."""
 
 
 def _explode(*_args: object, **_kwargs: object) -> None:
     """Stand-in for a :class:`PurgeEngine` method that raises mid-call."""
     raise RuntimeError(_EXPLOSIVE_FAILURE)
+
+
+_ENGINE_FAILED_REASON_NAME = "PURGE_ENGINE_FAILED_REASON"
+"""The constant :func:`_engine_failed_reason` reads."""
+
+
+def _engine_failed_reason() -> str:
+    """Return :data:`creek_mcp.tools.purge.PURGE_ENGINE_FAILED_REASON` (#2084).
+
+    Read by name at call time so this module still collects, and fails per
+    test, against a tree that has not defined it yet.
+
+    Returns:
+        The fixed refusal for a purge engine failure.
+    """
+    value = getattr(purge_mod, _ENGINE_FAILED_REASON_NAME)
+    assert isinstance(value, str)
+    return value
+
+
+def _assert_fixed_engine_failure(result: dict[str, object]) -> None:
+    """Assert *result* is the fixed engine-failure refusal, its text withheld.
+
+    Args:
+        result: A purge tool's response.
+    """
+    assert result["status"] == "refused"
+    assert result["reason"] == _engine_failed_reason()
+    assert _EXPLOSIVE_FAILURE not in repr(result)
 
 
 def test_purge_fragment_audits_engine_exception(
@@ -380,8 +415,7 @@ def test_purge_fragment_audits_engine_exception(
         fragment_id="frag-001",
         auth_token=ELEVATED_TOKEN,
     )
-    assert result["status"] == "refused"
-    assert _EXPLOSIVE_FAILURE in result["reason"]
+    _assert_fixed_engine_failure(result)
     entries = _audit_entries(vault)
     assert len(entries) == 1
     assert entries[0]["tool"] == "creek.purge.fragment"
@@ -400,8 +434,7 @@ def test_purge_source_audits_engine_exception(
         source_type="journal",
         auth_token=ELEVATED_TOKEN,
     )
-    assert result["status"] == "refused"
-    assert _EXPLOSIVE_FAILURE in result["reason"]
+    _assert_fixed_engine_failure(result)
     entries = _audit_entries(vault)
     assert len(entries) == 1
     assert entries[0]["tool"] == "creek.purge.source"
@@ -419,8 +452,7 @@ def test_purge_classifications_audits_engine_exception(
         vault_path=vault,
         auth_token=ELEVATED_TOKEN,
     )
-    assert result["status"] == "refused"
-    assert _EXPLOSIVE_FAILURE in result["reason"]
+    _assert_fixed_engine_failure(result)
     entries = _audit_entries(vault)
     assert len(entries) == 1
     assert entries[0]["tool"] == "creek.purge.classifications"
@@ -443,8 +475,7 @@ def test_purge_vault_audits_engine_exception(
         confirm_vault_path=str(vault),
         auth_token=ELEVATED_TOKEN,
     )
-    assert result["status"] == "refused"
-    assert _EXPLOSIVE_FAILURE in result["reason"]
+    _assert_fixed_engine_failure(result)
     entries = _audit_entries(vault)
     assert len(entries) == 1
     assert entries[0]["tool"] == "creek.purge.vault"
@@ -464,11 +495,58 @@ def test_purge_daterange_audits_engine_exception(
         end="2026-05-02",
         auth_token=ELEVATED_TOKEN,
     )
-    assert result["status"] == "refused"
-    assert _EXPLOSIVE_FAILURE in result["reason"]
+    _assert_fixed_engine_failure(result)
     entries = _audit_entries(vault)
     assert len(entries) == 1
     assert entries[0]["tool"] == "creek.purge.daterange"
+
+
+def test_purge_engine_failure_reason_is_fixed_and_logged(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An engine ``OSError`` is the fixed refusal; its path rides the log (#2084).
+
+    Before #2084 the refusal was ``purge engine failed: {exc}``, so an
+    ``OSError`` served the vault path it failed on. The text now reaches only
+    the operator record's traceback, whose message names the type alone, and
+    the call is still audited exactly once.
+    """
+    from creek.purge import PurgeEngine as _PurgeEngine
+
+    caplog.set_level(logging.WARNING, logger=_PURGE_LOGGER)
+    leaked_path = "/home/owner/vault/01-Fragments/x.md"
+    marker = "PURGE-LEAK-MARKER"
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        """Fail on disk the way a real deletion can."""
+        raise OSError(f"{leaked_path} {marker}")
+
+    monkeypatch.setattr(_PurgeEngine, "purge_fragment", _fail)
+    result = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=ELEVATED_TOKEN,
+    )
+
+    assert result == {
+        "status": "refused",
+        "tool": "creek.purge.fragment",
+        "reason": "purge engine failed",
+    }
+    assert leaked_path not in repr(result)
+    assert marker not in repr(result)
+    assert len(_audit_entries(vault)) == 1
+    records = [r for r in caplog.records if r.name == _PURGE_LOGGER]
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    (record,) = records
+    assert isinstance(record.exc_info, tuple), record.exc_info
+    assert type(record.exc_info[1]) is OSError
+    assert "OSError" in record.getMessage()
+    assert "creek.purge.fragment" in record.getMessage()
+    assert marker not in record.getMessage()
+    assert leaked_path not in record.getMessage()
 
 
 def test_crawdad_consumer_cannot_purge(
