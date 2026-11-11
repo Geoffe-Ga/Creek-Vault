@@ -299,6 +299,42 @@ Three refinements make the proxy reflect the *right* you:
 
 > **Voice distance is not an AI detector.** It is a *probabilistic, vault-relative* signal — how far a draft sits from **your own measured writing**, not whether text "is AI". A high distance is a prompt to revise toward your voice, never proof of authorship. Humans and tools are unreliable at AI detection; these scores are for *your* review, never an accusation.
 
+## Mission and values for Reconcile
+
+`creek mission` drafts a personal mission statement and three to seven values from your own writing, in your voice, shaped as a document Reconcile keeps on its Personal page. Over MCP the same thing is `creek.mission` ([mcp](./mcp.md#mission-and-values)).
+
+```bash
+# Draw on your open fragments (the default ceiling).
+creek mission --vault ~/Obsidian/Creek-Vault
+
+# Include personal fragments too (recorded in the privacy audit log).
+creek mission --vault ~/Obsidian/Creek-Vault --include-tier personal
+
+# Draw on fewer notes, and steer the wording with your voice core.
+creek mission --vault ~/Obsidian/Creek-Vault --limit 6 --voice-core ./voice-core.md
+```
+
+**What it reads.** Only your own fragments: `source.author: self`, no `author_slug`, and never a `reference`. Fragments where you say what you value rank first (a value phrase such as "I believe" or "matters to me", an F4 Community Love classification, then extra weight for `aspirational` writing and praxis potential), followed by your other recent writing, so a vault that rarely names its values outright still has your voice to draw on. A fragment above the ceiling is left out entirely, not summarised. A fragment `creek classify` has not tiered yet counts as personal, so it needs `--include-tier personal`, and one that never recorded a `privacy_tier` at all counts as intimate.
+
+**How it is routed.** One model turn on the `generation` stage, keyed by the most sensitive fragment it carries, so an intimate mission stays on the local model or is refused. The style preamble from your voice fingerprint is included, as on `creek draft`.
+
+**What comes back.** The model answers in JSON, and Creek renders it itself, so the output always has the same shape:
+
+```markdown
+## Mission
+One paragraph, in the first person.
+
+## Values
+
+### Honesty
+What it means for how you act.
+
+### Care
+...
+```
+
+Reconcile splits a Document into Atoms at blank lines, so each value is its own Atom, and the same text works as a group's founding Document. The title fits Reconcile's 1 to 120 code-point limit. The draft names no person, group or place: a mission statement tied to a name is exactly the kind of record Reconcile works to protect. The note saved to `07-Voice/Mission/<date>-<slug>.md` records `source_fragments` and the sources' most sensitive `privacy_tier`, and its body is the paste-ready text. Read it through before you use it; only you can say whether it is true.
+
 ## Local-first ergonomics
 
 All generation flows (`mine`, `draft`, `report`, `skills`) respect the privacy tier configuration via the shared filter in `creek/classify/privacy_filter.py`. By default:

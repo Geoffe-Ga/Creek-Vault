@@ -93,6 +93,7 @@ _DESK_TOOLS: Final[frozenset[str]] = frozenset(
         "creek.draft",
         "creek.author",
         "creek.revoice",
+        "creek.mission",
         "creek.reflect",
         "creek.save",
         "creek.jobs.read",
@@ -120,7 +121,7 @@ _PURGE_TOOLS: Final[frozenset[str]] = frozenset(
         "creek.purge.vault",
     }
 )
-_DEFAULT_PROFILE_TOOL_COUNT: Final[int] = 12
+_DEFAULT_PROFILE_TOOL_COUNT: Final[int] = 13
 
 # Floor-clearing (>= 32 chars) fake test literals, never real credentials.
 _GATED_TOKEN: Final[str] = "gated-consumer-test-token-" + "g" * 20
@@ -488,10 +489,10 @@ def test_only_elevated_token_tools_carry_no_grant() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_list_tools_for_the_default_profile_is_twelve_tools(
+def test_list_tools_for_the_default_profile_is_thirteen_tools(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default profile includes revoice (#1981), but neither link nor purge."""
+    """The default profile has revoice (#1981) and mission, but not link or purge."""
     server = _server(vault)
     _present(monkeypatch, _token("acct_91", _gated_scopes(Grant.READ, Grant.DESK)))
     listed = _listed(server)

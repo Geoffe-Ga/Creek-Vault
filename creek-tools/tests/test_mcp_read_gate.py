@@ -247,6 +247,7 @@ from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.journal import journal_ingest_tool
 from creek_mcp.tools.mine import mine_tool
+from creek_mcp.tools.mission import mission_tool
 from creek_mcp.tools.redact import _OUT_OF_SCOPE_REASON, redact_scan_tool
 from creek_mcp.tools.reflect import reflect_tool
 from creek_mcp.tools.report import report_tool
@@ -272,7 +273,7 @@ if TYPE_CHECKING:
 # METADATA_ONLY (or upgrades a tracked gap to a gate it never grew) fails.
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 27
+_EXPECTED_TOOL_COUNT = 28
 
 _EXPECTED_PRIMITIVES = frozenset({"refuse_above_ceiling", "iter_admitted_fragments"})
 
@@ -287,6 +288,7 @@ _PINNED_GATE_ROWS = [
     ("creek.wheel", "creek_mcp.tools.wheel", "to_privacy_override"),
     ("creek.mine", "creek_mcp.tools.mine", "to_privacy_override"),
     ("creek.draft", "creek_mcp.tools.draft", "to_privacy_override"),
+    ("creek.mission", "creek_mcp.tools.mission", "to_privacy_override"),
     ("creek.author", "creek_mcp.tools.author", "to_privacy_override"),
     # #968 closed the report gap. The entry is *re-pointed* at the gate that
     # closed it rather than relabelled: report_tool now converts the ceiling
@@ -2072,6 +2074,53 @@ def _probe_mine(vault: Path) -> dict[str, Any]:
     )
 
 
+class _MissionEchoFactory:
+    """A ``creek.mission`` factory whose model writes back the prompt it was sent.
+
+    The answer is a well-formed mission whose ``mission`` field *is* the
+    prompt, so the response's ``markdown`` and the saved note both carry every
+    byte that crossed to the model. That turns the response and artifact
+    channels into readings of the prompt channel as well: a canary that
+    reached the model cannot stay out of either. The fields are collapsed to
+    one line on the way through, which leaves the whitespace-free sentinels
+    intact.
+    """
+
+    def __call__(
+        self, tier: PrivacyTier, *, max_tokens: int | None = None
+    ) -> Callable[[str], str]:
+        """Return the echoing completion callable; the tier is not under test."""
+        del tier, max_tokens
+        return self._complete
+
+    @staticmethod
+    def _complete(prompt: str) -> str:
+        """Answer with a mission whose body is *prompt*."""
+        return json.dumps(
+            {
+                "title": "Echo",
+                "mission": prompt,
+                "values": [{"name": "Echo", "statement": "The prompt, returned."}],
+            }
+        )
+
+
+def _probe_mission(vault: Path) -> dict[str, Any]:
+    """Call ``creek.mission`` at the open ceiling with the prompt-echoing model.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return mission_tool(
+        vault_path=vault,
+        llm_factory=_MissionEchoFactory(),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
 def _probe_reflect(vault: Path) -> dict[str, Any]:
     """Call ``creek.reflect`` at the open ceiling on the intimate canary.
 
@@ -2745,6 +2794,7 @@ def _probe_author(
 _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.wheel": _probe_wheel,
     "creek.mine": _probe_mine,
+    "creek.mission": _probe_mission,
     "creek.reflect": _probe_reflect,
     "creek.compile": _probe_compile,
     "creek.report": _probe_report,
@@ -2766,6 +2816,7 @@ tree, so layer (f) stays a unit test.
 _RUNTIME_PROBE_CONTROLS: dict[str, str] = {
     "creek.wheel": "test_wheel_probe_still_counts_the_fragment_it_is_admitted_to",
     "creek.mine": "test_mine_probe_still_reaches_the_admitted_corpus",
+    "creek.mission": "test_mission_probe_still_carries_the_admitted_corpus",
     "creek.reflect": "test_reflect_probe_refuses_rather_than_merely_staying_quiet",
     "creek.compile": "test_compile_probe_refuses_rather_than_merely_staying_quiet",
     "creek.report": "test_report_probe_leaves_no_canary_in_the_artifact_it_writes",
@@ -3504,6 +3555,22 @@ def test_mine_probe_still_reaches_the_admitted_corpus(canary_vault: Path) -> Non
     response = _probe_mine(canary_vault)
     assert response["status"] == "ok"
     assert response["total"] > 0
+
+
+def test_mission_probe_still_carries_the_admitted_corpus(canary_vault: Path) -> None:
+    """``creek.mission``'s probe is not passing by drafting from nothing.
+
+    :class:`_MissionEchoFactory` writes the prompt back as the mission, so the
+    response's ``markdown`` is the prompt the model saw. The open canary in it
+    proves the corpus walk ran and admitted the ``open`` fragment; a tier
+    filter broken in the drop-everything direction would answer ``empty``
+    instead, and the sweep's exclusion would then hold over nothing.
+    """
+    response = _probe_mission(canary_vault)
+    assert response["status"] == "ok"
+    assert response["source_fragments"] == [_RUNTIME_OPEN_ID]
+    assert _RUNTIME_OPEN_CANARY in response["markdown"]
+    assert _RUNTIME_INTIMATE_CANARY not in response["markdown"]
 
 
 def test_reflect_probe_refuses_rather_than_merely_staying_quiet(
@@ -4311,6 +4378,7 @@ _PINNED_LLM_BACKED_GATED_TOOLS = (
     "creek.author",
     "creek.compile",
     "creek.draft",
+    "creek.mission",
     "creek.reflect",
 )
 
@@ -4955,9 +5023,50 @@ def _prompt_probe_author(vault: Path) -> _PromptCapture:
     return _PromptCapture(response=response, prompts=tuple(factory.prompts))
 
 
+_MISSION_PROMPT_PROBE_ANSWER = json.dumps(
+    {
+        "title": "Probe",
+        "mission": "A sentinel-free mission.",
+        "values": [{"name": "Plain", "statement": "Nothing from the corpus."}],
+    }
+)
+"""The recorder's answer for the mission probe: a readable mission, no sentinel.
+
+``creek.mission`` refuses an answer it cannot read, and
+:data:`_CANNED_LLM_RESPONSE` is not one, so the probe hands the recorder its
+own. Sentinel-free for the reason the canned response is: a canary found in
+the response can then only have come from the corpus.
+"""
+
+
+def _prompt_probe_mission(vault: Path) -> _PromptCapture:
+    """Draft a mission at the open ceiling over the three-tier vault.
+
+    The ``personal`` canary is what this probe is for. ``select_mission_sources``
+    admits through ``tier_within_override``'s hard cutoff, not through
+    ``filter_fragments_by_tier``, so a personal fragment contributes nothing at
+    ``ceiling=open`` — not its body, and not the title-only summary the draft
+    path carries by design.
+
+    Args:
+        vault: The seeded three-tier canary vault.
+
+    Returns:
+        The tool's response paired with every prompt it sent.
+    """
+    factory = _RecordingLLMFactory(response=_MISSION_PROMPT_PROBE_ANSWER)
+    response = mission_tool(
+        vault_path=vault,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    return _PromptCapture(response=response, prompts=tuple(factory.prompts))
+
+
 _PROMPT_PROBES: dict[str, Callable[[Path], _PromptCapture]] = {
     "creek.author": _prompt_probe_author,
     "creek.compile": _prompt_probe_compile,
+    "creek.mission": _prompt_probe_mission,
     "creek.reflect": _prompt_probe_reflect,
 }
 """LLM-backed ``GATED`` tool → a callable that invokes it and captures its prompts.
@@ -5923,6 +6032,23 @@ def _artifact_call_mine(vault: Path) -> dict[str, Any]:
     )
 
 
+def _artifact_call_mission(vault: Path) -> dict[str, Any]:
+    """Draft a mission at the open ceiling with the prompt-echoing model.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return mission_tool(
+        vault_path=vault,
+        llm_factory=_MissionEchoFactory(),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer=_ARTIFACT_CONSUMER,
+    )
+
+
 def _artifact_call_redact_scan(vault: Path) -> dict[str, Any]:
     """Scan the **admitted** staging subtree, not the refused fragment subtree.
 
@@ -6082,6 +6208,9 @@ _ARTIFACT_OBSERVATIONS: dict[str, _ArtifactObservation] = {
     "creek.mine": _ArtifactObservation(
         seed=_seed_canary_fragments, call=_artifact_call_mine
     ),
+    "creek.mission": _ArtifactObservation(
+        seed=_seed_canary_fragments, call=_artifact_call_mission
+    ),
     "creek.redact.scan": _ArtifactObservation(
         seed=_seed_redact_vault, call=_artifact_call_redact_scan
     ),
@@ -6128,6 +6257,7 @@ _ARTIFACT_OBSERVATION_STATUS: dict[str, frozenset[str]] = {
     "creek.draft": frozenset({"ok"}),
     "creek.journal": frozenset({"ok"}),
     "creek.mine": frozenset({"ok"}),
+    "creek.mission": frozenset({"ok"}),
     "creek.redact.scan": frozenset({"ok"}),
     "creek.reflect": frozenset({"ok", "empty"}),
     "creek.report": frozenset({"ok"}),
@@ -6284,6 +6414,7 @@ _PINNED_ARTIFACT_WRITING_GATED_TOOLS = (
     "creek.draft",
     "creek.journal",
     "creek.mine",
+    "creek.mission",
     "creek.report",
     "creek.skills.refresh",
     "creek.state.render",
@@ -6343,6 +6474,18 @@ def _artifact_probe_mine(vault: Path) -> _ArtifactEvidence:
     return _run_artifact_observation("creek.mine", vault)
 
 
+def _artifact_probe_mission(vault: Path) -> _ArtifactEvidence:
+    """Observe the ``07-Voice/Mission`` note ``creek.mission`` saves.
+
+    Args:
+        vault: A vault the observation may seed and write into.
+
+    Returns:
+        The saved note and the audit row, with their text.
+    """
+    return _run_artifact_observation("creek.mission", vault)
+
+
 def _artifact_probe_report(vault: Path) -> _ArtifactEvidence:
     """Observe the tag garden and tag history ``creek.report`` writes.
 
@@ -6395,6 +6538,7 @@ _ARTIFACT_PROBES: dict[str, Callable[[Path], _ArtifactEvidence]] = {
     "creek.compile": _artifact_probe_compile,
     "creek.journal": _artifact_probe_journal,
     "creek.mine": _artifact_probe_mine,
+    "creek.mission": _artifact_probe_mission,
     "creek.report": _artifact_probe_report,
     "creek.skills.refresh": _artifact_probe_skills_refresh,
     "creek.state.render": _artifact_probe_state_render,
@@ -6481,6 +6625,9 @@ _ARTIFACT_PROBE_CONTROLS: dict[str, str] = {
         "test_the_compile_artifact_probe_refuses_and_an_admitted_compile_writes"
     ),
     "creek.mine": "test_the_mine_artifact_probe_writes_a_routing_only_gap_record",
+    "creek.mission": (
+        "test_the_mission_artifact_probe_saves_the_admitted_corpus_and_no_more"
+    ),
     "creek.journal": (
         "test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched"
     ),
@@ -7002,6 +7149,35 @@ def test_the_mine_artifact_probe_writes_a_routing_only_gap_record(
         "an intimate fragment's sentinel reached the compile-gaps log at "
         f"privacy_tier_ceiling=open.\n\n{evidence.blob}"
     )
+
+
+def test_the_mission_artifact_probe_saves_the_admitted_corpus_and_no_more(
+    tmp_path: Path,
+) -> None:
+    """``creek.mission``'s artifact carries the open canary and nothing above it.
+
+    Over a vault that also holds a ``personal`` canary, which the shared sweep's
+    fixture deliberately does not. Personal is the tier a title-only summary
+    would carry into the prompt, so it is the one exclusion here with teeth:
+    the mission's selection cuts it off outright, and the saved note — the
+    prompt, echoed back by :class:`_MissionEchoFactory` — must show that.
+    """
+    _write_fragment(
+        tmp_path,
+        frag_id=_RUNTIME_PERSONAL_ID,
+        title=f"Personal canary {_RUNTIME_PERSONAL_CANARY}",
+        body=f"Personal canary body {_RUNTIME_PERSONAL_CANARY}",
+        privacy_tier="personal",
+        tags=[_RUNTIME_PERSONAL_CANARY],
+    )
+
+    evidence = _artifact_probe_mission(tmp_path)
+
+    assert evidence.response["status"] == "ok"
+    assert evidence.response["mission_path"] in evidence.written
+    assert _RUNTIME_OPEN_CANARY in evidence.blob
+    assert _RUNTIME_INTIMATE_CANARY not in evidence.blob
+    assert _RUNTIME_PERSONAL_CANARY not in evidence.blob
 
 
 def test_the_draft_artifact_exemption_is_still_true(canary_vault: Path) -> None:

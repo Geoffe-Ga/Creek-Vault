@@ -75,6 +75,7 @@ if TYPE_CHECKING:
         SeedSpec,
     )
     from creek.generate.mining import MiningRunReport
+    from creek.generate.mission import MissionResult
     from creek.ingest.base import Ingestor
     from creek.ingest.discord_dispatch import DiscordMode
     from creek.ingest.gdrive import DownloadResult
@@ -6611,6 +6612,165 @@ def draft(
     )
     saved_path = generator.save_draft(draft_obj, vault_path)
     console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
+
+
+# ---------------------------------------------------------------------------
+# `creek mission` — a personal mission and values document for Reconcile
+# ---------------------------------------------------------------------------
+
+_MISSION_LIMIT_HELP = (
+    "How many of your fragments to draw on: the ones where you state a value "
+    "first, then your other recent writing (default 12, at most 40)."
+)
+"""``--limit`` help. ``tests/test_cli_mission.py`` pins its two numbers to
+:data:`creek.generate.mission.DEFAULT_MISSION_LIMIT` and
+:data:`creek.generate.mission.MAX_MISSION_LIMIT`, which the CLI cannot import at
+module load without pulling in the draft stack."""
+
+_MISSION_PASTE_HINT = (
+    "[dim]Paste the title and the body below into a new document on "
+    "Reconcile's Personal page. Read it through first: it is a draft in your "
+    "voice, and only you can say whether it is true.[/dim]"
+)
+
+
+def _mission_limit(limit: int | None) -> int:
+    """Return the effective ``--limit``, exiting 2 above the cap.
+
+    Args:
+        limit: The ``--limit`` flag, or ``None`` for the default.
+
+    Returns:
+        The number of sources to draw on.
+
+    Raises:
+        typer.Exit: With code 2 when *limit* is above the cap.
+    """
+    from creek.generate.mission import DEFAULT_MISSION_LIMIT, MAX_MISSION_LIMIT
+
+    if limit is None:
+        return DEFAULT_MISSION_LIMIT
+    if limit > MAX_MISSION_LIMIT:
+        console.print(f"[red]--limit is at most {MAX_MISSION_LIMIT}.[/red]")
+        raise typer.Exit(code=2)
+    return limit
+
+
+def _print_mission(result: MissionResult) -> None:
+    """Print where *result* was saved, then its title and body, ready to paste.
+
+    The document goes through :func:`typer.echo`, not Rich, so a ``[`` in the
+    owner's own words is printed as written rather than read as markup.
+
+    Args:
+        result: The saved mission.
+    """
+    console.print(f"[bold green]Mission saved: {escape(str(result.path))}[/bold green]")
+    console.print(_MISSION_PASTE_HINT)
+    typer.echo("")
+    typer.echo(f"Title: {result.document.title}")
+    typer.echo("")
+    typer.echo(result.markdown, nl=False)
+
+
+@app.command()
+def mission(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=(
+            "Privacy-tier ceiling: open, personal, intimate, or all. The "
+            "default admits open fragments only, and a fragment above the "
+            "ceiling is left out entirely. Elevated values are recorded in "
+            "<vault>/00-Creek-Meta/audit/privacy.jsonl."
+        ),
+    ),
+    limit: int | None = typer.Option(None, "--limit", min=1, help=_MISSION_LIMIT_HELP),
+    voice_core: Path | None = typer.Option(
+        None,
+        "--voice-core",
+        help="Path to a voice-core text file added to the prompt.",
+    ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        min=1,
+        help="Maximum tokens the model may generate for the mission.",
+    ),
+) -> None:
+    """Draft a personal mission and values document for Reconcile.
+
+    Picks your own fragments, never another author's or an AI's, ranking the
+    ones where you say what you value first. It asks the generation model for
+    a one-paragraph mission and three to seven values in your voice, saves
+    the result to ``07-Voice/Mission/``, and prints the title and Markdown
+    body ready to paste into Reconcile's Personal page.
+
+    The draft names no person, group or place, because a mission statement
+    tied to a name is the kind of record Reconcile works hardest to protect.
+    The call is routed by the most sensitive fragment it carries, so an
+    intimate mission stays on the local model or is refused.
+    """
+    from creek.classify.llm.providers import PROVIDER_CALL_FAILURES
+    from creek.generate.ai_style.fingerprint import load_fingerprint
+    from creek.generate.ai_style.preamble import build_style_preamble
+    from creek.generate.mission import (
+        MISSION_MAX_OUTPUT_TOKENS,
+        MissionParseError,
+        content_tier,
+        generate_mission,
+        select_mission_sources,
+    )
+
+    vault_path = _resolve_vault(vault)
+    override = _parse_include_tier(include_tier)
+    voice_text = _read_voice_core(voice_core)
+    sources = select_mission_sources(
+        vault_path, override=override, limit=_mission_limit(limit)
+    )
+    if not sources:
+        console.print(
+            "[yellow]No fragments of your own within this tier; nothing to "
+            "draft a mission from. Fragments `creek classify` has not tiered "
+            "yet count as personal: pass --include-tier personal to use "
+            "them.[/yellow]"
+        )
+        return
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="mission",
+        override=override,
+        fragment_ids=[source.fragment_id for source in sources],
+    )
+    vault_config = _load_config_for_vault(vault)
+    ai_style = vault_config.ai_style
+    llm_factory = _build_draft_llm_factory(
+        vault_config, max_tokens or MISSION_MAX_OUTPUT_TOKENS
+    )
+    try:
+        result = generate_mission(
+            vault_path,
+            llm=llm_factory(content_tier(sources)),
+            sources=sources,
+            style_preamble=build_style_preamble(
+                load_fingerprint(vault_path, ai_style), ai_style
+            ),
+            voice_core=voice_text,
+        )
+    except MissionParseError as exc:
+        console.print(
+            f"[red]The model's answer could not be read as a mission "
+            f"({escape(str(exc))}). Nothing was saved; run it again.[/red]"
+        )
+        raise typer.Exit(code=1) from exc
+    except PROVIDER_CALL_FAILURES as exc:
+        console.print(
+            "[red]The LLM provider failed while writing the mission "
+            f"({type(exc).__name__}). Nothing was saved.[/red]"
+        )
+        raise typer.Exit(code=1) from exc
+    _print_mission(result)
 
 
 # ---------------------------------------------------------------------------

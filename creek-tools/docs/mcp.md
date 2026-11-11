@@ -287,7 +287,27 @@ confinement boundary.
 |----------------|------------------------------------------------------------------------|-------------------------------------------------------------------------------|
 | `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). A failure answers `status: error` with a fixed `reason` (`LLM provider call failed for author` / `writing desk failed for author`), never the exception's text ([#2082](https://github.com/Geoffe-Ga/Creek-Vault/issues/2082)). The voice call asks for 4,096 output tokens; a body that still reaches the ceiling answers `truncated: true` (on the response, the job result and the saved draft) rather than passing as whole. A draft filed past the deadline is titled by its own first `# heading` (else `Writing Desk <medium>`), never by `query`, and its `source_fragments` are the fragments its claims cite. |
 | `creek.revoice` | `text`, `register?`, `phase?` | Rewrite supplied text in the owner's voice, preserving meaning and claims without saving. Requires `vault:desk`. |
+| `creek.mission` | `limit?` (default 12, at most 40) | Draft the owner's mission and values as a Reconcile personal document, save it to `07-Voice/Mission/`, and return its `title` and `markdown`. Answers synchronously, with no job handle. Requires `vault:desk`. |
 | `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` / `creek.revoice` job handle to `{status, job_id, state, result?}`. |
+
+### Mission and values
+
+`creek.mission(limit?, privacy_tier_ceiling?)` drafts the owner's personal
+mission statement and values for Reconcile's Personal page; [generation](./generation.md#mission-and-values-for-reconcile)
+describes the document. It reads only the owner's own fragments, and admits
+them with `tier_within_override`'s hard cutoff, so a fragment above the
+ceiling contributes nothing to the prompt, not even a title. That is why the
+response may carry the document itself: `{status: "ok", mission_path, title,
+markdown, source_fragments, source_count, value_count}`, plus
+`inference_source` when the route was recorded. The routing tier is the more
+sensitive of the ceiling and the sources' own tiers, and it is never echoed.
+With nothing to draw on the answer is `empty` and no provider is built. Every
+refusal is a fixed reason: `limit must be between 1 and 40`, `mission
+unavailable: <TypeName>` for a config that cannot load, `LLM provider
+unavailable for mission`, `LLM provider call failed for mission`, the writer's
+refused request key, or `the model's answer could not be read as a mission;
+nothing was saved`. It is one bounded model turn (2,048 output tokens), so it
+answers synchronously, like `creek.reflect`.
 
 ### Revoice supplied text
 

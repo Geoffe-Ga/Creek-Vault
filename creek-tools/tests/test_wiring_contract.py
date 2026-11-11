@@ -855,6 +855,9 @@ class Bench:
             ),
             author_llm_factory=_author_llm_double,
             revoice_llm_factory=_author_llm_double,
+            mission_llm_factory=lambda _tier, *, max_tokens: (
+                lambda _prompt: _MISSION_CANARY_ANSWER
+            ),
         )
         args = {
             key: value.format(**slots) if isinstance(value, str) else value
@@ -870,6 +873,15 @@ class Bench:
 
 _LLM_CANARY: Final = f"LLM-DOUBLE-SPOKE. {CANARY}"
 """Text the injected provider double returns; it must reach the saved artefact."""
+
+_MISSION_CANARY_ANSWER: Final = json.dumps(
+    {
+        "title": "Canary mission",
+        "mission": _LLM_CANARY,
+        "values": [{"name": "Canary", "statement": _LLM_CANARY}],
+    }
+)
+"""The mission double's answer: a readable mission whose words are the canary."""
 
 _REFLECT_CANARY: Final = json.dumps(
     {"notes": [{"quote": "I rest sometimes", "kind": "reframe", "note": "Yours."}]},
@@ -1674,6 +1686,25 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
             seeded=True,
         ),
     ),
+    "creek.mission": Surface(
+        shape=Shape.WRITES,
+        why=(
+            "#1024: a composition that answers over the wire must also land in "
+            "the note it names; the mission note is what a Reconcile personal "
+            "page is pasted from, so the provider's words and the sources they "
+            "drew on must both be in it"
+        ),
+        derived_from=(
+            "creek_mcp.server:build_server",
+            "creek.generate.mission:MISSION_SUBDIR",
+            "creek.generate.mission:save_mission",
+        ),
+        kwargs=dict(_ALL),
+        effect=Effect(
+            writes=("07-Voice/Mission/*.md",),
+            contains=(_LLM_CANARY, "source_fragments"),
+        ),
+    ),
     "creek.save": Surface(
         shape=Shape.WRITES,
         why="#580: the save target routing table is where artefacts get orphaned",
@@ -1863,6 +1894,16 @@ EXEMPTIONS: Final[Mapping[str, Exemption]] = {
         ),
         argv=("--vault", "{vault}", "--no-llm"),
         blocker="LLM provider unavailable; cannot generate draft",
+    ),
+    "mission": Exemption(
+        reason=(
+            "#1024: `creek mission` builds its provider through "
+            "_build_draft_llm_factory and takes no injection seam, exactly as "
+            "`creek draft` does. Its effect is asserted where that factory is "
+            "replaced: tests/test_cli_mission.py drives the registered command "
+            "end to end, and the MCP twin is MCP_CONTRACT['creek.mission']."
+        ),
+        delegate='tests/test_cli_mission.py:["mission", "--vault"',
     ),
     "compile": Exemption(
         reason=(

@@ -22,6 +22,7 @@ _EXPECTED_COMMANDS = {
     "lint",
     "mine",
     "draft",
+    "mission",
     "save",
     "explain",
     "phase",
@@ -37,7 +38,7 @@ def test_commands_directory_exists() -> None:
 
 
 def test_all_required_commands_have_files() -> None:
-    """Each of the 11 documented commands has a markdown file."""
+    """Each of the 12 documented commands has a markdown file."""
     on_disk = {p.stem for p in _COMMANDS_DIR.glob("*.md")}
     missing = _EXPECTED_COMMANDS - on_disk
     assert not missing, f"missing command files: {sorted(missing)}"
@@ -61,6 +62,7 @@ def test_command_frontmatter_parses(name: str) -> None:
         ("lint", "creek.lint"),
         ("mine", "creek.mine"),
         ("draft", "creek.draft"),
+        ("mission", "creek.mission"),
         ("save", "creek.save"),
         ("phase", "creek.state"),
         ("wavelength", "creek.state"),
