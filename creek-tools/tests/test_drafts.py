@@ -805,6 +805,36 @@ class TestSaveDraft:
         assert path.parent == vault / DRAFTS_SUBDIR
         assert path.name == "2026-04-20-what-the-creek-teaches.md"
 
+    @pytest.mark.parametrize("tier", [None, "personal", "intimate"])
+    def test_stamps_privacy_tier_only_when_given(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+        tier: str | None,
+    ) -> None:
+        """The MCP adapter's tier becomes ``privacy_tier``; the CLI stamps none."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        draft = Draft(
+            title="Stamped",
+            body="Body text.",
+            idea_strategy=MiningStrategy.THREAD_TERMINUS.value,
+            source_fragments=("frag-A",),
+            threads=(),
+            eddies=(),
+            skill_stack=(),
+            prompt="full prompt",
+            generated_date=datetime(2026, 4, 20, tzinfo=UTC),
+        )
+        path = gen.save_draft(
+            draft, vault, privacy_tier=None if tier is None else PrivacyTier(tier)
+        )
+        metadata = frontmatter.load(path).metadata
+        if tier is None:
+            assert "privacy_tier" not in metadata
+        else:
+            assert metadata["privacy_tier"] == tier
+
     def test_frontmatter_carries_provenance(
         self,
         vault: Path,

@@ -245,6 +245,8 @@ TOOL_GRANTS: Final[Mapping[str, Grant]] = MappingProxyType(
         "creek.author": Grant.DESK,
         "creek.revoice": Grant.DESK,
         "creek.mission": Grant.DESK,
+        # Hands back what the desk verbs above saved; DESK like them.
+        "creek.drafts.read": Grant.DESK,
         "creek.reflect": Grant.DESK,
         "creek.save": Grant.DESK,
         # #1966: the handle reader for the two desk verbs above. Only a

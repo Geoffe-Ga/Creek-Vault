@@ -147,6 +147,7 @@ _EXPECTED_ORDER: Final[tuple[str, ...]] = (
     "creek.revoice",
     "creek.mission",
     "creek.save",
+    "creek.drafts.read",
     "creek.jobs.read",
     "creek.ingest",
     "creek.redact.scan",
@@ -581,6 +582,19 @@ _EXPECTED_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
         "title": "_saveArguments",
         "type": "object",
     },
+    "creek.drafts.read": {
+        "$defs": _TIER_CEILING_DEFS,
+        "properties": {
+            "path": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+                "title": "Path",
+            },
+            "privacy_tier_ceiling": {"$ref": "#/$defs/TierCeiling", "default": "open"},
+        },
+        "title": "_drafts_readArguments",
+        "type": "object",
+    },
     "creek.jobs.read": {
         "$defs": _TIER_CEILING_DEFS,
         "properties": {
@@ -960,6 +974,9 @@ _EXPECTED_DESCRIPTIONS: Final[dict[str, str]] = {
     "creek.save": (
         "Save a Discord/Claude answer back into the vault; ``tier`` required."
     ),
+    "creek.drafts.read": (
+        "List saved drafts and mission notes, or return one by its path."
+    ),
     "creek.jobs.read": (
         "Resolve a creek.draft / creek.author job handle to its state."
     ),
@@ -1058,7 +1075,7 @@ def test_registration_order_is_pinned(registered_tools: list[Tool]) -> None:
     Args:
         registered_tools: The live tool surface, in registration order.
     """
-    assert len(registered_tools) == 28
+    assert len(registered_tools) == 29
     assert tuple(tool.name for tool in registered_tools) == _EXPECTED_ORDER
 
 
@@ -1075,10 +1092,10 @@ def test_the_pinned_table_covers_the_whole_surface(
         registered_tools: The live tool surface, in registration order.
     """
     live = {tool.name for tool in registered_tools}
-    assert len(registered_tools) == 28
-    assert len(_EXPECTED_ORDER) == 28
-    assert len(_EXPECTED_SCHEMAS) == 28
-    assert len(_EXPECTED_DESCRIPTIONS) == 28
+    assert len(registered_tools) == 29
+    assert len(_EXPECTED_ORDER) == 29
+    assert len(_EXPECTED_SCHEMAS) == 29
+    assert len(_EXPECTED_DESCRIPTIONS) == 29
     assert set(_EXPECTED_ORDER) == live
     assert set(_EXPECTED_SCHEMAS) == live
     assert set(_EXPECTED_DESCRIPTIONS) == live
@@ -1147,7 +1164,7 @@ def test_the_pinned_prose_is_interpreter_independent(
         for name, schema in _EXPECTED_SCHEMAS.items()
         if "$defs" in schema
     }
-    assert len(embedded) == 23
+    assert len(embedded) == 24
     still_normalised = {
         name for name, text in embedded.items() if inspect.cleandoc(text) != text
     }
@@ -1297,7 +1314,7 @@ def test_no_top_level_function_nests_more_than_eight_defs() -> None:
     server_mod = importlib.import_module("creek_mcp.server")
     missing = [name for name in _REGISTRARS if not hasattr(server_mod, name)]
     assert not missing, f"creek_mcp.server is missing registrars: {missing}"
-    assert sum(counts[name] for name in _REGISTRARS) == 28, (
-        "the five registrars must between them hold exactly the 28 tool "
+    assert sum(counts[name] for name in _REGISTRARS) == 29, (
+        "the five registrars must between them hold exactly the 29 tool "
         f"closures, got {[(n, counts[n]) for n in _REGISTRARS]}"
     )

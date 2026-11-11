@@ -1930,6 +1930,14 @@ EXEMPTIONS: Final[Mapping[str, Exemption]] = {
         ),
         delegate="tests/test_mcp_server.py:creek.handshake",
     ),
+    "creek.drafts.read": Exemption(
+        reason=(
+            "#1024: a reader whose effect is the bytes it hands back, not a "
+            "vault write; the read-gate suite probes it on every channel and "
+            "test_mcp_server drives the registered tool end to end."
+        ),
+        delegate="tests/test_mcp_server.py:creek.drafts.read",
+    ),
     "creek.jobs.read": Exemption(
         reason=(
             "#1966: a job handle only exists once a composition outlived the "
