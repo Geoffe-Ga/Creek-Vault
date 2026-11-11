@@ -334,8 +334,9 @@ lives in `07-Voice/Mission/`.
 - **What comes back.** The body only. The frontmatter stays in the vault: a
   `creek draft` file carries its whole prompt there, and provenance ids are
   not the caller's to collect. A body over 200,000 characters is refused with
-  `document too large to return`, and a well-formed path naming no file with
-  `no saved document at that path`.
+  `document too large to return`. A well-formed path naming no file gets the
+  generic above-ceiling refusal, so guessing a file name (they are slugs of
+  titles) cannot confirm that an above-ceiling draft exists.
 - **Audit.** Each call is logged with whether a path was given, never which.
 
 ### Revoice supplied text

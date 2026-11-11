@@ -13,8 +13,11 @@ unrecognised one ranks as intimate (:func:`stamped_content_tier`), so a draft
 written before drafts were stamped, or written by ``creek draft`` on the CLI
 under ``--include-tier``, is refused below ``ceiling=all`` rather than
 guessed at. The refusal is the generic four-key payload and never names the
-tier. The listing applies the same test per document and simply omits what
-the ceiling does not admit; a title is content.
+tier, and a path naming no document gets the identical refusal: file names
+are slugs of titles, so a distinct "missing" answer would confirm that an
+above-ceiling draft on a guessed topic exists. The listing applies the same
+test per document and simply omits what the ceiling does not admit; a title
+is content.
 
 **Confinement.** A ``path`` must be vault-relative, POSIX, and name a ``.md``
 file *directly* under ``07-Voice/Drafts`` or ``07-Voice/Mission``. Any other
@@ -37,11 +40,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
 import frontmatter
-import yaml
 
 from creek.generate.state_tiers import stamped_content_tier
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.read_gate import refuse_above_ceiling
+from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON, refuse_above_ceiling
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, tier_allowed
 
 TOOL_NAME: Final[str] = "creek.drafts.read"
@@ -65,7 +68,6 @@ PATH_REASON: Final[str] = (
     "path must name a .md file directly under 07-Voice/Drafts or 07-Voice/Mission"
 )
 TOO_LARGE_REASON: Final[str] = "document too large to return"
-MISSING_REASON: Final[str] = "no saved document at that path"
 
 
 def drafts_read_tool(
@@ -88,7 +90,8 @@ def drafts_read_tool(
         A listing ``{status, tool, tier_ceiling, documents}`` (``empty`` when
         nothing is admitted); one document ``{status: "ok", path, kind, title,
         markdown}``; or a refusal carrying no content, whose reason is fixed:
-        a malformed path, no such document, above the ceiling, or too large.
+        a malformed path, too large, or the generic above-ceiling reason,
+        which a missing document shares so that a guessed path is no oracle.
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
@@ -108,7 +111,12 @@ def _read(vault_path: Path, path: str, ceiling: TierCeiling) -> dict[str, Any]:
         return refusal_response(tool=TOOL_NAME, ceiling=ceiling, reason=PATH_REASON)
     target = _confined(vault_path, kind, PurePosixPath(path).name)
     if target is None:
-        return refusal_response(tool=TOOL_NAME, ceiling=ceiling, reason=MISSING_REASON)
+        # The above-ceiling refusal, byte for byte. Draft file names are slugs
+        # of their titles, so a distinct "missing" answer would let a caller
+        # confirm that an above-ceiling draft on a guessed topic exists.
+        return refusal_response(
+            tool=TOOL_NAME, ceiling=ceiling, reason=GENERIC_ABOVE_CEILING_REASON
+        )
     text = target.read_text(encoding="utf-8")
     if (
         refusal := refuse_above_ceiling(
@@ -213,11 +221,15 @@ def _split(text: str, *, fallback_title: str) -> tuple[str, str]:
     """Return a document's title and its body without frontmatter.
 
     Unparsable frontmatter (reachable only at ``ceiling=all``, since it also
-    ranks the document intimate) hands back the whole text as the body.
+    ranks the document intimate) hands back the whole text as the body. The
+    guard is the package's one definition of unreadable frontmatter,
+    :data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS`, the same tuple
+    :func:`stamped_content_tier` catches: a key YAML reads as an int, bool or
+    date makes ``frontmatter`` raise ``TypeError``, and the two must agree.
     """
     try:
         post = frontmatter.loads(text)
-    except (yaml.YAMLError, ValueError):
+    except FRONTMATTER_LOAD_ERRORS:
         return fallback_title, text.strip()
     title = post.metadata.get("title")
     return (

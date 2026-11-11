@@ -17,7 +17,6 @@ from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.drafts_read import (
     MAX_BODY_CHARS,
-    MISSING_REASON,
     PATH_REASON,
     TOO_LARGE_REASON,
     TOOL_NAME,
@@ -158,12 +157,67 @@ def test_refuses_any_path_outside_the_two_folders(tmp_path: Path, path: str) -> 
 
 
 def test_a_missing_document_is_not_found(tmp_path: Path) -> None:
-    """A well-formed path naming no file is refused with the fixed missing reason."""
+    """A missing document gets the above-ceiling refusal, byte for byte.
+
+    Draft file names are slugs of their titles, so a distinct "missing" answer
+    would let a caller confirm that an above-ceiling draft on a guessed topic
+    exists without reading it.
+    """
     result = drafts_read_tool(vault_path=tmp_path, path="07-Voice/Drafts/none.md")
 
     assert result["status"] == "refused"
-    assert result["reason"] == MISSING_REASON
+    assert result["reason"] == GENERIC_ABOVE_CEILING_REASON
     assert "markdown" not in result
+
+
+def test_missing_and_above_ceiling_answers_are_identical(tmp_path: Path) -> None:
+    """Probing a guessed file name reveals nothing about whether it exists."""
+    _doc(tmp_path, "07-Voice/Drafts/2026-11-10-private-topic.md", tier="intimate")
+
+    present = drafts_read_tool(
+        vault_path=tmp_path, path="07-Voice/Drafts/2026-11-10-private-topic.md"
+    )
+    absent = drafts_read_tool(
+        vault_path=tmp_path, path="07-Voice/Drafts/2026-11-10-other-topic.md"
+    )
+
+    assert present == absent
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["1: one\n", "true: yes\n", "2024-05-01: dated\n"],
+)
+def test_a_non_string_frontmatter_key_degrades_instead_of_crashing(
+    tmp_path: Path, header: str
+) -> None:
+    """A key YAML reads as an int, bool or date makes ``frontmatter`` raise TypeError.
+
+    The tier stamp is then unreadable, so the document ranks intimate and only
+    ``ceiling=all`` reaches it; there it reads back whole, and lists by its
+    file name, rather than crashing the tool.
+    """
+    target = tmp_path / "07-Voice" / "Drafts" / "2026-11-10-odd.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(f"---\n{header}title: Odd\n---\nBody.\n", encoding="utf-8")
+
+    read = drafts_read_tool(
+        vault_path=tmp_path,
+        path="07-Voice/Drafts/2026-11-10-odd.md",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    listed = drafts_read_tool(vault_path=tmp_path, privacy_tier_ceiling=TierCeiling.ALL)
+
+    assert read["status"] == "ok"
+    assert read["title"] == "2026-11-10-odd"
+    assert "Body." in read["markdown"]
+    assert listed["documents"] == [
+        {
+            "path": "07-Voice/Drafts/2026-11-10-odd.md",
+            "kind": "draft",
+            "title": "2026-11-10-odd",
+        }
+    ]
 
 
 def test_a_symlinked_document_is_not_followed(tmp_path: Path) -> None:
@@ -180,7 +234,7 @@ def test_a_symlinked_document_is_not_followed(tmp_path: Path) -> None:
     )
     listed = drafts_read_tool(vault_path=tmp_path, privacy_tier_ceiling=TierCeiling.ALL)
 
-    assert result["reason"] == MISSING_REASON
+    assert result["reason"] == GENERIC_ABOVE_CEILING_REASON
     assert "SECRET" not in json.dumps(result)
     assert listed["documents"] == []
 
@@ -200,7 +254,7 @@ def test_a_symlinked_drafts_folder_is_not_followed(tmp_path: Path) -> None:
     )
     listed = drafts_read_tool(vault_path=vault, privacy_tier_ceiling=TierCeiling.ALL)
 
-    assert read["reason"] == MISSING_REASON
+    assert read["reason"] == GENERIC_ABOVE_CEILING_REASON
     assert listed["documents"] == []
 
 
