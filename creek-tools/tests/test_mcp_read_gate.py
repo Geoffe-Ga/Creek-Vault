@@ -245,6 +245,7 @@ from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.classify_entry import entry_classification_tool
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.drafts_read import drafts_read_tool
 from creek_mcp.tools.journal import journal_ingest_tool
 from creek_mcp.tools.mine import mine_tool
 from creek_mcp.tools.mission import mission_tool
@@ -273,7 +274,7 @@ if TYPE_CHECKING:
 # METADATA_ONLY (or upgrades a tracked gap to a gate it never grew) fails.
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 28
+_EXPECTED_TOOL_COUNT = 29
 
 _EXPECTED_PRIMITIVES = frozenset({"refuse_above_ceiling", "iter_admitted_fragments"})
 
@@ -311,6 +312,9 @@ _PINNED_GATE_ROWS = [
     # reflect, read one level up: read's target is not caller-*named* but it is
     # caller-*addressed* and singular, which is the property that matters.
     ("creek.state.read", "creek_mcp.tools.state_read", "refuse_above_ceiling"),
+    # ``creek.drafts.read`` refuses on a saved document's own stamp for the
+    # same reason: one caller-addressed document, nothing to partially admit.
+    ("creek.drafts.read", "creek_mcp.tools.drafts_read", "refuse_above_ceiling"),
     # #874's ``creek.classify.entry`` is born gated, and it is the third
     # adopter of ``refuse_above_ceiling`` on ``creek.state.read``'s exact
     # argument rather than a fourth shape: an ``entry_ref`` is caller-ADDRESSED
@@ -2285,6 +2289,48 @@ def _probe_state_read(vault: Path) -> dict[str, Any]:
     )
 
 
+_DRAFTS_READ_INTIMATE_PATH = "07-Voice/Drafts/2026-11-10-intimate.md"
+_DRAFTS_READ_OPEN_PATH = "07-Voice/Drafts/2026-11-10-open.md"
+
+
+def _seed_saved_drafts(vault: Path) -> None:
+    """Save one intimate-stamped and one open-stamped draft, each with a canary.
+
+    ``canary_vault`` holds no saved drafts, so a bare ``drafts_read_tool`` call
+    would answer ``not_found`` and the canary sweep would pass over nothing.
+    The intimate draft puts the intimate canary genuinely into the document the
+    probe addresses; the open one is the positive control.
+    """
+    drafts = vault / "07-Voice" / "Drafts"
+    drafts.mkdir(parents=True, exist_ok=True)
+    for rel, tier, canary in (
+        (_DRAFTS_READ_INTIMATE_PATH, "intimate", _RUNTIME_INTIMATE_CANARY),
+        (_DRAFTS_READ_OPEN_PATH, "open", _RUNTIME_OPEN_CANARY),
+    ):
+        (vault / rel).write_text(
+            f"---\ntype: draft\ntitle: Saved {tier}\nprivacy_tier: {tier}\n---\n"
+            f"# Saved\n\n{canary}\n",
+            encoding="utf-8",
+        )
+
+
+def _probe_drafts_read(vault: Path) -> dict[str, Any]:
+    """Read the intimate-stamped saved draft at the open ceiling.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    _seed_saved_drafts(vault)
+    return drafts_read_tool(
+        vault_path=vault,
+        path=_DRAFTS_READ_INTIMATE_PATH,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
 def _seed_journal_canary(vault: Path) -> None:
     """Ingest one ``intimate`` journal entry the later overwrite attempt targets.
 
@@ -2800,6 +2846,7 @@ _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.report": _probe_report,
     "creek.state.render": _probe_state_render,
     "creek.state.read": _probe_state_read,
+    "creek.drafts.read": _probe_drafts_read,
     "creek.journal": _probe_journal,
     "creek.upload": _probe_upload,
     "creek.redact.scan": _probe_redact_scan,
@@ -2825,6 +2872,9 @@ _RUNTIME_PROBE_CONTROLS: dict[str, str] = {
     ),
     "creek.state.read": (
         "test_state_read_probe_refuses_rather_than_merely_staying_quiet"
+    ),
+    "creek.drafts.read": (
+        "test_drafts_read_probe_refuses_and_still_reads_the_admitted_draft"
     ),
     "creek.journal": (
         "test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched"
@@ -3907,6 +3957,35 @@ def test_state_read_probe_refuses_rather_than_merely_staying_quiet(
         "Every extra key on a refusal is derived from content the caller was "
         f"not admitted to.\n\n{response}"
     )
+
+
+def test_drafts_read_probe_refuses_and_still_reads_the_admitted_draft(
+    canary_vault: Path,
+) -> None:
+    """``creek.drafts.read`` refuses the intimate draft and is not vacuous.
+
+    The refusal is the canonical four keys with the generic reason, so it
+    names no tier. The control reads the open-stamped draft beside it at the
+    same ceiling and finds its canary, so the probe's quiet answer is the gate
+    and not a reader that resolves nothing.
+    """
+    response = _probe_drafts_read(canary_vault)
+    assert response == refusal_response(
+        tool="creek.drafts.read",
+        ceiling=TierCeiling.OPEN,
+        reason=GENERIC_ABOVE_CEILING_REASON,
+    )
+    admitted = drafts_read_tool(
+        vault_path=canary_vault,
+        path=_DRAFTS_READ_OPEN_PATH,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert admitted["status"] == "ok"
+    assert _RUNTIME_OPEN_CANARY in admitted["markdown"]
+    listed = drafts_read_tool(
+        vault_path=canary_vault, privacy_tier_ceiling=TierCeiling.OPEN
+    )
+    assert [doc["path"] for doc in listed["documents"]] == [_DRAFTS_READ_OPEN_PATH]
 
 
 def test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched(
@@ -6143,6 +6222,29 @@ def _artifact_call_state_read(vault: Path) -> dict[str, Any]:
     )
 
 
+def _seed_saved_drafts_vault(vault: Path) -> None:
+    """Seed the canary corpus and the two saved drafts the read addresses."""
+    _seed_canary_fragments(vault)
+    _seed_saved_drafts(vault)
+
+
+def _artifact_call_drafts_read(vault: Path) -> dict[str, Any]:
+    """Read the open-stamped saved draft at the open ceiling.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return drafts_read_tool(
+        vault_path=vault,
+        path=_DRAFTS_READ_OPEN_PATH,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer=_ARTIFACT_CONSUMER,
+    )
+
+
 def _artifact_call_state_render(vault: Path) -> dict[str, Any]:
     """Render the state report at the open ceiling.
 
@@ -6226,6 +6328,9 @@ _ARTIFACT_OBSERVATIONS: dict[str, _ArtifactObservation] = {
     "creek.state.read": _ArtifactObservation(
         seed=_seed_rendered_state_vault, call=_artifact_call_state_read
     ),
+    "creek.drafts.read": _ArtifactObservation(
+        seed=_seed_saved_drafts_vault, call=_artifact_call_drafts_read
+    ),
     "creek.state.render": _ArtifactObservation(
         seed=_seed_state_vault, call=_artifact_call_state_render
     ),
@@ -6263,6 +6368,7 @@ _ARTIFACT_OBSERVATION_STATUS: dict[str, frozenset[str]] = {
     "creek.report": frozenset({"ok"}),
     "creek.skills.refresh": frozenset({"ok"}),
     "creek.state.read": frozenset({"ok"}),
+    "creek.drafts.read": frozenset({"ok"}),
     "creek.state.render": frozenset({"ok"}),
     "creek.upload": frozenset({"ok"}),
     "creek.wheel": frozenset({"ok"}),

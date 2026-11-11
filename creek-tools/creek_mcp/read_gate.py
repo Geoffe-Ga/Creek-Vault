@@ -504,6 +504,26 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         gate_module="creek_mcp.tools.mission",
         gate_symbol="to_privacy_override",
     ),
+    "creek.drafts.read": ToolPosture(
+        posture=ReadPosture.GATED,
+        grant=Grant.DESK,
+        rationale=(
+            "Reads only .md files directly under 07-Voice/Drafts and "
+            "07-Voice/Mission, confined by path shape and by refusing "
+            "symlinks. Admits a document by its own privacy_tier stamp "
+            "through refuse_above_ceiling, the creek.state.read rule: a "
+            "caller-addressed single document has nothing to partially admit. "
+            "No stamp, an unparsable stamp or an unknown one ranks intimate "
+            "(stamped_content_tier), so CLI drafts and drafts saved before "
+            "stamping are refused below ceiling=all. The listing omits what "
+            "the ceiling does not admit. Only the body is returned, never the "
+            "frontmatter, which holds prompts and provenance. creek.draft and "
+            "creek.author stamp what they save with the tier it was written "
+            "under."
+        ),
+        gate_module="creek_mcp.tools.drafts_read",
+        gate_symbol="refuse_above_ceiling",
+    ),
     "creek.author": ToolPosture(
         posture=ReadPosture.GATED,
         grant=Grant.DESK,

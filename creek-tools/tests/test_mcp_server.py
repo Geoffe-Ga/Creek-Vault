@@ -50,6 +50,7 @@ EXPECTED_TOOLS = {
     "creek.revoice",
     "creek.mission",
     "creek.save",
+    "creek.drafts.read",
     "creek.jobs.read",
     "creek.ingest",
     "creek.redact.scan",
@@ -339,6 +340,44 @@ def test_call_tool_save_through_mcp(vault: Path) -> None:
     structured = _structured(result)
     assert structured["status"] == "ok"
     assert structured["tool"] == "creek.save"
+
+
+def test_call_tool_drafts_read_through_mcp(vault: Path) -> None:
+    """End-to-end: ``call_tool("creek.drafts.read")`` lists and reads a draft."""
+    drafts = vault / "07-Voice" / "Drafts"
+    drafts.mkdir(parents=True, exist_ok=True)
+    (drafts / "2026-11-10-essay.md").write_text(
+        "---\ntitle: Saved essay\nprivacy_tier: open\nprompt: HIDDEN\n---\n"
+        "# Saved essay\n\nBody text.\n",
+        encoding="utf-8",
+    )
+    server = build_server(
+        transport=Transport.STDIO,
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+
+    listed = _structured(
+        asyncio.run(server.call_tool("creek.drafts.read", {})),
+    )
+    read = _structured(
+        asyncio.run(
+            server.call_tool(
+                "creek.drafts.read", {"path": "07-Voice/Drafts/2026-11-10-essay.md"}
+            ),
+        ),
+    )
+
+    assert listed["documents"] == [
+        {
+            "path": "07-Voice/Drafts/2026-11-10-essay.md",
+            "kind": "draft",
+            "title": "Saved essay",
+        }
+    ]
+    assert read["status"] == "ok"
+    assert read["markdown"] == "# Saved essay\n\nBody text."
+    assert "HIDDEN" not in str(read)
 
 
 def test_call_tool_save_through_mcp_refuses_without_tier(vault: Path) -> None:
@@ -1346,6 +1385,7 @@ def test_build_server_wires_the_production_draft_llm_factory(
             vault_path: Path,
             *,
             inference_source: str | None = None,
+            privacy_tier: object = None,
         ) -> Path:
             """Persist a placeholder file so the tool can report its path."""
             del draft

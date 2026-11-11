@@ -396,6 +396,7 @@ def test_draft_success_path_saves_file(
             {"mine_all": lambda self, vault_path, *, current_phase: [_stub_seed()]},
         )(),
     )
+    stamped: list[PrivacyTier | None] = []
 
     class _StubGenerator:
         def __init__(self, **kw: object) -> None:
@@ -420,7 +421,9 @@ def test_draft_success_path_saves_file(
             vault_path: Path,
             *,
             inference_source: str | None = None,
+            privacy_tier: PrivacyTier | None = None,
         ) -> Path:
+            stamped.append(privacy_tier)
             target = vault_path / "07-Voice" / "Drafts" / "2026-05-11-stub.md"
             target.write_text("body", encoding="utf-8")
             return target
@@ -435,6 +438,10 @@ def test_draft_success_path_saves_file(
     assert result["draft_path"] == "07-Voice/Drafts/2026-05-11-stub.md"
     assert result["title"] == "Stub idea"
     assert result["source_fragments"] == ["frag-1"]
+    # Stamped with the routing tier the draft was written under, so
+    # creek.drafts.read can hand it back only at a ceiling that admits it.
+    # frag-1 is not in this vault, so it fails closed to intimate.
+    assert stamped == [PrivacyTier.INTIMATE]
 
 
 def test_draft_refuses_when_llm_returns_empty(
@@ -619,6 +626,7 @@ def _patch_generator(monkeypatch: pytest.MonkeyPatch) -> None:
             vault_path: Path,
             *,
             inference_source: str | None = None,
+            privacy_tier: object = None,
         ) -> Path:
             """Write a placeholder draft file and return its path."""
             del draft

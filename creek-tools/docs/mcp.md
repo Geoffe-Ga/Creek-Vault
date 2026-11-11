@@ -288,6 +288,7 @@ confinement boundary.
 | `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk. Streams progress and falls back to a job handle like `creek.draft` (the dry run excepted). A failure answers `status: error` with a fixed `reason` (`LLM provider call failed for author` / `writing desk failed for author`), never the exception's text ([#2082](https://github.com/Geoffe-Ga/Creek-Vault/issues/2082)). The voice call asks for 4,096 output tokens; a body that still reaches the ceiling answers `truncated: true` (on the response, the job result and the saved draft) rather than passing as whole. A draft filed past the deadline is titled by its own first `# heading` (else `Writing Desk <medium>`), never by `query`, and its `source_fragments` are the fragments its claims cite. |
 | `creek.revoice` | `text`, `register?`, `phase?` | Rewrite supplied text in the owner's voice, preserving meaning and claims without saving. Requires `vault:desk`. |
 | `creek.mission` | `limit?` (default 12, at most 40) | Draft the owner's mission and values as a Reconcile personal document, save it to `07-Voice/Mission/`, and return its `title` and `markdown`. Answers synchronously, with no job handle. Requires `vault:desk`. |
+| `creek.drafts.read` | `path?` | With no `path`, list the saved drafts and mission notes the ceiling admits (`{path, kind, title}`, newest first). With a `path` from that list, return `{path, kind, title, markdown}`: the body only, never the frontmatter. Requires `vault:desk`. |
 | `creek.jobs.read` | `job_id`                                                            | Resolve a `creek.draft` / `creek.author` / `creek.revoice` job handle to `{status, job_id, state, result?}`. |
 
 ### Mission and values
@@ -308,6 +309,35 @@ unavailable for mission`, `LLM provider call failed for mission`, the writer's
 refused request key, or `the model's answer could not be read as a mission;
 nothing was saved`. It is one bounded model turn (2,048 output tokens), so it
 answers synchronously, like `creek.reflect`.
+
+### Read back a saved draft or mission note
+
+`creek.drafts.read(path?, privacy_tier_ceiling?)` hands back what the desk
+saved, so an agent can attach it to its own conversation: a `creek.author` or
+`creek.draft` job answers with a `draft_path` only, and `creek.mission`'s note
+lives in `07-Voice/Mission/`.
+
+- **Scope.** It reads only `.md` files directly under `07-Voice/Drafts/` and
+  `07-Voice/Mission/`. Any other path, `..`, a nested folder, a backslash or a
+  path over 512 characters is refused with one fixed reason before the
+  filesystem is touched. A symlinked file or folder is treated as absent.
+- **Gate.** A document is admitted by its **own** `privacy_tier` stamp, the
+  `creek.state.read` rule. A document with no stamp, or one the tier model
+  does not recognise, counts as intimate, so a draft written by `creek draft`
+  on the command line, or saved before drafts were stamped, is refused below
+  `ceiling=all`. The refusal is the generic one and never names the tier, and
+  the listing simply leaves out what the ceiling does not admit.
+- **Stamping.** `creek.author` and `creek.draft` stamp what they save with the
+  tier it was written under: the caller's ceiling (`all` counts as intimate)
+  for `creek.author`, and the more sensitive of the ceiling and the sources'
+  own tiers for `creek.draft`. `creek.mission` already stamps its note.
+- **What comes back.** The body only. The frontmatter stays in the vault: a
+  `creek draft` file carries its whole prompt there, and provenance ids are
+  not the caller's to collect. A body over 200,000 characters is refused with
+  `document too large to return`. A well-formed path naming no file gets the
+  generic above-ceiling refusal, so guessing a file name (they are slugs of
+  titles) cannot confirm that an above-ceiling draft exists.
+- **Audit.** Each call is logged with whether a path was given, never which.
 
 ### Revoice supplied text
 
@@ -1037,7 +1067,8 @@ challenge asks for:
   `creek.state.read`, `creek.wheel`, `creek.mine`, `creek.classify.entry`,
   `creek.lint`), and draft, author, reflect, save and check on a draft in
   progress (`creek.draft`, `creek.author`, `creek.reflect`, `creek.save`,
-  `creek.jobs.read`). A draft from `creek.draft` lands in `07-Voice/Drafts/`.
+  `creek.jobs.read`). A draft from `creek.draft` lands in `07-Voice/Drafts/`,
+  and `creek.drafts.read` hands a saved draft or mission note back.
 - **It cannot** add journal entries or uploads unless it also holds
   `vault:journal`, and cannot run the pipeline passes (`creek.ingest`,
   `creek.classify`, `creek.link`, `creek.compile`, `creek.report`,
@@ -1554,7 +1585,7 @@ routable by design and requires TLS.
   | Grant            | Tools |
   |------------------|-------|
   | `vault:read`     | `creek.handshake`, `creek.state.read`, `creek.wheel`, `creek.mine`, `creek.classify.entry`, `creek.lint` |
-  | `vault:desk`     | `creek.draft`, `creek.author`, `creek.reflect`, `creek.save`, `creek.jobs.read` |
+  | `vault:desk`     | `creek.draft`, `creek.author`, `creek.reflect`, `creek.save`, `creek.jobs.read`, `creek.drafts.read` |
   | `vault:journal`  | `creek.journal`, `creek.upload` |
   | `vault:pipeline` | `creek.classify`, `creek.link`, `creek.compile`, `creek.report`, `creek.skills.refresh`, `creek.ingest`, `creek.redact.scan`, `creek.state.render` |
 

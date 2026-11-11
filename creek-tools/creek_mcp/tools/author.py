@@ -43,9 +43,15 @@ from creek.classify.llm.providers import (
 )
 from creek.classify.llm.router import IntimateRoutingError
 from creek.generate.drafts import INFERENCE_SOURCE_FRONTMATTER_KEY, reserve_draft_path
+from creek.models import PrivacyTier
 from creek.progress import CompositionStage, StageCallback, ignore_stage
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
+from creek_mcp.tier_ceiling import (
+    TierCeiling,
+    refusal_response,
+    routing_tier,
+    to_privacy_override,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -53,7 +59,6 @@ if TYPE_CHECKING:
     from creek.author import AuthoredDraft, ReflectionFinding
     from creek.author.client import AuthorLLMClient
     from creek.author.models import FindingDimension
-    from creek.models import PrivacyTier
     from creek_mcp.provenance import InferenceProvenance
 
 TOOL_NAME = "creek.author"
@@ -508,6 +513,7 @@ def save_authored_draft(vault_path: Path, response: dict[str, Any]) -> Path:
         truncated=bool(response.get("truncated", False)),
         source_fragments=_cited_fragment_ids(response),
         generated_date=generated.isoformat(),
+        privacy_tier=_saved_tier(response).value,
     )
     if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
         post[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[
@@ -540,6 +546,22 @@ def draft_title(body: str, medium: str) -> str:
     if match is not None and match.group(1).strip():
         return match.group(1).strip()
     return f"Writing Desk {medium}"
+
+
+def _saved_tier(response: dict[str, Any]) -> PrivacyTier:
+    """Return the ``privacy_tier`` a saved desk draft is stamped with.
+
+    The tier the envelope's ceiling maps to (``all`` maps to intimate): every
+    fragment the desk admitted sat at or below that ceiling, and the body was
+    cleared for a caller holding it. An envelope with no recognisable
+    ceiling stamps intimate, so ``creek.drafts.read`` hands it back only at
+    ``ceiling=all``.
+    """
+    try:
+        ceiling = TierCeiling(str(response.get("tier_ceiling")))
+    except ValueError:
+        return PrivacyTier.INTIMATE
+    return routing_tier(ceiling, None)
 
 
 def _cited_fragment_ids(response: dict[str, Any]) -> list[str]:

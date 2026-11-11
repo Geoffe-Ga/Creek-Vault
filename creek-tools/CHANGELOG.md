@@ -9,6 +9,23 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- `creek.drafts.read`: an agent can fetch the drafts and mission notes it
+  wrote and attach them to its own conversation. A `creek.author` or
+  `creek.draft` job answered with a `draft_path` only, so an agent such as
+  OpenClaw could start an essay but never read it back.
+  - With no `path` it lists the saved documents the caller's ceiling admits;
+    with a `path` from that list it returns the body, never the frontmatter
+    (which holds prompts and provenance).
+  - It reads only `.md` files directly under `07-Voice/Drafts/` and
+    `07-Voice/Mission/`, refuses any other path shape, and does not follow
+    symlinks. It requires `vault:desk`.
+  - A document is admitted by its own `privacy_tier` stamp, and an unstamped
+    one counts as intimate, the `creek.state.read` rule. `creek.author` and
+    `creek.draft` now stamp what they save with the tier it was written
+    under, so their drafts can be read back at that ceiling. Drafts written
+    before this change, or by `creek draft` on the command line, stay
+    unstamped and readable only at `ceiling=all`.
+
 - **`creek mission` and `creek.mission` draft a personal mission and values
   document for Reconcile.** Both pick the owner's own
   fragments (never another author's, an AI's, or a `reference`), ranking the

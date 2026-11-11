@@ -113,6 +113,7 @@ from creek_mcp.tools import (
     wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.drafts_read import drafts_read_tool
 from creek_mcp.tools.handshake import AuthMode
 from creek_mcp.tools.mission import DEFAULT_MISSION_LIMIT, mission_tool
 from creek_mcp.tools.reflect import GroundingSession, build_reflect_seams
@@ -1553,9 +1554,10 @@ def _register_authoring_tools(
 
     ``creek.state.read``, ``creek.state.render``, ``creek.lint``,
     ``creek.mine``, ``creek.draft``, ``creek.author``, ``creek.revoice``,
-    ``creek.mission``, ``creek.save`` and ``creek.jobs.read`` -- state
-    operations, four model-backed compositions, and the job-handle reader for
-    the three that run as jobs.
+    ``creek.mission``, ``creek.save``, ``creek.jobs.read`` and
+    ``creek.drafts.read`` -- state operations, four model-backed
+    compositions, the job-handle reader for the three that run as jobs, and
+    the reader that hands their saved drafts and mission notes back.
 
     The four model-backed composition closures live in a separate registrar
     so each registrar stays below the nested-definition ceiling.
@@ -1668,6 +1670,19 @@ def _register_authoring_tools(
             source_id=source_id,
             saved_by=saved_by,
             full_body=full_body,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+    @server.tool(name="creek.drafts.read")
+    def _drafts_read(
+        path: str | None = None,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """List saved drafts and mission notes, or return one by its path."""
+        return drafts_read_tool(
+            vault_path=vault,
+            path=path,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )

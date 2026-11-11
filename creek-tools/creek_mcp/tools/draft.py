@@ -442,7 +442,12 @@ def draft_tool(
             exc, privacy_tier_ceiling, default=DRAFT_PROVIDER_FAILED_REASON
         )
     source = None if provenance is None else provenance.source
-    saved = generator.save_draft(draft, vault_path, inference_source=source)
+    # Stamped with the tier the draft was written under -- the more sensitive
+    # of the ceiling and the sources' own tiers -- so creek.drafts.read hands
+    # it back only to a caller whose ceiling admits that tier.
+    saved = generator.save_draft(
+        draft, vault_path, inference_source=source, privacy_tier=tier
+    )
     response: dict[str, Any] = {
         "status": "ok",
         "tool": TOOL_NAME,

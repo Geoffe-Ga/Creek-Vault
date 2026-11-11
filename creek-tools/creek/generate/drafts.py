@@ -2809,7 +2809,12 @@ class DraftGenerator:
         return target
 
     def save_draft(
-        self, draft: Draft, vault_path: Path, *, inference_source: str | None = None
+        self,
+        draft: Draft,
+        vault_path: Path,
+        *,
+        inference_source: str | None = None,
+        privacy_tier: PrivacyTier | None = None,
     ) -> Path:
         """Write *draft* to ``07-Voice/Drafts/YYYY-MM-DD-{slug}.md``.
 
@@ -2825,6 +2830,11 @@ class DraftGenerator:
                 adapter recorded when it resolved the provider (#1967) — or
                 ``None`` to stamp nothing, as the CLI does. A route label,
                 never a key.
+            privacy_tier: The tier to stamp as ``privacy_tier``: the MCP
+                adapter passes the tier the draft was written under, so
+                ``creek.drafts.read`` can hand it back to a caller whose
+                ceiling admits that tier. ``None`` (the CLI) stamps nothing,
+                and an unstamped draft ranks as intimate to every reader.
 
         Returns:
             The absolute path of the written markdown file.
@@ -2873,6 +2883,8 @@ class DraftGenerator:
             post[key] = value
         if inference_source is not None:
             post[INFERENCE_SOURCE_FRONTMATTER_KEY] = inference_source
+        if privacy_tier is not None:
+            post["privacy_tier"] = PrivacyTier(privacy_tier).value
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         self._on_stage(CompositionStage.SAVED)
         return target
