@@ -465,13 +465,31 @@ _EXPECTED_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
         "type": "object",
     },
     "creek.revoice": {
-        "$defs": _TIER_CEILING_DEFS,
+        "$defs": {
+            **_TIER_CEILING_DEFS,
+            "VoiceRegister": {
+                "description": "Voice register describing the tone of the content.",
+                "enum": [
+                    "confessional",
+                    "analytical",
+                    "playful",
+                    "prophetic",
+                    "instructional",
+                    "raw",
+                    "conversational",
+                ],
+                "title": "VoiceRegister",
+                "type": "string",
+            },
+        },
         "properties": {
             "text": {"title": "Text", "type": "string"},
             "register": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "anyOf": [
+                    {"$ref": "#/$defs/VoiceRegister"},
+                    {"type": "null"},
+                ],
                 "default": None,
-                "title": "Register",
             },
             "phase": {
                 "anyOf": [{"type": "string"}, {"type": "null"}],
