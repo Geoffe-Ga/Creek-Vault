@@ -350,6 +350,11 @@ biographical facts to stay unchanged. No fragments are retrieved and no draft
 is written. Missing voice-core is allowed: the call uses the care policy alone
 and reports `voice_skills: []` rather than claiming a learned voice.
 
+The MCP input schema publishes the canonical register enum so clients can
+choose a valid value without an out-of-band ontology lookup: `confessional`,
+`analytical`, `playful`, `prophetic`, `instructional`, `raw`, or
+`conversational`. Unknown values remain invalid at the adapter boundary.
+
 Native generated skills can contain private source exemplars from an earlier
 refresh. Revoice reconstructs their abstract signature in memory, retaining
 style instructions and anti-patterns while excluding every cached source title,

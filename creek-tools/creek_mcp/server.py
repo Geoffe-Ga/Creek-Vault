@@ -29,6 +29,7 @@ from creek.care.guardrail import acute_distress_guard
 from creek.classify.llm.pool_boundary import declared_pool_request
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
+from creek.models import VoiceRegister
 from creek_mcp.agent_tokens import JwtAgentTokenVerifier, mcp_token_verifier
 from creek_mcp.audit import AUDIT_OUTCOME_REFUSED, MCPAuditLog
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
@@ -1795,7 +1796,7 @@ def _register_composition_tools(
     @server.tool(name="creek.revoice")
     async def _revoice(
         text: str,
-        register: str | None = None,
+        register: VoiceRegister | None = None,
         phase: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
         *,
@@ -1808,7 +1809,7 @@ def _register_composition_tools(
             revoice_tool,
             vault_path=vault,
             text=text,
-            register=register,
+            register=VoiceRegister(register).value if register is not None else None,
             phase=phase,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=caller,
