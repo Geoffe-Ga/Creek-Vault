@@ -528,7 +528,15 @@ class FlyProviderDriver:
         self,
         allocation: RoutableAllocation,
     ) -> tuple[_AllocationRef, Mapping[str, Any]]:
-        """Converge and revalidate the exact store-owned Machine generation."""
+        """Converge and revalidate the exact store-owned Machine generation.
+
+        A Machine already ``started`` when first read is routed from that read:
+        its custody was just verified and no start ran that could change it.
+        Every proxied vault request routes, so waiting and re-reading a warm
+        Machine spends Fly Machines API calls on nothing -- and the readiness
+        wait is the one Fly rate-limits first, which turned a burst of vault
+        requests into 429s and then 503s.
+        """
         reference = self._reference(allocation.activation_id)
         if allocation.provider_allocation_id != reference.allocation_id:
             self._rejected("provider allocation identity does not match activation")
@@ -546,7 +554,9 @@ class FlyProviderDriver:
             self._identifier(volume, "volume"),
             runtime_secrets,
         )
-        if str(machine.get("state")) not in {"started", "starting"}:
+        if str(machine.get("state")) == "started":
+            return reference, machine
+        if str(machine.get("state")) != "starting":
             self._change_machine_state(reference, machine, "start")
         self._wait_until_started(reference, machine)
         self._require_app(reference)
