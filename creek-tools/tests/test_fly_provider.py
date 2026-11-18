@@ -579,7 +579,57 @@ def test_routing_start_wait_and_machine_rediscovery_are_store_bound() -> None:
     starts = [request for request in api.requests if request[1].endswith("/start")]
     waits = [request for request in api.requests if request[1].endswith("/wait")]
     assert len(starts) == 1
-    assert len(waits) == 2
+    assert len(waits) == 1
+
+
+def _warm_routed(api: FakeFlyAPI) -> tuple[FlyProviderDriver, RoutableAllocation]:
+    """Provision and route once, so the allocation's Machine is already started."""
+    driver = fly_driver(api)
+    job = fly_job()
+    allocation = driver.provision(job)
+    routed = RoutableAllocation(
+        job.job_id,
+        job.activation_id,
+        job.requester_identity,
+        job.consumer_identity,
+        allocation.allocation_id,
+    )
+    driver.prepare_route(routed)
+    return driver, routed
+
+
+def test_routing_a_started_machine_skips_start_wait_and_rediscovery() -> None:
+    """A warm route reads custody once and spends no Fly start, wait or re-read.
+
+    Every proxied vault request routes, and a resonance pass sends several at
+    once; the readiness wait is the call Fly's Machines API rate-limits first,
+    so a warm route that still waits turns a burst into 429s and 503s.
+    """
+    api = FakeFlyAPI()
+    driver, routed = _warm_routed(api)
+    request_count = len(api.requests)
+
+    target = driver.prepare_route(routed)
+
+    warm = api.requests[request_count:]
+    assert target.base_url.startswith(f"https://{_only_machine(api)['id']}.vm.")
+    assert not any(path.endswith(("/start", "/wait")) for _, path in warm)
+    machine_lists = [path for _, path in warm if path.endswith("/machines")]
+    volume_lists = [path for _, path in warm if path.endswith("/volumes")]
+    assert len(machine_lists) == 1
+    assert len(volume_lists) == 1
+
+
+def test_routing_a_started_machine_still_refuses_drifted_custody() -> None:
+    """Skipping the cold-start re-read keeps the one custody check it relies on."""
+    api = FakeFlyAPI()
+    driver, routed = _warm_routed(api)
+    _only_volume(api)["encrypted"] = False
+
+    with pytest.raises(ProviderError) as raised:
+        driver.prepare_route(routed)
+
+    assert raised.value.reason is FailureReason.PROVIDER_REJECTED
 
 
 def test_routing_rejects_a_stale_provider_allocation_before_start() -> None:
