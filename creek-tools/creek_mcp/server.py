@@ -1802,7 +1802,13 @@ def _register_composition_tools(
         *,
         ctx: Context,
     ) -> dict[str, Any]:
-        """Rewrite supplied text in the owner's voice without saving."""
+        """Rewrite supplied text in the owner's voice without saving.
+
+        Only ``status: "ok"`` means Creek accepts the rewrite as owner-voiced.
+        ``status: "unvoiced"`` still returns text, but ``voice_check.reasons``
+        says why it is not the owner's voice (``no_owner_style`` or
+        ``insufficient_rewrite``); do not present it as such.
+        """
         caller = _effective_consumer(consumer)
         provenance = InferenceProvenance()
         work = partial(

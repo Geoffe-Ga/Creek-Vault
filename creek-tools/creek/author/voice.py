@@ -246,11 +246,16 @@ class RevoicePrompt:
         static: The cacheable care policy and voice conditioning.
         dynamic: The supplied text and meaning-preserving instruction.
         voice_skills: Applied skill names, without paths or file contents.
+        owner_style_skills: The subset of :attr:`voice_skills` whose text is
+            owner-authored style rather than a canonical signature. A native
+            generated skill is reconstructed as that signature, which is the
+            same text for every vault and so carries nothing of this owner.
     """
 
     static: str
     dynamic: str
     voice_skills: tuple[str, ...]
+    owner_style_skills: tuple[str, ...] = ()
 
 
 def _native_voice_signature(name: str, metadata: Mapping[str, object]) -> str:
@@ -366,7 +371,16 @@ def split_revoice_prompt(
             text,
         ]
     )
-    return RevoicePrompt(static, dynamic, tuple(name for name, _content in skills))
+    return RevoicePrompt(
+        static,
+        dynamic,
+        tuple(name for name, _content in skills),
+        tuple(
+            name
+            for name, content in skills
+            if content.strip() != render_voice_signature(name).strip()
+        ),
+    )
 
 
 def _dominant_phase(evidence: EvidenceBundle) -> str | None:

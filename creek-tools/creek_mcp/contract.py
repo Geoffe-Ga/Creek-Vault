@@ -20,8 +20,19 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.29.0"
+CONTRACT_VERSION: Final[str] = "0.30.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.30.0: ``creek.revoice`` reports whether Creek accepts its rewrite as being in
+the owner's voice. Every rewrite gains a content-free ``voice_check`` object
+with ``voice_applied``, ``conditioning`` (``owner | generic | none``),
+``owner_style_skills``, ``rewritten_ratio``, ``min_rewritten_ratio``,
+``opening_similarity`` and closed ``reasons`` (``no_owner_style``,
+``insufficient_rewrite``). A rewrite that fails either condition returns the new
+status ``unvoiced`` instead of ``ok``, with its text, so a near-copy or a
+generic-template rewrite can no longer be read as success. A detached
+``unvoiced`` job still ``succeeds`` and its retained body carries the same
+status. No ``/v1`` route, wire model or capability moves; ``0.29`` stays served.
 
 0.29.0 (#2075, follow-up to #2066): ``GET /v1/jobs/{job_id}``'s closed
 ``failure_code`` vocabulary gains ``busy``. A durable ``llm`` classification

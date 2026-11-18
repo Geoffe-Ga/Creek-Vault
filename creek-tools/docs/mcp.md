@@ -347,8 +347,9 @@ voice-core and requested canonical phase/register skills. Its cached system
 prefix contains the care policy and skills; its dynamic prompt marks the text
 as untrusted data and requires meaning, claims, qualifications, attribution and
 biographical facts to stay unchanged. No fragments are retrieved and no draft
-is written. Missing voice-core is allowed: the call uses the care policy alone
-and reports `voice_skills: []` rather than claiming a learned voice.
+is written. Missing voice-core is allowed: the call uses the care policy alone,
+reports `voice_skills: []`, and returns `status: "unvoiced"` rather than
+claiming a learned voice.
 
 The MCP input schema publishes the canonical register enum so clients can
 choose a valid value without an out-of-band ontology lookup: `confessional`,
@@ -370,9 +371,40 @@ Input is limited to 16,000 characters. Empty text and unknown canonical slugs
 return `status: "error"` before a model is built. The tier-keyed factory routes
 from the declared ceiling, so `intimate`/`all` is local-only or refused; remote
 callers retain their existing cap below intimate. A success returns
-`{status, tool, tier_ceiling, text, voice_skills, usage}` and an optional
-`inference_source`. Incomplete, empty or oversized model output is an error.
-Only input/output character counts enter this tool's audit entry.
+`{status, tool, tier_ceiling, text, voice_skills, voice_check, usage}` and an
+optional `inference_source`. Incomplete, empty or oversized model output is an
+error. Only input/output character counts enter this tool's audit entry.
+
+#### Did the voice actually apply? (`voice_check`, contract 0.30)
+
+Creek decides whether a rewrite counts as owner-voiced, so clients need no
+heuristics of their own. Every rewrite carries a content-free `voice_check`:
+
+| Field | Meaning |
+|---|---|
+| `voice_applied` | `true` only when both checks below pass. |
+| `conditioning` | `owner` when at least one applied skill is owner-authored style; `generic` when only canonical signatures applied; `none` with no voice skill. |
+| `owner_style_skills` | The applied skills that carry owner-authored style. |
+| `rewritten_ratio` | Share of output words that are new after citations, links, footnotes, punctuation and case are normalized away. Deleting source text never counts. |
+| `min_rewritten_ratio` | The floor `rewritten_ratio` must reach (`0.25`). |
+| `opening_similarity` | How alike the two openings are (`0..1`). Diagnostic only. |
+| `reasons` | Closed codes for each failed check: `no_owner_style`, `insufficient_rewrite`. |
+
+A rewrite that fails either check returns `status: "unvoiced"`. The response
+keeps `text`, so a caller can inspect it, but it must not present that text as
+the owner's voice. A detached `unvoiced` job ends `succeeded`, and its retained
+body carries the same status.
+
+Generated skills are sent as their canonical signatures, as described above.
+Those signatures are the same text for every vault, so a vault whose skill tree
+is entirely generated reports `conditioning: "generic"` and every rewrite comes
+back `unvoiced`. To condition revoice on your own voice, add owner-authored,
+source-free style to `voice-core` or the register/phase skill you request. Use
+no native `category`/`variant`/`generated_date` metadata and no exemplar
+section.
+
+The verdict measures how much of the prose moved, not whether it sounds like
+you. It is a floor against near-copies, not a stylometric judgment.
 
 The composition wrapper reports `skills` then `composed`, with the same deadline
 and one-active-composition-per-agent rule as draft/author. A detached rewrite

@@ -334,9 +334,10 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
         ("0.2", _OK_STATUS),
         ("0.2.0", _INCOMPATIBLE_STATUS),
         ("0.2.1", _INCOMPATIBLE_STATUS),
-        # ``0.30`` is to the served ``0.3`` what ``0.20`` was to ``0.2`` until
-        # #1938 made ``0.20`` a real minor: equal as a float, not as a string.
-        ("0.30", _INCOMPATIBLE_STATUS),
+        # ``0.40`` is to the served ``0.4`` what ``0.20`` and ``0.30`` were to
+        # ``0.2`` and ``0.3`` until #1938 and the revoice voice check minted
+        # them: equal as a float, not as a string.
+        ("0.40", _INCOMPATIBLE_STATUS),
         # And one that can never be minted, so this row never expires: ``0.200``
         # is float-equal to both ``0.2`` and ``0.20`` and prefix-matches both,
         # while no bump will ever reach it.

@@ -9,6 +9,26 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`creek.revoice` reports whether the owner's voice was actually applied
+  (contract 0.30).** A revoice of an analytical essay returned `ok` even
+  though the opening was nearly unchanged and most edits were citation
+  cleanup, punctuation, spelling and compression. A client then counted the
+  raw textual difference as a successful voice transformation. That verdict
+  belongs to Creek, so the tool now makes it:
+  - Every rewrite carries a content-free `voice_check` with `voice_applied`,
+    `conditioning`, `owner_style_skills`, `rewritten_ratio`,
+    `opening_similarity` and closed `reasons`.
+  - `conditioning` is `owner` only when an applied skill is owner-authored
+    style. Generated skills are sent as canonical signatures (#1986). Those are
+    the same text for every vault, so on their own they report `generic`.
+  - `rewritten_ratio` counts output words that are new once citations, links,
+    footnotes, punctuation and case are normalized away. Deleted source text
+    never counts, so compression alone cannot pass the `0.25` floor.
+  - A rewrite that fails either check returns `status: "unvoiced"`, with its
+    text, instead of `ok`. A detached `unvoiced` job still ends `succeeded`.
+  - The OpenAPI golden (`openapi-0.30.0.json`) and the `adepthood-v1` bundle
+    are regenerated for the version string only. No `/v1` shape moves.
+
 - `creek.drafts.read`: an agent can fetch the drafts and mission notes it
   wrote and attach them to its own conversation. A `creek.author` or
   `creek.draft` job answered with a `draft_path` only, so an agent such as

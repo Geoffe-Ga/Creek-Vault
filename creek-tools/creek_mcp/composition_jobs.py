@@ -65,7 +65,7 @@ from creek_mcp.tools.author import TOOL_NAME as AUTHOR_TOOL_NAME
 from creek_mcp.tools.draft import DRAFT_STAGES, draft_job_result
 from creek_mcp.tools.draft import TOOL_NAME as DRAFT_TOOL_NAME
 from creek_mcp.tools.jobs import jobs_read_tool, unavailable_refusal
-from creek_mcp.tools.revoice import REVOICE_STAGES
+from creek_mcp.tools.revoice import REVOICE_STAGES, REWRITE_STATUSES
 from creek_mcp.tools.revoice import TOOL_NAME as REVOICE_TOOL_NAME
 
 if TYPE_CHECKING:
@@ -257,12 +257,17 @@ def revoice_call(
 def _settle_revoice(
     response: dict[str, Any], *, detached: bool
 ) -> dict[str, Any] | None:
-    """Project only counts; detached text is retained separately in memory."""
+    """Project only counts; detached text is retained separately in memory.
+
+    An ``unvoiced`` rewrite still finished, so its job succeeds. The retained
+    body carries the status and ``voice_check`` that explain the verdict.
+    """
     del detached
-    if response.get("status") != "ok":
+    status = response.get("status")
+    if status not in REWRITE_STATUSES:
         return None
     return {
-        "status": "ok",
+        "status": status,
         "tool": REVOICE_TOOL_NAME,
         "output_chars": len(response["text"]),
     }
@@ -512,7 +517,7 @@ class CompositionJobs:
         if (
             call.tool == REVOICE_TOOL_NAME
             and detached
-            and response.get("status") == "ok"
+            and response.get("status") in REWRITE_STATUSES
         ):
             self.revoice_results.put(
                 record.job_id,

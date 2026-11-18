@@ -3,12 +3,19 @@
 No corpus retrieval or saving happens here. Prompt assembly belongs to the
 Writing Desk's voice stack; the injected tier-keyed factory owns routing.
 Only declared ceilings are echoed, never derived sensitivity or provider errors.
+
+Creek, not the caller, decides whether the voice was applied
+(:mod:`creek.author.revoice_check`). A bounded rewrite that lacks owner-authored
+conditioning, or that barely changed the prose, returns ``status: "unvoiced"``.
+It still includes the text, so a client that only accepts ``ok`` cannot mistake
+a near-copy for success.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
+from creek.author.revoice_check import check_revoice
 from creek.author.voice import split_revoice_prompt
 from creek.classify.llm.router import IntimateRoutingError
 from creek.models import Phase, PrivacyTier, VoiceRegister
@@ -31,6 +38,10 @@ MAX_REVOICE_OUTPUT_TOKENS: Final = 8_192
 """Enough room to render a maximum-length passage without unbounded output."""
 REVOICE_STAGES: Final = (CompositionStage.SKILLS, CompositionStage.COMPOSED)
 """The two progress boundaries crossed by a rewrite that saves nothing."""
+STATUS_UNVOICED: Final = "unvoiced"
+"""A complete rewrite that Creek does not accept as being in the owner's voice."""
+REWRITE_STATUSES: Final = frozenset({"ok", STATUS_UNVOICED})
+"""Statuses that carry rewritten text, as opposed to an error or refusal."""
 
 
 class RevoiceLLMFactory(Protocol):
@@ -101,12 +112,19 @@ def _rewrite(
     ):
         return _error(ceiling, "The model did not return a complete bounded rewrite")
     on_stage(CompositionStage.COMPOSED)
+    check = check_revoice(
+        text,
+        completion.text,
+        owner_style_skills=prompt.owner_style_skills,
+        voice_skills=prompt.voice_skills,
+    )
     response: dict[str, Any] = {
-        "status": "ok",
+        "status": "ok" if check.voice_applied else STATUS_UNVOICED,
         "tool": TOOL_NAME,
         "tier_ceiling": ceiling.value,
         "text": completion.text,
         "voice_skills": list(prompt.voice_skills),
+        "voice_check": check.as_dict(),
         "usage": completion.usage or {},
     }
     if provenance is not None and provenance.source is not None:
@@ -140,8 +158,11 @@ def revoice_tool(
         on_stage: Content-free progress sink.
 
     Returns:
-        An ``ok`` envelope with text, applied skill names and usage; a static
-        ``error`` for invalid input/model failure; or the canonical routing refusal.
+        An ``ok`` envelope with text, applied skill names, ``voice_check`` and
+        usage when Creek accepts the rewrite as owner-voiced. The same envelope
+        with ``status: "unvoiced"`` when it does not; ``voice_check.reasons``
+        says why. A static ``error`` for invalid input or model failure, or the
+        canonical routing refusal.
         Every attempted call appends only its input/output character counts.
     """
     reason = _invalid(text, register, phase)

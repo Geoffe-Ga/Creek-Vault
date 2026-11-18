@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.29.0",
+  "contract_version": "0.30.0",
   "files": [
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-ready.json",
-      "sha256": "72223537eed7b460b533b99f667567000084ee5b69477bef5cb1c56edb6cfd0f",
+      "sha256": "976fc12193d57d808fb9c91380edf5ba9b47b10c7a345b3f4dae14f661fe3ae3",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-unavailable.json",
-      "sha256": "981f36232a7f2744c962ad19bcf8e1d092e24953dd614becbcb46c7ce111cb7c",
+      "sha256": "8a021c48296e62e69431525dce40ed603cc4c066b69514554934c7c75e248330",
       "state": null
     },
     {
@@ -76,7 +76,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "f98cc925862fd75af8e4edfcf2afd81423a26bd39e2f57f23a6d66f8f8ea2f90",
+      "sha256": "e2726ed33824bc347ae007deaebe3b791f1a6c27f6e8c8f899357daaa8216fc3",
       "state": "empty"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "72223537eed7b460b533b99f667567000084ee5b69477bef5cb1c56edb6cfd0f",
+      "sha256": "976fc12193d57d808fb9c91380edf5ba9b47b10c7a345b3f4dae14f661fe3ae3",
       "state": "success"
     },
     {

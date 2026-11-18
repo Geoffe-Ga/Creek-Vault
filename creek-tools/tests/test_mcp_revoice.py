@@ -110,6 +110,27 @@ def test_prompt_caches_only_skills_and_preserves_meaning(vault: Path) -> None:
     assert "untrusted" in dynamic.lower()
 
 
+def test_prompt_separates_owner_style_from_canonical_signatures(vault: Path) -> None:
+    """Only owner-authored files count as owner style; native caches do not."""
+    _skills(vault)
+    SkillTreeGenerator(override=PrivacyTierOverride.PERSONAL).generate_all_skills(
+        vault, vault / "native-skills"
+    )
+    native_register = vault / "native-skills/registers/conversational.SKILL.md"
+    (vault / "creek-skills/registers/conversational.SKILL.md").write_text(
+        native_register.read_text()
+    )
+    prompt = split_revoice_prompt(
+        INPUT, vault, phase="rising", register="conversational"
+    )
+    assert prompt.voice_skills == (
+        "voice-core",
+        "phase-rising",
+        "register-conversational",
+    )
+    assert prompt.owner_style_skills == ("voice-core", "phase-rising")
+
+
 @pytest.mark.parametrize("corruption", ["none", "headings", "metadata", "yaml"])
 def test_generated_private_exemplars_never_enter_revoice_inference(
     vault: Path, corruption: str
@@ -178,7 +199,12 @@ def test_generated_private_exemplars_never_enter_revoice_inference(
         phase="rising",
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
-    assert response["status"] == "ok"
+    # Reconstructed native skills are canonical text shared by every vault, so
+    # the rewrite is honestly reported as not carrying this owner's voice.
+    assert response["status"] == "unvoiced"
+    assert response["voice_check"]["conditioning"] == "generic"
+    assert response["voice_check"]["owner_style_skills"] == []
+    assert response["voice_check"]["reasons"] == ["no_owner_style"]
     assert provider.tiers == [PrivacyTier.OPEN]
     captured = repr(provider.prompts)
     assert all(canary not in captured for canary in canaries)
@@ -304,6 +330,14 @@ def test_happy_path_uses_skills_and_audits_only_character_counts(vault: Path) ->
         "register-conversational",
     ]
     assert response["usage"] == {"input_tokens": 42, "output_tokens": 17}
+    assert response["voice_check"]["voice_applied"] is True
+    assert response["voice_check"]["conditioning"] == "owner"
+    assert response["voice_check"]["owner_style_skills"] == [
+        "voice-core",
+        "phase-rising",
+        "register-conversational",
+    ]
+    assert response["voice_check"]["reasons"] == []
     assert provider.tiers == [PrivacyTier.PERSONAL]
     assert "CORPUS_SENTINEL_NEVER_RETRIEVED" not in repr(provider.prompts)
     assert "derived_tier" not in response
@@ -328,9 +362,41 @@ def test_missing_skills_still_conditions_with_care(vault: Path) -> None:
     """Missing voice skills do not pretend the owner's voice was learned."""
     provider = _Provider()
     response = revoice_tool(vault_path=vault, text=INPUT, llm_factory=provider.factory)
-    assert response["status"] == "ok"
+    assert response["status"] == "unvoiced"
+    assert response["text"] == OUTPUT
     assert response["voice_skills"] == []
+    assert response["voice_check"]["conditioning"] == "none"
+    assert response["voice_check"]["reasons"] == ["no_owner_style"]
     assert provider.prompts[0][0] == CARE_POLICY
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        INPUT,
+        INPUT.replace(";", ".").replace("Thanks", "Thank you"),
+        "Thanks for the invitation.",
+    ],
+    ids=["echo", "punctuation-and-a-word", "compression"],
+)
+def test_cosmetic_output_is_unvoiced_even_with_owner_style(
+    vault: Path, output: str
+) -> None:
+    """Regression: a near-copy must not be reported as an owner-voiced success."""
+    _skills(vault)
+    provider = _Provider(text=output)
+    response = revoice_tool(
+        vault_path=vault,
+        text=INPUT,
+        llm_factory=provider.factory,
+        register="conversational",
+    )
+    assert response["status"] == "unvoiced"
+    assert response["text"] == output
+    assert response["voice_check"]["conditioning"] == "owner"
+    assert response["voice_check"]["voice_applied"] is False
+    assert response["voice_check"]["reasons"] == ["insufficient_rewrite"]
+    assert INPUT not in json.dumps(response["voice_check"])
 
 
 @pytest.mark.parametrize(
@@ -424,6 +490,7 @@ def _structured(result: object) -> dict[str, Any]:
 
 def test_registered_tool_round_trip_and_desk_grant(vault: Path) -> None:
     """FastMCP advertises and dispatches the production revoice adapter."""
+    _skills(vault)
     provider = _Provider()
     server = build_server(
         transport=Transport.STDIO,
@@ -436,15 +503,20 @@ def test_registered_tool_round_trip_and_desk_grant(vault: Path) -> None:
     response = _structured(
         asyncio.run(server.call_tool("creek.revoice", {"text": INPUT}))
     )
+    assert response["status"] == "ok"
     assert response["text"] == OUTPUT
+    assert response["voice_check"]["voice_applied"] is True
     assert provider.prompts
 
 
+@pytest.mark.parametrize(("owner_style", "status"), [(True, "ok"), (False, "unvoiced")])
 def test_detached_rewrite_is_readable_but_never_persisted(
-    vault: Path, monkeypatch: pytest.MonkeyPatch
+    vault: Path, monkeypatch: pytest.MonkeyPatch, owner_style: bool, status: str
 ) -> None:
-    """The owner obtains a detached body without any artifact containing it."""
+    """The owner obtains a detached body, with its honest status, unpersisted."""
     monkeypatch.setenv("CREEK_MCP_SYNC_DEADLINE_SECONDS", "0.01")
+    if owner_style:
+        _skills(vault)
     provider = _Provider()
     provider.gate = threading.Event()
     server = build_server(
@@ -469,7 +541,9 @@ def test_detached_rewrite_is_readable_but_never_persisted(
         pytest.fail("detached rewrite never finished")
 
     result = asyncio.run(run())
+    assert result["result"]["status"] == status
     assert result["result"]["text"] == OUTPUT
+    assert result["result"]["voice_check"]["voice_applied"] is owner_style
     assert not (vault / "07-Voice").exists()
     for path in vault.rglob("*"):
         if path.is_file():
