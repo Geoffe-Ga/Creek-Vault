@@ -985,7 +985,15 @@ _EXPECTED_DESCRIPTIONS: Final[dict[str, str]] = {
         "``max_rounds`` defaults to the vault's "
         "``author.max_author_rounds`` (3)."
     ),
-    "creek.revoice": "Rewrite supplied text in the owner's voice without saving.",
+    "creek.revoice": (
+        "Rewrite supplied text in the owner's voice without saving.\n\n"
+        'Only ``status: "ok"`` carries a rewrite Creek accepts as owner-voiced.\n'
+        '``status: "refused"`` with ``reason`` ``no_owner_voice``,\n'
+        "``insufficient_transformation`` or ``fidelity_violation`` returns no\n"
+        "text; ``voice_check.diagnostics`` names what failed. Inputs over\n"
+        "16,000 characters must be split at headings, and each part is judged\n"
+        "on its own opening and sections."
+    ),
     "creek.mission": (
         "Draft the owner's mission and values as a Reconcile personal document."
     ),

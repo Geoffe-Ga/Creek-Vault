@@ -9,6 +9,32 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`creek.revoice` refuses a rewrite that did not apply the owner's voice
+  (contract 0.30).** A revoice of an analytical essay returned `ok` although
+  the opening was nearly unchanged and the edits were citation removal,
+  punctuation, spelling, compression and one generic rewritten stretch. A
+  client read the large aggregate diff as success. Generated skills reach the
+  model as canonical text identical for every vault (#1986), so no
+  owner-specific evidence was sent, and nothing judged the output.
+  - Grounding: owner-authored style skills, or the owner's register samples,
+    each re-screened (self-authored, `voice_weight > 0`, tier admitted at the
+    declared ceiling) and measured into a numeric style profile. With
+    neither, the call is refused as `no_owner_voice` before any model spend.
+    A requested register is always applied, never silently dropped.
+  - Gate (`creek/author/revoice_check.py`): headings and citations kept;
+    every substantial section rewritten in new words *and* new sentences;
+    the opening changed; style moved toward the owner's profile. A raw diff
+    is never the criterion.
+  - One bounded retry with owner excerpts and fixed feedback, so at most
+    two model calls.
+  - A rejected rewrite returns `status: "refused"`, `reason`
+    (`insufficient_transformation`, `fidelity_violation`, `no_owner_voice`)
+    and content-free `voice_check` diagnostics, without the text.
+  - `python -m creek.author.revoice_check SOURCE OUTPUT --vault V` judges a
+    local pair the same way.
+  - The OpenAPI golden (`openapi-0.30.0.json`) and the `adepthood-v1` bundle
+    are regenerated for the version string only. No `/v1` shape moves.
+
 - `creek.drafts.read`: an agent can fetch the drafts and mission notes it
   wrote and attach them to its own conversation. A `creek.author` or
   `creek.draft` job answered with a `draft_path` only, so an agent such as

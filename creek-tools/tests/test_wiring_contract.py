@@ -350,6 +350,8 @@ class Surface:
             surface whose artefacts ``creek init`` already deploys still has
             something to do. Without this, ``skills sync`` could only ever be
             asserted against files that predate it.
+        files: Vault-relative files written before the run, for a precondition
+            no CLI command can produce from the shared seed corpus.
         stdin: Input fed to an interactive prompt.
         effect: The named observable.
         contrast: Negative control; required whenever ``effect.prints`` is set.
@@ -367,6 +369,7 @@ class Surface:
     kwargs: Mapping[str, Any] = field(default_factory=dict)
     prepare: tuple[tuple[str, ...], ...] = ()
     strip: tuple[str, ...] = ()
+    files: Mapping[str, str] = field(default_factory=dict)
     stdin: str = ""
     contrast: Contrast | None = None
     refusal: Refusal | None = None
@@ -886,6 +889,9 @@ _MISSION_CANARY_ANSWER: Final = json.dumps(
 _REFLECT_CANARY: Final = json.dumps(
     {"notes": [{"quote": "I rest sometimes", "kind": "reframe", "note": "Yours."}]},
 )
+
+_OWNER_STYLE: Final = "Short sentences. Plain words. First person, present tense."
+"""An owner-authored (custom, non-native) voice-core style for revoice."""
 
 _AUTHOR_CANARY: Final = "AUTHOR-DOUBLE-SPOKE"
 """Prefix the injected author voice double emits; it must reach the draft body.
@@ -1676,11 +1682,19 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
             "creek.author.voice:split_revoice_prompt",
         ),
         kwargs={"text": "creek and stone", **_ALL},
-        effect=Effect(prints=(_AUTHOR_CANARY,)),
+        # Revoice refuses ``no_owner_voice`` before building a model unless
+        # some owner-authored style grounds it (contract 0.30), so the double
+        # is only reachable once a custom voice-core is in place. The double
+        # shouts its whole prompt back, headings included, so the voice gate
+        # rejects it as unfaithful and the refusal (rightly) omits the text.
+        # Two attempts prove the injected client was consulted, and that the
+        # retry stayed bounded at one.
+        files={"creek-skills/meta/voice-core.SKILL.md": _OWNER_STYLE},
+        effect=Effect(prints=('"attempts": 2',)),
         contrast=Contrast(
             why=(
                 "blank supplied text is rejected before constructing a model, "
-                "so the model's voice canary must be absent"
+                "so no model attempt may be reported"
             ),
             kwargs={"text": "", **_ALL},
             seeded=True,
@@ -2373,6 +2387,9 @@ def test_mcp_surface_produces_its_declared_effect(
     """
     assert elevated_token == _ELEVATED_TOKEN
     vault = bench.seeded_vault()
+    for relative, content in surface.files.items():
+        (vault / relative).parent.mkdir(parents=True, exist_ok=True)
+        (vault / relative).write_text(content, encoding="utf-8")
     outcome = bench.run_mcp(name, surface.kwargs, vault=vault, prepare=surface.prepare)
 
     _assert_writes(surface, vault, outcome, name)

@@ -28,8 +28,10 @@ the one place these compositions run through instead:
    the job's content-free result, which ``creek.jobs.read`` serves.
 
 Revoice is the exception to draft persistence: its durable result carries only
-counts. Successful detached bodies live in a bounded process-local cache, and
-``read`` adds them only after checking the original agent and declared ceiling.
+counts, or a voice refusal's closed ``reason``. Detached bodies (an ``ok``
+rewrite, or a refusal's content-free ``voice_check``) live in a bounded
+process-local cache, and ``read`` adds them only after checking the original
+agent and declared ceiling.
 They are never written to the vault and are unavailable after restart.
 
 **Who wins a near-tie is decided once, under one lock.** The worker finishing
@@ -65,7 +67,7 @@ from creek_mcp.tools.author import TOOL_NAME as AUTHOR_TOOL_NAME
 from creek_mcp.tools.draft import DRAFT_STAGES, draft_job_result
 from creek_mcp.tools.draft import TOOL_NAME as DRAFT_TOOL_NAME
 from creek_mcp.tools.jobs import jobs_read_tool, unavailable_refusal
-from creek_mcp.tools.revoice import REVOICE_STAGES
+from creek_mcp.tools.revoice import REVOICE_STAGES, is_voice_outcome
 from creek_mcp.tools.revoice import TOOL_NAME as REVOICE_TOOL_NAME
 
 if TYPE_CHECKING:
@@ -257,10 +259,22 @@ def revoice_call(
 def _settle_revoice(
     response: dict[str, Any], *, detached: bool
 ) -> dict[str, Any] | None:
-    """Project only counts; detached text is retained separately in memory."""
+    """Project only counts or a closed code; bodies stay in process memory.
+
+    A voice refusal is a finished verdict, not a crash, so its job succeeds
+    with the refusal's closed ``reason``. The retained body adds the
+    content-free ``voice_check``. A routing refusal or error stays ``failed``,
+    exactly as before.
+    """
     del detached
-    if response.get("status") != "ok":
+    if not is_voice_outcome(response):
         return None
+    if response["status"] == "refused":
+        return {
+            "status": "refused",
+            "tool": REVOICE_TOOL_NAME,
+            "reason": response["reason"],
+        }
     return {
         "status": "ok",
         "tool": REVOICE_TOOL_NAME,
@@ -509,11 +523,7 @@ class CompositionJobs:
             self._close(call, record, None, detached=handoff.finish())
             raise
         detached = handoff.finish()
-        if (
-            call.tool == REVOICE_TOOL_NAME
-            and detached
-            and response.get("status") == "ok"
-        ):
+        if call.tool == REVOICE_TOOL_NAME and detached and is_voice_outcome(response):
             self.revoice_results.put(
                 record.job_id,
                 consumer=call.consumer,

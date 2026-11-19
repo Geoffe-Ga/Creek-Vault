@@ -235,6 +235,11 @@ def test_revoice_over_mcp_uses_the_writers_key_without_saving(
 ) -> None:
     """Revoice inherits the request-key route without persisting either passage."""
     vendor = _Vendor(monkeypatch)
+    # Owner-authored style grounds the rewrite; without it revoice refuses
+    # ``no_owner_voice`` before any model call, and no key would be exercised.
+    core = managed / "creek-skills" / "meta" / "voice-core.SKILL.md"
+    core.parent.mkdir(parents=True, exist_ok=True)
+    core.write_text("Short sentences. Plain words. First person.")
     passage = "Please send the report on Friday."
     result = _call(
         managed, "creek.revoice", {"text": passage}, _keyed("openai", OPENAI_CANARY)
