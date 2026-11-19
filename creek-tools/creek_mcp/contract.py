@@ -23,16 +23,17 @@ from typing import Final
 CONTRACT_VERSION: Final[str] = "0.30.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
 
-0.30.0: ``creek.revoice`` reports whether Creek accepts its rewrite as being in
-the owner's voice. Every rewrite gains a content-free ``voice_check`` object
-with ``voice_applied``, ``conditioning`` (``owner | generic | none``),
-``owner_style_skills``, ``rewritten_ratio``, ``min_rewritten_ratio``,
-``opening_similarity`` and closed ``reasons`` (``no_owner_style``,
-``insufficient_rewrite``). A rewrite that fails either condition returns the new
-status ``unvoiced`` instead of ``ok``, with its text, so a near-copy or a
-generic-template rewrite can no longer be read as success. A detached
-``unvoiced`` job still ``succeeds`` and its retained body carries the same
-status. No ``/v1`` route, wire model or capability moves; ``0.29`` stays served.
+0.30.0: ``creek.revoice`` judges whether it applied the owner's voice. It is
+grounded in owner-authored style skills or the owner's register samples,
+re-screened (self-authored, ``voice_weight > 0``) and admitted at the declared
+ceiling. A deterministic gate checks fidelity (headings, citations),
+per-section transformation, the opening, and style shift toward the owner's
+measured profile; one bounded retry adds owner excerpts. A failing rewrite
+returns ``status: "refused"`` with ``reason`` ``no_owner_voice``,
+``insufficient_transformation`` or ``fidelity_violation`` and a content-free
+``voice_check``, never the rejected text. ``ok`` responses gain
+``voice_check``. A detached voice refusal ends ``succeeded`` with that closed
+reason. No ``/v1`` route, wire model or capability moves; ``0.29`` stays served.
 
 0.29.0 (#2075, follow-up to #2066): ``GET /v1/jobs/{job_id}``'s closed
 ``failure_code`` vocabulary gains ``busy``. A durable ``llm`` classification

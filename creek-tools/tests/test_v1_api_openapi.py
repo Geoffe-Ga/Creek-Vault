@@ -121,8 +121,8 @@ OPENAPI_GOLDEN: Final[Path] = (
 )
 """The published document at contract 0.30.0: only ``info.version`` moves.
 
-0.30.0 is MCP-only (``creek.revoice`` gains ``voice_check`` and the
-``unvoiced`` status), so no ``/v1`` path or schema changes. 0.29.0 gave
+0.30.0 is MCP-only (``creek.revoice`` gains ``voice_check`` and refuses
+an unvoiced rewrite), so no ``/v1`` path or schema changes. 0.29.0 gave
 ``JobFailureCode`` ``busy`` (#2075), so ``JobStatusResponse`` moved on
 ``GET /v1/jobs/{job_id}``. The ``424 request_key_rejected`` 0.28.0 documented
 on ``POST /v1/reflections`` and ``POST /v1/letters/{external_id}`` is

@@ -71,6 +71,7 @@ from pydantic import ValidationError
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     raw_privacy_tier,
+    tier_within_override,
     within_ceiling,
 )
 from creek.config import VoiceAudienceWeightingConfig
@@ -599,6 +600,70 @@ def _read_sample_manifest(register_dir: Path) -> frozenset[str]:
     if not isinstance(recorded, list):
         return frozenset()
     return frozenset(str(entry) for entry in recorded)
+
+
+@dataclass(frozen=True)
+class OwnerVoiceSample:
+    """One owner-authored register sample admitted for revoice grounding.
+
+    Attributes:
+        register: The canonical register folder it was saved under.
+        body: The sample's prose, without frontmatter.
+    """
+
+    register: str
+    body: str
+
+
+def _owner_sample(
+    md_file: Path, override: PrivacyTierOverride
+) -> OwnerVoiceSample | None:
+    """Return *md_file* as an owner sample if every gate admits it, else ``None``.
+
+    The samples folder is one an operator also curates by hand, so a file's
+    location proves nothing. Each sample is re-screened on its own
+    frontmatter: self-authored, positive ``voice_weight`` (an AI draft is
+    stamped ``0.0``), qualifying confidence and canonical register through
+    :func:`_eligible_register`, then admitted by tier at *override*.
+    """
+    if md_file.name == _SUMMARY_FILENAME or md_file.is_symlink():
+        return None
+    loaded = _load_fragment_with_body(md_file)
+    if loaded is None:
+        return None
+    fragment, body, _raw = loaded
+    if not tier_within_override(PrivacyTier(str(fragment.privacy_tier)), override):
+        return None
+    if _eligible_register(fragment, allow_intimate=True) is None or not body.strip():
+        return None
+    return OwnerVoiceSample(register=md_file.parent.name, body=body.strip())
+
+
+def load_owner_voice_samples(
+    vault_path: Path, *, override: PrivacyTierOverride
+) -> list[OwnerVoiceSample]:
+    """Load the persisted register samples a revoice may be grounded in.
+
+    Reads only ``07-Voice/Register-Samples/<canonical register>/*.md``, as
+    written by :meth:`VoiceExemplarCollector.save_exemplars`. It does not
+    follow symlinks and never walks the corpus, so it costs at most
+    :data:`DEFAULT_MAX_PER_REGISTER` files per register.
+
+    Args:
+        vault_path: The vault root.
+        override: The admission ceiling; samples above it are skipped.
+
+    Returns:
+        Admitted samples in a stable (register, filename) order.
+    """
+    root = vault_path.joinpath(*_SAMPLES_SUBPATH)
+    found = (
+        _owner_sample(md_file, override)
+        for register in VOICE_REGISTERS
+        if (root / register).is_dir() and not (root / register).is_symlink()
+        for md_file in sorted((root / register).glob("*.md"))
+    )
+    return [sample for sample in found if sample is not None]
 
 
 class VoiceExemplarCollector:

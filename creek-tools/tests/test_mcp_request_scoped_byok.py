@@ -45,7 +45,6 @@ from creek_mcp.httpapi import mcp_request_key
 from creek_mcp.policy import Transport
 from creek_mcp.provenance import InferenceProvenance
 from creek_mcp.tools.draft import DRAFT_PROVIDER_UNAVAILABLE_REASON
-from creek_mcp.tools.revoice import REWRITE_STATUSES
 from tests.mcp_http_support import call_tool, open_session
 from tests.test_request_scoped_byok import (
     CANARY_KEY,
@@ -236,13 +235,16 @@ def test_revoice_over_mcp_uses_the_writers_key_without_saving(
 ) -> None:
     """Revoice inherits the request-key route without persisting either passage."""
     vendor = _Vendor(monkeypatch)
+    # Owner-authored style grounds the rewrite; without it revoice refuses
+    # ``no_owner_voice`` before any model call, and no key would be exercised.
+    core = managed / "creek-skills" / "meta" / "voice-core.SKILL.md"
+    core.parent.mkdir(parents=True, exist_ok=True)
+    core.write_text("Short sentences. Plain words. First person.")
     passage = "Please send the report on Friday."
     result = _call(
         managed, "creek.revoice", {"text": passage}, _keyed("openai", OPENAI_CANARY)
     )
-    # Key routing is under test, not voice: the fixture vault has no owner
-    # style, so a completed rewrite is honestly reported ``unvoiced``.
-    assert result["status"] in REWRITE_STATUSES, result
+    assert result["status"] == "ok", result
     assert result["inference_source"] == "request_key:openai"
     assert result["text"]
     assert set(vendor.keys_sent()) == {OPENAI_CANARY}

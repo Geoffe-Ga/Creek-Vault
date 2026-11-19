@@ -342,14 +342,14 @@ lives in `07-Voice/Mission/`.
 ### Revoice supplied text
 
 `creek.revoice(text, register?, phase?, privacy_tier_ceiling?)` transforms the
-caller's draft rather than composing from vault evidence. It reads only the
-voice-core and requested canonical phase/register skills. Its cached system
-prefix contains the care policy and skills; its dynamic prompt marks the text
-as untrusted data and requires meaning, claims, qualifications, attribution and
-biographical facts to stay unchanged. No fragments are retrieved and no draft
-is written. Missing voice-core is allowed: the call uses the care policy alone,
-reports `voice_skills: []`, and returns `status: "unvoiced"` rather than
-claiming a learned voice.
+caller's draft rather than composing from vault evidence. Its cached system
+prefix holds the care policy and the voice-core, phase and register skills.
+A requested register or phase is always applied: from its file, or as its
+canonical signature when the file is missing or withheld, never silently
+dropped. The dynamic prompt carries the owner grounding and the passage. It
+marks the text as untrusted, and requires every claim, qualification,
+attribution, biographical fact, heading, citation, footnote reference and link
+to stay unchanged. No draft is written.
 
 The MCP input schema publishes the canonical register enum so clients can
 choose a valid value without an out-of-band ontology lookup: `confessional`,
@@ -370,50 +370,77 @@ alongside the dynamic passage, while supported cloud providers retain caching.
 Input is limited to 16,000 characters. Empty text and unknown canonical slugs
 return `status: "error"` before a model is built. The tier-keyed factory routes
 from the declared ceiling, so `intimate`/`all` is local-only or refused; remote
-callers retain their existing cap below intimate. A success returns
-`{status, tool, tier_ceiling, text, voice_skills, voice_check, usage}` and an
-optional `inference_source`. Incomplete, empty or oversized model output is an
-error. Only input/output character counts enter this tool's audit entry.
+callers retain their existing cap below intimate. Incomplete, empty or
+oversized model output is an error. Only input/output character counts enter
+this tool's audit entry.
 
-#### Did the voice actually apply? (`voice_check`, contract 0.30)
+#### Owner grounding and the voice gate (contract 0.30)
 
-Creek decides whether a rewrite counts as owner-voiced, so clients need no
-heuristics of their own. Every rewrite carries a content-free `voice_check`:
+Canonical signatures are the same text for every vault: they describe a
+register, not a person. Revoice therefore needs owner-specific grounding from
+at least one of:
 
-| Field | Meaning |
-|---|---|
-| `voice_applied` | `true` only when both checks below pass. |
-| `conditioning` | `owner` when at least one applied skill is owner-authored style; `generic` when only canonical signatures applied; `none` with no voice skill. |
-| `owner_style_skills` | The applied skills that carry owner-authored style. |
-| `rewritten_ratio` | Share of output words that are new after citations, links, footnotes, punctuation and case are normalized away. Deleting source text never counts. |
-| `min_rewritten_ratio` | The floor `rewritten_ratio` must reach (`0.25`). |
-| `opening_similarity` | How alike the two openings are (`0..1`). Diagnostic only. |
-| `reasons` | Closed codes for each failed check: `no_owner_style`, `insufficient_rewrite`. |
+- an **owner-authored style skill** (a custom voice-core, phase or register
+  file, as above); or
+- the owner's **register samples** in `07-Voice/Register-Samples/`, written by
+  `creek voice`. Each sample is re-screened on its own frontmatter: it must be
+  self-authored, have `voice_weight > 0` (AI drafts are stamped `0.0`), have
+  qualifying confidence and a canonical register, and have a tier admitted at
+  the declared ceiling. Symlinks and `_Summary.md` are skipped. With at least
+  three samples (150 words), Creek measures a numeric style profile:
+  sentence length and spread, short-sentence and question share, and
+  first-person, contraction, em-dash and parenthetical rates. The profile is
+  sent as numbers, never owner words.
 
-A rewrite that fails either check returns `status: "unvoiced"`. The response
-keeps `text`, so a caller can inspect it, but it must not present that text as
-the owner's voice. A detached `unvoiced` job ends `succeeded`, and its retained
-body carries the same status.
+With neither, the call returns `status: "refused"`, `reason:
+"no_owner_voice"` before any model is built.
 
-Generated skills are sent as their canonical signatures, as described above.
-Those signatures are the same text for every vault, so a vault whose skill tree
-is entirely generated reports `conditioning: "generic"` and every rewrite comes
-back `unvoiced`. To condition revoice on your own voice, add owner-authored,
-source-free style to `voice-core` or the register/phase skill you request. Use
-no native `category`/`variant`/`generated_date` metadata and no exemplar
-section.
+Every rewrite then passes through a deterministic gate. A raw diff is never
+the criterion: deleting citations, compressing, or one heavily rewritten
+section all produce a large diff without a voice.
 
-The verdict measures how much of the prose moved, not whether it sounds like
-you. It is a floor against near-copies, not a stylometric judgment.
+| Check | Fails as | Diagnostic |
+|---|---|---|
+| Every heading and every citation, footnote reference and link target survives | `fidelity_violation` | `headings_changed`, `citations_dropped` |
+| Each section of at least 40 words has ≥25% new words **and** ≤50% sentences that near-copy a source sentence | `insufficient_transformation` | `section_unchanged` |
+| The first 40 prose words are under 80% similar | `insufficient_transformation` | `opening_unchanged` |
+| The whole passage meets the same wording and sentence floors | `insufficient_transformation` | `copyedit_only` |
+| With a profile, the output sits closer to the owner than the source did (≥10% closer, or already close) | `insufficient_transformation` | `no_style_shift` |
 
-The composition wrapper reports `skills` then `composed`, with the same deadline
-and one-active-composition-per-agent rule as draft/author. A detached rewrite
-returns a job handle. `creek.jobs.read` returns its text only to the original
-agent at a ceiling at least as sensitive as the original call. Results are
-readable for ten minutes in a per-server cache holding at most 32 successful
-rewrites; expired entries are removed on the next cache operation. Expiry,
-eviction and process restart return the same unavailable refusal. Durable job
-records retain only status and output character count, never either passage.
+If any transformation check fails, `reason` is `insufficient_transformation`;
+fidelity-only failures are `fidelity_violation`. A failed first attempt gets
+**exactly one** retry. The retry adds up to three owner excerpts (admitted
+samples only) and fixed instructions naming the failed checks, so there are
+never more than two model calls.
+
+Responses:
+
+- `ok`: `{status, tool, tier_ceiling, text, voice_skills, voice_check, usage}`
+  plus an optional `inference_source`.
+- Voice refusal: `{status: "refused", tool, tier_ceiling, reason, voice_skills,
+  voice_check, usage}`. **No `text`**: a rejected rewrite must not be
+  presented as the owner's voice.
+
+`voice_check` is content-free: `voice_applied`, `diagnostics`,
+`rewritten_ratio`, `copied_sentence_ratio`, `opening_similarity`,
+`unchanged_sections` (section indices, `0` being the text before the first
+heading), `style_distance_source`, `style_distance_output` (`null` when not
+measured), `owner_samples`, `owner_profile`, `owner_style_skills`, and
+`attempts`. `usage` sums both attempts.
+
+A detached job whose call ends in a voice refusal finishes `succeeded`. Its
+durable record holds only `{status: "refused", tool, reason}`, and
+`creek.jobs.read` adds the `voice_check` from bounded process memory, exactly
+as it does for an `ok` body. Routing refusals and errors still end `failed`.
+
+**Long documents.** The 16,000-character limit is unchanged. Split a longer
+document at headings and revoice each part. Every part is judged on its own
+opening and its own sections, so a strong part cannot carry an unchanged one.
+Treat the document as revoiced only if every part returns `ok`.
+
+To judge a local pair the same way, run
+`python -m creek.author.revoice_check SOURCE OUTPUT --vault VAULT [--ceiling C]
+[--register R]`. It prints the verdict and exits `0` (pass) or `1` (refused).
 
 ### Author from vault evidence
 

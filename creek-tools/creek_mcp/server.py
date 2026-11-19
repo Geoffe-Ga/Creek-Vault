@@ -1804,10 +1804,12 @@ def _register_composition_tools(
     ) -> dict[str, Any]:
         """Rewrite supplied text in the owner's voice without saving.
 
-        Only ``status: "ok"`` means Creek accepts the rewrite as owner-voiced.
-        ``status: "unvoiced"`` still returns text, but ``voice_check.reasons``
-        says why it is not the owner's voice (``no_owner_style`` or
-        ``insufficient_rewrite``); do not present it as such.
+        Only ``status: "ok"`` carries a rewrite Creek accepts as owner-voiced.
+        ``status: "refused"`` with ``reason`` ``no_owner_voice``,
+        ``insufficient_transformation`` or ``fidelity_violation`` returns no
+        text; ``voice_check.diagnostics`` names what failed. Inputs over
+        16,000 characters must be split at headings, and each part is judged
+        on its own opening and sections.
         """
         caller = _effective_consumer(consumer)
         provenance = InferenceProvenance()
