@@ -1,0 +1,581 @@
+<title>__DECIDE_TITLE__</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<!--__DECIDE_FONTS__-->
+<style>
+/* Layout: a deliberation docket. Sticky progress bar, an index of decisions
+   beside a single reading column; each decision reads summary → options →
+   evidence → your call. Theme tokens below; DESIGN.md overrides follow. */
+:root {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --sunken: #edf0f4;
+  --fg: #1a2130;
+  --muted: #5a6476;
+  --line: #d8dde5;
+  --accent: #2c5a88;
+  --accent-ink: #ffffff;
+  --accent-soft: #e2ebf5;
+  --rec: #8a5d0c;
+  --rec-soft: #f5ead2;
+  --sev-low: #3c7a55;
+  --sev-med: #9c6410;
+  --sev-high: #ad3434;
+  --font-display: "Spectral", Georgia, "Times New Roman", serif;
+  --font-body: "Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11151c; --surface: #19202a; --sunken: #141a22; --fg: #e5e8ee;
+    --muted: #99a2b1; --line: #2a3240; --accent: #82aad6; --accent-ink: #0c1320;
+    --accent-soft: #1e2b3b; --rec: #dfb25c; --rec-soft: #2d2617;
+    --sev-low: #6dbd8a; --sev-med: #dfa449; --sev-high: #ee7a7a;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11151c; --surface: #19202a; --sunken: #141a22; --fg: #e5e8ee;
+  --muted: #99a2b1; --line: #2a3240; --accent: #82aad6; --accent-ink: #0c1320;
+  --accent-soft: #1e2b3b; --rec: #dfb25c; --rec-soft: #2d2617;
+  --sev-low: #6dbd8a; --sev-med: #dfa449; --sev-high: #ee7a7a;
+  color-scheme: dark;
+}
+</style>
+<style id="decide-theme">/*__DECIDE_THEME__*/</style>
+<style>
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font-body); font-size: 15px; line-height: 1.55;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--surface);
+}
+.gutter {
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1180px; margin: 0 auto; }
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; line-height: 1.2; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.eyebrow {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--muted);
+}
+
+/* Sticky bar */
+.bar {
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5;
+  background: var(--surface); border-bottom: 1px solid var(--line);
+}
+.bar-inner {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+  padding-block: 10px;
+}
+.bar-title { font-family: var(--font-display); font-weight: 600; font-size: 17px; min-width: 0; flex: 1 1 220px; }
+.progress { display: flex; align-items: center; gap: 10px; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; }
+.meter { width: 120px; height: 6px; border-radius: 3px; background: var(--sunken); overflow: hidden; }
+.meter > span { display: block; height: 100%; background: var(--accent); width: 0; transition: width 0.25s ease; }
+.saved { font-size: 12px; color: var(--muted); min-width: 9em; }
+.btn {
+  font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+  border-radius: 8px; padding: 8px 14px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--fg);
+}
+.btn:hover { border-color: var(--accent); }
+.btn-primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btn-primary:hover { filter: brightness(1.08); }
+.btn-quiet { background: transparent; border-color: transparent; color: var(--muted); font-weight: 500; }
+
+/* Intro */
+.intro { padding-block: 32px 8px; display: grid; gap: 12px; }
+.intro h1 { font-size: clamp(26px, 4vw, 36px); font-weight: 600; }
+.prompt {
+  max-width: 68ch; color: var(--muted); border-left: 3px solid var(--line);
+  padding-left: 12px; margin: 0;
+}
+.context { max-width: 68ch; margin: 0; }
+
+/* Layout */
+.layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 32px; padding-block: 24px 64px; }
+@media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); gap: 16px; } }
+.index { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 70px); align-self: start; display: grid; gap: 4px; }
+@media (max-width: 900px) { .index { position: static; } }
+.index a {
+  display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: baseline;
+  text-decoration: none; color: var(--fg); padding: 6px 8px; border-radius: 6px; font-size: 14px;
+}
+.index a:hover { background: var(--sunken); }
+.dot { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--muted); display: inline-block; transform: translateY(-1px); }
+.dot[data-status="decided"] { background: var(--accent); border-color: var(--accent); }
+.dot[data-status="deferred"] { background: var(--rec); border-color: var(--rec); }
+
+.decisions { display: grid; gap: 28px; min-width: 0; }
+.decision {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: clamp(16px, 3vw, 28px); display: grid; gap: 22px; min-width: 0;
+  scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 72px);
+}
+.d-head { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; }
+.d-head h2 { font-size: clamp(20px, 2.6vw, 25px); font-weight: 600; flex: 1 1 280px; min-width: 0; }
+.chip {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+}
+.chip[data-status="decided"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.chip[data-status="deferred"] { color: var(--rec); border-color: var(--rec); background: var(--rec-soft); }
+.question { font-size: 17px; font-weight: 600; margin: 0; max-width: 68ch; }
+.summary { margin: 0; max-width: 68ch; }
+.section { display: grid; gap: 10px; min-width: 0; }
+.section > h3 { font-family: var(--font-mono); font-size: 11px; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.lean { margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--rec-soft); color: var(--fg); font-size: 14px; max-width: 74ch; }
+.lean strong { color: var(--rec); }
+
+/* Options */
+.options { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.option {
+  display: grid; gap: 8px; align-content: start; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: var(--surface);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.option:hover { border-color: var(--accent); }
+.option:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.option-top { display: flex; gap: 10px; align-items: flex-start; }
+.option-top input { margin-top: 4px; accent-color: var(--accent); flex: none; }
+.option-label { font-weight: 600; }
+.option-summary { margin: 0; font-size: 14px; color: var(--muted); }
+.badge {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--rec); background: var(--rec-soft); border-radius: 4px; padding: 2px 6px; white-space: nowrap; margin-left: auto;
+}
+.pc { display: grid; gap: 4px; font-size: 13px; margin: 0; padding: 0; list-style: none; }
+.pc li { display: grid; grid-template-columns: 14px 1fr; gap: 6px; }
+.pc li::before { font-family: var(--font-mono); font-weight: 700; }
+.pc .pro::before { content: "+"; color: var(--sev-low); }
+.pc .con::before { content: "−"; color: var(--sev-high); }
+.option-extra { display: flex; flex-wrap: wrap; gap: 8px 12px; }
+.option-extra .option { padding: 10px 12px; flex: 1 1 220px; }
+.other-input {
+  font: inherit; font-size: 14px; width: 100%; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+}
+
+/* Evidence */
+.evidence { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+.table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+tr:last-child td, tr:last-child th { border-bottom: 0; }
+thead th { background: var(--sunken); font-weight: 600; white-space: nowrap; }
+tbody th { font-weight: 600; color: var(--muted); white-space: nowrap; }
+td.sel, th.sel { background: var(--accent-soft); }
+.risks, .examples { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.risk {
+  display: grid; gap: 4px; padding: 10px 12px; border-radius: 8px; background: var(--sunken);
+  border-left: 4px solid var(--sev-med); font-size: 14px;
+}
+.risk[data-sev="low"] { border-left-color: var(--sev-low); }
+.risk[data-sev="high"] { border-left-color: var(--sev-high); }
+.risk-top { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; }
+.sev { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--sev-med); }
+.risk[data-sev="low"] .sev { color: var(--sev-low); }
+.risk[data-sev="high"] .sev { color: var(--sev-high); }
+.risk-mit { color: var(--muted); font-size: 13px; }
+.applies { font-size: 12px; color: var(--muted); }
+.example { padding: 10px 12px; border-radius: 8px; background: var(--sunken); font-size: 14px; display: grid; gap: 2px; }
+.example-title { font-weight: 600; }
+
+/* Your call */
+.notes {
+  font: inherit; font-size: 14px; width: 100%; min-height: 84px; resize: vertical;
+  padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+}
+
+/* Hand-back */
+.handback { display: grid; gap: 12px; padding: clamp(16px, 3vw, 28px); background: var(--surface); border: 1px solid var(--accent); border-radius: var(--radius); scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 72px); }
+.handback h2 { font-size: 22px; }
+.handback p { margin: 0; max-width: 68ch; }
+.handback-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.export {
+  font-family: var(--font-mono); font-size: 12px; width: 100%; min-height: 220px; resize: vertical;
+  padding: 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--sunken); color: var(--fg);
+}
+.toast { font-size: 13px; color: var(--accent); min-height: 1.4em; }
+details.restore summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+details.restore textarea { margin-top: 8px; min-height: 100px; }
+.confirm-row { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
+</style>
+
+<div class="bar">
+  <div class="wrap gutter bar-inner">
+    <div class="bar-title" id="bar-title"></div>
+    <div class="progress"><div class="meter" aria-hidden="true"><span id="meter"></span></div><span id="progress-text"></span></div>
+    <span class="saved" id="saved" aria-live="polite"></span>
+    <button class="btn btn-primary" id="copy-top" type="button">Copy for Claude</button>
+  </div>
+</div>
+
+<header class="wrap gutter intro">
+  <div class="eyebrow" id="eyebrow"></div>
+  <h1 id="title"></h1>
+  <p class="prompt" id="prompt"></p>
+  <p class="context" id="context"></p>
+</header>
+
+<main class="wrap gutter layout">
+  <nav class="index" id="index" aria-label="Decisions"></nav>
+  <div class="decisions" id="decisions">
+    <section class="handback" id="handback" aria-labelledby="handback-h">
+      <h2 id="handback-h">Send your answers to Claude</h2>
+      <p>Your answers save in this browser as you go. When you're done, copy them and paste them into your Claude session. Claude reads the JSON block at the end.</p>
+      <div class="handback-actions">
+        <button class="btn btn-primary" id="copy-bottom" type="button">Copy for Claude</button>
+        <span class="confirm-row" id="clear-row"></span>
+      </div>
+      <div class="toast" id="toast" role="status"></div>
+      <label class="eyebrow" for="export">What gets copied</label>
+      <textarea class="export" id="export" readonly></textarea>
+      <details class="restore">
+        <summary>Restore answers from a copied block</summary>
+        <label class="eyebrow" for="restore-input">Paste a block copied from this sheet</label>
+        <textarea class="export" id="restore-input" placeholder="Paste here. Answers load automatically."></textarea>
+      </details>
+    </section>
+  </div>
+</main>
+
+<script id="decide-data" type="application/json">__DECIDE_DATA__</script>
+<script>
+(function () {
+  "use strict";
+  var DATA = JSON.parse(document.getElementById("decide-data").textContent);
+  var KEY = "decide:" + DATA.id;
+  var DEFER = "__defer";
+  var OTHER = "__other";
+  var STATUS_LABEL = { open: "Open", decided: "Decided", deferred: "Later" };
+  var state = {};
+
+  function h(tag, attrs) {
+    var el = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        var v = attrs[k];
+        if (v === null || v === undefined || v === false) return;
+        if (k === "text") el.textContent = v;
+        else if (k === "class") el.className = v;
+        else if (k.slice(0, 2) === "on") el.addEventListener(k.slice(2), v);
+        else el.setAttribute(k, v === true ? "" : v);
+      });
+    }
+    for (var i = 2; i < arguments.length; i++) {
+      var c = arguments[i];
+      if (c === null || c === undefined || c === false) continue;
+      el.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    }
+    return el;
+  }
+
+  function answer(id) {
+    if (!state[id]) state[id] = { choice: [], other: "", notes: "" };
+    return state[id];
+  }
+  function statusOf(d) {
+    var a = answer(d.id);
+    if (a.choice.indexOf(DEFER) !== -1) return "deferred";
+    var real = a.choice.filter(function (c) { return c !== OTHER || a.other.trim(); });
+    return real.length ? "decided" : "open";
+  }
+
+  function load() {
+    try {
+      var raw = window.localStorage.getItem(KEY);
+      if (raw) state = JSON.parse(raw) || {};
+    } catch (e) { state = {}; }
+  }
+  var savedTimer = null;
+  function save() {
+    var el = document.getElementById("saved");
+    try {
+      window.localStorage.setItem(KEY, JSON.stringify(state));
+      el.textContent = "Saved in this browser";
+    } catch (e) {
+      el.textContent = "Not saved: copy before closing";
+    }
+    clearTimeout(savedTimer);
+    savedTimer = setTimeout(function () { el.textContent = ""; }, 2500);
+  }
+
+  function optionLabel(d, id) {
+    if (id === DEFER) return "Decide later";
+    if (id === OTHER) return "Other";
+    var o = d.options.find(function (x) { return x.id === id; });
+    return o ? o.label : id;
+  }
+
+  function exportText() {
+    var lines = ["<!-- decide-answers sheet=" + DATA.id + " -->", "# Decisions: " + DATA.title, ""];
+    var out = [];
+    DATA.decisions.forEach(function (d, i) {
+      var a = answer(d.id);
+      var picks = a.choice.map(function (c) {
+        return c === OTHER ? "Other: " + (a.other.trim() || "(blank)") : optionLabel(d, c);
+      });
+      lines.push((i + 1) + ". **" + d.title + "** (`" + d.id + "`): " + (picks.length ? picks.join("; ") : "no answer"));
+      if (a.notes.trim()) lines.push("   - Notes: " + a.notes.trim().replace(/\n+/g, " / "));
+      out.push({ id: d.id, status: statusOf(d), choice: a.choice.slice(), other: a.other.trim(), notes: a.notes.trim() });
+    });
+    lines.push("", "```json", JSON.stringify({ sheet: DATA.id, answers: out }, null, 2), "```");
+    return lines.join("\n");
+  }
+
+  function refresh() {
+    var done = 0;
+    DATA.decisions.forEach(function (d) {
+      var st = statusOf(d);
+      if (st !== "open") done++;
+      var chip = document.getElementById("chip-" + d.id);
+      chip.dataset.status = st;
+      chip.textContent = STATUS_LABEL[st];
+      document.getElementById("dot-" + d.id).dataset.status = st;
+      var a = answer(d.id);
+      document.querySelectorAll('[data-col^="' + d.id + '::"]').forEach(function (cell) {
+        var col = cell.getAttribute("data-col").split("::")[1];
+        cell.classList.toggle("sel", a.choice.indexOf(col) !== -1);
+      });
+    });
+    var n = DATA.decisions.length;
+    document.getElementById("meter").style.width = (n ? (done / n) * 100 : 0) + "%";
+    document.getElementById("progress-text").textContent = done + " of " + n + " answered";
+    document.getElementById("export").value = exportText();
+  }
+
+  function onChoice(d, value, checked, multi) {
+    var a = answer(d.id);
+    if (!multi) {
+      a.choice = checked ? [value] : [];
+    } else if (value === DEFER) {
+      a.choice = checked ? [DEFER] : [];
+      if (checked) {
+        document.querySelectorAll('input[name="choice-' + d.id + '"]').forEach(function (box) {
+          if (box.value !== DEFER) box.checked = false;
+        });
+      }
+    } else {
+      a.choice = a.choice.filter(function (c) { return c !== DEFER && c !== value; });
+      if (checked) a.choice.push(value);
+      var deferBox = document.getElementById("opt-" + d.id + "-" + DEFER);
+      if (deferBox) deferBox.checked = false;
+    }
+    save();
+    refresh();
+  }
+
+  function choiceInput(d, value, multi) {
+    var a = answer(d.id);
+    return h("input", {
+      type: multi ? "checkbox" : "radio", name: "choice-" + d.id, value: value,
+      id: "opt-" + d.id + "-" + value, checked: a.choice.indexOf(value) !== -1,
+      onchange: function (e) { onChoice(d, value, e.target.checked, multi); }
+    });
+  }
+
+  function matrix(d, rows, rowKey) {
+    if (!rows || !rows.length) return null;
+    var head = h("tr", null, h("th", { scope: "col" }));
+    d.options.forEach(function (o) {
+      head.appendChild(h("th", { scope: "col", "data-col": d.id + "::" + o.id, text: o.label }));
+    });
+    var body = h("tbody");
+    rows.forEach(function (r) {
+      var tr = h("tr", null, h("th", { scope: "row", text: r[rowKey] }));
+      d.options.forEach(function (o) {
+        tr.appendChild(h("td", { "data-col": d.id + "::" + o.id, text: (r.values && r.values[o.id]) || "–" }));
+      });
+      body.appendChild(tr);
+    });
+    return h("div", { class: "table-scroll" }, h("table", null, h("thead", null, head), body));
+  }
+
+  function renderOptions(d, multi) {
+    var options = h("div", { class: "options" });
+    d.options.forEach(function (o) {
+      var pc = h("ul", { class: "pc" });
+      (o.pros || []).forEach(function (p) { pc.appendChild(h("li", { class: "pro", text: p })); });
+      (o.cons || []).forEach(function (c) { pc.appendChild(h("li", { class: "con", text: c })); });
+      options.appendChild(h("label", { class: "option", for: "opt-" + d.id + "-" + o.id },
+        h("div", { class: "option-top" }, choiceInput(d, o.id, multi),
+          h("span", { class: "option-label", text: o.label }),
+          d.recommended === o.id ? h("span", { class: "badge", text: "Claude's lean" }) : null),
+        o.summary ? h("p", { class: "option-summary", text: o.summary }) : null,
+        pc.childNodes.length ? pc : null));
+    });
+    return options;
+  }
+
+  function renderExtra(d, multi) {
+    var other = h("input", {
+      class: "other-input", type: "text", id: "other-" + d.id, value: answer(d.id).other,
+      placeholder: "Describe another approach", "aria-label": "Other approach for " + d.title,
+      oninput: function (e) {
+        answer(d.id).other = e.target.value;
+        var box = document.getElementById("opt-" + d.id + "-" + OTHER);
+        if (e.target.value.trim() && !box.checked) { box.checked = true; onChoice(d, OTHER, true, multi); return; }
+        save();
+        refresh();
+      }
+    });
+    return h("div", { class: "option-extra" },
+      h("label", { class: "option", for: "opt-" + d.id + "-" + OTHER },
+        h("div", { class: "option-top" }, choiceInput(d, OTHER, multi), h("span", { class: "option-label", text: "Something else" })),
+        other),
+      h("label", { class: "option", for: "opt-" + d.id + "-" + DEFER },
+        h("div", { class: "option-top" }, choiceInput(d, DEFER, multi), h("span", { class: "option-label", text: "Decide later" })),
+        h("p", { class: "option-summary", text: "Park it. Claude won't build on an answer here." })));
+  }
+
+  function renderEvidence(d) {
+    var evidence = h("div", { class: "evidence" });
+    var tr = matrix(d, d.tradeoffs, "dimension");
+    if (tr) evidence.appendChild(h("div", { class: "section" }, h("h3", { text: "Trade-offs" }), tr));
+    var co = matrix(d, d.costs, "item");
+    if (co) evidence.appendChild(h("div", { class: "section" }, h("h3", { text: "Costs" }), co));
+    if (d.risks && d.risks.length) {
+      var rl = h("ul", { class: "risks" });
+      d.risks.forEach(function (r) {
+        var sev = r.severity || "medium";
+        var applies = (r.options || []).map(function (id) { return optionLabel(d, id); }).join(", ");
+        rl.appendChild(h("li", { class: "risk", "data-sev": sev },
+          h("div", { class: "risk-top" }, h("span", { class: "sev", text: sev + " risk" }), h("span", { text: r.risk })),
+          r.mitigation ? h("span", { class: "risk-mit", text: "Mitigation: " + r.mitigation }) : null,
+          applies ? h("span", { class: "applies", text: "Applies to: " + applies }) : null));
+      });
+      evidence.appendChild(h("div", { class: "section" }, h("h3", { text: "Risks" }), rl));
+    }
+    if (d.examples && d.examples.length) {
+      var el = h("ul", { class: "examples" });
+      d.examples.forEach(function (x) {
+        var title = x.url && /^https:\/\//.test(x.url)
+          ? h("a", { class: "example-title", href: x.url, target: "_blank", rel: "noopener noreferrer", text: x.title })
+          : h("span", { class: "example-title", text: x.title });
+        el.appendChild(h("li", { class: "example" }, title, x.detail ? h("span", { text: x.detail }) : null));
+      });
+      evidence.appendChild(h("div", { class: "section" }, h("h3", { text: "Examples" }), el));
+    }
+    return evidence.childNodes.length ? evidence : null;
+  }
+
+  function renderDecision(d, i) {
+    var multi = !!d.multi;
+    var notes = h("textarea", {
+      class: "notes", id: "notes-" + d.id, placeholder: "Constraints, conditions, what would change your mind…",
+      oninput: function (e) { answer(d.id).notes = e.target.value; save(); refresh(); }
+    });
+    notes.value = answer(d.id).notes;
+    var lean = d.recommended && d.recommendation_reason
+      ? h("p", { class: "lean" }, h("strong", { text: "Claude's lean: " + optionLabel(d, d.recommended) + ". " }), d.recommendation_reason)
+      : null;
+    return h("article", { class: "decision", id: "d-" + d.id, "aria-labelledby": "h-" + d.id },
+      h("div", { class: "d-head" },
+        h("span", { class: "eyebrow", text: "D-" + String(i + 1).padStart(2, "0") }),
+        h("h2", { id: "h-" + d.id, text: d.title }),
+        h("span", { class: "chip", id: "chip-" + d.id })),
+      d.question ? h("p", { class: "question", text: d.question }) : null,
+      d.summary ? h("p", { class: "summary", text: d.summary }) : null,
+      h("div", { class: "section" },
+        h("h3", { text: multi ? "Choices · pick any" : "Choices · pick one" }),
+        lean, renderOptions(d, multi), renderExtra(d, multi)),
+      renderEvidence(d),
+      h("div", { class: "section" }, h("h3", null, h("label", { for: "notes-" + d.id, text: "Notes" })), notes));
+  }
+
+  function flash(msg) {
+    var t = document.getElementById("toast");
+    t.textContent = msg;
+    setTimeout(function () { if (t.textContent === msg) t.textContent = ""; }, 5000);
+  }
+  function selectExport(msg) {
+    var box = document.getElementById("export");
+    box.scrollIntoView({ block: "center" });
+    box.focus();
+    box.select();
+    flash(msg);
+  }
+  function copy() {
+    var text = exportText();
+    document.getElementById("export").value = text;
+    var p = null;
+    try { p = navigator.clipboard && navigator.clipboard.writeText(text); } catch (e) { p = null; }
+    if (!p) { selectExport("Copying isn't available here. The text is selected: press Ctrl+C or ⌘C."); return; }
+    p.then(function () { flash("Copied. Paste it into your Claude session."); },
+      function () { selectExport("Copying was blocked. The text is selected: press Ctrl+C or ⌘C."); });
+  }
+
+  function restore(text) {
+    var m = text.match(/```json\s*([\s\S]*?)```/);
+    var parsed;
+    try { parsed = JSON.parse(m ? m[1] : text); } catch (e) { return; }
+    if (!parsed || parsed.sheet !== DATA.id) { flash("That block is from a different sheet."); return; }
+    state = {};
+    (parsed.answers || []).forEach(function (a) {
+      state[a.id] = { choice: a.choice || [], other: a.other || "", notes: a.notes || "" };
+    });
+    save();
+    renderAll();
+    flash("Answers restored.");
+  }
+
+  function wireClear() {
+    var row = document.getElementById("clear-row");
+    function reset() {
+      row.textContent = "";
+      row.appendChild(h("button", { class: "btn btn-quiet", type: "button", onclick: ask }, "Clear answers"));
+    }
+    function ask() {
+      row.textContent = "";
+      row.appendChild(h("span", { class: "applies", text: "Clear every answer and note?" }));
+      row.appendChild(h("button", { class: "btn", type: "button", onclick: function () {
+        state = {};
+        try { window.localStorage.removeItem(KEY); } catch (e) { /* storage unavailable */ }
+        renderAll();
+        reset();
+        flash("Answers cleared.");
+      } }, "Clear"));
+      row.appendChild(h("button", { class: "btn btn-quiet", type: "button", onclick: reset }, "Cancel"));
+    }
+    reset();
+  }
+
+  function renderAll() {
+    var list = document.getElementById("decisions");
+    var hand = document.getElementById("handback");
+    var index = document.getElementById("index");
+    list.querySelectorAll("article.decision").forEach(function (n) { n.remove(); });
+    index.textContent = "";
+    DATA.decisions.forEach(function (d, i) {
+      list.insertBefore(renderDecision(d, i), hand);
+      index.appendChild(h("a", { href: "#d-" + d.id }, h("span", { class: "dot", id: "dot-" + d.id }), h("span", { text: d.title })));
+    });
+    index.appendChild(h("a", { href: "#handback" }, h("span", { text: "→" }), h("span", { text: "Send to Claude" })));
+    refresh();
+  }
+
+  document.getElementById("bar-title").textContent = DATA.title;
+  document.getElementById("title").textContent = DATA.title;
+  document.getElementById("eyebrow").textContent =
+    "Decision sheet · " + DATA.decisions.length + " decisions" + (DATA.created ? " · " + DATA.created : "");
+  var promptEl = document.getElementById("prompt");
+  if (DATA.prompt) promptEl.textContent = "Prompt: " + DATA.prompt; else promptEl.hidden = true;
+  var ctxEl = document.getElementById("context");
+  if (DATA.context) ctxEl.textContent = DATA.context; else ctxEl.hidden = true;
+  document.getElementById("copy-top").addEventListener("click", copy);
+  document.getElementById("copy-bottom").addEventListener("click", copy);
+  document.getElementById("restore-input").addEventListener("input", function (e) { restore(e.target.value); });
+  wireClear();
+  load();
+  renderAll();
+})();
+</script>
