@@ -34,6 +34,7 @@ from creek.classify.llm.pool_boundary import (
     POOL_MAX_EMBED_RESPONSE_BYTES,
     POOL_MAX_RESPONSE_BYTES,
     POOL_MODELS_PATH,
+    POOL_REQUEST_TIMEOUT,
     POOL_URL_ENV,
     PoolBoundaryError,
     PoolRequestTooLargeError,
@@ -43,13 +44,27 @@ from creek.classify.llm.pool_boundary import (
     pool_generate,
     pool_list_models,
 )
-from tests.pool_support import FakePool, SocketSpy
+from tests.pool_support import FakePool, SocketSpy, read_request
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 _JSON_PADDING: Final[int] = len(json.dumps({"p": ""}).encode("utf-8"))
 """Bytes a ``{"p": "..."}`` body adds around its string value."""
+
+_STREAM_CHUNK_BYTES: Final[int] = 65536
+"""Bytes per ``sendall`` from the endless-body listener."""
+
+_STREAM_MULTIPLE: Final[int] = 4
+"""How many caps' worth the endless-body listener streams before it waits."""
+
+_HANG_UP_TIMEOUT: Final[float] = POOL_REQUEST_TIMEOUT + 1.0
+"""Seconds the endless-body listener holds the connection for the client.
+
+Longer than the dial's own request timeout, so a reader that tried to take the
+whole body would time out — and fail as unreachable — before the listener let
+go and closed, rather than seeing an end-of-stream and refusing late.
+"""
 
 _FAKE_PROXY: Final[str] = "http://proxy.invalid:3128"
 """An obviously fake proxy; a dial aimed at it would show up in the spy."""
@@ -245,6 +260,14 @@ class TestResponseCap:
         and never closes; a ``read()``-then-check would block on it until the
         socket timeout. Refusing promptly is only possible if the read stops
         at the cap.
+
+        "Never closes" is load-bearing. The listener drains the whole request
+        first and holds the connection open until the client hangs up, so the
+        only way this dial can end is the cap. A listener that closed after
+        streaming — with the request body still unread in its receive queue —
+        would reset the connection, and the reset discards response bytes not
+        yet delivered, so the client failed as unreachable short of the cap
+        whenever the kernel buffered the whole stream first.
         """
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
@@ -256,14 +279,19 @@ class TestResponseCap:
 
         def _serve() -> None:
             conn, _ = listener.accept()
-            conn.recv(65536)
-            conn.sendall(b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\n\r\n")
-            chunk = b"x" * 65536
-            sent = 0
             try:
-                while sent <= 4 * POOL_MAX_RESPONSE_BYTES:
+                read_request(conn)
+                conn.sendall(
+                    b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\n\r\n"
+                )
+                chunk = b"x" * _STREAM_CHUNK_BYTES
+                sent = 0
+                while sent <= _STREAM_MULTIPLE * POOL_MAX_RESPONSE_BYTES:
                     conn.sendall(chunk)
                     sent += len(chunk)
+                conn.settimeout(_HANG_UP_TIMEOUT)
+                while conn.recv(_STREAM_CHUNK_BYTES):
+                    pass
             except OSError:
                 return
             finally:
@@ -276,4 +304,4 @@ class TestResponseCap:
                 pool_generate({"prompt": "p"})
         finally:
             listener.close()
-            thread.join(timeout=5)
+            thread.join(timeout=_HANG_UP_TIMEOUT)
