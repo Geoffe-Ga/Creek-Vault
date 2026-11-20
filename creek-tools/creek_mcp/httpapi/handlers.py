@@ -72,6 +72,7 @@ from creek_mcp.api.routes import (
     OP_JOURNAL_WITHDRAW,
     OP_LETTERS,
     OP_LINK,
+    OP_PIPELINE_STATUS,
     OP_READING_RECOMMENDATIONS,
     OP_REFLECTIONS,
     OP_UPLOAD,
@@ -102,6 +103,7 @@ from creek_mcp.httpapi.pipeline import (
     handle_job_status,
     handle_link,
 )
+from creek_mcp.httpapi.pipeline_status import handle_pipeline_status
 from creek_mcp.httpapi.reading_recommendations import handle_reading_recommendations
 from creek_mcp.httpapi.reflect import handle_reflection
 from creek_mcp.httpapi.upload import handle_upload
@@ -225,6 +227,7 @@ _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
     OP_JOB_STATUS: handle_job_status,
     OP_LETTERS: handle_letter,
     OP_LINK: handle_link,
+    OP_PIPELINE_STATUS: handle_pipeline_status,
     OP_REFLECTIONS: handle_reflection,
     OP_READING_RECOMMENDATIONS: handle_reading_recommendations,
     OP_UPLOAD: handle_upload,

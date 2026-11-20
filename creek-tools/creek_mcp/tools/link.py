@@ -18,6 +18,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Final
 
 from creek._fslock import VaultLockTimeoutError
+from creek.audit.stage_log import link_stage
 from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
 from creek.link.embeddings import (
     EMBEDDING_MODEL_UNAVAILABLE_REASON,
@@ -32,6 +33,7 @@ from creek.vault.mutations import (
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.config_refusal import config_unavailable_refusal
 from creek_mcp.grounding_route import link_embedder
+from creek_mcp.stage_recording import record_pass, utc_now
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
 if TYPE_CHECKING:
@@ -50,6 +52,51 @@ logger = logging.getLogger(__name__)
 
 
 def link_tool(
+    *,
+    vault_path: Path,
+    method: str = "embeddings",
+    rebuild: bool = False,
+    privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    consumer: str = "unknown",
+) -> dict[str, Any]:
+    """Run one linker stage and record it in the stage log (#2124).
+
+    The stage itself is :func:`_link_pass`, whose docstring states the
+    refusals and return keys. This wrapper appends one ``linked:<method>``
+    line with the outcome the caller is about to be told; an unknown method
+    names no stage and records nothing.
+
+    Args:
+        vault_path: Vault root to link.
+        method: One of :data:`creek.surface_modes.LINK_METHODS`.
+        rebuild: Recompute cached artefacts from scratch.
+        privacy_tier_ceiling: Recorded for the audit trail.
+        consumer: Who is calling, for the audit trail.
+
+    Returns:
+        :func:`_link_pass`'s result, unchanged.
+    """
+    started_at = utc_now()
+    result = _link_pass(
+        vault_path=vault_path,
+        method=method,
+        rebuild=rebuild,
+        privacy_tier_ceiling=privacy_tier_ceiling,
+        consumer=consumer,
+    )
+    stage = link_stage(method)
+    if stage is not None:
+        record_pass(
+            vault_path,
+            (stage,),
+            result,
+            started_at,
+            unrecorded_prefixes=(CONFIG_UNAVAILABLE_PREFIX,),
+        )
+    return result
+
+
+def _link_pass(
     *,
     vault_path: Path,
     method: str = "embeddings",

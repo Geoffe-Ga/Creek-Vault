@@ -245,6 +245,9 @@ CLASSIFICATIONS_PATH: Final[str] = "/v1/classifications"
 LINKS_PATH: Final[str] = "/v1/links"
 """The whole-vault linking endpoint (contract 0.10, #1570)."""
 
+PIPELINE_STATUS_PATH: Final[str] = "/v1/pipeline/status"
+"""Per-folder counts and per-document stage trails (contract 0.34, #2124)."""
+
 JOB_TEMPLATE: Final[str] = "/v1/jobs/{job_id}"
 """The durable pipeline-job status route template (contract 0.14, #1605)."""
 

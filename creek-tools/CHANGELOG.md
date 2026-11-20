@@ -9,6 +9,26 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Contract 0.34.0: `GET /v1/pipeline/status` says what Creek did with each
+  upload, and which folders hold something (#2124).** A read on the
+  `pipeline` capability, served from `0.34` (earlier minors are refused
+  `incompatible_version`). `folders` lists every scaffolded ontology folder,
+  empty ones included, with its note count, `last_written_at`, and its
+  `writer` or a closed `writer_reason` when nothing fills it (registry:
+  `creek/vault/folder_writers.py`). `documents` lists the caller's most recent
+  uploads (`limit`, default 50, max 200) with a stage trail — `ingested`,
+  `classified`, `praxis_scanned`, `linked:<method>`, each `ok` / `partial` /
+  `failed` — built from two new append-only records: upload receipts beside
+  the ingest ledger (`State/ingest/upload-receipts.jsonl`, erased with the
+  fragment by `forget_fragment_ids`) and a stage log the classify and link
+  tools append (`State/stage-log.jsonl`). Documents above the caller's
+  ceiling are counted in `documents_withheld`, never named; no body or title
+  crosses. `jobs` lists the caller's ten newest durable pipeline jobs, read
+  without recovery. Folder walks are cached per directory on its mtime, so the
+  read is cheap to poll. The OpenAPI golden (`openapi-0.34.0.json`) and the
+  `adepthood-v1` bundle (six models, two `pipeline-status/` examples) are
+  regenerated. `0.33`, `0.32` and `0.31` stay served.
+
 - **A Substack export uploaded as loose files lands as Substack writing
   (#2123, contract 0.33).** adepthood's folder import sends an unzipped
   export one `POST /v1/uploads` per file, and only a `.zip` got content-based

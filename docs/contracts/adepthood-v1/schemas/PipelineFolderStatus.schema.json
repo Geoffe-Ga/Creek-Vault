@@ -1,0 +1,78 @@
+{
+  "$defs": {
+    "FolderWriterlessReason": {
+      "description": "Why a scaffolded folder has no writer, so an empty one says why.\n\nAttributes:\n    CONTAINER: A grouping folder; notes are filed into its subfolders.\n    OWNER_CURATED: Material the owner places by hand; no stage writes it.\n    INDEXED_AT_PARENT: The stage covering this topic files one index in\n        the parent folder instead.\n    TEMPLATE_EXAMPLE: A scaffold example of a layout, never filled.",
+      "enum": [
+        "container",
+        "owner_curated",
+        "indexed_at_parent",
+        "template_example"
+      ],
+      "title": "FolderWriterlessReason",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One scaffolded ontology folder: how much it holds, and what fills it.\n\nAttributes:\n    path: The vault-relative folder path.\n    count: Notes attributed to this folder, every tier counted. A note\n        counts toward the deepest scaffolded folder holding it, so a nested\n        scaffolded folder is never counted twice.\n    last_written_at: The newest such note's modification time, or ``None``\n        when the folder holds none.\n    writer: The subsystem that writes here, or ``None``.\n    writer_reason: Why nothing writes here, or ``None`` when ``writer``\n        is set. Exactly one of the two is non-null.",
+  "properties": {
+    "count": {
+      "description": "Notes held, every tier counted.",
+      "minimum": 0,
+      "title": "Count",
+      "type": "integer"
+    },
+    "last_written_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Newest note's modification time, UTC; null when empty.",
+      "title": "Last Written At"
+    },
+    "path": {
+      "description": "Vault-relative folder path.",
+      "maxLength": 128,
+      "pattern": "^(?:0[1-9]|1[01])-[A-Za-z-]+(?:/[A-Za-z0-9-]+)*$",
+      "title": "Path",
+      "type": "string"
+    },
+    "writer": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z][a-z0-9_-]*(?:\\.[a-z0-9_-]+)*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The subsystem that writes here; null when none does.",
+      "title": "Writer"
+    },
+    "writer_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FolderWriterlessReason"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Why nothing writes here; null when writer is set."
+    }
+  },
+  "required": [
+    "path",
+    "count",
+    "last_written_at",
+    "writer",
+    "writer_reason"
+  ],
+  "title": "PipelineFolderStatus",
+  "type": "object"
+}

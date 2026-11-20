@@ -34,6 +34,7 @@ from creek.ingest.substack_loose import (
     record_manifest,
     substack_post_identity,
 )
+from creek.ingest.upload_receipts import read_upload_receipts
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
@@ -528,3 +529,31 @@ def test_single_post_ingestor_discovers_nothing_for_a_missing_file(
 
     assert ingestor.discover(tmp_path / "absent.html") == []
     assert ingestor.discover(tmp_path) == []
+
+
+# --------------------------------------------------------------------------- #
+# Upload receipts for GET /v1/pipeline/status (#2124)
+# --------------------------------------------------------------------------- #
+
+
+def test_each_loose_post_is_receipted_with_its_fragment(vault: Path) -> None:
+    """A loose post lands as a fragment, so the status route can name it."""
+    _upload(vault, "posts.csv", _manifest_csv())
+    posts = _upload_posts(vault)
+
+    receipts = read_upload_receipts(vault)
+
+    assert [r.fragment_id for r in receipts] == [
+        fragment_id for post in posts for fragment_id in post["affected_fragment_ids"]
+    ]
+    assert [r.filename for r in receipts] == [
+        f"{post_id}.{slug}.html" for post_id, slug, _title, _date in _POSTS
+    ]
+
+
+def test_a_manifest_is_never_receipted(vault: Path) -> None:
+    """``posts.csv`` writes no fragment, so it is no document on the status route."""
+    manifest = _upload(vault, "posts.csv", _manifest_csv())
+
+    assert manifest["status"] == MANIFEST_STATUS
+    assert read_upload_receipts(vault) == []

@@ -62,6 +62,8 @@ from creek_mcp.api.models import (
     LetterResponse,
     LinkRequest,
     LinkResponse,
+    PipelineStatusQuery,
+    PipelineStatusResponse,
     ReadingRecommendationRequest,
     ReadingRecommendationResponse,
     ReflectionRequest,
@@ -261,6 +263,15 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/pipeline/status",
+        "GET",
+        "getPipelineStatus",
+        Capability.PIPELINE,
+        None,
+        PipelineStatusResponse,
+        True,
+    ),
+    (
         "/v1/agent-activity",
         "GET",
         "getAgentActivity",
@@ -317,13 +328,14 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "classifications",
     "links",
     "job-status",
+    "pipeline-status",
     "agent-activity",
     "reading-recommendations",
     "export",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 22
+_EXPECTED_ROUTE_COUNT: Final[int] = 23
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -770,7 +782,7 @@ def test_every_route_model_is_a_published_contract_model() -> None:
 
 
 def test_route_spec_declares_the_published_fields() -> None:
-    """``RouteSpec`` carries exactly the twelve fields the adapter consumes."""
+    """``RouteSpec`` carries exactly the thirteen fields the adapter consumes."""
     assert {field.name for field in fields(RouteSpec)} == {
         "path",
         "method",
@@ -784,6 +796,7 @@ def test_route_spec_declares_the_published_fields() -> None:
         "success_responses",
         "accepts_request_key",
         "query_model",
+        "since_minor",
     }
 
 
@@ -865,7 +878,7 @@ def test_route_spec_uses_slots() -> None:
 
 
 def test_only_the_agent_activity_route_declares_a_query_model() -> None:
-    """Agent activity (#1968) and the export (#2033) take query strings; no other.
+    """Agent activity (#1968), the export (#2033) and pipeline status (#2124) only.
 
     Every other route still takes no query parameters, so a client generator
     that sees ``in: query`` anywhere else is reading a regression.
@@ -874,4 +887,8 @@ def test_only_the_agent_activity_route_declares_a_query_model() -> None:
         spec.operation_id: spec.query_model
         for spec in ROUTES
         if spec.query_model is not None
-    } == {"getAgentActivity": AgentActivityQuery, "exportVault": ExportQuery}
+    } == {
+        "getAgentActivity": AgentActivityQuery,
+        "exportVault": ExportQuery,
+        "getPipelineStatus": PipelineStatusQuery,
+    }

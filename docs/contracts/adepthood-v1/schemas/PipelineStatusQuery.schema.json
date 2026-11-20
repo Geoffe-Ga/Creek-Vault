@@ -1,0 +1,15 @@
+{
+  "additionalProperties": false,
+  "description": "The query string ``GET /v1/pipeline/status`` accepts, and nothing else.\n\nAttributes:\n    limit: The most documents wanted, most recently landed first. Values\n        above :data:`PIPELINE_STATUS_MAX_LIMIT` are clamped to it.",
+  "properties": {
+    "limit": {
+      "default": 50,
+      "description": "Most documents to return, most recent first; values above 200 are clamped to 200.",
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "title": "PipelineStatusQuery",
+  "type": "object"
+}

@@ -20,8 +20,24 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.33.0"
+CONTRACT_VERSION: Final[str] = "0.34.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.34.0 (#2124): ``GET /v1/pipeline/status`` joins the ``pipeline`` capability
+and is served only to a caller declaring 0.34 or later (``RouteSpec.since_minor``;
+an earlier minor is refused ``incompatible_version``). It returns every
+scaffolded ontology folder with its note count, ``last_written_at`` and its
+writer — or, for a folder no stage fills, ``writer: null`` with a closed
+``writer_reason`` — the caller's most recent uploads (``limit``, default 50,
+clamped to 200) with the stages each has been through (``ingested``,
+``classified``, ``praxis_scanned``, ``linked:<method>``, each ``ok`` /
+``partial`` / ``failed``), and the caller's recent durable pipeline jobs. Stage
+rows come from two new append-only records: upload receipts beside the ingest
+ledger, and a stage log the classify and link tools append. Counts are every
+tier; a document with any fragment above the caller's ceiling is withheld and
+counted in ``documents_withheld``. No body or title crosses. The read is
+side-effect-free. No other route, body, status, error code or MCP tool shape
+moves; ``0.33``, ``0.32`` and ``0.31`` stay served.
 
 0.33.0 (#2123): a Substack export uploaded as loose files is identified file
 by file. ``creek.upload`` of a ``posts.csv`` whose header carries Substack's

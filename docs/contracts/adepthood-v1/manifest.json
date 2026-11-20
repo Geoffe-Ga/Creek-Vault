@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.33.0",
+  "contract_version": "0.34.0",
   "files": [
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-ready.json",
-      "sha256": "07700f1603e63dc87154bbd4b73c5ad14399ec7ac70cfb02b930b29ac2a41c2f",
+      "sha256": "681c59a44b0a29c8d94089e48c4112236f688eae9fe62b6258de82f0dd87cf1f",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-unavailable.json",
-      "sha256": "b5010b5ead7e216397f9e0a0ca74148037d7d20627154260d6aa2080dc7af050",
+      "sha256": "9df5a4055e674d5d4a4dd6a85f24533074877fa5a7ac421b909b241b9c9c2f04",
       "state": null
     },
     {
@@ -76,7 +76,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "14ee67ee4303b9b4e7b96795349be217d11af0dee7adf642689aab2a32c8ff86",
+      "sha256": "1263976f91c8d4bf49de3cb48eaf8102f49ae82d6785e6b98eb6af463e81b639",
       "state": "empty"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "07700f1603e63dc87154bbd4b73c5ad14399ec7ac70cfb02b930b29ac2a41c2f",
+      "sha256": "681c59a44b0a29c8d94089e48c4112236f688eae9fe62b6258de82f0dd87cf1f",
       "state": "success"
     },
     {
@@ -655,6 +655,20 @@
     },
     {
       "capability": null,
+      "model": "PipelineStatusResponse",
+      "path": "pipeline-status/empty.json",
+      "sha256": "83d7f270600b4f8a6cea2b19397ad6a56e53ff9ddc38c49cde1ecb1253085993",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "PipelineStatusResponse",
+      "path": "pipeline-status/success.json",
+      "sha256": "7ca19865d07d0fc517153951bb17d5e8eee8174f3d2942787e60714d828d0d7a",
+      "state": null
+    },
+    {
+      "capability": null,
       "model": null,
       "path": "retry-policy.json",
       "sha256": "4813329e280836f088087a6b0d82be66beb7da5caf7f675441ea6e2de18910e8",
@@ -882,6 +896,48 @@
       "model": "NotApplicableExample",
       "path": "schemas/NotApplicableExample.schema.json",
       "sha256": "4e69aa485c3297cd037885a6a8aeadf4d862eac27619bccef3aee4f66702f421",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "PipelineDocumentStatus",
+      "path": "schemas/PipelineDocumentStatus.schema.json",
+      "sha256": "79bb32eed6e9f618e4ceb03db2301d8f43396979123ef008e275aa091da0b7e5",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "PipelineFolderStatus",
+      "path": "schemas/PipelineFolderStatus.schema.json",
+      "sha256": "9c9d4d85d1b86b68a02afd42bbeb4d9dc5bd3d9324c6f956114015ffe67e9e6f",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "PipelineJobSummary",
+      "path": "schemas/PipelineJobSummary.schema.json",
+      "sha256": "ed1a8279e277e60d21ae66012524faa01457f4dbb7f0d2e335c5e3be6c8486ef",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "PipelineStageRecord",
+      "path": "schemas/PipelineStageRecord.schema.json",
+      "sha256": "d3edf535425ef030fdd9b444c20b0a3727bab864218434a81546eccbfa6d83e0",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "PipelineStatusQuery",
+      "path": "schemas/PipelineStatusQuery.schema.json",
+      "sha256": "698a397f245f0a4f3a49382ff9a0e513f34991174d250f97ca1ce322516d1992",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "PipelineStatusResponse",
+      "path": "schemas/PipelineStatusResponse.schema.json",
+      "sha256": "a64feb642070a2861c227d6688f81cd6b3bd75e38fc03f32c16c65c8b3d4b15a",
       "state": null
     },
     {

@@ -13,6 +13,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Final
 
 from creek._fslock import VaultLockTimeoutError
+from creek.audit.stage_log import PassStage
 from creek.classify.classify_engine import (
     LLM_PROVIDER_UNAVAILABLE_REASON,
     LLMProviderUnavailableError,
@@ -44,6 +45,7 @@ from creek_mcp.provenance import (
     request_key_inference_source,
     stage_inference_source,
 )
+from creek_mcp.stage_recording import record_pass, utc_now
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
 if TYPE_CHECKING:
@@ -63,6 +65,12 @@ answers it ``503 temporarily_unavailable`` (#2097).
 logger = logging.getLogger(__name__)
 
 _VALID_METHODS = ("rules", "llm")
+
+_CLASSIFY_STAGES: Final[tuple[PassStage, ...]] = (
+    PassStage.CLASSIFIED,
+    PassStage.PRAXIS_SCANNED,
+)
+"""The stages one classify pass constitutes, in the order they are logged."""
 _UNPINNED_DETAIL = (
     "only the pinned local model may classify while a model package is "
     "configured or the server runs in container mode"
@@ -233,7 +241,7 @@ def _rules_fallback(
         ``fallback_reason`` on success; a rules refusal (a busy vault)
         is returned unmarked, since nothing fell back.
     """
-    result = classify_tool(
+    result = _classify_pass(
         vault_path=vault_path,
         method="rules",
         force=force,
@@ -287,6 +295,62 @@ def _classifiable_config(
 
 
 def classify_tool(
+    *,
+    vault_path: Path,
+    method: str = "rules",
+    force: bool = False,
+    retier: bool = False,
+    privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    consumer: str = "unknown",
+    request_key: RequestKey | None = None,
+    fallback_to_rules: bool = False,
+) -> dict[str, Any]:
+    """Run one classify pass and record it in the stage log (#2124).
+
+    The pass itself is :func:`_classify_pass`, whose docstring states every
+    argument, refusal and return key. This wrapper only appends the
+    ``classified`` and ``praxis_scanned`` stages — the praxis keyword verdict and
+    the ``04-Praxis`` page post-pass (#2122) both run inside classify, and a
+    page-write error joins the pass's ``errors`` — with the outcome the
+    caller is about to be told, so ``GET /v1/pipeline/status`` reads what ran
+    rather than inferring it. An unknown method records nothing.
+
+    Args:
+        vault_path: Vault root to classify.
+        method: ``"rules"`` or ``"llm"``.
+        force: Overwrite ``classification_method: manual`` decisions.
+        retier: Re-derive concrete tiers, escalate-only.
+        privacy_tier_ceiling: Recorded for the audit trail.
+        consumer: Who is calling, for the audit trail.
+        request_key: A writer's request-scoped key, or ``None``.
+        fallback_to_rules: Run ``rules`` when no ``llm`` classifier is
+            available.
+
+    Returns:
+        :func:`_classify_pass`'s result, unchanged.
+    """
+    started_at = utc_now()
+    result = _classify_pass(
+        vault_path=vault_path,
+        method=method,
+        force=force,
+        retier=retier,
+        privacy_tier_ceiling=privacy_tier_ceiling,
+        consumer=consumer,
+        request_key=request_key,
+        fallback_to_rules=fallback_to_rules,
+    )
+    record_pass(
+        vault_path,
+        _CLASSIFY_STAGES,
+        result,
+        started_at,
+        unrecorded_prefixes=(CONFIG_UNAVAILABLE_PREFIX,),
+    )
+    return result
+
+
+def _classify_pass(
     *,
     vault_path: Path,
     method: str = "rules",

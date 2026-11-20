@@ -91,6 +91,7 @@ import base64
 import binascii
 import shutil
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -126,6 +127,7 @@ from creek.ingest.substack_loose import (
     record_manifest,
     substack_post_identity,
 )
+from creek.ingest.upload_receipts import record_upload_receipts
 from creek.models import PrivacyTier
 from creek.vault.mutations import (
     CONTENT_MUTATION_BUSY_REASON,
@@ -1627,7 +1629,7 @@ def upload_tool(
                 ceiling=privacy_tier_ceiling,
                 reason=CONTENT_MUTATION_BUSY_REASON,
             )
-        return _admitted_upload_outcome(
+        outcome = _admitted_upload_outcome(
             vault_path=vault_path,
             audit_args=audit_args,
             external_id=external_id,
@@ -1639,3 +1641,32 @@ def upload_tool(
             timestamp=timestamp,
             run=run,
         )
+        _record_receipts(vault_path, outcome, consumer)
+        return outcome
+
+
+def _record_receipts(vault_path: Path, outcome: dict[str, Any], consumer: str) -> None:
+    """Receipt a landed upload for ``GET /v1/pipeline/status`` (#2124).
+
+    Only an upload that wrote or updated something is receipted: a refusal
+    landed nothing, and an ``unchanged`` re-send landed nothing *new*, so its
+    earlier receipt — and every stage that has run since — still stands.
+    Called under the content-mutation hold, so the receipt's instant is before
+    any classify or link pass that later takes the lock.
+
+    Args:
+        vault_path: Vault root.
+        outcome: :func:`_admitted_upload_outcome`'s return dict.
+        consumer: The authenticated caller.
+    """
+    if outcome.get("status") != "ok" or outcome.get("action") == "unchanged":
+        return
+    record_upload_receipts(
+        vault_path,
+        consumer=consumer,
+        external_id=str(outcome["external_id"]),
+        filename=str(outcome["filename"]),
+        tier=str(outcome["tier"]),
+        fragment_ids=list(outcome["affected_fragment_ids"]),
+        at=datetime.now(UTC),
+    )

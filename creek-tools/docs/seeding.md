@@ -365,6 +365,7 @@ filesystem with. It publishes exactly twenty-two routes:
 | `POST` | `/v1/classifications` |
 | `POST` | `/v1/links` |
 | `GET` | `/v1/jobs/{job_id}` |
+| `GET` | `/v1/pipeline/status` |
 | `GET` | `/v1/agent-activity` |
 | `POST` | `/v1/reading-recommendations` |
 | `GET` | `/v1/export` |
@@ -372,7 +373,7 @@ filesystem with. It publishes exactly twenty-two routes:
 
 <!-- /capability-set -->
 
-Two of those twenty-two were observed writing a fragment into `01-Fragments/`
+Two of those twenty-three were observed writing a fragment into `01-Fragments/`
 here — `POST /v1/uploads` and `PUT /v1/journal-entries/{external_id}`:
 
 ```console

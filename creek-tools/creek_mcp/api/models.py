@@ -105,6 +105,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.33",
     "0.32",
     "0.31",
     "0.30",
@@ -3445,6 +3446,270 @@ class ExportResponse(_WireModel):
     )
 
 
+# --------------------------------------------------------------------------
+# Pipeline status (#2124)
+# --------------------------------------------------------------------------
+
+PIPELINE_STATUS_SINCE_MINOR: Final[str] = "0.34"
+"""First minor that serves ``GET /v1/pipeline/status`` (#2124).
+
+The route joins the ``pipeline`` capability, which was published at
+:data:`_PIPELINE_MINOR`, so the capability gate alone would serve it to a
+caller pinned to a minor that never documented it. The route therefore
+declares this minor of its own (:attr:`creek_mcp.api.routes.RouteSpec.since_minor`)
+and a caller below it is refused ``incompatible_version``, as for any route
+that predates the caller's vendored contract. It is a literal for the reason
+:data:`_UPLOAD_MINOR` is.
+"""
+
+PIPELINE_STATUS_DEFAULT_LIMIT: Final[int] = 50
+"""How many documents ``GET /v1/pipeline/status`` returns when ``limit`` is absent."""
+
+PIPELINE_STATUS_MAX_LIMIT: Final[int] = 200
+"""The most documents one status read returns; larger values are clamped."""
+
+PIPELINE_STATUS_MAX_JOBS: Final[int] = 10
+"""The most durable jobs one status read lists, newest first."""
+
+_MAX_FOLDER_PATH_CHARS: Final[int] = 128
+"""Upper bound on a folder path: the deepest scaffold folder is far shorter."""
+
+_MAX_FRAGMENT_PATH_CHARS: Final[int] = 1024
+"""Upper bound on a vault-relative fragment path."""
+
+_MAX_PIPELINE_FOLDERS: Final[int] = 256
+"""Upper bound on the folder list: the scaffold holds a few dozen folders."""
+
+FOLDER_PATH_PATTERN: Final[str] = r"^(?:0[1-9]|1[01])-[A-Za-z-]+(?:/[A-Za-z0-9-]+)*$"
+"""A scaffolded ontology folder: a numbered root and plain segments, no dots."""
+
+FOLDER_WRITER_PATTERN: Final[str] = r"^[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+)*$"
+"""A writer name: a dotted lower-case subsystem name, never prose."""
+
+FRAGMENT_PATH_PATTERN: Final[str] = (
+    r"^01-Fragments/(?:[^/\x00-\x1f]+/)*[^/\x00-\x1f]+\.md$"
+)
+"""A fragment's vault-relative path: under ``01-Fragments``, a ``.md`` file."""
+
+
+class PipelineStage(StrEnum):
+    """A stage a document can have been through, in pipeline order.
+
+    Attributes:
+        INGESTED: The upload landed as one or more fragments.
+        CLASSIFIED: A classify pass ran over the vault after it landed.
+        PRAXIS_SCANNED: The praxis passes ran (inside classify): the keyword
+            verdict, then the ``04-Praxis`` page post-pass.
+        LINKED_EMBEDDINGS: The ``embeddings`` linker stage ran after it landed.
+        LINKED_TEMPORAL: The ``temporal`` linker stage ran after it landed.
+        LINKED_EDDIES: The ``eddies`` linker stage ran after it landed.
+        LINKED_THREADS: The ``threads`` linker stage ran after it landed.
+    """
+
+    INGESTED = "ingested"
+    CLASSIFIED = "classified"
+    PRAXIS_SCANNED = "praxis_scanned"
+    LINKED_EMBEDDINGS = "linked:embeddings"
+    LINKED_TEMPORAL = "linked:temporal"
+    LINKED_EDDIES = "linked:eddies"
+    LINKED_THREADS = "linked:threads"
+
+
+class PipelineStageOutcome(StrEnum):
+    """How the pass behind one stage row ended.
+
+    Attributes:
+        OK: Completed with nothing left over.
+        PARTIAL: Completed, but left work a retry of the same stage picks up.
+        FAILED: Refused before it did its work; no later pass has succeeded.
+    """
+
+    OK = "ok"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
+class FolderWriterlessReason(StrEnum):
+    """Why a scaffolded folder has no writer, so an empty one says why.
+
+    Attributes:
+        CONTAINER: A grouping folder; notes are filed into its subfolders.
+        OWNER_CURATED: Material the owner places by hand; no stage writes it.
+        INDEXED_AT_PARENT: The stage covering this topic files one index in
+            the parent folder instead.
+        TEMPLATE_EXAMPLE: A scaffold example of a layout, never filled.
+    """
+
+    CONTAINER = "container"
+    OWNER_CURATED = "owner_curated"
+    INDEXED_AT_PARENT = "indexed_at_parent"
+    TEMPLATE_EXAMPLE = "template_example"
+
+
+class PipelineStatusQuery(_WireModel):
+    """The query string ``GET /v1/pipeline/status`` accepts, and nothing else.
+
+    Attributes:
+        limit: The most documents wanted, most recently landed first. Values
+            above :data:`PIPELINE_STATUS_MAX_LIMIT` are clamped to it.
+    """
+
+    limit: int = Field(
+        default=PIPELINE_STATUS_DEFAULT_LIMIT,
+        ge=1,
+        description=(
+            "Most documents to return, most recent first; values above "
+            f"{PIPELINE_STATUS_MAX_LIMIT} are clamped to {PIPELINE_STATUS_MAX_LIMIT}."
+        ),
+    )
+
+
+class PipelineFolderStatus(_WireModel):
+    """One scaffolded ontology folder: how much it holds, and what fills it.
+
+    Attributes:
+        path: The vault-relative folder path.
+        count: Notes attributed to this folder, every tier counted. A note
+            counts toward the deepest scaffolded folder holding it, so a nested
+            scaffolded folder is never counted twice.
+        last_written_at: The newest such note's modification time, or ``None``
+            when the folder holds none.
+        writer: The subsystem that writes here, or ``None``.
+        writer_reason: Why nothing writes here, or ``None`` when ``writer``
+            is set. Exactly one of the two is non-null.
+    """
+
+    path: str = Field(
+        max_length=_MAX_FOLDER_PATH_CHARS,
+        pattern=FOLDER_PATH_PATTERN,
+        description="Vault-relative folder path.",
+    )
+    count: int = Field(ge=_MIN_COUNT, description="Notes held, every tier counted.")
+    last_written_at: AwareDatetime | None = Field(
+        description="Newest note's modification time, UTC; null when empty.",
+    )
+    writer: str | None = Field(
+        pattern=FOLDER_WRITER_PATTERN,
+        description="The subsystem that writes here; null when none does.",
+    )
+    writer_reason: FolderWriterlessReason | None = Field(
+        description="Why nothing writes here; null when writer is set.",
+    )
+
+
+class PipelineStageRecord(_WireModel):
+    """One stage a document has been through.
+
+    Attributes:
+        stage: Which stage.
+        at: When it finished (for ``ingested``, when the upload landed).
+        outcome: How it ended.
+    """
+
+    stage: PipelineStage = Field(description="Which stage.")
+    at: AwareDatetime = Field(description="When the stage finished, UTC.")
+    outcome: PipelineStageOutcome = Field(description="How the stage ended.")
+
+
+class PipelineDocumentStatus(_WireModel):
+    """One document this caller uploaded, and the stages it has been through.
+
+    Attributes:
+        external_id: The caller's own idempotency key for the upload.
+        filename: The filename the caller sent.
+        fragment_path: The first fragment's vault-relative path. Nullable in
+            the schema, but a document with an unresolvable fragment is
+            withheld (its tier cannot be proven), so a listed one names it.
+        fragment_count: How many fragments the upload produced.
+        stages: ``ingested`` first, then each later stage that has covered the
+            document, in pipeline order. A stage not yet run is absent.
+    """
+
+    external_id: str = Field(
+        min_length=1,
+        max_length=MAX_EXTERNAL_ID_CHARS,
+        description="The caller's idempotency key for the upload.",
+    )
+    filename: str = Field(
+        min_length=1,
+        max_length=MAX_FILENAME_CHARS,
+        description="The filename the caller sent.",
+    )
+    fragment_path: str | None = Field(
+        max_length=_MAX_FRAGMENT_PATH_CHARS,
+        pattern=FRAGMENT_PATH_PATTERN,
+        description="The first fragment's vault-relative path; null when gone.",
+    )
+    fragment_count: int = Field(ge=1, description="Fragments the upload produced.")
+    stages: list[PipelineStageRecord] = Field(
+        min_length=1,
+        max_length=len(PipelineStage),
+        description="Stages the document has been through, in pipeline order.",
+    )
+
+
+class PipelineJobSummary(_WireModel):
+    """One of this caller's durable pipeline jobs, counts-free.
+
+    Attributes:
+        job_id: The job's opaque id, as ``GET /v1/jobs/{job_id}`` takes it.
+        kind: ``classification`` or ``link``.
+        method: The method the job runs.
+        state: Its lifecycle state, read without side effects: a queued or
+            running job no live worker owns reads ``failed``, as
+            ``GET /v1/jobs/{job_id}`` would record it.
+        failure_code: Why a failed job failed, when the caller can remedy it.
+        updated_at: When the job record last changed.
+    """
+
+    job_id: JobId = Field(description="Opaque server-generated job identifier.")
+    kind: Literal["classification", "link"] = Field(description="What the job runs.")
+    method: ClassificationMethod | LinkMethod = Field(description="The job's method.")
+    state: JobState = Field(description="Current lifecycle state.")
+    failure_code: JobFailureCode | None = Field(
+        description="Why a failed job failed, when remediable; null otherwise.",
+    )
+    updated_at: AwareDatetime = Field(description="When the record last changed.")
+
+
+class PipelineStatusResponse(_WireModel):
+    """What the pipeline has done: per folder, per document, per job.
+
+    Read-only: computing it triggers no stage and writes nothing.
+
+    Attributes:
+        status: Always ``"ok"``.
+        tier_ceiling: The caller's declared ceiling.
+        folders: Every scaffolded ontology folder, in path order, including
+            empty and writerless ones.
+        documents: This caller's most recently landed uploads, newest first,
+            at most the requested ``limit``. A document with any fragment above
+            the ceiling is withheld, never named.
+        documents_withheld: How many of the requested documents were withheld
+            for the ceiling. Counted so a short page is not read as complete.
+        jobs: This caller's most recent durable pipeline jobs, newest first.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Caller's declared ceiling.")
+    folders: list[PipelineFolderStatus] = Field(
+        max_length=_MAX_PIPELINE_FOLDERS,
+        description="Every scaffolded ontology folder, in path order.",
+    )
+    documents: list[PipelineDocumentStatus] = Field(
+        max_length=PIPELINE_STATUS_MAX_LIMIT,
+        description="This caller's most recent uploads, newest first.",
+    )
+    documents_withheld: int = Field(
+        ge=_MIN_COUNT,
+        description="Requested documents withheld because of the ceiling.",
+    )
+    jobs: list[PipelineJobSummary] = Field(
+        max_length=PIPELINE_STATUS_MAX_JOBS,
+        description="This caller's most recent durable pipeline jobs.",
+    )
+
+
 class NotApplicableExample(_WireModel):
     """Marks a fixture-matrix cell that has no response shape to document.
 
@@ -3514,6 +3779,12 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "LinkRequest": LinkRequest,
     "LinkResponse": LinkResponse,
     "NotApplicableExample": NotApplicableExample,
+    "PipelineDocumentStatus": PipelineDocumentStatus,
+    "PipelineFolderStatus": PipelineFolderStatus,
+    "PipelineJobSummary": PipelineJobSummary,
+    "PipelineStageRecord": PipelineStageRecord,
+    "PipelineStatusQuery": PipelineStatusQuery,
+    "PipelineStatusResponse": PipelineStatusResponse,
     "ReflectionNote": ReflectionNote,
     "ReflectionRequest": ReflectionRequest,
     "ReflectionResponse": ReflectionResponse,

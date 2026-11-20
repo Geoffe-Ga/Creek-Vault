@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.33.0",
+    "version": "0.34.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -2439,6 +2439,135 @@
         }
       }
     },
+    "/v1/pipeline/status": {
+      "get": {
+        "operationId": "getPipelineStatus",
+        "summary": "Report per-folder counts and each recent upload's pipeline stages.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Most documents to return, most recent first; values above 200 are clamped to 200.",
+            "schema": {
+              "default": 50,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Report per-folder counts and each recent upload's pipeline stages.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/agent-activity": {
       "get": {
         "operationId": "getAgentActivity",
@@ -3748,6 +3877,256 @@
         "title": "VoiceDraftAttribution",
         "type": "object"
       },
+      "PipelineStage": {
+        "description": "A stage a document can have been through, in pipeline order.\n\nAttributes:\n    INGESTED: The upload landed as one or more fragments.\n    CLASSIFIED: A classify pass ran over the vault after it landed.\n    PRAXIS_SCANNED: The praxis passes ran (inside classify): the keyword\n        verdict, then the ``04-Praxis`` page post-pass.\n    LINKED_EMBEDDINGS: The ``embeddings`` linker stage ran after it landed.\n    LINKED_TEMPORAL: The ``temporal`` linker stage ran after it landed.\n    LINKED_EDDIES: The ``eddies`` linker stage ran after it landed.\n    LINKED_THREADS: The ``threads`` linker stage ran after it landed.",
+        "enum": [
+          "ingested",
+          "classified",
+          "praxis_scanned",
+          "linked:embeddings",
+          "linked:temporal",
+          "linked:eddies",
+          "linked:threads"
+        ],
+        "title": "PipelineStage",
+        "type": "string"
+      },
+      "PipelineStageOutcome": {
+        "description": "How the pass behind one stage row ended.\n\nAttributes:\n    OK: Completed with nothing left over.\n    PARTIAL: Completed, but left work a retry of the same stage picks up.\n    FAILED: Refused before it did its work; no later pass has succeeded.",
+        "enum": [
+          "ok",
+          "partial",
+          "failed"
+        ],
+        "title": "PipelineStageOutcome",
+        "type": "string"
+      },
+      "PipelineStageRecord": {
+        "additionalProperties": false,
+        "description": "One stage a document has been through.\n\nAttributes:\n    stage: Which stage.\n    at: When it finished (for ``ingested``, when the upload landed).\n    outcome: How it ended.",
+        "properties": {
+          "stage": {
+            "$ref": "#/components/schemas/PipelineStage",
+            "description": "Which stage."
+          },
+          "at": {
+            "description": "When the stage finished, UTC.",
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/PipelineStageOutcome",
+            "description": "How the stage ended."
+          }
+        },
+        "required": [
+          "stage",
+          "at",
+          "outcome"
+        ],
+        "title": "PipelineStageRecord",
+        "type": "object"
+      },
+      "FolderWriterlessReason": {
+        "description": "Why a scaffolded folder has no writer, so an empty one says why.\n\nAttributes:\n    CONTAINER: A grouping folder; notes are filed into its subfolders.\n    OWNER_CURATED: Material the owner places by hand; no stage writes it.\n    INDEXED_AT_PARENT: The stage covering this topic files one index in\n        the parent folder instead.\n    TEMPLATE_EXAMPLE: A scaffold example of a layout, never filled.",
+        "enum": [
+          "container",
+          "owner_curated",
+          "indexed_at_parent",
+          "template_example"
+        ],
+        "title": "FolderWriterlessReason",
+        "type": "string"
+      },
+      "PipelineDocumentStatus": {
+        "additionalProperties": false,
+        "description": "One document this caller uploaded, and the stages it has been through.\n\nAttributes:\n    external_id: The caller's own idempotency key for the upload.\n    filename: The filename the caller sent.\n    fragment_path: The first fragment's vault-relative path. Nullable in\n        the schema, but a document with an unresolvable fragment is\n        withheld (its tier cannot be proven), so a listed one names it.\n    fragment_count: How many fragments the upload produced.\n    stages: ``ingested`` first, then each later stage that has covered the\n        document, in pipeline order. A stage not yet run is absent.",
+        "properties": {
+          "external_id": {
+            "description": "The caller's idempotency key for the upload.",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "External Id",
+            "type": "string"
+          },
+          "filename": {
+            "description": "The filename the caller sent.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Filename",
+            "type": "string"
+          },
+          "fragment_path": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "pattern": "^01-Fragments/(?:[^/\\x00-\\x1f]+/)*[^/\\x00-\\x1f]+\\.md$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The first fragment's vault-relative path; null when gone.",
+            "title": "Fragment Path"
+          },
+          "fragment_count": {
+            "description": "Fragments the upload produced.",
+            "minimum": 1,
+            "title": "Fragment Count",
+            "type": "integer"
+          },
+          "stages": {
+            "description": "Stages the document has been through, in pipeline order.",
+            "items": {
+              "$ref": "#/components/schemas/PipelineStageRecord"
+            },
+            "maxItems": 7,
+            "minItems": 1,
+            "title": "Stages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "external_id",
+          "filename",
+          "fragment_path",
+          "fragment_count",
+          "stages"
+        ],
+        "title": "PipelineDocumentStatus",
+        "type": "object"
+      },
+      "PipelineFolderStatus": {
+        "additionalProperties": false,
+        "description": "One scaffolded ontology folder: how much it holds, and what fills it.\n\nAttributes:\n    path: The vault-relative folder path.\n    count: Notes attributed to this folder, every tier counted. A note\n        counts toward the deepest scaffolded folder holding it, so a nested\n        scaffolded folder is never counted twice.\n    last_written_at: The newest such note's modification time, or ``None``\n        when the folder holds none.\n    writer: The subsystem that writes here, or ``None``.\n    writer_reason: Why nothing writes here, or ``None`` when ``writer``\n        is set. Exactly one of the two is non-null.",
+        "properties": {
+          "path": {
+            "description": "Vault-relative folder path.",
+            "maxLength": 128,
+            "pattern": "^(?:0[1-9]|1[01])-[A-Za-z-]+(?:/[A-Za-z0-9-]+)*$",
+            "title": "Path",
+            "type": "string"
+          },
+          "count": {
+            "description": "Notes held, every tier counted.",
+            "minimum": 0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "last_written_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Newest note's modification time, UTC; null when empty.",
+            "title": "Last Written At"
+          },
+          "writer": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_-]*(?:\\.[a-z0-9_-]+)*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The subsystem that writes here; null when none does.",
+            "title": "Writer"
+          },
+          "writer_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FolderWriterlessReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why nothing writes here; null when writer is set."
+          }
+        },
+        "required": [
+          "path",
+          "count",
+          "last_written_at",
+          "writer",
+          "writer_reason"
+        ],
+        "title": "PipelineFolderStatus",
+        "type": "object"
+      },
+      "PipelineJobSummary": {
+        "additionalProperties": false,
+        "description": "One of this caller's durable pipeline jobs, counts-free.\n\nAttributes:\n    job_id: The job's opaque id, as ``GET /v1/jobs/{job_id}`` takes it.\n    kind: ``classification`` or ``link``.\n    method: The method the job runs.\n    state: Its lifecycle state, read without side effects: a queued or\n        running job no live worker owns reads ``failed``, as\n        ``GET /v1/jobs/{job_id}`` would record it.\n    failure_code: Why a failed job failed, when the caller can remedy it.\n    updated_at: When the job record last changed.",
+        "properties": {
+          "job_id": {
+            "description": "Opaque server-generated job identifier.",
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "What the job runs.",
+            "enum": [
+              "classification",
+              "link"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "method": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClassificationMethod"
+              },
+              {
+                "$ref": "#/components/schemas/LinkMethod"
+              }
+            ],
+            "description": "The job's method.",
+            "title": "Method"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState",
+            "description": "Current lifecycle state."
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobFailureCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why a failed job failed, when remediable; null otherwise."
+          },
+          "updated_at": {
+            "description": "When the record last changed.",
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "kind",
+          "method",
+          "state",
+          "failure_code",
+          "updated_at"
+        ],
+        "title": "PipelineJobSummary",
+        "type": "object"
+      },
       "NoteKind": {
         "description": "The seven margin-note kinds, mirroring the reflect tool's vocabulary.\n\nKept in lock-step with :data:`creek_mcp.tools.reflect._ALLOWED_KINDS`,\nwhich is what the produced notes are actually constrained to; a wire enum\nthat drifted from it would let a legitimate note fail validation on the way\nout.\n\nAttributes:\n    FEAR: A named fear surfacing in the entry.\n    GIFT: Something the writer is giving or has been given.\n    LONGING: An unmet want the writing circles.\n    PATTERN: A recurrence the writer has not named yet.\n    REFRAME: The same material seen from another angle.\n    TENSION: Two things the entry holds at once.\n    VALUE: A commitment the entry reveals.",
         "enum": [
@@ -4979,6 +5358,80 @@
           "reason"
         ],
         "title": "NotApplicableExample",
+        "type": "object"
+      },
+      "PipelineStatusQuery": {
+        "additionalProperties": false,
+        "description": "The query string ``GET /v1/pipeline/status`` accepts, and nothing else.\n\nAttributes:\n    limit: The most documents wanted, most recently landed first. Values\n        above :data:`PIPELINE_STATUS_MAX_LIMIT` are clamped to it.",
+        "properties": {
+          "limit": {
+            "default": 50,
+            "description": "Most documents to return, most recent first; values above 200 are clamped to 200.",
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "PipelineStatusQuery",
+        "type": "object"
+      },
+      "PipelineStatusResponse": {
+        "additionalProperties": false,
+        "description": "What the pipeline has done: per folder, per document, per job.\n\nRead-only: computing it triggers no stage and writes nothing.\n\nAttributes:\n    status: Always ``\"ok\"``.\n    tier_ceiling: The caller's declared ceiling.\n    folders: Every scaffolded ontology folder, in path order, including\n        empty and writerless ones.\n    documents: This caller's most recently landed uploads, newest first,\n        at most the requested ``limit``. A document with any fragment above\n        the ceiling is withheld, never named.\n    documents_withheld: How many of the requested documents were withheld\n        for the ceiling. Counted so a short page is not read as complete.\n    jobs: This caller's most recent durable pipeline jobs, newest first.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Caller's declared ceiling."
+          },
+          "folders": {
+            "description": "Every scaffolded ontology folder, in path order.",
+            "items": {
+              "$ref": "#/components/schemas/PipelineFolderStatus"
+            },
+            "maxItems": 256,
+            "title": "Folders",
+            "type": "array"
+          },
+          "documents": {
+            "description": "This caller's most recent uploads, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/PipelineDocumentStatus"
+            },
+            "maxItems": 200,
+            "title": "Documents",
+            "type": "array"
+          },
+          "documents_withheld": {
+            "description": "Requested documents withheld because of the ceiling.",
+            "minimum": 0,
+            "title": "Documents Withheld",
+            "type": "integer"
+          },
+          "jobs": {
+            "description": "This caller's most recent durable pipeline jobs.",
+            "items": {
+              "$ref": "#/components/schemas/PipelineJobSummary"
+            },
+            "maxItems": 10,
+            "title": "Jobs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "folders",
+          "documents",
+          "documents_withheld",
+          "jobs"
+        ],
+        "title": "PipelineStatusResponse",
         "type": "object"
       },
       "ReflectionRequest": {

@@ -1,0 +1,112 @@
+{
+  "$defs": {
+    "PipelineStage": {
+      "description": "A stage a document can have been through, in pipeline order.\n\nAttributes:\n    INGESTED: The upload landed as one or more fragments.\n    CLASSIFIED: A classify pass ran over the vault after it landed.\n    PRAXIS_SCANNED: The praxis passes ran (inside classify): the keyword\n        verdict, then the ``04-Praxis`` page post-pass.\n    LINKED_EMBEDDINGS: The ``embeddings`` linker stage ran after it landed.\n    LINKED_TEMPORAL: The ``temporal`` linker stage ran after it landed.\n    LINKED_EDDIES: The ``eddies`` linker stage ran after it landed.\n    LINKED_THREADS: The ``threads`` linker stage ran after it landed.",
+      "enum": [
+        "ingested",
+        "classified",
+        "praxis_scanned",
+        "linked:embeddings",
+        "linked:temporal",
+        "linked:eddies",
+        "linked:threads"
+      ],
+      "title": "PipelineStage",
+      "type": "string"
+    },
+    "PipelineStageOutcome": {
+      "description": "How the pass behind one stage row ended.\n\nAttributes:\n    OK: Completed with nothing left over.\n    PARTIAL: Completed, but left work a retry of the same stage picks up.\n    FAILED: Refused before it did its work; no later pass has succeeded.",
+      "enum": [
+        "ok",
+        "partial",
+        "failed"
+      ],
+      "title": "PipelineStageOutcome",
+      "type": "string"
+    },
+    "PipelineStageRecord": {
+      "additionalProperties": false,
+      "description": "One stage a document has been through.\n\nAttributes:\n    stage: Which stage.\n    at: When it finished (for ``ingested``, when the upload landed).\n    outcome: How it ended.",
+      "properties": {
+        "at": {
+          "description": "When the stage finished, UTC.",
+          "format": "date-time",
+          "title": "At",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/PipelineStageOutcome",
+          "description": "How the stage ended."
+        },
+        "stage": {
+          "$ref": "#/$defs/PipelineStage",
+          "description": "Which stage."
+        }
+      },
+      "required": [
+        "stage",
+        "at",
+        "outcome"
+      ],
+      "title": "PipelineStageRecord",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One document this caller uploaded, and the stages it has been through.\n\nAttributes:\n    external_id: The caller's own idempotency key for the upload.\n    filename: The filename the caller sent.\n    fragment_path: The first fragment's vault-relative path. Nullable in\n        the schema, but a document with an unresolvable fragment is\n        withheld (its tier cannot be proven), so a listed one names it.\n    fragment_count: How many fragments the upload produced.\n    stages: ``ingested`` first, then each later stage that has covered the\n        document, in pipeline order. A stage not yet run is absent.",
+  "properties": {
+    "external_id": {
+      "description": "The caller's idempotency key for the upload.",
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "External Id",
+      "type": "string"
+    },
+    "filename": {
+      "description": "The filename the caller sent.",
+      "maxLength": 255,
+      "minLength": 1,
+      "title": "Filename",
+      "type": "string"
+    },
+    "fragment_count": {
+      "description": "Fragments the upload produced.",
+      "minimum": 1,
+      "title": "Fragment Count",
+      "type": "integer"
+    },
+    "fragment_path": {
+      "anyOf": [
+        {
+          "maxLength": 1024,
+          "pattern": "^01-Fragments/(?:[^/\\x00-\\x1f]+/)*[^/\\x00-\\x1f]+\\.md$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The first fragment's vault-relative path; null when gone.",
+      "title": "Fragment Path"
+    },
+    "stages": {
+      "description": "Stages the document has been through, in pipeline order.",
+      "items": {
+        "$ref": "#/$defs/PipelineStageRecord"
+      },
+      "maxItems": 7,
+      "minItems": 1,
+      "title": "Stages",
+      "type": "array"
+    }
+  },
+  "required": [
+    "external_id",
+    "filename",
+    "fragment_path",
+    "fragment_count",
+    "stages"
+  ],
+  "title": "PipelineDocumentStatus",
+  "type": "object"
+}

@@ -1,0 +1,53 @@
+{
+  "$defs": {
+    "PipelineStage": {
+      "description": "A stage a document can have been through, in pipeline order.\n\nAttributes:\n    INGESTED: The upload landed as one or more fragments.\n    CLASSIFIED: A classify pass ran over the vault after it landed.\n    PRAXIS_SCANNED: The praxis passes ran (inside classify): the keyword\n        verdict, then the ``04-Praxis`` page post-pass.\n    LINKED_EMBEDDINGS: The ``embeddings`` linker stage ran after it landed.\n    LINKED_TEMPORAL: The ``temporal`` linker stage ran after it landed.\n    LINKED_EDDIES: The ``eddies`` linker stage ran after it landed.\n    LINKED_THREADS: The ``threads`` linker stage ran after it landed.",
+      "enum": [
+        "ingested",
+        "classified",
+        "praxis_scanned",
+        "linked:embeddings",
+        "linked:temporal",
+        "linked:eddies",
+        "linked:threads"
+      ],
+      "title": "PipelineStage",
+      "type": "string"
+    },
+    "PipelineStageOutcome": {
+      "description": "How the pass behind one stage row ended.\n\nAttributes:\n    OK: Completed with nothing left over.\n    PARTIAL: Completed, but left work a retry of the same stage picks up.\n    FAILED: Refused before it did its work; no later pass has succeeded.",
+      "enum": [
+        "ok",
+        "partial",
+        "failed"
+      ],
+      "title": "PipelineStageOutcome",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One stage a document has been through.\n\nAttributes:\n    stage: Which stage.\n    at: When it finished (for ``ingested``, when the upload landed).\n    outcome: How it ended.",
+  "properties": {
+    "at": {
+      "description": "When the stage finished, UTC.",
+      "format": "date-time",
+      "title": "At",
+      "type": "string"
+    },
+    "outcome": {
+      "$ref": "#/$defs/PipelineStageOutcome",
+      "description": "How the stage ended."
+    },
+    "stage": {
+      "$ref": "#/$defs/PipelineStage",
+      "description": "Which stage."
+    }
+  },
+  "required": [
+    "stage",
+    "at",
+    "outcome"
+  ],
+  "title": "PipelineStageRecord",
+  "type": "object"
+}

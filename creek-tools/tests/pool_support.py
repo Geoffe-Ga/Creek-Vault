@@ -98,6 +98,40 @@ def _content_length(head: bytes) -> int:
     return 0
 
 
+def read_request(conn: socket.socket) -> tuple[bytes, bytes]:
+    """Read one whole HTTP request from *conn*: its header block and its body.
+
+    A listener must drain the request before it closes. ``http.client`` sends
+    the header block and the body in two ``send`` calls, so one ``recv`` can
+    return the headers alone; closing a socket whose receive queue still holds
+    unread bytes makes the kernel send a TCP ``RST`` instead of a ``FIN``
+    (RFC 2525 section 2.17), which discards whatever response bytes had not yet
+    reached the client and fails its read with ``ECONNRESET``.
+
+    Args:
+        conn: An accepted connection.
+
+    Returns:
+        The header block (without the blank line) and the body its
+        ``Content-Length`` declared, short only if the client hung up early.
+    """
+    conn.settimeout(_DRAIN_TIMEOUT)
+    buffer = b""
+    while _SEPARATOR not in buffer:
+        chunk = _recv(conn)
+        if not chunk:
+            return buffer, b""
+        buffer += chunk
+    head, _, body = buffer.partition(_SEPARATOR)
+    declared = _content_length(head)
+    while len(body) < declared:
+        chunk = _recv(conn)
+        if not chunk:
+            break
+        body += chunk
+    return head, body
+
+
 def pinned_identity_digest(model_name: str = PINNED_MODEL) -> str:
     """Return the manifest digest a matching fake pool would imply.
 
@@ -348,20 +382,7 @@ class FakePool:
 
     def _drain(self, conn: socket.socket) -> bytes:
         """Read one whole HTTP request, and return its header block."""
-        conn.settimeout(_DRAIN_TIMEOUT)
-        buffer = b""
-        while _SEPARATOR not in buffer:
-            chunk = _recv(conn)
-            if not chunk:
-                return buffer
-            buffer += chunk
-        head, _, body = buffer.partition(_SEPARATOR)
-        declared = _content_length(head)
-        while len(body) < declared:
-            chunk = _recv(conn)
-            if not chunk:
-                break
-            body += chunk
+        head, body = read_request(conn)
         self._record_body(body)
         return head
 
