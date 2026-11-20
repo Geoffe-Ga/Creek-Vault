@@ -17,14 +17,17 @@ promises:
 from __future__ import annotations
 
 import base64
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
+import frontmatter
 import pytest
 
 from creek.audit.stage_log import PassStage, StageOutcome, record_stage_run
 from creek.vault.folder_writers import ONTOLOGY_FOLDERS
+from creek.vault.writer import VaultWriter
 from creek_mcp import pipeline_status
 from creek_mcp.api.models import (
     PIPELINE_STATUS_MAX_LIMIT,
@@ -393,15 +396,74 @@ def test_no_body_or_title_crosses_the_wire(vault: Path) -> None:
     assert _TITLE not in response.text
 
 
-def test_a_purged_fragment_leaves_its_document_without_a_path(vault: Path) -> None:
-    """A fragment no longer live reads ``fragment_path: null``, still listed."""
+def _withheld_at_open(test_client: TestClient) -> dict[str, Any]:
+    """Read the status at an ``open`` ceiling and return the body."""
+    response = test_client.get(PIPELINE_STATUS_PATH, headers=headers())
+    assert response.status_code == _OK, response.text
+    return envelope(response)
+
+
+def test_a_tombed_fragment_withholds_its_document(vault: Path) -> None:
+    """A fragment moved out of ``01-Fragments`` fails closed, never drops out.
+
+    ``VaultWriter.tomb_fragment`` relocates a vanished unit's fragment into
+    ``10-Liminal/Orphaned``, beyond the walk that resolves ids. Its tier can
+    no longer be read there, so it counts as ``intimate``: the document is
+    withheld from a lower ceiling and counted, never listed (#2136 review).
+    """
+    with client(vault_path=vault) as test_client:
+        _upload(test_client, "up-1")
+        path = _status(test_client)["documents"][0]["fragment_path"]
+        fragment_id = str(frontmatter.load(str(vault / path)).metadata["id"])
+        assert VaultWriter(vault).tomb_fragment(fragment_id) is not None
+        body = _withheld_at_open(test_client)
+
+    assert body["documents"] == []
+    assert body["documents_withheld"] == 1
+
+
+def test_a_missing_fragment_withholds_its_document(vault: Path) -> None:
+    """A fragment that is simply gone is unprovable, so it is withheld."""
     with client(vault_path=vault) as test_client:
         _upload(test_client, "up-1")
         path = _status(test_client)["documents"][0]["fragment_path"]
         (vault / path).unlink()
-        body = _status(test_client)
+        body = _withheld_at_open(test_client)
 
-    assert body["documents"][0]["fragment_path"] is None
+    assert body["documents"] == []
+    assert body["documents_withheld"] == 1
+
+
+@pytest.mark.parametrize("filename", ["../../outside.md", "sub/inner.md", ".."])
+def test_a_corrupted_index_filename_is_skipped_and_fails_closed(
+    vault: Path, filename: str
+) -> None:
+    """An index entry naming a path outside its directory is never followed.
+
+    The newest mapping wins in ``.id-index.jsonl``, so a hand-corrupted line
+    redirects the id. Following it could leave the vault or put a path the
+    wire pattern rejects into the body (an uncaught ``500``); instead the
+    entry is skipped, the fragment is unresolved, and the document is
+    withheld like any unprovable one.
+    """
+    (vault / "outside.md").write_text(
+        "---\nid: x\nprivacy_tier: open\n---\nbody\n", encoding="utf-8"
+    )
+    inner = vault / "01-Fragments" / "Notes" / "sub"
+    inner.mkdir(parents=True)
+    (inner / "inner.md").write_text("x", encoding="utf-8")
+    with client(vault_path=vault) as test_client:
+        _upload(test_client, "up-1")
+        path = _status(test_client)["documents"][0]["fragment_path"]
+        fragment = vault / path
+        fragment_id = str(frontmatter.load(str(fragment)).metadata["id"])
+        index = fragment.parent / ".id-index.jsonl"
+        with index.open("a", encoding="utf-8") as handle:
+            handle.write("\n" + json.dumps({"id": fragment_id, "filename": filename}))
+        body = _withheld_at_open(test_client)
+
+    assert body["documents"] == []
+    assert body["documents_withheld"] == 1
 
 
 # --------------------------------------------------------------------------- #

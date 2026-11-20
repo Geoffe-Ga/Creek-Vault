@@ -902,7 +902,7 @@
       "capability": null,
       "model": "PipelineDocumentStatus",
       "path": "schemas/PipelineDocumentStatus.schema.json",
-      "sha256": "ed10f07e28729822b2f546d198a9ce320f4655228b89c8d4fb910cf7277ead81",
+      "sha256": "79bb32eed6e9f618e4ceb03db2301d8f43396979123ef008e275aa091da0b7e5",
       "state": null
     },
     {
@@ -937,7 +937,7 @@
       "capability": null,
       "model": "PipelineStatusResponse",
       "path": "schemas/PipelineStatusResponse.schema.json",
-      "sha256": "b09558453bfaff6cc833314aaa4166eb049fb3f6995a0ae2f73c7ee77ee69f62",
+      "sha256": "a64feb642070a2861c227d6688f81cd6b3bd75e38fc03f32c16c65c8b3d4b15a",
       "state": null
     },
     {

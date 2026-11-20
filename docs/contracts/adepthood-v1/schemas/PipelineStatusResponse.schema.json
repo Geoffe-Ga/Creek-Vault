@@ -53,7 +53,7 @@
     },
     "PipelineDocumentStatus": {
       "additionalProperties": false,
-      "description": "One document this caller uploaded, and the stages it has been through.\n\nAttributes:\n    external_id: The caller's own idempotency key for the upload.\n    filename: The filename the caller sent.\n    fragment_path: The first fragment's vault-relative path, or ``None``\n        when it is no longer live under ``01-Fragments``.\n    fragment_count: How many fragments the upload produced.\n    stages: ``ingested`` first, then each later stage that has covered the\n        document, in pipeline order. A stage not yet run is absent.",
+      "description": "One document this caller uploaded, and the stages it has been through.\n\nAttributes:\n    external_id: The caller's own idempotency key for the upload.\n    filename: The filename the caller sent.\n    fragment_path: The first fragment's vault-relative path. Nullable in\n        the schema, but a document with an unresolvable fragment is\n        withheld (its tier cannot be proven), so a listed one names it.\n    fragment_count: How many fragments the upload produced.\n    stages: ``ingested`` first, then each later stage that has covered the\n        document, in pipeline order. A stage not yet run is absent.",
       "properties": {
         "external_id": {
           "description": "The caller's idempotency key for the upload.",

@@ -22,8 +22,13 @@ cached the same way, keyed on the file's own mtime.
 **Ceiling and identity.** Counts are every tier: a number names nothing.
 Documents are this caller's own uploads only, and one whose fragments include
 any above the ceiling is withheld and counted in ``documents_withheld``. A
-fragment's tier is its on-disk ``privacy_tier``, failing closed to
-``intimate``, and never below the tier the upload declared. The body carries
+fragment's tier is its on-disk ``privacy_tier``, never below the tier the
+upload declared, and it fails closed to ``intimate`` whenever it cannot be
+proven: an unreadable header, or a fragment that cannot be resolved to a file
+under ``01-Fragments`` at all — one soft-tombed into ``10-Liminal/Orphaned``,
+one deleted, or one whose index entry names a path outside its own directory
+(#2136 review). Such a document is withheld from every remote ceiling rather
+than silently judged on its remaining fragments. The body carries
 filenames, the caller's ids and vault paths — never a title or a byte of
 content.
 
@@ -34,6 +39,7 @@ an index.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import threading
 from dataclasses import dataclass, field
@@ -49,6 +55,7 @@ from creek.vault.folder_writers import ONTOLOGY_FOLDERS
 from creek.vault.links import read_header_meta
 from creek.vault.writer import VaultWriter
 from creek_mcp.api.models import (
+    FRAGMENT_PATH_PATTERN,
     PIPELINE_STATUS_MAX_JOBS,
     FolderWriterlessReason,
     PipelineDocumentStatus,
@@ -60,6 +67,7 @@ from creek_mcp.api.models import (
     WireTierCeiling,
 )
 from creek_mcp.httpapi.jobs import recent_pipeline_jobs
+from creek_mcp.path_confinement import resolve_within_vault
 from creek_mcp.tier_ceiling import frontmatter_tier, tier_allowed, tier_sensitivity
 
 if TYPE_CHECKING:
@@ -84,6 +92,9 @@ _FRAGMENTS_ROOT: Final[str] = "01-Fragments"
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
 """Nanoseconds in a second, for ``st_mtime_ns``."""
+
+_DOT_NAMES: Final[frozenset[str]] = frozenset({".", ".."})
+"""Index filenames that name a directory rather than a note."""
 
 _CACHE_MAX_ENTRIES: Final[int] = 8192
 """Bound on each cache; a full cache is cleared rather than grown."""
@@ -156,6 +167,10 @@ def _scan(path: Path) -> _DirScan | None:
         cached = _CACHES.dirs.get(path)
     if cached is not None and cached.mtime_ns == info.st_mtime_ns:
         return cached
+    # Listed outside the lock on purpose: two threads missing at once both
+    # list the directory and store equal results. Wasted work, never a wrong
+    # answer — holding the lock across a directory listing would serialise
+    # every status read instead.
     scanned = _listed(path, info.st_mtime_ns)
     _remember(_CACHES.dirs, path, scanned)
     return scanned
@@ -267,6 +282,40 @@ def _fragment_dirs(vault: Path) -> Iterator[Path]:
         yield Path(root)
 
 
+def _contained_note(vault: Path, directory: Path, filename: str) -> Path | None:
+    """Return *directory*/*filename* when it is a plain note inside the vault.
+
+    An index entry is a hint, and a hand-corrupted one can name ``../x.md`` or
+    ``sub/x.md``. Following it could leave the vault, or put a path into the
+    body that :data:`~creek_mcp.api.models.FRAGMENT_PATH_PATTERN` rejects —
+    an uncaught validation error, served as ``500``. So the entry must be a
+    bare name in its own directory, the vault-relative path must match the
+    published pattern, the file must be a regular non-link file, and its
+    resolved location must stay inside the vault
+    (:func:`~creek_mcp.path_confinement.resolve_within_vault`). Anything else
+    is skipped, which leaves the id unresolved and therefore fail-closed.
+
+    Args:
+        vault: Vault root.
+        directory: The ``01-Fragments`` directory whose index named it.
+        filename: The index entry's filename.
+
+    Returns:
+        The note's path, or ``None`` when the entry cannot be trusted.
+    """
+    candidate = directory / filename
+    if Path(filename).name != filename or filename in _DOT_NAMES:
+        return None
+    relative = candidate.relative_to(vault).as_posix()
+    if re.fullmatch(FRAGMENT_PATH_PATTERN, relative) is None:
+        return None
+    if candidate.is_symlink() or not candidate.is_file():
+        return None
+    if resolve_within_vault(vault, relative) is None:
+        return None
+    return candidate
+
+
 def _fragment_paths(vault: Path, wanted: AbstractSet[str]) -> dict[str, Path]:
     """Resolve each wanted fragment id to its live file through the indexes."""
     found: dict[str, Path] = {}
@@ -274,9 +323,9 @@ def _fragment_paths(vault: Path, wanted: AbstractSet[str]) -> dict[str, Path]:
         for fragment_id, filename in VaultWriter.read_index(directory).items():
             if fragment_id not in wanted or fragment_id in found:
                 continue
-            candidate = directory / filename
-            if candidate.is_file() and not candidate.is_symlink():
-                found[fragment_id] = candidate
+            note = _contained_note(vault, directory, filename)
+            if note is not None:
+                found[fragment_id] = note
         if len(found) == len(wanted):
             break
     return found
@@ -300,9 +349,17 @@ def _tier_of(path: Path) -> PrivacyTier:
 def _admitted(
     document: _Document, paths: dict[str, Path], ceiling: TierCeiling
 ) -> bool:
-    """Return whether every fragment of *document* is within *ceiling*."""
+    """Return whether every fragment of *document* is within *ceiling*.
+
+    A fragment that did not resolve to a file counts as ``intimate``: its tier
+    cannot be read, and leaving it out would judge the document on the
+    fragments that happened to survive (#2136 review).
+    """
     tiers = [document.declared]
-    tiers.extend(_tier_of(paths[f]) for f in document.fragment_ids if f in paths)
+    tiers.extend(
+        _tier_of(paths[f]) if f in paths else PrivacyTier.INTIMATE
+        for f in document.fragment_ids
+    )
     strictest = max(tiers, key=tier_sensitivity)
     return tier_allowed(strictest, ceiling)
 

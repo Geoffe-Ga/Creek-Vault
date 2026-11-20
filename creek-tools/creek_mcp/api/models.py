@@ -3617,8 +3617,9 @@ class PipelineDocumentStatus(_WireModel):
     Attributes:
         external_id: The caller's own idempotency key for the upload.
         filename: The filename the caller sent.
-        fragment_path: The first fragment's vault-relative path, or ``None``
-            when it is no longer live under ``01-Fragments``.
+        fragment_path: The first fragment's vault-relative path. Nullable in
+            the schema, but a document with an unresolvable fragment is
+            withheld (its tier cannot be proven), so a listed one names it.
         fragment_count: How many fragments the upload produced.
         stages: ``ingested`` first, then each later stage that has covered the
             document, in pipeline order. A stage not yet run is absent.
