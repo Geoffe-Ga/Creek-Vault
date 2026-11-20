@@ -66,6 +66,11 @@ Gate ordering, all of it load-bearing and asserted from outside:
    an archive is admitted by exactly what a document is, and above the
    format gate below it, since that gate's only answer for a ``.zip`` was the
    refusal this fork replaces;
+   Just below it, a loose Substack export file (#2123): a ``posts.csv``
+   manifest is kept as metadata and answered ``status: "manifest"`` without
+   being staged, and a ``<post_id>.<slug>.html`` post with Substack's markup
+   (or listed in an admitted manifest row) is routed to the Substack ingestor
+   rather than by its extension;
 6. the unsupported-format gate — a ``.json`` conversation export, a ``.tar``
    or a legacy ``.doc`` is refused *with a remedy* rather than routed to
    ``generic`` (#1526), and it sits here, above the write, so the refused
@@ -112,6 +117,15 @@ from creek.ingest.journal_staging import (
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import derive_source_key, run_ingest
 from creek.ingest.source_unit import split_source_unit
+from creek.ingest.substack import single_post_ingestor
+from creek.ingest.substack_loose import (
+    SUBSTACK_MANIFEST_RELPATH,
+    is_substack_manifest,
+    load_manifest,
+    parse_manifest_rows,
+    record_manifest,
+    substack_post_identity,
+)
 from creek.models import PrivacyTier
 from creek.vault.mutations import (
     CONTENT_MUTATION_BUSY_REASON,
@@ -130,6 +144,7 @@ from creek_mcp.tier_ceiling import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from creek.ingest.base import Ingestor
     from creek.ingest.pipeline import IngestRunResult
 
     # The ingest runner seam — production is ``run_ingest``; tests inject a
@@ -157,6 +172,17 @@ upload was too big.
 # ``creek/vault/writer.py``'s own routing map.
 _FRAGMENT_ROUTING_DIR = Path("01-Fragments")
 
+
+MANIFEST_STATUS: Final[str] = "manifest"
+"""``status`` of an upload recognised as a Substack export manifest (#2123).
+
+Neither ``ok`` nor a refusal: the file was understood and kept, but as the
+metadata a later post upload is dated from, never as a fragment — so there is
+no ``fragment_id`` to report. See :func:`_manifest_outcome`.
+"""
+
+SUBSTACK_SOURCE_TYPE: Final[str] = "substack"
+"""The :data:`creek.ingest.INGESTOR_REGISTRY` key of a loose Substack file."""
 
 ARCHIVE_NO_FRAGMENTS_REASON: Final[str] = (
     "the archive was recognised as an export but produced no fragments"
@@ -663,6 +689,7 @@ def _ingest_outcome(
     audit_args: dict[str, Any],
     staged: Path,
     source_type: str,
+    ingestor_cls: type[Ingestor],
     upload_tier: PrivacyTier,
     ceiling: TierCeiling,
     consumer: str,
@@ -688,7 +715,10 @@ def _ingest_outcome(
         vault_path: Vault root.
         audit_args: The sanitised argument summary for the audit trail.
         staged: The staged file to ingest.
-        source_type: Registry key chosen by ``route_to_ingestor``.
+        source_type: Registry key chosen by ``route_to_ingestor``, or
+            ``substack`` for a loose Substack post (#2123).
+        ingestor_cls: The ingestor to run — the registry's class for
+            *source_type*, or a single-post Substack ingestor.
         upload_tier: The tier declared for this content.
         ceiling: The caller's admission ceiling.
         consumer: Free-form consumer id for the audit log.
@@ -702,7 +732,7 @@ def _ingest_outcome(
     runner = run if run is not None else run_ingest
     try:
         result = runner(
-            ingestor_cls=INGESTOR_REGISTRY[source_type],
+            ingestor_cls=ingestor_cls,
             source_type=source_type,
             input_path=staged,
             vault_path=vault_path,
@@ -1202,6 +1232,102 @@ def _admitted_upload_outcome(
             run=run,
         )
 
+    # The loose Substack export (#2123): a ``posts.csv`` manifest is kept as
+    # metadata and never staged, and a post is routed by its content to the
+    # Substack ingestor rather than by its extension to ``document``. Below
+    # every privacy gate above, exactly as the archive fork is.
+    if is_substack_manifest(filename, raw):
+        return _manifest_outcome(
+            vault_path=vault_path,
+            audit_args=audit_args,
+            external_id=external_id,
+            filename=filename,
+            raw=raw,
+            upload_tier=upload_tier,
+            ceiling=ceiling,
+            consumer=consumer,
+            timestamp=timestamp,
+        )
+    route = _document_route(
+        vault_path=vault_path,
+        audit_args=audit_args,
+        external_id=external_id,
+        filename=filename,
+        raw=raw,
+        upload_tier=upload_tier,
+        ceiling=ceiling,
+        consumer=consumer,
+    )
+    if isinstance(route, dict):
+        return route
+    source_type, ingestor_cls = route
+
+    staged = _stage_upload(vault_path, external_id, filename, raw)
+    result = _ingest_outcome(
+        vault_path=vault_path,
+        audit_args=audit_args,
+        staged=staged,
+        source_type=source_type,
+        ingestor_cls=ingestor_cls,
+        upload_tier=upload_tier,
+        ceiling=ceiling,
+        consumer=consumer,
+        run=run,
+    )
+    if isinstance(result, dict):
+        _discard_unreferenced(vault_path, staged)
+        return result
+    return _document_success(
+        vault_path=vault_path,
+        audit_args=audit_args,
+        staged=staged,
+        result=result,
+        external_id=external_id,
+        filename=filename,
+        timestamp=timestamp,
+        source_type=source_type,
+        upload_tier=upload_tier,
+        ceiling=ceiling,
+        consumer=consumer,
+        size_bytes=len(raw),
+    )
+
+
+def _document_route(
+    *,
+    vault_path: Path,
+    audit_args: dict[str, Any],
+    external_id: str,
+    filename: str,
+    raw: bytes,
+    upload_tier: PrivacyTier,
+    ceiling: TierCeiling,
+    consumer: str,
+) -> tuple[str, type[Ingestor]] | dict[str, Any]:
+    """Return the source type and ingestor for one document, or its refusal.
+
+    A loose Substack post (#2123) — a ``<post_id>.<slug>.html`` name with
+    Substack's markup, or listed in a manifest this tier may read — goes to a
+    :func:`~creek.ingest.substack.single_post_ingestor`. Everything else goes
+    through the unsupported-format gate (#1526) to the registry ingestor its
+    extension names.
+
+    Args:
+        vault_path: Vault root.
+        audit_args: The sanitised argument summary for the audit trail.
+        external_id: The caller's idempotency key.
+        filename: The caller's original filename.
+        raw: The decoded document bytes.
+        upload_tier: The tier declared for this content.
+        ceiling: The caller's admission ceiling.
+        consumer: Free-form consumer id for the audit log.
+
+    Returns:
+        ``(source_type, ingestor_cls)``, or the unsupported-format refusal.
+    """
+    post = substack_post_identity(filename, raw, load_manifest(vault_path), upload_tier)
+    if post is not None:
+        return SUBSTACK_SOURCE_TYPE, single_post_ingestor(post)
     # The unsupported-format gate (#1526), above the staging write: an
     # extension the ``generic`` fallback would flatten into one blob is
     # refused with a remedy, and refused before its bytes touch disk. It is
@@ -1219,23 +1345,43 @@ def _admitted_upload_outcome(
     )
     if not isinstance(routed, str):
         return routed
-    source_type = routed
+    return routed, INGESTOR_REGISTRY[routed]
 
-    staged = _stage_upload(vault_path, external_id, filename, raw)
-    result = _ingest_outcome(
-        vault_path=vault_path,
-        audit_args=audit_args,
-        staged=staged,
-        source_type=source_type,
-        upload_tier=upload_tier,
-        ceiling=ceiling,
-        consumer=consumer,
-        run=run,
-    )
-    if isinstance(result, dict):
-        _discard_unreferenced(vault_path, staged)
-        return result
 
+def _document_success(
+    *,
+    vault_path: Path,
+    audit_args: dict[str, Any],
+    staged: Path,
+    result: IngestRunResult,
+    external_id: str,
+    filename: str,
+    timestamp: str | None,
+    source_type: str,
+    upload_tier: PrivacyTier,
+    ceiling: TierCeiling,
+    consumer: str,
+    size_bytes: int,
+) -> dict[str, Any]:
+    """Audit a successful single-document ingest and build its response.
+
+    Args:
+        vault_path: Vault root.
+        audit_args: The sanitised argument summary for the audit trail.
+        staged: The staged file the ingest read.
+        result: The completed run.
+        external_id: The caller's idempotency key.
+        filename: The caller's original filename.
+        timestamp: Echoed back unchanged.
+        source_type: The ingestor's registry key.
+        upload_tier: The declared tier.
+        ceiling: The caller's admission ceiling.
+        consumer: Free-form consumer id for the audit log.
+        size_bytes: The document's decoded size.
+
+    Returns:
+        :func:`upload_tool`'s success response.
+    """
     # Every fragment the staged document produced, in ledger-key order, so
     # an RTBF request answered from this audit entry reaches all of them
     # (#1305). ``fragment_id`` keeps its singular contract by naming the
@@ -1264,7 +1410,7 @@ def _admitted_upload_outcome(
         "affected_fragment_ids": affected,
         "action": _action_of(result),
         "tier": upload_tier.value,
-        "size_bytes": len(raw),
+        "size_bytes": size_bytes,
         # ``ceiling_safe_warnings``, never ``warnings``: it is the only ingest
         # advisory channel that may cross this boundary, because the operator
         # channel interpolates real vault fragment ids this caller's ceiling
@@ -1272,7 +1418,66 @@ def _admitted_upload_outcome(
         # for why that call is made at the producer (#1372). This is the
         # surface that most needs it — the collapsed-unit advisory reports
         # actual data loss and fires on the multi-sheet-workbook path.
-        "warnings": list(result.ceiling_safe_warnings),
+        "warnings": result.ceiling_safe_warnings.copy(),
+    }
+
+
+def _manifest_outcome(
+    *,
+    vault_path: Path,
+    audit_args: dict[str, Any],
+    external_id: str,
+    filename: str,
+    raw: bytes,
+    upload_tier: PrivacyTier,
+    ceiling: TierCeiling,
+    consumer: str,
+    timestamp: str | None,
+) -> dict[str, Any]:
+    """Keep a Substack ``posts.csv`` as manifest rows, never as a fragment.
+
+    The rows are merged into
+    :data:`~creek.ingest.substack_loose.SUBSTACK_MANIFEST_RELPATH` at the
+    declared tier, so a post uploaded afterwards is titled and dated from them
+    when its own tier admits them. Nothing is staged and nothing is written
+    under ``01-Fragments``; the call is audited with no affected fragment.
+
+    Args:
+        vault_path: Vault root.
+        audit_args: The sanitised argument summary for the audit trail.
+        external_id: The caller's idempotency key.
+        filename: The caller's original filename.
+        raw: The manifest's bytes.
+        upload_tier: The declared tier, stored with every row.
+        ceiling: The caller's admission ceiling.
+        consumer: Free-form consumer id for the audit log.
+        timestamp: Echoed back unchanged.
+
+    Returns:
+        The ``status: "manifest"`` response.
+    """
+    rows = parse_manifest_rows(raw)
+    record_manifest(vault_path, rows, upload_tier)
+    MCPAuditLog(vault_path).append(
+        tool=TOOL_NAME,
+        args=audit_args,
+        tier_ceiling=ceiling,
+        consumer=consumer,
+        created_path=str(SUBSTACK_MANIFEST_RELPATH),
+        created_tier=upload_tier.value,
+        affected_fragment_ids=[],
+    )
+    return {
+        "status": MANIFEST_STATUS,
+        "tool": TOOL_NAME,
+        "tier_ceiling": ceiling.value,
+        "external_id": external_id,
+        "filename": filename,
+        "timestamp": timestamp,
+        "source_type": SUBSTACK_SOURCE_TYPE,
+        "manifest_posts": len(rows),
+        "tier": upload_tier.value,
+        "size_bytes": len(raw),
     }
 
 

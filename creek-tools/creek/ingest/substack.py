@@ -32,6 +32,7 @@ from __future__ import annotations
 import csv
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -52,6 +53,7 @@ from creek.ingest.html import parse_html_to_markdown
 from creek.models import SourceKind, SourcePlatform
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -69,7 +71,10 @@ __all__ = [
     "SUBSCRIBER_CSV_SUFFIXES",
     "SUBSCRIBER_LIST_PREFIX",
     "SubstackIngestor",
+    "SubstackPost",
     "is_substack_export",
+    "parse_posts_rows",
+    "single_post_ingestor",
 ]
 
 
@@ -147,30 +152,45 @@ def _merge_optional_fields(
         frontmatter_dict["substack_post_id"] = post_id
 
 
-def _parse_posts_csv(csv_path: Path) -> dict[str, dict[str, str]]:
-    """Parse ``posts.csv`` into ``{post_id: {column: value}}``.
+def parse_posts_rows(lines: Iterable[str]) -> dict[str, dict[str, str]]:
+    """Parse ``posts.csv`` text into ``{post_id: {column: value}}``.
 
     Unknown columns are dropped (Substack's export schema drifts over
     the years). Rows without a ``post_id`` are skipped — the value is
     the join key, and a row that cannot be joined is useless to the
-    ingestor. A missing file yields an empty dict so the caller can
-    treat "no metadata" as a recoverable state.
+    ingestor.
+
+    Args:
+        lines: The CSV's lines, as an open text handle or any iterable of
+            strings :class:`csv.DictReader` accepts.
+
+    Returns:
+        The known columns of every joinable row, keyed by its ``post_id``
+        cell exactly as written.
+    """
+    metadata: dict[str, dict[str, str]] = {}
+    for row in csv.DictReader(lines):
+        post_id = (row.get("post_id") or "").strip()
+        if not post_id:
+            continue
+        metadata[post_id] = {
+            key: value
+            for key, value in row.items()
+            if key in _KNOWN_POSTS_COLUMNS and value is not None
+        }
+    return metadata
+
+
+def _parse_posts_csv(csv_path: Path) -> dict[str, dict[str, str]]:
+    """Parse the ``posts.csv`` at *csv_path* with :func:`parse_posts_rows`.
+
+    A missing file yields an empty dict so the caller can treat "no
+    metadata" as a recoverable state.
     """
     if not csv_path.is_file():
         return {}
-    metadata: dict[str, dict[str, str]] = {}
     with csv_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            post_id = (row.get("post_id") or "").strip()
-            if not post_id:
-                continue
-            metadata[post_id] = {
-                key: value
-                for key, value in row.items()
-                if key in _KNOWN_POSTS_COLUMNS and value is not None
-            }
-    return metadata
+        return parse_posts_rows(handle)
 
 
 def _is_subscriber_csv(path: Path) -> bool:
@@ -204,12 +224,25 @@ def _scrape_published_date(html_file: Path) -> str:
     return match.group(1) if match else ""
 
 
+def _derived_row(html_file: Path, post_id: str, slug: str) -> dict[str, str]:
+    """Return the ``posts.csv``-shaped row one post's own file implies.
+
+    The title is rendered from the slug and the publication date scraped from
+    the HTML's ``datePublished`` (blank when absent — never guessed).
+    """
+    return {
+        "post_id": post_id,
+        "post_date": _scrape_published_date(html_file),
+        "title": _title_from_slug(slug),
+        "subtitle": "",
+    }
+
+
 def _derive_posts_metadata(source_path: Path) -> dict[str, dict[str, str]]:
     """Synthesize ``posts.csv``-equivalent metadata from post HTML filenames.
 
-    Used when an export lacks ``posts.csv`` (#594): the title is derived from the
-    ``<post_id>.<slug>.html`` slug and the publication date is scraped from each
-    HTML's ``datePublished`` JSON-LD (blank when absent — never guessed). Shaped
+    Used when an export lacks ``posts.csv`` (#594): each row is
+    :func:`_derived_row` of a ``<post_id>.<slug>.html`` file. Shaped
     identically to :func:`_parse_posts_csv` so the parse stage is unchanged.
     """
     metadata: dict[str, dict[str, str]] = {}
@@ -220,12 +253,7 @@ def _derive_posts_metadata(source_path: Path) -> dict[str, dict[str, str]]:
         if post_id is None:
             continue
         slug = html_file.name[len(post_id) + 1 : -len(".html")]
-        metadata[post_id] = {
-            "post_id": post_id,
-            "post_date": _scrape_published_date(html_file),
-            "title": _title_from_slug(slug),
-            "subtitle": "",
-        }
+        metadata[post_id] = _derived_row(html_file, post_id, slug)
     return metadata
 
 
@@ -260,6 +288,31 @@ def _resolve_authored_at(
             if authored is not None:
                 return authored, authored
     return None, file_modified_time(file_path)
+
+
+# ---- One post, uploaded on its own (#2123) ----
+
+
+@dataclass(frozen=True, slots=True)
+class SubstackPost:
+    """The identity of one Substack post that arrived as a loose file.
+
+    A post uploaded on its own is staged under a name derived from the
+    caller's ``external_id``, so its ``<post_id>.<slug>.html`` filename — the
+    only place an export records which post it is — must travel beside the
+    bytes rather than in the staged name.
+
+    Attributes:
+        post_id: The leading numeric id from the original filename.
+        slug: The slug from the original filename, rendered into the title
+            when no manifest row names one.
+        row: The export manifest's row for this post, when one was received
+            and may be joined; ``None`` otherwise.
+    """
+
+    post_id: str
+    slug: str
+    row: dict[str, str] | None = None
 
 
 # ---- SubstackIngestor ----
@@ -333,6 +386,32 @@ class SubstackIngestor(Ingestor):
                 continue
             docs.append(self._read_html(html_file, post_id))
         return docs
+
+    def discover_post(self, file_path: Path, post: SubstackPost) -> list[RawDocument]:
+        """Read one post file whose identity is known from elsewhere (#2123).
+
+        The single-file twin of :meth:`discover`. The metadata row is the
+        file's own :func:`_derived_row` with every non-blank cell of
+        ``post.row`` laid over it, so a manifest supplies the title and date
+        it has while a blank manifest date still falls back to the HTML's own
+        ``datePublished``.
+
+        Args:
+            file_path: The post's HTML file, under any name.
+            post: The post's identity and, when available, its manifest row.
+
+        Returns:
+            One document, or none when *file_path* is not a file.
+        """
+        self._posts_metadata = {}
+        if not file_path.is_file():
+            return []
+        supplied = {
+            key: value for key, value in (post.row or {}).items() if value.strip()
+        }
+        derived = _derived_row(file_path, post.post_id, post.slug)
+        self._posts_metadata = {post.post_id: derived | supplied}
+        return [self._read_html(file_path, post.post_id)]
 
     def _read_html(self, file_path: Path, post_id: str) -> RawDocument:
         """Read one post HTML into a :class:`RawDocument`."""
@@ -410,3 +489,36 @@ class SubstackIngestor(Ingestor):
 
         _merge_optional_fields(frontmatter_dict, row, fragment.metadata.get("post_id"))
         return frontmatter_dict
+
+
+def single_post_ingestor(post: SubstackPost) -> type[SubstackIngestor]:
+    """Return a :class:`SubstackIngestor` bound to one loose post (#2123).
+
+    The ingest pipeline constructs each ingestor zero-argument from its class
+    (:func:`creek.ingest.pipeline.build_ingestor`), so a post's identity is
+    bound into a class rather than passed to an instance. Every parsing step
+    is :class:`SubstackIngestor`'s own; only discovery is narrowed to the one
+    file the pipeline is handed, via :meth:`SubstackIngestor.discover_post`.
+
+    Args:
+        post: The post's identity and optional manifest row.
+
+    Returns:
+        An ingestor class whose ``discover`` reads exactly that one post.
+    """
+
+    class SinglePostIngestor(SubstackIngestor):
+        """A :class:`SubstackIngestor` that reads one known post file."""
+
+        def discover(self, source_path: Path) -> list[RawDocument]:
+            """Read *source_path* as the bound post.
+
+            Args:
+                source_path: The staged post file.
+
+            Returns:
+                One document, or none when *source_path* is not a file.
+            """
+            return self.discover_post(source_path, post)
+
+    return SinglePostIngestor
