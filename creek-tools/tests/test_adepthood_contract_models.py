@@ -562,6 +562,37 @@ _RECOMMENDATION = {
     "benefit": "An attention practice.",
 }
 
+_PIPELINE_STAGE_PAYLOAD: dict[str, Any] = {
+    "stage": "classified",
+    "at": "2026-11-20T17:03:40Z",
+    "outcome": "ok",
+}
+_PIPELINE_FOLDER_PAYLOAD: dict[str, Any] = {
+    "path": "01-Fragments/Writing/Substack",
+    "count": 3,
+    "last_written_at": "2026-11-20T17:02:11Z",
+    "writer": "ingest",
+    "writer_reason": None,
+}
+_PIPELINE_DOCUMENT_PAYLOAD: dict[str, Any] = {
+    "external_id": "adepthood:upload:1",
+    "filename": "on-attention.html",
+    "fragment_path": "01-Fragments/Writing/Substack/on-attention.md",
+    "fragment_count": 1,
+    "stages": [
+        {"stage": "ingested", "at": "2026-11-20T17:02:11Z", "outcome": "ok"},
+        _PIPELINE_STAGE_PAYLOAD,
+    ],
+}
+_PIPELINE_JOB_PAYLOAD: dict[str, Any] = {
+    "job_id": "00000000-0000-4000-8000-000000000001",
+    "kind": "link",
+    "method": "embeddings",
+    "state": "running",
+    "failure_code": None,
+    "updated_at": "2026-11-20T17:05:30Z",
+}
+
 HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     "ReadingCandidate": _READING,
     "ReadingSource": _READING_SOURCE,
@@ -601,6 +632,28 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     "ExportFragment": EXPORT_FRAGMENT_PAYLOAD,
     "ExportQuery": {"cursor": "d-" + "0" * 64, "limit": 50},
     "ExportResponse": EXPORT_RESPONSE_PAYLOAD,
+    "PipelineDocumentStatus": _PIPELINE_DOCUMENT_PAYLOAD,
+    "PipelineFolderStatus": _PIPELINE_FOLDER_PAYLOAD,
+    "PipelineJobSummary": _PIPELINE_JOB_PAYLOAD,
+    "PipelineStageRecord": _PIPELINE_STAGE_PAYLOAD,
+    "PipelineStatusQuery": {"limit": 50},
+    "PipelineStatusResponse": {
+        "status": "ok",
+        "tier_ceiling": "personal",
+        "folders": [
+            _PIPELINE_FOLDER_PAYLOAD,
+            {
+                "path": "09-Reference/External-Sources",
+                "count": 0,
+                "last_written_at": None,
+                "writer": None,
+                "writer_reason": "owner_curated",
+            },
+        ],
+        "documents": [_PIPELINE_DOCUMENT_PAYLOAD],
+        "documents_withheld": 0,
+        "jobs": [_PIPELINE_JOB_PAYLOAD],
+    },
     JournalUpsertRequest.__name__: JOURNAL_UPSERT_REQUEST_PAYLOAD,
     JournalUpsertResponse.__name__: JOURNAL_UPSERT_RESPONSE_PAYLOAD,
     JournalWithdrawResponse.__name__: JOURNAL_WITHDRAW_RESPONSE_PAYLOAD,
@@ -2109,3 +2162,22 @@ def test_every_minor_below_the_current_one_is_still_served() -> None:
         f"missing: {sorted(expected - set(SUPPORTED_CONTRACT_MINORS))}\n"
         f"served: {list(SUPPORTED_CONTRACT_MINORS)}"
     )
+
+
+def test_every_pipeline_status_example_validates_against_its_model() -> None:
+    """The two ``pipeline-status/`` examples sit outside the matrix yet still
+    validate against ``PipelineStatusResponse`` and list every folder (#2124)."""
+    model = CONTRACT_MODELS["PipelineStatusResponse"]
+    entries = [
+        entry
+        for entry in _manifest_entries()
+        if entry["path"].startswith("pipeline-status/")
+    ]
+    assert sorted(entry["path"] for entry in entries) == [
+        "pipeline-status/empty.json",
+        "pipeline-status/success.json",
+    ]
+    for entry in entries:
+        assert entry["model"] == "PipelineStatusResponse"
+        text = (BUNDLE_ROOT / entry["path"]).read_text(encoding="utf-8")
+        assert isinstance(model.model_validate(json.loads(text)), model)

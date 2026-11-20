@@ -2648,6 +2648,7 @@ _READ_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
         "drive",
         "export",
         "generation",
+        "pipeline_status",
         "provisioning",
         "routing",
         "vault_alerts",

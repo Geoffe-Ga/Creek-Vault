@@ -25,7 +25,6 @@ import frontmatter
 import pytest
 
 from creek.ingest.substack import SubstackPost, single_post_ingestor
-from creek.ingest.upload_receipts import read_upload_receipts
 from creek.ingest.substack_loose import (
     SUBSTACK_MANIFEST_RELPATH,
     ManifestEntry,
@@ -35,6 +34,7 @@ from creek.ingest.substack_loose import (
     record_manifest,
     substack_post_identity,
 )
+from creek.ingest.upload_receipts import read_upload_receipts
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling

@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from creek_mcp.api.models import (
+    PIPELINE_STATUS_SINCE_MINOR,
     AgentActivityQuery,
     AgentActivityResponse,
     CapabilitiesResponse,
@@ -54,6 +55,8 @@ from creek_mcp.api.models import (
     LetterResponse,
     LinkRequest,
     LinkResponse,
+    PipelineStatusQuery,
+    PipelineStatusResponse,
     ReflectionRequest,
     ReflectionResponse,
     UploadManifestResponse,
@@ -183,6 +186,9 @@ OP_LINK: Final[str] = "createLink"
 
 OP_JOB_STATUS: Final[str] = "getPipelineJob"
 """``operation_id`` of ``GET /v1/jobs/{job_id}``."""
+
+OP_PIPELINE_STATUS: Final[str] = "getPipelineStatus"
+"""``operation_id`` of ``GET /v1/pipeline/status``."""
 
 OP_AGENT_ACTIVITY: Final[str] = "getAgentActivity"
 """``operation_id`` of ``GET /v1/agent-activity``."""
@@ -342,6 +348,11 @@ class RouteSpec:
             document states and the bounds the handler validates are one
             declaration; the OpenAPI generator publishes one ``in: query``
             parameter per field.
+        since_minor: The first contract minor that serves this route, or
+            ``None`` when it is served from its capability's own minor
+            (#2124). Set when a route joins a capability published earlier:
+            the capability gate alone would serve it to a caller whose
+            vendored contract never documented it.
     """
 
     path: str
@@ -356,6 +367,7 @@ class RouteSpec:
     success_responses: tuple[tuple[int, type[BaseModel] | None], ...] | None = None
     accepts_request_key: bool = False
     query_model: type[BaseModel] | None = None
+    since_minor: str | None = None
 
     @property
     def published_success_responses(
@@ -642,6 +654,18 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         response_model=JobStatusResponse,
         requires_contract_version=True,
         summary="Report one durable pipeline job's counts-only state.",
+    ),
+    RouteSpec(
+        path="/v1/pipeline/status",
+        method="GET",
+        operation_id=OP_PIPELINE_STATUS,
+        capability=Capability.PIPELINE,
+        request_model=None,
+        response_model=PipelineStatusResponse,
+        requires_contract_version=True,
+        summary="Report per-folder counts and each recent upload's pipeline stages.",
+        query_model=PipelineStatusQuery,
+        since_minor=PIPELINE_STATUS_SINCE_MINOR,
     ),
     RouteSpec(
         path="/v1/agent-activity",

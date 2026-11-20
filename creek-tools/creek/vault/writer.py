@@ -2914,6 +2914,25 @@ class VaultWriter:
         return recovered
 
     @staticmethod
+    def read_index(directory: Path) -> dict[str, str]:
+        """Return *directory*'s ``{id: filename}`` index, strictly read-only.
+
+        The public, side-effect-free view of one ``.id-index.jsonl``
+        (#2124): unlike :meth:`find_fragment` it never repairs, persists or
+        locks anything, so a read-only surface such as
+        ``GET /v1/pipeline/status`` can resolve ids to files without
+        writing into the vault. An absent or unreadable index is ``{}``,
+        and a mapping is a hint, not proof: the caller checks the file.
+
+        Args:
+            directory: A fragment directory.
+
+        Returns:
+            The parsed mappings; later entries win.
+        """
+        return VaultWriter._load_index_file(directory / INDEX_FILENAME)
+
+    @staticmethod
     def _load_index_file(index_path: Path) -> dict[str, str]:
         """Parse a JSONL index file into ``{id: filename}``.
 

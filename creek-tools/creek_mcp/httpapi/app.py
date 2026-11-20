@@ -255,13 +255,17 @@ def _predates_the_capability(request: Request, spec: RouteSpec) -> bool:
 
     Returns:
         ``True`` when this caller is pinned below the minor that published this
-        route's capability.
+        route's capability, or below the route's own
+        :attr:`~creek_mcp.api.routes.RouteSpec.since_minor` when it joined that
+        capability later (#2124).
     """
     if spec.capability is None:
         return False
     declared = request.headers.get(CONTRACT_VERSION_HEADER)
     if declared is None:
         return False
+    if spec.since_minor is not None and not minor_at_least(declared, spec.since_minor):
+        return True
     return not minor_at_least(declared, CAPABILITY_SINCE_MINOR[spec.capability])
 
 

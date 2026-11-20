@@ -101,6 +101,7 @@ from tests.v1_api_support import (
     JOURNAL_TEMPLATE,
     LETTERS_TEMPLATE,
     LINKS_PATH,
+    PIPELINE_STATUS_PATH,
     REFLECTIONS_PATH,
     UPLOAD_PATH,
     VOICE_DRAFT_TEMPLATE,
@@ -117,12 +118,14 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.33.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.34.0.json"
 )
-"""The published document at contract 0.33.0: ``POST /v1/uploads`` gains a ``202``.
+"""The published document at contract 0.34.0: adds ``GET /v1/pipeline/status``.
 
-0.33.0 (#2123) documents ``202`` ``UploadManifestResponse`` beside the
-upload's ``200``, for a loose Substack ``posts.csv``. 0.32.0 moves no
+0.34.0 (#2124) adds the ``getPipelineStatus`` operation, its ``limit`` query
+parameter and the six ``Pipeline*`` schemas; no existing path moves. 0.33.0
+(#2123) documents ``202`` ``UploadManifestResponse`` beside the upload's
+``200``, for a loose Substack ``posts.csv``. 0.32.0 moves no
 ``/v1`` shape: ``POST /v1/classifications`` now also writes
 ``04-Praxis/`` pages (#2122) and ``creek.purge.*`` gains a counter, neither
 of which is a path or schema. 0.31.0 (#2121) documents the advisory
@@ -457,9 +460,9 @@ def test_documented_paths_equal_the_mounted_routes(vault: Path) -> None:
 
 
 def test_every_published_route_is_documented() -> None:
-    """All eighteen paths appear, named explicitly so a silent drop is visible.
+    """All nineteen paths appear, named explicitly so a silent drop is visible.
 
-    Eighteen paths over twenty-two operations since #2033: two resource paths
+    Nineteen paths over twenty-three operations since #2124: two resource paths
     serve multiple methods, which is why this is a set of paths
     while ``test_documented_routes_are_the_mounted_ones`` above compares
     ``(method, path)`` pairs.
@@ -479,6 +482,7 @@ def test_every_published_route_is_documented() -> None:
         CLASSIFICATIONS_PATH,
         LINKS_PATH,
         JOB_TEMPLATE,
+        PIPELINE_STATUS_PATH,
         AGENT_ACTIVITY_PATH,
         HEALTH_PATH,
         "/v1/reading-recommendations",

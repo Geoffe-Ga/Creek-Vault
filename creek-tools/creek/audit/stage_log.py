@@ -53,8 +53,10 @@ class PassStage(StrEnum):
 
     Attributes:
         CLASSIFIED: A classify pass (any method) ran.
-        PRAXIS_SCANNED: The praxis keyword pass, which runs inside classify on
-            every fragment that pass processes.
+        PRAXIS_SCANNED: The praxis passes inside classify: the keyword verdict
+            on every fragment that pass processes, then the post-pass that
+            files a ``04-Praxis`` page for every explicit fragment lacking one
+            (#2122). A page that could not be written makes it ``partial``.
         LINKED_EMBEDDINGS: The ``embeddings`` linker stage ran.
         LINKED_TEMPORAL: The ``temporal`` linker stage ran.
         LINKED_EDDIES: The ``eddies`` linker stage ran.

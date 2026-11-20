@@ -1,0 +1,450 @@
+{
+  "documents": [],
+  "documents_withheld": 0,
+  "folders": [
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments",
+      "writer": null,
+      "writer_reason": "container"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Conversations",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Data",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Decks",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Documents",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Images",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Journal",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Messages",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Notes",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Technical",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Unsorted",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Writing",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "01-Fragments/Writing/Substack",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "02-Threads",
+      "writer": null,
+      "writer_reason": "container"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "02-Threads/Active",
+      "writer": "link.threads",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "02-Threads/Dormant",
+      "writer": "link.threads",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "02-Threads/Resolved",
+      "writer": "link.threads",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "03-Eddies",
+      "writer": "link.eddies",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "04-Praxis",
+      "writer": null,
+      "writer_reason": "container"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "04-Praxis/Daily",
+      "writer": "classify.praxis",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "04-Praxis/Seasonal",
+      "writer": "classify.praxis",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "04-Praxis/Situational",
+      "writer": "classify.praxis",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "05-Wavelength",
+      "writer": null,
+      "writer_reason": "container"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "05-Wavelength/Mode-Profiles",
+      "writer": "generate.wavelength",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "05-Wavelength/Observations",
+      "writer": "save",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "05-Wavelength/Phase-Maps",
+      "writer": "generate.wavelength",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies",
+      "writer": "compile",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F1-Agency",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F10-Emptiness",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F2-Receptivity",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F3-Self-Love-Power",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F4-Community-Love",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F5-Achievism",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F6-Pluralism",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F7-Integration",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F8-True-Self",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "06-Frequencies/F9-Unity",
+      "writer": null,
+      "writer_reason": "indexed_at_parent"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "07-Voice",
+      "writer": "generate.voice",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "07-Voice/Drafts",
+      "writer": "draft",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "07-Voice/Lexicon",
+      "writer": "generate.lexicon",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "07-Voice/Lexicon/Metaphors",
+      "writer": "generate.lexicon",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "07-Voice/Register-Samples",
+      "writer": "generate.voice",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "07-Voice/Rhetorical-Patterns",
+      "writer": "generate.voice",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "08-Decisions",
+      "writer": null,
+      "writer_reason": "container"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "08-Decisions/Active",
+      "writer": "generate.decisions",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "08-Decisions/Archive",
+      "writer": "generate.decisions",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "08-Decisions/Frameworks",
+      "writer": null,
+      "writer_reason": "owner_curated"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "09-Reference",
+      "writer": null,
+      "writer_reason": "container"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "09-Reference/APTITUDE-Course",
+      "writer": null,
+      "writer_reason": "owner_curated"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "09-Reference/External-Sources",
+      "writer": null,
+      "writer_reason": "owner_curated"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "09-Reference/Published-Essays",
+      "writer": null,
+      "writer_reason": "owner_curated"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal",
+      "writer": null,
+      "writer_reason": "container"
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal/Compost",
+      "writer": "generate.compost",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal/Compost/Review",
+      "writer": "generate.compost",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal/Compost/intimate-stubs",
+      "writer": "save",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal/Orphaned",
+      "writer": "ingest",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal/Paradoxes",
+      "writer": "generate.paradox",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal/Synchronicities",
+      "writer": "generate.synchronicity",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal/Unnamed",
+      "writer": "generate.unnamed",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "10-Liminal/Unnamed/Digests",
+      "writer": "generate.unnamed",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "11-Other-Authors",
+      "writer": "authors",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "11-Other-Authors/ai-as-user",
+      "writer": "voice-drafts",
+      "writer_reason": null
+    },
+    {
+      "count": 0,
+      "last_written_at": null,
+      "path": "11-Other-Authors/example-author",
+      "writer": null,
+      "writer_reason": "template_example"
+    }
+  ],
+  "jobs": [],
+  "status": "ok",
+  "tier_ceiling": "personal"
+}

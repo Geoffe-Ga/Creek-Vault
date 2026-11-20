@@ -309,8 +309,9 @@ def classify_tool(
 
     The pass itself is :func:`_classify_pass`, whose docstring states every
     argument, refusal and return key. This wrapper only appends the
-    ``classified`` and ``praxis_scanned`` stages — the praxis keyword pass runs
-    inside classify on every fragment the pass processes — with the outcome the
+    ``classified`` and ``praxis_scanned`` stages — the praxis keyword verdict and
+    the ``04-Praxis`` page post-pass (#2122) both run inside classify, and a
+    page-write error joins the pass's ``errors`` — with the outcome the
     caller is about to be told, so ``GET /v1/pipeline/status`` reads what ran
     rather than inferring it. An unknown method records nothing.
 

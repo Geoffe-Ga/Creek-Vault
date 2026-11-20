@@ -67,6 +67,7 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from creek.care.guardrail import CARE_SIGNAL
 from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES
+from creek.vault.folder_writers import ONTOLOGY_FOLDERS
 from creek_mcp.api.models import (
     CONTRACT_MINOR,
     CONTRACT_MODELS,
@@ -773,6 +774,96 @@ _EXPORT_EMPTY: Final[dict[str, Any]] = {
 }
 """A vault holding nothing yet, or the page past the last item: not an error."""
 
+_PIPELINE_STATUS_LANDED: Final[str] = "2026-11-20T17:02:11Z"
+"""When the example upload landed."""
+
+_PIPELINE_STATUS_FILLED: Final[dict[str, int]] = {
+    "01-Fragments/Writing/Substack": 212,
+    "03-Eddies": 9,
+}
+"""Example counts for the folders the success example shows filling."""
+
+
+def _pipeline_folders(filled: dict[str, int]) -> list[dict[str, Any]]:
+    """Return every scaffolded folder's row, counting only *filled* ones.
+
+    Built from the registry rather than typed, so the published example lists
+    exactly the folders the server lists, writerless ones included.
+
+    Args:
+        filled: Folder path to example count; every other folder is empty.
+
+    Returns:
+        One row per scaffolded folder, in path order.
+    """
+    return [
+        {
+            "path": folder.path,
+            "count": filled.get(folder.path, 0),
+            "last_written_at": (
+                _PIPELINE_STATUS_LANDED if folder.path in filled else None
+            ),
+            "writer": folder.writer,
+            "writer_reason": None if folder.reason is None else folder.reason.value,
+        }
+        for folder in ONTOLOGY_FOLDERS
+    ]
+
+
+_PIPELINE_STATUS_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "folders": _pipeline_folders(_PIPELINE_STATUS_FILLED),
+    "documents": [
+        {
+            "external_id": "adepthood:upload:example-1",
+            "filename": "on-attention.html",
+            "fragment_path": "01-Fragments/Writing/Substack/on-attention.md",
+            "fragment_count": 1,
+            "stages": [
+                {
+                    "stage": "ingested",
+                    "at": _PIPELINE_STATUS_LANDED,
+                    "outcome": "ok",
+                },
+                {"stage": "classified", "at": "2026-11-20T17:03:40Z", "outcome": "ok"},
+                {
+                    "stage": "praxis_scanned",
+                    "at": "2026-11-20T17:03:40Z",
+                    "outcome": "ok",
+                },
+                {
+                    "stage": "linked:eddies",
+                    "at": "2026-11-20T17:05:02Z",
+                    "outcome": "partial",
+                },
+            ],
+        }
+    ],
+    "documents_withheld": 1,
+    "jobs": [
+        {
+            "job_id": "00000000-0000-4000-8000-000000000001",
+            "kind": "link",
+            "method": LinkMethod.EMBEDDINGS.value,
+            "state": "running",
+            "failure_code": None,
+            "updated_at": "2026-11-20T17:05:30Z",
+        }
+    ],
+}
+"""A landed upload part-way through linking, one withheld, one job running."""
+
+_PIPELINE_STATUS_EMPTY: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "folders": _pipeline_folders({}),
+    "documents": [],
+    "documents_withheld": 0,
+    "jobs": [],
+}
+"""A freshly scaffolded vault: every folder listed, each empty, none an error."""
+
 
 # --------------------------------------------------------------------------
 # The 11 x 7 matrix
@@ -1106,6 +1197,36 @@ def _agent_discovery_files() -> list[_BundleFile]:
     ]
 
 
+_PIPELINE_STATUS_DIR: Final[str] = "pipeline-status"
+"""Bundle subdirectory holding the ``GET /v1/pipeline/status`` examples."""
+
+
+def _pipeline_status_files() -> list[_BundleFile]:
+    """Render the status read's two shapes without adding matrix cells (#2124).
+
+    ``pipeline``'s matrix column already shows its two write verbs; the status
+    read is a third response model on the same capability, so its examples sit
+    beside the matrix, as the discovery states do.
+
+    Returns:
+        A populated and an empty ``PipelineStatusResponse``.
+    """
+    payloads = {
+        "success": _PIPELINE_STATUS_SUCCESS,
+        "empty": _PIPELINE_STATUS_EMPTY,
+    }
+    return [
+        _BundleFile(
+            path=f"{_PIPELINE_STATUS_DIR}/{name}.json",
+            text=_serialise(payload),
+            model="PipelineStatusResponse",
+            capability=None,
+            state=None,
+        )
+        for name, payload in payloads.items()
+    ]
+
+
 def _manifest_entry(generated: _BundleFile) -> dict[str, Any]:
     """Return the manifest record describing one generated file.
 
@@ -1159,7 +1280,8 @@ def build_bundle() -> dict[str, str]:
         Every generated file: ``schemas/<Model>.schema.json`` for each
         published model, ``examples/<capability>/<state>.json`` for all 77
         matrix cells, the two optional-agent discovery states under
-        ``discovery/``, ``retry-policy.json``, and ``manifest.json``. The
+        ``discovery/``, the two pipeline-status examples under
+        ``pipeline-status/``, ``retry-policy.json``, and ``manifest.json``. The
         committed bundle must equal this exactly, minus the docs-owned
         ``README.md``.
     """
@@ -1167,6 +1289,7 @@ def build_bundle() -> dict[str, str]:
         *_schema_files(),
         *_example_files(),
         *_agent_discovery_files(),
+        *_pipeline_status_files(),
         _retry_policy_file(),
     ]
     manifest = _manifest_file(generated)

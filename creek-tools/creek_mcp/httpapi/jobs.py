@@ -17,6 +17,8 @@ live job failed merely by being asked about it.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeAlias
 from uuid import UUID, uuid4
 
@@ -30,6 +32,7 @@ from creek_mcp.api.models import (
     JobState,
     JobStatusResponse,
     LinkResponse,
+    PipelineJobSummary,
 )
 
 if TYPE_CHECKING:
@@ -39,6 +42,7 @@ if TYPE_CHECKING:
 
 _JOB_DIRECTORY: Final[tuple[str, ...]] = ("00-Creek-Meta", "State", "jobs")
 _JOB_LOCK_NAME: Final[str] = "jobs.lock"
+_NS_PER_SECOND: Final[int] = 1_000_000_000
 
 WORKER_LOST: Final[str] = "worker_lost"
 """The ``failure_reason`` of a job its worker never finished.
@@ -320,3 +324,101 @@ def status_for(
         result=result,
         failure_code=record.failure_code if record.state is JobState.FAILED else None,
     )
+
+
+def _effective_state(
+    record: StoredJob, worker_id: str, active_job_ids: AbstractSet[str]
+) -> JobState:
+    """Return the state :func:`status_for` would serve, without recording it.
+
+    A queued or running record this worker is not executing is one
+    :func:`_recovered` would rewrite ``failed``; the status listing reports
+    that verdict but leaves the rewrite to the job's own read.
+    """
+    orphaned = record.worker_id != worker_id or record.job_id not in active_job_ids
+    if record.state in {JobState.QUEUED, JobState.RUNNING} and orphaned:
+        return JobState.FAILED
+    return record.state
+
+
+def _summary(
+    record: StoredJob,
+    updated_ns: int,
+    worker_id: str,
+    active_job_ids: AbstractSet[str],
+) -> PipelineJobSummary | None:
+    """Project one pipeline record onto its wire summary, or ``None``."""
+    state = _effective_state(record, worker_id, active_job_ids)
+    failed_in_place = state is record.state is JobState.FAILED
+    try:
+        return PipelineJobSummary.model_validate(
+            {
+                "job_id": record.job_id,
+                "kind": record.kind,
+                "method": record.method,
+                "state": state,
+                "failure_code": record.failure_code if failed_in_place else None,
+                "updated_at": datetime.fromtimestamp(
+                    updated_ns / _NS_PER_SECOND, tz=UTC
+                ),
+            }
+        )
+    except ValidationError:
+        return None
+
+
+def _newest_records(vault: Path) -> list[tuple[int, Path]]:
+    """Return every job record path with its mtime, newest first."""
+    directory = _directory(vault)
+    if not directory.is_dir():
+        return []
+    stamped: list[tuple[int, Path]] = []
+    for path in directory.glob("*.json"):
+        try:
+            stamped.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    return sorted(stamped, key=itemgetter(0), reverse=True)
+
+
+def recent_pipeline_jobs(
+    vault: Path,
+    *,
+    consumer: str,
+    worker_id: str,
+    active_job_ids: AbstractSet[str],
+    limit: int,
+) -> list[PipelineJobSummary]:
+    """Return one consumer's newest pipeline jobs, read without side effects (#2124).
+
+    Strictly read-only: no lock is taken and no record is rewritten. A queued
+    or running record no live worker owns is *reported* ``failed`` — the
+    verdict ``GET /v1/jobs/{job_id}`` would record — but the rewrite is left
+    to that route, so a status poll never mutates the job store. Another
+    consumer's records and composition kinds are skipped unread by the caller.
+
+    Args:
+        vault: The vault holding the job directory.
+        consumer: The caller; only its own records are listed.
+        worker_id: This process's worker id.
+        active_job_ids: The ids this process is executing right now.
+        limit: The most summaries to return.
+
+    Returns:
+        Summaries, newest record first.
+    """
+    summaries: list[PipelineJobSummary] = []
+    for updated_ns, path in _newest_records(vault):
+        if len(summaries) >= limit:
+            break
+        record = _read(path)
+        if (
+            record is None
+            or record.consumer != consumer
+            or record.kind not in PIPELINE_KINDS
+        ):
+            continue
+        summary = _summary(record, updated_ns, worker_id, active_job_ids)
+        if summary is not None:
+            summaries.append(summary)
+    return summaries

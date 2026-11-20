@@ -37,6 +37,9 @@ adepthood-v1/
 ├── discovery/
 │   ├── agent-mcp-ready.json           # ready vault with its public OAuth MCP resource and issuer
 │   └── agent-mcp-unavailable.json     # ready vault with agent_mcp: null
+├── pipeline-status/
+│   ├── success.json                   # GET /v1/pipeline/status: a landed upload part-way through linking
+│   └── empty.json                     # a fresh vault: every folder listed, each empty
 └── examples/
     └── <capability>/
         └── <state>.json               # one fixture per (capability, state) cell
@@ -56,6 +59,23 @@ order key: opaque, restart-stable, and it names no file, so it is safe in a
 logged URL. Any caller but the vault's sole configured consumer gets
 `403 privacy_refused`; a vault that cannot be read is `503 unavailable` —
 treat that as "vault unavailable", never as an empty export.
+
+## Pipeline status (`pipeline`, contract `0.34`)
+
+`GET /v1/pipeline/status?limit=` answers "what has Creek done with my
+uploads?". `folders` lists every scaffolded ontology folder, empty ones
+included, with `count`, `last_written_at`, and either `writer` or
+`writer: null` plus a closed `writer_reason` — so an empty folder that is
+filling reads differently from one nothing writes. `documents` lists the
+caller's own most recent uploads (`limit` default 50, clamped to 200), each
+with a `stages` trail (`ingested`, then `classified`, `praxis_scanned`,
+`linked:<method>`, each `ok` / `partial` / `failed`). A document above the
+caller's ceiling is never named; it is counted in `documents_withheld`.
+`jobs` lists the caller's newest durable pipeline jobs. The route is served
+only to a caller declaring `0.34` or later. Its two examples live under
+`pipeline-status/`, outside the capability/state matrix (the `pipeline` cells
+show its two write verbs), hashed by the same manifest and validated against
+[`PipelineStatusResponse.schema.json`](schemas/PipelineStatusResponse.schema.json).
 
 ## Optional agent MCP discovery
 
