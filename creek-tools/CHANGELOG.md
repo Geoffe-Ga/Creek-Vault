@@ -9,6 +9,22 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Contract 0.31.0: `temporarily_unavailable` says when to come back
+  (#2121).** A classify or link pass holds the vault content-mutation lock for
+  its whole run, so an upload arriving meanwhile waited its 10 s bound and was
+  refused `503 temporarily_unavailable` with no hint. A bulk seeder could only
+  guess, and about one file in twenty landed. Every
+  `temporarily_unavailable` served to a caller declaring 0.31 or later now
+  carries `Retry-After: 30`, from whichever layer refused (route, shedder or
+  deadline), decided once in `error_response` from the version the caller
+  declared at the edge (`RequestContext.contract_version`). The value is the
+  constant `TRANSIENT_RETRY_AFTER_SECONDS`, a hint outside
+  `retry-policy.json`. A 0.30-or-earlier caller is served the response its
+  minor published, byte-identical. The OpenAPI golden
+  (`openapi-0.31.0.json`) declares the header on every route's `503`, and the
+  `adepthood-v1` bundle is regenerated for the version string. The #2069
+  overwrite gate is unchanged: uploads of one `external_id` stay serialised.
+
 - **`creek.revoice` refuses a rewrite that did not apply the owner's voice
   (contract 0.30).** A revoice of an analytical essay returned `ok` although
   the opening was nearly unchanged and the edits were citation removal,

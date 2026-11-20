@@ -43,29 +43,33 @@ import io
 import json
 import re
 import zipfile
+from functools import partial
 from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
 import pytest
 
-from creek._fslock import VaultLockTimeoutError
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.archive import ARCHIVE_SUFFIXES
 from creek.ingest.gdrive import _EXTENSION_ROUTES, _Refuse
 from creek.ingest.pipeline import run_ingest
 from creek.models import PrivacyTier
-from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
+from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON, hold_content_mutation
 from creek_mcp.api.models import (
     CAPABILITY_SINCE_MINOR,
     ERROR_MESSAGES,
     ERROR_STATUS,
+    RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR,
     Capability,
     ErrorCode,
     ErrorEnvelope,
+    JournalAction,
     UploadResponse,
     minor_at_least,
 )
 from creek_mcp.audit import MCP_AUDIT_RELPATH
+from creek_mcp.httpapi.errors import RETRY_AFTER_HEADER, TRANSIENT_RETRY_AFTER_SECONDS
 from creek_mcp.httpapi.upload import upload_refusal_code
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
@@ -1014,6 +1018,152 @@ def test_upload_lock_contention_is_temporarily_unavailable(
     assert str(vault) not in response.text
     assert not contains_a_path(response.text)
     assert _fragments(vault) == []
+
+
+_BULK_UPLOADS: Final[int] = 20
+"""How many sequential uploads the #2121 bulk-seeding scenario sends."""
+
+_SHORT_LOCK_WAIT_SECONDS: Final[float] = 0.05
+"""The upload's content-lock wait in the #2121 tests, cut from the 10 s default.
+
+The real lock is held and the real refusal path runs; only the bound is
+shortened, so twenty refusals cost a second rather than two hundred.
+"""
+
+_PRE_RETRY_AFTER_MINOR: Final[str] = "0.30"
+"""The last minor whose ``temporarily_unavailable`` carried no ``Retry-After``."""
+
+
+def _short_lock_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind the upload tool's content-lock wait to :data:`_SHORT_LOCK_WAIT_SECONDS`.
+
+    Args:
+        monkeypatch: Rebinds the tool module's ``vault_lock`` reference.
+    """
+    monkeypatch.setattr(
+        "creek_mcp.tools.upload.vault_lock",
+        partial(vault_lock, timeout=_SHORT_LOCK_WAIT_SECONDS),
+    )
+
+
+def _bulk_body(index: int) -> dict[str, Any]:
+    """Return the *index*-th distinct document of a bulk upload.
+
+    Args:
+        index: The document's position in the batch.
+
+    Returns:
+        A body with its own ``external_id`` and its own content.
+    """
+    return _body(
+        filename=f"seed-{index}.md",
+        content=f"# Seed {index}\n\nsynthetic-bulk-seed-{index}\n".encode(),
+        external_id=f"adepthood:doc:bulk-{index}",
+    )
+
+
+def test_uploads_during_a_long_pass_are_told_when_to_retry_and_then_land(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Twenty uploads during a classify pass all land, none silently (#2121).
+
+    A classify or link pass holds the vault content-mutation lock for its
+    whole run, so an upload arriving meanwhile is refused ``503
+    temporarily_unavailable`` once its bounded wait expires. That refusal used
+    to carry no ``Retry-After``, so a bulk seeder could only guess, and most of
+    a folder silently failed to land. Every one of these refusals must now say
+    when to come back, and coming back then must succeed: the real lock is
+    held here exactly as ``hold_content_mutation`` holds it for a pass.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Shortens the upload's lock wait.
+    """
+    _short_lock_wait(monkeypatch)
+    with client(vault_path=vault) as test_client:
+        with hold_content_mutation(vault):
+            during = [
+                test_client.post(UPLOAD_PATH, json=_bulk_body(index), headers=headers())
+                for index in range(_BULK_UPLOADS)
+            ]
+        after = [
+            test_client.post(UPLOAD_PATH, json=_bulk_body(index), headers=headers())
+            for index in range(_BULK_UPLOADS)
+        ]
+
+    for response in during:
+        assert (
+            response.status_code == ERROR_STATUS[ErrorCode.TEMPORARILY_UNAVAILABLE]
+        ), response.text
+        assert envelope(response)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+        assert response.headers[RETRY_AFTER_HEADER] == TRANSIENT_RETRY_AFTER_SECONDS
+    assert [response.status_code for response in after] == [_OK_STATUS] * (
+        _BULK_UPLOADS
+    )
+    assert {UploadResponse.model_validate(r.json()).action for r in after} == {
+        JournalAction.CREATED
+    }
+    assert len(_fragments(vault)) == _BULK_UPLOADS
+
+
+def test_retry_after_is_a_whole_number_of_seconds() -> None:
+    """The hint is RFC 9110 ``delay-seconds``: a non-negative integer, as text."""
+    assert TRANSIENT_RETRY_AFTER_SECONDS.isdigit()
+    assert int(TRANSIENT_RETRY_AFTER_SECONDS) > 0
+
+
+def test_a_busy_upload_for_a_prior_minor_is_byte_identical(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller below the bump is served the ``503`` it always was (#2121).
+
+    ``Retry-After`` on ``temporarily_unavailable`` is published at
+    :data:`~creek_mcp.api.models.RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR`;
+    a ``0.30`` consumer's responses do not move after its minor shipped.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Shortens the upload's lock wait.
+    """
+    assert not minor_at_least(
+        _PRE_RETRY_AFTER_MINOR, RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR
+    )
+    _short_lock_wait(monkeypatch)
+    with hold_content_mutation(vault):
+        response = _post(vault, _body(), minor=_PRE_RETRY_AFTER_MINOR)
+
+    assert envelope(response)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert RETRY_AFTER_HEADER not in response.headers
+
+
+def test_concurrent_uploads_of_one_id_stay_serialised(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #2069 overwrite gate still serialises two uploads of one id (#2121).
+
+    The second upload of the same ``external_id`` cannot enter the gate while
+    the first holds the content lock: it is refused retryably, with the hint,
+    and leaves the first's fragment exactly as written. Nothing about the
+    retry hint lets a writer past the lock.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Shortens the upload's lock wait.
+    """
+    _short_lock_wait(monkeypatch)
+    first = _post(vault, _body())
+    assert first.status_code == _OK_STATUS, first.text
+    written = {path: path.read_bytes() for path in _fragments(vault)}
+
+    with hold_content_mutation(vault):
+        second = _post(vault, _body(content=b"# Ridge notes\n\nRewritten.\n"))
+
+    assert envelope(second)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert second.headers[RETRY_AFTER_HEADER] == TRANSIENT_RETRY_AFTER_SECONDS
+    assert {path: path.read_bytes() for path in _fragments(vault)} == written
 
 
 def test_an_absent_vault_is_a_refusal_and_not_a_crash(tmp_path: Path) -> None:

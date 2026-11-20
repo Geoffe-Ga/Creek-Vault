@@ -37,6 +37,7 @@ from creek_mcp.api.models import (
     ERROR_MESSAGES,
     ERROR_STATUS,
     MAX_EXTERNAL_ID_CHARS,
+    RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR,
     Capability,
     ErrorCode,
 )
@@ -51,7 +52,11 @@ from creek_mcp.api.routes import (
     RouteSpec,
 )
 from creek_mcp.contract import CONTRACT_VERSION
-from creek_mcp.httpapi.errors import RETRY_AFTER_HEADER, RETRY_AFTER_SECONDS
+from creek_mcp.httpapi.errors import (
+    RETRY_AFTER_HEADER,
+    RETRY_AFTER_SECONDS,
+    TRANSIENT_RETRY_AFTER_SECONDS,
+)
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -474,16 +479,37 @@ _RESPONSE_HEADERS: Final[dict[ErrorCode, dict[str, Any]]] = {
             "schema": {"type": "integer", "format": "int32", "example": 60},
         }
     },
+    ErrorCode.TEMPORARILY_UNAVAILABLE: {
+        RETRY_AFTER_HEADER: {
+            "description": (
+                "Advisory wait before retrying, as integer delta-seconds "
+                "(RFC 9110 §10.2.3). Sent to callers declaring contract "
+                f"{RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR} or later, "
+                f"and always the constant {TRANSIENT_RETRY_AFTER_SECONDS}: the "
+                "commonest cause is the vault's content-mutation lock, held for "
+                "the whole of a classify or link pass, and a wait derived from "
+                "that pass's progress would tell a prober how much work the "
+                "vault holds. Deliberately outside retry-policy.json, which "
+                "says whether to retry and is contract; this says when and is "
+                "a hint."
+            ),
+            "schema": {"type": "integer", "format": "int32", "example": 30},
+        }
+    },
 }
 """Response headers a refusal carries, keyed by the code that carries them.
 
 A table for the same reason :data:`_CAPABILITY_ERROR_CODES` is one: "which
-headers does this refusal send" is data about the refusal. One entry today, and
-it earns the table — a consumer cannot write a backoff against a header the
+headers does this refusal send" is data about the refusal. The table earns
+itself — a consumer cannot write a backoff against a header the
 document does not declare, and a cross-repo consumer is exactly who reads this
-document instead of the source. The value is interpolated from
-:data:`~creek_mcp.httpapi.errors.RETRY_AFTER_SECONDS` rather than restated, so
-the published number cannot drift from the one the server sends.
+document instead of the source. The values are interpolated from
+:data:`~creek_mcp.httpapi.errors.RETRY_AFTER_SECONDS` and
+:data:`~creek_mcp.httpapi.errors.TRANSIENT_RETRY_AFTER_SECONDS` rather than
+restated, so the published numbers cannot drift from the ones the server sends.
+The second entry (#2121) lands on every route, because
+``temporarily_unavailable`` is one of :data:`_UNIVERSAL_ERROR_CODES`: the
+shedding and deadline layers sit above the router.
 
 ``401``'s ``WWW-Authenticate`` is deliberately absent: it is obligatory for that
 status and carries no server-specific value a client reads.

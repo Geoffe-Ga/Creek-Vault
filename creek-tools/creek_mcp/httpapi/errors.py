@@ -137,8 +137,10 @@ from starlette.responses import JSONResponse
 from creek_mcp.api.models import (
     ERROR_MESSAGES,
     ERROR_STATUS,
+    RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR,
     ErrorCode,
     ErrorEnvelope,
+    minor_at_least,
 )
 from creek_mcp.api.routes import (
     AUTHORIZATION_HEADER,
@@ -265,6 +267,28 @@ this vault used?" to anyone willing to probe — the usage oracle
 :data:`~creek_mcp.api.models.ERROR_MESSAGES`'s entry for this code is also
 written to avoid. Sixty seconds matches the default per-hour admission window
 closely enough to be useful and tells the caller nothing.
+"""
+
+TRANSIENT_RETRY_AFTER_SECONDS: Final[str] = "30"
+"""The advisory wait a ``temporarily_unavailable`` refusal carries (#2121).
+
+Sent only to callers declaring
+:data:`~creek_mcp.api.models.RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR`
+or later. The refusal's commonest cause on a managed vault is an upload, a
+journal write or a pipeline request meeting the content-mutation lock held for
+the whole of a classify or link pass; before this hint a bulk seeder could only
+guess when to come back, and gave up on most of a folder.
+
+A constant rather than a figure derived from the running pass's progress, for
+the reason :data:`RETRY_AFTER_SECONDS` is one: a wait computed from what this
+vault is doing right now would tell any caller willing to probe how much work
+the vault holds and how far through it the pass is. No job records progress
+today besides, so a derived figure would be a guess presented as a measurement.
+Thirty seconds is three of the lock's own bounded waits
+(:data:`creek._fslock.DEFAULT_LOCK_TIMEOUT_SECONDS`): long enough that a
+retrying client is not the thing keeping the lock contended, short enough that
+a pass ending is noticed promptly. It is a hint, outside ``retry-policy.json``,
+so it may change without a contract bump.
 """
 
 WWW_AUTHENTICATE_HEADER: Final[str] = "WWW-Authenticate"
@@ -456,22 +480,50 @@ def json_response(
     return JSONResponse(payload, status_code=status, headers=_merged_headers(headers))
 
 
-def _challenge_for(code: ErrorCode) -> Mapping[str, str]:
+def _serves_transient_retry_after(context: RequestContext) -> bool:
+    """Return whether this caller's minor publishes the transient wait (#2121).
+
+    Args:
+        context: The request's context, carrying the version the caller
+            declared at the edge.
+
+    Returns:
+        ``True`` only when the caller declared
+        :data:`~creek_mcp.api.models.RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR`
+        or later. No declaration, or one that does not parse, is ``False``:
+        an earlier minor's response must stay byte-identical.
+    """
+    declared = context.contract_version
+    return declared is not None and minor_at_least(
+        declared, RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR
+    )
+
+
+def _challenge_for(code: ErrorCode, context: RequestContext) -> Mapping[str, str]:
     """Return the extra headers a refusal with *code* must carry.
 
     Args:
         code: The wire error code being rendered.
+        context: The request's context, which says which minor the caller
+            declared and so which headers that minor published.
 
     Returns:
         The bearer challenge for an unauthenticated refusal, the advisory
-        wait for an admission refusal, and nothing for every other code — a
-        challenge on a ``422`` would invite a client to re-present credentials
-        that were never the problem.
+        wait for an admission refusal, the transient wait for a
+        ``temporarily_unavailable`` served to a caller at or past contract
+        0.31, and nothing for every other code — a challenge on a ``422``
+        would invite a client to re-present credentials that were never the
+        problem, and a wait on ``unavailable`` would tell a client to keep
+        coming back to a refusal only an operator clears.
     """
     if code is ErrorCode.UNAUTHENTICATED:
         return {WWW_AUTHENTICATE_HEADER: BEARER_CHALLENGE}
     if code is ErrorCode.RATE_LIMITED:
         return {RETRY_AFTER_HEADER: RETRY_AFTER_SECONDS}
+    if code is ErrorCode.TEMPORARILY_UNAVAILABLE and _serves_transient_retry_after(
+        context
+    ):
+        return {RETRY_AFTER_HEADER: TRANSIENT_RETRY_AFTER_SECONDS}
     return {}
 
 
@@ -500,5 +552,5 @@ def error_response(code: ErrorCode, context: RequestContext) -> Response:
     return json_response(
         envelope.model_dump(mode="json"),
         ERROR_STATUS[code],
-        headers=_challenge_for(code),
+        headers=_challenge_for(code, context),
     )

@@ -105,6 +105,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.30",
     "0.29",
     "0.28",
     "0.27",
@@ -560,6 +561,19 @@ refused key before — by
 :func:`creek_mcp.httpapi.generation.served_error_code`. One constant for both
 routes, because both began serving the code in the same change. It is a
 literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
+RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR: Final[str] = "0.31"
+"""First minor whose ``temporarily_unavailable`` carries ``Retry-After`` (#2121).
+
+Every ``503 temporarily_unavailable`` served to a caller declaring this minor or
+later carries the advisory
+:data:`~creek_mcp.httpapi.errors.TRANSIENT_RETRY_AFTER_SECONDS` wait, whichever
+layer refused: a route meeting the vault content-mutation lock held by a
+classify or link pass, the concurrency shedder, or the request deadline. A
+caller declaring an earlier minor is served the response its minor published,
+byte-identical, without the header. It is a literal for the reason
+:data:`_UPLOAD_MINOR` is.
 """
 
 JOB_FAILURE_CODE_SINCE_MINOR: Final[str] = "0.26"
