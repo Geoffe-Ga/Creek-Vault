@@ -3469,6 +3469,7 @@ class TestLinkAdvisoryFields:
             largest_cluster_fragments=12,
             clusters_split=6,
             oversized_discarded=521,
+            skipped_materialisation=3,
         )
 
         def _fake_run_link(**_kwargs: object) -> LinkSummary:
@@ -3504,6 +3505,7 @@ class TestLinkAdvisoryFields:
         assert result["largest_cluster_fragments"] == 12
         assert result["clusters_split"] == 6
         assert result["oversized_discarded"] == 521
+        assert result["skipped_materialisation"] == 3
 
     def test_link_counts_are_plain_integers_not_content(
         self,
@@ -3527,6 +3529,7 @@ class TestLinkAdvisoryFields:
             "largest_cluster_fragments",
             "clusters_split",
             "oversized_discarded",
+            "skipped_materialisation",
         ):
             assert isinstance(result[key], int), key
 

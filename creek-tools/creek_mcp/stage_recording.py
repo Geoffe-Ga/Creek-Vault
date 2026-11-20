@@ -31,6 +31,7 @@ _LEFTOVER_KEYS: Final[tuple[str, ...]] = (
     "errors",
     "llm_call_failed",
     "oversized_discarded",
+    "skipped_materialisation",
 )
 """Result keys whose truthy value means the pass left work for a retry."""
 

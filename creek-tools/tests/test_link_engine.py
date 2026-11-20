@@ -429,6 +429,7 @@ def test_run_link_eddies_materialises_eddy_files(tmp_path: Path) -> None:
     # The reported count matches the number of files written.
     assert summary.eddies_written == len(md_files)
     assert summary.eddies_detected == len(md_files)
+    assert summary.skipped_materialisation == 0
 
 
 def test_run_link_eddies_updates_member_fragment_frontmatter(tmp_path: Path) -> None:
@@ -598,6 +599,8 @@ def test_run_link_eddies_write_oserror_does_not_crash(tmp_path: Path) -> None:
     # write failed.
     assert summary.eddies_detected >= 1
     assert summary.eddies_written == 0
+    # #2125: every detected page that never landed is reported, not dropped.
+    assert summary.skipped_materialisation == summary.eddies_detected
     # #1382: no page landed, so no member may cite one.
     assert not _cluster_page_titles(vault / "03-Eddies")
     for path in _fragment_files(vault):
@@ -726,6 +729,7 @@ def test_run_link_eddies_failed_page_write_leaves_members_unstamped(
     assert failed_titles, "the injected write failure never fired"
     assert summary.eddies_detected == 2
     assert summary.eddies_written == 1
+    assert summary.skipped_materialisation == 1
 
     page_titles = _cluster_page_titles(vault / "03-Eddies")
     assert len(page_titles) == 1
@@ -779,9 +783,10 @@ def test_run_link_eddies_skips_missing_vault_scaffold(tmp_path: Path) -> None:
             rebuild=False,
         )
 
-    # Detection still ran; persistence was skipped wholesale.
+    # Detection still ran; persistence was skipped wholesale — and says so.
     assert summary.eddies_detected >= 1
     assert summary.eddies_written == 0
+    assert summary.skipped_materialisation == summary.eddies_detected
 
 
 def test_run_link_eddies_fragment_write_oserror_is_logged(tmp_path: Path) -> None:

@@ -210,4 +210,8 @@ def _link_pass(
         "largest_cluster_fragments": summary.largest_cluster_fragments,
         "clusters_split": summary.clusters_split,
         "oversized_discarded": summary.oversized_discarded,
+        # A detected eddy or thread whose page never reached disk (#2125). Also
+        # a count, and also left for a retry, so the stage log records the
+        # pass ``partial`` (creek_mcp.stage_recording) instead of ``ok``.
+        "skipped_materialisation": summary.skipped_materialisation,
     }

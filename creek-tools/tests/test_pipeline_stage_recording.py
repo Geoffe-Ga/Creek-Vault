@@ -112,6 +112,24 @@ def test_a_link_pass_that_discarded_fragments_records_partial(
     assert [r.outcome for r in read_stage_runs(vault)] == [StageOutcome.PARTIAL]
 
 
+def test_a_link_pass_that_skipped_a_page_records_partial(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detected page that never reached disk is left for a retry (#2125)."""
+    real = link_mod.run_link
+
+    def _skipping(**kwargs: Any) -> Any:
+        summary = real(**kwargs)
+        return type(summary)(**{**summary.__dict__, "skipped_materialisation": 1})
+
+    monkeypatch.setattr(link_mod, "run_link", _skipping)
+
+    result = link_tool(vault_path=vault, method="temporal")
+
+    assert result["skipped_materialisation"] == 1
+    assert [r.outcome for r in read_stage_runs(vault)] == [StageOutcome.PARTIAL]
+
+
 def test_a_refused_link_pass_records_failed(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -190,6 +208,8 @@ def test_a_refused_upload_records_no_receipt(vault: Path) -> None:
         ({"status": "ok", "errors": ["boom"]}, StageOutcome.PARTIAL),
         ({"status": "ok", "llm_call_failed": 2}, StageOutcome.PARTIAL),
         ({"status": "ok", "oversized_discarded": 1}, StageOutcome.PARTIAL),
+        ({"status": "ok", "skipped_materialisation": 1}, StageOutcome.PARTIAL),
+        ({"status": "ok", "skipped_materialisation": 0}, StageOutcome.OK),
         (
             {"status": "refused", "reason": "vault content mutation busy"},
             StageOutcome.FAILED,
