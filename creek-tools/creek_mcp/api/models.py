@@ -105,6 +105,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.34",
     "0.33",
     "0.32",
     "0.31",
@@ -592,6 +593,16 @@ classify or link pass, the concurrency shedder, or the request deadline. A
 caller declaring an earlier minor is served the response its minor published,
 byte-identical, without the header. It is a literal for the reason
 :data:`_UPLOAD_MINOR` is.
+"""
+
+VOICE_SINCE_MINOR: Final[str] = "0.35"
+"""First minor whose letters and reflections carry ``voice`` (#2126).
+
+``LetterResponse`` and ``ReflectionResponse`` say whether the owner's own style
+was applied (``owner``) or the generic Higher Self voice was
+(``higher_self``). A caller declaring an earlier minor vendored closed response
+schemas without the key, so it is omitted for them and their bodies are
+byte-identical. It is a literal for the reason :data:`_UPLOAD_MINOR` is.
 """
 
 JOB_FAILURE_CODE_SINCE_MINOR: Final[str] = "0.26"
@@ -1879,6 +1890,30 @@ class LetterRequest(_WireModel):
         return value
 
 
+class ReplyVoice(StrEnum):
+    """Which voice a letter or reflection was written in (#2126).
+
+    The wire twin of :class:`creek.author.reply_voice.ReplyVoice`, which this
+    framework-free module does not import; a test pins the two vocabularies
+    equal.
+
+    Attributes:
+        OWNER: The prompt carried the owner's own style, drawn only from the
+            owner's own writing: owner-authored style skills, register samples
+            admitted at the caller's ceiling, or the voice fingerprint.
+        HIGHER_SELF: No owner style was found; the generic Higher Self voice.
+    """
+
+    OWNER = "owner"
+    HIGHER_SELF = "higher_self"
+
+
+_VOICE_DESCRIPTION: Final[str] = (
+    "owner when the owner's own style shaped the text, else higher_self. "
+    "Since contract 0.35."
+)
+
+
 class LetterResponse(_WireModel):
     """The letter the vault wrote, and the Voice Draft now holding it.
 
@@ -1908,6 +1943,11 @@ class LetterResponse(_WireModel):
             consumer's use for the field is to notice a route it did not
             expect, so a label the server cannot stand behind would be worse
             than none.
+        voice: Which voice the letter was written in (#2126): ``owner`` when
+            the owner's own style shaped it, ``higher_self`` otherwise. An
+            ``unchanged`` letter reports the voice it was stored with, and a
+            letter stored before contract 0.35 is ``higher_self``. Since
+            contract 0.35, and omitted for a caller declaring an earlier minor.
     """
 
     status: Literal["ok"] = Field(description="Always ok; failure is an error.")
@@ -1931,6 +1971,7 @@ class LetterResponse(_WireModel):
             "request_key:<vendor> or local. Since contract 0.19."
         ),
     )
+    voice: ReplyVoice | None = Field(default=None, description=_VOICE_DESCRIPTION)
 
 
 class UploadRequest(_WireModel):
@@ -2894,6 +2935,10 @@ class ReflectionResponse(_WireModel):
             consumer's use for the field is to notice a route it did not
             expect, so a label the server cannot stand behind would be worse
             than none.
+        voice: Which voice the notes were written in (#2126): ``owner`` when
+            the owner's own style shaped them, ``higher_self`` otherwise.
+            Since contract 0.35, and omitted for a caller declaring an earlier
+            minor.
     """
 
     status: Literal[ReflectionStatus.OK, ReflectionStatus.EMPTY] = Field(
@@ -2956,6 +3001,10 @@ class ReflectionResponse(_WireModel):
             "request_key:<vendor> or local. Since contract 0.19."
         ),
     )
+    # Contract 0.35 (#2126). Dropped when ``None`` by the same ``_dumped``
+    # rule as ``inference_source``, and ``None`` whenever the caller's minor
+    # predates :data:`VOICE_SINCE_MINOR`.
+    voice: ReplyVoice | None = Field(default=None, description=_VOICE_DESCRIPTION)
 
 
 class CareEscalationResponse(_WireModel):

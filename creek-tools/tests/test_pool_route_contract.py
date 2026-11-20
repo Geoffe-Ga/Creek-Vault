@@ -1090,11 +1090,12 @@ class TestCapOrder:
 
     def test_an_oversized_snippet_is_dropped_and_the_entry_survives(self) -> None:
         """The prompt comes back under the cap, still carrying the whole entry."""
-        prompt = reflect_module._capped_prompt(
+        capped = reflect_module._capped_prompt(
             ENTRY, [self._snippet(2000)], max_notes=3
         )
 
-        assert prompt is not None
+        assert capped is not None
+        prompt = capped.text
         assert ENTRY in prompt
         assert self._snippet(2000) not in prompt
         assert pool_prompt_within_cap(prompt)
@@ -1106,11 +1107,12 @@ class TestCapOrder:
         reflection every neighbour over one long one.
         """
         keeper = "the first and most relevant neighbour."
-        prompt = reflect_module._capped_prompt(
+        capped = reflect_module._capped_prompt(
             ENTRY, [keeper, self._snippet(2000)], max_notes=3
         )
 
-        assert prompt is not None
+        assert capped is not None
+        prompt = capped.text
         assert keeper in prompt
         assert pool_prompt_within_cap(prompt)
 

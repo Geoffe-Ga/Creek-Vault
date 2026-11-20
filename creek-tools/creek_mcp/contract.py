@@ -20,8 +20,23 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.34.0"
+CONTRACT_VERSION: Final[str] = "0.35.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.35.0 (#2126): letters and reflections write in the owner's own voice when
+the vault holds it, and say so. ``POST /v1/letters/{external_id}`` and
+``POST /v1/reflections`` build their style from the Writing Desk voice stack:
+owner-authored, source-free style skills (voice-core and the
+``conversational`` register), the owner's register samples admitted at the
+declared ceiling (as a numeric profile, never their words), and the persisted
+voice fingerprint when the ceiling admits ``personal``. Never canonical
+signatures, borrowed ``11-Other-Authors`` material, or earlier AI letters and
+reflections. ``LetterResponse`` and ``ReflectionResponse`` gain the optional
+``voice`` (``owner`` | ``higher_self``), served from 0.35 and omitted below;
+``creek.reflect`` results gain the same key. A vault-written letter records
+its voice in its Voice Draft, so an ``unchanged`` repeat reports it. ``creek
+fill`` now builds the voice fingerprint. No route, status or error code moves;
+``0.34`` stays served.
 
 0.34.0 (#2124): ``GET /v1/pipeline/status`` joins the ``pipeline`` capability
 and is served only to a caller declaring 0.34 or later (``RouteSpec.since_minor``;

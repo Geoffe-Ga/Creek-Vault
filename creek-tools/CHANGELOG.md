@@ -9,6 +9,31 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Letters and reflections write in the owner's own voice, and say so
+  (#2126, contract 0.35).** Every `/v1` letter and reflection used one fixed
+  "Higher Self" persona, so nothing the owner wrote shaped how it sounded.
+  - `creek/author/reply_voice.py` builds the style from the Writing Desk voice
+    stack: owner-authored, source-free style skills (voice-core and the
+    `conversational` register, through the new
+    `creek.author.voice.owner_style_sections`, which shares revoice's
+    owner-style rule); the owner's register samples admitted at the declared
+    ceiling, as a numeric profile with no sample words; and the persisted
+    voice fingerprint, only when the ceiling admits `personal` and it is not
+    thin. Canonical signatures, `11-Other-Authors` material and earlier AI
+    letters (Voice Drafts: AI authorship, zero voice weight) never count.
+  - `POST /v1/letters/{external_id}` keeps the care policy first and the
+    Higher Self framing, adding "in the owner's own style, as described
+    below" and the style block; `POST /v1/reflections` does the same for its
+    margin notes. With no owner evidence both prompts are unchanged. A
+    reflection drops the style before refusing an over-cap entry.
+  - `LetterResponse` and `ReflectionResponse` gain the optional `voice`
+    (`owner` | `higher_self`), served from 0.35 and omitted below it;
+    `creek.reflect` results carry it too. A letter records its voice in its
+    Voice Draft, so an `unchanged` repeat reports it; a letter stored before
+    0.35 reads as `higher_self`.
+  - `creek fill` runs `report/fingerprint`, so a managed vault has one.
+  - The OpenAPI golden (`openapi-0.35.0.json`) and the `adepthood-v1` bundle
+    are regenerated.
 - **`GET /v1/pipeline/status` lists an upload filed under `11-Other-Authors`
   (#2125).** A note naming its `source.author_slug` is filed by ingest into
   `11-Other-Authors/<slug>`, but the route resolved fragments under

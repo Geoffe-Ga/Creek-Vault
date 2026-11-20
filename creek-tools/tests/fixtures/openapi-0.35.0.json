@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.34.0",
+    "version": "0.35.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -3848,6 +3848,15 @@
         "title": "LetterNote",
         "type": "object"
       },
+      "ReplyVoice": {
+        "description": "Which voice a letter or reflection was written in (#2126).\n\nThe wire twin of :class:`creek.author.reply_voice.ReplyVoice`, which this\nframework-free module does not import; a test pins the two vocabularies\nequal.\n\nAttributes:\n    OWNER: The prompt carried the owner's own style, drawn only from the\n        owner's own writing: owner-authored style skills, register samples\n        admitted at the caller's ceiling, or the voice fingerprint.\n    HIGHER_SELF: No owner style was found; the generic Higher Self voice.",
+        "enum": [
+          "owner",
+          "higher_self"
+        ],
+        "title": "ReplyVoice",
+        "type": "string"
+      },
       "VoiceDraftAttribution": {
         "additionalProperties": false,
         "description": "The fixed attribution of every remotely stored Voice Draft.\n\nAll three fields are literals with defaults, so a producer can construct\nthe one valid value with no caller input and a consumer cannot mistake an\nAI-authored draft for owner voice.",
@@ -5244,7 +5253,7 @@
       },
       "LetterResponse": {
         "additionalProperties": false,
-        "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.",
+        "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the letter was written in (#2126): ``owner`` when\n        the owner's own style shaped it, ``higher_self`` otherwise. An\n        ``unchanged`` letter reports the voice it was stored with, and a\n        letter stored before contract 0.35 is ``higher_self``. Since\n        contract 0.35, and omitted for a caller declaring an earlier minor.",
         "properties": {
           "status": {
             "const": "ok",
@@ -5306,6 +5315,18 @@
             "default": null,
             "description": "Route that answered: pool:creek, pool:attested:<vendor>, request_key:<vendor> or local. Since contract 0.19.",
             "title": "Inference Source"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReplyVoice"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "owner when the owner's own style shaped the text, else higher_self. Since contract 0.35."
           }
         },
         "required": [
@@ -5478,7 +5499,7 @@
       },
       "ReflectionResponse": {
         "additionalProperties": false,
-        "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier — the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field — do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.",
+        "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier — the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field — do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the notes were written in (#2126): ``owner`` when\n        the owner's own style shaped them, ``higher_self`` otherwise.\n        Since contract 0.35, and omitted for a caller declaring an earlier\n        minor.",
         "properties": {
           "status": {
             "description": "ok or empty; escalate is CareEscalationResponse instead.",
@@ -5571,6 +5592,18 @@
             "default": null,
             "description": "Route that answered: pool:creek, pool:attested:<vendor>, request_key:<vendor> or local. Since contract 0.19.",
             "title": "Inference Source"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReplyVoice"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "owner when the owner's own style shaped the text, else higher_self. Since contract 0.35."
           }
         },
         "required": [

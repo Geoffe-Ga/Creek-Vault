@@ -2195,6 +2195,8 @@ def test_the_fields_are_absent_not_empty_when_nothing_qualifies(
         "routed_tier",
         "notes",
         "essay_grounded",
+        # #2126: always present on ok/empty; no owner style in this vault.
+        "voice",
     }
 
 
@@ -2571,6 +2573,7 @@ _EXIT_PATHS = {
             "routed_tier": "open",
             "notes": [{"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"}],
             "essay_grounded": False,
+            "voice": "higher_self",
         },
     ),
     "empty": (
@@ -2582,6 +2585,7 @@ _EXIT_PATHS = {
             "routed_tier": "open",
             "notes": [],
             "essay_grounded": False,
+            "voice": "higher_self",
         },
     ),
     # Deliberately asymmetric: a care escalation carries **no** ``routed_tier``,
@@ -2667,7 +2671,15 @@ _ESSAY_KEY = frozenset({"essay"})
 _PRAXIS_KEY = frozenset({"related_praxis"})
 _EDDIES_KEY = frozenset({"related_eddies"})
 _BASE_OK_KEYS = frozenset(
-    {"status", "tool", "tier_ceiling", "routed_tier", "notes", "essay_grounded"}
+    {
+        "status",
+        "tool",
+        "tier_ceiling",
+        "routed_tier",
+        "notes",
+        "essay_grounded",
+        "voice",
+    }
 )
 
 

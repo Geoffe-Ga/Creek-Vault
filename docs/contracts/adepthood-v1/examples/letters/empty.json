@@ -11,5 +11,6 @@
   "status": "ok",
   "tier": "personal",
   "tier_ceiling": "personal",
-  "title": "Voice draft"
+  "title": "Voice draft",
+  "voice": "owner"
 }

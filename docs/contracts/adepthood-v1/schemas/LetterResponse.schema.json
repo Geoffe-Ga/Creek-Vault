@@ -1,5 +1,14 @@
 {
   "$defs": {
+    "ReplyVoice": {
+      "description": "Which voice a letter or reflection was written in (#2126).\n\nThe wire twin of :class:`creek.author.reply_voice.ReplyVoice`, which this\nframework-free module does not import; a test pins the two vocabularies\nequal.\n\nAttributes:\n    OWNER: The prompt carried the owner's own style, drawn only from the\n        owner's own writing: owner-authored style skills, register samples\n        admitted at the caller's ceiling, or the voice fingerprint.\n    HIGHER_SELF: No owner style was found; the generic Higher Self voice.",
+      "enum": [
+        "owner",
+        "higher_self"
+      ],
+      "title": "ReplyVoice",
+      "type": "string"
+    },
     "VoiceDraftAttribution": {
       "additionalProperties": false,
       "description": "The fixed attribution of every remotely stored Voice Draft.\n\nAll three fields are literals with defaults, so a producer can construct\nthe one valid value with no caller input and a consumer cannot mistake an\nAI-authored draft for owner voice.",
@@ -40,7 +49,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted \u2014 rather\n        than guessed \u2014 on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.",
+  "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted \u2014 rather\n        than guessed \u2014 on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the letter was written in (#2126): ``owner`` when\n        the owner's own style shaped it, ``higher_self`` otherwise. An\n        ``unchanged`` letter reports the voice it was stored with, and a\n        letter stored before contract 0.35 is ``higher_self``. Since\n        contract 0.35, and omitted for a caller declaring an earlier minor.",
   "properties": {
     "action": {
       "description": "Created, or unchanged when the id already held a letter.",
@@ -102,6 +111,18 @@
       "description": "Stored letter title.",
       "title": "Title",
       "type": "string"
+    },
+    "voice": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReplyVoice"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "owner when the owner's own style shaped the text, else higher_self. Since contract 0.35."
     }
   },
   "required": [

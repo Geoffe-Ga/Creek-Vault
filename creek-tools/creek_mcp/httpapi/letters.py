@@ -43,6 +43,7 @@ from creek_mcp.api.models import (
     LETTER_RATE_LIMITED_SINCE_MINOR,
     OK_STATUS,
     PROVENANCE_SINCE_MINOR,
+    VOICE_SINCE_MINOR,
     CareEscalationResponse,
     CareSignal,
     ErrorCode,
@@ -50,6 +51,7 @@ from creek_mcp.api.models import (
     LetterRequest,
     LetterResponse,
     ReflectionStatus,
+    ReplyVoice,
     VoiceDraftAttribution,
     WireTierCeiling,
 )
@@ -70,6 +72,7 @@ from creek_mcp.tools.letter import (
     LetterEscalation,
     LetterRefusal,
     LetterSource,
+    letter_voice,
     write_letter,
 )
 
@@ -217,7 +220,11 @@ def _escalation(outcome: LetterEscalation, context: RequestContext) -> Response:
 
 
 def _letter(
-    outcome: LetterWrite, context: RequestContext, inference_source: str | None
+    outcome: LetterWrite,
+    context: RequestContext,
+    inference_source: str | None,
+    *,
+    serve_voice: bool,
 ) -> Response:
     """Project a stored letter onto the closed response model.
 
@@ -226,6 +233,11 @@ def _letter(
     caller's declared minor predates the field, the route is one this contract
     does not label, or the id already held a letter and it was returned
     **without a model call at all**, so there is no route to name.
+
+    ``voice`` (#2126) is served when *serve_voice* — the caller declared
+    :data:`~creek_mcp.api.models.VOICE_SINCE_MINOR` or later — and is the
+    voice the stored letter was written in, so an ``unchanged`` letter reports
+    it without a model call.
 
     Returns:
         The ``200``, or ``internal_error`` when the stored record cannot be
@@ -245,12 +257,14 @@ def _letter(
             letter=record.content,
             attribution=VoiceDraftAttribution(),
             inference_source=inference_source,
+            voice=ReplyVoice(letter_voice(record).value) if serve_voice else None,
         )
     except (ValidationError, ValueError, KeyError):
         return error_response(ErrorCode.INTERNAL_ERROR, context)
     body = payload.model_dump(mode="json")
-    if inference_source is None:
-        body.pop("inference_source")
+    for key in ("inference_source", "voice"):
+        if body[key] is None:
+            body.pop(key)
     return json_response(body, HTTP_OK)
 
 
@@ -261,6 +275,7 @@ def _render(
     *,
     serve_rate_limited: bool,
     serve_request_key_rejected: bool,
+    serve_voice: bool,
 ) -> Response:
     """Map one tool outcome onto its wire response.
 
@@ -279,7 +294,7 @@ def _render(
         return error_response(code, context)
     if isinstance(outcome, LetterEscalation):
         return _escalation(outcome, context)
-    return _letter(outcome, context, inference_source)
+    return _letter(outcome, context, inference_source, serve_voice=serve_voice)
 
 
 async def handle_letter(request: Request) -> Response:
@@ -324,4 +339,5 @@ async def handle_letter(request: Request) -> Response:
             request, LETTER_RATE_LIMITED_SINCE_MINOR
         ),
         serve_request_key_rejected=serves_request_key_rejected(request),
+        serve_voice=declared_minor_at_least(request, VOICE_SINCE_MINOR),
     )
