@@ -12,9 +12,18 @@ stage append one line per pass, written by the MCP tools that every surface —
 Classify walks every fragment under ``01-Fragments`` and the linker loads every
 fragment before it writes, so a pass whose ``started_at`` is at or after a
 document's ingest instant ran over that document. ``started_at`` is taken
-*before* the pass waits for the content-mutation lock, so the comparison can
-only under-claim (a document that landed while the pass queued is reported as
-not yet covered, and the next pass covers it), never over-claim.
+*before* the pass waits for the content-mutation lock, so within one clock
+the comparison can only under-claim (a document that landed while the pass
+queued is reported as not yet covered, and the next pass covers it).
+
+That guarantee assumes the receipt and the pass were stamped by the same
+clock. On one vault host they are — the upload, the synchronous pass and the
+durable job worker all run on the machine that holds the vault — but a pass
+and an upload stamped by two machines whose clocks disagree could be ordered
+wrongly by up to that skew, and a pass that predates a document by less than
+the skew could be shown as covering it. The stage trail is a status display,
+never an enforcement boundary, so that bounded error is accepted rather than
+engineered away.
 
 The format mirrors :mod:`creek.audit.yield_summary`: one JSON object per line,
 appended, never rewritten, not hash-chained — this is operational telemetry, and
