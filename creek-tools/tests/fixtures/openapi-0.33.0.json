@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.32.0",
+    "version": "0.33.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -693,6 +693,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UploadResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Ingest one uploaded document as a fragment, idempotently.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadManifestResponse"
                 }
               }
             }
@@ -5118,6 +5128,48 @@
           "essay_grounded"
         ],
         "title": "ReflectionResponse",
+        "type": "object"
+      },
+      "UploadManifestResponse": {
+        "additionalProperties": false,
+        "description": "A loose Substack ``posts.csv`` recognised as its export manifest (#2123).\n\nThe ``202`` twin of :class:`UploadResponse`. adepthood's folder import\nsends an unzipped export one file at a time; the manifest among them is\nmetadata, not writing, so it is kept to date and title the posts it lists\n— those uploaded afterwards — and never written as a fragment. There is\ntherefore no ``fragment_id``, and no ``tier`` for the reason\n:class:`UploadResponse` has none.\n\nAttributes:\n    status: Always ``\"manifest\"``.\n    tier_ceiling: The ceiling the call was served under, echoed.\n    external_id: The consumer-side identity of the upload, unchanged.\n    source_type: Always ``substack``: the export the manifest belongs to.\n    manifest_posts: How many joinable post rows the manifest held.",
+        "properties": {
+          "status": {
+            "const": "manifest",
+            "description": "The file was kept as an export manifest, not a fragment.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "external_id": {
+            "description": "Consumer-side upload identity.",
+            "title": "External Id",
+            "type": "string"
+          },
+          "source_type": {
+            "const": "substack",
+            "description": "The export the manifest belongs to.",
+            "title": "Source Type",
+            "type": "string"
+          },
+          "manifest_posts": {
+            "description": "Joinable post rows the manifest held.",
+            "minimum": 0,
+            "title": "Manifest Posts",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "external_id",
+          "source_type",
+          "manifest_posts"
+        ],
+        "title": "UploadManifestResponse",
         "type": "object"
       },
       "UploadRequest": {

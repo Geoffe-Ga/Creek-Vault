@@ -120,6 +120,7 @@ from creek_mcp.api.models import (
     RelatedPraxis,
     RetryDisposition,
     TierModel,
+    UploadManifestResponse,
     UploadRequest,
     UploadResponse,
     VaultState,
@@ -248,6 +249,14 @@ UPLOAD_RESPONSE_PAYLOAD: dict[str, Any] = {
     "affected_fragment_ids": ["frag-2026-07-31-ridge-notes"],
     "action": "created",
     "source_type": "markdown",
+}
+
+UPLOAD_MANIFEST_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "manifest",
+    "tier_ceiling": "personal",
+    "external_id": "adepthood:doc:2026-11-20T06:12:00Z",
+    "source_type": "substack",
+    "manifest_posts": 3,
 }
 
 VOICE_DRAFT_ATTRIBUTION_PAYLOAD: dict[str, Any] = {
@@ -609,6 +618,7 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     RelatedEddy.__name__: RELATED_EDDY_PAYLOAD,
     RelatedPraxis.__name__: RELATED_PRAXIS_PAYLOAD,
     TierModel.__name__: TIER_MODEL_PAYLOAD,
+    UploadManifestResponse.__name__: UPLOAD_MANIFEST_RESPONSE_PAYLOAD,
     UploadRequest.__name__: UPLOAD_REQUEST_PAYLOAD,
     UploadResponse.__name__: UPLOAD_RESPONSE_PAYLOAD,
     VaultState.__name__: VAULT_STATE_PAYLOAD,

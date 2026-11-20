@@ -117,11 +117,13 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.32.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.33.0.json"
 )
-"""The published document at contract 0.32.0: only ``info.version`` moves.
+"""The published document at contract 0.33.0: ``POST /v1/uploads`` gains a ``202``.
 
-0.32.0 moves no ``/v1`` shape: ``POST /v1/classifications`` now also writes
+0.33.0 (#2123) documents ``202`` ``UploadManifestResponse`` beside the
+upload's ``200``, for a loose Substack ``posts.csv``. 0.32.0 moves no
+``/v1`` shape: ``POST /v1/classifications`` now also writes
 ``04-Praxis/`` pages (#2122) and ``creek.purge.*`` gains a counter, neither
 of which is a path or schema. 0.31.0 (#2121) documents the advisory
 ``Retry-After`` header on the ``temporarily_unavailable`` response of every

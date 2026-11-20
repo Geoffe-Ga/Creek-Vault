@@ -535,6 +535,18 @@ still served `null` for that job, byte-identical, and `0.28` stays in the
 window. Adepthood can rely on `busy` only once its vendored
 `VaultJobFailureCode` carries it and its pin reaches `0.29`.
 
+`0.33.0` (#2123) gives `POST /v1/uploads` a second success. A Substack export
+uploaded as loose files — adepthood's folder import sends one request per file —
+is identified file by file: its `posts.csv` manifest answers `202`
+`UploadManifestResponse` (`status: "manifest"`, `source_type: "substack"`,
+`manifest_posts`) and writes no fragment, and each `<post_id>.<slug>.html` post
+with Substack's markup (or listed in that manifest) answers the usual `200`
+with `source_type: "substack"`, filed under `01-Fragments/Writing/Substack`.
+A caller declaring `0.32` or earlier is served `415 unsupported_source` for the
+manifest instead of the `202` its vendored contract cannot name, and `0.32`
+stays in the window. Adepthood can count the manifest as handled only once its
+upload result parser accepts the `202` body and its pin reaches `0.33`.
+
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE
 /v1/connectors/drive` and `POST /v1/connectors/drive/syncs`. It is additive in

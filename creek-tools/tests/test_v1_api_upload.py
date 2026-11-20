@@ -61,10 +61,12 @@ from creek_mcp.api.models import (
     ERROR_MESSAGES,
     ERROR_STATUS,
     RETRY_AFTER_ON_TEMPORARILY_UNAVAILABLE_SINCE_MINOR,
+    UPLOAD_MANIFEST_SINCE_MINOR,
     Capability,
     ErrorCode,
     ErrorEnvelope,
     JournalAction,
+    UploadManifestResponse,
     UploadResponse,
     minor_at_least,
 )
@@ -97,6 +99,7 @@ if TYPE_CHECKING:
     import httpx
 
 _OK_STATUS: Final[int] = 200
+HTTP_ACCEPTED: Final[int] = 202
 _INVALID_REQUEST_STATUS: Final[int] = ERROR_STATUS[ErrorCode.INVALID_REQUEST]
 _PRIVACY_REFUSED_STATUS: Final[int] = ERROR_STATUS[ErrorCode.PRIVACY_REFUSED]
 _INCOMPATIBLE_STATUS: Final[int] = ERROR_STATUS[ErrorCode.INCOMPATIBLE_VERSION]
@@ -699,6 +702,97 @@ def test_an_unrecognised_archive_lands_as_415_with_the_remedy(vault: Path) -> No
     assert body["code"] == ErrorCode.UNSUPPORTED_SOURCE.value
     assert "creek ingest" in body["message"]
     assert _fragments(vault) == []
+
+
+_SUBSTACK_MANIFEST: Final[bytes] = (
+    b"post_id,post_date,is_published,title\n171234567,2024-03-15,true,On Attention\n"
+)
+"""A Substack ``posts.csv`` manifest naming one post (#2123)."""
+
+_SUBSTACK_POST: Final[bytes] = (
+    b'<div class="captioned-image-container">'
+    b'<img src="https://substackcdn.com/image/fetch/x.png"/></div>'
+    b"<p>synthetic-substack-body-2123</p>"
+)
+"""One post body carrying Substack's editor markup (#2123)."""
+
+_PRE_MANIFEST_MINOR: Final[str] = "0.32"
+"""The last served minor before ``UploadManifestResponse`` existed."""
+
+
+def test_a_loose_substack_manifest_answers_202_and_writes_no_fragment(
+    vault: Path,
+) -> None:
+    """``posts.csv`` from an unzipped export is a manifest, not a spreadsheet.
+
+    Args:
+        vault: A seeded vault.
+    """
+    response = _post(
+        vault,
+        _body(filename="posts.csv", content=_SUBSTACK_MANIFEST, external_id="m:1"),
+    )
+
+    assert response.status_code == HTTP_ACCEPTED
+    parsed = UploadManifestResponse.model_validate(envelope(response))
+    assert parsed.status == "manifest"
+    assert parsed.source_type == "substack"
+    assert parsed.external_id == "m:1"
+    assert parsed.manifest_posts == 1
+    assert set(envelope(response)) == set(UploadManifestResponse.model_fields)
+    assert _fragments(vault) == []
+
+
+def test_a_pre_manifest_minor_is_refused_the_manifest_it_cannot_parse(
+    vault: Path,
+) -> None:
+    """A caller before 0.33 vendored no ``202`` on this route: it gets ``415``.
+
+    ``415 unsupported_source`` is what such a caller already handles for a
+    file Creek will not ingest as a document, and no fragment is written.
+
+    Args:
+        vault: A seeded vault.
+    """
+    assert not minor_at_least(_PRE_MANIFEST_MINOR, UPLOAD_MANIFEST_SINCE_MINOR)
+
+    response = _post(
+        vault,
+        _body(filename="posts.csv", content=_SUBSTACK_MANIFEST),
+        minor=_PRE_MANIFEST_MINOR,
+    )
+
+    assert response.status_code == _UNSUPPORTED_SOURCE_STATUS
+    assert envelope(response)["code"] == ErrorCode.UNSUPPORTED_SOURCE.value
+    assert _fragments(vault) == []
+
+
+def test_a_loose_substack_post_crosses_the_route_as_substack_writing(
+    vault: Path,
+) -> None:
+    """A post uploaded on its own lands in ``Writing/Substack``, dated.
+
+    Args:
+        vault: A seeded vault.
+    """
+    _post(vault, _body(filename="posts.csv", content=_SUBSTACK_MANIFEST))
+    response = _post(
+        vault,
+        _body(
+            filename="171234567.on-attention.html",
+            content=_SUBSTACK_POST,
+            external_id="p:1",
+        ),
+    )
+
+    assert response.status_code == _OK_STATUS
+    parsed = UploadResponse.model_validate(envelope(response))
+    assert parsed.source_type == "substack"
+    (fragment,) = _fragments(vault)
+    assert fragment.parent == vault / "01-Fragments" / "Writing" / "Substack"
+    metadata = frontmatter.load(fragment).metadata
+    assert metadata["title"] == "On Attention"
+    assert str(metadata["authored_at"]).startswith("2024-03-15")
 
 
 def test_the_refused_extension_sweep_is_not_vacuous() -> None:
