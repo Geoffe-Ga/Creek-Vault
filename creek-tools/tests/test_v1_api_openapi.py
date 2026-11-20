@@ -117,15 +117,17 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.31.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.32.0.json"
 )
-"""The published document at contract 0.31.0: ``503`` declares ``Retry-After``.
+"""The published document at contract 0.32.0: only ``info.version`` moves.
 
-0.31.0 (#2121) documents the advisory ``Retry-After`` header on the
-``temporarily_unavailable`` response of every route, since that refusal is
-reachable everywhere; no path, schema or status moves. 0.30.0 was MCP-only
-(``creek.revoice`` gains ``voice_check`` and refuses an unvoiced rewrite), so
-no ``/v1`` path or schema changes. 0.29.0 gave
+0.32.0 moves no ``/v1`` shape: ``POST /v1/classifications`` now also writes
+``04-Praxis/`` pages (#2122) and ``creek.purge.*`` gains a counter, neither
+of which is a path or schema. 0.31.0 (#2121) documents the advisory
+``Retry-After`` header on the ``temporarily_unavailable`` response of every
+route, since that refusal is reachable everywhere; no path, schema or status
+moves. 0.30.0 was MCP-only (``creek.revoice`` gains ``voice_check`` and
+refuses an unvoiced rewrite), so no ``/v1`` path or schema changes. 0.29.0 gave
 ``JobFailureCode`` ``busy`` (#2075), so ``JobStatusResponse`` moved on
 ``GET /v1/jobs/{job_id}``. The ``424 request_key_rejected`` 0.28.0 documented
 on ``POST /v1/reflections`` and ``POST /v1/letters/{external_id}`` is

@@ -47,6 +47,9 @@ class JobRuntime:
             garbage-collected mid-run.
         active_job_ids: Every job id this process is executing.
         active_job_by_consumer: The one job each consumer is running.
+        vault_pass_by_consumer: The subset of those jobs that are whole-vault
+            pipeline passes, by consumer, so a synchronous pass can run after
+            its own consumer's job rather than racing it (#2132).
     """
 
     worker_id: str = field(default_factory=_new_worker_id)
@@ -54,6 +57,7 @@ class JobRuntime:
     tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     active_job_ids: set[str] = field(default_factory=set)
     active_job_by_consumer: dict[str, str] = field(default_factory=dict)
+    vault_pass_by_consumer: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
 
     def busy(self, consumer: str) -> bool:
         """Return whether *consumer* already has a job running here.
@@ -66,7 +70,14 @@ class JobRuntime:
         """
         return consumer in self.active_job_by_consumer
 
-    def track(self, consumer: str, job_id: str, task: asyncio.Task[Any]) -> None:
+    def track(
+        self,
+        consumer: str,
+        job_id: str,
+        task: asyncio.Task[Any],
+        *,
+        vault_pass: bool = False,
+    ) -> None:
         """Register *task* as *consumer*'s active job until it finishes.
 
         Call under :attr:`admission_lock`, after :meth:`busy` said no.
@@ -75,11 +86,40 @@ class JobRuntime:
             consumer: The caller the job is bound to.
             job_id: The durable record's id.
             task: The task executing the job.
+            vault_pass: Whether the job is a whole-vault pipeline pass, which
+                :meth:`settle_vault_pass` lets a synchronous pass wait for.
         """
         self.tasks.add(task)
         self.active_job_ids.add(job_id)
         self.active_job_by_consumer[consumer] = job_id
+        if vault_pass:
+            self.vault_pass_by_consumer[consumer] = task
         task.add_done_callback(partial(self._release, consumer=consumer, job_id=job_id))
+
+    async def settle_vault_pass(self, consumer: str, timeout: float) -> None:
+        """Wait, at most *timeout* seconds, for *consumer*'s own vault-pass job.
+
+        Without this a synchronous pass sent after a detached one raced it for
+        the vault content lock, so which ran first — and whether the consumer's
+        next long request met the one-active-job refusal — was decided by
+        thread scheduling (#2132). Waiting first makes a consumer's passes run
+        in the order it sent them. The wait never cancels the job, and on
+        timeout the caller proceeds exactly as it did before: the content lock
+        still bounds it.
+
+        Determinism: :meth:`_release` was registered on the task before this
+        wait's own callback, and the loop runs a task's callbacks in order, so
+        once the job is done its admission slot is already free when this
+        returns.
+
+        Args:
+            consumer: The caller about to run a synchronous pass.
+            timeout: The longest wait, in seconds.
+        """
+        task = self.vault_pass_by_consumer.get(consumer)
+        if task is None:
+            return
+        await asyncio.wait({task}, timeout=timeout)
 
     def _release(self, task: asyncio.Task[Any], *, consumer: str, job_id: str) -> None:
         """Forget a finished task and free its consumer's admission slot.
@@ -95,3 +135,5 @@ class JobRuntime:
         self.active_job_ids.discard(job_id)
         if self.active_job_by_consumer.get(consumer) == job_id:
             del self.active_job_by_consumer[consumer]
+        if self.vault_pass_by_consumer.get(consumer) is task:
+            del self.vault_pass_by_consumer[consumer]

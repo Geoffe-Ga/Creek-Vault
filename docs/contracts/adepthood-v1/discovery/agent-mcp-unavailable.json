@@ -15,8 +15,8 @@
     "reading-recommendations",
     "export"
   ],
-  "contract_minor": "0.31",
-  "contract_version": "0.31.0",
+  "contract_minor": "0.32",
+  "contract_version": "0.32.0",
   "inference_pool": true,
   "keyless_inference": true,
   "ontology_version": "aptitude-wavelength/2026-05-23",
@@ -26,6 +26,7 @@
   ],
   "status": "ok",
   "supported_contract_minors": [
+    "0.32",
     "0.31",
     "0.30",
     "0.29",

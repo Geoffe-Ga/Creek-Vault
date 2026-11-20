@@ -120,6 +120,14 @@ structurally unreachable. The policy lives in
 actually raised — the observability that was missing when this field had
 an invisible (in fact absent) producer.
 
+A verdict is not yet an entity. After the per-fragment dispatch, still
+inside the content-mutation lock, the engine runs
+:func:`creek.classify.praxis_writer.write_praxis_pages`, which writes one
+``proposed`` ``04-Praxis/`` page per ``explicit`` fragment that has none
+(#2122) — before it, :meth:`~creek.vault.writer.VaultWriter.write_praxis`
+had no caller and ``04-Praxis/`` never filled.
+:attr:`ClassifySummary.praxis_written` counts them.
+
 Tags pass (issue #878)
 ----------------------
 
@@ -230,6 +238,7 @@ from creek.classify.llm import LLMClassifier
 from creek.classify.llm.pool_boundary import declared_pool_request, pool_wire_tier
 from creek.classify.llm.router import NON_INTIMATE_ROUTE, IntimateRoutingError
 from creek.classify.praxis_pass import apply_praxis
+from creek.classify.praxis_writer import write_praxis_pages
 from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
 from creek.classify.privacy_pass import (
@@ -466,6 +475,11 @@ class ClassifySummary:
             fabricated ``weighted`` block is cleared either way. Not a subset
             of :attr:`preserved_llm` but its complement: these are exactly the
             fragments that stamp would otherwise have stranded.
+        praxis_written: ``04-Praxis/`` pages the post-pass created (#2122) —
+            one per ``explicit`` fragment in the vault that had none yet,
+            including fragments this run preserved. A second run over an
+            unchanged vault reports ``0``; a page that could not be written
+            is reported on :attr:`errors` instead.
     """
 
     total: int
@@ -483,6 +497,7 @@ class ClassifySummary:
     retiered: int = 0
     llm_call_failed: int = 0
     healed_unearned_llm: int = 0
+    praxis_written: int = 0
 
 
 @dataclass
@@ -840,6 +855,12 @@ def _run_classify_with_content_lock_held(
         lock=threading.Lock(),
     )
     _dispatch_files(files, process_one, workers=workers)
+    # Post-pass (#2122), still under the content lock ``run_classify`` holds:
+    # materialise a 04-Praxis page for every explicit fragment lacking one.
+    # Vault-wide rather than per-classified-fragment, so a vault whose
+    # fragments the resume short-circuit preserved still backfills.
+    praxis = write_praxis_pages(vault_path)
+    counts.errors.extend(praxis.errors)
 
     return ClassifySummary(
         total=counts.total,
@@ -857,6 +878,7 @@ def _run_classify_with_content_lock_held(
         retiered=counts.retiered,
         llm_call_failed=counts.llm_call_failed,
         healed_unearned_llm=counts.healed_unearned_llm,
+        praxis_written=praxis.written,
     )
 
 

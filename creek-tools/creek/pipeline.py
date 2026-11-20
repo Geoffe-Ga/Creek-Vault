@@ -41,6 +41,7 @@ from creek.audit.yield_summary import (
 from creek.classify.audience import AudienceClassifier
 from creek.classify.classify_engine import build_tier_classifiers
 from creek.classify.praxis_pass import apply_praxis
+from creek.classify.praxis_writer import write_praxis_pages
 from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
 from creek.classify.privacy_pass import PRIVACY_TIER_KEY, apply_tier, reassess
@@ -373,6 +374,9 @@ class PipelineResult(BaseModel):
             would have been routed to the LLM if Pass 3 were enabled.
             Always reported, even on normal runs that did dispatch the
             residue.
+        praxis_pages_written: ``04-Praxis/`` pages written for ``explicit``
+            fragments that had none (#2122), by the same post-pass
+            ``creek classify`` runs.
         errors: Human-readable error messages collected from each stage.
             Each entry is prefixed with its source ingestor name so the
             user can trace the failure back to the offending file.
@@ -397,6 +401,7 @@ class PipelineResult(BaseModel):
     deterministic_classified: int = 0
     local_model_processed: int = 0
     residue: int = 0
+    praxis_pages_written: int = 0
     errors: list[str] = Field(default_factory=list)
     contested_sources: list[str] = Field(default_factory=list)
     unclaimed_sources: list[str] = Field(default_factory=list)
@@ -594,6 +599,12 @@ class Pipeline:
 
             # Stage 4: Vault write -- persist classified fragments+bodies.
             self._write_to_vault(classified, vault_path, result)
+
+            # Stage 4b (#2122): the explicit verdicts stage 3 stamped become
+            # 04-Praxis pages, in the same locked window as their sources.
+            praxis = write_praxis_pages(vault_path)
+            result.praxis_pages_written = praxis.written
+            result.errors.extend(praxis.errors)
         return classified
 
     def _emit_yield_summary(

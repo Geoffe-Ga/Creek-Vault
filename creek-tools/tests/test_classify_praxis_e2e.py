@@ -220,3 +220,73 @@ def test_report_decisions_is_idempotent_after_the_praxis_pass(
         assert result.exit_code == 0, result.output
 
     assert len(_active_decision_notes(vault)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 04-Praxis (#2122)
+# --------------------------------------------------------------------------- #
+
+_SIT_FRAGMENT_ID = "frag-praxis-sit01"
+
+_SIT_BODY = (
+    "From now on, I'm committing to a 10-minute morning sit.\n"
+    "I will keep the cushion by the window."
+)
+"""Practice language that scores ``explicit`` on two distinct moderate markers.
+
+``from now on`` and ``I will`` are both sentence-anchored first-person
+commitments (:data:`creek.classify.praxis_pass._PRAXIS_SIGNALS`); "morning"
+maps the page to ``habit`` and so to ``04-Praxis/Daily/``.
+"""
+
+
+def _seed_sit(vault: Path) -> None:
+    """Write the morning-sit fragment into a scaffolded *vault*."""
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    write_fragment_file(
+        vault=vault,
+        fragment=Fragment(
+            id=_SIT_FRAGMENT_ID,
+            title="Cushion notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_SIT_BODY,
+    )
+
+
+def _praxis_pages(vault: Path) -> list[Path]:
+    """Return every markdown page under ``04-Praxis``, sorted."""
+    root = vault / "04-Praxis"
+    return sorted(root.rglob("*.md")) if root.is_dir() else []
+
+
+@pytest.mark.integration
+def test_classify_writes_a_daily_praxis_page_derived_from_the_fragment(
+    tmp_path: Path,
+) -> None:
+    """``creek classify`` turns an explicit fragment into a ``Daily`` page, once.
+
+    Before #2122 the fragment gained ``praxis_potential: explicit`` and
+    ``04-Praxis/`` stayed empty forever: ``write_praxis`` had no caller.
+    """
+    vault = tmp_path / "vault"
+    _seed_sit(vault)
+    assert _praxis_pages(vault) == []
+
+    for _ in range(2):
+        result = runner.invoke(
+            app, ["classify", "--method", "rules", "--vault", str(vault)]
+        )
+        assert result.exit_code == 0, result.output
+
+    pages = _praxis_pages(vault)
+    assert len(pages) == 1, f"expected exactly one praxis page, got {pages}"
+    assert pages[0].parent == vault / "04-Praxis" / "Daily"
+    meta = frontmatter.load(str(pages[0])).metadata
+    assert meta["derived_from"] == [_SIT_FRAGMENT_ID]
+    assert meta["praxis_type"] == "habit"
+    assert meta["status"] == "proposed"
+    assert meta["title"] == "From now on, I'm committing to a 10-minute morning sit."

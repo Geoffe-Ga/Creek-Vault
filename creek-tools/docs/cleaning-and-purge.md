@@ -393,6 +393,16 @@ notes that carry no pointer, and the counter is not incremented for a
 refused pointer either — in a dry run or a real one. A dry-run
 otherwise reports what *would* be removed without touching disk.
 
+It also carries `praxis_pages_removed` (#2122): the number of
+`04-Praxis/` pages deleted because the purged fragment was their only
+`derived_from` source. The classify post-pass titles such a page with that
+fragment's first sentence, so the page is a copy of erased content rather
+than a reference to it, and the id scrub alone would leave the sentence
+behind. A page that names other sources too keeps the ordinary id scrub.
+Known residual, shared with every page `VaultWriter` writes: the
+title-derived filename stays in that folder's `.id-index.jsonl` and in
+`00-Creek-Meta/Processing-Log/provenance.jsonl`.
+
 It also carries `voice_artifacts_removed` (#1211): the number of
 derived `07-Voice/` notes deleted because they held the purged
 fragment's own content — its `Register-Samples` file copy, the

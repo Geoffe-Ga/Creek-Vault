@@ -44,6 +44,7 @@ import frontmatter
 from pydantic import BaseModel, Field
 
 from creek._containment import escaping_child
+from creek.classify.praxis_writer import praxis_page_sources
 from creek.clean.hygiene import is_external_target
 from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
 from creek.ingest.ledger import forget_fragment_ids
@@ -75,6 +76,9 @@ _VAULT_CONTENT_FOLDERS: tuple[str, ...] = (
 
 VAULT_PURGE_CONFIRMATION = "I understand this is irreversible"
 """Exact phrase required to confirm a full-vault purge."""
+
+_PRAXIS_RELDIR: str = "04-Praxis"
+"""Vault folder holding praxis pages compiled from fragments (#2122)."""
 
 _VOICE_RELDIR: str = "07-Voice"
 """Vault folder holding the voice subsystem's derived artifacts (#1211)."""
@@ -1094,6 +1098,14 @@ class PurgeResult(BaseModel):
             :attr:`fragments_affected`: these are derived copies, not
             fragments, and the same rule already governs
             :attr:`journal_staged_removed`.
+        praxis_pages_removed: Number of ``04-Praxis/`` pages deleted because
+            the purged fragment was their **only** ``derived_from`` source
+            (#2122). The classify post-pass titles such a page with that
+            fragment's first sentence, so it is a copy of the erased content,
+            not a reference to it; a page with other sources keeps the
+            ordinary provenance scrub. Counted-only in a dry run, and like
+            :attr:`voice_artifacts_removed` never appended to
+            :attr:`deleted_files`.
         ledger_rows_removed: Number of ingest-ledger **rows** physically
             erased from ``00-Creek-Meta/State/ingest/*.jsonl`` because
             they named a purged fragment, or named a source unit a
@@ -1146,6 +1158,7 @@ class PurgeResult(BaseModel):
     intimate_stubs_removed: int = 0
     journal_staged_removed: int = 0
     voice_artifacts_removed: int = 0
+    praxis_pages_removed: int = 0
     ledger_rows_removed: int = 0
     meta_artifacts_removed: int = 0
     voice_body_undecodable: list[str] = Field(default_factory=list)
@@ -1266,6 +1279,7 @@ class PurgeEngine:
             # rewrites it to ``[[[purged]]]``. Swept afterwards, the
             # sweep would be blind to exactly the notes quoting the body.
             self._purge_voice_artifacts(fragment_id, frag_file, result)
+            self._purge_praxis_pages(fragment_id, result)
             # One vault walk applies both the wiki-link and provenance scrubs.
             wiki_count, md_count, prov_count = self._scrub_references(
                 title=title,
@@ -1896,6 +1910,10 @@ class PurgeEngine:
             frag_file,
             result,
         )
+        self._purge_praxis_pages(
+            frag_id if isinstance(frag_id, str) else "",
+            result,
+        )
         # One vault walk applies both the wiki-link and provenance scrubs.
         wiki_count, md_count, prov_count = self._scrub_references(
             title=title,
@@ -2300,6 +2318,33 @@ class PurgeEngine:
                 self._ledger.mark_removed(target)
             else:
                 target.unlink(missing_ok=True)
+
+    def _purge_praxis_pages(self, fragment_id: str, result: PurgeResult) -> None:
+        """Delete the ``04-Praxis/`` pages derived solely from *fragment_id* (#2122).
+
+        Run before the reference scrub, which would otherwise rewrite the id
+        to :data:`PURGED_MARKER` and blind this match. A page naming other
+        sources too is left to that scrub: it is (or may be) the owner's own
+        synthesis, and the remaining sources still justify it.
+
+        Args:
+            fragment_id: Id of the fragment being purged. Empty skips.
+            result: Accumulator; ``praxis_pages_removed`` counts each page
+                removed (or that an apply run would remove).
+        """
+        root = self.vault_path / _PRAXIS_RELDIR
+        if not fragment_id or not root.is_dir():
+            return
+        for page in _contained_md_files(root, vault_path=self.vault_path):
+            if praxis_page_sources(page) != [fragment_id]:
+                continue
+            if self._skip_as_removed(page):
+                continue
+            result.praxis_pages_removed += 1
+            if self.dry_run:
+                self._ledger.mark_removed(page)
+            else:
+                page.unlink(missing_ok=True)
 
     @staticmethod
     def _contained_voice_artifact(
@@ -3486,6 +3531,7 @@ class PurgeEngine:
             intimate_stubs_removed=result.intimate_stubs_removed,
             journal_staged_removed=result.journal_staged_removed,
             voice_artifacts_removed=result.voice_artifacts_removed,
+            praxis_pages_removed=result.praxis_pages_removed,
             ledger_rows_removed=result.ledger_rows_removed,
             meta_artifacts_removed=result.meta_artifacts_removed,
             dry_run=result.dry_run,

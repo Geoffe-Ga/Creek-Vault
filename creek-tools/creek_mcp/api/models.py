@@ -105,6 +105,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.31",
     "0.30",
     "0.29",
     "0.28",

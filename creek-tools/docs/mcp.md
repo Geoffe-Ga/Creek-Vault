@@ -1038,7 +1038,9 @@ Operational rules:
   hand-maintained list had dropped: `embeddings_removed`,
   `provenance_scrubbed`, `intimate_stubs_removed`,
   `journal_staged_removed`, `voice_artifacts_removed` and
-  `voice_body_undecodable`.
+  `voice_body_undecodable`. Since contract 0.32 it also carries
+  `praxis_pages_removed` (#2122): `04-Praxis/` pages deleted because the
+  purged fragment was their only source.
 
 Example `.mcp.json` for a Claude Code instance configured for
 destructive ops (replace the token with a freshly generated one — the

@@ -3137,6 +3137,8 @@ def classify(
         # Issue #877: same reasoning for the praxis axis — it is the only
         # visible evidence that the field has a producer at all.
         f"{summary.praxis_marked} praxis marked, "
+        # Issue #2122: the 04-Praxis pages those verdicts produced.
+        f"{summary.praxis_written} praxis page(s) written, "
         # Issue #878: and again for hashtag tags. Counts fragments gained,
         # not tags written, so a second run over an unchanged vault reports
         # zero rather than re-reporting the whole vault.
@@ -7681,6 +7683,10 @@ def _render_purge_result(result: PurgeResult) -> None:
     if result.intimate_stubs_removed:
         console.print(
             f"Intimate stubs removed: {result.intimate_stubs_removed}",
+        )
+    if result.praxis_pages_removed:
+        console.print(
+            f"Praxis pages removed: {result.praxis_pages_removed}",
         )
     if result.ledger_rows_removed:
         console.print(
