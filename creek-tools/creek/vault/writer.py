@@ -2137,7 +2137,12 @@ class VaultWriter:
             extra_frontmatter={"aliases": [eddy.title]},
         )
 
-    def write_praxis(self, praxis: Praxis) -> Path:
+    def write_praxis(
+        self,
+        praxis: Praxis,
+        *,
+        privacy_tier: PrivacyTier | None = None,
+    ) -> Path:
         """Write a Praxis to 04-Praxis/{type}/.
 
         Maps praxis_type to subfolder: habit/practice -> Daily,
@@ -2146,13 +2151,25 @@ class VaultWriter:
 
         Args:
             praxis: The Praxis model to write.
+            privacy_tier: The tier the page inherits from its sources, stamped
+                as ``privacy_tier`` frontmatter (#2122). :class:`Praxis` has no
+                such field, so a page compiled from fragment text carries its
+                source's tier only when the caller passes it here.
 
         Returns:
             Path to the written (or existing duplicate) markdown file.
         """
         subfolder = _PRAXIS_SUBFOLDER.get(str(praxis.praxis_type), "Situational")
         target_dir = self.vault_path / _PRAXIS_RELPART / subfolder
-        return self._write_model(praxis, target_dir, body=_render_praxis_body(praxis))
+        extra: dict[str, object] | None = (
+            None if privacy_tier is None else {"privacy_tier": privacy_tier.value}
+        )
+        return self._write_model(
+            praxis,
+            target_dir,
+            body=_render_praxis_body(praxis),
+            extra_frontmatter=extra,
+        )
 
     def write_decision(self, decision: Decision) -> Path:
         """Write a Decision to 08-Decisions/{status}/.

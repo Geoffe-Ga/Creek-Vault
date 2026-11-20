@@ -114,6 +114,10 @@ class PurgeAuditEntry(BaseModel):
             removed. Without this field the outcome line reported a
             successful erasure while the body survived in a derived
             artifact.
+        praxis_pages_removed: Number of ``04-Praxis/`` pages deleted because
+            the purged fragment was their only ``derived_from`` source and
+            their title copies its first sentence (#2122). Zero for entries
+            written before that field existed.
         ledger_rows_removed: Number of ingest-ledger rows physically
             erased from ``00-Creek-Meta/State/ingest/*.jsonl`` because
             they named a purged fragment or the source unit it came
@@ -168,6 +172,7 @@ class PurgeAuditEntry(BaseModel):
     intimate_stubs_removed: int = 0
     journal_staged_removed: int = 0
     voice_artifacts_removed: int = 0
+    praxis_pages_removed: int = 0
     ledger_rows_removed: int = 0
     meta_artifacts_removed: int = 0
     operator: str = _DEFAULT_OPERATOR
@@ -206,6 +211,7 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("intimate_stubs_removed", 0)
     upgraded.setdefault("journal_staged_removed", 0)
     upgraded.setdefault("voice_artifacts_removed", 0)
+    upgraded.setdefault("praxis_pages_removed", 0)
     upgraded.setdefault("ledger_rows_removed", 0)
     upgraded.setdefault("meta_artifacts_removed", 0)
     # GAP-002 fields take their schema defaults via Pydantic when
@@ -378,6 +384,7 @@ class PurgeAuditLog:
             "intimate_stubs_removed": 0,
             "journal_staged_removed": 0,
             "voice_artifacts_removed": 0,
+            "praxis_pages_removed": 0,
             "ledger_rows_removed": 0,
             "meta_artifacts_removed": 0,
             "operator": "system",

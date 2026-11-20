@@ -9,6 +9,25 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Classification fills `04-Praxis/` (#2122, contract 0.32).**
+  `VaultWriter.write_praxis` had no caller, so a fragment marked
+  `praxis_potential: explicit` never became a Praxis page and
+  `related_praxis` on `/v1/reflections` was always empty.
+  - `creek classify`, `POST /v1/classifications` and `creek process` end with
+    a post-pass (`creek/classify/praxis_writer.py`), inside the
+    content-mutation lock, that writes one `proposed` page per explicit
+    fragment lacking one: `derived_from: [<id>]`, the fragment's first
+    sentence as title (80 characters at most), `praxis_type` from a keyword
+    map (habit → `Daily/`, commitment → `Seasonal/`, else `Situational/`), and
+    the source's `privacy_tier` (missing → `intimate`).
+  - Dedupe is by `derived_from` across all of `04-Praxis/`: a re-run never
+    writes a second page and never rewrites one the owner edited or moved.
+  - `ClassifySummary.praxis_written` / `PipelineResult.praxis_pages_written`
+    count the pages; the CLI prints them.
+  - A scoped purge deletes a page whose only source is the purged fragment
+    and reports `praxis_pages_removed` (CLI, audit log, `creek.purge.*`).
+  - The OpenAPI golden (`openapi-0.32.0.json`) and the `adepthood-v1` bundle
+    are regenerated for the version string only. No `/v1` shape moves.
 - **Contract 0.31.0: `temporarily_unavailable` says when to come back
   (#2121).** A classify or link pass holds the vault content-mutation lock for
   its whole run, so an upload arriving meanwhile waited its 10 s bound and was

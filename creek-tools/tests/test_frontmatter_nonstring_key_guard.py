@@ -170,6 +170,7 @@ _HELPER_BRACKETING_SITES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("classify/review_runner.py", "_read_entry"),
         ("classify/classify_engine.py", "_load_classifiable_fragment"),
         ("author/checks.py", "_scan_subtree_for_cited"),
+        ("classify/praxis_writer.py", "_write_one"),
         ("voice_drafts.py", "_load_path"),
     },
 )

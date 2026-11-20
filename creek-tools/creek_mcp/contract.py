@@ -20,8 +20,19 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.31.0"
+CONTRACT_VERSION: Final[str] = "0.32.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.32.0 (#2122): classification materialises ``04-Praxis/``. ``creek.classify``
+and ``POST /v1/classifications`` (and ``creek process``) now end with a
+post-pass, inside the same content-mutation lock, that writes one
+``status: proposed`` praxis page per ``praxis_potential: explicit`` fragment
+lacking one, ``derived_from`` that fragment and stamped with its tier. Before
+it, ``related_praxis`` on ``/v1/reflections`` could never be non-empty.
+``creek.purge.*`` results gain the integer ``praxis_pages_removed``: a page
+whose only source is the purged fragment copies its first sentence, so it is
+deleted rather than id-scrubbed. No ``/v1`` route, wire model or capability
+moves; ``0.31`` stays served.
 
 0.31.0 (#2121): every ``503 temporarily_unavailable`` served to a caller
 declaring 0.31 or later carries an advisory ``Retry-After: 30``, whichever

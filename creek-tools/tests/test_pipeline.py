@@ -14,6 +14,7 @@ import shutil
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import frontmatter
 import pytest
 
 from creek.config import CreekConfig
@@ -1942,6 +1943,31 @@ class TestPipelinePraxisPass:
             "frag-praxispipe01": PraxisPotential.EXPLICIT.value,
             "frag-praxispipe02": PraxisPotential.NONE.value,
         }
+
+    def test_process_writes_the_praxis_page_inside_the_locked_window(
+        self, vault_path: Path
+    ) -> None:
+        """``creek process`` writes 04-Praxis too, like ``creek classify`` (#2122).
+
+        Ingestion is stubbed to one signal-bearing fragment; classification
+        and the vault write run for real, and the page lands in the same
+        content-locked window that wrote its source.
+        """
+        pipeline = Pipeline(config=CreekConfig(), no_llm=True)
+        item = self._ingested(
+            "frag-praxispipe2122",
+            "From now on I sit every morning.\nI will keep it short.",
+        )
+        result = PipelineResult()
+        with patch.object(Pipeline, "_run_ingestion", return_value=[item]):
+            pipeline._ingest_classify_write(vault_path, vault_path, result)
+
+        pages = sorted((vault_path / "04-Praxis").rglob("*.md"))
+        assert result.praxis_pages_written == 1
+        assert [page.parent.name for page in pages] == ["Daily"]
+        assert frontmatter.load(str(pages[0])).metadata["derived_from"] == [
+            "frag-praxispipe2122"
+        ]
 
     def test_praxis_pass_never_demotes_an_llm_verdict(self, vault_path: Path) -> None:
         """A fragment already ``latent`` is not reset to ``none`` by the pass.

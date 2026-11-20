@@ -73,7 +73,8 @@ Nearly every use in this package brackets a bare
 ``frontmatter.load``/``loads`` call and nothing else. The exceptions are
 enumerated exhaustively here — :func:`iter_vault_fragments` below,
 :func:`creek.classify.review_runner._read_entry`,
-:func:`creek.author.checks._scan_subtree_for_cited`, and
+:func:`creek.author.checks._scan_subtree_for_cited`,
+:func:`creek.classify.praxis_writer._write_one`, and
 :func:`creek.classify.classify_engine._load_classifiable_fragment` — and they
 bracket a single call to :func:`try_load_fragment` (or to
 ``classify_engine._read_fragment``, a thin alias for it) instead, because that
