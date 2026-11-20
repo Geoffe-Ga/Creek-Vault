@@ -593,6 +593,32 @@ intimate-never-cloud gate; this is a scheduling change, not an egress bypass.
 must poll rather than assume prompt completion. The operator CLI forms remain
 available for local workflows.
 
+#### Checking that every folder fills
+
+`GET /v1/pipeline/status` lists every scaffolded folder with its note count and
+the writer that fills it, or the reason nothing does. The hermetic e2e lane
+`tests/e2e/test_ontology_population_e2e.py` (#2125) proves that registry: it
+uploads the dummy corpus in `tests/fixtures/ontology_corpus/` (rendered by
+`tests/e2e/ontology_corpus.py`, which dates it relative to today), runs every
+writer, and fails unless each written folder gained a note during its own
+writer's stage and every upload's stage trail reads `ok`. A link pass that
+detected an eddy or thread and failed to write its page reports
+`skipped_materialisation` on `creek.link` and records `partial`, so it fails the
+lane rather than passing as a log line. Run it with `./scripts/test.sh --e2e`.
+To inspect the same corpus by hand against a live temporary server instead,
+scaffold a throwaway vault with `creek init --vault /tmp/creek-demo`, export
+`CREEK_MCP_CONSUMER_TOKENS="adepthood=<a 32+ character token>"`, and start the
+API from `creek-tools/` with
+`python -m scripts.dast_serve --config /tmp/creek-demo/00-Creek-Meta/creek_config.yaml`
+(loopback, port 8823, with an access log on stderr). Then send each
+`ontology_corpus.uploads(date.today())` entry to `POST /v1/uploads` with your
+bearer token, `X-Creek-Contract-Version: 0.34` and
+`X-Creek-Tier-Ceiling: personal`, call `/v1/classifications` and the four
+`/v1/links` methods, and read `GET /v1/pipeline/status`. A live server uses the
+real embedding model and OCR, so its counts can differ from the lane's; the
+CLI-only writers (`creek report`, `save`, `compile`, `draft`, `compost scan`)
+are run against the same vault with `--vault /tmp/creek-demo`.
+
 #### What these routes deliberately do not offer
 
 - **A fragment selector.** There is none, and adding one would be a mistake:

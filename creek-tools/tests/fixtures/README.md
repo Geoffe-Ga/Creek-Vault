@@ -12,6 +12,7 @@ tests/fixtures/
 ├── corrupt/                        — malformed inputs (truncated, empty, bad YAML)
 ├── encoding/                       — non-UTF-8 inputs (cp1252, shift_jis, BOM)
 ├── injection/                      — adversarial inputs (YAML in body, secret look-alikes)
+├── ontology_corpus/                — the dummy corpus that must fill every ontology folder (#2125)
 ├── scale/                          — large inputs to surface quadratic blowups
 ├── symlinks/                       — instructions for runtime-built symlink fixtures
 └── sample_*.{json,md}              — happy-path fixtures (legacy location)

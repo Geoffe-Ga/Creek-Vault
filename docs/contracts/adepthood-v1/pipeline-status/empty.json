@@ -412,7 +412,7 @@
       "count": 0,
       "last_written_at": null,
       "path": "10-Liminal/Unnamed",
-      "writer": "generate.unnamed",
+      "writer": "save",
       "writer_reason": null
     },
     {
@@ -426,7 +426,7 @@
       "count": 0,
       "last_written_at": null,
       "path": "11-Other-Authors",
-      "writer": "authors",
+      "writer": "ingest",
       "writer_reason": null
     },
     {

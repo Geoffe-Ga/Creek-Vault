@@ -657,14 +657,14 @@
       "capability": null,
       "model": "PipelineStatusResponse",
       "path": "pipeline-status/empty.json",
-      "sha256": "83d7f270600b4f8a6cea2b19397ad6a56e53ff9ddc38c49cde1ecb1253085993",
+      "sha256": "26f3ca8975ad9fc89bb2a6193967d345d9dbf5fe6bb2ec879565ab4383f53d31",
       "state": null
     },
     {
       "capability": null,
       "model": "PipelineStatusResponse",
       "path": "pipeline-status/success.json",
-      "sha256": "7ca19865d07d0fc517153951bb17d5e8eee8174f3d2942787e60714d828d0d7a",
+      "sha256": "ea5c9531556d72799e896e0e2f019dd7d64ebbb533d396f5895f8f9b894d9db4",
       "state": null
     },
     {
