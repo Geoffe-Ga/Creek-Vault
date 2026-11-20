@@ -20,8 +20,20 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.30.0"
+CONTRACT_VERSION: Final[str] = "0.31.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.31.0 (#2121): every ``503 temporarily_unavailable`` served to a caller
+declaring 0.31 or later carries an advisory ``Retry-After: 30``, whichever
+layer refused it. The case that earned it is an upload, journal write or
+pipeline request meeting the vault content-mutation lock while a classify or
+link pass holds it for its whole run: the refusal said only "transient", so a
+bulk seeder guessed, gave up, and most of a folder never landed. The value is
+the constant :data:`~creek_mcp.httpapi.errors.TRANSIENT_RETRY_AFTER_SECONDS`,
+not a figure derived from the running pass, and like ``429``'s it is a hint
+outside ``retry-policy.json``. A caller declaring 0.30 or earlier is served
+the response its minor published, byte-identical, with no header. No route,
+body, status, error code or MCP tool shape moves; ``0.30`` stays served.
 
 0.30.0: ``creek.revoice`` judges whether it applied the owner's voice. It is
 grounded in owner-authored style skills or the owner's register samples,

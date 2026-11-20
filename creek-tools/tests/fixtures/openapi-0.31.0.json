@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.30.0",
+    "version": "0.31.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -83,6 +83,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -203,6 +213,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -331,6 +351,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -489,6 +519,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         },
@@ -607,6 +647,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         }
@@ -723,6 +773,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -855,6 +915,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         },
@@ -983,6 +1053,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         }
@@ -1099,6 +1179,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -1269,6 +1359,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         },
@@ -1387,6 +1487,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         }
@@ -1491,6 +1601,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -1601,6 +1721,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         }
@@ -1707,6 +1837,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -1837,6 +1977,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -1985,6 +2135,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         },
@@ -2111,6 +2271,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -2244,6 +2414,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         }
@@ -2373,6 +2553,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         }
@@ -2499,6 +2689,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }
@@ -2640,6 +2840,16 @@
                   "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
+                }
+              }
             }
           }
         }
@@ -2727,6 +2937,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "description": "Advisory wait before retrying, as integer delta-seconds (RFC 9110 §10.2.3). Sent to callers declaring contract 0.31 or later, and always the constant 30: the commonest cause is the vault's content-mutation lock, held for the whole of a classify or link pass, and a wait derived from that pass's progress would tell a prober how much work the vault holds. Deliberately outside retry-policy.json, which says whether to retry and is contract; this says when and is a hint.",
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "example": 30
                 }
               }
             }

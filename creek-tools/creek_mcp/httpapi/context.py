@@ -36,6 +36,9 @@ from time import monotonic
 from typing import TYPE_CHECKING, Final
 from uuid import uuid4
 
+from starlette.datastructures import Headers
+
+from creek_mcp.api.routes import CONTRACT_VERSION_HEADER
 from creek_mcp.tier_ceiling import TierCeiling
 
 if TYPE_CHECKING:
@@ -122,6 +125,15 @@ class RequestContext:
             never outlive the vault request that wanted the answer (ADR-0016
             Decision 1 item 4). It names an instant, never a duration, because
             a duration read later in the stack would restart the clock.
+        contract_version: The caller's ``X-Creek-Contract-Version`` exactly as
+            sent, or ``None`` when it sent none. Recorded at the edge so a
+            refusal rendered by a layer *above* the router — the shedder, the
+            deadline — can still decide which headers the caller's minor was
+            published with (#2121). It is never validated here, never logged
+            and never echoed: the version gate refuses an unserved value, and
+            every reader compares it through
+            :func:`~creek_mcp.api.models.minor_at_least`, which fails closed on
+            anything unparseable.
     """
 
     request_id: str
@@ -130,6 +142,7 @@ class RequestContext:
     ceiling: TierCeiling = TierCeiling.OPEN
     started: bool = False
     deadline: float | None = None
+    contract_version: str | None = None
 
     def remaining(self) -> float | None:
         """Return the seconds left before this request's deadline fires.
@@ -155,7 +168,10 @@ def bind_context(scope: Scope) -> RequestContext:
     Returns:
         The freshly minted context, already attached.
     """
-    context = RequestContext(request_id=uuid4().hex)
+    context = RequestContext(
+        request_id=uuid4().hex,
+        contract_version=Headers(scope=scope).get(CONTRACT_VERSION_HEADER),
+    )
     scope[SCOPE_KEY] = context
     return context
 
