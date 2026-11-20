@@ -8,6 +8,29 @@
   "external_id": "adepthood-voicedraft-4ab787c21ef0",
   "fragment_id": "voice-draft-88f3a410be6c2e9a95d7d0ab",
   "letter": "You took the long way home so you could hear the river before deciding. That is not delay; it is a practice you already keep. Let the next choice wait for the same quiet.",
+  "related_eddies": [
+    {
+      "description": "Synthetic example description of a topic cluster.",
+      "formed": "2026-03-04",
+      "fragment_count": 12,
+      "title": "Rest and Ruin"
+    }
+  ],
+  "related_praxis": [
+    {
+      "excerpt": "Synthetic example prose. A real excerpt is the praxis page's own opening lines, taken verbatim and capped.",
+      "praxis_type": "practice",
+      "status": "active",
+      "title": "Rest before the collapse"
+    }
+  ],
+  "related_threads": [
+    {
+      "id": "thread-0000000001",
+      "status": "active",
+      "title": "Leaving the firm"
+    }
+  ],
   "status": "ok",
   "tier": "personal",
   "tier_ceiling": "personal",

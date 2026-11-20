@@ -1,0 +1,39 @@
+{
+  "$defs": {
+    "ThreadLifecycle": {
+      "description": "The three thread statuses, mirroring :class:`creek.models.ThreadStatus`.\n\nRead from the ``02-Threads/`` subfolder a thread page lives in (#2127).\n\nAttributes:\n    ACTIVE: A current that is still running.\n    DORMANT: Quiet for now, not over.\n    RESOLVED: A current that has run its course.",
+      "enum": [
+        "active",
+        "dormant",
+        "resolved"
+      ],
+      "title": "ThreadLifecycle",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One narrative thread the entry belongs to (contract 0.36, #2127).\n\nA thread page is compiled from the fragments that link to it, exactly as\nan eddy is, so it carries :class:`RelatedEddy`'s caveat:\n:mod:`creek_mcp.compiled_pages` names a thread only when one of the\nentry's seed fragments is a member, the members it can enumerate account\nfor the page's ``fragment_count``, and every one of them is within the\ncaller's ceiling. Only these three labels cross the wire \u2014 never the\npage's body, description or member count.\n\nAttributes:\n    id: The thread page's own ``id``.\n    title: The thread page's title.\n    status: :class:`ThreadLifecycle`, from the subfolder it lives in.",
+  "properties": {
+    "id": {
+      "description": "The thread page's own id.",
+      "title": "Id",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/ThreadLifecycle",
+      "description": "active, dormant or resolved."
+    },
+    "title": {
+      "description": "The thread page's title.",
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "status"
+  ],
+  "title": "RelatedThread",
+  "type": "object"
+}

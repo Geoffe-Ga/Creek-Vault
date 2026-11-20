@@ -25,6 +25,13 @@
       "title": "Rest before the collapse"
     }
   ],
+  "related_threads": [
+    {
+      "id": "thread-0000000001",
+      "status": "active",
+      "title": "Leaving the firm"
+    }
+  ],
   "routed_tier": "personal",
   "status": "ok",
   "tier_ceiling": "personal",

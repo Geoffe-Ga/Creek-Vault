@@ -118,15 +118,19 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.35.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.36.0.json"
 )
-"""The published document at contract 0.35.0.
+"""The published document at contract 0.36.0.
 
-0.35.0 (#2126) adds the optional ``voice`` (``owner`` | ``higher_self``) to
-``LetterResponse`` and ``ReflectionResponse``, and the ``ReplyVoice`` enum
-they share; no path or status moves. 0.34.0 (#2124) adds the
-``getPipelineStatus`` operation, its ``limit`` query parameter and the six
-``Pipeline*`` schemas; no existing path moves. 0.33.0
+0.36.0 (#2127) adds the optional ``related_threads`` to ``ReflectionResponse``
+and ``related_praxis`` / ``related_eddies`` / ``related_threads`` to
+``LetterResponse``, with the ``RelatedThread`` model and ``ThreadLifecycle``
+enum; no path or status moves. 0.35.0 (#2126) adds the optional ``voice``
+(``owner`` | ``higher_self``) to ``LetterResponse`` and
+``ReflectionResponse``, and the ``ReplyVoice`` enum they share; no path or
+status moves. 0.34.0 (#2124) adds the ``getPipelineStatus`` operation, its
+``limit`` query parameter and the six ``Pipeline*`` schemas; no existing path
+moves. 0.33.0
 (#2123) documents ``202`` ``UploadManifestResponse`` beside the upload's
 ``200``, for a loose Substack ``posts.csv``. 0.32.0 moves no
 ``/v1`` shape: ``POST /v1/classifications`` now also writes

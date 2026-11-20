@@ -90,6 +90,7 @@ from creek_mcp.api.models import (
     ReflectionStatus,
     ReplyVoice,
     RequestKeyProvider,
+    ThreadLifecycle,
     WireTierCeiling,
 )
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
@@ -333,6 +334,50 @@ _EXAMPLE_LETTER_TEXT: Final[str] = (
 )
 """A synthetic, non-intimate letter: the fixture is a shape, not a person."""
 
+_EXAMPLE_PRAXIS: Final[dict[str, Any]] = {
+    "title": "Rest before the collapse",
+    "praxis_type": PraxisKind.PRACTICE.value,
+    "status": PraxisLifecycle.ACTIVE.value,
+    "excerpt": (
+        "Synthetic example prose. A real excerpt is the praxis page's own "
+        "opening lines, taken verbatim and capped."
+    ),
+}
+"""The ``related_praxis`` cell of the success fixture (contract 0.9, #873).
+
+Synthetic, like the note beside it: no fixture in this bundle carries real
+vault prose. What it documents is the *shape*, and one property a consumer
+cannot see from the shape — a praxis page reaches the wire only when every
+fragment its ``derived_from`` names is within the caller's ceiling.
+"""
+
+_EXAMPLE_EDDY: Final[dict[str, Any]] = {
+    "title": "Rest and Ruin",
+    "description": "Synthetic example description of a topic cluster.",
+    "fragment_count": 12,
+    "formed": "2026-03-04",
+}
+"""The ``related_eddies`` cell of the success fixture (contract 0.9, #873).
+
+``description`` and ``fragment_count`` are *compiled from* the eddy's members,
+which is why the page is published only when the members that can be
+enumerated account for ``fragment_count`` exactly and every one of them is
+admitted. An eddy whose provenance is partial is withheld, not summarised.
+"""
+
+_EXAMPLE_THREAD: Final[dict[str, Any]] = {
+    "id": "thread-0000000001",
+    "title": "Leaving the firm",
+    "status": ThreadLifecycle.ACTIVE.value,
+}
+"""The ``related_threads`` cell of the success fixtures (contract 0.36, #2127).
+
+Only the page's ``id``, ``title`` and the status its ``02-Threads/`` subfolder
+names: never its body. Like an eddy, a thread is compiled from the fragments
+linking to it, so it is published only when a seed fragment is one of them,
+they are all enumerable, and every one is within the caller's ceiling.
+"""
+
 _LETTER_SUCCESS: Final[dict[str, Any]] = {
     "status": OK_STATUS,
     "tier_ceiling": WireTierCeiling.PERSONAL.value,
@@ -345,8 +390,15 @@ _LETTER_SUCCESS: Final[dict[str, Any]] = {
     "attribution": _VOICE_DRAFT_ATTRIBUTION,
     "inference_source": INFERENCE_SOURCE_POOL_CREEK,
     "voice": ReplyVoice.OWNER.value,
+    "related_praxis": [_EXAMPLE_PRAXIS],
+    "related_eddies": [_EXAMPLE_EDDY],
+    "related_threads": [_EXAMPLE_THREAD],
 }
 """A first letter, stored as the Voice Draft at the caller's id.
+
+The three ``related_*`` fields (contract 0.36, #2127) name the practices,
+eddies and threads the letter's source entry touches. Shown present so a
+consumer has the populated shape; each is absent when nothing qualifies.
 
 ``inference_source`` names the route that wrote it (contract 0.19, #1894).
 Shown *present* here because a consumer needs the populated shape; the field
@@ -524,37 +576,6 @@ _EXAMPLE_NOTE: Final[dict[str, Any]] = {
 }
 """One margin note. Deliberately invented, and labelled as such in the note."""
 
-_EXAMPLE_PRAXIS: Final[dict[str, Any]] = {
-    "title": "Rest before the collapse",
-    "praxis_type": PraxisKind.PRACTICE.value,
-    "status": PraxisLifecycle.ACTIVE.value,
-    "excerpt": (
-        "Synthetic example prose. A real excerpt is the praxis page's own "
-        "opening lines, taken verbatim and capped."
-    ),
-}
-"""The ``related_praxis`` cell of the success fixture (contract 0.9, #873).
-
-Synthetic, like the note beside it: no fixture in this bundle carries real
-vault prose. What it documents is the *shape*, and one property a consumer
-cannot see from the shape — a praxis page reaches the wire only when every
-fragment its ``derived_from`` names is within the caller's ceiling.
-"""
-
-_EXAMPLE_EDDY: Final[dict[str, Any]] = {
-    "title": "Rest and Ruin",
-    "description": "Synthetic example description of a topic cluster.",
-    "fragment_count": 12,
-    "formed": "2026-03-04",
-}
-"""The ``related_eddies`` cell of the success fixture (contract 0.9, #873).
-
-``description`` and ``fragment_count`` are *compiled from* the eddy's members,
-which is why the page is published only when the members that can be
-enumerated account for ``fragment_count`` exactly and every one of them is
-admitted. An eddy whose provenance is partial is withheld, not summarised.
-"""
-
 _REFLECTIONS_SUCCESS: Final[dict[str, Any]] = {
     "status": ReflectionStatus.OK.value,
     "tier_ceiling": WireTierCeiling.PERSONAL.value,
@@ -564,10 +585,14 @@ _REFLECTIONS_SUCCESS: Final[dict[str, Any]] = {
     "essay_grounded": False,
     "related_praxis": [_EXAMPLE_PRAXIS],
     "related_eddies": [_EXAMPLE_EDDY],
+    "related_threads": [_EXAMPLE_THREAD],
     "inference_source": INFERENCE_SOURCE_POOL_CREEK,
     "voice": ReplyVoice.OWNER.value,
 }
 """A reflection that found something.
+
+``related_threads`` (contract 0.36, #2127) is shown present for the reason
+the two 0.9 ``related_*`` fields are.
 
 ``voice`` (contract 0.35, #2126) is ``owner``: the notes were written in the
 owner's own style. :data:`_REFLECTIONS_EMPTY` shows ``higher_self``.
@@ -588,7 +613,7 @@ _REFLECTIONS_EMPTY: Final[dict[str, Any]] = {
     **{
         key: value
         for key, value in _REFLECTIONS_SUCCESS.items()
-        if key not in {"related_praxis", "related_eddies"}
+        if key not in {"related_praxis", "related_eddies", "related_threads"}
     },
     "status": ReflectionStatus.EMPTY.value,
     "notes": [],

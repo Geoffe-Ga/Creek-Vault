@@ -1,8 +1,8 @@
 {
   "agent_mcp": null,
   "capabilities": [],
-  "contract_minor": "0.35",
-  "contract_version": "0.35.0",
+  "contract_minor": "0.36",
+  "contract_version": "0.36.0",
   "inference_pool": true,
   "keyless_inference": true,
   "ontology_version": "aptitude-wavelength/2026-05-23",
@@ -12,6 +12,7 @@
   ],
   "status": "uninitialized",
   "supported_contract_minors": [
+    "0.36",
     "0.35",
     "0.34",
     "0.33",

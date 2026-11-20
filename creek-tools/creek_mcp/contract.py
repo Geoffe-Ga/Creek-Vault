@@ -20,8 +20,24 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.35.0"
+CONTRACT_VERSION: Final[str] = "0.36.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.36.0 (#2127): reflections and letters name the threads, eddies and praxis
+the entry actually touches. ``ReflectionResponse`` gains the optional
+``related_threads`` (at most 2 ``{id, title, status}``, status
+``active``/``dormant``/``resolved`` from the page's ``02-Threads/``
+subfolder) beside the 0.9 fields, and ``creek.reflect`` results gain the same
+key. ``LetterResponse`` gains ``related_praxis``, ``related_eddies`` and
+``related_threads``, selected for the letter's source entry by the
+reflection's own seed gate (its nearest corpus fragments) and admitted by
+:mod:`creek_mcp.compiled_pages`: a page is named only when a seed fragment is
+one of its sources, every source is within the caller's ceiling and its
+membership is complete. Every key is omitted when nothing qualifies — never
+padded, never present-and-empty — and for a caller declaring ``0.35`` or
+earlier. No page body crosses the wire and the letter prompt is unchanged.
+New wire models ``RelatedThread`` and enum ``ThreadLifecycle``. No route,
+status or error code moves; ``0.35`` stays served.
 
 0.35.0 (#2126): letters and reflections write in the owner's own voice when
 the vault holds it, and say so. ``POST /v1/letters/{external_id}`` and
