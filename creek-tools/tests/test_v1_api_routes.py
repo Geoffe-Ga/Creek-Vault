@@ -66,6 +66,7 @@ from creek_mcp.api.models import (
     ReadingRecommendationResponse,
     ReflectionRequest,
     ReflectionResponse,
+    UploadManifestResponse,
     UploadRequest,
     UploadResponse,
     VoiceDraftDeleteResponse,
@@ -439,16 +440,21 @@ def test_every_route_declares_its_published_success_responses() -> None:
 def test_only_long_pipeline_writes_declare_the_202_success() -> None:
     """Only classification and linking can return a durable job handle.
 
-    This is the assertion that makes the diff reviewable: the mechanism is
-    landed and inert, so the whole of its effect on the published document is
-    "no change". The first route to declare a second success status has to
-    edit this test on purpose.
+    And the upload route, since contract 0.31 (#2123), the one ``202`` that is
+    not a job: a loose Substack manifest, kept without writing a fragment.
+    Every other route still declares exactly one success, so a route adding a
+    second has to edit this test on purpose.
     """
     for spec in ROUTES:
         if spec.operation_id in {"createClassification", "createLink"}:
             assert spec.published_success_responses == (
                 (200, spec.response_model),
                 (202, JobAcceptedResponse),
+            )
+        elif spec.operation_id == "uploadDocument":
+            assert spec.published_success_responses == (
+                (200, UploadResponse),
+                (202, UploadManifestResponse),
             )
         else:
             assert spec.success_responses is None

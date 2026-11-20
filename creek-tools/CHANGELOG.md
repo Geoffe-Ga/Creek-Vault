@@ -9,6 +9,23 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **A Substack export uploaded as loose files lands as Substack writing
+  (#2123, contract 0.33).** adepthood's folder import sends an unzipped
+  export one `POST /v1/uploads` per file, and only a `.zip` got content-based
+  source detection, so every post landed in `01-Fragments/Unsorted` as
+  `platform: other` and `posts.csv` became a spreadsheet fragment in
+  `01-Fragments/Data`.
+  - `posts.csv` with Substack's `post_id`/`post_date`/`is_published` header is
+    kept as the export manifest (`status: "manifest"`; `202
+    UploadManifestResponse` over `/v1` from 0.33, `415 unsupported_source` to
+    an earlier minor) and writes no fragment.
+  - A `<post_id>.<slug>.html` upload with Substack's editor markup, or listed
+    in a received manifest, is read by the Substack ingestor (staged and
+    ledgered like any upload) and filed under `01-Fragments/Writing/Substack`
+    with `source.platform: substack`, titled and dated from the manifest when
+    one has arrived and its tier admits it, else from the slug and the HTML's
+    own `datePublished`. The owner's `2024.notes.html` without that evidence
+    stays a document.
 - **Classification fills `04-Praxis/` (#2122, contract 0.32).**
   `VaultWriter.write_praxis` had no caller, so a fragment marked
   `praxis_potential: explicit` never became a Praxis page and

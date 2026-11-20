@@ -20,8 +20,20 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.32.0"
+CONTRACT_VERSION: Final[str] = "0.33.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.33.0 (#2123): a Substack export uploaded as loose files is identified file
+by file. ``creek.upload`` of a ``posts.csv`` whose header carries Substack's
+``post_id``, ``post_date`` and ``is_published`` returns the new
+``status: "manifest"`` (``source_type: "substack"``, ``manifest_posts``) and
+writes no fragment; its rows date and title posts uploaded afterwards, joined
+only into a post at the manifest's tier or above. A ``<post_id>.<slug>.html``
+upload carrying Substack's markup, or listed in such a manifest, routes to
+the Substack ingestor (``source_type: "substack"``) instead of ``document``.
+``POST /v1/uploads`` answers the manifest ``202``
+``UploadManifestResponse`` to a caller declaring 0.33; a ``0.32`` caller is
+served ``415 unsupported_source``. ``0.32`` stays served.
 
 0.32.0 (#2122): classification materialises ``04-Praxis/``. ``creek.classify``
 and ``POST /v1/classifications`` (and ``creek process``) now end with a

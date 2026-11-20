@@ -105,6 +105,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.32",
     "0.31",
     "0.30",
     "0.29",
@@ -279,6 +280,21 @@ served only to callers declaring :data:`BUSY_FAILURE_CODE_SINCE_MINOR`; a
 ``0.28`` caller whose job met the same content-lock contention is served the
 ``failure_code: null`` it always was, so every response it can reach is
 byte-identical and ``0.28`` stays in the window.
+
+Contract 0.30 is MCP-only (``creek.revoice``'s voice gate) and moves no
+``/v1`` shape.
+
+Contract 0.31 (#2121) adds an advisory ``Retry-After`` header to
+``temporarily_unavailable`` for callers declaring it, and 0.32 (#2122) moves
+no ``/v1`` shape; each keeps its predecessor in the window.
+
+Contract 0.33 (#2123) adds a second success on ``POST /v1/uploads``:
+``202`` :class:`UploadManifestResponse`, for a Substack export's
+``posts.csv`` uploaded loose. It is served only to callers declaring
+:data:`UPLOAD_MANIFEST_SINCE_MINOR`; a ``0.32`` caller sending the same file
+is served ``415 unsupported_source``, a refusal its vocabulary already holds,
+and no fragment is written either way. Every other response it can reach is
+byte-identical, so ``0.32`` stays in the window.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -595,6 +611,15 @@ before — and below 0.26 the key is omitted altogether
 (:data:`JOB_FAILURE_CODE_SINCE_MINOR`). The stored record keeps ``busy``
 whichever minor reads it: the downgrade is a property of the response. It is a
 literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
+UPLOAD_MANIFEST_SINCE_MINOR: Final[str] = "0.33"
+"""First minor that may be served ``202`` :class:`UploadManifestResponse` (#2123).
+
+A caller declaring an earlier minor vendored ``POST /v1/uploads`` with one
+success, ``200`` :class:`UploadResponse`, which needs a ``fragment_id`` a
+manifest does not have. It is served ``415 unsupported_source`` for the same
+upload instead. It is a literal for the reason :data:`_UPLOAD_MINOR` is.
 """
 
 AGENT_MCP_URL_MAX_CHARS: Final[int] = 2048
@@ -2613,6 +2638,37 @@ JobId: TypeAlias = UUID
 """An opaque server-generated identifier for one durable pipeline job."""
 
 
+class UploadManifestResponse(_WireModel):
+    """A loose Substack ``posts.csv`` recognised as its export manifest (#2123).
+
+    The ``202`` twin of :class:`UploadResponse`. adepthood's folder import
+    sends an unzipped export one file at a time; the manifest among them is
+    metadata, not writing, so it is kept to date and title the posts it lists
+    — those uploaded afterwards — and never written as a fragment. There is
+    therefore no ``fragment_id``, and no ``tier`` for the reason
+    :class:`UploadResponse` has none.
+
+    Attributes:
+        status: Always ``"manifest"``.
+        tier_ceiling: The ceiling the call was served under, echoed.
+        external_id: The consumer-side identity of the upload, unchanged.
+        source_type: Always ``substack``: the export the manifest belongs to.
+        manifest_posts: How many joinable post rows the manifest held.
+    """
+
+    status: Literal["manifest"] = Field(
+        description="The file was kept as an export manifest, not a fragment."
+    )
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-side upload identity.")
+    source_type: Literal["substack"] = Field(
+        description="The export the manifest belongs to."
+    )
+    manifest_posts: int = Field(
+        ge=0, description="Joinable post rows the manifest held."
+    )
+
+
 class JobAcceptedResponse(_WireModel):
     """The durable handle returned when a long pipeline pass is accepted."""
 
@@ -3464,6 +3520,7 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "RelatedEddy": RelatedEddy,
     "RelatedPraxis": RelatedPraxis,
     "TierModel": TierModel,
+    "UploadManifestResponse": UploadManifestResponse,
     "UploadRequest": UploadRequest,
     "UploadResponse": UploadResponse,
     "VaultState": VaultState,

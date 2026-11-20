@@ -70,8 +70,10 @@ from creek.ingest.archive import (
 from creek.vault.mutations import CONTENT_MUTATION_BUSY_REASON
 from creek_mcp.api.models import (
     OK_STATUS,
+    UPLOAD_MANIFEST_SINCE_MINOR,
     ErrorCode,
     JournalAction,
+    UploadManifestResponse,
     UploadRequest,
     UploadResponse,
     WireTierCeiling,
@@ -79,17 +81,25 @@ from creek_mcp.api.models import (
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
+from creek_mcp.httpapi.generation import declared_minor_at_least
 from creek_mcp.httpapi.journal import admissible_external_id
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
-from creek_mcp.tools.upload import ARCHIVE_NO_FRAGMENTS_REASON, upload_tool
+from creek_mcp.tools.upload import (
+    ARCHIVE_NO_FRAGMENTS_REASON,
+    MANIFEST_STATUS,
+    upload_tool,
+)
 
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
     from creek_mcp.httpapi.context import RequestContext
+
+HTTP_ACCEPTED: Final[int] = 202
+"""The status a loose Substack manifest is answered with (#2123)."""
 
 _BLANK_CALL_REASON: Final[str] = "filename, external_id and content_base64 are required"
 """``_validated_upload``'s malformed-call refusal, verbatim."""
@@ -291,18 +301,60 @@ def _upload(
     )
 
 
-def _render(result: dict[str, Any], context: RequestContext) -> Response:
+def _render_manifest(
+    result: dict[str, Any], context: RequestContext, *, serve_manifest: bool
+) -> Response:
+    """Project a ``status: "manifest"`` return onto ``202``, or its downgrade.
+
+    A caller declaring a minor before
+    :data:`~creek_mcp.api.models.UPLOAD_MANIFEST_SINCE_MINOR` vendored only the
+    ``200`` :class:`~creek_mcp.api.models.UploadResponse`, which cannot express
+    an upload that produced no fragment. It is served
+    ``415 unsupported_source`` — "not something Creek ingests as a document",
+    which is true, and a code that caller already handles.
+
+    Args:
+        result: The tool's manifest return.
+        context: The request's context.
+        serve_manifest: Whether the caller's minor can name the ``202``.
+
+    Returns:
+        The ``202`` :class:`~creek_mcp.api.models.UploadManifestResponse`, the
+        downgrade, or ``internal_error`` when the return cannot be described.
+    """
+    if not serve_manifest:
+        return error_response(ErrorCode.UNSUPPORTED_SOURCE, context)
+    try:
+        payload = UploadManifestResponse(
+            status="manifest",
+            tier_ceiling=WireTierCeiling(result["tier_ceiling"]),
+            external_id=str(result["external_id"]),
+            source_type=result["source_type"],
+            manifest_posts=result["manifest_posts"],
+        )
+    except (ValidationError, ValueError, KeyError, TypeError):
+        return error_response(ErrorCode.INTERNAL_ERROR, context)
+    return json_response(payload.model_dump(mode="json"), HTTP_ACCEPTED)
+
+
+def _render(
+    result: dict[str, Any], context: RequestContext, *, serve_manifest: bool
+) -> Response:
     """Project the tool's return onto the published response, or a refusal.
 
     Args:
         result: The tool's return dict.
         context: The request's context.
+        serve_manifest: Whether the caller's declared minor can name the
+            ``202`` manifest answer (#2123).
 
     Returns:
         The ``200`` carrying :class:`~creek_mcp.api.models.UploadResponse`, or
         the published refusal for the tool's reason, or ``internal_error`` when
         the document was ingested but cannot be honestly described.
     """
+    if result.get("status") == MANIFEST_STATUS:
+        return _render_manifest(result, context, serve_manifest=serve_manifest)
     if result.get("status") != OK_STATUS:
         return error_response(
             upload_refusal_code(str(result.get("reason", ""))), context
@@ -371,4 +423,8 @@ async def handle_upload(request: Request) -> Response:
     result = await write_off_loop(_upload, request, parsed, context)
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    return _render(result, context)
+    return _render(
+        result,
+        context,
+        serve_manifest=declared_minor_at_least(request, UPLOAD_MANIFEST_SINCE_MINOR),
+    )

@@ -1,0 +1,53 @@
+{
+  "$defs": {
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A loose Substack ``posts.csv`` recognised as its export manifest (#2123).\n\nThe ``202`` twin of :class:`UploadResponse`. adepthood's folder import\nsends an unzipped export one file at a time; the manifest among them is\nmetadata, not writing, so it is kept to date and title the posts it lists\n\u2014 those uploaded afterwards \u2014 and never written as a fragment. There is\ntherefore no ``fragment_id``, and no ``tier`` for the reason\n:class:`UploadResponse` has none.\n\nAttributes:\n    status: Always ``\"manifest\"``.\n    tier_ceiling: The ceiling the call was served under, echoed.\n    external_id: The consumer-side identity of the upload, unchanged.\n    source_type: Always ``substack``: the export the manifest belongs to.\n    manifest_posts: How many joinable post rows the manifest held.",
+  "properties": {
+    "external_id": {
+      "description": "Consumer-side upload identity.",
+      "title": "External Id",
+      "type": "string"
+    },
+    "manifest_posts": {
+      "description": "Joinable post rows the manifest held.",
+      "minimum": 0,
+      "title": "Manifest Posts",
+      "type": "integer"
+    },
+    "source_type": {
+      "const": "substack",
+      "description": "The export the manifest belongs to.",
+      "title": "Source Type",
+      "type": "string"
+    },
+    "status": {
+      "const": "manifest",
+      "description": "The file was kept as an export manifest, not a fragment.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "external_id",
+    "source_type",
+    "manifest_posts"
+  ],
+  "title": "UploadManifestResponse",
+  "type": "object"
+}

@@ -56,6 +56,7 @@ from creek_mcp.api.models import (
     LinkResponse,
     ReflectionRequest,
     ReflectionResponse,
+    UploadManifestResponse,
     UploadRequest,
     UploadResponse,
     VoiceDraftDeleteResponse,
@@ -507,6 +508,10 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         capability=Capability.UPLOAD,
         request_model=UploadRequest,
         response_model=UploadResponse,
+        success_responses=(
+            (200, UploadResponse),
+            (202, UploadManifestResponse),
+        ),
         requires_contract_version=True,
         summary="Ingest one uploaded document as a fragment, idempotently.",
         max_body_bytes=UPLOAD_MAX_BODY_BYTES,
