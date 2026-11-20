@@ -824,6 +824,9 @@ def test_a_consumer_cannot_fan_out_inflight_pipeline_jobs(
         "classify_tool",
         partial(_blocked_llm_success, started, release, calls),
     )
+    # The job is held open past the own-job wait (#2132), so the second request
+    # meets the refusal after a short wait rather than the production bound.
+    monkeypatch.setattr(pipeline_module, "OWN_JOB_WAIT_SECONDS", _SHORT_OWN_JOB_WAIT)
     first = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
     assert started.wait(timeout=2.0)
     second = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
@@ -1894,3 +1897,169 @@ def test_a_retryable_sync_refusal_has_a_job_code(reason: str) -> None:
     if retryable and code is not ErrorCode.INTERNAL_ERROR:
         refused = {"status": "refused", "reason": reason}
         assert pipeline_module._failure_code(refused) is not None
+
+
+# --------------------------------------------------------------------------- #
+# A consumer's passes run in the order it sent them (#2132)
+# --------------------------------------------------------------------------- #
+
+_SHORT_OWN_JOB_WAIT: Final[float] = 0.05
+"""A test-sized stand-in for ``OWN_JOB_WAIT_SECONDS`` where a job is held open."""
+
+_JOB_RUN_SECONDS: Final[float] = 0.3
+"""How long the stubbed ``llm`` job runs: long enough that, unordered, the next
+synchronous pass and the next ``llm`` request always land while it is active."""
+
+
+def _ordered_tool(order: list[str], started: Event) -> Callable[..., dict[str, object]]:
+    """Return a ``classify_tool`` double that records when each pass runs."""
+
+    def _tool(**kwargs: object) -> dict[str, object]:
+        if kwargs["method"] == "llm":
+            started.set()
+            time.sleep(_JOB_RUN_SECONDS)
+            order.append("llm-finished")
+        else:
+            order.append(f"{kwargs['method']}-started")
+        return _llm_success()
+
+    return _tool
+
+
+def test_a_synchronous_pass_runs_after_the_consumers_own_active_job(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``llm`` → ``rules`` → ``llm`` resolves the same way every time (#2132).
+
+    Before #2132 the synchronous ``rules`` pass raced the detached job for the
+    content lock, and whether the next ``llm`` request met the documented
+    one-active-job ``503 unavailable`` depended on thread scheduling. The pass
+    now waits for its own consumer's job first, so the job's slot is free —
+    deterministically — by the time the ``rules`` response is sent.
+    """
+    order: list[str] = []
+    started = Event()
+    monkeypatch.setattr(pipeline_module, "classify_tool", _ordered_tool(order, started))
+
+    first = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    assert started.wait(timeout=2.0)
+    rules = api.post(CLASSIFICATIONS_PATH, json={"method": "rules"}, headers=headers())
+    second = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+
+    assert first.status_code == HTTP_ACCEPTED
+    assert rules.status_code == HTTP_OK
+    assert second.status_code == HTTP_ACCEPTED, second.text
+    assert order[:2] == ["llm-finished", "rules-started"]
+    _await_terminal(api, second.json()["job_id"])
+
+
+def test_a_synchronous_link_waits_for_the_consumers_own_job_too(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering holds across the two pipeline routes."""
+    order: list[str] = []
+    started = Event()
+    monkeypatch.setattr(pipeline_module, "classify_tool", _ordered_tool(order, started))
+
+    def _link(**kwargs: object) -> dict[str, object]:
+        order.append(f"{kwargs['method']}-started")
+        return {
+            "status": "ok",
+            "tier_ceiling": "open",
+            "method": kwargs["method"],
+            "fragment_count": 0,
+            "link_count": 0,
+            "largest_cluster_fragments": 0,
+            "clusters_split": 0,
+            "oversized_discarded": 0,
+        }
+
+    monkeypatch.setattr(pipeline_module, "link_tool", _link)
+
+    api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    assert started.wait(timeout=2.0)
+    linked = api.post(LINKS_PATH, json={"method": "temporal"}, headers=headers())
+
+    assert linked.status_code == HTTP_OK
+    assert order == ["llm-finished", "temporal-started"]
+
+
+def test_the_wait_is_bounded_so_a_long_job_never_holds_a_pass_hostage(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the bound the pass proceeds, exactly as it did before #2132."""
+    order: list[str] = []
+    started = Event()
+    release = Event()
+
+    def _tool(**kwargs: object) -> dict[str, object]:
+        if kwargs["method"] == "llm":
+            started.set()
+            assert release.wait(timeout=5.0)
+            order.append("llm-finished")
+        else:
+            order.append("rules-started")
+        return _llm_success()
+
+    monkeypatch.setattr(pipeline_module, "classify_tool", _tool)
+    monkeypatch.setattr(pipeline_module, "OWN_JOB_WAIT_SECONDS", _SHORT_OWN_JOB_WAIT)
+
+    accepted = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    assert started.wait(timeout=2.0)
+    rules = api.post(CLASSIFICATIONS_PATH, json={"method": "rules"}, headers=headers())
+    release.set()
+    _await_terminal(api, accepted.json()["job_id"])
+
+    assert rules.status_code == HTTP_OK
+    assert order == ["rules-started", "llm-finished"]
+
+
+def test_another_consumers_job_is_not_waited_for(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering is per consumer: one caller's job never delays another's pass."""
+    order: list[str] = []
+    started = Event()
+    release = Event()
+
+    def _tool(**kwargs: object) -> dict[str, object]:
+        if kwargs["method"] == "llm":
+            started.set()
+            assert release.wait(timeout=5.0)
+            order.append("llm-finished")
+        else:
+            order.append("rules-started")
+        return _llm_success()
+
+    monkeypatch.setattr(pipeline_module, "classify_tool", _tool)
+
+    accepted = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    assert started.wait(timeout=2.0)
+    rules = api.post(
+        CLASSIFICATIONS_PATH,
+        json={"method": "rules"},
+        headers=headers(token=OTHER_TOKEN),
+    )
+    release.set()
+    _await_terminal(api, accepted.json()["job_id"])
+
+    assert rules.status_code == HTTP_OK
+    assert order == ["rules-started", "llm-finished"]
+
+
+def test_a_back_to_back_long_request_is_admitted_once_its_own_job_finishes(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``llm`` → ``llm`` no longer depends on how fast the first worker ran (#2132)."""
+    order: list[str] = []
+    started = Event()
+    monkeypatch.setattr(pipeline_module, "classify_tool", _ordered_tool(order, started))
+
+    first = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    assert started.wait(timeout=2.0)
+    second = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+
+    assert first.status_code == HTTP_ACCEPTED
+    assert second.status_code == HTTP_ACCEPTED, second.text
+    assert order == ["llm-finished"]
+    _await_terminal(api, second.json()["job_id"])

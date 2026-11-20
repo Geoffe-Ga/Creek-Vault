@@ -85,6 +85,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
+from creek._fslock import DEFAULT_LOCK_TIMEOUT_SECONDS
 from creek.classify.llm.consent import is_managed_vault
 from creek.classify.llm.providers import REQUEST_KEY_REJECTED_REASON
 from creek.classify.llm.request_key import InvalidRequestKeyError
@@ -174,6 +175,14 @@ _Request = TypeVar("_Request", bound=BaseModel)
 
 _Response = TypeVar("_Response", bound=BaseModel)
 """Which published response one of the two builders below produces."""
+
+
+OWN_JOB_WAIT_SECONDS: Final[float] = DEFAULT_LOCK_TIMEOUT_SECONDS
+"""Longest a synchronous pass waits for its own consumer's active job (#2132).
+
+The content lock's own bound: before #2132 the pass would have waited that
+long for the lock the job held, so waiting for the job instead adds an order,
+not a new delay class."""
 
 
 def pipeline_refusal_code(reason: str) -> ErrorCode:
@@ -692,10 +701,17 @@ async def _accepted_job(
     only on that loop (:class:`~creek_mcp.httpapi.job_runtime.JobRuntime`).
     The detached worker never touches them, so correctness does not rely on
     cross-thread ``set`` operations being atomic.  A consumer already running an
-    expensive pass receives the contract's static ``unavailable`` refusal and
-    can retry after polling its accepted job.
+    expensive pass first waits, at most :data:`OWN_JOB_WAIT_SECONDS`, for that
+    pass to finish (#2132); one still running after that receives the
+    contract's static ``unavailable`` refusal and can retry after polling its
+    accepted job. Without the wait, whether a back-to-back request met the
+    refusal was decided by how fast the first worker happened to finish.
     """
     runtime = _runtime(request)
+    # Outside the admission lock, so one consumer's wait never stalls another's
+    # admission. A job that finishes within the bound frees its slot before the
+    # busy check below; one that does not still meets the documented refusal.
+    await _after_own_job(request, context)
     async with runtime.admission_lock:
         if runtime.busy(context.consumer):
             return error_response(ErrorCode.UNAVAILABLE, context)
@@ -709,7 +725,7 @@ async def _accepted_job(
         task = asyncio.create_task(
             asyncio.to_thread(_execute_pipeline_job, vault, record, request_key)
         )
-        runtime.track(context.consumer, record.job_id, task)
+        runtime.track(context.consumer, record.job_id, task, vault_pass=True)
     payload = JobAcceptedResponse(
         status="accepted", job_id=UUID(record.job_id), state=JobState.QUEUED
     )
@@ -731,6 +747,25 @@ def _job_status(
         consumer=context.consumer,
         worker_id=_runtime(request).worker_id,
         active_job_ids=active_job_ids,
+    )
+
+
+async def _after_own_job(request: Request, context: RequestContext) -> None:
+    """Let *context*'s consumer's active pipeline job finish first (#2132).
+
+    A synchronous pass otherwise races its own consumer's detached job for the
+    vault content lock, so the order the two ran in — and whether the
+    consumer's next long request met the documented one-active-job ``503
+    unavailable`` — was decided by thread scheduling. Bounded by
+    :data:`OWN_JOB_WAIT_SECONDS`: past it the pass proceeds and meets the
+    content lock's own bound, as before.
+
+    Args:
+        request: The request in flight.
+        context: Its context, naming the consumer.
+    """
+    await _runtime(request).settle_vault_pass(
+        context.consumer, timeout=OWN_JOB_WAIT_SECONDS
     )
 
 
@@ -765,6 +800,7 @@ async def handle_classification(request: Request) -> Response:
             context=context,
             request_key=request_key,
         )
+    await _after_own_job(request, context)
     result = await write_off_loop(_classify, request, parsed, context)
     return _rendered(
         result,
@@ -809,6 +845,7 @@ async def handle_link(request: Request) -> Response:
             retier=False,
             context=context,
         )
+    await _after_own_job(request, context)
     try:
         result = await write_off_loop(_link, request, parsed, context)
     except EmbeddingModelUnavailableError as exc:
