@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.34.0",
+  "contract_version": "0.35.0",
   "files": [
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-ready.json",
-      "sha256": "681c59a44b0a29c8d94089e48c4112236f688eae9fe62b6258de82f0dd87cf1f",
+      "sha256": "0df3f70c621421a0bfb9c1d1f81daf34bd9c269fac5f091d0cab71172ebc75e2",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-unavailable.json",
-      "sha256": "9df5a4055e674d5d4a4dd6a85f24533074877fa5a7ac421b909b241b9c9c2f04",
+      "sha256": "a98b2be8afe6e986edd3ce1cd176a15798927e7a4dbdfa5df82ade2e2880efca",
       "state": null
     },
     {
@@ -76,7 +76,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "1263976f91c8d4bf49de3cb48eaf8102f49ae82d6785e6b98eb6af463e81b639",
+      "sha256": "7107d7bf5639c5a6426fae2927cc9d948d5d62f8ebba7d9441ed0cbe7d0a2b35",
       "state": "empty"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "681c59a44b0a29c8d94089e48c4112236f688eae9fe62b6258de82f0dd87cf1f",
+      "sha256": "0df3f70c621421a0bfb9c1d1f81daf34bd9c269fac5f091d0cab71172ebc75e2",
       "state": "success"
     },
     {
@@ -321,7 +321,7 @@
       "capability": "letters",
       "model": "LetterResponse",
       "path": "examples/letters/empty.json",
-      "sha256": "b49aa4e4e7607b01085aea11d8150cb9514df346d58488d1f54f02b24670e025",
+      "sha256": "733fa1f51d0cbeb310132b18039ffe7115db31ea1378fae4fd594b504c3a6458",
       "state": "empty"
     },
     {
@@ -349,7 +349,7 @@
       "capability": "letters",
       "model": "LetterResponse",
       "path": "examples/letters/success.json",
-      "sha256": "4917a2581ce7f9ff4d45f7410b957fc92b5faadac24f033928dd38c9d0ca5470",
+      "sha256": "6c7f7e1905f680667045e2952e1ee1ab602536a3729295fe2ccf84b0fc100bea",
       "state": "success"
     },
     {
@@ -468,7 +468,7 @@
       "capability": "reflections",
       "model": "ReflectionResponse",
       "path": "examples/reflections/empty.json",
-      "sha256": "04ca80bbbb2d7662ac2508ed505a852e8d558ea9cfdf238229430a2ee74b7023",
+      "sha256": "5ffe833074ccb8cf5bb3d937fc9707238830763d2f3738713283205a7ca5318e",
       "state": "empty"
     },
     {
@@ -496,7 +496,7 @@
       "capability": "reflections",
       "model": "ReflectionResponse",
       "path": "examples/reflections/success.json",
-      "sha256": "86d48e5c429bd811e55c9412ee3c0e55a22d18ff9dc903d6e3c8dd2f074b5794",
+      "sha256": "377d7d5818cf22cfa3cc42bfb0cfbb191ad7def1b0125902a9af118b52d1247c",
       "state": "success"
     },
     {
@@ -874,7 +874,7 @@
       "capability": null,
       "model": "LetterResponse",
       "path": "schemas/LetterResponse.schema.json",
-      "sha256": "071e294e25883eaf27c3ce1d9cc3e72621a90e36e6d957c2bae15b395c9d7f75",
+      "sha256": "f919851d435c07dcf4f9107329bbaa1b4b8e31efba0ab1310400606913698d10",
       "state": null
     },
     {
@@ -993,7 +993,7 @@
       "capability": null,
       "model": "ReflectionResponse",
       "path": "schemas/ReflectionResponse.schema.json",
-      "sha256": "721a3964c31823a146fe9ae05760a82d2fa5c7ab48ba0ba2a2d6b2dcef3e9ae1",
+      "sha256": "9ed3368e6cff250ed122c31cd1ae3441fa9a493494ed722393904b979ea516c0",
       "state": null
     },
     {

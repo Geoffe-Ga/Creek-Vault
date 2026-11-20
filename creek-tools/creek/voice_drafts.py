@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _VOICE_DRAFT_KEY: Final[str] = "voice_draft"
+_VOICE_KEY: Final[str] = "voice"
 _LOCK_RELPATH: Final[tuple[str, ...]] = (
     "00-Creek-Meta",
     "locks",
@@ -91,15 +92,26 @@ class VoiceDraftRecord:
     content: str
     tier: PrivacyTier
     path: Path
+    voice: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class VoiceDraftDocument:
-    """The mutable document fields supplied for one Voice Draft upsert."""
+    """The mutable document fields supplied for one Voice Draft upsert.
+
+    Attributes:
+        content: The draft body.
+        title: Optional title; the placeholder is stored when absent.
+        tier: The draft's tier.
+        voice: Which voice a vault-written letter was written in (#2126), kept
+            in the private ``voice_draft`` block so a repeat can report it
+            without a model call. ``None`` for every other draft.
+    """
 
     content: str
     title: str | None
     tier: PrivacyTier
+    voice: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,9 +157,12 @@ def _normalise_content(content: str) -> str:
     return content.rstrip()
 
 
-def _voice_draft_metadata(external_id: str) -> dict[str, str]:
+def _voice_draft_metadata(external_id: str, voice: str | None) -> dict[str, str]:
     """Return the private identity block stored inside the tiered note."""
-    return {"external_id": external_id}
+    block = {"external_id": external_id}
+    if voice is not None:
+        block[_VOICE_KEY] = voice
+    return block
 
 
 def _render_record(
@@ -156,6 +171,7 @@ def _render_record(
     content: str,
     title: str,
     tier: PrivacyTier,
+    voice: str | None = None,
 ) -> str:
     """Render one AI-attributed fragment without deriving public text from body."""
     digest = _identity_digest(external_id)
@@ -172,7 +188,7 @@ def _render_record(
         privacy_tier=tier,
     )
     metadata = fragment.model_dump(mode="json") | {
-        _VOICE_DRAFT_KEY: _voice_draft_metadata(external_id),
+        _VOICE_DRAFT_KEY: _voice_draft_metadata(external_id, voice),
         "saved_from": {
             "source_kind": _SOURCE_KIND,
             "source_id": external_id,
@@ -192,6 +208,13 @@ def _stored_external_id(raw: Mapping[str, object]) -> str | None:
         return None
     value = identity.get("external_id")
     return str(value) if isinstance(value, str) else None
+
+
+def _stored_voice(raw: Mapping[str, object]) -> str | None:
+    """Return the recorded voice of a vault-written letter, if any."""
+    identity = raw.get(_VOICE_DRAFT_KEY)
+    value = identity.get(_VOICE_KEY) if isinstance(identity, Mapping) else None
+    return value if isinstance(value, str) else None
 
 
 def _load_path(path: Path, external_id: str) -> VoiceDraftRecord | None:
@@ -222,6 +245,7 @@ def _load_path(path: Path, external_id: str) -> VoiceDraftRecord | None:
         content=content,
         tier=PrivacyTier(str(fragment.privacy_tier)),
         path=path,
+        voice=_stored_voice(raw),
     )
 
 
@@ -335,6 +359,7 @@ def _write_record(
         content=_normalise_content(document.content),
         title=_effective_title(document),
         tier=document.tier,
+        voice=document.voice,
     )
     atomic_write_text(path, rendered)
     stored = _load_path(path, external_id)

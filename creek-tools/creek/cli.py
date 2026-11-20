@@ -3553,6 +3553,9 @@ def _build_fill_steps(
         # report belongs in it — otherwise the register samples are only ever
         # written by an operator who knows to run ``report --type voice`` by hand.
         ("report/voice", lambda: _report_voice(vault_path, unfiltered)),
+        # #2126: ``/v1`` letters and reflections take the owner's measured
+        # style from the persisted fingerprint, so a managed vault needs one.
+        ("report/fingerprint", lambda: _report_fingerprint(vault_path, unfiltered)),
         (
             "report/wavelength",
             lambda: _report_wavelength(vault_path, "weekly", unfiltered),

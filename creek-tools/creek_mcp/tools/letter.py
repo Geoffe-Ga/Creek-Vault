@@ -30,6 +30,15 @@ the wire.
    (:func:`creek.voice_drafts.create_voice_draft_if_absent`), so two concurrent
    letters for one id store exactly one.
 
+**Voice (#2126).** Once every gate has passed and no stored letter answers,
+:func:`creek.author.reply_voice.reply_style` reads the owner's own style —
+owner-authored skills, register samples admitted at the caller's ceiling, and
+the voice fingerprint when that ceiling admits ``personal`` — and the prompt
+carries it after the care policy and the Higher Self framing. With none the
+prompt is unchanged. The voice applied is stored in the Voice Draft, so a
+repeat reports it without a model call. Earlier letters are AI-authored,
+zero-weight Voice Drafts under ``11-Other-Authors`` and never become style.
+
 **Disclosure.** The audit row and the log records carry lengths, the declared
 tier and a closed-vocabulary outcome only — never the entry, the note, the
 prompt or the letter.
@@ -50,6 +59,7 @@ from creek.classify.llm.providers import (
     RequestKeyRejectedError,
 )
 from creek.config import CONFIG_LOAD_FAILURES
+from creek.reply_voice import HIGHER_SELF_STYLE, ReplyStyle, ReplyVoice
 from creek.voice_drafts import (
     VoiceDraftAccessDeniedError,
     VoiceDraftAction,
@@ -66,6 +76,7 @@ from creek_mcp.tier_ceiling import (
     TierCeiling,
     routing_tier,
     tier_allowed,
+    to_privacy_override,
     write_tier_allowed,
 )
 
@@ -85,6 +96,7 @@ __all__ = [
     "LetterSource",
     "LetterWrite",
     "build_letter_prompt",
+    "letter_voice",
     "write_letter",
 ]
 
@@ -225,6 +237,13 @@ class LetterCall:
             Invoked only once every gate has passed, so a provider that cannot
             be built costs nothing on a refused call.
         care_guard: ``(text) -> reason | None``.
+        apply_owner_voice: Whether the owner's style may shape the letter
+            (#2126). ``POST /v1/letters`` passes ``False`` to a caller
+            declaring a minor below
+            :data:`~creek_mcp.api.models.VOICE_SINCE_MINOR`, which cannot read
+            ``voice``: its prompt stays the generic Higher Self one, byte for
+            byte, the owner's style is not read, and the letter is stored as
+            ``higher_self``.
     """
 
     vault_path: Path
@@ -233,23 +252,37 @@ class LetterCall:
     consumer: str
     build_factory: Callable[[], LetterLLMFactory]
     care_guard: Callable[[str], str | None]
+    apply_owner_voice: bool = True
 
 
-def build_letter_prompt(source: LetterSource) -> str:
+def build_letter_prompt(
+    source: LetterSource, style: ReplyStyle = HIGHER_SELF_STYLE
+) -> str:
     """Compose the letter prompt from the caller's own entry and note.
 
     Instructions first, then each caller field inside its own named delimiter,
-    so the model can tell the material it is grounded in from the task.
+    so the model can tell the material it is grounded in from the task. The
+    care policy always leads. With the owner's style (#2126) the Higher Self
+    framing is kept and the owner's source-free style block follows the
+    instructions; without it the prompt is exactly the generic one.
 
     Args:
         source: The entry and note to write from.
+        style: The owner's style, or :data:`HIGHER_SELF_STYLE` for none.
 
     Returns:
         The prompt.
     """
+    owner = style.voice is ReplyVoice.OWNER
+    voice = (
+        "in their own Higher Self's voice and in the owner's own style, as "
+        "described below,"
+        if owner
+        else "in their own Higher Self's voice,"
+    )
     instructions = (
         "You are writing a short, warm letter to the person whose journal this "
-        "is, in their own Higher Self's voice, expanding on a margin note left on "
+        f"is, {voice} expanding on a margin note left on "
         "their entry: their words and wisdom handed back, never advice or a plan. "
         "Stay grounded in the passage the note anchors to and in the entry around "
         "it; speak in second person, plainly, like a smart friend. If a stage or "
@@ -265,7 +298,20 @@ def build_letter_prompt(source: LetterSource) -> str:
         f"The passage it anchors to:\n<passage>\n{source.anchor_text}\n</passage>\n\n"
         f"The full entry for context:\n<entry>\n{source.content}\n</entry>"
     )
-    return f"{CARE_POLICY}\n\n{instructions}\n\n{material}"
+    head = f"{instructions}\n\n{style.block}" if owner else instructions
+    return f"{CARE_POLICY}\n\n{head}\n\n{material}"
+
+
+def letter_voice(record: VoiceDraftRecord) -> ReplyVoice:
+    """Return the voice a stored letter was written in.
+
+    Only an explicit ``owner`` record is the owner's voice. Every letter
+    stored before #2126 carries no voice and was written in the generic
+    Higher Self voice, and anything unrecognised is never promoted to owner.
+    """
+    if record.voice == ReplyVoice.OWNER.value:
+        return ReplyVoice.OWNER
+    return ReplyVoice.HIGHER_SELF
 
 
 def _bounded_letter(completion: str) -> str:
@@ -312,7 +358,9 @@ def _existing_letter(
     return existing
 
 
-def _generate(call: LetterCall, source: LetterSource) -> str | LetterRefusal:
+def _generate(
+    call: LetterCall, source: LetterSource, style: ReplyStyle
+) -> str | LetterRefusal:
     """Dial the tier-routed model once and return the bounded letter.
 
     The cap clause is ordered **first** and that ordering is the whole of
@@ -330,7 +378,7 @@ def _generate(call: LetterCall, source: LetterSource) -> str | LetterRefusal:
     tier = routing_tier(call.ceiling, source.tier)
     try:
         llm = call.build_factory()(tier, max_tokens=LETTER_MAX_OUTPUT_TOKENS)
-        completion = llm(build_letter_prompt(source))
+        completion = llm(build_letter_prompt(source, style))
     except ProviderRateLimitError:
         return LetterRefusal.RATE_LIMITED
     except RequestKeyRejectedError:
@@ -349,15 +397,18 @@ def _generate(call: LetterCall, source: LetterSource) -> str | LetterRefusal:
 
 
 def _store(
-    call: LetterCall, source: LetterSource, letter: str
+    call: LetterCall, source: LetterSource, letter: str, voice: ReplyVoice
 ) -> LetterWrite | LetterRefusal:
-    """Store *letter* first-writer-wins under the caller's id."""
+    """Store *letter* first-writer-wins under the caller's id, with its voice."""
     try:
         return create_voice_draft_if_absent(
             vault_path=call.vault_path,
             external_id=call.external_id,
             document=VoiceDraftDocument(
-                content=letter, title=source.title, tier=source.tier
+                content=letter,
+                title=source.title,
+                tier=source.tier,
+                voice=voice.value,
             ),
             existing_is_admitted=lambda tier: tier_allowed(tier, call.ceiling),
         )
@@ -374,6 +425,27 @@ def _care_reason(call: LetterCall, source: LetterSource) -> str | None:
     return call.care_guard(source.content) or call.care_guard(source.note)
 
 
+def _letter_style(call: LetterCall) -> ReplyStyle:
+    """Return the style this letter is written in (#2126).
+
+    Read after the ceiling, care and stored-letter gates, so an above-ceiling,
+    escalated or repeated call reads none of the owner's style. It *is* read
+    before the dial, so a call refused at dial time (rate limit, rejected key,
+    unavailable provider) has already read it; nothing it read is stored or
+    returned on that path. Samples are admitted at the caller's own ceiling.
+    A caller that cannot read ``voice`` (``apply_owner_voice`` false) gets the
+    generic style without reading anything.
+
+    Imported here, not at module top: the HTTP API must cold-start without
+    importing ``creek.author`` (tests/test_container_image_contract.py).
+    """
+    if not call.apply_owner_voice:
+        return HIGHER_SELF_STYLE
+    from creek.author.reply_voice import reply_style
+
+    return reply_style(call.vault_path, override=to_privacy_override(call.ceiling))
+
+
 def _admitted_outcome(call: LetterCall, source: LetterSource) -> LetterOutcome:
     """Run the gates after the ceiling check, in source order."""
     reason = _care_reason(call, source)
@@ -384,10 +456,11 @@ def _admitted_outcome(call: LetterCall, source: LetterSource) -> LetterOutcome:
         return existing
     if existing is not None:
         return VoiceDraftWriteResult(VoiceDraftAction.UNCHANGED, existing)
-    letter = _generate(call, source)
+    style = _letter_style(call)
+    letter = _generate(call, source, style)
     if isinstance(letter, LetterRefusal):
         return letter
-    return _store(call, source, letter)
+    return _store(call, source, letter, style.voice)
 
 
 def write_letter(call: LetterCall, source: LetterSource) -> LetterOutcome:

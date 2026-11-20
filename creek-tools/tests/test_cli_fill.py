@@ -65,6 +65,9 @@ _EXPECTED_ORDER = [
     # only ever written by an operator who knows to run
     # ``creek report --type voice`` by hand.
     "report/voice",
+    # #2126: letters and reflections are styled by the voice fingerprint, so
+    # ``fill`` builds it — otherwise a managed vault never has one.
+    "report/fingerprint",
     "report/wavelength",
     "index",
 ]
@@ -99,6 +102,7 @@ def _install_recorders(
         ("_report_synchronicity", "report/synchronicity"),
         ("_report_mode_profiles", "report/mode-profiles"),
         ("_report_voice", "report/voice"),
+        ("_report_fingerprint", "report/fingerprint"),
     ):
         monkeypatch.setattr(cli_mod, name, rec(label))
     # ``rec`` already accepts any signature; spelling ``_report_wavelength``'s

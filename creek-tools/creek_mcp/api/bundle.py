@@ -88,6 +88,7 @@ from creek_mcp.api.models import (
     PraxisKind,
     PraxisLifecycle,
     ReflectionStatus,
+    ReplyVoice,
     RequestKeyProvider,
     WireTierCeiling,
 )
@@ -343,12 +344,16 @@ _LETTER_SUCCESS: Final[dict[str, Any]] = {
     "letter": _EXAMPLE_LETTER_TEXT,
     "attribution": _VOICE_DRAFT_ATTRIBUTION,
     "inference_source": INFERENCE_SOURCE_POOL_CREEK,
+    "voice": ReplyVoice.OWNER.value,
 }
 """A first letter, stored as the Voice Draft at the caller's id.
 
 ``inference_source`` names the route that wrote it (contract 0.19, #1894).
 Shown *present* here because a consumer needs the populated shape; the field
 is absent whenever there is no route to name.
+
+``voice`` (contract 0.35, #2126) is ``owner``: the vault held the owner's own
+style. A repeat reports the voice the letter was stored with.
 """
 
 _LETTER_EMPTY: Final[dict[str, Any]] = {
@@ -560,8 +565,12 @@ _REFLECTIONS_SUCCESS: Final[dict[str, Any]] = {
     "related_praxis": [_EXAMPLE_PRAXIS],
     "related_eddies": [_EXAMPLE_EDDY],
     "inference_source": INFERENCE_SOURCE_POOL_CREEK,
+    "voice": ReplyVoice.OWNER.value,
 }
 """A reflection that found something.
+
+``voice`` (contract 0.35, #2126) is ``owner``: the notes were written in the
+owner's own style. :data:`_REFLECTIONS_EMPTY` shows ``higher_self``.
 
 ``inference_source`` names the route that answered (contract 0.19, #1894), and
 is shown present for the reason the two ``related_*`` fields are.
@@ -583,6 +592,7 @@ _REFLECTIONS_EMPTY: Final[dict[str, Any]] = {
     },
     "status": ReflectionStatus.EMPTY.value,
     "notes": [],
+    "voice": ReplyVoice.HIGHER_SELF.value,
 }
 """A reflection with nothing to say. Still a 200.
 

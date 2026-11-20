@@ -46,6 +46,7 @@ from creek.care.guardrail import acute_distress_guard
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek_mcp.api.models import (
     RELATED_FIELDS_SINCE_MINOR,
+    VOICE_SINCE_MINOR,
     CareEscalationResponse,
     CareSignal,
     ErrorCode,
@@ -53,6 +54,7 @@ from creek_mcp.api.models import (
     ReflectionRequest,
     ReflectionResponse,
     ReflectionStatus,
+    ReplyVoice,
     WireTierCeiling,
 )
 from creek_mcp.httpapi.context import context_of
@@ -389,6 +391,9 @@ def _reflect(
         consumer=context.consumer,
         max_notes=parsed.max_notes,
         grounding_route=grounding_route,
+        # #2126: owner-voiced notes only for a caller that can read ``voice``;
+        # below it the prompt is the generic one, byte for byte.
+        apply_owner_voice=declared_minor_at_least(request, VOICE_SINCE_MINOR),
     )
 
 
@@ -445,6 +450,7 @@ def _render_notes(
     *,
     serve_related: bool,
     inference_source: str | None,
+    serve_voice: bool,
 ) -> Response:
     """Return the note-bearing response for an ``ok`` or ``empty`` result.
 
@@ -456,6 +462,8 @@ def _render_notes(
         inference_source: The route that answered, or ``None`` when it is one
             this contract does not label or the caller's minor predates the
             field.
+        serve_voice: Whether the caller's declared minor can describe
+            ``voice`` (:data:`~creek_mcp.api.models.VOICE_SINCE_MINOR`).
 
     Returns:
         A ``200`` carrying :class:`~creek_mcp.api.models.ReflectionResponse`, or
@@ -481,6 +489,7 @@ def _render_notes(
             related_praxis=result.get("related_praxis"),
             related_eddies=result.get("related_eddies"),
             inference_source=inference_source,
+            voice=ReplyVoice(result["voice"]) if serve_voice else None,
         )
     except (ValidationError, ValueError, KeyError, TypeError):
         return error_response(ErrorCode.INTERNAL_ERROR, context)
@@ -526,8 +535,9 @@ def _dumped(payload: ReflectionResponse, *, serve_related: bool) -> dict[str, An
     for key in ("related_praxis", "related_eddies"):
         if not serve_related or data.get(key) is None:
             data.pop(key, None)
-    if data.get("inference_source") is None:
-        data.pop("inference_source", None)
+    for key in ("inference_source", "voice"):
+        if data.get(key) is None:
+            data.pop(key, None)
     return data
 
 
@@ -553,6 +563,7 @@ def _render(
     serve_provenance: bool,
     serve_request_key_rejected: bool,
     request_key: str,
+    serve_voice: bool,
 ) -> Response:
     """Project the tool's result onto the published response, or a refusal.
 
@@ -568,6 +579,8 @@ def _render(
             can name ``request_key_rejected``.
         request_key: The request key's provider, or :data:`_NO_REQUEST_KEY`,
             for the refusal log.
+        serve_voice: Whether the caller declared a minor that can describe
+            ``voice`` (#2126).
 
     Returns:
         The published response.
@@ -581,6 +594,7 @@ def _render(
             context,
             serve_related=serve_related,
             inference_source=provenance.source if serve_provenance else None,
+            serve_voice=serve_voice,
         )
     reason = str(result.get("reason", ""))
     code = reflect_refusal_code(reason)
@@ -659,4 +673,5 @@ async def handle_reflection(request: Request) -> Response:
         serve_provenance=serves_provenance(request),
         serve_request_key_rejected=serves_request_key_rejected(request),
         request_key=key_provider,
+        serve_voice=declared_minor_at_least(request, VOICE_SINCE_MINOR),
     )

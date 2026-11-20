@@ -27,5 +27,6 @@
   ],
   "routed_tier": "personal",
   "status": "ok",
-  "tier_ceiling": "personal"
+  "tier_ceiling": "personal",
+  "voice": "owner"
 }

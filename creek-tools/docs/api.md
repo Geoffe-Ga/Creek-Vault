@@ -548,6 +548,20 @@ manifest instead of the `202` its vendored contract cannot name, and `0.32`
 stays in the window. Adepthood can count the manifest as handled only once its
 upload result parser accepts the `202` body and its pin reaches `0.33`.
 
+`0.35.0` (#2126) says whose voice a letter or reflection is in. The letter
+response and the reflection response gain the optional `voice`: `owner` when
+the owner's own style shaped the text, `higher_self` when the vault holds none
+and the generic Higher Self prompt was used. The style comes only from the
+owner's own writing — owner-authored style skills, register samples admitted
+at your declared ceiling (as a numeric profile, never their words), and the
+voice fingerprint when your ceiling admits `personal` — never from earlier
+letters or reflections, and never from borrowed authors. A missing voice is
+never a refusal. A repeat letter reports the voice it was stored with, and a
+letter stored before `0.35` reads `higher_self`. A caller below `0.35` cannot
+read the field, so it is never sent owner-voiced prose either: its prompt is
+the generic Higher Self one, its letters are stored as `higher_self`, its
+bodies are byte-identical, and `0.34` stays in the window.
+
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE
 /v1/connectors/drive` and `POST /v1/connectors/drive/syncs`. It is additive in

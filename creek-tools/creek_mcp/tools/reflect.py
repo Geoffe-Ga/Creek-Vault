@@ -21,6 +21,12 @@ synthesised from fragments the caller may not be entitled to, so
 fragment is within the ceiling, and withholds any page whose provenance it
 cannot enumerate in full.
 
+Since #2126 every ``ok``/``empty`` response carries ``voice``: ``owner`` when
+the prompt carried the owner's own style
+(:func:`creek.author.reply_voice.reply_style`, admitted at the caller's
+ceiling), ``higher_self`` when the vault holds none or the style had to be
+given up to fit the pool cap.
+
 Four guarantees this module enforces:
 
 - **The ceiling is enforced on read (#846).** An ``entry_ref`` resolves a vault
@@ -99,6 +105,7 @@ from creek.classify.llm.providers import (
     RequestKeyRejectedError,
 )
 from creek.config import CONFIG_LOAD_FAILURES
+from creek.reply_voice import HIGHER_SELF_STYLE, ReplyStyle, ReplyVoice
 from creek.vault.reader import CORPUS_SUBDIRS, try_validate_fragment
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
@@ -683,13 +690,31 @@ def _clean_notes(
     return cleaned
 
 
+class _Prompt(NamedTuple):
+    """A prompt under the cap and the voice it was written to carry.
+
+    Attributes:
+        text: The prompt.
+        voice: ``OWNER`` when the owner's style is in it (#2126).
+    """
+
+    text: str
+    voice: ReplyVoice
+
+
 def _capped_prompt(
     entry: str,
     grounding: list[str],
     *,
     max_notes: int,
-) -> str | None:
+    style: ReplyStyle = HIGHER_SELF_STYLE,
+) -> _Prompt | None:
     """Return a prompt under the pool's token cap, or ``None`` to refuse.
+
+    The owner's style (#2126) is the second thing given up, after every
+    grounding snippet and before the entry: a reflection in the generic Higher
+    Self voice is still a reflection, and one that does not read the whole
+    entry is not.
 
     ADR-0016 Decision 1 item 4, vault side, in its exact order: **grounding
     snippets are dropped first**, one at a time from the least relevant end,
@@ -712,12 +737,26 @@ def _capped_prompt(
         max_notes: The caller's requested note count.
 
     Returns:
-        The prompt to send, or ``None`` when even the ungrounded prompt
-        exceeds the cap.
+        The prompt to send and its voice, or ``None`` when even the
+        ungrounded Higher Self prompt exceeds the cap.
     """
+    styles = (style, HIGHER_SELF_STYLE) if style.block else (style,)
+    for candidate in styles:
+        prompt = _grounded_within_cap(
+            entry, grounding, max_notes=max_notes, style=candidate
+        )
+        if prompt is not None:
+            return _Prompt(prompt, candidate.voice)
+    return None
+
+
+def _grounded_within_cap(
+    entry: str, grounding: list[str], *, max_notes: int, style: ReplyStyle
+) -> str | None:
+    """Drop grounding from the least relevant end until *style*'s prompt fits."""
     snippets = grounding.copy()
     while True:
-        prompt = _build_prompt(entry, snippets, max_notes=max_notes)
+        prompt = _build_prompt(entry, snippets, max_notes=max_notes, style=style)
         if pool_prompt_within_cap(prompt):
             return prompt
         if not snippets:
@@ -730,8 +769,14 @@ def _build_prompt(
     grounding: list[str],
     *,
     max_notes: int = _DEFAULT_MAX_NOTES,
+    style: ReplyStyle = HIGHER_SELF_STYLE,
 ) -> str:
-    """Compose a concise, output-bounded margin-note prompt."""
+    """Compose a concise, output-bounded margin-note prompt.
+
+    With the owner's style (#2126) the Higher Self framing is kept and the
+    owner's source-free style block follows it; without it the prompt is
+    exactly the generic one.
+    """
     sources = "\n\n".join(f"- {snippet}" for snippet in grounding) or "(none)"
     kinds = ", ".join(sorted(_ALLOWED_KINDS))
     note_limit = _bounded_note_count(max_notes)
@@ -745,13 +790,17 @@ def _build_prompt(
         "Prefer one strong note; add another only when essential. Return JSON only: "
         "no analysis, preamble, Markdown fence, or essay."
     )
+    owner = style.voice is ReplyVoice.OWNER
+    voice = " in the writer's own style, as described below" if owner else ""
+    style_block = f"{style.block}\n\n" if owner else ""
     return (
         CARE_POLICY
         + "\n\n"
         + "You are the writer's own Higher Self leaving warm, second-person margin "
-        "notes on their journal entry. Mirror their wisdom back; never advise from "
-        "above, never diagnose, never console with platitudes. Ground every note in "
-        "their own words and the source fragments below.\n\n"
+        f"notes on their journal entry{voice}. Mirror their wisdom back; never "
+        "advise from above, never diagnose, never console with platitudes. Ground "
+        "every note in their own words and the source fragments below.\n\n"
+        + style_block
         + schema
         + f"\n\nSOURCE FRAGMENTS:\n{sources}\n\nENTRY:\n{entry}"
     )
@@ -1022,6 +1071,7 @@ def _reflection_response(
     related: RelatedCompiled,
     ceiling: TierCeiling,
     tier: PrivacyTier,
+    voice: ReplyVoice = ReplyVoice.HIGHER_SELF,
 ) -> dict[str, Any]:
     """Render the answered-reflection response, omitting what does not qualify.
 
@@ -1039,6 +1089,7 @@ def _reflection_response(
             nothing qualifies.
         ceiling: The caller's declared ceiling, echoed back.
         tier: The tier the model call was actually routed at.
+        voice: Which voice the prompt carried (#2126).
 
     Returns:
         The ``ok`` / ``empty`` response dict.
@@ -1052,6 +1103,7 @@ def _reflection_response(
         # ``essay`` is free model prose and is NOT verbatim/grounding-checked the
         # way ``notes[].quote`` is — a client must not treat it as grounded.
         "essay_grounded": False,
+        "voice": voice.value,
     }
     if essay is not None:
         result["essay"] = essay
@@ -1063,6 +1115,17 @@ def _reflection_response(
     if related.eddies:
         result["related_eddies"] = related.eddies
     return result
+
+
+def _owner_style(vault_path: Path, ceiling: TierCeiling) -> ReplyStyle:
+    """Return the owner's style for this reflection, admitted at *ceiling*.
+
+    Imported lazily, as :class:`~creek.author.agents.RetrievalSpecialist` is:
+    the HTTP API must cold-start without importing ``creek.author``.
+    """
+    from creek.author.reply_voice import reply_style
+
+    return reply_style(vault_path, override=to_privacy_override(ceiling))
 
 
 def _corpus_for_entry(
@@ -1104,6 +1167,7 @@ def reflect_tool(
     consumer: str = "unknown",
     max_notes: int = _DEFAULT_MAX_NOTES,
     grounding_route: GroundingRoute | None = None,
+    apply_owner_voice: bool = True,
 ) -> dict[str, Any]:
     """Return anchored Higher-Self margin notes for a single journal entry.
 
@@ -1157,6 +1221,13 @@ def reflect_tool(
             destination every byte went to. A decision that raises leaves the
             reflection ungrounded with nothing embedded — never grounded by a
             route nobody chose.
+        apply_owner_voice: Whether the owner's style may shape the notes
+            (#2126). ``POST /v1/reflections`` passes ``False`` to a caller
+            declaring a minor below
+            :data:`~creek_mcp.api.models.VOICE_SINCE_MINOR`, which cannot read
+            ``voice``: its prompt stays the generic Higher Self one, byte for
+            byte, and the owner's style is not even read. The MCP tool has no
+            declared minor and keeps the default, reporting ``voice`` itself.
 
     Returns:
         ``{status, tool, tier_ceiling, ...}`` — ``ok`` with ``notes`` (+ optional
@@ -1230,7 +1301,16 @@ def reflect_tool(
     # Before the factory, not after: building it probes the provider, and a
     # probe is a dial. An over-cap entry must be refused with **zero** dials
     # (ADR-0016 T20).
-    prompt = _capped_prompt(entry, grounding.lines, max_notes=max_notes)
+    prompt = _capped_prompt(
+        entry,
+        grounding.lines,
+        max_notes=max_notes,
+        style=(
+            _owner_style(vault_path, privacy_tier_ceiling)
+            if apply_owner_voice
+            else HIGHER_SELF_STYLE
+        ),
+    )
     if prompt is None:
         return refusal_response(
             tool=TOOL_NAME,
@@ -1240,7 +1320,7 @@ def reflect_tool(
     try:
         max_tokens = _reflection_output_token_budget(max_notes)
         llm = llm_factory(tier, max_tokens=max_tokens)
-        response_text = llm(prompt)
+        response_text = llm(prompt.text)
     except PROVIDER_CALL_FAILURES as exc:
         # Type name only — see the module docstring (#2083).
         logger.warning(
@@ -1267,6 +1347,7 @@ def reflect_tool(
         related=related,
         ceiling=privacy_tier_ceiling,
         tier=tier,
+        voice=prompt.voice,
     )
 
 

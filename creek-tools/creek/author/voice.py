@@ -384,6 +384,42 @@ def _requested_skills(
     return [(name, found.get(name) or render_voice_signature(name)) for name in names]
 
 
+def _is_owner_style(name: str, content: str) -> bool:
+    """Return whether *content* is owner-authored rather than a canonical signature.
+
+    A canonical signature is the same text for every vault, so it describes a
+    register and never this owner. The one predicate behind both
+    :attr:`RevoicePrompt.owner_style_skills` and :func:`owner_style_sections`.
+    """
+    return content.strip() != render_voice_signature(name).strip()
+
+
+def owner_style_sections(
+    vault: Path, *, phase: str | None, register: str | None
+) -> list[tuple[str, str]]:
+    """Return the owner-authored, source-free voice skills for *phase*/*register*.
+
+    The subset of the revoice stack that is this owner's own style (#2126):
+    every section is projected through :func:`_source_free_style`, so no
+    cached exemplar can reach a provider, and canonical signatures (from a
+    missing file or a reconstructed native cache) are dropped because they
+    describe no one. Letters and reflections build their style from these.
+
+    Args:
+        vault: The vault holding the voice skill tree.
+        phase: A canonical phase slug, or no phase conditioning.
+        register: A voice-register slug, or no register conditioning.
+
+    Returns:
+        ``(name, style)`` pairs in voice-core, phase, register order.
+    """
+    return [
+        (name, content)
+        for name, content in _requested_skills(vault, phase, register)
+        if _is_owner_style(name, content)
+    ]
+
+
 def _grounding_lines(grounding: RevoiceGrounding) -> list[str]:
     """Render grounding as dynamic prompt blocks, omitting what is absent."""
     lines: list[str] = []
@@ -442,11 +478,7 @@ def split_revoice_prompt(
         static,
         dynamic,
         tuple(name for name, _content in skills),
-        tuple(
-            name
-            for name, content in skills
-            if content.strip() != render_voice_signature(name).strip()
-        ),
+        tuple(name for name, content in skills if _is_owner_style(name, content)),
     )
 
 
