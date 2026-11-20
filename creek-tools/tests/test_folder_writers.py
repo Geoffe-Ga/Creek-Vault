@@ -72,6 +72,20 @@ def test_the_epics_writerless_folders_are_flagged() -> None:
     assert reasons["01-Fragments"] is WriterlessReason.CONTAINER
 
 
+def test_the_writers_the_population_lane_corrected_are_pinned() -> None:
+    """``Unnamed`` is filled by ``save``; other authors' notes by ingest (#2125).
+
+    ``generate.unnamed`` only reads ``10-Liminal/Unnamed`` (it writes the
+    ``Digests`` beneath it), and no ``authors`` subsystem exists: a note lands
+    in ``11-Other-Authors/<slug>`` when ingest reads its ``author_slug``.
+    """
+    writers = {folder.path: folder.writer for folder in ONTOLOGY_FOLDERS}
+
+    assert writers["10-Liminal/Unnamed"] == "save"
+    assert writers["10-Liminal/Unnamed/Digests"] == "generate.unnamed"
+    assert writers["11-Other-Authors"] == "ingest"
+
+
 def test_the_fragment_folders_fill_from_ingest() -> None:
     """Every ``01-Fragments`` subfolder is an ingest destination."""
     for folder in ONTOLOGY_FOLDERS:

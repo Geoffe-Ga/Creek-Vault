@@ -13,13 +13,19 @@ them (``generate.*``, ``save``) are reached from the ``creek`` CLI or MCP rather
 than from a ``/v1`` route, so on a managed vault such a folder can stay empty
 until that subsystem is run. The name says which one to run.
 
-**Provisional until proven.** #2125
-proves each entry against a live server and a dummy corpus. The three praxis
-cadences are written by the classify post-pass
-(:func:`creek.classify.praxis_writer.write_praxis_pages`, #2122), which files
-each page by its ``praxis_type`` into ``Daily``, ``Seasonal`` or
-``Situational``; ``tests/test_folder_writers.py`` runs it and fails if a page
-lands in a folder not registered to :data:`PRAXIS_WRITER`.
+**Proven, not asserted.** ``tests/e2e/test_ontology_population_e2e.py``
+(#2125) runs every writer named here over a dummy corpus and fails unless each
+folder gains a note during its own writer's stage. That proof corrected two
+entries: ``10-Liminal/Unnamed`` is filled by ``creek save --target unnamed``
+(the ``generate.unnamed`` digest only reads it, and writes ``Digests``), and
+``11-Other-Authors/<slug>`` by ingest, from a note whose frontmatter names its
+``source.author_slug``. The three praxis cadences are written by the classify
+post-pass (:func:`creek.classify.praxis_writer.write_praxis_pages`, #2122);
+``tests/test_folder_writers.py`` runs it too. One entry is registered but not
+reachable: ``08-Decisions/Archive``'s move
+(``DecisionDetector.update_decision_phase``) has no caller on any surface, and
+the lane records that as a known gap (#2137) rather than calling the folder
+writerless.
 
 How a note is attributed to a folder: each ``.md`` file counts toward the
 deepest registered folder that contains it, so a nested registered folder is
@@ -171,9 +177,9 @@ ONTOLOGY_FOLDERS: Final[tuple[OntologyFolder, ...]] = (
     _written("10-Liminal/Orphaned", _INGEST),
     _written("10-Liminal/Paradoxes", "generate.paradox"),
     _written("10-Liminal/Synchronicities", "generate.synchronicity"),
-    _written("10-Liminal/Unnamed", _UNNAMED),
+    _written("10-Liminal/Unnamed", _SAVE),
     _written("10-Liminal/Unnamed/Digests", _UNNAMED),
-    _written("11-Other-Authors", "authors"),
+    _written("11-Other-Authors", _INGEST),
     _written("11-Other-Authors/ai-as-user", "voice-drafts"),
     _writerless("11-Other-Authors/example-author", WriterlessReason.TEMPLATE_EXAMPLE),
 )

@@ -134,6 +134,12 @@ class LinkSummary:
             of it. ``0`` means nothing reached disk — an empty vault, or a
             swallowed ``OSError`` from the cache write. The CLI reports
             this rather than asserting that vectors were cached (#1337).
+        skipped_materialisation: Eddies or threads detected whose page never
+            reached disk — every one when the vault lacks the dirs a
+            :class:`VaultWriter` needs, or each write that raised ``OSError``.
+            Both paths log and carry on, so before #2125 this number lived only
+            in the log and a caller read the pass as clean. ``0`` for the
+            methods that materialise nothing.
     """
 
     method: str
@@ -150,6 +156,7 @@ class LinkSummary:
     oversized_discarded: int = 0
     fragments_embedded: int = 0
     vectors_persisted: int = 0
+    skipped_materialisation: int = 0
 
 
 @dataclass(frozen=True)
@@ -387,6 +394,7 @@ def _run_threads(
         link_count=len(threads),
         threads_detected=len(threads),
         threads_written=len(written_threads),
+        skipped_materialisation=len(threads) - len(written_threads),
         member_fragments_updated=fragments_updated,
         largest_cluster_fragments=_largest_cluster(detector.thread_members),
         clusters_split=detector.clusters_split,
@@ -485,6 +493,7 @@ def _run_eddies(
         link_count=len(eddies),
         eddies_detected=len(eddies),
         eddies_written=len(written_eddies),
+        skipped_materialisation=len(eddies) - len(written_eddies),
         member_fragments_updated=fragments_updated,
         largest_cluster_fragments=_largest_cluster(detector.eddy_members),
         clusters_split=detector.clusters_split,

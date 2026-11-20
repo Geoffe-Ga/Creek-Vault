@@ -1,0 +1,2 @@
+post_id,post_date,is_published,email_sent_at,inbox_sent_at,type,audience,title,subtitle,podcast_url
+171234567,2024-03-15T08:30:00.000Z,true,,,newsletter,everyone,On Attention,A subtitle,

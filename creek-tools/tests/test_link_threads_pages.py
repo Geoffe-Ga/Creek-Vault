@@ -112,6 +112,7 @@ def test_link_threads_writes_one_page_per_detected_thread(tmp_path: Path) -> Non
     assert summary.fragment_count == 3
     assert summary.threads_detected == 1
     assert summary.threads_written == summary.threads_detected
+    assert summary.skipped_materialisation == 0
     pages = _thread_pages(vault)
     assert len(pages) == summary.threads_written
     # Pages route under a status subfolder (Active/Dormant/Resolved).
@@ -350,3 +351,31 @@ def test_link_threads_failed_page_write_leaves_members_unstamped(
             f"{path.name} belongs only to the failed thread and must not have "
             f"been rewritten at all"
         )
+
+
+def test_link_threads_reports_a_page_that_failed_to_write(tmp_path: Path) -> None:
+    """A thread page the disk refused is counted, never silently dropped (#2125).
+
+    ``_materialise_link_models`` logs and skips an ``OSError``; before #2125
+    that was visible only in the log, so a status reader saw ``ok``.
+    """
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    _thread_corpus(vault)
+
+    with patch(
+        "creek.link.link_engine.VaultWriter.write_thread",
+        side_effect=OSError("disk full"),
+    ):
+        summary = run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="threads",
+            rebuild=False,
+        )
+
+    assert summary.threads_detected == 1
+    assert summary.threads_written == 0
+    assert summary.skipped_materialisation == 1
+    assert _thread_pages(vault) == []

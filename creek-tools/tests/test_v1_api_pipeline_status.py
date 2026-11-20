@@ -422,6 +422,80 @@ def test_a_tombed_fragment_withholds_its_document(vault: Path) -> None:
     assert body["documents_withheld"] == 1
 
 
+_BORROWED_NOTE: Final[str] = (
+    "---\nsource:\n  platform: markdown\n  author: other\n"
+    "  author_slug: montaigne\n---\n# Of experience\n\n"
+    "No desire is more natural than the desire for knowledge.\n"
+)
+"""A note naming its author: ingest files it under ``11-Other-Authors/montaigne``."""
+
+
+def _upload_borrowed(test_client: TestClient, tier: str) -> None:
+    """Upload :data:`_BORROWED_NOTE` at *tier*."""
+    response = test_client.post(
+        UPLOAD_PATH,
+        headers=headers(ceiling="personal"),
+        json={
+            "filename": "of-experience.md",
+            "content_base64": base64.b64encode(_BORROWED_NOTE.encode()).decode(),
+            "external_id": "borrowed-1",
+            "tier": tier,
+        },
+    )
+    assert response.status_code == _OK, response.text
+
+
+def test_an_upload_filed_under_other_authors_is_listed_at_its_tier(
+    vault: Path,
+) -> None:
+    """A borrowed note resolves where ingest filed it, not only ``01-Fragments``.
+
+    Ingest files a note whose frontmatter names ``source.author_slug`` into
+    ``11-Other-Authors/<slug>``. Resolving fragments under ``01-Fragments``
+    alone left it unresolvable, so the fail-closed rule withheld it at every
+    ceiling and its caller never saw its trail (#2125).
+    """
+    with client(vault_path=vault) as test_client:
+        _upload_borrowed(test_client, "personal")
+        body = _status(test_client)
+
+    assert body["documents_withheld"] == 0
+    [document] = body["documents"]
+    assert document["filename"] == "of-experience.md"
+    assert document["fragment_path"].startswith("11-Other-Authors/montaigne/")
+    assert (vault / document["fragment_path"]).is_file()
+    assert _stages(document)[0] == ("ingested", "ok")
+
+
+def test_an_upload_filed_under_other_authors_is_withheld_above_the_ceiling(
+    vault: Path,
+) -> None:
+    """Resolved there, its own tier still decides: ``personal`` is not ``open``."""
+    with client(vault_path=vault) as test_client:
+        _upload_borrowed(test_client, "personal")
+        body = _withheld_at_open(test_client)
+
+    assert body["documents"] == []
+    assert body["documents_withheld"] == 1
+
+
+def test_the_resolved_roots_are_the_live_ingest_folders() -> None:
+    """Every folder ingest writes a live fragment into is walked; tombs are not.
+
+    Derived from the folder registry, so a new ingest destination is resolved
+    without a second list to keep in step. ``10-Liminal/Orphaned`` is ingest's
+    too, but a tombed fragment is not live and stays fail-closed (#2136).
+    """
+    ingest = {f.path for f in ONTOLOGY_FOLDERS if f.writer == "ingest"}
+    live = ingest - {"10-Liminal/Orphaned"}
+
+    roots = pipeline_status.FRAGMENT_ROOTS
+
+    assert roots == ("01-Fragments", "11-Other-Authors")
+    assert all(path.split("/", 1)[0] in roots for path in live)
+    assert "10-Liminal" not in roots
+
+
 def test_a_missing_fragment_withholds_its_document(vault: Path) -> None:
     """A fragment that is simply gone is unprovable, so it is withheld."""
     with client(vault_path=vault) as test_client:
