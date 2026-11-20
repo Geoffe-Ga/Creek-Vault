@@ -1,12 +1,14 @@
-"""The compiled layer — eddies and praxis — as seen through a tier ceiling (#873).
+"""The compiled layer — threads, eddies and praxis — through a tier ceiling (#873).
 
 ``creek.reflect`` grounds its margin notes in the corpus fragments nearest an
-entry. Those fragments *belong to* compiled structures — ``03-Eddies/`` topic
-clusters they carry ``eddies:`` wiki-links to, and ``04-Praxis/`` pages whose
-``derived_from`` names them — and this module is the one place that turns a set
-of seed fragment ids into the bounded, ceiling-admitted view of those
-structures that :func:`creek_mcp.tools.reflect.reflect_tool` publishes as
-``related_praxis`` / ``related_eddies``.
+entry. Those fragments *belong to* compiled structures — ``02-Threads/``
+narrative currents and ``03-Eddies/`` topic clusters they carry ``threads:`` /
+``eddies:`` wiki-links to, and ``04-Praxis/`` pages whose ``derived_from``
+names them — and this module is the one place that turns a set of seed
+fragment ids into the bounded, ceiling-admitted view of those structures that
+:func:`creek_mcp.tools.reflect.reflect_tool` publishes as ``related_praxis`` /
+``related_eddies`` / ``related_threads`` (threads since #2127, which also
+publishes all three on letters).
 
 **A compiled page is a laundering risk, and is treated as one.** An eddy page's
 ``description`` and ``fragment_count``, and a praxis page's body, are
@@ -29,7 +31,7 @@ caller's ceiling. A page whose provenance cannot be enumerated in full is
   (:func:`_provenance_admitted`);
 - any contributing fragment id does not resolve to a fragment on disk at all,
   so its tier is unknown and unknowable;
-- an eddy page's own ``fragment_count`` disagrees with the number of member
+- an eddy or thread page's own ``fragment_count`` disagrees with the number of member
   fragments that can be enumerated, which is what an above-ceiling,
   hand-deleted, purged or unreadable member looks like from here;
 - a praxis page declares no ``derived_from`` at all, or declares one carrying a
@@ -63,7 +65,7 @@ from datetime import date, datetime
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
-from creek.models import PraxisStatus, PraxisType
+from creek.models import PraxisStatus, PraxisType, ThreadStatus
 from creek.vault.links import read_header_meta
 from creek.vault.reader import iter_vault_fragments
 from creek_mcp.tier_ceiling import frontmatter_tier, tier_allowed, tier_sensitivity
@@ -83,6 +85,13 @@ MAX_RELATED_PRAXIS: Final[int] = 3
 MAX_RELATED_EDDIES: Final[int] = 2
 """Most eddy pages one reflection may carry (issue #873's suggested bound)."""
 
+MAX_RELATED_THREADS: Final[int] = 2
+"""Most thread pages one reflection or letter may carry (#2127).
+
+Matches :data:`MAX_RELATED_EDDIES`: a reflection is a note in the margin, not
+a dashboard.
+"""
+
 EXCERPT_CHARS: Final[int] = 240
 """Hard cap on a praxis excerpt, in characters.
 
@@ -93,6 +102,7 @@ about admission.
 """
 
 _FRAGMENTS_SUBDIR: Final[str] = "01-Fragments"
+_THREADS_SUBDIR: Final[str] = "02-Threads"
 _EDDIES_SUBDIR: Final[str] = "03-Eddies"
 _PRAXIS_SUBDIR: Final[str] = "04-Praxis"
 
@@ -101,12 +111,21 @@ _PRAXIS_TYPES: Final[frozenset[str]] = frozenset(member.value for member in Prax
 _PRAXIS_STATUSES: Final[frozenset[str]] = frozenset(
     member.value for member in PraxisStatus
 )
+_THREAD_STATUS_FOLDERS: Final[dict[str, str]] = {
+    member.value.capitalize(): member.value for member in ThreadStatus
+}
+"""``02-Threads/`` subfolder -> the status it means.
+
+The folder names are the ones :meth:`creek.vault.writer.VaultWriter.write_thread`
+routes a thread into. A thread page anywhere else under ``02-Threads/`` has no
+status this module can vouch for, so it is never published.
+"""
 
 
 class RelatedCompiled(NamedTuple):
-    """The compiled structures one reflection may carry.
+    """The compiled structures one reflection or letter may carry.
 
-    Both lists are empty when nothing qualifies, which is what
+    Every list is empty when nothing qualifies, which is what
     :func:`creek_mcp.tools.reflect.reflect_tool` renders as the fields being
     *absent* rather than present-and-empty.
 
@@ -115,10 +134,13 @@ class RelatedCompiled(NamedTuple):
             status, excerpt}`` mappings.
         eddies: At most :data:`MAX_RELATED_EDDIES` ``{title, description,
             fragment_count, formed}`` mappings.
+        threads: At most :data:`MAX_RELATED_THREADS` ``{id, title, status}``
+            mappings (#2127).
     """
 
     praxis: list[dict[str, Any]]
     eddies: list[dict[str, Any]]
+    threads: list[dict[str, Any]]
 
 
 class _Corpus(NamedTuple):
@@ -130,10 +152,12 @@ class _Corpus(NamedTuple):
             no page depending on it may be published.
         eddy_members: Eddy title -> the ordered, deduplicated ids of the
             fragments carrying an ``eddies:`` wiki-link to it.
+        thread_members: Thread title -> the same, for ``threads:`` links.
     """
 
     tier_by_id: dict[str, PrivacyTier]
     eddy_members: dict[str, list[str]]
+    thread_members: dict[str, list[str]]
 
 
 class _EddyPage(NamedTuple):
@@ -143,6 +167,15 @@ class _EddyPage(NamedTuple):
     description: str
     fragment_count: int
     formed: str
+
+
+class _ThreadPage(NamedTuple):
+    """A well-formed ``02-Threads/<Status>/`` page's published fields."""
+
+    id: str
+    title: str
+    status: str
+    fragment_count: int
 
 
 class _PraxisPage(NamedTuple):
@@ -202,10 +235,11 @@ def _read_corpus(
             exactly what this index needs to see to withhold a compiled page.
 
     Returns:
-        The tier index and the eddy membership map.
+        The tier index and the eddy and thread membership maps.
     """
     tier_by_id: dict[str, PrivacyTier] = {}
     members: dict[str, list[str]] = {}
+    threads: dict[str, list[str]] = {}
     source = (
         (
             (fragment, raw)
@@ -222,11 +256,30 @@ def _read_corpus(
         tier_by_id[fragment.id] = (
             tier if prior is None else max(prior, tier, key=tier_sensitivity)
         )
-        for link in fragment.eddies:
-            title = _wikilink_target(link)
-            if title is not None:
-                members.setdefault(title, []).append(fragment.id)
-    return _Corpus(tier_by_id, {title: _unique(ids) for title, ids in members.items()})
+        _index_links(members, fragment.eddies, fragment.id)
+        _index_links(threads, fragment.threads, fragment.id)
+    return _Corpus(tier_by_id, _deduplicated(members), _deduplicated(threads))
+
+
+def _index_links(
+    index: dict[str, list[str]], links: Iterable[object], frag_id: str
+) -> None:
+    """Record *frag_id* as a member of every page *links* names.
+
+    Args:
+        index: Page title -> member ids, updated in place.
+        links: One fragment's ``eddies:`` or ``threads:`` entries.
+        frag_id: That fragment's id.
+    """
+    for link in links:
+        title = _wikilink_target(link)
+        if title is not None:
+            index.setdefault(title, []).append(frag_id)
+
+
+def _deduplicated(index: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Return *index* with every member list deduplicated, order kept."""
+    return {title: _unique(ids) for title, ids in index.items()}
 
 
 def _provenance_admitted(
@@ -398,12 +451,32 @@ def _pages_under(root: Path) -> list[Path]:
     return sorted(root.rglob("*.md"))
 
 
-def _eddy_pages(vault_path: Path) -> dict[str, _EddyPage]:
-    """Index ``03-Eddies/`` by title, dropping any title claimed twice.
+def _unambiguous(pages: Iterable[_EddyPage | _ThreadPage]) -> dict[str, Any]:
+    """Index *pages* by title, dropping any title claimed twice.
 
     A title two pages both answer to is ambiguous, and an ambiguous title
     cannot be matched to the member set that authorizes it — so it is dropped
     rather than resolved by first- or last-wins.
+
+    Args:
+        pages: Well-formed pages of one kind.
+
+    Returns:
+        Unambiguous pages keyed by title.
+    """
+    indexed: dict[str, Any] = {}
+    ambiguous: set[str] = set()
+    for page in pages:
+        if page.title in indexed:
+            ambiguous.add(page.title)
+        indexed[page.title] = page
+    for title in ambiguous:
+        del indexed[title]
+    return indexed
+
+
+def _eddy_pages(vault_path: Path) -> dict[str, _EddyPage]:
+    """Index ``03-Eddies/`` by title, dropping any title claimed twice.
 
     Args:
         vault_path: Vault root.
@@ -411,27 +484,119 @@ def _eddy_pages(vault_path: Path) -> dict[str, _EddyPage]:
     Returns:
         Unambiguous eddy pages keyed by title.
     """
-    pages: dict[str, _EddyPage] = {}
-    ambiguous: set[str] = set()
-    for path in _pages_under(vault_path / _EDDIES_SUBDIR):
-        page = _eddy_page(path)
-        if page is None:
+    parsed = (_eddy_page(path) for path in _pages_under(vault_path / _EDDIES_SUBDIR))
+    return _unambiguous(page for page in parsed if page is not None)
+
+
+def _thread_page(path: Path, status: str) -> _ThreadPage | None:
+    """Parse one ``02-Threads/<Status>/`` page, or ``None`` when not well-formed.
+
+    Args:
+        path: The markdown page.
+        status: The status its subfolder names. The subfolder, not the page's
+            own ``status:`` key, is authoritative: it is where
+            :meth:`~creek.vault.writer.VaultWriter.write_thread` routes a
+            thread and where the owner moves one by hand.
+
+    Returns:
+        The page's published fields, or ``None`` when its ``type`` is not
+        ``thread``, its ``id`` or ``title`` is missing or blank, or its
+        ``fragment_count`` is not a non-negative integer. As for an eddy,
+        ``fragment_count`` is load-bearing: :func:`_admitted_titles` compares
+        it with the members it can enumerate.
+    """
+    meta = read_header_meta(path)
+    if meta.get("type") != "thread":
+        return None
+    page_id = meta.get("id")
+    title = meta.get("title")
+    count = meta.get("fragment_count")
+    if not isinstance(page_id, str) or not page_id.strip():
+        return None
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        return None
+    return _ThreadPage(
+        id=page_id.strip(), title=title.strip(), status=status, fragment_count=count
+    )
+
+
+def _thread_pages(vault_path: Path) -> dict[str, _ThreadPage]:
+    """Index every status folder of ``02-Threads/`` by title, unambiguously.
+
+    A title claimed by two pages — in one folder or across two — is dropped.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        Unambiguous thread pages keyed by title.
+    """
+    root = vault_path / _THREADS_SUBDIR
+    parsed = (
+        _thread_page(path, status)
+        for folder, status in _THREAD_STATUS_FOLDERS.items()
+        for path in _pages_under(root / folder)
+    )
+    return _unambiguous(page for page in parsed if page is not None)
+
+
+def _admitted_titles(
+    seeds: set[str],
+    members_by_title: dict[str, list[str]],
+    counts: dict[str, int],
+    corpus: _Corpus,
+    ceiling: TierCeiling,
+    limit: int,
+) -> list[str]:
+    """Return the titles of the admitted member-compiled pages the seeds touch.
+
+    Shared by eddies and threads, which are both compiled from the fragments
+    linking to them. A page is a candidate only when a seed is one of its
+    members — never padded with an untouched page. Candidates are ranked by
+    how many seeds they contain, ties broken by title, so the result is
+    deterministic and independent of filesystem order.
+
+    Args:
+        seeds: Seed fragment ids.
+        members_by_title: Page title -> its enumerable member ids.
+        counts: Page title -> the ``fragment_count`` the page declares; a
+            title absent here has no well-formed page.
+        corpus: The indexed corpus walk.
+        ceiling: The caller's declared ceiling.
+        limit: The most titles to return.
+
+    Returns:
+        At most *limit* titles.
+    """
+    overlaps = {
+        title: len(seeds.intersection(members))
+        for title, members in members_by_title.items()
+        if title in counts and seeds.intersection(members)
+    }
+    selected: list[str] = []
+    for title in sorted(overlaps, key=lambda name: (-overlaps[name], name)):
+        members = members_by_title[title]
+        # The completeness check. ``EddyDetector`` and ``ThreadDetector`` set
+        # ``fragment_count`` to exactly the member list they then write the
+        # wiki-links for, so a disagreement means a member is missing from the
+        # walk — deleted, purged, unreadable, or simply never written — and a
+        # page compiled from a fragment nobody can produce is opaque.
+        if len(members) != counts[title]:
             continue
-        if page.title in pages:
-            ambiguous.add(page.title)
-        pages[page.title] = page
-    for title in ambiguous:
-        del pages[title]
-    return pages
+        if not _provenance_admitted(members, corpus, ceiling):
+            continue
+        selected.append(title)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _select_eddies(
     seeds: set[str], corpus: _Corpus, vault_path: Path, ceiling: TierCeiling
 ) -> list[dict[str, Any]]:
     """Return the admitted eddy pages the seed fragments belong to.
-
-    Candidates are ranked by how many seeds they contain, ties broken by title,
-    so the result is deterministic and independent of filesystem order.
 
     Args:
         seeds: Seed fragment ids.
@@ -443,35 +608,60 @@ def _select_eddies(
         At most :data:`MAX_RELATED_EDDIES` published mappings.
     """
     pages = _eddy_pages(vault_path)
-    overlaps = {
-        title: len(seeds.intersection(members))
-        for title, members in corpus.eddy_members.items()
-        if title in pages and seeds.intersection(members)
-    }
-    selected: list[dict[str, Any]] = []
-    for title in sorted(overlaps, key=lambda name: (-overlaps[name], name)):
-        page = pages[title]
-        members = corpus.eddy_members[title]
-        # The completeness check. ``EddyDetector`` sets ``fragment_count`` to
-        # exactly the member list it then writes the wiki-links for, so a
-        # disagreement means a member is missing from the walk — deleted,
-        # purged, unreadable, or simply never written — and a page compiled
-        # from a fragment nobody can produce is opaque.
-        if len(members) != page.fragment_count:
-            continue
-        if not _provenance_admitted(members, corpus, ceiling):
-            continue
-        selected.append(
-            {
-                "title": page.title,
-                "description": page.description,
-                "fragment_count": page.fragment_count,
-                "formed": page.formed,
-            }
-        )
-        if len(selected) >= MAX_RELATED_EDDIES:
-            break
-    return selected
+    titles = _admitted_titles(
+        seeds,
+        corpus.eddy_members,
+        {title: page.fragment_count for title, page in pages.items()},
+        corpus,
+        ceiling,
+        MAX_RELATED_EDDIES,
+    )
+    return [
+        {
+            "title": pages[title].title,
+            "description": pages[title].description,
+            "fragment_count": pages[title].fragment_count,
+            "formed": pages[title].formed,
+        }
+        for title in titles
+    ]
+
+
+def _select_threads(
+    seeds: set[str], corpus: _Corpus, vault_path: Path, ceiling: TierCeiling
+) -> list[dict[str, Any]]:
+    """Return the admitted thread pages the seed fragments belong to (#2127).
+
+    The same gate as :func:`_select_eddies`: seed overlap selects, complete
+    and ceiling-admitted membership authorizes. Only ``{id, title, status}``
+    is published — never the page's body or member count.
+
+    Args:
+        seeds: Seed fragment ids.
+        corpus: The indexed corpus walk.
+        vault_path: Vault root.
+        ceiling: The caller's declared ceiling.
+
+    Returns:
+        At most :data:`MAX_RELATED_THREADS` published mappings.
+    """
+    pages = _thread_pages(vault_path)
+    titles = _admitted_titles(
+        seeds,
+        corpus.thread_members,
+        {title: page.fragment_count for title, page in pages.items()},
+        corpus,
+        ceiling,
+        MAX_RELATED_THREADS,
+    )
+    return [
+        {
+            "id": pages[title].id,
+            "title": pages[title].title,
+            "status": pages[title].status,
+        }
+        for title in titles
+    ]
 
 
 def _select_praxis(
@@ -535,14 +725,15 @@ def related_compiled(
             projection. Supplying it avoids parsing those files a second time.
 
     Returns:
-        The bounded, admitted view. Empty on both axes when there are no seeds
-        — no seeds means nothing selected, never "select everything".
+        The bounded, admitted view. Empty on every axis when there are no
+        seeds — no seeds means nothing selected, never "select everything".
     """
     seeds = {seed for seed in seed_ids if seed}
     if not seeds:
-        return RelatedCompiled([], [])
+        return RelatedCompiled([], [], [])
     corpus = _read_corpus(vault_path, corpus_records)
     return RelatedCompiled(
         praxis=_select_praxis(seeds, corpus, vault_path, ceiling),
         eddies=_select_eddies(seeds, corpus, vault_path, ceiling),
+        threads=_select_threads(seeds, corpus, vault_path, ceiling),
     )

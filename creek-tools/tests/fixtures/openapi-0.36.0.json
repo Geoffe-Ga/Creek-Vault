@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.35.0",
+    "version": "0.36.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -3848,6 +3848,123 @@
         "title": "LetterNote",
         "type": "object"
       },
+      "PraxisKind": {
+        "description": "The five praxis types, mirroring the vault's own vocabulary.\n\nKept in lock-step with :class:`creek.models.PraxisType`, which is what a\n``04-Praxis/`` page's ``praxis_type`` is actually constrained to;\n:mod:`creek_mcp.compiled_pages` withholds any page naming something outside\nit, so a wire enum that drifted would refuse a legitimate page on the way\nout — or, worse, admit a hand-edited value the vault never sanctioned.\n``tests/test_adepthood_contract_models.py`` pins the two lists equal.\n\nAttributes:\n    COMMITMENT: A promise the writer has made.\n    FRAMEWORK: A way of seeing they reuse.\n    HABIT: Something done repeatedly, near-automatically.\n    INSIGHT: A distilled realisation.\n    PRACTICE: Something done deliberately and returned to.",
+        "enum": [
+          "commitment",
+          "framework",
+          "habit",
+          "insight",
+          "practice"
+        ],
+        "title": "PraxisKind",
+        "type": "string"
+      },
+      "PraxisLifecycle": {
+        "description": "The four praxis lifecycle statuses, mirroring :class:`creek.models.PraxisStatus`.\n\nAttributes:\n    ACTIVE: Currently being practised.\n    INTEGRATED: Absorbed; no longer needs deliberate attention.\n    PROPOSED: Named but not yet taken up.\n    RELEASED: Deliberately let go.",
+        "enum": [
+          "active",
+          "integrated",
+          "proposed",
+          "released"
+        ],
+        "title": "PraxisLifecycle",
+        "type": "string"
+      },
+      "RelatedEddy": {
+        "additionalProperties": false,
+        "description": "One eddy the reflected entry belongs to (contract 0.9, #873).\n\nCarries the same compiled-page caveat as :class:`RelatedPraxis`, and one\nmore that is specific to it: ``description`` and ``fragment_count`` are\n*synthesised from the eddy's members*, so publishing the page to a caller\nadmitted to only some of them would hand over a summary of content they\ncannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only\nwhen the members it can enumerate account for ``fragment_count`` exactly\n**and** every one of them is within the ceiling.\n\nAttributes:\n    title: The eddy page's title.\n    description: The eddy's own one-line description; ``\"\"`` when the page\n        declares none.\n    fragment_count: How many fragments the eddy clusters. A tally, so never\n        negative.\n    formed: The ``YYYY-MM-DD`` the eddy was first detected.",
+        "properties": {
+          "title": {
+            "description": "The eddy page's title.",
+            "title": "Title",
+            "type": "string"
+          },
+          "description": {
+            "description": "The eddy's own description; may be empty.",
+            "title": "Description",
+            "type": "string"
+          },
+          "fragment_count": {
+            "description": "How many fragments the eddy clusters.",
+            "minimum": 0,
+            "title": "Fragment Count",
+            "type": "integer"
+          },
+          "formed": {
+            "description": "ISO date the eddy was first detected.",
+            "title": "Formed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "description",
+          "fragment_count",
+          "formed"
+        ],
+        "title": "RelatedEddy",
+        "type": "object"
+      },
+      "RelatedPraxis": {
+        "additionalProperties": false,
+        "description": "One praxis page the reflected entry contributed to (contract 0.9, #873).\n\n**Compiled, not raw.** A praxis page is distilled *from* fragments, so it\nis published only when every id in its ``derived_from`` resolves to a\nfragment within the caller's ceiling — and withheld outright when its\nprovenance cannot be enumerated in full. That rule lives in\n:mod:`creek_mcp.compiled_pages`; nothing on this model re-derives it, and\nno field here carries a tier, because a page that reached the wire is one\nwhose whole provenance was already admitted.\n\nAttributes:\n    title: The praxis page's title.\n    praxis_type: Which of the five :class:`PraxisKind` values it is.\n    status: Where it sits in the :class:`PraxisLifecycle`.\n    excerpt: The page's own opening prose, whitespace-collapsed and capped\n        at :data:`creek_mcp.compiled_pages.EXCERPT_CHARS`. Not a model\n        summary and not grounding-checked — it is the page as written.",
+        "properties": {
+          "title": {
+            "description": "The praxis page's title.",
+            "title": "Title",
+            "type": "string"
+          },
+          "praxis_type": {
+            "$ref": "#/components/schemas/PraxisKind",
+            "description": "Which kind of praxis this is."
+          },
+          "status": {
+            "$ref": "#/components/schemas/PraxisLifecycle",
+            "description": "Where it sits in its lifecycle."
+          },
+          "excerpt": {
+            "description": "The page's own opening prose, capped.",
+            "title": "Excerpt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "praxis_type",
+          "status",
+          "excerpt"
+        ],
+        "title": "RelatedPraxis",
+        "type": "object"
+      },
+      "RelatedThread": {
+        "additionalProperties": false,
+        "description": "One narrative thread the entry belongs to (contract 0.36, #2127).\n\nA thread page is compiled from the fragments that link to it, exactly as\nan eddy is, so it carries :class:`RelatedEddy`'s caveat:\n:mod:`creek_mcp.compiled_pages` names a thread only when one of the\nentry's seed fragments is a member, the members it can enumerate account\nfor the page's ``fragment_count``, and every one of them is within the\ncaller's ceiling. Only these three labels cross the wire — never the\npage's body, description or member count.\n\nAttributes:\n    id: The thread page's own ``id``.\n    title: The thread page's title.\n    status: :class:`ThreadLifecycle`, from the subfolder it lives in.",
+        "properties": {
+          "id": {
+            "description": "The thread page's own id.",
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "description": "The thread page's title.",
+            "title": "Title",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ThreadLifecycle",
+            "description": "active, dormant or resolved."
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "status"
+        ],
+        "title": "RelatedThread",
+        "type": "object"
+      },
       "ReplyVoice": {
         "description": "Which voice a letter or reflection was written in (#2126).\n\nThe wire twin of :class:`creek.author.reply_voice.ReplyVoice`, which this\nframework-free module does not import; a test pins the two vocabularies\nequal.\n\nAttributes:\n    OWNER: The prompt carried the owner's own style, drawn only from the\n        owner's own writing: owner-authored style skills, register samples\n        admitted at the caller's ceiling, or the voice fingerprint.\n    HIGHER_SELF: No owner style was found; the generic Higher Self voice.",
         "enum": [
@@ -3855,6 +3972,16 @@
           "higher_self"
         ],
         "title": "ReplyVoice",
+        "type": "string"
+      },
+      "ThreadLifecycle": {
+        "description": "The three thread statuses, mirroring :class:`creek.models.ThreadStatus`.\n\nRead from the ``02-Threads/`` subfolder a thread page lives in (#2127).\n\nAttributes:\n    ACTIVE: A current that is still running.\n    DORMANT: Quiet for now, not over.\n    RESOLVED: A current that has run its course.",
+        "enum": [
+          "active",
+          "dormant",
+          "resolved"
+        ],
+        "title": "ThreadLifecycle",
         "type": "string"
       },
       "VoiceDraftAttribution": {
@@ -4150,29 +4277,6 @@
         "title": "NoteKind",
         "type": "string"
       },
-      "PraxisKind": {
-        "description": "The five praxis types, mirroring the vault's own vocabulary.\n\nKept in lock-step with :class:`creek.models.PraxisType`, which is what a\n``04-Praxis/`` page's ``praxis_type`` is actually constrained to;\n:mod:`creek_mcp.compiled_pages` withholds any page naming something outside\nit, so a wire enum that drifted would refuse a legitimate page on the way\nout — or, worse, admit a hand-edited value the vault never sanctioned.\n``tests/test_adepthood_contract_models.py`` pins the two lists equal.\n\nAttributes:\n    COMMITMENT: A promise the writer has made.\n    FRAMEWORK: A way of seeing they reuse.\n    HABIT: Something done repeatedly, near-automatically.\n    INSIGHT: A distilled realisation.\n    PRACTICE: Something done deliberately and returned to.",
-        "enum": [
-          "commitment",
-          "framework",
-          "habit",
-          "insight",
-          "practice"
-        ],
-        "title": "PraxisKind",
-        "type": "string"
-      },
-      "PraxisLifecycle": {
-        "description": "The four praxis lifecycle statuses, mirroring :class:`creek.models.PraxisStatus`.\n\nAttributes:\n    ACTIVE: Currently being practised.\n    INTEGRATED: Absorbed; no longer needs deliberate attention.\n    PROPOSED: Named but not yet taken up.\n    RELEASED: Deliberately let go.",
-        "enum": [
-          "active",
-          "integrated",
-          "proposed",
-          "released"
-        ],
-        "title": "PraxisLifecycle",
-        "type": "string"
-      },
       "ReflectionNote": {
         "additionalProperties": false,
         "description": "One margin note: a verbatim span, a kind, and the reflection itself.\n\nAttributes:\n    quote: A span copied verbatim from the entry. The producing tool\n        verifies this; a note whose quote is not verbatim is dropped rather\n        than returned.\n    kind: One of the seven :class:`NoteKind` values.\n    note: The reflection, addressed to the writer in second person.",
@@ -4198,73 +4302,6 @@
           "note"
         ],
         "title": "ReflectionNote",
-        "type": "object"
-      },
-      "RelatedEddy": {
-        "additionalProperties": false,
-        "description": "One eddy the reflected entry belongs to (contract 0.9, #873).\n\nCarries the same compiled-page caveat as :class:`RelatedPraxis`, and one\nmore that is specific to it: ``description`` and ``fragment_count`` are\n*synthesised from the eddy's members*, so publishing the page to a caller\nadmitted to only some of them would hand over a summary of content they\ncannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only\nwhen the members it can enumerate account for ``fragment_count`` exactly\n**and** every one of them is within the ceiling.\n\nAttributes:\n    title: The eddy page's title.\n    description: The eddy's own one-line description; ``\"\"`` when the page\n        declares none.\n    fragment_count: How many fragments the eddy clusters. A tally, so never\n        negative.\n    formed: The ``YYYY-MM-DD`` the eddy was first detected.",
-        "properties": {
-          "title": {
-            "description": "The eddy page's title.",
-            "title": "Title",
-            "type": "string"
-          },
-          "description": {
-            "description": "The eddy's own description; may be empty.",
-            "title": "Description",
-            "type": "string"
-          },
-          "fragment_count": {
-            "description": "How many fragments the eddy clusters.",
-            "minimum": 0,
-            "title": "Fragment Count",
-            "type": "integer"
-          },
-          "formed": {
-            "description": "ISO date the eddy was first detected.",
-            "title": "Formed",
-            "type": "string"
-          }
-        },
-        "required": [
-          "title",
-          "description",
-          "fragment_count",
-          "formed"
-        ],
-        "title": "RelatedEddy",
-        "type": "object"
-      },
-      "RelatedPraxis": {
-        "additionalProperties": false,
-        "description": "One praxis page the reflected entry contributed to (contract 0.9, #873).\n\n**Compiled, not raw.** A praxis page is distilled *from* fragments, so it\nis published only when every id in its ``derived_from`` resolves to a\nfragment within the caller's ceiling — and withheld outright when its\nprovenance cannot be enumerated in full. That rule lives in\n:mod:`creek_mcp.compiled_pages`; nothing on this model re-derives it, and\nno field here carries a tier, because a page that reached the wire is one\nwhose whole provenance was already admitted.\n\nAttributes:\n    title: The praxis page's title.\n    praxis_type: Which of the five :class:`PraxisKind` values it is.\n    status: Where it sits in the :class:`PraxisLifecycle`.\n    excerpt: The page's own opening prose, whitespace-collapsed and capped\n        at :data:`creek_mcp.compiled_pages.EXCERPT_CHARS`. Not a model\n        summary and not grounding-checked — it is the page as written.",
-        "properties": {
-          "title": {
-            "description": "The praxis page's title.",
-            "title": "Title",
-            "type": "string"
-          },
-          "praxis_type": {
-            "$ref": "#/components/schemas/PraxisKind",
-            "description": "Which kind of praxis this is."
-          },
-          "status": {
-            "$ref": "#/components/schemas/PraxisLifecycle",
-            "description": "Where it sits in its lifecycle."
-          },
-          "excerpt": {
-            "description": "The page's own opening prose, capped.",
-            "title": "Excerpt",
-            "type": "string"
-          }
-        },
-        "required": [
-          "title",
-          "praxis_type",
-          "status",
-          "excerpt"
-        ],
-        "title": "RelatedPraxis",
         "type": "object"
       },
       "WheelFrequency": {
@@ -5253,7 +5290,7 @@
       },
       "LetterResponse": {
         "additionalProperties": false,
-        "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the letter was written in (#2126): ``owner`` when\n        the owner's own style shaped it, ``higher_self`` otherwise. An\n        ``unchanged`` letter reports the voice it was stored with, and a\n        letter stored before contract 0.35 is ``higher_self``. Since\n        contract 0.35, and omitted for a caller declaring an earlier minor.",
+        "description": "The letter the vault wrote, and the Voice Draft now holding it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`, and an\n        acute-distress entry is a :class:`CareEscalationResponse`.\n    tier_ceiling: The caller's declared ceiling, echoed.\n    external_id: The caller-owned id; ``DELETE\n        /v1/voice-drafts/{external_id}`` retracts the letter.\n    fragment_id: The stable vault-side fragment identity.\n    action: ``created`` for a new letter, ``unchanged`` when the id already\n        held one, which is returned as stored without a model call.\n    tier: The stored letter's tier.\n    title: The stored title.\n    letter: The letter text. Free model prose, never a verbatim quote. A\n        new letter is capped at :data:`MAX_LETTER_CHARS`; an ``unchanged``\n        one is returned exactly as stored, so a draft put by\n        ``PUT /v1/voice-drafts`` is never truncated on the way out.\n    attribution: Fixed AI attribution and zero voice weight.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the letter was written in (#2126): ``owner`` when\n        the owner's own style shaped it, ``higher_self`` otherwise. An\n        ``unchanged`` letter reports the voice it was stored with, and a\n        letter stored before contract 0.35 is ``higher_self``. Since\n        contract 0.35, and omitted for a caller declaring an earlier minor.\n    related_praxis: At most three :class:`RelatedPraxis` the letter's\n        source entry touches (#2127), selected and admitted exactly as on\n        :class:`ReflectionResponse`.\n    related_eddies: At most two :class:`RelatedEddy`, the same way.\n    related_threads: At most two :class:`RelatedThread`, the same way.\n        Each of the three is absent when nothing qualifies, and for a\n        caller declaring a minor below\n        :data:`RELATED_SURFACES_SINCE_MINOR`.",
         "properties": {
           "status": {
             "const": "ok",
@@ -5327,6 +5364,57 @@
             ],
             "default": null,
             "description": "owner when the owner's own style shaped the text, else higher_self. Since contract 0.35."
+          },
+          "related_praxis": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RelatedPraxis"
+                },
+                "maxItems": 3,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Praxis the source entry touches; absent when none. Since 0.36.",
+            "title": "Related Praxis"
+          },
+          "related_eddies": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RelatedEddy"
+                },
+                "maxItems": 2,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Eddies the source entry belongs to; absent when none. Since 0.36.",
+            "title": "Related Eddies"
+          },
+          "related_threads": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RelatedThread"
+                },
+                "maxItems": 2,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Threads the entry belongs to; absent when none. Since contract 0.36.",
+            "title": "Related Threads"
           }
         },
         "required": [
@@ -5499,7 +5587,7 @@
       },
       "ReflectionResponse": {
         "additionalProperties": false,
-        "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier — the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field — do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the notes were written in (#2126): ``owner`` when\n        the owner's own style shaped them, ``higher_self`` otherwise.\n        Since contract 0.35, and omitted for a caller declaring an earlier\n        minor.",
+        "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier — the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field — do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted — rather\n        than guessed — on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the notes were written in (#2126): ``owner`` when\n        the owner's own style shaped them, ``higher_self`` otherwise.\n        Since contract 0.35, and omitted for a caller declaring an earlier\n        minor.\n    related_threads: At most two :class:`RelatedThread` the entry belongs\n        to (#2127). Absent when none qualifies, and for a caller declaring\n        a minor below :data:`RELATED_SURFACES_SINCE_MINOR`.",
         "properties": {
           "status": {
             "description": "ok or empty; escalate is CareEscalationResponse instead.",
@@ -5578,6 +5666,23 @@
             "default": null,
             "description": "Eddies the entry belongs to; absent when none.",
             "title": "Related Eddies"
+          },
+          "related_threads": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RelatedThread"
+                },
+                "maxItems": 2,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Threads the entry belongs to; absent when none. Since contract 0.36.",
+            "title": "Related Threads"
           },
           "inference_source": {
             "anyOf": [

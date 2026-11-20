@@ -46,6 +46,7 @@ from creek.care.guardrail import acute_distress_guard
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek_mcp.api.models import (
     RELATED_FIELDS_SINCE_MINOR,
+    RELATED_SURFACES_SINCE_MINOR,
     VOICE_SINCE_MINOR,
     CareEscalationResponse,
     CareSignal,
@@ -451,6 +452,7 @@ def _render_notes(
     serve_related: bool,
     inference_source: str | None,
     serve_voice: bool,
+    serve_threads: bool = False,
 ) -> Response:
     """Return the note-bearing response for an ``ok`` or ``empty`` result.
 
@@ -464,6 +466,8 @@ def _render_notes(
             field.
         serve_voice: Whether the caller's declared minor can describe
             ``voice`` (:data:`~creek_mcp.api.models.VOICE_SINCE_MINOR`).
+        serve_threads: Whether it can describe ``related_threads``
+            (:data:`~creek_mcp.api.models.RELATED_SURFACES_SINCE_MINOR`).
 
     Returns:
         A ``200`` carrying :class:`~creek_mcp.api.models.ReflectionResponse`, or
@@ -488,6 +492,7 @@ def _render_notes(
             # inside ``reflect_tool``; this adapter inherits it and adds none.
             related_praxis=result.get("related_praxis"),
             related_eddies=result.get("related_eddies"),
+            related_threads=result.get("related_threads") if serve_threads else None,
             inference_source=inference_source,
             voice=ReplyVoice(result["voice"]) if serve_voice else None,
         )
@@ -517,10 +522,12 @@ def _dumped(payload: ReflectionResponse, *, serve_related: bool) -> dict[str, An
     so only on the reflections that found a compiled neighbour, which is the
     worst distribution a break could have.
 
-    ``inference_source`` is dropped on the same rule and needs no third
-    argument: :func:`_render_notes` is handed ``None`` for it whenever the
-    caller's minor predates :data:`~creek_mcp.api.models.PROVENANCE_SINCE_MINOR`,
-    so "withheld from this caller" and "no route this contract labels" arrive
+    ``inference_source`` and ``related_threads`` (#2127) are dropped on the
+    same rule and need no third argument: :func:`_render_notes` is handed
+    ``None`` for each whenever the caller's minor predates
+    :data:`~creek_mcp.api.models.PROVENANCE_SINCE_MINOR` (or, for the threads,
+    :data:`~creek_mcp.api.models.RELATED_SURFACES_SINCE_MINOR`), so "withheld
+    from this caller" and "no route this contract labels" arrive
     here as the same absence.
 
     Args:
@@ -535,7 +542,7 @@ def _dumped(payload: ReflectionResponse, *, serve_related: bool) -> dict[str, An
     for key in ("related_praxis", "related_eddies"):
         if not serve_related or data.get(key) is None:
             data.pop(key, None)
-    for key in ("inference_source", "voice"):
+    for key in ("related_threads", "inference_source", "voice"):
         if data.get(key) is None:
             data.pop(key, None)
     return data
@@ -564,6 +571,7 @@ def _render(
     serve_request_key_rejected: bool,
     request_key: str,
     serve_voice: bool,
+    serve_threads: bool = False,
 ) -> Response:
     """Project the tool's result onto the published response, or a refusal.
 
@@ -581,6 +589,7 @@ def _render(
             for the refusal log.
         serve_voice: Whether the caller declared a minor that can describe
             ``voice`` (#2126).
+        serve_threads: Whether it can describe ``related_threads`` (#2127).
 
     Returns:
         The published response.
@@ -595,6 +604,7 @@ def _render(
             serve_related=serve_related,
             inference_source=provenance.source if serve_provenance else None,
             serve_voice=serve_voice,
+            serve_threads=serve_threads,
         )
     reason = str(result.get("reason", ""))
     code = reflect_refusal_code(reason)
@@ -674,4 +684,5 @@ async def handle_reflection(request: Request) -> Response:
         serve_request_key_rejected=serves_request_key_rejected(request),
         request_key=key_provider,
         serve_voice=declared_minor_at_least(request, VOICE_SINCE_MINOR),
+        serve_threads=declared_minor_at_least(request, RELATED_SURFACES_SINCE_MINOR),
     )

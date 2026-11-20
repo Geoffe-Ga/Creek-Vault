@@ -105,6 +105,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.35",
     "0.34",
     "0.33",
     "0.32",
@@ -595,6 +596,17 @@ byte-identical, without the header. It is a literal for the reason
 :data:`_UPLOAD_MINOR` is.
 """
 
+RELATED_SURFACES_SINCE_MINOR: Final[str] = "0.36"
+"""First minor whose reflections and letters carry the #2127 related fields.
+
+``ReflectionResponse`` gains ``related_threads``; ``LetterResponse`` gains
+``related_praxis``, ``related_eddies`` and ``related_threads``. One constant
+for all four because they are one contract change: a consumer that vendored
+the ``0.36`` schemas can describe every one of them, and an earlier one
+validates closed schemas carrying none, so each key is omitted for it. It is a
+literal for the reason :data:`_UPLOAD_MINOR` is.
+"""
+
 VOICE_SINCE_MINOR: Final[str] = "0.35"
 """First minor whose letters and reflections carry ``voice`` (#2126).
 
@@ -970,6 +982,22 @@ class PraxisLifecycle(StrEnum):
     RELEASED = "released"
 
 
+class ThreadLifecycle(StrEnum):
+    """The three thread statuses, mirroring :class:`creek.models.ThreadStatus`.
+
+    Read from the ``02-Threads/`` subfolder a thread page lives in (#2127).
+
+    Attributes:
+        ACTIVE: A current that is still running.
+        DORMANT: Quiet for now, not over.
+        RESOLVED: A current that has run its course.
+    """
+
+    ACTIVE = "active"
+    DORMANT = "dormant"
+    RESOLVED = "resolved"
+
+
 class ErrorCode(StrEnum):
     """The twelve wire error codes: nine from 0.2, one each at 0.8, 0.19 and 0.28.
 
@@ -1270,6 +1298,13 @@ _MIN_CARE_RESOURCES: Final[int] = 1
 
 _MAX_RELATED_PRAXIS: Final[int] = 3
 """Published ceiling on :attr:`ReflectionResponse.related_praxis` (#873)."""
+
+_MAX_RELATED_THREADS: Final[int] = 2
+"""Published ceiling on every ``related_threads`` list (#2127).
+
+Restated for the reason :data:`_MAX_RELATED_EDDIES` is, and pinned to
+:data:`creek_mcp.compiled_pages.MAX_RELATED_THREADS` by the same test.
+"""
 
 _MAX_RELATED_EDDIES: Final[int] = 2
 """Published ceiling on :attr:`ReflectionResponse.related_eddies` (#873).
@@ -1914,6 +1949,87 @@ _VOICE_DESCRIPTION: Final[str] = (
 )
 
 
+class RelatedPraxis(_WireModel):
+    """One praxis page the reflected entry contributed to (contract 0.9, #873).
+
+    **Compiled, not raw.** A praxis page is distilled *from* fragments, so it
+    is published only when every id in its ``derived_from`` resolves to a
+    fragment within the caller's ceiling — and withheld outright when its
+    provenance cannot be enumerated in full. That rule lives in
+    :mod:`creek_mcp.compiled_pages`; nothing on this model re-derives it, and
+    no field here carries a tier, because a page that reached the wire is one
+    whose whole provenance was already admitted.
+
+    Attributes:
+        title: The praxis page's title.
+        praxis_type: Which of the five :class:`PraxisKind` values it is.
+        status: Where it sits in the :class:`PraxisLifecycle`.
+        excerpt: The page's own opening prose, whitespace-collapsed and capped
+            at :data:`creek_mcp.compiled_pages.EXCERPT_CHARS`. Not a model
+            summary and not grounding-checked — it is the page as written.
+    """
+
+    title: str = Field(description="The praxis page's title.")
+    praxis_type: PraxisKind = Field(description="Which kind of praxis this is.")
+    status: PraxisLifecycle = Field(description="Where it sits in its lifecycle.")
+    excerpt: str = Field(description="The page's own opening prose, capped.")
+
+
+class RelatedEddy(_WireModel):
+    """One eddy the reflected entry belongs to (contract 0.9, #873).
+
+    Carries the same compiled-page caveat as :class:`RelatedPraxis`, and one
+    more that is specific to it: ``description`` and ``fragment_count`` are
+    *synthesised from the eddy's members*, so publishing the page to a caller
+    admitted to only some of them would hand over a summary of content they
+    cannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only
+    when the members it can enumerate account for ``fragment_count`` exactly
+    **and** every one of them is within the ceiling.
+
+    Attributes:
+        title: The eddy page's title.
+        description: The eddy's own one-line description; ``""`` when the page
+            declares none.
+        fragment_count: How many fragments the eddy clusters. A tally, so never
+            negative.
+        formed: The ``YYYY-MM-DD`` the eddy was first detected.
+    """
+
+    title: str = Field(description="The eddy page's title.")
+    description: str = Field(description="The eddy's own description; may be empty.")
+    fragment_count: int = Field(
+        ge=_MIN_COUNT, description="How many fragments the eddy clusters."
+    )
+    formed: str = Field(description="ISO date the eddy was first detected.")
+
+
+class RelatedThread(_WireModel):
+    """One narrative thread the entry belongs to (contract 0.36, #2127).
+
+    A thread page is compiled from the fragments that link to it, exactly as
+    an eddy is, so it carries :class:`RelatedEddy`'s caveat:
+    :mod:`creek_mcp.compiled_pages` names a thread only when one of the
+    entry's seed fragments is a member, the members it can enumerate account
+    for the page's ``fragment_count``, and every one of them is within the
+    caller's ceiling. Only these three labels cross the wire — never the
+    page's body, description or member count.
+
+    Attributes:
+        id: The thread page's own ``id``.
+        title: The thread page's title.
+        status: :class:`ThreadLifecycle`, from the subfolder it lives in.
+    """
+
+    id: str = Field(description="The thread page's own id.")
+    title: str = Field(description="The thread page's title.")
+    status: ThreadLifecycle = Field(description="active, dormant or resolved.")
+
+
+_RELATED_THREADS_DESCRIPTION: Final[str] = (
+    "Threads the entry belongs to; absent when none. Since contract 0.36."
+)
+
+
 class LetterResponse(_WireModel):
     """The letter the vault wrote, and the Voice Draft now holding it.
 
@@ -1948,6 +2064,14 @@ class LetterResponse(_WireModel):
             ``unchanged`` letter reports the voice it was stored with, and a
             letter stored before contract 0.35 is ``higher_self``. Since
             contract 0.35, and omitted for a caller declaring an earlier minor.
+        related_praxis: At most three :class:`RelatedPraxis` the letter's
+            source entry touches (#2127), selected and admitted exactly as on
+            :class:`ReflectionResponse`.
+        related_eddies: At most two :class:`RelatedEddy`, the same way.
+        related_threads: At most two :class:`RelatedThread`, the same way.
+            Each of the three is absent when nothing qualifies, and for a
+            caller declaring a minor below
+            :data:`RELATED_SURFACES_SINCE_MINOR`.
     """
 
     status: Literal["ok"] = Field(description="Always ok; failure is an error.")
@@ -1972,6 +2096,21 @@ class LetterResponse(_WireModel):
         ),
     )
     voice: ReplyVoice | None = Field(default=None, description=_VOICE_DESCRIPTION)
+    related_praxis: list[RelatedPraxis] | None = Field(
+        default=None,
+        max_length=_MAX_RELATED_PRAXIS,
+        description="Praxis the source entry touches; absent when none. Since 0.36.",
+    )
+    related_eddies: list[RelatedEddy] | None = Field(
+        default=None,
+        max_length=_MAX_RELATED_EDDIES,
+        description="Eddies the source entry belongs to; absent when none. Since 0.36.",
+    )
+    related_threads: list[RelatedThread] | None = Field(
+        default=None,
+        max_length=_MAX_RELATED_THREADS,
+        description=_RELATED_THREADS_DESCRIPTION,
+    )
 
 
 class UploadRequest(_WireModel):
@@ -2845,60 +2984,6 @@ class CareSignal(_WireModel):
     )
 
 
-class RelatedPraxis(_WireModel):
-    """One praxis page the reflected entry contributed to (contract 0.9, #873).
-
-    **Compiled, not raw.** A praxis page is distilled *from* fragments, so it
-    is published only when every id in its ``derived_from`` resolves to a
-    fragment within the caller's ceiling — and withheld outright when its
-    provenance cannot be enumerated in full. That rule lives in
-    :mod:`creek_mcp.compiled_pages`; nothing on this model re-derives it, and
-    no field here carries a tier, because a page that reached the wire is one
-    whose whole provenance was already admitted.
-
-    Attributes:
-        title: The praxis page's title.
-        praxis_type: Which of the five :class:`PraxisKind` values it is.
-        status: Where it sits in the :class:`PraxisLifecycle`.
-        excerpt: The page's own opening prose, whitespace-collapsed and capped
-            at :data:`creek_mcp.compiled_pages.EXCERPT_CHARS`. Not a model
-            summary and not grounding-checked — it is the page as written.
-    """
-
-    title: str = Field(description="The praxis page's title.")
-    praxis_type: PraxisKind = Field(description="Which kind of praxis this is.")
-    status: PraxisLifecycle = Field(description="Where it sits in its lifecycle.")
-    excerpt: str = Field(description="The page's own opening prose, capped.")
-
-
-class RelatedEddy(_WireModel):
-    """One eddy the reflected entry belongs to (contract 0.9, #873).
-
-    Carries the same compiled-page caveat as :class:`RelatedPraxis`, and one
-    more that is specific to it: ``description`` and ``fragment_count`` are
-    *synthesised from the eddy's members*, so publishing the page to a caller
-    admitted to only some of them would hand over a summary of content they
-    cannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only
-    when the members it can enumerate account for ``fragment_count`` exactly
-    **and** every one of them is within the ceiling.
-
-    Attributes:
-        title: The eddy page's title.
-        description: The eddy's own one-line description; ``""`` when the page
-            declares none.
-        fragment_count: How many fragments the eddy clusters. A tally, so never
-            negative.
-        formed: The ``YYYY-MM-DD`` the eddy was first detected.
-    """
-
-    title: str = Field(description="The eddy page's title.")
-    description: str = Field(description="The eddy's own description; may be empty.")
-    fragment_count: int = Field(
-        ge=_MIN_COUNT, description="How many fragments the eddy clusters."
-    )
-    formed: str = Field(description="ISO date the eddy was first detected.")
-
-
 class ReflectionResponse(_WireModel):
     """Margin notes for one entry.
 
@@ -2939,6 +3024,9 @@ class ReflectionResponse(_WireModel):
             the owner's own style shaped them, ``higher_self`` otherwise.
             Since contract 0.35, and omitted for a caller declaring an earlier
             minor.
+        related_threads: At most two :class:`RelatedThread` the entry belongs
+            to (#2127). Absent when none qualifies, and for a caller declaring
+            a minor below :data:`RELATED_SURFACES_SINCE_MINOR`.
     """
 
     status: Literal[ReflectionStatus.OK, ReflectionStatus.EMPTY] = Field(
@@ -2988,6 +3076,14 @@ class ReflectionResponse(_WireModel):
         default=None,
         max_length=_MAX_RELATED_EDDIES,
         description="Eddies the entry belongs to; absent when none.",
+    )
+    # Contract 0.36 (#2127). Dropped when ``None`` by the same ``_dumped``
+    # rule as the two 0.9 fields, and ``None`` whenever the caller's minor
+    # predates :data:`RELATED_SURFACES_SINCE_MINOR`.
+    related_threads: list[RelatedThread] | None = Field(
+        default=None,
+        max_length=_MAX_RELATED_THREADS,
+        description=_RELATED_THREADS_DESCRIPTION,
     )
     # Contract 0.19 (#1894). Dropped when ``None`` by the same ``_dumped``
     # rule the two 0.9 fields take, and for the same reason: every published
@@ -3844,6 +3940,7 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "ReflectionResponse": ReflectionResponse,
     "RelatedEddy": RelatedEddy,
     "RelatedPraxis": RelatedPraxis,
+    "RelatedThread": RelatedThread,
     "TierModel": TierModel,
     "UploadManifestResponse": UploadManifestResponse,
     "UploadRequest": UploadRequest,

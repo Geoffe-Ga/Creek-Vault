@@ -1085,7 +1085,7 @@ def _reflection_response(
     Args:
         notes: The cleaned, verbatim-verified notes; empty means ``empty``.
         essay: The model's free prose, or ``None`` when it offered none.
-        related: The admitted compiled structures; empty on both axes when
+        related: The admitted compiled structures; empty on every axis when
             nothing qualifies.
         ceiling: The caller's declared ceiling, echoed back.
         tier: The tier the model call was actually routed at.
@@ -1107,13 +1107,15 @@ def _reflection_response(
     }
     if essay is not None:
         result["essay"] = essay
-    # Both keys are OMITTED when nothing qualifies, never present-and-empty: a
+    # Every key is OMITTED when nothing qualifies, never present-and-empty: a
     # consumer written before #873 must parse a reflection with no compiled
     # neighbours byte-for-byte as it did before.
     if related.praxis:
         result["related_praxis"] = related.praxis
     if related.eddies:
         result["related_eddies"] = related.eddies
+    if related.threads:
+        result["related_threads"] = related.threads
     return result
 
 
@@ -1245,10 +1247,11 @@ def reflect_tool(
         treats it as grounded.
 
         An ``ok`` / ``empty`` result may additionally carry ``related_praxis``
-        (≤3 ``{title, praxis_type, status, excerpt}``) and ``related_eddies``
-        (≤2 ``{title, description, fragment_count, formed}``) — the compiled
-        structures the reflected entry and its grounding belong to (#873). Both
-        keys are **absent** when nothing qualifies, so the response a
+        (≤3 ``{title, praxis_type, status, excerpt}``), ``related_eddies``
+        (≤2 ``{title, description, fragment_count, formed}``) and, since
+        #2127, ``related_threads`` (≤2 ``{id, title, status}``) — the compiled
+        structures the reflected entry and its grounding belong to (#873). Each
+        key is **absent** when nothing qualifies, so the response a
         pre-#873 consumer parses is unchanged whenever the vault has no
         admitted compiled neighbours. Neither is a new read privilege: a
         compiled page is published only when every fragment it was compiled
@@ -1492,7 +1495,62 @@ def _related(
         return related_compiled(seeds, vault_path, ceiling, corpus_records=records)
     except Exception as exc:
         logger.debug("Related compiled layer degraded to none (%s)", type(exc).__name__)
-        return RelatedCompiled([], [])
+        return RelatedCompiled([], [], [])
+
+
+def related_for_content(
+    content: str,
+    vault_path: Path,
+    ceiling: TierCeiling,
+    tier: PrivacyTier,
+    *,
+    session: GroundingSession | None = None,
+    grounding_route: GroundingRoute | None = None,
+) -> RelatedCompiled:
+    """Return the compiled structures raw entry text touches, at *ceiling* (#2127).
+
+    The letter route's selection, and deliberately the reflection's own: the
+    entry is grounded by :func:`_default_retrieve` exactly as an inline
+    ``content`` reflection is, and the ids of the fragments it retrieves seed
+    :func:`creek_mcp.compiled_pages.related_compiled`. So a letter names the
+    same practices, eddies and threads a reflection on the same entry would,
+    and none the entry does not touch. Raw text is the caller's own and is not
+    a corpus fragment, so it contributes no seed of its own.
+
+    It never raises: grounding and the lookup each degrade to nothing, and a
+    route decision that refuses grounding embeds nothing and seeds nothing.
+
+    Args:
+        content: The entry text.
+        vault_path: Vault root.
+        ceiling: The caller's declared ceiling: the retrieval cutoff and the
+            admission rule for every candidate page.
+        tier: The routing tier, at which a non-local route embeds the query.
+        session: The owner's warmed :class:`GroundingSession`, or ``None``.
+        grounding_route: The embedding-route decision, or ``None`` for local.
+
+    Returns:
+        The bounded, admitted structures; empty on every axis when none
+        qualifies.
+    """
+    decision = _decide_route(grounding_route, tier)
+    if not decision.allowed:
+        return RelatedCompiled([], [], [])
+    try:
+        corpus = _load_reflection_corpus(vault_path)
+    except Exception as exc:
+        logger.debug("Related compiled layer degraded to none (%s)", type(exc).__name__)
+        return RelatedCompiled([], [], [])
+    grounding = _default_retrieve(
+        content,
+        vault_path,
+        to_privacy_override(ceiling),
+        session,
+        corpus,
+        query_tier=decision.query_tier,
+        embedder=decision.embedder,
+    )
+    return _related(grounding.source_ids, vault_path, ceiling, None, corpus)
 
 
 def _default_retrieve(

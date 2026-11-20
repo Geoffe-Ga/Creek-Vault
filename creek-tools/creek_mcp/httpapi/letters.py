@@ -26,23 +26,37 @@ any more than on the others: the dial is refused before
 :func:`~creek.voice_drafts.create_voice_draft_if_absent` is reached, so a
 capped request leaves the caller-owned slot unwritten and a retry still
 ``created``.
+
+**Related surfaces (#2127, contract 0.36).** A stored letter — ``created`` or
+``unchanged`` — is decorated with the practices, eddies and threads its source
+entry touches, chosen by
+:func:`creek_mcp.tools.reflect.related_for_content`: the reflection's own seed
+gate and :mod:`creek_mcp.compiled_pages`' provenance admission, at the
+caller's ceiling. Only for a caller declaring
+:data:`~creek_mcp.api.models.RELATED_SURFACES_SINCE_MINOR` or later (an
+earlier one is spent no corpus walk at all), never on a refusal or an
+escalation, and never at the letter's expense: a lookup that fails leaves the
+three keys absent. The letter prompt is untouched, so no page reaches the
+model.
 """
 
 from __future__ import annotations
 
+import logging
 from functools import partial
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple
 
 from pydantic import ValidationError
 
 from creek.care.guardrail import CARE_SIGNAL, acute_distress_guard
 from creek.classify.llm.request_key import InvalidRequestKeyError
 from creek.models import PrivacyTier
-from creek.voice_drafts import VoiceDraftAction
+from creek.voice_drafts import VoiceDraftAction, VoiceDraftWriteResult
 from creek_mcp.api.models import (
     LETTER_RATE_LIMITED_SINCE_MINOR,
     OK_STATUS,
     PROVENANCE_SINCE_MINOR,
+    RELATED_SURFACES_SINCE_MINOR,
     VOICE_SINCE_MINOR,
     CareEscalationResponse,
     CareSignal,
@@ -51,10 +65,14 @@ from creek_mcp.api.models import (
     LetterRequest,
     LetterResponse,
     ReflectionStatus,
+    RelatedEddy,
+    RelatedPraxis,
+    RelatedThread,
     ReplyVoice,
     VoiceDraftAttribution,
     WireTierCeiling,
 )
+from creek_mcp.compiled_pages import RelatedCompiled
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
@@ -84,8 +102,33 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
     from creek.classify.llm.request_key import RequestKey
+    from creek.link.embeddings import TextEmbedder
     from creek_mcp.httpapi.context import RequestContext
+    from creek_mcp.tier_ceiling import TierCeiling
     from creek_mcp.tools.letter import LetterLLMFactory, LetterOutcome, LetterWrite
+    from creek_mcp.tools.reflect import GroundingSession
+
+    RelatedLookup = Callable[[Path, str, TierCeiling, PrivacyTier], RelatedCompiled]
+    """``(vault, entry, ceiling, entry tier) -> RelatedCompiled`` (#2127)."""
+
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+
+_NO_RELATED: Final[RelatedCompiled] = RelatedCompiled([], [], [])
+"""What a letter carries when nothing qualifies, or nothing was looked up."""
+
+
+class _Answer(NamedTuple):
+    """One letter attempt's outcome and the compiled pages its entry touches.
+
+    Attributes:
+        outcome: What :func:`~creek_mcp.tools.letter.write_letter` answered.
+        related: The admitted related surfaces; empty unless the outcome is a
+            stored letter and the caller's minor can describe them.
+    """
+
+    outcome: LetterOutcome
+    related: RelatedCompiled
+
 
 REFUSAL_CODES: Final[dict[LetterRefusal, ErrorCode]] = {
     LetterRefusal.ABOVE_CEILING: ErrorCode.PRIVACY_REFUSED,
@@ -157,6 +200,66 @@ def _default_factory(
     return _build_letter_llm_factory(vault, request_key, provenance)
 
 
+def _default_related_lookup(
+    vault: Path,
+    content: str,
+    ceiling: TierCeiling,
+    tier: PrivacyTier,
+    *,
+    session: GroundingSession | None,
+    request_key: RequestKey | None,
+    production: bool,
+) -> RelatedCompiled:
+    """Return the compiled pages *content* touches, the way a reflection would.
+
+    Imported lazily, as :func:`_default_factory` is. The embedding route is the
+    reflection's own production decision (#1904), bound only when the letter's
+    factory is the production one — an injected factory resolves no stage, so
+    grounding then keeps the local route, exactly as on ``POST
+    /v1/reflections``.
+
+    Args:
+        vault: The vault the letter was written in.
+        content: The letter's source entry.
+        ceiling: The caller's admitted ceiling.
+        tier: The source entry's declared tier.
+        session: The app's warmed grounding session, shared with reflections.
+        request_key: The writer's request-scoped key, or ``None``.
+        production: Whether the letter's factory is the production one.
+
+    Returns:
+        The admitted related surfaces.
+    """
+    from creek_mcp.tier_ceiling import routing_tier
+    from creek_mcp.tools.reflect import related_for_content
+
+    route = (
+        partial(_production_grounding_route, vault, request_key) if production else None
+    )
+    return related_for_content(
+        content,
+        vault,
+        ceiling,
+        routing_tier(ceiling, tier),
+        session=session,
+        grounding_route=route,
+    )
+
+
+def _production_grounding_route(
+    vault: Path, request_key: RequestKey | None, tier: PrivacyTier
+) -> TextEmbedder | None:
+    """Build the reflection's grounding route for *vault* and decide for *tier*.
+
+    Built per call rather than up front so a vault config that cannot load
+    raises inside the route decision, which refuses grounding — never a
+    letter.
+    """
+    from creek_mcp.server import _build_reflect_grounding_route
+
+    return _build_reflect_grounding_route(vault, request_key)(tier)
+
+
 async def _parsed_body(request: Request) -> LetterRequest | None:
     """Return the validated request body, collapsing every parse failure."""
     try:
@@ -185,13 +288,18 @@ def _write(
     build_factory: Callable[[], LetterLLMFactory] | None,
     request_key: RequestKey | None,
     provenance: InferenceProvenance,
-) -> LetterOutcome | None:
+    serve_related: bool,
+) -> _Answer | None:
     """Resolve the vault and run the letter tool, both off the event loop.
 
+    The related surfaces (#2127) are looked up here too, after the letter is
+    stored and only when *serve_related*, so a refusal, an escalation or an
+    older caller costs no corpus walk.
+
     Returns:
-        The tool's outcome, or ``None`` when there is no scaffolded vault —
-        checked before the audit append, so a missing vault is never created
-        as a side effect of asking for a letter.
+        The tool's outcome with its related surfaces, or ``None`` when there
+        is no scaffolded vault — checked before the audit append, so a missing
+        vault is never created as a side effect of asking for a letter.
     """
     vault = configured_vault(request)
     if vault is None or not vault_available(vault):
@@ -208,7 +316,42 @@ def _write(
         # ``voice``; below it the prompt is the generic one, byte for byte.
         apply_owner_voice=declared_minor_at_least(request, VOICE_SINCE_MINOR),
     )
-    return write_letter(call, _source(parsed))
+    source = _source(parsed)
+    outcome = write_letter(call, source)
+    if not serve_related or not isinstance(outcome, VoiceDraftWriteResult):
+        return _Answer(outcome, _NO_RELATED)
+    lookup: RelatedLookup = request.app.state.letter_related_lookup or partial(
+        _default_related_lookup,
+        session=request.app.state.reflect_grounding_session,
+        request_key=request_key,
+        production=build_factory is None,
+    )
+    return _Answer(
+        outcome, _related(lookup, vault, source.content, call.ceiling, source.tier)
+    )
+
+
+def _related(
+    lookup: RelatedLookup,
+    vault: Path,
+    content: str,
+    ceiling: TierCeiling,
+    tier: PrivacyTier,
+) -> RelatedCompiled:
+    """Run *lookup*, degrading to nothing on any failure.
+
+    An enrichment step must never take down the letter it decorates, and the
+    lookup walks user-managed vault markdown whose failure surface is
+    open-ended. Only the exception's type name is logged, never its message,
+    which could carry vault content into an untiered log.
+    """
+    try:
+        return lookup(vault, content, ceiling, tier)
+    except Exception as exc:
+        _LOGGER.debug(
+            "Letter related surfaces degraded to none (%s)", type(exc).__name__
+        )
+        return _NO_RELATED
 
 
 def _escalation(outcome: LetterEscalation, context: RequestContext) -> Response:
@@ -228,6 +371,7 @@ def _letter(
     inference_source: str | None,
     *,
     serve_voice: bool,
+    related: RelatedCompiled = _NO_RELATED,
 ) -> Response:
     """Project a stored letter onto the closed response model.
 
@@ -241,6 +385,9 @@ def _letter(
     :data:`~creek_mcp.api.models.VOICE_SINCE_MINOR` or later — and is the
     voice the stored letter was written in, so an ``unchanged`` letter reports
     it without a model call.
+
+    *related* (#2127) is already empty unless the caller's minor can describe
+    it; each of its three lists is dropped when empty, never sent empty.
 
     Returns:
         The ``200``, or ``internal_error`` when the stored record cannot be
@@ -261,18 +408,32 @@ def _letter(
             attribution=VoiceDraftAttribution(),
             inference_source=inference_source,
             voice=ReplyVoice(letter_voice(record).value) if serve_voice else None,
+            related_praxis=[RelatedPraxis.model_validate(row) for row in related.praxis]
+            or None,
+            related_eddies=[RelatedEddy.model_validate(row) for row in related.eddies]
+            or None,
+            related_threads=[
+                RelatedThread.model_validate(row) for row in related.threads
+            ]
+            or None,
         )
     except (ValidationError, ValueError, KeyError):
         return error_response(ErrorCode.INTERNAL_ERROR, context)
     body = payload.model_dump(mode="json")
-    for key in ("inference_source", "voice"):
+    for key in (
+        "inference_source",
+        "voice",
+        "related_praxis",
+        "related_eddies",
+        "related_threads",
+    ):
         if body[key] is None:
             body.pop(key)
     return json_response(body, HTTP_OK)
 
 
 def _render(
-    outcome: LetterOutcome,
+    answer: _Answer,
     context: RequestContext,
     inference_source: str | None,
     *,
@@ -288,6 +449,7 @@ def _render(
     flag would make a caller's provenance eligibility decide which refusal it
     is told about.
     """
+    outcome = answer.outcome
     if isinstance(outcome, LetterRefusal):
         code = served_error_code(
             REFUSAL_CODES[outcome],
@@ -297,7 +459,13 @@ def _render(
         return error_response(code, context)
     if isinstance(outcome, LetterEscalation):
         return _escalation(outcome, context)
-    return _letter(outcome, context, inference_source, serve_voice=serve_voice)
+    return _letter(
+        outcome,
+        context,
+        inference_source,
+        serve_voice=serve_voice,
+        related=answer.related,
+    )
 
 
 async def handle_letter(request: Request) -> Response:
@@ -321,7 +489,7 @@ async def handle_letter(request: Request) -> Response:
     except InvalidRequestKeyError:
         return error_response(ErrorCode.INVALID_REQUEST, context)
     provenance = InferenceProvenance()
-    outcome = await write_off_loop(
+    answer = await write_off_loop(
         _write,
         request,
         external_id,
@@ -330,12 +498,13 @@ async def handle_letter(request: Request) -> Response:
         request.app.state.letter_llm_factory,
         request_key,
         provenance,
+        declared_minor_at_least(request, RELATED_SURFACES_SINCE_MINOR),
     )
-    if outcome is None:
+    if answer is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
     serve = declared_minor_at_least(request, PROVENANCE_SINCE_MINOR)
     return _render(
-        outcome,
+        answer,
         context,
         provenance.source if serve else None,
         serve_rate_limited=declared_minor_at_least(

@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.35.0",
+  "contract_version": "0.36.0",
   "files": [
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-ready.json",
-      "sha256": "0df3f70c621421a0bfb9c1d1f81daf34bd9c269fac5f091d0cab71172ebc75e2",
+      "sha256": "50e45085fc1a54ea791f540e407aa8d303e9fb5aa04b6554170a8f878fef5a37",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-unavailable.json",
-      "sha256": "a98b2be8afe6e986edd3ce1cd176a15798927e7a4dbdfa5df82ade2e2880efca",
+      "sha256": "ca379b80cb4dfd3781e20db1d10e4884f6d11308616cdda2b6d7028d7d87a4ed",
       "state": null
     },
     {
@@ -76,7 +76,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "7107d7bf5639c5a6426fae2927cc9d948d5d62f8ebba7d9441ed0cbe7d0a2b35",
+      "sha256": "e55310cbde4ff61cca3637d4ca4e4c6160242a85433b98b745fa42ff6b367111",
       "state": "empty"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "0df3f70c621421a0bfb9c1d1f81daf34bd9c269fac5f091d0cab71172ebc75e2",
+      "sha256": "50e45085fc1a54ea791f540e407aa8d303e9fb5aa04b6554170a8f878fef5a37",
       "state": "success"
     },
     {
@@ -321,7 +321,7 @@
       "capability": "letters",
       "model": "LetterResponse",
       "path": "examples/letters/empty.json",
-      "sha256": "733fa1f51d0cbeb310132b18039ffe7115db31ea1378fae4fd594b504c3a6458",
+      "sha256": "04c9721b7620ccd7fb79f231ad867c4f6ba578dc7f08d3f58eb6d6f2036f41e6",
       "state": "empty"
     },
     {
@@ -349,7 +349,7 @@
       "capability": "letters",
       "model": "LetterResponse",
       "path": "examples/letters/success.json",
-      "sha256": "6c7f7e1905f680667045e2952e1ee1ab602536a3729295fe2ccf84b0fc100bea",
+      "sha256": "6719338624039bdf2a55ce0905cf8109b37f3ae9951be7b75caa21029123c503",
       "state": "success"
     },
     {
@@ -496,7 +496,7 @@
       "capability": "reflections",
       "model": "ReflectionResponse",
       "path": "examples/reflections/success.json",
-      "sha256": "377d7d5818cf22cfa3cc42bfb0cfbb191ad7def1b0125902a9af118b52d1247c",
+      "sha256": "65a273250289d878a2da768b00fe0b991149fbd48dc84eeb0c8452495c1cbec3",
       "state": "success"
     },
     {
@@ -874,7 +874,7 @@
       "capability": null,
       "model": "LetterResponse",
       "path": "schemas/LetterResponse.schema.json",
-      "sha256": "f919851d435c07dcf4f9107329bbaa1b4b8e31efba0ab1310400606913698d10",
+      "sha256": "3f543421d4bb16f0b9ed1498820d2a8352e0e466199f1c2b8704884bc766b77b",
       "state": null
     },
     {
@@ -993,7 +993,7 @@
       "capability": null,
       "model": "ReflectionResponse",
       "path": "schemas/ReflectionResponse.schema.json",
-      "sha256": "9ed3368e6cff250ed122c31cd1ae3441fa9a493494ed722393904b979ea516c0",
+      "sha256": "e4f0b5ae0b2c059b32dbca6692230f3aa525428d3eff1045ffeb49bf28102851",
       "state": null
     },
     {
@@ -1008,6 +1008,13 @@
       "model": "RelatedPraxis",
       "path": "schemas/RelatedPraxis.schema.json",
       "sha256": "0561d2a8538e894969c4ec062e8234b5150477b07f137c10c3a65cc80138f85d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "RelatedThread",
+      "path": "schemas/RelatedThread.schema.json",
+      "sha256": "3a4d76e161dda07eca85525017c8074b8baadc5ad62fb74b9200c9bebc8ffd88",
       "state": null
     },
     {

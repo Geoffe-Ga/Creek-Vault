@@ -60,7 +60,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from creek.care.guardrail import CARE_SIGNAL
 from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES
-from creek.models import PraxisStatus, PraxisType, PrivacyTier
+from creek.models import PraxisStatus, PraxisType, PrivacyTier, ThreadStatus
 from creek_mcp import policy, read_gate
 from creek_mcp.api import models as api_models
 from creek_mcp.api.bundle import (
@@ -118,7 +118,9 @@ from creek_mcp.api.models import (
     ReflectionStatus,
     RelatedEddy,
     RelatedPraxis,
+    RelatedThread,
     RetryDisposition,
+    ThreadLifecycle,
     TierModel,
     UploadManifestResponse,
     UploadRequest,
@@ -134,7 +136,11 @@ from creek_mcp.api.models import (
     WheelResponse,
     WireTierCeiling,
 )
-from creek_mcp.compiled_pages import MAX_RELATED_EDDIES, MAX_RELATED_PRAXIS
+from creek_mcp.compiled_pages import (
+    MAX_RELATED_EDDIES,
+    MAX_RELATED_PRAXIS,
+    MAX_RELATED_THREADS,
+)
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.tier_ceiling import CEILING_ROUTING_TIER, routing_tier, tier_allowed
 from creek_mcp.tools import reflect
@@ -494,6 +500,12 @@ RELATED_EDDY_PAYLOAD: dict[str, Any] = {
     "formed": "2026-03-04",
 }
 
+RELATED_THREAD_PAYLOAD: dict[str, Any] = {
+    "id": "thread-0000000001",
+    "title": "Leaving the firm",
+    "status": "active",
+}
+
 REFLECTION_RESPONSE_PAYLOAD: dict[str, Any] = {
     "status": "ok",
     "tier_ceiling": "personal",
@@ -669,6 +681,7 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     ReflectionRequest.__name__: REFLECTION_REQUEST_PAYLOAD,
     ReflectionResponse.__name__: REFLECTION_RESPONSE_PAYLOAD,
     RelatedEddy.__name__: RELATED_EDDY_PAYLOAD,
+    RelatedThread.__name__: RELATED_THREAD_PAYLOAD,
     RelatedPraxis.__name__: RELATED_PRAXIS_PAYLOAD,
     TierModel.__name__: TIER_MODEL_PAYLOAD,
     UploadManifestResponse.__name__: UPLOAD_MANIFEST_RESPONSE_PAYLOAD,
@@ -1035,6 +1048,7 @@ def test_wire_tier_ceiling_rejects_non_remote_values(value: str) -> None:
             {"commitment", "framework", "habit", "insight", "practice"},
         ),
         (PraxisLifecycle, {"active", "integrated", "proposed", "released"}),
+        (ThreadLifecycle, {"active", "dormant", "resolved"}),
     ],
     ids=[
         "WireTierCeiling",
@@ -1044,6 +1058,7 @@ def test_wire_tier_ceiling_rejects_non_remote_values(value: str) -> None:
         "RetryDisposition",
         "PraxisKind",
         "PraxisLifecycle",
+        "ThreadLifecycle",
     ],
 )
 def test_enum_membership_is_pinned(
@@ -1930,6 +1945,40 @@ def test_the_published_related_bounds_match_the_producer() -> None:
     eddies = schema["properties"]["related_eddies"]["anyOf"][0]
     assert praxis["maxItems"] == MAX_RELATED_PRAXIS
     assert eddies["maxItems"] == MAX_RELATED_EDDIES
+    for model in (ReflectionResponse, LetterResponse):
+        threads = model.model_json_schema()["properties"]["related_threads"]
+        assert threads["anyOf"][0]["maxItems"] == MAX_RELATED_THREADS
+    letter = LetterResponse.model_json_schema()["properties"]
+    assert letter["related_praxis"]["anyOf"][0]["maxItems"] == MAX_RELATED_PRAXIS
+    assert letter["related_eddies"]["anyOf"][0]["maxItems"] == MAX_RELATED_EDDIES
+
+
+def test_thread_lifecycle_tracks_the_domain_thread_status() -> None:
+    """``ThreadLifecycle`` is the wire twin of :class:`creek.models.ThreadStatus`."""
+    assert {status.value for status in ThreadLifecycle} == {
+        status.value for status in ThreadStatus
+    }
+
+
+def test_related_threads_round_trip_and_refuse_their_bound() -> None:
+    """A thread validates with its closed status, and a third one is refused."""
+    response = ReflectionResponse.model_validate(
+        {**REFLECTION_RESPONSE_PAYLOAD, "related_threads": [RELATED_THREAD_PAYLOAD]}
+    )
+
+    assert response.related_threads is not None
+    assert response.related_threads[0].status is ThreadLifecycle.ACTIVE
+    with pytest.raises(ValidationError):
+        ReflectionResponse.model_validate(
+            {
+                **REFLECTION_RESPONSE_PAYLOAD,
+                "related_threads": [RELATED_THREAD_PAYLOAD] * (MAX_RELATED_THREADS + 1),
+            }
+        )
+    with pytest.raises(ValidationError):
+        RelatedThread.model_validate({**RELATED_THREAD_PAYLOAD, "status": "stalled"})
+    with pytest.raises(ValidationError):
+        RelatedThread.model_validate({**RELATED_THREAD_PAYLOAD, "body": "leak"})
 
 
 def test_the_related_fields_are_optional_and_default_absent() -> None:

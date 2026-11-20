@@ -9,6 +9,23 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Reflections and letters name the threads, eddies and praxis the entry
+  touches (#2127, contract 0.36).**
+  - `creek_mcp/compiled_pages.py` selects `02-Threads/{Active,Dormant,Resolved}/`
+    pages the way it selects eddies: a thread is named only when a seed
+    fragment links to it, its `fragment_count` matches the members on disk,
+    and every member is within the caller's ceiling. At most two, ranked by
+    seed overlap then title; status comes from the subfolder.
+  - `ReflectionResponse` (and `creek.reflect` results) gain the optional
+    `related_threads` (`{id, title, status}`); `LetterResponse` gains
+    `related_praxis`, `related_eddies` and `related_threads`, chosen for the
+    letter's source entry by the reflection's own seed gate
+    (`creek_mcp.tools.reflect.related_for_content`). Omitted when nothing
+    qualifies and for callers declaring `0.35` or earlier; no page body
+    crosses the wire, and the letter prompt is unchanged.
+  - New wire model `RelatedThread` and enum `ThreadLifecycle`; the
+    `adepthood-v1` bundle and the OpenAPI golden (`openapi-0.36.0.json`) are
+    regenerated.
 - **Letters and reflections write in the owner's own voice, and say so
   (#2126, contract 0.35).** Every `/v1` letter and reflection used one fixed
   "Higher Self" persona, so nothing the owner wrote shaped how it sounded.

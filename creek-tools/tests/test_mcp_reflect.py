@@ -2299,7 +2299,7 @@ def test_the_entry_ref_seeds_the_compiled_lookup(tmp_path: Path) -> None:
         """Record the seeds handed to the lookup."""
         del vault_arg, ceiling
         seen.append(list(seeds))
-        return RelatedCompiled([], [])
+        return RelatedCompiled([], [], [])
 
     factory = _RecordingFactory(_notes_payload())
     reflect_tool(
@@ -2467,7 +2467,7 @@ class _CountingLookup:
         """Record the consultation and return nothing qualifying."""
         del seeds, vault, ceiling
         self.calls += 1
-        return RelatedCompiled([], [])
+        return RelatedCompiled([], [], [])
 
 
 def _char_unavailable_factory(tier: PrivacyTier, *, max_tokens: int):
@@ -2711,7 +2711,7 @@ def test_the_optional_keys_are_omitted_not_empty(
             _notes_payload(_CHAR_NOTE, essay=_CHAR_ESSAY if has_essay else None)
         ),
         retrieve=_no_retrieval,
-        related_lookup=lambda *_args: RelatedCompiled(praxis, eddies),
+        related_lookup=lambda *_args: RelatedCompiled(praxis, eddies, []),
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
 

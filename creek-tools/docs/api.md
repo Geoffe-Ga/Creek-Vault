@@ -562,6 +562,22 @@ read the field, so it is never sent owner-voiced prose either: its prompt is
 the generic Higher Self one, its letters are stored as `higher_self`, its
 bodies are byte-identical, and `0.34` stays in the window.
 
+`0.36.0` (#2127) names the threads, eddies and praxis an entry actually
+touches. The reflection response gains the optional `related_threads` — at
+most two `{id, title, status}`, where `status` is `active`, `dormant` or
+`resolved` (from the thread page's `02-Threads/` subfolder) — beside the
+`related_praxis` and `related_eddies` it has carried since `0.9`. The letter
+response gains all three, chosen for the letter's source entry exactly as a
+reflection on the same text would choose them: the entry's nearest corpus
+fragments select candidate pages, and a page is named only when one of them
+is among its sources, its sources are all on disk, and every one is within
+your declared ceiling. An entry that touches nothing returns none of the keys
+— they are omitted, never sent empty, and never padded with an unrelated
+page. Only titles and labels cross the wire, never a page's body, and the
+letter's prompt is unchanged. A refusal or care escalation carries none. The
+fields are withheld from a caller below `0.36`, so its bodies are
+byte-identical and `0.35` stays in the window.
+
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE
 /v1/connectors/drive` and `POST /v1/connectors/drive/syncs`. It is additive in

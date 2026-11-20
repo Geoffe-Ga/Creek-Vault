@@ -727,6 +727,11 @@ def create_app(
     app.state.pipeline_jobs = job_runtime
     app.state.reflect_llm_factory = reflect_llm_factory
     app.state.letter_llm_factory = letter_llm_factory
+    # The letter route's related-surfaces lookup (#2127): ``None`` builds the
+    # production one per request, over the grounding session below. Set on
+    # ``app.state`` rather than taken as a parameter for the reason the
+    # session is: production never configures it, and a test replaces it.
+    app.state.letter_related_lookup = None
     # One grounding session per app (#1034), so ``POST /v1/reflections`` builds
     # and warms its retrieval specialist once for this process rather than once
     # per request. Set on ``app.state`` rather than taken as a ``create_app``

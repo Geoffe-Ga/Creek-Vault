@@ -131,6 +131,33 @@
       "title": "RelatedPraxis",
       "type": "object"
     },
+    "RelatedThread": {
+      "additionalProperties": false,
+      "description": "One narrative thread the entry belongs to (contract 0.36, #2127).\n\nA thread page is compiled from the fragments that link to it, exactly as\nan eddy is, so it carries :class:`RelatedEddy`'s caveat:\n:mod:`creek_mcp.compiled_pages` names a thread only when one of the\nentry's seed fragments is a member, the members it can enumerate account\nfor the page's ``fragment_count``, and every one of them is within the\ncaller's ceiling. Only these three labels cross the wire \u2014 never the\npage's body, description or member count.\n\nAttributes:\n    id: The thread page's own ``id``.\n    title: The thread page's title.\n    status: :class:`ThreadLifecycle`, from the subfolder it lives in.",
+      "properties": {
+        "id": {
+          "description": "The thread page's own id.",
+          "title": "Id",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ThreadLifecycle",
+          "description": "active, dormant or resolved."
+        },
+        "title": {
+          "description": "The thread page's title.",
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status"
+      ],
+      "title": "RelatedThread",
+      "type": "object"
+    },
     "ReplyVoice": {
       "description": "Which voice a letter or reflection was written in (#2126).\n\nThe wire twin of :class:`creek.author.reply_voice.ReplyVoice`, which this\nframework-free module does not import; a test pins the two vocabularies\nequal.\n\nAttributes:\n    OWNER: The prompt carried the owner's own style, drawn only from the\n        owner's own writing: owner-authored style skills, register samples\n        admitted at the caller's ceiling, or the voice fingerprint.\n    HIGHER_SELF: No owner style was found; the generic Higher Self voice.",
       "enum": [
@@ -138,6 +165,16 @@
         "higher_self"
       ],
       "title": "ReplyVoice",
+      "type": "string"
+    },
+    "ThreadLifecycle": {
+      "description": "The three thread statuses, mirroring :class:`creek.models.ThreadStatus`.\n\nRead from the ``02-Threads/`` subfolder a thread page lives in (#2127).\n\nAttributes:\n    ACTIVE: A current that is still running.\n    DORMANT: Quiet for now, not over.\n    RESOLVED: A current that has run its course.",
+      "enum": [
+        "active",
+        "dormant",
+        "resolved"
+      ],
+      "title": "ThreadLifecycle",
       "type": "string"
     },
     "WireTierCeiling": {
@@ -151,7 +188,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier \u2014 the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field \u2014 do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted \u2014 rather\n        than guessed \u2014 on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the notes were written in (#2126): ``owner`` when\n        the owner's own style shaped them, ``higher_self`` otherwise.\n        Since contract 0.35, and omitted for a caller declaring an earlier\n        minor.",
+  "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier \u2014 the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field \u2014 do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.\n    inference_source: The route that answered, one of ``pool:creek``,\n        ``pool:attested:<vendor>``, ``request_key:<vendor>`` or ``local``\n        (ADR-0016 Decision 1 item 11). Since contract 0.19, and omitted\n        for a caller declaring an earlier minor. Also omitted \u2014 rather\n        than guessed \u2014 on an answer this vocabulary does not label, which\n        today is an operator's own cloud key on a self-hosted vault or an\n        attested enclave (unreadable, and still off-device). The\n        consumer's use for the field is to notice a route it did not\n        expect, so a label the server cannot stand behind would be worse\n        than none.\n    voice: Which voice the notes were written in (#2126): ``owner`` when\n        the owner's own style shaped them, ``higher_self`` otherwise.\n        Since contract 0.35, and omitted for a caller declaring an earlier\n        minor.\n    related_threads: At most two :class:`RelatedThread` the entry belongs\n        to (#2127). Absent when none qualifies, and for a caller declaring\n        a minor below :data:`RELATED_SURFACES_SINCE_MINOR`.",
   "properties": {
     "essay": {
       "anyOf": [
@@ -227,6 +264,23 @@
       "default": null,
       "description": "Praxis pages the entry contributed to; absent when none.",
       "title": "Related Praxis"
+    },
+    "related_threads": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/RelatedThread"
+          },
+          "maxItems": 2,
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Threads the entry belongs to; absent when none. Since contract 0.36.",
+      "title": "Related Threads"
     },
     "routed_tier": {
       "$ref": "#/$defs/WireTierCeiling",

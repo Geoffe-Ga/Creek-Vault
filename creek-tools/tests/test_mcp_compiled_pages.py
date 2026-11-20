@@ -288,7 +288,7 @@ def test_an_above_ceiling_seed_widens_nothing(tmp_path: Path) -> None:
 
     related = related_compiled([_INTIMATE_FRAGMENT], vault, TierCeiling.PERSONAL)
 
-    assert related == RelatedCompiled([], [])
+    assert related == RelatedCompiled([], [], [])
 
 
 def test_intimate_provenance_is_published_only_at_an_intimate_ceiling(
@@ -448,8 +448,8 @@ def test_no_seeds_selects_nothing(tmp_path: Path) -> None:
     _eddy(vault, fragment_count=1)
     _praxis(vault, derived_from=(_OPEN_FRAGMENT,))
 
-    assert related_compiled([], vault, TierCeiling.ALL) == RelatedCompiled([], [])
-    assert related_compiled([""], vault, TierCeiling.ALL) == RelatedCompiled([], [])
+    assert related_compiled([], vault, TierCeiling.ALL) == RelatedCompiled([], [], [])
+    assert related_compiled([""], vault, TierCeiling.ALL) == RelatedCompiled([], [], [])
 
 
 def test_an_unrelated_seed_selects_nothing(tmp_path: Path) -> None:
@@ -462,7 +462,7 @@ def test_an_unrelated_seed_selects_nothing(tmp_path: Path) -> None:
 
     related = related_compiled([_PERSONAL_FRAGMENT], vault, TierCeiling.ALL)
 
-    assert related == RelatedCompiled([], [])
+    assert related == RelatedCompiled([], [], [])
 
 
 def test_an_empty_vault_yields_nothing_and_does_not_raise(tmp_path: Path) -> None:
@@ -471,7 +471,7 @@ def test_an_empty_vault_yields_nothing_and_does_not_raise(tmp_path: Path) -> Non
 
     assert related_compiled(
         [_OPEN_FRAGMENT], vault, TierCeiling.ALL
-    ) == RelatedCompiled([], [])
+    ) == RelatedCompiled([], [], [])
 
 
 @pytest.mark.parametrize(
