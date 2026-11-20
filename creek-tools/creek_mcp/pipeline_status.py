@@ -24,8 +24,8 @@ Documents are this caller's own uploads only, and one whose fragments include
 any above the ceiling is withheld and counted in ``documents_withheld``. A
 fragment's tier is its on-disk ``privacy_tier``, never below the tier the
 upload declared, and it fails closed to ``intimate`` whenever it cannot be
-proven: an unreadable header, or a fragment that cannot be resolved to a file
-under ``01-Fragments`` at all — one soft-tombed into ``10-Liminal/Orphaned``,
+proven: an unreadable header, or a fragment that cannot be resolved to a live
+file at all — one soft-tombed into ``10-Liminal/Orphaned``,
 one deleted, or one whose index entry names a path outside its own directory
 (#2136 review). Such a document is withheld from every remote ceiling rather
 than silently judged on its remaining fragments. The body carries
@@ -87,8 +87,26 @@ _NOTE_SUFFIX: Final[str] = ".md"
 _SKIPPED_PREFIXES: Final[tuple[str, ...]] = (".", "_")
 """Hidden files (indexes, locks) and scaffold docs (``_README.md``) are not notes."""
 
-_FRAGMENTS_ROOT: Final[str] = "01-Fragments"
-"""Where fragments live, and therefore where their index files are."""
+FRAGMENT_ROOTS: Final[tuple[str, ...]] = tuple(
+    sorted(
+        {
+            folder.path.split("/", 1)[0]
+            for folder in ONTOLOGY_FOLDERS
+            if folder.writer == "ingest"
+            and re.fullmatch(FRAGMENT_PATH_PATTERN, f"{folder.path}/note.md")
+        }
+    )
+)
+"""The top-level folders a live fragment can be filed under, and so indexed in.
+
+Derived from the folder registry — every folder ingest writes, kept where
+:data:`~creek_mcp.api.models.FRAGMENT_PATH_PATTERN` admits a live fragment —
+so a fragment is resolved wherever ingest can file it: ``01-Fragments`` and,
+for a note naming its author, ``11-Other-Authors`` (#2125). Before, only
+``01-Fragments`` was walked, and the fail-closed rule then withheld every
+borrowed upload at every ceiling. ``10-Liminal/Orphaned`` is ingest's too, but
+a tombed fragment is not live, so it stays unresolved and fail-closed.
+"""
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
 """Nanoseconds in a second, for ``st_mtime_ns``."""
@@ -276,10 +294,11 @@ def _latest_documents(
 
 
 def _fragment_dirs(vault: Path) -> Iterator[Path]:
-    """Yield every directory under ``01-Fragments``, links not followed."""
-    for root, dirnames, _files in os.walk(vault / _FRAGMENTS_ROOT):
-        dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
-        yield Path(root)
+    """Yield every directory under each :data:`FRAGMENT_ROOTS`, links not followed."""
+    for fragment_root in FRAGMENT_ROOTS:
+        for root, dirnames, _files in os.walk(vault / fragment_root):
+            dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+            yield Path(root)
 
 
 def _contained_note(vault: Path, directory: Path, filename: str) -> Path | None:
@@ -297,7 +316,7 @@ def _contained_note(vault: Path, directory: Path, filename: str) -> Path | None:
 
     Args:
         vault: Vault root.
-        directory: The ``01-Fragments`` directory whose index named it.
+        directory: The fragment directory whose index named it.
         filename: The index entry's filename.
 
     Returns:

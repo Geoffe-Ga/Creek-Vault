@@ -9,6 +9,17 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`GET /v1/pipeline/status` lists an upload filed under `11-Other-Authors`
+  (#2125).** A note naming its `source.author_slug` is filed by ingest into
+  `11-Other-Authors/<slug>`, but the route resolved fragments under
+  `01-Fragments` only, so since its fail-closed rule (#2136 review) such an
+  upload was withheld at every ceiling. Fragments now resolve under every
+  top-level folder ingest files a live fragment into, derived from the folder
+  registry (`FRAGMENT_ROOTS`); a tombed fragment in `10-Liminal/Orphaned` still
+  fails closed. `PipelineDocumentStatus.fragment_path`'s published pattern
+  widens to `^(?:01-Fragments|11-Other-Authors)/…\.md$`; the 0.34.0 OpenAPI
+  golden and the `adepthood-v1` schemas are regenerated in place.
+
 - **An e2e lane proves every ontology folder fills, or says why not (#2125).**
   `tests/e2e/test_ontology_population_e2e.py` scaffolds a vault with `creek
   init`, uploads a dummy multi-source corpus (`tests/fixtures/ontology_corpus/`)
@@ -20,7 +31,7 @@ to locate the originating commit for any reference below.
   `10-Liminal/Unnamed` is written by `save` (not `generate.unnamed`, which only
   writes `Digests`) and `11-Other-Authors` by `ingest` (there is no `authors`
   subsystem). `08-Decisions/Archive` is recorded as a known gap: no surface
-  calls `DecisionDetector.update_decision_phase` (#2137). A borrowed note uploaded into `11-Other-Authors/<slug>` is likewise recorded as withheld by the status route, which resolves fragments under `01-Fragments` only. `LinkSummary` and the
+  calls `DecisionDetector.update_decision_phase` (#2137). `LinkSummary` and the
   `creek.link` result gain `skipped_materialisation` — eddies or threads
   detected whose page never reached disk, previously a log line only — and a
   non-zero count records the link stage `partial`. No `/v1` shape changes.

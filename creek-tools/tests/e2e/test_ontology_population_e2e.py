@@ -108,21 +108,6 @@ the folder, and fails the moment it fills, so the entry cannot outlive the fix.
 """
 
 
-_KNOWN_WITHHELD: Final[dict[str, str]] = {
-    "of-experience.md": (
-        "a borrowed note lands in 11-Other-Authors/<slug>, but the status route "
-        "resolves fragments under 01-Fragments only, so the upload is withheld "
-        "as unresolvable at every ceiling (follow-up to #2136's fail-closed "
-        "rule; issue to be filed)."
-    ),
-}
-"""Uploads the status route withholds although the caller may read them.
-
-A real defect, recorded the same way as :data:`_KNOWN_UNFILLED`: the lane
-requires the upload to stay withheld and counted, and fails once it is listed.
-"""
-
-
 class _TopicEncoder:
     """A sentence-transformer stand-in: one fixed vector per fixture topic."""
 
@@ -543,15 +528,10 @@ def _document_problems(
 ) -> list[str]:
     """Require every upload listed, its trail showing every stage, each ``ok``."""
     listed = {document["filename"] for document in documents}
-    unlisted = set(uploaded) - listed
     problems = [
         f"{name}: uploaded, but not listed by the status route"
-        for name in sorted(unlisted - set(_KNOWN_WITHHELD))
+        for name in sorted(set(uploaded) - listed)
     ]
-    problems.extend(
-        f"{name}: now listed; remove it from _KNOWN_WITHHELD"
-        for name in sorted(set(_KNOWN_WITHHELD) & listed)
-    )
     every_stage = {stage.value for stage in PipelineStage}
     for document in documents:
         outcomes = {record["stage"]: record["outcome"] for record in document["stages"]}
@@ -602,9 +582,6 @@ def test_every_ontology_folder_is_populated_or_writerless(
         *_status_problems(status, _note_counts(vault)),
         *_document_problems(status["documents"], run.uploaded),
     ]
-    if status["documents_withheld"] != len(_KNOWN_WITHHELD):
-        problems.append(
-            f"documents_withheld is {status['documents_withheld']}, "
-            f"expected {len(_KNOWN_WITHHELD)}"
-        )
+    if status["documents_withheld"]:
+        problems.append(f"documents_withheld is {status['documents_withheld']}")
     assert not problems, "\n  ".join(["ontology population failed:", *problems])

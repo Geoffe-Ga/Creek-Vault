@@ -3487,9 +3487,14 @@ FOLDER_WRITER_PATTERN: Final[str] = r"^[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+)*$"
 """A writer name: a dotted lower-case subsystem name, never prose."""
 
 FRAGMENT_PATH_PATTERN: Final[str] = (
-    r"^01-Fragments/(?:[^/\x00-\x1f]+/)*[^/\x00-\x1f]+\.md$"
+    r"^(?:01-Fragments|11-Other-Authors)/(?:[^/\x00-\x1f]+/)*[^/\x00-\x1f]+\.md$"
 )
-"""A fragment's vault-relative path: under ``01-Fragments``, a ``.md`` file."""
+"""A live fragment's vault-relative path: a ``.md`` file where ingest files one.
+
+That is ``01-Fragments`` for the owner's own material and ``11-Other-Authors``
+for a note whose frontmatter names its ``source.author_slug`` (#2125). A
+fragment soft-tombed into ``10-Liminal/Orphaned`` is not live and has no path.
+"""
 
 
 class PipelineStage(StrEnum):

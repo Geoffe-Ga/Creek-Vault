@@ -79,7 +79,7 @@
           "anyOf": [
             {
               "maxLength": 1024,
-              "pattern": "^01-Fragments/(?:[^/\\x00-\\x1f]+/)*[^/\\x00-\\x1f]+\\.md$",
+              "pattern": "^(?:01-Fragments|11-Other-Authors)/(?:[^/\\x00-\\x1f]+/)*[^/\\x00-\\x1f]+\\.md$",
               "type": "string"
             },
             {
