@@ -237,6 +237,31 @@ def test_a_prior_minor_is_not_served_the_voice_field(tmp_path: Path) -> None:
     assert VOICE_SINCE_MINOR == "0.35"
 
 
+def test_a_prior_minor_gets_the_pre_2126_prompt_even_with_owner_evidence(
+    tmp_path: Path,
+) -> None:
+    """A caller that cannot read ``voice`` is never sent prose it cannot label.
+
+    The owner style is applied only from :data:`VOICE_SINCE_MINOR`: below it the
+    provider prompt is byte-identical to the generic Higher Self prompt, and the
+    letter is stored as written in that voice, so a later 0.35 repeat says so.
+    """
+    vault = seed_vault(tmp_path / "vault")
+    _owner_skill(vault)
+    spy = _Spy()
+
+    response = _post(vault, spy, minor=_PRIOR_VOICE_MINOR)
+
+    assert response.status_code == 200, response.text
+    assert spy.prompts == [build_letter_prompt(_source())]
+    for instruction in _OWNER_INSTRUCTIONS:
+        assert instruction not in spy.prompts[0]
+    record = read_voice_draft(vault_path=vault, external_id=_EXTERNAL_ID)
+    assert record is not None
+    assert record.voice == "higher_self"
+    assert envelope(_post(vault, spy))["voice"] == "higher_self"
+
+
 def test_owner_register_samples_above_the_ceiling_never_reach_the_prompt(
     tmp_path: Path,
 ) -> None:

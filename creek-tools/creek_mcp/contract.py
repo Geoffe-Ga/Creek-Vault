@@ -33,7 +33,9 @@ voice fingerprint when the ceiling admits ``personal``. Never canonical
 signatures, borrowed ``11-Other-Authors`` material, or earlier AI letters and
 reflections. ``LetterResponse`` and ``ReflectionResponse`` gain the optional
 ``voice`` (``owner`` | ``higher_self``), served from 0.35 and omitted below;
-``creek.reflect`` results gain the same key. A vault-written letter records
+``creek.reflect`` results gain the same key. A ``/v1`` caller declaring an
+earlier minor cannot read ``voice``, so its prompt keeps the generic Higher
+Self voice, byte for byte. A vault-written letter records
 its voice in its Voice Draft, so an ``unchanged`` repeat reports it. ``creek
 fill`` now builds the voice fingerprint. No route, status or error code moves;
 ``0.34`` stays served.

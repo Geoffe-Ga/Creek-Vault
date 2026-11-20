@@ -237,6 +237,13 @@ class LetterCall:
             Invoked only once every gate has passed, so a provider that cannot
             be built costs nothing on a refused call.
         care_guard: ``(text) -> reason | None``.
+        apply_owner_voice: Whether the owner's style may shape the letter
+            (#2126). ``POST /v1/letters`` passes ``False`` to a caller
+            declaring a minor below
+            :data:`~creek_mcp.api.models.VOICE_SINCE_MINOR`, which cannot read
+            ``voice``: its prompt stays the generic Higher Self one, byte for
+            byte, the owner's style is not read, and the letter is stored as
+            ``higher_self``.
     """
 
     vault_path: Path
@@ -245,6 +252,7 @@ class LetterCall:
     consumer: str
     build_factory: Callable[[], LetterLLMFactory]
     care_guard: Callable[[str], str | None]
+    apply_owner_voice: bool = True
 
 
 def build_letter_prompt(
@@ -417,6 +425,27 @@ def _care_reason(call: LetterCall, source: LetterSource) -> str | None:
     return call.care_guard(source.content) or call.care_guard(source.note)
 
 
+def _letter_style(call: LetterCall) -> ReplyStyle:
+    """Return the style this letter is written in (#2126).
+
+    Read after the ceiling, care and stored-letter gates, so an above-ceiling,
+    escalated or repeated call reads none of the owner's style. It *is* read
+    before the dial, so a call refused at dial time (rate limit, rejected key,
+    unavailable provider) has already read it; nothing it read is stored or
+    returned on that path. Samples are admitted at the caller's own ceiling.
+    A caller that cannot read ``voice`` (``apply_owner_voice`` false) gets the
+    generic style without reading anything.
+
+    Imported here, not at module top: the HTTP API must cold-start without
+    importing ``creek.author`` (tests/test_container_image_contract.py).
+    """
+    if not call.apply_owner_voice:
+        return HIGHER_SELF_STYLE
+    from creek.author.reply_voice import reply_style
+
+    return reply_style(call.vault_path, override=to_privacy_override(call.ceiling))
+
+
 def _admitted_outcome(call: LetterCall, source: LetterSource) -> LetterOutcome:
     """Run the gates after the ceiling check, in source order."""
     reason = _care_reason(call, source)
@@ -427,15 +456,7 @@ def _admitted_outcome(call: LetterCall, source: LetterSource) -> LetterOutcome:
         return existing
     if existing is not None:
         return VoiceDraftWriteResult(VoiceDraftAction.UNCHANGED, existing)
-    # Read only once every gate has passed and no stored letter answers, so a
-    # refused or repeated call reads none of the owner's style (#2126). The
-    # samples it may read are admitted at the caller's own ceiling.
-    #
-    # Imported here, not at module top: the HTTP API must cold-start without
-    # importing ``creek.author`` (tests/test_container_image_contract.py).
-    from creek.author.reply_voice import reply_style
-
-    style = reply_style(call.vault_path, override=to_privacy_override(call.ceiling))
+    style = _letter_style(call)
     letter = _generate(call, source, style)
     if isinstance(letter, LetterRefusal):
         return letter

@@ -30,7 +30,9 @@ to locate the originating commit for any reference below.
     (`owner` | `higher_self`), served from 0.35 and omitted below it;
     `creek.reflect` results carry it too. A letter records its voice in its
     Voice Draft, so an `unchanged` repeat reports it; a letter stored before
-    0.35 reads as `higher_self`.
+    0.35 reads as `higher_self`. A caller declaring an earlier minor cannot
+    read `voice`, so it is never sent owner-voiced prose: its prompt stays
+    the generic one and its letters are stored as `higher_self`.
   - `creek fill` runs `report/fingerprint`, so a managed vault has one.
   - The OpenAPI golden (`openapi-0.35.0.json`) and the `adepthood-v1` bundle
     are regenerated.

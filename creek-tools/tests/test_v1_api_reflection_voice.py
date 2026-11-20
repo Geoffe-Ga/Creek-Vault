@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 
 from creek.classify.llm.pool_boundary import POOL_PROMPT_TOKEN_CAP
 from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools import reflect as reflect_module
 from creek_mcp.tools.reflect import reflect_tool
 from tests.test_reply_voice import OWNER_STYLE
 from tests.v1_api_support import (
@@ -43,6 +44,8 @@ _TURN: Final[str] = json.dumps(
     {"notes": [{"quote": _VERBATIM, "kind": "pattern", "note": "you notice it."}]}
 )
 _PRIOR_VOICE_MINOR: Final[str] = "0.34"
+_DEFAULT_MAX_NOTES: Final[int] = 3
+"""``ReflectionRequest.max_notes``'s default, which ``_post`` leaves unset."""
 _OWNER_INSTRUCTIONS: Final[tuple[str, ...]] = (
     "Write in lowercase only.",
     "Never use em-dashes.",
@@ -132,6 +135,24 @@ def test_a_prior_minor_is_not_served_the_voice_field(tmp_path: Path) -> None:
 
     assert response.status_code == 200, response.text
     assert "voice" not in envelope(response)
+
+
+def test_a_prior_minor_gets_the_pre_2126_prompt_even_with_owner_evidence(
+    tmp_path: Path,
+) -> None:
+    """Below ``VOICE_SINCE_MINOR`` the provider prompt carries no owner style."""
+    vault = seed_vault(tmp_path / "vault")
+    _owner_skill(vault)
+    spy = _Spy()
+
+    response = _post(vault, spy, minor=_PRIOR_VOICE_MINOR)
+
+    assert response.status_code == 200, response.text
+    assert spy.prompts == [
+        reflect_module._build_prompt(_ENTRY, [], max_notes=_DEFAULT_MAX_NOTES)
+    ]
+    for instruction in _OWNER_INSTRUCTIONS:
+        assert instruction not in spy.prompts[0]
 
 
 def test_an_owner_style_too_large_for_the_cap_falls_back_to_the_higher_self(

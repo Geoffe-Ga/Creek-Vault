@@ -391,6 +391,9 @@ def _reflect(
         consumer=context.consumer,
         max_notes=parsed.max_notes,
         grounding_route=grounding_route,
+        # #2126: owner-voiced notes only for a caller that can read ``voice``;
+        # below it the prompt is the generic one, byte for byte.
+        apply_owner_voice=declared_minor_at_least(request, VOICE_SINCE_MINOR),
     )
 
 

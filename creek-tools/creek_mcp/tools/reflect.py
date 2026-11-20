@@ -1167,6 +1167,7 @@ def reflect_tool(
     consumer: str = "unknown",
     max_notes: int = _DEFAULT_MAX_NOTES,
     grounding_route: GroundingRoute | None = None,
+    apply_owner_voice: bool = True,
 ) -> dict[str, Any]:
     """Return anchored Higher-Self margin notes for a single journal entry.
 
@@ -1220,6 +1221,13 @@ def reflect_tool(
             destination every byte went to. A decision that raises leaves the
             reflection ungrounded with nothing embedded — never grounded by a
             route nobody chose.
+        apply_owner_voice: Whether the owner's style may shape the notes
+            (#2126). ``POST /v1/reflections`` passes ``False`` to a caller
+            declaring a minor below
+            :data:`~creek_mcp.api.models.VOICE_SINCE_MINOR`, which cannot read
+            ``voice``: its prompt stays the generic Higher Self one, byte for
+            byte, and the owner's style is not even read. The MCP tool has no
+            declared minor and keeps the default, reporting ``voice`` itself.
 
     Returns:
         ``{status, tool, tier_ceiling, ...}`` — ``ok`` with ``notes`` (+ optional
@@ -1297,7 +1305,11 @@ def reflect_tool(
         entry,
         grounding.lines,
         max_notes=max_notes,
-        style=_owner_style(vault_path, privacy_tier_ceiling),
+        style=(
+            _owner_style(vault_path, privacy_tier_ceiling)
+            if apply_owner_voice
+            else HIGHER_SELF_STYLE
+        ),
     )
     if prompt is None:
         return refusal_response(

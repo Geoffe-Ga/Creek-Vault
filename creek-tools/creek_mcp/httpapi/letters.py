@@ -204,6 +204,9 @@ def _write(
         build_factory=build_factory
         or partial(_default_factory, vault, request_key, provenance),
         care_guard=acute_distress_guard,
+        # #2126: an owner-voiced letter only for a caller that can read
+        # ``voice``; below it the prompt is the generic one, byte for byte.
+        apply_owner_voice=declared_minor_at_least(request, VOICE_SINCE_MINOR),
     )
     return write_letter(call, _source(parsed))
 

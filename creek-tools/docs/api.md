@@ -557,9 +557,10 @@ at your declared ceiling (as a numeric profile, never their words), and the
 voice fingerprint when your ceiling admits `personal` — never from earlier
 letters or reflections, and never from borrowed authors. A missing voice is
 never a refusal. A repeat letter reports the voice it was stored with, and a
-letter stored before `0.35` reads `higher_self`. The field is withheld from a
-caller below `0.35`, so its bodies are byte-identical and `0.34` stays in the
-window.
+letter stored before `0.35` reads `higher_self`. A caller below `0.35` cannot
+read the field, so it is never sent owner-voiced prose either: its prompt is
+the generic Higher Self one, its letters are stored as `higher_self`, its
+bodies are byte-identical, and `0.34` stays in the window.
 
 `0.9.0` (#1527) is the second such bump, and the first to publish a capability
 served by **three** routes: `drive-connector`, over `GET`/`DELETE
