@@ -127,6 +127,8 @@ Follow the 4-gate process:
 3. **CI**: All GitHub Actions jobs green
 4. **Review**: LGTM before merge
 
+A flaky test is worse than no test: fix its root cause, decouple what it tests, or delete it with a stated reason; never retry, quarantine or skip it to get green.
+
 ## Review Verdicts: `COMMENTS` Never Iterates
 
 A Claude review `Verdict: COMMENTS` is a sign-off with non-blocking findings.
