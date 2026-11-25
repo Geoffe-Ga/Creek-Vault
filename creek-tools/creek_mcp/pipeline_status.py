@@ -32,6 +32,16 @@ than silently judged on its remaining fragments. The body carries
 filenames, the caller's ids and vault paths — never a title or a byte of
 content.
 
+**Whole-corpus totals (#2147).** ``totals`` counts every document of the
+caller per stage, whatever ``limit`` and the ceiling say, so a consumer can
+show "x of y" over a corpus larger than one page. Each document is counted by
+:func:`_stages`, the function that builds its own trail, so the totals and the
+rows cannot disagree. They need the receipts and the stage log only: no
+fragment is resolved or opened for a document that is merely counted. A
+document's trail depends only on which passes started at or after it landed,
+so documents that landed between the same two passes share one computed trail
+and the cost is bounded by the number of passes, not passes times documents.
+
 **Read-only.** Nothing here opens a file for writing, takes a lock, or repairs
 an index.
 """
@@ -42,6 +52,7 @@ import os
 import re
 import stat
 import threading
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from operator import attrgetter
@@ -63,7 +74,9 @@ from creek_mcp.api.models import (
     PipelineStage,
     PipelineStageOutcome,
     PipelineStageRecord,
+    PipelineStageTotal,
     PipelineStatusResponse,
+    PipelineTotals,
     WireTierCeiling,
 )
 from creek_mcp.httpapi.jobs import recent_pipeline_jobs
@@ -435,26 +448,67 @@ def _document_status(
     )
 
 
-def document_statuses(
-    vault: Path, *, consumer: str, ceiling: TierCeiling, limit: int
+def _totals(documents: list[_Document], runs: list[StageRun]) -> PipelineTotals:
+    """Count every document per stage, by the rule its own trail is built on.
+
+    :func:`_stages` is asked for each trail, so a document counts toward a
+    stage here exactly when its ``documents`` row would name that stage, under
+    the same outcome. A trail depends on the document only through which
+    passes started at or after it landed; documents that fall between the
+    same two pass starts therefore share one trail, computed once.
+
+    Args:
+        documents: Every document of the caller, every tier.
+        runs: Every recorded pass.
+
+    Returns:
+        The document count and one row per stage, in pipeline order.
+    """
+    starts = sorted(run.started_at for run in runs)
+    trails: dict[int, list[PipelineStageRecord]] = {}
+    counts = {stage: dict.fromkeys(PipelineStageOutcome, 0) for stage in PipelineStage}
+    for document in documents:
+        earlier_passes = bisect_left(starts, document.at)
+        trail = trails.get(earlier_passes)
+        if trail is None:
+            trail = trails[earlier_passes] = _stages(document, runs)
+        for record in trail:
+            counts[record.stage][record.outcome] += 1
+    return PipelineTotals(
+        documents=len(documents),
+        stages=[
+            PipelineStageTotal(
+                stage=stage,
+                covered=counted[PipelineStageOutcome.OK],
+                partial=counted[PipelineStageOutcome.PARTIAL],
+                failed=counted[PipelineStageOutcome.FAILED],
+            )
+            for stage, counted in counts.items()
+        ],
+    )
+
+
+def _page(
+    vault: Path,
+    documents: list[_Document],
+    runs: list[StageRun],
+    ceiling: TierCeiling,
 ) -> tuple[list[PipelineDocumentStatus], int]:
-    """Return this caller's newest documents and how many were withheld.
+    """Return the admitted rows of one page and how many were withheld.
 
     Args:
         vault: Vault root.
-        consumer: The caller; only its own uploads are listed.
+        documents: The page: the newest documents, already cut to the limit.
+        runs: Every recorded pass.
         ceiling: The caller's admitted ceiling.
-        limit: The most documents to consider, newest first.
 
     Returns:
         The admitted rows and the count withheld for the ceiling.
     """
-    documents = _latest_documents(read_upload_receipts(vault), consumer)[:limit]
     if not documents:
         return [], 0
     wanted = {f for document in documents for f in document.fragment_ids}
     paths = _fragment_paths(vault, wanted)
-    runs = read_stage_runs(vault)
     admitted = [d for d in documents if _admitted(d, paths, ceiling)]
     rows = [_document_status(vault, d, paths, runs) for d in admitted]
     return rows, len(documents) - len(admitted)
@@ -468,16 +522,21 @@ def build_status(
     limit: int,
     worker_id: str,
     active_job_ids: AbstractSet[str],
+    with_totals: bool,
 ) -> PipelineStatusResponse:
     """Return the whole status body for one caller.
 
     Args:
         vault: Vault root, already probed as available.
-        consumer: The authenticated caller.
+        consumer: The authenticated caller; only its own uploads are read.
         ceiling: The caller's admitted ceiling.
-        limit: The clamped document limit.
+        limit: The clamped document limit: the most rows listed, newest first.
         worker_id: This process's job worker id.
         active_job_ids: The job ids this process is executing.
+        with_totals: Whether to count ``totals`` over every document. ``False``
+            for a caller whose minor predates
+            :data:`~creek_mcp.api.models.PIPELINE_TOTALS_SINCE_MINOR`, which
+            leaves the field ``None`` and the work undone.
 
     Returns:
         The response model.
@@ -485,9 +544,9 @@ def build_status(
     Raises:
         OSError: When a scaffolded folder exists but cannot be listed.
     """
-    documents, withheld = document_statuses(
-        vault, consumer=consumer, ceiling=ceiling, limit=limit
-    )
+    everything = _latest_documents(read_upload_receipts(vault), consumer)
+    runs = read_stage_runs(vault) if everything else []
+    documents, withheld = _page(vault, everything[:limit], runs, ceiling)
     return PipelineStatusResponse(
         status="ok",
         tier_ceiling=WireTierCeiling(ceiling.value),
@@ -501,4 +560,5 @@ def build_status(
             active_job_ids=active_job_ids,
             limit=PIPELINE_STATUS_MAX_JOBS,
         ),
+        totals=_totals(everything, runs) if with_totals else None,
     )

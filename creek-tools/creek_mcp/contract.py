@@ -20,8 +20,25 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.36.0"
+CONTRACT_VERSION: Final[str] = "0.37.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.37.0 (#2147): ``GET /v1/pipeline/status`` counts the caller's whole corpus
+per stage. ``PipelineStatusResponse`` gains ``totals``: ``documents`` (every
+upload document of the caller, one per ``external_id``, every tier) and
+``stages``, one ``{stage, covered, partial, failed}`` row per
+``PipelineStage`` in pipeline order, zero rows included. The three counts are
+disjoint and follow the outcome the document's own ``stages`` row carries —
+both come from one function, so they cannot disagree — and what is left of
+``documents`` is what the stage has not run over. Totals ignore ``limit`` and
+the tier ceiling (a count names nothing; no filename, id or path is added)
+and are read from the upload receipts and the stage log alone, so the
+``documents`` list stays clamped to 200 and no fragment is opened for a
+document that is only counted. The field is sent to a caller declaring
+``0.37``; one declaring ``0.34`` to ``0.36`` gets the body its minor
+published, byte for byte, and the totals are not computed for it. New wire
+models ``PipelineTotals`` and ``PipelineStageTotal``. No route, status or
+error code moves; ``0.36`` stays served.
 
 0.36.0 (#2127): reflections and letters name the threads, eddies and praxis
 the entry actually touches. ``ReflectionResponse`` gains the optional

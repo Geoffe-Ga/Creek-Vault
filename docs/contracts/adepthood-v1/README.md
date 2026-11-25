@@ -60,7 +60,7 @@ logged URL. Any caller but the vault's sole configured consumer gets
 `403 privacy_refused`; a vault that cannot be read is `503 unavailable` —
 treat that as "vault unavailable", never as an empty export.
 
-## Pipeline status (`pipeline`, contract `0.34`)
+## Pipeline status (`pipeline`, contract `0.34`; `totals` at `0.37`)
 
 `GET /v1/pipeline/status?limit=` answers "what has Creek done with my
 uploads?". `folders` lists every scaffolded ontology folder, empty ones
@@ -72,7 +72,15 @@ with a `stages` trail (`ingested`, then `classified`, `praxis_scanned`,
 `linked:<method>`, each `ok` / `partial` / `failed`). A document above the
 caller's ceiling is never named; it is counted in `documents_withheld`.
 `jobs` lists the caller's newest durable pipeline jobs. The route is served
-only to a caller declaring `0.34` or later. Its two examples live under
+only to a caller declaring `0.34` or later.
+
+`totals` (contract `0.37`) counts the caller's **whole** corpus, whatever
+`limit` and the ceiling say: `documents`, and one `stages` row per stage, in
+pipeline order and listed even at zero, with disjoint `covered` (`ok`),
+`partial` and `failed` counts. `documents` minus the three is what a stage
+has not run over, and `stages[ingested].covered` equals `documents`. Use it
+for "x of y files" per stage; the `documents` list is one page. A caller
+declaring `0.34`–`0.36` is not sent the key. Its two examples live under
 `pipeline-status/`, outside the capability/state matrix (the `pipeline` cells
 show its two write verbs), hashed by the same manifest and validated against
 [`PipelineStatusResponse.schema.json`](schemas/PipelineStatusResponse.schema.json).
