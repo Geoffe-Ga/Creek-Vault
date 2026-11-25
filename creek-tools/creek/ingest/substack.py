@@ -72,6 +72,7 @@ __all__ = [
     "SUBSCRIBER_LIST_PREFIX",
     "SubstackIngestor",
     "SubstackPost",
+    "is_subscriber_csv",
     "is_substack_export",
     "parse_posts_rows",
     "single_post_ingestor",
@@ -193,11 +194,21 @@ def _parse_posts_csv(csv_path: Path) -> dict[str, dict[str, str]]:
         return parse_posts_rows(handle)
 
 
-def _is_subscriber_csv(path: Path) -> bool:
+def is_subscriber_csv(path: Path) -> bool:
     """Return whether *path* is a subscriber-engagement CSV (PII).
 
     Covers both layouts: per-post ``<post_id>.<slug>.delivers.csv`` /
     ``.opens.csv`` and the top-level ``email_list*.csv`` roster.
+
+    Decided from the file's name alone, and the one predicate both arrival
+    routes use: the directory ingestor's discovery walk here, and the loose
+    single-file upload in :mod:`creek_mcp.tools.upload` (#2133).
+
+    Args:
+        path: The file's path; only its last component is read.
+
+    Returns:
+        ``True`` when the name is one of Substack's subscriber CSVs.
     """
     name = path.name.lower()
     if name.startswith(SUBSCRIBER_LIST_PREFIX) and name.endswith(".csv"):
@@ -247,7 +258,7 @@ def _derive_posts_metadata(source_path: Path) -> dict[str, dict[str, str]]:
     """
     metadata: dict[str, dict[str, str]] = {}
     for html_file in sorted(source_path.rglob("*.html")):
-        if not html_file.is_file() or _is_subscriber_csv(html_file):
+        if not html_file.is_file() or is_subscriber_csv(html_file):
             continue
         post_id = extract_post_id(html_file.name)
         if post_id is None:
@@ -375,7 +386,7 @@ class SubstackIngestor(Ingestor):
             # Paranoia — an HTML extension shouldn't match the subscriber
             # filter, but a future export-layout change could; keep the
             # PII guard at the discover boundary regardless.
-            if _is_subscriber_csv(html_file):
+            if is_subscriber_csv(html_file):
                 continue
             post_id = extract_post_id(html_file.name)
             if post_id is None:

@@ -38,7 +38,11 @@ from creek.ingest.upload_receipts import read_upload_receipts
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
-from creek_mcp.tools.upload import MANIFEST_STATUS, upload_tool
+from creek_mcp.tools.upload import (
+    MANIFEST_STATUS,
+    SUBSCRIBER_DATA_REASON,
+    upload_tool,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -557,3 +561,115 @@ def test_a_manifest_is_never_receipted(vault: Path) -> None:
 
     assert manifest["status"] == MANIFEST_STATUS
     assert read_upload_receipts(vault) == []
+
+
+# --------------------------------------------------------------------------- #
+# Subscriber lists are refused, never ingested (#2133)
+# --------------------------------------------------------------------------- #
+
+_SUBSCRIBER_EMAILS: Final[tuple[str, ...]] = (
+    "reader.one@subscribers.example",
+    "reader.two@subscribers.example",
+)
+"""Third parties' addresses in every subscriber fixture; none may reach disk."""
+
+_SUBSCRIBER_FILES: Final[tuple[str, ...]] = (
+    "email_list.csv",
+    "email_list.my-publication.csv",
+    "171234567.on-attention.delivers.csv",
+    "171234567.on-attention.opens.csv",
+    "posts/171234567.on-attention.opens.csv",
+    "EMAIL_LIST.CSV",
+)
+"""Each subscriber-file shape a Substack export holds, as a folder import names it."""
+
+
+def _subscriber_csv() -> bytes:
+    """Return a subscriber CSV naming every address in :data:`_SUBSCRIBER_EMAILS`.
+
+    Returns:
+        The CSV bytes.
+    """
+    rows = "".join(
+        f"{email},2024-03-15T08:30:00.000Z,true\n" for email in _SUBSCRIBER_EMAILS
+    )
+    return ("email,timestamp,active_subscription\n" + rows).encode()
+
+
+def _files_naming_a_subscriber(vault: Path) -> list[str]:
+    """Return every file under *vault* whose bytes hold a subscriber address.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        Vault-relative paths, empty when no address was written anywhere.
+    """
+    needles = [email.encode() for email in _SUBSCRIBER_EMAILS]
+    return sorted(
+        path.relative_to(vault).as_posix()
+        for path in vault.rglob("*")
+        if path.is_file() and any(needle in path.read_bytes() for needle in needles)
+    )
+
+
+@pytest.mark.parametrize("filename", _SUBSCRIBER_FILES)
+def test_a_loose_subscriber_csv_is_refused_and_nothing_is_written(
+    vault: Path, filename: str
+) -> None:
+    """Every subscriber-file shape is refused: no fragment, no address on disk.
+
+    **The RED this was written against**: each of these was read by the
+    spreadsheet ingestor and written to ``01-Fragments/Data`` with the
+    subscribers' addresses in its body and its staged copy.
+    """
+    response = _upload(vault, filename, _subscriber_csv())
+
+    assert response["status"] == "refused"
+    assert response["reason"] == SUBSCRIBER_DATA_REASON
+    assert _fragments(vault) == []
+    assert _files_naming_a_subscriber(vault) == []
+    staging = vault / "00-Creek-Meta/adepthood/uploads"
+    assert not staging.exists() or not any(staging.iterdir())
+    assert read_upload_receipts(vault) == []
+
+
+def test_a_subscriber_refusal_is_audited_without_content(vault: Path) -> None:
+    """The refusal is audited, and names neither the file nor its rows back."""
+    response = _upload(vault, "171234567.on-attention.opens.csv", _subscriber_csv())
+
+    assert set(response) == {"status", "tool", "tier_ceiling", "reason"}
+    assert "on-attention" not in response["reason"]
+    entries = [
+        json.loads(line)
+        for line in (vault / MCP_AUDIT_RELPATH).read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.upload"
+    assert "affected_fragment_ids" not in entries[0] or not entries[0].get(
+        "affected_fragment_ids"
+    )
+    assert "created_path" not in entries[0] or entries[0]["created_path"] is None
+
+
+def test_a_whole_loose_export_keeps_its_posts_and_drops_its_subscribers(
+    vault: Path,
+) -> None:
+    """Sent file by file, the export lands as a zipped one does: posts only."""
+    _upload(vault, "posts.csv", _manifest_csv())
+    _upload_posts(vault)
+    for filename in _SUBSCRIBER_FILES:
+        _upload(vault, filename, _subscriber_csv())
+
+    assert len(_fragments(vault)) == len(_POSTS)
+    assert _relative_dirs(vault) == {"Writing/Substack"}
+    assert _files_naming_a_subscriber(vault) == []
+
+
+def test_an_ordinary_csv_is_still_a_spreadsheet(vault: Path) -> None:
+    """A CSV matching no subscriber filter is ingested exactly as before."""
+    response = _upload(vault, "budget.csv", b"item,cost\nink,12\n")
+
+    assert response["status"] == "ok"
+    assert response["source_type"] == "spreadsheet"

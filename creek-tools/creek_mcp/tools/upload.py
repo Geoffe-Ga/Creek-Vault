@@ -75,7 +75,11 @@ Gate ordering, all of it load-bearing and asserted from outside:
    manifest is kept as metadata and answered ``status: "manifest"`` without
    being staged, and a ``<post_id>.<slug>.html`` post with Substack's markup
    (or listed in an admitted manifest row) is routed to the Substack ingestor
-   rather than by its extension;
+   rather than by its extension. Its subscriber lists (#2133) —
+   ``email_list*.csv``, ``*.delivers.csv`` and ``*.opens.csv``, by the
+   predicate the ``.zip`` path filters with — are refused here, audited, with
+   :data:`SUBSCRIBER_DATA_REASON`: third parties' addresses are never staged
+   and never become a spreadsheet fragment;
 6. the unsupported-format gate — an unrecognised ``.json``, a ``.jsonl``, a
    ``.tar`` or a legacy ``.doc`` is refused *with a remedy* rather than routed to
    ``generic`` (#1526), and it sits here, above the write, so the refused
@@ -125,7 +129,7 @@ from creek.ingest.json_loose import is_loose_json, lay_out_loose_export
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import derive_source_key, run_ingest
 from creek.ingest.source_unit import split_source_unit
-from creek.ingest.substack import single_post_ingestor
+from creek.ingest.substack import is_subscriber_csv, single_post_ingestor
 from creek.ingest.substack_loose import (
     SUBSTACK_MANIFEST_RELPATH,
     is_substack_manifest,
@@ -196,6 +200,19 @@ no ``fragment_id`` to report. See :func:`_manifest_outcome`.
 
 SUBSTACK_SOURCE_TYPE: Final[str] = "substack"
 """The :data:`creek.ingest.INGESTOR_REGISTRY` key of a loose Substack file."""
+
+SUBSCRIBER_DATA_REASON: Final[str] = (
+    "this file is a Substack subscriber list, which Creek deliberately skips"
+)
+"""Refusal for a loose Substack subscriber CSV (#2133).
+
+``email_list*.csv`` and the per-post ``*.delivers.csv`` / ``*.opens.csv`` hold
+other people's email addresses. A zipped export drops them during discovery;
+sent loose, each is refused with this reason, and nothing is staged or
+written. A *constant*, naming neither the file nor anything in it, so the HTTP
+adapter can recognise it by equality and answer ``415 unsupported_source`` —
+the terminal, non-5xx outcome a client counts as skipped rather than failed.
+"""
 
 ARCHIVE_NO_FRAGMENTS_REASON: Final[str] = (
     "the archive was recognised as an export but produced no fragments"
@@ -1302,6 +1319,18 @@ def _admitted_upload_outcome(
     # metadata and never staged, and a post is routed by its content to the
     # Substack ingestor rather than by its extension to ``document``. Below
     # every privacy gate above, exactly as the archive fork is.
+    # Its subscriber lists (#2133) are other people's addresses. The zip path
+    # drops them in discovery; here they are refused by the same predicate,
+    # above the staging write, so no byte of them reaches the vault. The
+    # audit entry is the caller's own arguments and nothing else.
+    if is_subscriber_csv(Path(filename)):
+        return _refuse_with_audit(
+            vault_path=vault_path,
+            audit_args=audit_args,
+            ceiling=ceiling,
+            consumer=consumer,
+            reason=SUBSCRIBER_DATA_REASON,
+        )
     if is_substack_manifest(filename, raw):
         return _manifest_outcome(
             vault_path=vault_path,
@@ -1573,7 +1602,7 @@ def upload_tool(
     :func:`creek.ingest.archive.detect_export_type`, which is the same
     guarantee the missing override was protecting.
 
-    Three dispatch paths, then:
+    The dispatch paths, then:
 
     * a ``.zip`` goes to :func:`_archive_outcome` — unpacked containment-first
       and under entry/byte bounds, identified from its contents, ingested by
@@ -1584,6 +1613,9 @@ def upload_tool(
       is again decided from the bytes, by
       :func:`creek.ingest.archive.detect_document_export_type`, never from
       the filename;
+    * a loose Substack subscriber list (#2133) — ``email_list*.csv``,
+      ``*.delivers.csv``, ``*.opens.csv`` — is refused with
+      :data:`SUBSCRIBER_DATA_REASON` and never staged;
     * anything else keeps the single-document path: dispatch by extension
       through :func:`creek.ingest.route_to_ingestor`, and an extension that
       function refuses (any other ``.json``, ``.tar``, ``.doc``, …) refused

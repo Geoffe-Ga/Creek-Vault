@@ -548,6 +548,12 @@ manifest instead of the `202` its vendored contract cannot name, and `0.32`
 stays in the window. Adepthood can count the manifest as handled only once its
 upload result parser accepts the `202` body and its pin reaches `0.33`.
 
+The same export's subscriber lists — `email_list*.csv`, `*.delivers.csv` and
+`*.opens.csv` — hold other people's email addresses and are never ingested
+(#2133). A `.zip` drops them silently; sent loose, each is answered
+`415 unsupported_source` at every declared minor, with nothing staged or
+written. Count it as skipped, not failed: it is `terminal`, and deliberate.
+
 `0.35.0` (#2126) says whose voice a letter or reflection is in. The letter
 response and the reflection response gain the optional `voice`: `owner` when
 the owner's own style shaped the text, `higher_self` when the vault holds none

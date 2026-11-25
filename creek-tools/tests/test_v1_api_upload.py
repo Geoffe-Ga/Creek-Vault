@@ -75,7 +75,7 @@ from creek_mcp.httpapi.errors import RETRY_AFTER_HEADER, TRANSIENT_RETRY_AFTER_S
 from creek_mcp.httpapi.upload import upload_refusal_code
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
-from creek_mcp.tools.upload import MAX_UPLOAD_BYTES
+from creek_mcp.tools.upload import MAX_UPLOAD_BYTES, SUBSCRIBER_DATA_REASON
 from tests.archive_export_support import (
     CHATGPT_KEPT_ANSWER,
     CLAUDE_QUESTION,
@@ -872,6 +872,46 @@ def test_a_loose_substack_post_crosses_the_route_as_substack_writing(
     assert str(metadata["authored_at"]).startswith("2024-03-15")
 
 
+_SUBSCRIBER_EMAIL: Final[str] = "reader.one@subscribers.example"
+"""A third party's address in the subscriber fixture (#2133)."""
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "email_list.csv",
+        "171234567.on-attention.delivers.csv",
+        "171234567.on-attention.opens.csv",
+    ],
+)
+def test_a_loose_substack_subscriber_csv_is_415_and_writes_nothing(
+    vault: Path, filename: str
+) -> None:
+    """A subscriber list is deliberately skipped: ``415``, never a fragment.
+
+    ``415 unsupported_source`` is the terminal, non-5xx answer adepthood
+    already counts as *Skipped* rather than *Failed* (#2133).
+
+    Args:
+        vault: A seeded vault.
+        filename: One subscriber-file shape from a Substack export.
+    """
+    content = f"email,timestamp\n{_SUBSCRIBER_EMAIL},2024-03-15\n".encode()
+
+    response = _post(vault, _body(filename=filename, content=content))
+
+    assert response.status_code == _UNSUPPORTED_SOURCE_STATUS
+    assert envelope(response)["code"] == ErrorCode.UNSUPPORTED_SOURCE.value
+    assert _SUBSCRIBER_EMAIL not in response.text
+    assert "on-attention" not in response.text
+    assert _fragments(vault) == []
+    assert not [
+        path
+        for path in vault.rglob("*")
+        if path.is_file() and _SUBSCRIBER_EMAIL.encode() in path.read_bytes()
+    ]
+
+
 def test_the_refused_extension_sweep_is_not_vacuous() -> None:
     """The sweep above really does cover all three refused families.
 
@@ -1106,6 +1146,10 @@ def test_no_refusal_body_carries_a_path_or_the_document(vault: Path) -> None:
         # The #970 overwrite gate's refusal, which names neither the protected
         # fragment nor its tier.
         (GENERIC_ABOVE_CEILING_REASON, ErrorCode.PRIVACY_REFUSED),
+        # A loose Substack subscriber list (#2133): deliberately skipped, by
+        # exact equality — a composed string around it stays closed.
+        (SUBSCRIBER_DATA_REASON, ErrorCode.UNSUPPORTED_SOURCE),
+        (f"{SUBSCRIBER_DATA_REASON}: a.csv", ErrorCode.INTERNAL_ERROR),
         ("vault unavailable", ErrorCode.TEMPORARILY_UNAVAILABLE),
         # Content-lock contention (#2069): retryable, and matched by EXACT
         # equality, so a reason that merely contains the phrase — which could
