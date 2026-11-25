@@ -66,13 +66,18 @@ Gate ordering, all of it load-bearing and asserted from outside:
    an archive is admitted by exactly what a document is, and above the
    format gate below it, since that gate's only answer for a ``.zip`` was the
    refusal this fork replaces;
-   Just below it, a loose Substack export file (#2123): a ``posts.csv``
+   Just below it, a loose conversation export (#2148): a ``.json`` whose
+   **contents** are a ChatGPT, Claude or Discord export takes that same
+   archive path, with the one file laid out where its directory ingestor
+   looks in place of an extraction. A ``.json`` matching no export falls
+   through to gate 6 untouched;
+   Then a loose Substack export file (#2123): a ``posts.csv``
    manifest is kept as metadata and answered ``status: "manifest"`` without
    being staged, and a ``<post_id>.<slug>.html`` post with Substack's markup
    (or listed in an admitted manifest row) is routed to the Substack ingestor
    rather than by its extension;
-6. the unsupported-format gate — a ``.json`` conversation export, a ``.tar``
-   or a legacy ``.doc`` is refused *with a remedy* rather than routed to
+6. the unsupported-format gate — an unrecognised ``.json``, a ``.jsonl``, a
+   ``.tar`` or a legacy ``.doc`` is refused *with a remedy* rather than routed to
    ``generic`` (#1526), and it sits here, above the write, so the refused
    bytes never reach the staging directory at all;
 7. **only then** :func:`_stage_upload` writes anything, and the ingest, the
@@ -106,6 +111,7 @@ from creek.ingest import (
 from creek.ingest.archive import (
     UNRECOGNISED_EXPORT_REASON,
     ArchiveRefusedError,
+    detect_document_export_type,
     detect_export_type,
     extract_archive,
     is_supported_archive,
@@ -115,6 +121,7 @@ from creek.ingest.journal_staging import (
     UPLOAD_LEDGER_SOURCE,
     UPLOAD_STAGING_RELDIR,
 )
+from creek.ingest.json_loose import is_loose_json, lay_out_loose_export
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import derive_source_key, run_ingest
 from creek.ingest.source_unit import split_source_unit
@@ -152,6 +159,10 @@ if TYPE_CHECKING:
     # The ingest runner seam — production is ``run_ingest``; tests inject a
     # stub to exercise the failure path.
     _Runner = Callable[..., IngestRunResult]
+
+    # Fills an export scratch directory from the upload's bytes and names the
+    # export: ``(source_type, ingest_root)``, or a content-free refusal reason.
+    _Unpacker = Callable[[bytes, Path], tuple[str, Path] | str]
 
 TOOL_NAME = "creek.upload"
 
@@ -872,6 +883,33 @@ def _unpacked_export(raw: bytes, root: Path) -> tuple[str, Path] | str:
     return detected
 
 
+def _loose_export_unpacker(source_type: str) -> _Unpacker:
+    """Return the "unpack" step for one loose export document (#2148).
+
+    The archive path's seam for a file that needs no extraction: the bytes are
+    written where *source_type*'s directory ingestor discovers them, under the
+    same per-``external_id`` scratch directory an archive unpacks into. That
+    directory being shared is what makes the two paths agree — a
+    ``conversations.json`` sent loose derives the fragment ids the same file
+    derives inside a ``.zip`` — and what gets the copy erased in
+    :func:`_archive_outcome`'s ``finally``.
+
+    Args:
+        source_type: The export family
+            :func:`creek.ingest.archive.detect_document_export_type` named.
+
+    Returns:
+        A callable with :func:`_unpacked_export`'s signature that cannot
+        refuse: detection has already succeeded.
+    """
+
+    def unpack(raw: bytes, root: Path) -> tuple[str, Path]:
+        """Lay *raw* out under *root* and name its export."""
+        return source_type, lay_out_loose_export(source_type, raw, root)
+
+    return unpack
+
+
 def _archive_run(
     *,
     vault_path: Path,
@@ -1019,6 +1057,7 @@ def _archive_outcome(
     consumer: str,
     timestamp: str | None,
     run: _Runner | None,
+    unpack: _Unpacker | None = None,
 ) -> dict[str, Any]:
     """Unpack an export archive, ingest it, and delete every extracted byte.
 
@@ -1049,6 +1088,10 @@ def _archive_outcome(
         consumer: Free-form consumer id for the audit log.
         timestamp: Echoed back unchanged.
         run: Ingest-runner seam.
+        unpack: What fills the extraction directory and names the export.
+            ``None`` selects :func:`_unpacked_export`, the ``.zip`` reader; a
+            loose export document (#2148) passes the layout its ingestor
+            expects instead, and shares everything else here.
 
     Returns:
         The success payload, or a structured four-key refusal.
@@ -1071,7 +1114,7 @@ def _archive_outcome(
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     try:
-        detected = _unpacked_export(raw, root)
+        detected = (unpack if unpack is not None else _unpacked_export)(raw, root)
         if isinstance(detected, str):
             return _refuse_with_audit(
                 vault_path=vault_path,
@@ -1232,6 +1275,27 @@ def _admitted_upload_outcome(
             consumer=consumer,
             timestamp=timestamp,
             run=run,
+        )
+
+    # The loose conversation export (#2148): a ``.json`` whose CONTENTS are a
+    # ChatGPT, Claude or Discord export takes the archive path with a
+    # one-file "unpack". Decided here, above the format gate, because that
+    # gate's only answer for a ``.json`` is the refusal; a ``.json`` that
+    # matches no export falls through to it and is refused exactly as before.
+    loose_export = detect_document_export_type(raw) if is_loose_json(filename) else None
+    if loose_export is not None:
+        return _archive_outcome(
+            vault_path=vault_path,
+            audit_args=audit_args,
+            external_id=external_id,
+            filename=filename,
+            raw=raw,
+            upload_tier=upload_tier,
+            ceiling=ceiling,
+            consumer=consumer,
+            timestamp=timestamp,
+            run=run,
+            unpack=_loose_export_unpacker(loose_export),
         )
 
     # The loose Substack export (#2123): a ``posts.csv`` manifest is kept as
@@ -1509,17 +1573,22 @@ def upload_tool(
     :func:`creek.ingest.archive.detect_export_type`, which is the same
     guarantee the missing override was protecting.
 
-    Two dispatch paths, then, chosen from the caller's filename alone:
+    Three dispatch paths, then:
 
     * a ``.zip`` goes to :func:`_archive_outcome` — unpacked containment-first
       and under entry/byte bounds, identified from its contents, ingested by
       the matching directory ingestor, and erased from the vault before the
       call returns;
+    * a ``.json`` whose contents are a ChatGPT, Claude or Discord export
+      (#2148) takes that same path with nothing to unpack — the export type
+      is again decided from the bytes, by
+      :func:`creek.ingest.archive.detect_document_export_type`, never from
+      the filename;
     * anything else keeps the single-document path: dispatch by extension
       through :func:`creek.ingest.route_to_ingestor`, and an extension that
-      function refuses (``.json``, ``.tar``, ``.doc``, …) refused here too,
-      with its guidance, rather than flattened into one ``generic``
-      fragment (#1526).
+      function refuses (any other ``.json``, ``.tar``, ``.doc``, …) refused
+      here too, with its guidance, rather than flattened into one
+      ``generic`` fragment (#1526).
 
     Args:
         vault_path: Vault root.
@@ -1552,8 +1621,9 @@ def upload_tool(
             :func:`creek.ingest.pipeline.run_ingest`.
 
     Returns:
-        For an archive, the same keys plus ``discovered`` / ``written`` /
-        ``failed_documents``, and a ``warnings`` list that names the shortfall
+        For an archive or a recognised loose export, the same keys plus
+        ``discovered`` / ``written`` / ``failed_documents``, and a
+        ``warnings`` list that names the shortfall
         in counts when only part of the export could be read.
 
         ``{status, tool, tier_ceiling, external_id, filename, timestamp,

@@ -78,7 +78,12 @@ from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
 from creek_mcp.tools.upload import MAX_UPLOAD_BYTES
 from tests.archive_export_support import (
     CHATGPT_KEPT_ANSWER,
+    CLAUDE_QUESTION,
+    DISCORD_MESSAGE,
     chatgpt_archive,
+    chatgpt_conversations,
+    claude_export,
+    discord_channel_messages,
     zip_slip_archive,
 )
 from tests.v1_api_support import (
@@ -107,6 +112,9 @@ _UNSUPPORTED_SOURCE_STATUS: Final[int] = ERROR_STATUS[ErrorCode.UNSUPPORTED_SOUR
 
 _OLD_MINOR: Final[str] = "0.2"
 """A minor this server still serves, and that predates ``upload``."""
+
+_UNRECOGNISED_JSON: Final[bytes] = b'{"name": "creek", "version": "1.0.0"}'
+"""A ``package.json``-shaped object: valid JSON that is nobody's export (#2148)."""
 
 _DOCUMENT_BODY: Final[bytes] = b"# Ridge notes\n\nThe fog lifted at seven.\n"
 """Synthetic markdown. Never a real journal entry; nothing here is a person."""
@@ -598,6 +606,11 @@ def test_every_refused_extension_lands_as_415_with_the_remedy(
     still pass a single-case test while turning the other two into server
     faults.
 
+    ``.json`` is in the sweep because it is refused **when unrecognised**
+    (#2148): the payload here is a JSON object that is nobody's export. A
+    ``.json`` whose contents are a ChatGPT, Claude or Discord export is
+    ingested instead, and has its own tests below.
+
     The body carries the published remedy — a refusal that does not say what to
     do instead is one the caller retries verbatim — and no fragment is written.
 
@@ -607,7 +620,7 @@ def test_every_refused_extension_lands_as_415_with_the_remedy(
     """
     response = _post(
         vault,
-        _body(filename=f"export{suffix}", content=b'{"conversations": []}'),
+        _body(filename=f"export{suffix}", content=_UNRECOGNISED_JSON),
     )
 
     assert response.status_code == _UNSUPPORTED_SOURCE_STATUS
@@ -615,6 +628,70 @@ def test_every_refused_extension_lands_as_415_with_the_remedy(
     assert body["code"] == ErrorCode.UNSUPPORTED_SOURCE.value
     assert body["message"] == ERROR_MESSAGES[ErrorCode.UNSUPPORTED_SOURCE]
     assert "creek ingest" in body["message"]
+    assert _fragments(vault) == []
+
+
+@pytest.mark.parametrize(
+    ("document", "source_type", "marker"),
+    [
+        (chatgpt_conversations(), "chatgpt", CHATGPT_KEPT_ANSWER),
+        (claude_export(), "claude", CLAUDE_QUESTION),
+        (discord_channel_messages(), "discord", DISCORD_MESSAGE),
+    ],
+    ids=["chatgpt", "claude", "discord"],
+)
+def test_a_loose_export_json_crosses_the_route_and_is_ingested(
+    vault: Path, document: object, source_type: str, marker: str
+) -> None:
+    """#2148 over HTTP: a recognised ``.json`` is a ``200``, not a ``415``.
+
+    All three are posted under one filename that names no platform, so the
+    ingestor each reaches was chosen from the bytes. The body is the published
+    ``UploadResponse`` an export ``.zip`` already returns — no new field, which
+    is why this needed no contract minor.
+
+    Args:
+        vault: A seeded vault.
+        document: One export family's document.
+        source_type: The ingestor it must reach.
+        marker: Text from the document that must land in a fragment.
+    """
+    response = _post(
+        vault,
+        _body(filename="data.json", content=json.dumps(document).encode()),
+    )
+
+    assert response.status_code == _OK_STATUS
+    parsed = UploadResponse.model_validate(envelope(response))
+    assert parsed.source_type == source_type
+    assert parsed.fragment_id == parsed.affected_fragment_ids[0]
+    assert len(_fragments(vault)) == len(parsed.affected_fragment_ids)
+    assert marker in "\n".join(
+        path.read_text(encoding="utf-8") for path in _fragments(vault)
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [_UNRECOGNISED_JSON, b'[{"sku": "a1"}]', b'{"conversations": ['],
+    ids=["package-json", "list-of-unrelated-dicts", "malformed"],
+)
+def test_an_unrecognised_json_is_still_415_and_writes_nothing(
+    vault: Path, content: bytes
+) -> None:
+    """The answer adepthood maps to "Skipped" is unchanged, byte for byte.
+
+    Args:
+        vault: A seeded vault.
+        content: A ``.json`` payload that matches no export.
+    """
+    response = _post(vault, _body(filename="conversations.json", content=content))
+
+    assert response.status_code == _UNSUPPORTED_SOURCE_STATUS
+    body = envelope(response)
+    assert set(body) == {"code", "message", "request_id"}
+    assert body["code"] == ErrorCode.UNSUPPORTED_SOURCE.value
+    assert body["message"] == ERROR_MESSAGES[ErrorCode.UNSUPPORTED_SOURCE]
     assert _fragments(vault) == []
 
 

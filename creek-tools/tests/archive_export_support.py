@@ -185,16 +185,13 @@ def chatgpt_archive(*, prefix: str = "") -> bytes:
     )
 
 
-def claude_archive(*, prefix: str = "") -> bytes:
-    """Return a ``.zip`` holding a Claude conversation export.
-
-    Args:
-        prefix: Optional directory the export is nested under.
+def claude_export() -> dict[str, Any]:
+    """Return a one-conversation Claude export as Python objects.
 
     Returns:
-        The archive's bytes.
+        The export's top-level ``{"conversations": [...]}`` dict.
     """
-    export = {
+    return {
         "conversations": [
             {
                 "uuid": "claude-conv-1",
@@ -225,7 +222,42 @@ def claude_archive(*, prefix: str = "") -> bytes:
             }
         ]
     }
-    return _zip({f"{prefix}conversations.json": json.dumps(export).encode()})
+
+
+def claude_archive(*, prefix: str = "") -> bytes:
+    """Return a ``.zip`` holding a Claude conversation export.
+
+    Args:
+        prefix: Optional directory the export is nested under.
+
+    Returns:
+        The archive's bytes.
+    """
+    return _zip({f"{prefix}conversations.json": json.dumps(claude_export()).encode()})
+
+
+def discord_channel_messages(channel_name: str = "riverbank") -> list[dict[str, Any]]:
+    """Return one Discord channel's ``messages.json`` as Python objects.
+
+    The lowercase schema older packages and DiscordChatExporter write: a JSON
+    list of message dicts, which is also the outermost shape of a ChatGPT
+    export. Telling the two apart is the point of the loose-file suite (#2148).
+
+    Args:
+        channel_name: Interpolated into each body so two channels differ.
+
+    Returns:
+        Three messages from one author, an hour apart.
+    """
+    return [
+        {
+            "id": f"m-{channel_name}-{step}",
+            "author": {"id": "user-geoff", "name": "geoff"},
+            "content": f"{DISCORD_MESSAGE} ({channel_name} {step})",
+            "timestamp": f"2024-11-10T1{step}:00:00Z",
+        }
+        for step in range(3)
+    ]
 
 
 def discord_archive(*, prefix: str = "") -> bytes:

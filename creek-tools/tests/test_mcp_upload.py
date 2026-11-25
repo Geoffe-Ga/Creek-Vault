@@ -1443,6 +1443,20 @@ def _chatgpt_export_bytes() -> bytes:
     ).encode("utf-8")
 
 
+def _unrecognised_json_bytes() -> bytes:
+    """Return structured JSON that is no conversation export, built at runtime.
+
+    Since #2148 a ``.json`` whose contents *are* a ChatGPT, Claude or Discord
+    export is ingested by that export's ingestor
+    (``tests/test_upload_json_loose.py``). The #1526 refusal is what remains
+    for every other ``.json``, so this case now sends one of those: records
+    with no ``mapping`` graph and no message signature.
+    """
+    return json.dumps(
+        [{"title": "A structured file that must not become one blob", "rows": [1, 2]}]
+    ).encode("utf-8")
+
+
 def _tar_archive_bytes() -> bytes:
     """Return a genuine TAR archive wrapping the export above, built in-process.
 
@@ -1470,14 +1484,14 @@ def _tar_archive_bytes() -> bytes:
     [
         pytest.param(
             "conversations.json",
-            _chatgpt_export_bytes(),
+            _unrecognised_json_bytes(),
             [
                 "'.json'",
                 "single undifferentiated blob",
                 "creek ingest --type",
                 ".zip",
             ],
-            id="chatgpt-conversations-json",
+            id="unrecognised-json",
         ),
         pytest.param(
             "chatgpt-export.tar",

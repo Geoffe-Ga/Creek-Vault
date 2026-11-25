@@ -148,6 +148,9 @@ _EXTENSION_ROUTES: dict[str, str | _Refuse] = {
     ".tiff": "image",
     ".webp": "image",
     # --- refused: structured formats `generic` would silently ruin -----
+    # ``.json`` stays refused HERE, as one document. ``creek.upload`` reads a
+    # ``.json``'s contents above this table and ingests a recognised
+    # conversation export (#2148); only the unrecognised ones reach this row.
     ".json": _Refuse(STRUCTURED_EXPORT_GUIDANCE),
     ".jsonl": _Refuse(STRUCTURED_EXPORT_GUIDANCE),
     ".ndjson": _Refuse(STRUCTURED_EXPORT_GUIDANCE),

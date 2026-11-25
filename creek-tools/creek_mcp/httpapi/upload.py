@@ -25,13 +25,17 @@ Since #1525 an export **archive** is uploadable through this same route with
 no new field: send the platform's ``.zip`` as ``content_base64``, and the tool
 decides the export type from the archive's contents. That is why the override
 is still absent — content-based detection is the guarantee the missing
-override was standing in for.
+override was standing in for. Since #2148 the same holds for a loose ``.json``
+the owner has already unpacked: one whose contents are a ChatGPT, Claude or
+Discord export is ingested and answers in the archive's shape, so this adapter
+gained no branch and the contract no field.
 
 **The unsupported-format refusal, and why it is translated rather than echoed.**
 Since #1526 :func:`creek.ingest.route_to_ingestor` raises
-:class:`~creek.ingest.UnsupportedSourceError` for a conversation export, an
-archive or a legacy binary Office document instead of flattening it into one
-``generic`` blob. ``upload_tool`` catches that above the staging write and
+:class:`~creek.ingest.UnsupportedSourceError` for a ``.json`` that is no
+recognised export, an archive or a legacy binary Office document instead of
+flattening it into one ``generic`` blob. ``upload_tool`` catches that above
+the staging write and
 returns its message as a refusal *reason*; :func:`upload_refusal_code` maps that
 reason to :attr:`~creek_mcp.api.models.ErrorCode.UNSUPPORTED_SOURCE`, whose
 ``415`` body carries the one published constant naming the remedy. The
