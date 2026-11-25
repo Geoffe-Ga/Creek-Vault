@@ -11,6 +11,11 @@ only validates the query, resolves the vault off the event loop and renders.
 recovered, no index is repaired. A poll every few seconds must not be a
 writer.
 
+**Totals are a 0.37 field (#2147).** ``totals`` is counted and sent only to a
+caller declaring :data:`~creek_mcp.api.models.PIPELINE_TOTALS_SINCE_MINOR` or
+later. An earlier minor vendored a closed schema without the key, so its body
+is the one its minor published, byte for byte.
+
 **An unavailable vault is said out loud.** No vault, an unreadable one, or a
 scaffolded folder that cannot be listed mid-read is ``503 unavailable`` —
 never a short ``200`` a dashboard would draw as "empty".
@@ -18,19 +23,21 @@ never a short ``200`` a dashboard would draw as "empty".
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
 from creek_mcp import pipeline_status
 from creek_mcp.api.models import (
     PIPELINE_STATUS_MAX_LIMIT,
+    PIPELINE_TOTALS_SINCE_MINOR,
     ErrorCode,
     PipelineStatusQuery,
 )
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
+from creek_mcp.httpapi.generation import declared_minor_at_least
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.tools.handshake import vault_available
 
@@ -70,6 +77,7 @@ def _read(
     context: RequestContext,
     limit: int,
     active_job_ids: frozenset[str],
+    with_totals: bool,
 ) -> PipelineStatusResponse | None:
     """Resolve the vault and build the body, off the event loop.
 
@@ -79,6 +87,7 @@ def _read(
         limit: The clamped document limit.
         active_job_ids: The job ids this process is executing, snapshotted on
             the event loop.
+        with_totals: Whether the caller's minor can describe ``totals``.
 
     Returns:
         The body, or ``None`` when there is no readable vault.
@@ -95,9 +104,31 @@ def _read(
             limit=limit,
             worker_id=runtime.worker_id,
             active_job_ids=active_job_ids,
+            with_totals=with_totals,
         )
     except OSError:
         return None
+
+
+def _dumped(body: PipelineStatusResponse) -> dict[str, Any]:
+    """Serialise the body, dropping ``totals`` when it was withheld.
+
+    ``totals`` is ``None`` exactly when the caller's minor predates it. That
+    caller's closed schema has no such key, so the key is removed rather than
+    sent ``null``. The other nullable fields (``last_written_at``, ``writer``)
+    are published as nullable and stay, which is why this is not
+    ``exclude_none``.
+
+    Args:
+        body: The built response.
+
+    Returns:
+        The JSON-ready mapping.
+    """
+    data = body.model_dump(mode="json")
+    if data["totals"] is None:
+        del data["totals"]
+    return data
 
 
 async def handle_pipeline_status(request: Request) -> Response:
@@ -107,8 +138,10 @@ async def handle_pipeline_status(request: Request) -> Response:
         request: The request in flight.
 
     Returns:
-        The published body; ``invalid_request`` for a query the schema does
-        not admit; ``unavailable`` when the vault cannot be read.
+        The published body, with ``totals`` only for a caller declaring
+        :data:`~creek_mcp.api.models.PIPELINE_TOTALS_SINCE_MINOR` or later;
+        ``invalid_request`` for a query the schema does not admit;
+        ``unavailable`` when the vault cannot be read.
     """
     context = context_of(request.scope)
     query = _parsed_query(request)
@@ -117,7 +150,10 @@ async def handle_pipeline_status(request: Request) -> Response:
     runtime: JobRuntime = request.app.state.pipeline_jobs
     active_job_ids = frozenset(runtime.active_job_ids)
     limit = min(query.limit, PIPELINE_STATUS_MAX_LIMIT)
-    body = await read_off_loop(_read, request, context, limit, active_job_ids)
+    with_totals = declared_minor_at_least(request, PIPELINE_TOTALS_SINCE_MINOR)
+    body = await read_off_loop(
+        _read, request, context, limit, active_job_ids, with_totals
+    )
     if body is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    return json_response(body.model_dump(mode="json"), HTTP_OK)
+    return json_response(_dumped(body), HTTP_OK)

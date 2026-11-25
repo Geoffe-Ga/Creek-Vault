@@ -1,0 +1,52 @@
+{
+  "$defs": {
+    "PipelineStage": {
+      "description": "A stage a document can have been through, in pipeline order.\n\nAttributes:\n    INGESTED: The upload landed as one or more fragments.\n    CLASSIFIED: A classify pass ran over the vault after it landed.\n    PRAXIS_SCANNED: The praxis passes ran (inside classify): the keyword\n        verdict, then the ``04-Praxis`` page post-pass.\n    LINKED_EMBEDDINGS: The ``embeddings`` linker stage ran after it landed.\n    LINKED_TEMPORAL: The ``temporal`` linker stage ran after it landed.\n    LINKED_EDDIES: The ``eddies`` linker stage ran after it landed.\n    LINKED_THREADS: The ``threads`` linker stage ran after it landed.",
+      "enum": [
+        "ingested",
+        "classified",
+        "praxis_scanned",
+        "linked:embeddings",
+        "linked:temporal",
+        "linked:eddies",
+        "linked:threads"
+      ],
+      "title": "PipelineStage",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "How many of the caller's documents one stage has reached (#2147).\n\nThe three counts are disjoint: each document is counted at most once per\nstage, under the outcome its own ``stages`` row would carry. What is left\nof :attr:`PipelineTotals.documents` after all three is the number the\nstage has not run over yet.\n\nAttributes:\n    stage: Which stage.\n    covered: Documents a pass of this stage ran over and finished ``ok``.\n        For ``ingested`` this is every document.\n    partial: Documents whose covering pass finished ``partial``.\n    failed: Documents whose only covering passes ``failed``.",
+  "properties": {
+    "covered": {
+      "description": "Documents the stage covered with outcome ok.",
+      "minimum": 0,
+      "title": "Covered",
+      "type": "integer"
+    },
+    "failed": {
+      "description": "Documents whose covering passes all failed.",
+      "minimum": 0,
+      "title": "Failed",
+      "type": "integer"
+    },
+    "partial": {
+      "description": "Documents whose covering pass ended partial.",
+      "minimum": 0,
+      "title": "Partial",
+      "type": "integer"
+    },
+    "stage": {
+      "$ref": "#/$defs/PipelineStage",
+      "description": "Which stage."
+    }
+  },
+  "required": [
+    "stage",
+    "covered",
+    "partial",
+    "failed"
+  ],
+  "title": "PipelineStageTotal",
+  "type": "object"
+}

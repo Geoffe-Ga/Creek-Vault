@@ -85,6 +85,7 @@ from creek_mcp.api.models import (
     JournalAction,
     LinkMethod,
     NoteKind,
+    PipelineStage,
     PraxisKind,
     PraxisLifecycle,
     ReflectionStatus,
@@ -845,6 +846,54 @@ def _pipeline_folders(filled: dict[str, int]) -> list[dict[str, Any]]:
     ]
 
 
+_PIPELINE_STATUS_CORPUS: Final[int] = 1240
+"""Example corpus size: more documents than one status page can list."""
+
+_PIPELINE_STATUS_EMBEDDED: Final[int] = 900
+"""Example count of older uploads an earlier ``linked:embeddings`` pass reached."""
+
+_PIPELINE_STATUS_STAGE_TOTALS: Final[dict[PipelineStage, tuple[int, int, int]]] = {
+    PipelineStage.INGESTED: (_PIPELINE_STATUS_CORPUS, 0, 0),
+    PipelineStage.CLASSIFIED: (_PIPELINE_STATUS_CORPUS, 0, 0),
+    PipelineStage.PRAXIS_SCANNED: (_PIPELINE_STATUS_CORPUS, 0, 0),
+    PipelineStage.LINKED_EMBEDDINGS: (_PIPELINE_STATUS_EMBEDDED, 0, 0),
+    PipelineStage.LINKED_EDDIES: (0, _PIPELINE_STATUS_CORPUS, 0),
+}
+"""Example ``(covered, partial, failed)`` counts for the stages that have run.
+
+Consistent with the one listed document, which is the newest: every stage in
+its trail has reached the whole corpus under the same outcome, and
+``linked:embeddings``, absent from its trail, has reached only older uploads.
+"""
+
+
+def _pipeline_totals(
+    documents: int, reached: dict[PipelineStage, tuple[int, int, int]]
+) -> dict[str, Any]:
+    """Return a ``totals`` block listing every stage, zero rows included.
+
+    Args:
+        documents: The example corpus size.
+        reached: Stage to ``(covered, partial, failed)``; every other stage
+            is listed at zero.
+
+    Returns:
+        The block, its rows in pipeline order (contract 0.37, #2147).
+    """
+    rows = []
+    for stage in PipelineStage:
+        covered, partial, failed = reached.get(stage, (0, 0, 0))
+        rows.append(
+            {
+                "stage": stage.value,
+                "covered": covered,
+                "partial": partial,
+                "failed": failed,
+            }
+        )
+    return {"documents": documents, "stages": rows}
+
+
 _PIPELINE_STATUS_SUCCESS: Final[dict[str, Any]] = {
     "status": OK_STATUS,
     "tier_ceiling": WireTierCeiling.PERSONAL.value,
@@ -886,8 +935,12 @@ _PIPELINE_STATUS_SUCCESS: Final[dict[str, Any]] = {
             "updated_at": "2026-11-20T17:05:30Z",
         }
     ],
+    "totals": _pipeline_totals(_PIPELINE_STATUS_CORPUS, _PIPELINE_STATUS_STAGE_TOTALS),
 }
-"""A landed upload part-way through linking, one withheld, one job running."""
+"""A landed upload part-way through linking, one withheld, one job running.
+
+``totals`` counts the whole corpus behind the one listed row.
+"""
 
 _PIPELINE_STATUS_EMPTY: Final[dict[str, Any]] = {
     "status": OK_STATUS,
@@ -896,8 +949,12 @@ _PIPELINE_STATUS_EMPTY: Final[dict[str, Any]] = {
     "documents": [],
     "documents_withheld": 0,
     "jobs": [],
+    "totals": _pipeline_totals(0, {}),
 }
-"""A freshly scaffolded vault: every folder listed, each empty, none an error."""
+"""A freshly scaffolded vault: every folder listed, each empty, none an error.
+
+Its ``totals`` still list every stage, each at zero.
+"""
 
 
 # --------------------------------------------------------------------------

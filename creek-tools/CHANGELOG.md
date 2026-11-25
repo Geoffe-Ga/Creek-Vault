@@ -9,6 +9,23 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`GET /v1/pipeline/status` counts the whole corpus per stage (#2147,
+  contract 0.37).** The `documents` list is clamped to the newest 200
+  uploads, so a consumer could not say "x of y files" for a larger corpus.
+  - `PipelineStatusResponse` gains `totals`: `documents` (every upload
+    document of the caller, one per `external_id`, every tier) and `stages`,
+    one `{stage, covered, partial, failed}` row per stage in pipeline order,
+    listed even at zero. The counts are disjoint; `covered` is outcome `ok`.
+  - Each document is counted through `_stages`, the function that builds its
+    own trail, so totals and rows cannot disagree. Documents that landed
+    between the same two passes share one computed trail.
+  - Totals ignore `limit` and the tier ceiling (a count names nothing) and
+    read only the upload receipts and the stage log: no fragment is resolved
+    or opened for a document that is only counted.
+  - Sent to callers declaring `0.37`; `0.34`–`0.36` get their published body
+    byte for byte and the totals are not computed. New wire models
+    `PipelineTotals` and `PipelineStageTotal`; the `adepthood-v1` bundle and
+    the OpenAPI golden (`openapi-0.37.0.json`) are regenerated.
 - **Reflections and letters name the threads, eddies and praxis the entry
   touches (#2127, contract 0.36).**
   - `creek_mcp/compiled_pages.py` selects `02-Threads/{Active,Dormant,Resolved}/`

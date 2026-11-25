@@ -110,6 +110,10 @@ from creek_mcp.api.models import (
     LinkResponse,
     NotApplicableExample,
     NoteKind,
+    PipelineStage,
+    PipelineStageTotal,
+    PipelineStatusResponse,
+    PipelineTotals,
     PraxisKind,
     PraxisLifecycle,
     ReflectionNote,
@@ -605,6 +609,22 @@ _PIPELINE_JOB_PAYLOAD: dict[str, Any] = {
     "updated_at": "2026-11-20T17:05:30Z",
 }
 
+_PIPELINE_STAGE_TOTAL_PAYLOAD: dict[str, Any] = {
+    "stage": "classified",
+    "covered": 1180,
+    "partial": 60,
+    "failed": 0,
+}
+
+_PIPELINE_TOTALS_PAYLOAD: dict[str, Any] = {
+    "documents": 1240,
+    "stages": [
+        {"stage": stage.value, "covered": 0, "partial": 0, "failed": 0}
+        | ({"covered": 1240} if stage is PipelineStage.INGESTED else {})
+        for stage in PipelineStage
+    ],
+}
+
 HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     "ReadingCandidate": _READING,
     "ReadingSource": _READING_SOURCE,
@@ -648,6 +668,7 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     "PipelineFolderStatus": _PIPELINE_FOLDER_PAYLOAD,
     "PipelineJobSummary": _PIPELINE_JOB_PAYLOAD,
     "PipelineStageRecord": _PIPELINE_STAGE_PAYLOAD,
+    "PipelineStageTotal": _PIPELINE_STAGE_TOTAL_PAYLOAD,
     "PipelineStatusQuery": {"limit": 50},
     "PipelineStatusResponse": {
         "status": "ok",
@@ -665,7 +686,9 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
         "documents": [_PIPELINE_DOCUMENT_PAYLOAD],
         "documents_withheld": 0,
         "jobs": [_PIPELINE_JOB_PAYLOAD],
+        "totals": _PIPELINE_TOTALS_PAYLOAD,
     },
+    "PipelineTotals": _PIPELINE_TOTALS_PAYLOAD,
     JournalUpsertRequest.__name__: JOURNAL_UPSERT_REQUEST_PAYLOAD,
     JournalUpsertResponse.__name__: JOURNAL_UPSERT_RESPONSE_PAYLOAD,
     JournalWithdrawResponse.__name__: JOURNAL_WITHDRAW_RESPONSE_PAYLOAD,
@@ -2213,6 +2236,52 @@ def test_every_minor_below_the_current_one_is_still_served() -> None:
     )
 
 
+def test_pipeline_totals_list_every_stage_and_nothing_else() -> None:
+    """``totals`` is counts and the closed stage vocabulary: no name can ride it.
+
+    Every stage must have a row (so a consumer never infers one from absence),
+    a count cannot be negative, and neither model accepts a key that could
+    carry a filename, id or path (#2147).
+    """
+    totals = PipelineTotals.model_validate(_PIPELINE_TOTALS_PAYLOAD)
+
+    assert [row.stage for row in totals.stages] == list(PipelineStage)
+    assert totals.stages[0].covered == totals.documents
+    with pytest.raises(ValidationError):
+        PipelineTotals.model_validate(
+            {
+                **_PIPELINE_TOTALS_PAYLOAD,
+                "stages": _PIPELINE_TOTALS_PAYLOAD["stages"][1:],
+            }
+        )
+    with pytest.raises(ValidationError):
+        PipelineTotals.model_validate({**_PIPELINE_TOTALS_PAYLOAD, "documents": -1})
+    with pytest.raises(ValidationError):
+        PipelineTotals.model_validate({**_PIPELINE_TOTALS_PAYLOAD, "filename": "x.md"})
+    for key in ("covered", "partial", "failed"):
+        with pytest.raises(ValidationError):
+            PipelineStageTotal.model_validate(
+                {**_PIPELINE_STAGE_TOTAL_PAYLOAD, key: -1}
+            )
+    with pytest.raises(ValidationError):
+        PipelineStageTotal.model_validate(
+            {**_PIPELINE_STAGE_TOTAL_PAYLOAD, "external_id": "up-1"}
+        )
+
+
+def test_pipeline_totals_are_optional_so_an_earlier_body_still_validates() -> None:
+    """A 0.34 body has no ``totals``; the model reads that as withheld."""
+    payload = {
+        key: value
+        for key, value in HAPPY_PAYLOADS["PipelineStatusResponse"].items()
+        if key != "totals"
+    }
+
+    assert PipelineStatusResponse.model_validate(payload).totals is None
+    schema = PipelineStatusResponse.model_json_schema()
+    assert "totals" not in schema["required"]
+
+
 def test_every_pipeline_status_example_validates_against_its_model() -> None:
     """The two ``pipeline-status/`` examples sit outside the matrix yet still
     validate against ``PipelineStatusResponse`` and list every folder (#2124)."""
@@ -2229,4 +2298,7 @@ def test_every_pipeline_status_example_validates_against_its_model() -> None:
     for entry in entries:
         assert entry["model"] == "PipelineStatusResponse"
         text = (BUNDLE_ROOT / entry["path"]).read_text(encoding="utf-8")
-        assert isinstance(model.model_validate(json.loads(text)), model)
+        parsed = model.model_validate(json.loads(text))
+        assert isinstance(parsed, PipelineStatusResponse)
+        assert parsed.totals is not None
+        assert parsed.totals.stages[0].covered == parsed.totals.documents

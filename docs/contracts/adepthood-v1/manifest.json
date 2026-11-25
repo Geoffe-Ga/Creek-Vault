@@ -1,19 +1,19 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.36.0",
+  "contract_version": "0.37.0",
   "files": [
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-ready.json",
-      "sha256": "50e45085fc1a54ea791f540e407aa8d303e9fb5aa04b6554170a8f878fef5a37",
+      "sha256": "659cb8e2accaa08882b444ddc408f0098d1bc52ac05b6f02f3502508cda91bce",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "discovery/agent-mcp-unavailable.json",
-      "sha256": "ca379b80cb4dfd3781e20db1d10e4884f6d11308616cdda2b6d7028d7d87a4ed",
+      "sha256": "2e25c40bef4f8307c74e0c25b95bdca336bd1b879c1b11b6ee7e33a65ab8be15",
       "state": null
     },
     {
@@ -76,7 +76,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "e55310cbde4ff61cca3637d4ca4e4c6160242a85433b98b745fa42ff6b367111",
+      "sha256": "895568f60785c12cdee8ae622b9529c7f4db71c2681b4a9efff61a10c83e47b0",
       "state": "empty"
     },
     {
@@ -104,7 +104,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "50e45085fc1a54ea791f540e407aa8d303e9fb5aa04b6554170a8f878fef5a37",
+      "sha256": "659cb8e2accaa08882b444ddc408f0098d1bc52ac05b6f02f3502508cda91bce",
       "state": "success"
     },
     {
@@ -657,14 +657,14 @@
       "capability": null,
       "model": "PipelineStatusResponse",
       "path": "pipeline-status/empty.json",
-      "sha256": "26f3ca8975ad9fc89bb2a6193967d345d9dbf5fe6bb2ec879565ab4383f53d31",
+      "sha256": "75fc5a00054cd4ddb9e621e9acaedb79c2e9c3c18d8780fa2b3674e683ae0721",
       "state": null
     },
     {
       "capability": null,
       "model": "PipelineStatusResponse",
       "path": "pipeline-status/success.json",
-      "sha256": "ea5c9531556d72799e896e0e2f019dd7d64ebbb533d396f5895f8f9b894d9db4",
+      "sha256": "acfd2928d414c595b5508b9e9aedb903dabc0642d79ffe0a3958119e8cbf980f",
       "state": null
     },
     {
@@ -928,6 +928,13 @@
     },
     {
       "capability": null,
+      "model": "PipelineStageTotal",
+      "path": "schemas/PipelineStageTotal.schema.json",
+      "sha256": "05aff399b483db59d297924f16a3d29cfe859bd631f5ac9ddf6790be6dbc877c",
+      "state": null
+    },
+    {
+      "capability": null,
       "model": "PipelineStatusQuery",
       "path": "schemas/PipelineStatusQuery.schema.json",
       "sha256": "698a397f245f0a4f3a49382ff9a0e513f34991174d250f97ca1ce322516d1992",
@@ -937,7 +944,14 @@
       "capability": null,
       "model": "PipelineStatusResponse",
       "path": "schemas/PipelineStatusResponse.schema.json",
-      "sha256": "6e52bf6aa0ff13139d5c9099bbcb3f91b8801320d62d04e769a194d9d285826e",
+      "sha256": "24cea88eccb8bf5baef14fa7d61a3c6b0340ec5817c905af072050199851b776",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "PipelineTotals",
+      "path": "schemas/PipelineTotals.schema.json",
+      "sha256": "bc21b936b070326f53e20143e6582ed10d2b085ea26cac91d133917b284aa07b",
       "state": null
     },
     {

@@ -12,6 +12,10 @@ promises:
 * **Ceiling and identity**: above-ceiling documents are counted, never named;
   another caller's uploads and jobs are invisible; no body or title crosses.
 * **Read-only and bounded**: nothing is written; ``limit`` clamps.
+* **Whole-corpus totals** (#2147, contract 0.37): every document of the caller
+  is counted per stage by the per-document rule, whatever ``limit`` and the
+  ceiling say, without opening a fragment for it; an earlier minor's body is
+  unchanged.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
 import pytest
+from starlette.responses import JSONResponse
 
 from creek.audit.stage_log import PassStage, StageOutcome, record_stage_run
 from creek.vault.folder_writers import ONTOLOGY_FOLDERS
@@ -32,6 +37,7 @@ from creek_mcp import pipeline_status
 from creek_mcp.api.models import (
     PIPELINE_STATUS_MAX_LIMIT,
     PIPELINE_STATUS_SINCE_MINOR,
+    PIPELINE_TOTALS_SINCE_MINOR,
     Capability,
     FolderWriterlessReason,
     JobState,
@@ -68,6 +74,17 @@ _UNAVAILABLE: Final[int] = 503
 _CANARY: Final[str] = "synthetic-canary-2124: a sentence only the vault holds"
 _TITLE: Final[str] = "Synthetic Title Canary 2124"
 _PREVIOUS_MINOR: Final[str] = "0.32"
+_PRE_TOTALS_MINORS: Final[tuple[str, ...]] = ("0.34", "0.35", "0.36")
+"""Every minor that serves the route but predates ``totals`` (#2147)."""
+_PRE_TOTALS_KEYS: Final[list[str]] = [
+    "status",
+    "tier_ceiling",
+    "folders",
+    "documents",
+    "documents_withheld",
+    "jobs",
+]
+"""The 0.34 body's keys, in the order it has always sent them."""
 
 
 @pytest.fixture
@@ -538,6 +555,234 @@ def test_a_corrupted_index_filename_is_skipped_and_fails_closed(
 
     assert body["documents"] == []
     assert body["documents_withheld"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Whole-corpus totals (#2147, contract 0.37)
+# --------------------------------------------------------------------------- #
+
+
+def _totals(body: dict[str, Any]) -> dict[str, tuple[int, int, int]]:
+    """Return ``stage -> (covered, partial, failed)`` from a body's totals."""
+    return {
+        row["stage"]: (row["covered"], row["partial"], row["failed"])
+        for row in body["totals"]["stages"]
+    }
+
+
+def _counted_from_rows(body: dict[str, Any]) -> dict[str, tuple[int, int, int]]:
+    """Count the ``documents`` rows the way ``totals`` claims to."""
+    column = {"ok": 0, "partial": 1, "failed": 2}
+    counts = {stage.value: [0, 0, 0] for stage in PipelineStage}
+    for document in body["documents"]:
+        for stage, outcome in _stages(document):
+            counts[stage][column[outcome]] += 1
+    return {stage: (c[0], c[1], c[2]) for stage, c in counts.items()}
+
+
+def _record(vault: Path, stage: PassStage, outcome: StageOutcome) -> None:
+    """Record a pass that starts now, covering everything landed so far."""
+    now = datetime.now(UTC)
+    record_stage_run(
+        vault, stage=stage, outcome=outcome, started_at=now, finished_at=now
+    )
+
+
+def test_the_totals_minor_is_pinned() -> None:
+    """``totals`` arrives at 0.37; the route itself stays a 0.34 route."""
+    assert PIPELINE_TOTALS_SINCE_MINOR == "0.37"
+    assert PIPELINE_STATUS_SINCE_MINOR == "0.34"
+
+
+def test_an_empty_corpus_lists_every_stage_at_zero(vault: Path) -> None:
+    """Every stage has a row, in pipeline order, so none is read from absence."""
+    with client(vault_path=vault) as test_client:
+        body = _status(test_client)
+
+    assert body["totals"]["documents"] == 0
+    assert [row["stage"] for row in body["totals"]["stages"]] == [
+        stage.value for stage in PipelineStage
+    ]
+    assert set(_totals(body).values()) == {(0, 0, 0)}
+
+
+def test_totals_count_every_document_whatever_the_limit(vault: Path) -> None:
+    """A one-row page still reports the whole corpus, stage by stage."""
+    with client(vault_path=vault) as test_client:
+        _upload(test_client, "up-1")
+        _upload(test_client, "up-2")
+        _record(vault, PassStage.CLASSIFIED, StageOutcome.PARTIAL)
+        _record(vault, PassStage.LINKED_TEMPORAL, StageOutcome.OK)
+        _upload(test_client, "up-3")
+        _record(vault, PassStage.LINKED_EDDIES, StageOutcome.FAILED)
+        page = _status(test_client, limit=1)
+        whole = _status(test_client, limit=3)
+
+    assert [d["external_id"] for d in page["documents"]] == ["up-3"]
+    assert page["totals"] == whole["totals"]
+    assert page["totals"]["documents"] == 3
+    assert _totals(page) == {
+        "ingested": (3, 0, 0),
+        "classified": (0, 2, 0),
+        "praxis_scanned": (0, 0, 0),
+        "linked:embeddings": (0, 0, 0),
+        "linked:temporal": (2, 0, 0),
+        "linked:eddies": (0, 0, 3),
+        "linked:threads": (0, 0, 0),
+    }
+
+
+def test_totals_agree_with_the_document_rows(vault: Path) -> None:
+    """One rule serves both, so a full page recounts to exactly the totals."""
+    with client(vault_path=vault) as test_client:
+        _upload(test_client, "up-1")
+        _record(vault, PassStage.LINKED_THREADS, StageOutcome.FAILED)
+        _upload(test_client, "up-2")
+        _record(vault, PassStage.LINKED_THREADS, StageOutcome.OK)
+        _record(vault, PassStage.PRAXIS_SCANNED, StageOutcome.PARTIAL)
+        _upload(test_client, "up-3")
+        body = _status(test_client)
+
+    assert len(body["documents"]) == body["totals"]["documents"] == 3
+    assert _totals(body) == _counted_from_rows(body)
+    assert _totals(body)["linked:threads"] == (2, 0, 0)
+    assert _totals(body)["ingested"] == (3, 0, 0)
+
+
+def test_totals_count_above_ceiling_documents_and_name_none(vault: Path) -> None:
+    """A count names nothing: withheld documents are counted, never identified."""
+    with client(vault_path=vault) as test_client:
+        _upload(test_client, "up-secret", tier="personal")
+        _upload(test_client, "up-open")
+        _record(vault, PassStage.CLASSIFIED, StageOutcome.OK)
+        response = test_client.get(PIPELINE_STATUS_PATH, headers=headers())
+        body = envelope(response)
+
+    assert [d["external_id"] for d in body["documents"]] == ["up-open"]
+    assert body["documents_withheld"] == 1
+    assert body["totals"]["documents"] == 2
+    assert _totals(body)["ingested"] == (2, 0, 0)
+    assert _totals(body)["classified"] == (2, 0, 0)
+    assert "up-secret" not in response.text
+    assert set(body["totals"]) == {"documents", "stages"}
+    assert all(
+        set(row) == {"stage", "covered", "partial", "failed"}
+        for row in body["totals"]["stages"]
+    )
+
+
+def test_totals_leave_out_another_callers_uploads(vault: Path) -> None:
+    """The totals are this caller's corpus, as the rows are."""
+    with client(vault_path=vault) as test_client:
+        _upload(
+            test_client,
+            "up-theirs",
+            token_headers=headers(token=OTHER_TOKEN, ceiling="personal"),
+        )
+        _upload(test_client, "up-mine")
+        body = _status(test_client)
+
+    assert body["totals"]["documents"] == 1
+    assert _totals(body)["ingested"] == (1, 0, 0)
+
+
+def test_a_re_landed_document_counts_once(vault: Path) -> None:
+    """A document is one ``external_id``, however many times it landed."""
+    with client(vault_path=vault) as test_client:
+        _upload(test_client, "up-1")
+        response = test_client.post(
+            UPLOAD_PATH,
+            headers=headers(ceiling="personal"),
+            json={
+                "filename": "up-1.md",
+                "content_base64": base64.b64encode(b"# Rewritten\n\nNew.\n").decode(),
+                "external_id": "up-1",
+                "tier": "open",
+            },
+        )
+        assert response.status_code == _OK, response.text
+        body = _status(test_client)
+
+    assert body["totals"]["documents"] == 1
+
+
+def test_totals_open_no_fragment_beyond_the_page(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Totals come from receipts and the stage log: no fragment is read for them.
+
+    With three documents and ``limit=1`` only the page's own fragment is
+    resolved and opened; the two beyond it are counted without being looked
+    up, so the cost of a poll does not grow with what it merely counts.
+    """
+    resolved: list[set[str]] = []
+    opened: list[Path] = []
+    real_paths = pipeline_status._fragment_paths
+    real_header = pipeline_status.read_header_meta
+
+    def _paths(root: Path, wanted: set[str]) -> dict[str, Path]:
+        resolved.append(set(wanted))
+        return real_paths(root, wanted)
+
+    def _header(path: Path) -> Any:
+        opened.append(path)
+        return real_header(path)
+
+    with client(vault_path=vault) as test_client:
+        for external_id in ("up-1", "up-2", "up-3"):
+            _upload(test_client, external_id)
+        monkeypatch.setattr(pipeline_status, "_fragment_paths", _paths)
+        monkeypatch.setattr(pipeline_status, "read_header_meta", _header)
+        body = _status(test_client, limit=1)
+
+    [document] = body["documents"]
+    assert body["totals"]["documents"] == 3
+    assert [len(wanted) for wanted in resolved] == [1]
+    assert opened == [vault / document["fragment_path"]]
+
+
+@pytest.mark.parametrize("minor", _PRE_TOTALS_MINORS)
+def test_an_earlier_minor_gets_the_body_it_always_got(vault: Path, minor: str) -> None:
+    """0.34 to 0.36 vendored a closed schema without ``totals``: it is not sent."""
+    with client(vault_path=vault) as test_client:
+        _upload(test_client, "up-1")
+        _record(vault, PassStage.CLASSIFIED, StageOutcome.OK)
+        earlier = test_client.get(
+            PIPELINE_STATUS_PATH, headers=headers(minor=minor, ceiling="personal")
+        )
+        current = test_client.get(
+            PIPELINE_STATUS_PATH, headers=headers(ceiling="personal")
+        )
+
+    assert earlier.status_code == _OK, earlier.text
+    body = envelope(earlier)
+    assert list(body) == _PRE_TOTALS_KEYS
+    without = {k: v for k, v in envelope(current).items() if k != "totals"}
+    assert earlier.content == JSONResponse(without).body
+    assert list(envelope(current)) == [*_PRE_TOTALS_KEYS, "totals"]
+
+
+def test_totals_are_not_computed_when_not_asked_for(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that cannot read ``totals`` does not pay for them."""
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError
+
+    monkeypatch.setattr(pipeline_status, "_totals", _boom)
+
+    status = pipeline_status.build_status(
+        vault,
+        consumer="adepthood",
+        ceiling=TierCeiling.PERSONAL,
+        limit=1,
+        worker_id="worker",
+        active_job_ids=frozenset(),
+        with_totals=False,
+    )
+
+    assert status.totals is None
 
 
 # --------------------------------------------------------------------------- #

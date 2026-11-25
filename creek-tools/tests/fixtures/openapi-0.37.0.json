@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.36.0",
+    "version": "0.37.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -4263,6 +4263,70 @@
         "title": "PipelineJobSummary",
         "type": "object"
       },
+      "PipelineStageTotal": {
+        "additionalProperties": false,
+        "description": "How many of the caller's documents one stage has reached (#2147).\n\nThe three counts are disjoint: each document is counted at most once per\nstage, under the outcome its own ``stages`` row would carry. What is left\nof :attr:`PipelineTotals.documents` after all three is the number the\nstage has not run over yet.\n\nAttributes:\n    stage: Which stage.\n    covered: Documents a pass of this stage ran over and finished ``ok``.\n        For ``ingested`` this is every document.\n    partial: Documents whose covering pass finished ``partial``.\n    failed: Documents whose only covering passes ``failed``.",
+        "properties": {
+          "stage": {
+            "$ref": "#/components/schemas/PipelineStage",
+            "description": "Which stage."
+          },
+          "covered": {
+            "description": "Documents the stage covered with outcome ok.",
+            "minimum": 0,
+            "title": "Covered",
+            "type": "integer"
+          },
+          "partial": {
+            "description": "Documents whose covering pass ended partial.",
+            "minimum": 0,
+            "title": "Partial",
+            "type": "integer"
+          },
+          "failed": {
+            "description": "Documents whose covering passes all failed.",
+            "minimum": 0,
+            "title": "Failed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "stage",
+          "covered",
+          "partial",
+          "failed"
+        ],
+        "title": "PipelineStageTotal",
+        "type": "object"
+      },
+      "PipelineTotals": {
+        "additionalProperties": false,
+        "description": "Stage counts over every document this caller uploaded (#2147).\n\nCounted over the whole corpus, whatever ``limit`` asked for and whatever\nthe ceiling admits: a count names nothing. It carries no filename, id or\npath.\n\nAttributes:\n    documents: Every upload document of this caller, every tier counted.\n        One document per ``external_id``, however many fragments it made.\n    stages: One row per :class:`PipelineStage`, in pipeline order, listed\n        even at zero so a stage is never inferred from its absence.",
+        "properties": {
+          "documents": {
+            "description": "Every document this caller uploaded, every tier counted.",
+            "minimum": 0,
+            "title": "Documents",
+            "type": "integer"
+          },
+          "stages": {
+            "description": "One row per stage, in pipeline order, zero rows included.",
+            "items": {
+              "$ref": "#/components/schemas/PipelineStageTotal"
+            },
+            "maxItems": 7,
+            "minItems": 7,
+            "title": "Stages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "documents",
+          "stages"
+        ],
+        "title": "PipelineTotals",
+        "type": "object"
+      },
       "NoteKind": {
         "description": "The seven margin-note kinds, mirroring the reflect tool's vocabulary.\n\nKept in lock-step with :data:`creek_mcp.tools.reflect._ALLOWED_KINDS`,\nwhich is what the produced notes are actually constrained to; a wire enum\nthat drifted from it would let a legitimate note fail validation on the way\nout.\n\nAttributes:\n    FEAR: A named fear surfacing in the entry.\n    GIFT: Something the writer is giving or has been given.\n    LONGING: An unmet want the writing circles.\n    PATTERN: A recurrence the writer has not named yet.\n    REFRAME: The same material seen from another angle.\n    TENSION: Two things the entry holds at once.\n    VALUE: A commitment the entry reveals.",
         "enum": [
@@ -5486,7 +5550,7 @@
       },
       "PipelineStatusResponse": {
         "additionalProperties": false,
-        "description": "What the pipeline has done: per folder, per document, per job.\n\nRead-only: computing it triggers no stage and writes nothing.\n\nAttributes:\n    status: Always ``\"ok\"``.\n    tier_ceiling: The caller's declared ceiling.\n    folders: Every scaffolded ontology folder, in path order, including\n        empty and writerless ones.\n    documents: This caller's most recently landed uploads, newest first,\n        at most the requested ``limit``. A document with any fragment above\n        the ceiling is withheld, never named.\n    documents_withheld: How many of the requested documents were withheld\n        for the ceiling. Counted so a short page is not read as complete.\n    jobs: This caller's most recent durable pipeline jobs, newest first.",
+        "description": "What the pipeline has done: per folder, per document, per job.\n\nRead-only: computing it triggers no stage and writes nothing.\n\nAttributes:\n    status: Always ``\"ok\"``.\n    tier_ceiling: The caller's declared ceiling.\n    folders: Every scaffolded ontology folder, in path order, including\n        empty and writerless ones.\n    documents: This caller's most recently landed uploads, newest first,\n        at most the requested ``limit``. A document with any fragment above\n        the ceiling is withheld, never named.\n    documents_withheld: How many of the requested documents were withheld\n        for the ceiling. Counted so a short page is not read as complete.\n    jobs: This caller's most recent durable pipeline jobs, newest first.\n    totals: Stage counts over every document of this caller, not only the\n        listed page. Always present for a caller declaring\n        :data:`PIPELINE_TOTALS_SINCE_MINOR` or later; omitted, never sent\n        ``null``, for an earlier one.",
         "properties": {
           "status": {
             "const": "ok",
@@ -5530,6 +5594,18 @@
             "maxItems": 10,
             "title": "Jobs",
             "type": "array"
+          },
+          "totals": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PipelineTotals"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Stage counts over every document of this caller, whatever the limit; absent below contract 0.37."
           }
         },
         "required": [

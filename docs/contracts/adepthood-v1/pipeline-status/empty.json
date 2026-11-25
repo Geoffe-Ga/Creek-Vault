@@ -446,5 +446,52 @@
   ],
   "jobs": [],
   "status": "ok",
-  "tier_ceiling": "personal"
+  "tier_ceiling": "personal",
+  "totals": {
+    "documents": 0,
+    "stages": [
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "ingested"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "classified"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "praxis_scanned"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "linked:embeddings"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "linked:temporal"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "linked:eddies"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "linked:threads"
+      }
+    ]
+  }
 }

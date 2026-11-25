@@ -484,5 +484,52 @@
     }
   ],
   "status": "ok",
-  "tier_ceiling": "personal"
+  "tier_ceiling": "personal",
+  "totals": {
+    "documents": 1240,
+    "stages": [
+      {
+        "covered": 1240,
+        "failed": 0,
+        "partial": 0,
+        "stage": "ingested"
+      },
+      {
+        "covered": 1240,
+        "failed": 0,
+        "partial": 0,
+        "stage": "classified"
+      },
+      {
+        "covered": 1240,
+        "failed": 0,
+        "partial": 0,
+        "stage": "praxis_scanned"
+      },
+      {
+        "covered": 900,
+        "failed": 0,
+        "partial": 0,
+        "stage": "linked:embeddings"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "linked:temporal"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 1240,
+        "stage": "linked:eddies"
+      },
+      {
+        "covered": 0,
+        "failed": 0,
+        "partial": 0,
+        "stage": "linked:threads"
+      }
+    ]
+  }
 }

@@ -118,11 +118,13 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.36.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.37.0.json"
 )
-"""The published document at contract 0.36.0.
+"""The published document at contract 0.37.0.
 
-0.36.0 (#2127) adds the optional ``related_threads`` to ``ReflectionResponse``
+0.37.0 (#2147) adds the optional ``totals`` to ``PipelineStatusResponse``, with
+the ``PipelineTotals`` and ``PipelineStageTotal`` models; no path or status
+moves. 0.36.0 (#2127) adds the optional ``related_threads`` to ``ReflectionResponse``
 and ``related_praxis`` / ``related_eddies`` / ``related_threads`` to
 ``LetterResponse``, with the ``RelatedThread`` model and ``ThreadLifecycle``
 enum; no path or status moves. 0.35.0 (#2126) adds the optional ``voice``

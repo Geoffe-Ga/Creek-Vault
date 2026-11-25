@@ -105,6 +105,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.36",
     "0.35",
     "0.34",
     "0.33",
@@ -3607,6 +3608,16 @@ that predates the caller's vendored contract. It is a literal for the reason
 :data:`_UPLOAD_MINOR` is.
 """
 
+PIPELINE_TOTALS_SINCE_MINOR: Final[str] = "0.37"
+"""First minor whose ``GET /v1/pipeline/status`` body carries ``totals`` (#2147).
+
+The route itself stays a :data:`PIPELINE_STATUS_SINCE_MINOR` route. A caller
+declaring ``0.34`` to ``0.36`` vendored a closed ``PipelineStatusResponse``
+without the key, so it is served the body its minor published, byte for byte,
+and the totals are not computed for it. It is a literal for the reason
+:data:`_UPLOAD_MINOR` is.
+"""
+
 PIPELINE_STATUS_DEFAULT_LIMIT: Final[int] = 50
 """How many documents ``GET /v1/pipeline/status`` returns when ``limit`` is absent."""
 
@@ -3822,6 +3833,59 @@ class PipelineJobSummary(_WireModel):
     updated_at: AwareDatetime = Field(description="When the record last changed.")
 
 
+class PipelineStageTotal(_WireModel):
+    """How many of the caller's documents one stage has reached (#2147).
+
+    The three counts are disjoint: each document is counted at most once per
+    stage, under the outcome its own ``stages`` row would carry. What is left
+    of :attr:`PipelineTotals.documents` after all three is the number the
+    stage has not run over yet.
+
+    Attributes:
+        stage: Which stage.
+        covered: Documents a pass of this stage ran over and finished ``ok``.
+            For ``ingested`` this is every document.
+        partial: Documents whose covering pass finished ``partial``.
+        failed: Documents whose only covering passes ``failed``.
+    """
+
+    stage: PipelineStage = Field(description="Which stage.")
+    covered: int = Field(
+        ge=_MIN_COUNT, description="Documents the stage covered with outcome ok."
+    )
+    partial: int = Field(
+        ge=_MIN_COUNT, description="Documents whose covering pass ended partial."
+    )
+    failed: int = Field(
+        ge=_MIN_COUNT, description="Documents whose covering passes all failed."
+    )
+
+
+class PipelineTotals(_WireModel):
+    """Stage counts over every document this caller uploaded (#2147).
+
+    Counted over the whole corpus, whatever ``limit`` asked for and whatever
+    the ceiling admits: a count names nothing. It carries no filename, id or
+    path.
+
+    Attributes:
+        documents: Every upload document of this caller, every tier counted.
+            One document per ``external_id``, however many fragments it made.
+        stages: One row per :class:`PipelineStage`, in pipeline order, listed
+            even at zero so a stage is never inferred from its absence.
+    """
+
+    documents: int = Field(
+        ge=_MIN_COUNT,
+        description="Every document this caller uploaded, every tier counted.",
+    )
+    stages: list[PipelineStageTotal] = Field(
+        min_length=len(PipelineStage),
+        max_length=len(PipelineStage),
+        description="One row per stage, in pipeline order, zero rows included.",
+    )
+
+
 class PipelineStatusResponse(_WireModel):
     """What the pipeline has done: per folder, per document, per job.
 
@@ -3838,6 +3902,10 @@ class PipelineStatusResponse(_WireModel):
         documents_withheld: How many of the requested documents were withheld
             for the ceiling. Counted so a short page is not read as complete.
         jobs: This caller's most recent durable pipeline jobs, newest first.
+        totals: Stage counts over every document of this caller, not only the
+            listed page. Always present for a caller declaring
+            :data:`PIPELINE_TOTALS_SINCE_MINOR` or later; omitted, never sent
+            ``null``, for an earlier one.
     """
 
     status: Literal["ok"] = Field(description="Always ok; failure is an error.")
@@ -3857,6 +3925,18 @@ class PipelineStatusResponse(_WireModel):
     jobs: list[PipelineJobSummary] = Field(
         max_length=PIPELINE_STATUS_MAX_JOBS,
         description="This caller's most recent durable pipeline jobs.",
+    )
+    # Contract 0.37 (#2147). Dropped when ``None`` by the handler, and ``None``
+    # whenever the caller's minor predates :data:`PIPELINE_TOTALS_SINCE_MINOR`:
+    # every published response schema is closed, so a caller validating its
+    # vendored 0.36 schema would reject the whole body on a key it never
+    # negotiated.
+    totals: PipelineTotals | None = Field(
+        default=None,
+        description=(
+            "Stage counts over every document of this caller, whatever the "
+            "limit; absent below contract 0.37."
+        ),
     )
 
 
@@ -3933,8 +4013,10 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "PipelineFolderStatus": PipelineFolderStatus,
     "PipelineJobSummary": PipelineJobSummary,
     "PipelineStageRecord": PipelineStageRecord,
+    "PipelineStageTotal": PipelineStageTotal,
     "PipelineStatusQuery": PipelineStatusQuery,
     "PipelineStatusResponse": PipelineStatusResponse,
+    "PipelineTotals": PipelineTotals,
     "ReflectionNote": ReflectionNote,
     "ReflectionRequest": ReflectionRequest,
     "ReflectionResponse": ReflectionResponse,
