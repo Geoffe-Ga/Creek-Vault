@@ -9,6 +9,19 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **A loose Substack export's subscriber lists are refused, not ingested
+  (#2133, no contract change).** Sent one file per `POST /v1/uploads`, an
+  export's `email_list*.csv`, `*.delivers.csv` and `*.opens.csv` were read as
+  spreadsheets, so subscribers' email addresses were staged and written to
+  `01-Fragments/Data`.
+  - `creek.upload` now refuses them with `SUBSCRIBER_DATA_REASON`, above the
+    staging write: nothing is staged, written or receipted, and the refusal
+    is audited with the caller's arguments only. Matching is
+    `creek.ingest.substack.is_subscriber_csv`, the predicate the `.zip` path
+    filters with (made public, not copied).
+  - Over `/v1` the refusal is `415 unsupported_source`, the terminal answer a
+    client already treats as skipped. **Contract `0.37.0` is unchanged**: no
+    new code, status or field.
 - **A loose conversation-export `.json` is recognised by its contents and
   ingested (#2148, no contract change).** `POST /v1/uploads` and
   `creek.upload` refused every `.json` with "send the whole export as a

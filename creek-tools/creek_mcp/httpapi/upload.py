@@ -93,6 +93,7 @@ from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
 from creek_mcp.tools.upload import (
     ARCHIVE_NO_FRAGMENTS_REASON,
     MANIFEST_STATUS,
+    SUBSCRIBER_DATA_REASON,
     upload_tool,
 )
 
@@ -181,7 +182,7 @@ the caller most needs a definite answer.
 """
 
 _UNSUPPORTED_ARCHIVE_REASONS: Final[frozenset[str]] = frozenset(
-    {UNRECOGNISED_EXPORT_REASON, ARCHIVE_NO_FRAGMENTS_REASON}
+    {UNRECOGNISED_EXPORT_REASON, ARCHIVE_NO_FRAGMENTS_REASON, SUBSCRIBER_DATA_REASON}
 )
 """The #1525 archive refusals that mean "readable, but not an export I know".
 
@@ -190,6 +191,12 @@ unpacked safely and Creek still could not name it as a chatgpt / claude /
 discord / substack export, or named it and read no content out of it. Both are
 answered by the same advice — unpack it and run ``creek ingest`` — which is
 what :attr:`~creek_mcp.api.models.ErrorCode.UNSUPPORTED_SOURCE`'s body says.
+
+:data:`~creek_mcp.tools.upload.SUBSCRIBER_DATA_REASON` (#2133) joins them for
+its *outcome* rather than its remedy: a loose Substack subscriber list is
+skipped on purpose, and ``415`` is the terminal, non-5xx answer a client
+already counts as skipped rather than failed. No new code was minted for it,
+so no contract minor moved.
 """
 
 

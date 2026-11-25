@@ -454,25 +454,25 @@ class TestSubscriberCsvHelpers:
     """Direct unit tests for the PII-filter helper."""
 
     def test_email_list_csv_is_recognised(self, tmp_path: Path) -> None:
-        from creek.ingest.substack import _is_subscriber_csv
+        from creek.ingest.substack import is_subscriber_csv
 
         path = tmp_path / "email_list.csv"
         path.write_text("email\n", encoding="utf-8")
-        assert _is_subscriber_csv(path) is True
+        assert is_subscriber_csv(path) is True
 
     def test_delivers_csv_is_recognised(self, tmp_path: Path) -> None:
-        from creek.ingest.substack import _is_subscriber_csv
+        from creek.ingest.substack import is_subscriber_csv
 
         path = tmp_path / "111.foo.delivers.csv"
         path.write_text("email\n", encoding="utf-8")
-        assert _is_subscriber_csv(path) is True
+        assert is_subscriber_csv(path) is True
 
     def test_posts_csv_is_not_a_subscriber_csv(self, tmp_path: Path) -> None:
-        from creek.ingest.substack import _is_subscriber_csv
+        from creek.ingest.substack import is_subscriber_csv
 
         path = tmp_path / "posts.csv"
         path.write_text("post_id\n", encoding="utf-8")
-        assert _is_subscriber_csv(path) is False
+        assert is_subscriber_csv(path) is False
 
 
 class TestSubstackWithoutPostsCsv:
