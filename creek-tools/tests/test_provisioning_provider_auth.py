@@ -99,9 +99,12 @@ def _pilot_arguments(tmp_path: Path) -> list[str]:
         "--fly-image",
         "registry.example/creek@sha256:" + "a" * 64,
         "--fly-token-expires-at",
-        # The real fleet pass reads the wall clock, so the token must be well
-        # outside #1867's 72h warning window or an expiry alert joins the 401.
-        (datetime.now(tz=UTC) + _TOKEN_LIFETIME).isoformat(),
+        # Measured from the frozen instant every run here observes with: the
+        # CLI refuses an expiry more than 90 days past its clock, and the fleet
+        # pass must see the token well outside #1867's 72h warning window or an
+        # expiry alert joins the 401. A wall-clock expiry drifts past the first
+        # bound as the calendar moves away from ``_NOW``.
+        (_NOW + _TOKEN_LIFETIME).isoformat(),
         "--fleet-policy-file",
         str(policy),
         "--fleet-interval-seconds",
