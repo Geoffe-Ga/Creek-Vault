@@ -473,7 +473,8 @@ Which extensions are accepted, and what each becomes:
 | `.pptx` | `presentation` |
 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.tiff`, `.webp` | `image` |
 | `.zip` | `archive` |
-| `.json`, `.jsonl`, `.ndjson` | `refused` |
+| `.json` | `export` when its contents are a ChatGPT, Claude or Discord export; refused otherwise |
+| `.jsonl`, `.ndjson` | `refused` |
 | `.tar`, `.tgz`, `.gz`, `.bz2`, `.xz`, `.7z`, `.rar` | `refused` |
 | `.doc`, `.xls`, `.ppt` | `refused` |
 
@@ -490,6 +491,13 @@ conversation history as one undifferentiated blob:
 Note that `.zip` appears in the routing table as a refusal *and* is accepted
 in practice: the archive fork runs **before** extension routing, so a `.zip`
 never reaches the refusal. `.tar` and the rest do reach it — repack as `.zip`.
+
+A `.json` is in the same position when it is a conversation export (#2148).
+Its **contents** are read before extension routing: a ChatGPT
+`conversations.json`, a Claude export, or a Discord channel's `messages.json`
+is handed to that export's ingestor and answers like an archive
+(`source_type` is `chatgpt`, `claude` or `discord`). The filename decides
+nothing. Any other `.json` reaches the refusal unchanged.
 
 ### Tier is checked before anything is read
 
@@ -794,11 +802,16 @@ Ingested 1 fragment(s).
 Without `--yes` you would be answering a consent prompt that understates what
 is about to happen.
 
-### 3. Uploading a raw `.json` export is refused, and that is the feature
+### 3. A `.json` is ingested only when Creek recognises the export in it
 
-`conversations.json` is many conversations, not one document. It is refused
-with a `415` rather than filed as a blob. Send the platform's `.zip`, or
-unpack it and use the CLI.
+`conversations.json` is many conversations, not one document, so it is never
+filed as one blob. A `.json` whose contents are a ChatGPT, Claude or Discord
+export is read by that export's ingestor, one fragment set per conversation
+(#2148). A Discord `messages.json` sent on its own has no `channel.json`
+beside it, so its channel is named `unknown`; send the platform's `.zip` to
+keep channel names. Any other `.json` — a `package.json`, an arbitrary
+object, malformed JSON — is refused with a `415`, as are `.jsonl` and
+`.ndjson`.
 
 ### 4. The same `.py` file becomes different fragments by CLI and by upload
 

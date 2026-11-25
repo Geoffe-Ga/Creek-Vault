@@ -389,6 +389,24 @@ def extract_archive(raw: bytes, root: Path) -> None:
         raise
 
 
+def _parse_json(raw: bytes) -> object | None:
+    """Return *raw* parsed as JSON, or ``None`` when it is not readable JSON.
+
+    Args:
+        raw: A candidate export file's bytes.
+
+    Returns:
+        The parsed document, or ``None``.
+    """
+    try:
+        parsed: object = json.loads(raw.decode("utf-8", errors="replace"))
+    except (ValueError, RecursionError):
+        # RecursionError: a document nested past the interpreter's limit is
+        # not an export either, and must not become a crash for the caller.
+        return None
+    return parsed
+
+
 def _probe_json(path: Path) -> object | None:
     """Return *path* parsed as JSON, or ``None`` when it is not readable JSON.
 
@@ -399,10 +417,10 @@ def _probe_json(path: Path) -> object | None:
         The parsed document, or ``None``.
     """
     try:
-        parsed: object = json.loads(path.read_bytes().decode("utf-8", errors="replace"))
-    except (json.JSONDecodeError, OSError, ValueError):
+        raw = path.read_bytes()
+    except OSError:
         return None
-    return parsed
+    return _parse_json(raw)
 
 
 def _json_probes(directory: Path) -> list[object]:
@@ -477,8 +495,8 @@ def _looks_like_substack(directory: Path) -> bool:
     )
 
 
-def _looks_like_chatgpt(directory: Path) -> bool:
-    """Report whether *directory* holds a ChatGPT ``conversations.json``.
+def _document_is_chatgpt(document: object) -> bool:
+    """Report whether *document* is a ChatGPT ``conversations.json``.
 
     Stricter than :func:`creek.ingest.chatgpt._is_chatgpt_export`, which asks
     only for a JSON list of dicts, and stricter on purpose: a Discord channel's
@@ -490,24 +508,18 @@ def _looks_like_chatgpt(directory: Path) -> bool:
     order.
 
     Args:
-        directory: A candidate export root.
+        document: One parsed JSON document.
 
     Returns:
-        ``True`` when a JSON file is a list whose first dict carries
-        ``mapping``.
+        ``True`` when it is a list whose first dict carries ``mapping``.
     """
-    for document in _json_probes(directory):
-        if not isinstance(document, list):
-            continue
-        if any(
-            isinstance(entry, dict) and "mapping" in entry for entry in document[:1]
-        ):
-            return True
-    return False
+    if not isinstance(document, list):
+        return False
+    return any(isinstance(entry, dict) and "mapping" in entry for entry in document[:1])
 
 
-def _looks_like_claude(directory: Path) -> bool:
-    """Report whether *directory* holds a Claude conversation export.
+def _document_is_claude(document: object) -> bool:
+    """Report whether *document* is a Claude conversation export.
 
     Restates :meth:`creek.ingest.claude.ClaudeIngestor._is_claude_export`'s
     rule — a top-level dict with ``conversations``, or with ``messages`` plus
@@ -516,20 +528,122 @@ def _looks_like_claude(directory: Path) -> bool:
     the direction this module exists to avoid.
 
     Args:
+        document: One parsed JSON document.
+
+    Returns:
+        ``True`` when it matches either Claude export shape.
+    """
+    if not isinstance(document, dict):
+        return False
+    data: dict[str, Any] = document
+    if "conversations" in data:
+        return True
+    return "messages" in data and ("conversation_id" in data or "uuid" in data)
+
+
+_DISCORD_MESSAGE_SIGNATURES: Final[tuple[frozenset[str], ...]] = (
+    frozenset({"ID", "Timestamp", "Contents"}),
+    frozenset({"id", "timestamp", "content"}),
+)
+"""The keys one Discord message carries, in each schema the ingestor reads.
+
+The capitalised set is the current data package's; the lowercase set is older
+packages' and DiscordChatExporter's — the two
+:func:`creek.ingest.discord._normalize_message` tells apart. A whole signature
+is required, never one familiar key: ``id`` alone is on half the JSON in the
+world.
+"""
+
+
+def _document_is_discord_messages(document: object) -> bool:
+    """Report whether *document* is one Discord channel's ``messages.json``.
+
+    The question a loose file has to answer for itself (#2148). Inside an
+    export the *tree* answers it — :func:`_looks_like_discord` reads the
+    ``messages/<channel>/messages.json`` layout and never opens the file — but
+    a file sent on its own has no tree, so the shape of its first message is
+    the only evidence there is.
+
+    Disjoint from :func:`_document_is_chatgpt` by construction, not by the
+    order the two are asked in: an entry carrying ``mapping`` is never a
+    Discord message here, whatever else it carries.
+
+    Args:
+        document: One parsed JSON document.
+
+    Returns:
+        ``True`` when it is a list whose first entry is a dict carrying a
+        whole message signature and no ``mapping``.
+    """
+    if not isinstance(document, list) or not document:
+        return False
+    first = document[0]
+    if not isinstance(first, dict) or "mapping" in first:
+        return False
+    return any(signature <= first.keys() for signature in _DISCORD_MESSAGE_SIGNATURES)
+
+
+def _looks_like_chatgpt(directory: Path) -> bool:
+    """Report whether *directory* holds a ChatGPT ``conversations.json``.
+
+    Args:
         directory: A candidate export root.
 
     Returns:
-        ``True`` when a JSON file matches either Claude export shape.
+        ``True`` when a JSON file satisfies :func:`_document_is_chatgpt`.
     """
-    for document in _json_probes(directory):
-        if not isinstance(document, dict):
-            continue
-        data: dict[str, Any] = document
-        if "conversations" in data:
-            return True
-        if "messages" in data and ("conversation_id" in data or "uuid" in data):
-            return True
-    return False
+    return any(map(_document_is_chatgpt, _json_probes(directory)))
+
+
+def _looks_like_claude(directory: Path) -> bool:
+    """Report whether *directory* holds a Claude conversation export.
+
+    Args:
+        directory: A candidate export root.
+
+    Returns:
+        ``True`` when a JSON file satisfies :func:`_document_is_claude`.
+    """
+    return any(map(_document_is_claude, _json_probes(directory)))
+
+
+_DOCUMENT_DETECTORS: Final[tuple[tuple[str, Callable[[object], bool]], ...]] = (
+    ("chatgpt", _document_is_chatgpt),
+    ("claude", _document_is_claude),
+    ("discord", _document_is_discord_messages),
+)
+"""The export families one JSON document can belong to (#2148).
+
+The same ``chatgpt`` and ``claude`` predicates :data:`_DETECTORS` reaches
+through a directory, so a file is named the same way loose as it is zipped.
+``substack`` is absent because no single JSON document is a Substack export.
+The three shapes are mutually exclusive — a list with ``mapping``, a dict, a
+list without ``mapping`` — so the order here decides nothing.
+"""
+
+
+def detect_document_export_type(raw: bytes) -> str | None:
+    """Identify the export a single JSON file holds, from its contents alone.
+
+    The loose-file twin of :func:`detect_export_type`, and held to the same
+    rule: the caller never names the export type, and neither does the
+    filename.
+
+    Args:
+        raw: The file's bytes.
+
+    Returns:
+        The :data:`creek.ingest.INGESTOR_REGISTRY` key, or ``None`` when the
+        bytes are not JSON or match no export — a ``package.json``, an
+        arbitrary object, a list of something else.
+    """
+    document = _parse_json(raw)
+    if document is None:
+        return None
+    for source_type, matches in _DOCUMENT_DETECTORS:
+        if matches(document):
+            return source_type
+    return None
 
 
 _DETECTORS: Final[tuple[tuple[str, Callable[[Path], bool]], ...]] = (

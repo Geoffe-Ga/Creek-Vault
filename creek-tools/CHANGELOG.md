@@ -9,6 +9,26 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **A loose conversation-export `.json` is recognised by its contents and
+  ingested (#2148, no contract change).** `POST /v1/uploads` and
+  `creek.upload` refused every `.json` with "send the whole export as a
+  .zip", including a `conversations.json` the owner had already unpacked.
+  - A `.json` whose contents are a ChatGPT `conversations.json`, a Claude
+    export or a Discord channel's `messages.json` is laid out the way that
+    export's directory ingestor expects (`creek/ingest/json_loose.py`) and
+    takes the archive path: same gates, same size cap, same idempotency on
+    `external_id`, same upload receipts, nothing staged. A document sent
+    loose derives the fragment ids it derives as `conversations.json` inside
+    a `.zip`.
+  - The type is decided by `detect_document_export_type`, which shares the
+    ChatGPT and Claude predicates with archive detection. The filename and
+    the caller decide nothing. A Discord file has no `channel.json` beside
+    it, so its channel is `unknown`.
+  - **Contract `0.37.0` is unchanged.** Only the set of accepted inputs
+    widened: the success body is the one an export `.zip` already returns,
+    and a `.json` matching no export (a `package.json`, an arbitrary object,
+    malformed JSON) keeps `415 unsupported_source` byte for byte, with
+    nothing written or staged. `.jsonl` and `.ndjson` stay refused.
 - **`GET /v1/pipeline/status` counts the whole corpus per stage (#2147,
   contract 0.37).** The `documents` list is clamped to the newest 200
   uploads, so a consumer could not say "x of y files" for a larger corpus.

@@ -85,6 +85,7 @@ from creek.ingest import INGESTOR_REGISTRY, MarkdownIngestor
 from creek.ingest.archive import ARCHIVE_SUFFIXES
 from creek.ingest.gdrive import _EXTENSION_ROUTES
 from creek.ingest.images import ImageIngestor, OcrResult
+from creek.ingest.json_loose import LOOSE_JSON_SUFFIX
 from creek.ingest.presentations import (
     PresentationData,
     PresentationIngestor,
@@ -176,13 +177,17 @@ def _actual_upload_routes() -> dict[str, str]:
 
     Returns:
         A mapping of file extension to ``"archive"`` when the archive
-        fork claims it, the ingestor name when routing succeeds, and
-        ``"refused"`` otherwise.
+        fork claims it, ``"export"`` for the ``.json`` whose contents decide
+        (#2148), the ingestor name when routing succeeds, and ``"refused"``
+        otherwise.
     """
     actual: dict[str, str] = {}
     for extension, route in _EXTENSION_ROUTES.items():
         if extension in ARCHIVE_SUFFIXES:
             actual[extension] = "archive"
+        elif extension == LOOSE_JSON_SUFFIX:
+            # #2148: content-detected above the refusal its route still names.
+            actual[extension] = "export"
         elif isinstance(route, str):
             actual[extension] = route
         else:
