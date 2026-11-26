@@ -174,6 +174,7 @@ def test_mission_response_never_names_the_routing_tier(vault: Path) -> None:
         "source_fragments",
         "source_count",
         "value_count",
+        "voice_rating",
     }
 
 
@@ -371,3 +372,39 @@ def test_mission_records_no_route_it_did_not_resolve(vault: Path) -> None:
     assert "inference_source" not in response
     saved = frontmatter.load(vault / response["mission_path"])
     assert "inference_source" not in saved.metadata
+
+
+def test_mission_reports_and_logs_its_end_state_voice_rating(vault: Path) -> None:
+    """The saved mission is rated against the owner's fingerprint and logged."""
+    from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
+    from tests.test_revoice_evidence import install_owner_fingerprint
+
+    install_owner_fingerprint(vault)
+
+    response = mission_tool(vault_path=vault, llm_factory=_Factory())
+
+    assert response["status"] == "ok"
+    rating = response["voice_rating"]
+    assert set(rating) == {
+        "in_voice",
+        "voice_distance",
+        "voice_distance_upper",
+        "diverging",
+        "signature_gaps",
+    }
+    entries = [
+        json.loads(line)
+        for line in (vault / VOICE_RATINGS_RELPATH).read_text().splitlines()
+    ]
+    assert [entry["tool"] for entry in entries] == [TOOL_NAME]
+    assert entries[0]["artifact"] == response["mission_path"]
+    assert entries[0]["in_voice"] is rating["in_voice"]
+    assert response["markdown"] not in json.dumps(entries)
+
+
+def test_mission_without_a_fingerprint_is_unrated(vault: Path) -> None:
+    """No fingerprint: saved and returned, with no claim about its voice."""
+    response = mission_tool(vault_path=vault, llm_factory=_Factory())
+
+    assert response["status"] == "ok"
+    assert response["voice_rating"] is None

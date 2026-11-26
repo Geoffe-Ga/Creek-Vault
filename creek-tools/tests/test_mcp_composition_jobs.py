@@ -333,8 +333,35 @@ def test_the_fast_path_answers_exactly_as_the_synchronous_tool(vault: Path) -> N
     assert payload["draft_path"].startswith("07-Voice/Drafts/")
     assert (vault / payload["draft_path"]).is_file()
     assert payload["source_count"] == 0
-    assert payload["voice_guard_status"] == "skipped:disabled"
+    assert payload["voice_guard_status"] == "skipped:no_fingerprint"
     assert _lifecycle(vault) == []
+
+
+def test_an_mcp_draft_is_voice_guarded_and_rated_like_the_cli(vault: Path) -> None:
+    """With a fingerprint the guard runs and the end-state rating is returned.
+
+    Before this, ``creek.draft`` never handed the generator the owner's
+    fingerprint, so every MCP draft was stamped ``skipped:disabled``.
+    """
+    from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
+    from tests.test_revoice_evidence import install_owner_fingerprint
+
+    install_owner_fingerprint(vault)
+
+    payload = asyncio.run(_call(_server(vault), "creek.draft"))
+
+    assert payload["status"] == "ok"
+    assert not payload["voice_guard_status"].startswith("skipped:")
+    rating = payload["voice_rating"]
+    assert isinstance(rating["in_voice"], bool)
+    assert isinstance(rating["voice_distance"], float)
+    saved = frontmatter.load(vault / payload["draft_path"])
+    assert saved["voice_rating"] == rating
+    [entry] = [
+        json.loads(line)
+        for line in (vault / VOICE_RATINGS_RELPATH).read_text().splitlines()
+    ]
+    assert entry["artifact"] == payload["draft_path"]
 
 
 def test_the_fast_path_author_still_returns_its_body(vault: Path) -> None:
@@ -403,7 +430,7 @@ def test_a_draft_past_the_deadline_returns_a_handle_that_resolves(
     result = settled["result"]
     assert result["status"] == "ok"
     assert result["source_count"] == 0
-    assert result["voice_guard_status"] == "skipped:disabled"
+    assert result["voice_guard_status"] == "skipped:no_fingerprint"
     assert set(result) == {
         "status",
         "tool",
@@ -412,7 +439,10 @@ def test_a_draft_past_the_deadline_returns_a_handle_that_resolves(
         "idea_strategy",
         "source_count",
         "voice_guard_status",
+        "voice_rating",
     }
+    # No fingerprint in this vault: the draft is saved and reported unrated.
+    assert result["voice_rating"] is None
     saved = vault / result["draft_path"]
     assert saved.is_file()
     assert _BODY in saved.read_text(encoding="utf-8")
@@ -908,6 +938,7 @@ def test_author_projection_counts_distinct_cited_fragments_and_drops_content() -
             {"claim": "two", "source_fragments": ["frag-b", "frag-c"]},
         ],
         "warnings": [],
+        "voice_rating": {"in_voice": False, "voice_distance": 0.9},
     }
     result = author_job_result(response, "07-Voice/Drafts/x.md")
     assert result == {
@@ -922,6 +953,7 @@ def test_author_projection_counts_distinct_cited_fragments_and_drops_content() -
         "claim_count": 2,
         "source_count": 3,
         "warnings": [],
+        "voice_rating": {"in_voice": False, "voice_distance": 0.9},
     }
     assert "private" not in json.dumps(result)
 

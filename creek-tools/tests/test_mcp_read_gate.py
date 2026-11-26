@@ -222,6 +222,7 @@ from creek.classify.llm.prompts import (
     build_classification_prompt,
 )
 from creek.config import CreekConfig, LLMConfig
+from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
 from creek.generate.compile_routing import COMPILE_GAPS_RELPATH
 from creek.generate.mining import MiningStrategy
 from creek.models import Fragment, PrivacyTier
@@ -5772,6 +5773,15 @@ def _is_artifact_carve_out(relpath: Path) -> bool:
     *refused* compile creates the file too, and the refusal's byte-snapshot
     would otherwise read a content-free lock as a write.
 
+    The voice-ratings ledger
+    (:data:`creek.generate.ai_style.rating.VOICE_RATINGS_RELPATH`) is carved
+    out by its exact path too. Like the MCP audit log it is monitoring, not an
+    artifact: one line per finished text holding the tool, a timestamp, an
+    attempt count and the rating's numbers and closed feature keys, never
+    prose (``tests/generate/ai_style/test_rating.py`` pins that shape). It is
+    appended only after a tool has finished writing, so the artifact the tool
+    wrote is still observed on its own.
+
     Args:
         relpath: A vault-relative path.
 
@@ -5779,7 +5789,8 @@ def _is_artifact_carve_out(relpath: Path) -> bool:
         ``True`` when the path is bookkeeping the derivation must ignore.
     """
     return (
-        relpath in {MCP_AUDIT_RELPATH, CONTENT_MUTATION_LOCK_RELPATH}
+        relpath
+        in {MCP_AUDIT_RELPATH, CONTENT_MUTATION_LOCK_RELPATH, VOICE_RATINGS_RELPATH}
         or relpath.name in _ARTIFACT_DERIVATION_CARVE_OUT_NAMES
     )
 

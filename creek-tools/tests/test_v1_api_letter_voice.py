@@ -10,6 +10,7 @@ otherwise the prompt is unchanged and the response says
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
@@ -292,3 +293,45 @@ def test_owner_register_samples_above_the_ceiling_never_reach_the_prompt(
 
     assert envelope(response)["voice"] == "higher_self"
     assert "Owner style profile" not in spy.prompts[0]
+
+
+def test_an_owner_voiced_letter_is_rated_and_logged_not_refused(
+    tmp_path: Path,
+) -> None:
+    """Monitoring only: the letter is written as before and its rating logged."""
+    from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
+    from tests.test_revoice_evidence import install_owner_fingerprint
+
+    vault = seed_vault(tmp_path / "vault")
+    _owner_skill(vault)
+    install_owner_fingerprint(vault)
+
+    response = _post(vault, _Spy())
+
+    assert response.status_code == 200, response.text
+    assert envelope(response)["voice"] == "owner"
+    assert "voice_rating" not in envelope(response)
+    [entry] = [
+        json.loads(line)
+        for line in (vault / VOICE_RATINGS_RELPATH).read_text().splitlines()
+    ]
+    assert entry["tool"] == "creek.letter"
+    assert entry["rated"] is True
+    assert envelope(response)["letter"] not in json.dumps(entry)
+
+
+def test_a_higher_self_letter_is_not_rated(tmp_path: Path) -> None:
+    """The generic voice is not meant to match the owner's fingerprint.
+
+    No owner evidence at all (the fingerprint alone counts as owner style),
+    so the letter is the Higher Self's and nothing is logged; an owner letter
+    without a fingerprint would log an unrated line.
+    """
+    from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
+
+    vault = seed_vault(tmp_path / "vault")
+
+    response = _post(vault, _Spy())
+
+    assert envelope(response)["voice"] == "higher_self"
+    assert not (vault / VOICE_RATINGS_RELPATH).exists()

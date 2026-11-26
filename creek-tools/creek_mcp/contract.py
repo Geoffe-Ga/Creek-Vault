@@ -20,8 +20,24 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.38.0"
+CONTRACT_VERSION: Final[str] = "0.39.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.39.0: every essay writing path reports its end-state voice rating, the one
+0.38 gave ``creek.revoice``. ``creek.draft``, ``creek.author`` and
+``creek.mission`` ``ok`` responses gain ``voice_rating`` (``in_voice``,
+``voice_distance``, ``voice_distance_upper``, ``diverging``,
+``signature_gaps``; ``null`` when the vault has no usable fingerprint), as do
+the ``creek.jobs.read`` results of a detached draft or author run, and a
+saved draft or mission carries it in its frontmatter. Off-voice is reported
+and logged to ``00-Creek-Meta/voice-ratings.jsonl``, never refused. An
+owner-voiced letter is rated into that ledger too, with no wire change.
+``creek.draft`` now runs the voice-fidelity guard over MCP as ``creek draft``
+does: it was never handed the owner's fingerprint, so ``voice_guard_status``
+read ``skipped:disabled`` whatever the vault configured; it now reflects the
+vault (``skipped:no_fingerprint`` without one) and an off-voice draft gets the
+guard's one bounded rewrite. No ``/v1`` route, wire model or capability
+moves; ``0.38`` stays served.
 
 0.38.0: ``creek.revoice`` is judged on its end state, not on how many words
 changed. Each rewrite is rated against the vault's voice fingerprint
