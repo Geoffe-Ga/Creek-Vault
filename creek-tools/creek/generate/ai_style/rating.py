@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from creek.audit import log as audit_log
 from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
 from creek.generate.ai_style.fingerprint import load_fingerprint
 from creek.generate.ai_style.scanner import scan
@@ -161,7 +162,10 @@ def record_voice_rating(
     """Append one finished text's rating to the vault's voice-ratings ledger.
 
     Best-effort: a write failure is logged and swallowed, because monitoring
-    must never cost the owner the text it measures. The line carries no
+    must never cost the owner the text it measures. Lines are appended under
+    the same per-path thread lock and ``flock`` as the MCP audit log
+    (:func:`creek.audit.log.append_locked_line`), so every writing path can
+    share the ledger without interleaving. The line carries no
     prose, only the tool, the rating's numbers and closed feature keys, and
     an optional vault-relative *artifact* path. An off-voice rating also logs
     a ``WARNING`` naming the tool and distance, for alerting.
@@ -191,11 +195,10 @@ def record_voice_rating(
             )
     if artifact is not None:
         entry["artifact"] = artifact
-    path = vault / VOICE_RATINGS_RELPATH
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+        audit_log.append_locked_line(
+            vault / VOICE_RATINGS_RELPATH, json.dumps(entry, sort_keys=True)
+        )
     except OSError as exc:
         logger.warning(
             "could not record a voice rating for %s: %s", tool, type(exc).__name__

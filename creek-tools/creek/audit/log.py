@@ -163,6 +163,37 @@ def _last_line(path: Path) -> str | None:
     return lines[-1]
 
 
+def append_locked_line(path: Path, line: str) -> None:
+    """Append one *line* to the JSONL file at *path*, never interleaved.
+
+    The same serialisation :meth:`AuditLog.append` uses, without the hash
+    chain: the per-resolved-path thread lock, then ``flock`` on the open
+    ``O_APPEND`` descriptor, so concurrent threads and processes can never
+    tear or interleave a line. For plain monitoring logs (the voice-ratings
+    ledger) that need atomic appends but are not tamper evidence. Parent
+    directories are created.
+
+    Args:
+        path: The JSONL file to append to.
+        line: One line, without its trailing newline.
+
+    Raises:
+        OSError: When the file cannot be opened or written; callers that are
+            best-effort catch it.
+    """
+    holder = _thread_lock_holder_for(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with holder.lock, path.open("a", encoding="utf-8") as fh:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fh.write(line + "\n")
+            fh.flush()
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 class AuditLog:
     """Append-only JSONL log with a sha256 hash chain.
 

@@ -17,6 +17,9 @@ to locate the originating commit for any reference below.
   letters are rated into the ledger with no wire change. `creek.draft` over
   MCP now runs the voice-fidelity guard like `creek draft`: it was never
   given the owner's fingerprint, so every MCP draft read `skipped:disabled`.
+  The ledger now appends through `creek.audit.log.append_locked_line`, the
+  MCP audit log's per-path thread lock plus `flock`, so the writers sharing it
+  never interleave a line (#2168).
 
 - **`creek.revoice` is judged on its end state, and off-voice is logged, not
   refused (contract 0.38).** The 0.30 gate counted changed words, rebuilt
