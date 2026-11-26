@@ -374,7 +374,7 @@ callers retain their existing cap below intimate. Incomplete, empty or
 oversized model output is an error. Only input/output character counts enter
 this tool's audit entry.
 
-#### Owner grounding and the voice gate (contract 0.30)
+#### Owner grounding and the end-state voice rating (contracts 0.30, 0.38)
 
 Canonical signatures are the same text for every vault: they describe a
 register, not a person. Revoice therefore needs owner-specific grounding from
@@ -395,52 +395,58 @@ at least one of:
 With neither, the call returns `status: "refused"`, `reason:
 "no_owner_voice"` before any model is built.
 
-Every rewrite then passes through a deterministic gate. A raw diff is never
-the criterion: deleting citations, compressing, or one heavily rewritten
-section all produce a large diff without a voice.
+**Every rewrite is judged on its end state (contract 0.38).** How many words
+changed is not measured: a light touch on a passage that already reads as the
+owner is a success, and a sweeping rewrite into fluent generic prose is not.
+Two deterministic checks run on the finished text:
 
-| Check | Fails as | Diagnostic |
+| Check | On failure | Diagnostic |
 |---|---|---|
-| Every heading and every citation, footnote reference and link target survives | `fidelity_violation` | `headings_changed`, `citations_dropped` |
-| Each section of at least 40 words has ≥25% new words **and** ≤50% sentences that near-copy a source sentence | `insufficient_transformation` | `section_unchanged` |
-| The first 40 prose words are under 80% similar | `insufficient_transformation` | `opening_unchanged` |
-| The whole passage meets the same wording and sentence floors | `insufficient_transformation` | `copyedit_only` |
-| With a profile, the output sits closer to the owner than the source did (≥10% closer, or already close) | `insufficient_transformation` | `no_style_shift` |
+| The rewrite's **voice rating** against the vault's fingerprint (`creek report --type fingerprint`): `voice_distance` at or under `ai_style.voice_distance_upper` | retried once, then **returned** with the rating | `off_voice` |
+| Every heading and every citation, footnote reference and link target survives | retried once, then refused as `fidelity_violation` | `headings_changed`, `citations_dropped` |
 
-If any transformation check fails, `reason` is `insufficient_transformation`;
-fidelity-only failures are `fidelity_violation`. A failed first attempt gets
-**exactly one** retry. The retry adds up to three owner excerpts (admitted
-samples only) and fixed instructions naming the failed checks, so there are
-never more than two model calls.
+A first attempt with any diagnostic gets **exactly one** retry. The retry adds
+up to three owner excerpts (admitted samples only), fixed instructions naming
+the failed checks, and the fingerprint's own voice divergences (for example
+over-used transitions), so there are never more than two model calls. The
+better-rated attempt that kept its apparatus is returned.
+
+**Off-voice is reported and logged, never refused.** Refusing would discard a
+rewrite the owner asked for, often when the point was resonance with the
+source. Every rating is appended to the vault's
+`00-Creek-Meta/voice-ratings.jsonl`, one content-free JSON line per finished
+text (`timestamp`, `tool`, `rated`, `attempts`, and the rating fields below),
+and an off-voice result also logs a `WARNING` from
+`creek.generate.ai_style.rating`. Monitor and alert on those. A vault with no
+usable fingerprint (none built, thinner than `min_fingerprint_fragments`, or
+`ai_style.enabled: false`) is checked for fidelity only and its ratings are
+`null`.
 
 Responses:
 
 - `ok`: `{status, tool, tier_ceiling, text, voice_skills, voice_check, usage}`
-  plus an optional `inference_source`.
-- Voice refusal: `{status: "refused", tool, tier_ceiling, reason, voice_skills,
-  voice_check, usage}`. **No `text`**: a rejected rewrite must not be
-  presented as the owner's voice.
+  plus an optional `inference_source`. In voice or not.
+- Refusal: `{status: "refused", tool, tier_ceiling, reason, voice_skills,
+  voice_check, usage}` with `reason` `no_owner_voice` or
+  `fidelity_violation`. **No `text`.**
 
-`voice_check` is content-free: `voice_applied`, `diagnostics`,
-`rewritten_ratio`, `copied_sentence_ratio`, `opening_similarity`,
-`unchanged_sections` (section indices, `0` being the text before the first
-heading), `style_distance_source`, `style_distance_output` (`null` when not
-measured), `owner_samples`, `owner_profile`, `owner_style_skills`, and
-`attempts`. `usage` sums both attempts.
+`voice_check` is content-free: `voice_applied` (the rating's `in_voice`, or
+`null` when unrated), `diagnostics`, `voice_rating` (`in_voice`,
+`voice_distance`, `voice_distance_upper`, `diverging` and `signature_gaps` as
+closed feature keys, or `null`), `owner_samples`, `owner_profile`,
+`owner_style_skills`, and `attempts`. `usage` sums both attempts.
 
-A detached job whose call ends in a voice refusal finishes `succeeded`. Its
-durable record holds only `{status: "refused", tool, reason}`, and
-`creek.jobs.read` adds the `voice_check` from bounded process memory, exactly
-as it does for an `ok` body. Routing refusals and errors still end `failed`.
+A detached job whose call ends in a refusal finishes `succeeded`. Its durable
+record holds only `{status: "refused", tool, reason}`, and `creek.jobs.read`
+adds the `voice_check` from bounded process memory, exactly as it does for an
+`ok` body. Routing refusals and errors still end `failed`.
 
 **Long documents.** The 16,000-character limit is unchanged. Split a longer
-document at headings and revoice each part. Every part is judged on its own
-opening and its own sections, so a strong part cannot carry an unchanged one.
-Treat the document as revoiced only if every part returns `ok`.
+document at headings and revoice each part; each part is rated on its own.
 
 To judge a local pair the same way, run
-`python -m creek.author.revoice_check SOURCE OUTPUT --vault VAULT [--ceiling C]
-[--register R]`. It prints the verdict and exits `0` (pass) or `1` (refused).
+`python -m creek.author.revoice_check SOURCE OUTPUT --vault VAULT`. It prints
+the verdict and exits `0` (clean) or `1` (off-voice or lost apparatus).
 
 ### Author from vault evidence
 

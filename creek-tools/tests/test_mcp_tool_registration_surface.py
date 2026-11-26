@@ -987,12 +987,13 @@ _EXPECTED_DESCRIPTIONS: Final[dict[str, str]] = {
     ),
     "creek.revoice": (
         "Rewrite supplied text in the owner's voice without saving.\n\n"
-        'Only ``status: "ok"`` carries a rewrite Creek accepts as owner-voiced.\n'
-        '``status: "refused"`` with ``reason`` ``no_owner_voice``,\n'
-        "``insufficient_transformation`` or ``fidelity_violation`` returns no\n"
-        "text; ``voice_check.diagnostics`` names what failed. Inputs over\n"
-        "16,000 characters must be split at headings, and each part is judged\n"
-        "on its own opening and sections."
+        '``status: "ok"`` carries the rewrite, in voice or not:\n'
+        "``voice_check.voice_applied`` is its end-state rating against the\n"
+        "vault's voice fingerprint, and ``voice_check.voice_rating`` the\n"
+        'numbers behind it. ``status: "refused"`` with ``reason``\n'
+        "``no_owner_voice`` or ``fidelity_violation`` returns no text. Inputs\n"
+        "over 16,000 characters must be split at headings, and each part is\n"
+        "rated on its own."
     ),
     "creek.mission": (
         "Draft the owner's mission and values as a Reconcile personal document."

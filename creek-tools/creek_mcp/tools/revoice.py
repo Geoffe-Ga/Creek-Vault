@@ -11,16 +11,22 @@ Creek, not the caller, decides whether the voice was applied:
    (:mod:`creek.author.revoice_grounding`). Canonical skills are the same for
    every vault and do not count. Without either source, the call is refused
    as ``no_owner_voice`` before any model spend.
-2. **Gate.** Every rewrite is judged by :mod:`creek.author.revoice_check`
-   (fidelity, per-section transformation, opening, style shift).
-3. **One bounded retry.** A failed first attempt gets exactly one more,
-   with owner excerpts and fixed feedback naming the failed checks. There are
-   never more than two model calls. A detached job runs this whole function
-   once, so job semantics are unchanged.
+2. **End-state rating.** Every rewrite is rated against the vault's voice
+   fingerprint and checked for fidelity (headings, citations) by
+   :mod:`creek.author.revoice_check`. How many words changed is not measured:
+   the finished text either reads as the owner or it does not.
+3. **One bounded retry.** A first attempt that is off-voice or lost apparatus
+   gets exactly one more, with owner excerpts, fixed feedback naming the
+   failed checks and the fingerprint's voice divergences. There are never
+   more than two model calls. A detached job runs this whole function once,
+   so job semantics are unchanged.
 
-A rewrite the gate rejects returns ``status: "refused"`` with a closed
-``reason`` and content-free ``voice_check`` diagnostics. It never returns the
-rejected text, so no caller can present it as the owner's voice.
+**Off-voice is reported and logged, never refused.** The better-rated
+attempt is returned with its ``voice_check.voice_rating``, and every rating
+goes to the vault's voice-ratings ledger
+(:func:`creek.generate.ai_style.rating.record_voice_rating`) for monitoring.
+Only a rewrite that still loses headings or citations after the retry is
+refused, as ``fidelity_violation``, without its text.
 """
 
 from __future__ import annotations
@@ -28,7 +34,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
-from creek.author.revoice_check import RevoiceCheck, RevoiceReason, check_revoice
+from creek.author.revoice_check import (
+    Diagnostic,
+    RevoiceCheck,
+    RevoiceReason,
+    check_revoice,
+)
 from creek.author.revoice_grounding import (
     RETRY_FEEDBACK,
     OwnerGrounding,
@@ -37,6 +48,12 @@ from creek.author.revoice_grounding import (
 from creek.author.revoice_style import render_profile
 from creek.author.voice import RevoiceGrounding, RevoicePrompt, split_revoice_prompt
 from creek.classify.llm.router import IntimateRoutingError
+from creek.generate.ai_style.rating import (
+    VoiceScorer,
+    load_voice_scorer,
+    rating_from,
+    record_voice_rating,
+)
 from creek.models import Phase, PrivacyTier, VoiceRegister
 from creek.progress import CompositionStage, StageCallback, ignore_stage
 from creek_mcp.audit import MCPAuditLog
@@ -52,6 +69,7 @@ if TYPE_CHECKING:
 
     from creek.author.client import AuthorLLMClient
     from creek.classify.llm.completion import Completion
+    from creek.generate.ai_style.model import ScanReport
     from creek_mcp.provenance import InferenceProvenance
 
 TOOL_NAME: Final = "creek.revoice"
@@ -182,17 +200,41 @@ def _complete(
     return prompt, completion
 
 
+def _rate(
+    request: _Request, text: str, scorer: VoiceScorer | None
+) -> tuple[RevoiceCheck, ScanReport | None]:
+    """Rate and fidelity-check one rewrite, keeping the scan for retry feedback."""
+    report = None if scorer is None else scorer.report(text)
+    rating = (
+        None if report is None or scorer is None else rating_from(report, scorer.config)
+    )
+    return check_revoice(request.text, text, rating=rating), report
+
+
+def _feedback(check: RevoiceCheck, report: ScanReport | None) -> tuple[str, ...]:
+    """Return fixed retry feedback plus the fingerprint's voice divergences.
+
+    The divergence lines come from Creek's own tell catalog and go only to
+    the model, never to the caller.
+    """
+    lines = [RETRY_FEEDBACK[finding] for finding in check.diagnostics]
+    if report is not None and Diagnostic.OFF_VOICE in check.diagnostics:
+        lines += [f"({f.direction}-use) {f.message}" for f in report.findings]
+    return tuple(lines)
+
+
 def _attempts(
     request: _Request,
     client: AuthorLLMClient,
     owner: OwnerGrounding,
+    scorer: VoiceScorer | None,
     usage: dict[str, int],
 ) -> list[_Attempt] | None:
-    """Run the first attempt and, only if the gate rejects it, one retry.
+    """Run the first attempt and, only if a check found something, one retry.
 
     Returns:
-        The attempts made, last one decisive, or ``None`` when a model call
-        returned an unusable output.
+        The attempts made, in order, or ``None`` when a model call returned
+        an unusable output.
     """
     profile = render_profile(owner.profile) if owner.profile else None
     grounding = RevoiceGrounding(profile=profile)
@@ -203,16 +245,28 @@ def _attempts(
             return None
         prompt, completion = called
         _add_usage(usage, completion.usage)
-        check = check_revoice(request.text, completion.text, owner=owner.profile)
+        check, report = _rate(request, completion.text, scorer)
         made.append(_Attempt(prompt, completion, check))
-        if check.reason is None:
+        if check.clean:
             break
         grounding = RevoiceGrounding(
             profile=profile,
             excerpts=owner.excerpts,
-            feedback=tuple(RETRY_FEEDBACK[d] for d in check.diagnostics),
+            feedback=_feedback(check, report),
         )
     return made
+
+
+def _decisive(attempts: list[_Attempt]) -> _Attempt:
+    """Pick the attempt to answer with.
+
+    The best-rated attempt that kept its apparatus, the earlier one on a tie.
+    When every attempt lost apparatus, the last one, which is refused.
+    """
+    returnable = [attempt for attempt in attempts if attempt.check.reason is None]
+    if not returnable:
+        return attempts[-1]
+    return min(returnable, key=lambda attempt: attempt.check.distance)
 
 
 def _verdict(
@@ -221,24 +275,30 @@ def _verdict(
     attempts: list[_Attempt],
     usage: dict[str, int],
 ) -> dict[str, Any]:
-    """Render the decisive attempt as an ``ok`` rewrite or a voice refusal."""
-    last = attempts[-1]
-    voice_check = last.check.as_dict() | _grounding_summary(
-        owner, last.prompt, len(attempts)
+    """Render the decisive attempt as an ``ok`` rewrite or a fidelity refusal."""
+    chosen = _decisive(attempts)
+    voice_check = chosen.check.as_dict() | _grounding_summary(
+        owner, chosen.prompt, len(attempts)
     )
     response: dict[str, Any] = {
         "status": "ok",
         "tool": TOOL_NAME,
         "tier_ceiling": request.ceiling.value,
-        "voice_skills": list(last.prompt.voice_skills),
+        "voice_skills": list(chosen.prompt.voice_skills),
         "voice_check": voice_check,
         "usage": usage,
     }
-    if last.check.reason is None:
-        response["text"] = last.completion.text
+    if chosen.check.reason is None:
+        response["text"] = chosen.completion.text
     else:
         response["status"] = "refused"
-        response["reason"] = last.check.reason.value
+        response["reason"] = chosen.check.reason.value
+    record_voice_rating(
+        request.vault,
+        tool=TOOL_NAME,
+        rating=chosen.check.rating,
+        attempts=len(attempts),
+    )
     return response
 
 
@@ -284,7 +344,9 @@ def _rewrite(
     if client is None:
         return _error(request.ceiling, "No model is available to revoice this passage")
     usage: dict[str, int] = {}
-    attempts = _attempts(request, client, owner, usage)
+    attempts = _attempts(
+        request, client, owner, load_voice_scorer(request.vault), usage
+    )
     if attempts is None:
         return _error(
             request.ceiling, "The model did not return a complete bounded rewrite"
@@ -323,12 +385,14 @@ def revoice_tool(
         on_stage: Content-free progress sink.
 
     Returns:
-        ``ok`` with text, applied skill names, ``voice_check`` and summed usage
-        when the gate accepts the rewrite. ``refused`` with a closed ``reason``
-        (``no_owner_voice``, ``insufficient_transformation`` or
-        ``fidelity_violation``) and ``voice_check`` diagnostics, but no text,
-        when it does not. A static ``error`` for invalid input or model
-        failure, or the canonical routing refusal. Every attempted call
+        ``ok`` with text, applied skill names, ``voice_check`` (its
+        ``voice_rating`` and ``voice_applied`` report the end-state rating,
+        both ``None`` when the vault has no usable fingerprint) and summed
+        usage, whether or not the rewrite is in voice. ``refused`` with a
+        closed ``reason`` (``no_owner_voice`` or ``fidelity_violation``) and
+        ``voice_check`` diagnostics, but no text, otherwise. A static
+        ``error`` for invalid input or model failure, or the canonical
+        routing refusal. Every attempted call
         appends only its input/output character counts to the audit log.
     """
     reason = _invalid(text, register, phase)

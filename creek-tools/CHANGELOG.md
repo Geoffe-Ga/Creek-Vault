@@ -9,6 +9,26 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **`creek.revoice` is judged on its end state, and off-voice is logged, not
+  refused (contract 0.38).** The 0.30 gate counted changed words, rebuilt
+  sentences and a changed opening. It refused a light touch on a passage that
+  already read as the owner and could not tell a heavy rewrite into generic
+  prose from a voice.
+  - Each rewrite is rated against the vault's voice fingerprint by the new
+    shared `creek.generate.ai_style.rating` (`voice_distance` against
+    `ai_style.voice_distance_upper`) and checked for fidelity (headings,
+    citations). A first attempt that fails either gets the one bounded retry,
+    now carrying the fingerprint's own voice divergences.
+  - The better-rated attempt is **returned** whatever its rating.
+    `voice_check.voice_applied` is its `in_voice`, and the new
+    `voice_check.voice_rating` carries the numbers and closed feature keys
+    (`null` without a usable fingerprint). Only lost headings or citations
+    still refuse, as `fidelity_violation`; `insufficient_transformation` is
+    retired, with the word-change fields and the style-distance helpers.
+  - Every rating is appended to the vault's content-free
+    `00-Creek-Meta/voice-ratings.jsonl`, and an off-voice result logs a
+    `WARNING`, for monitoring and alerting.
+
 - **Your own writing no longer fails the voice check (#1945, no contract
   change).** `voice_distance` scored a real journaler's own register samples
   at a median 0.91 against the 0.35 ceiling, and every Writing Desk essay

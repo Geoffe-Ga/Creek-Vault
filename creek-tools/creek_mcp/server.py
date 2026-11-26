@@ -1804,12 +1804,13 @@ def _register_composition_tools(
     ) -> dict[str, Any]:
         """Rewrite supplied text in the owner's voice without saving.
 
-        Only ``status: "ok"`` carries a rewrite Creek accepts as owner-voiced.
-        ``status: "refused"`` with ``reason`` ``no_owner_voice``,
-        ``insufficient_transformation`` or ``fidelity_violation`` returns no
-        text; ``voice_check.diagnostics`` names what failed. Inputs over
-        16,000 characters must be split at headings, and each part is judged
-        on its own opening and sections.
+        ``status: "ok"`` carries the rewrite, in voice or not:
+        ``voice_check.voice_applied`` is its end-state rating against the
+        vault's voice fingerprint, and ``voice_check.voice_rating`` the
+        numbers behind it. ``status: "refused"`` with ``reason``
+        ``no_owner_voice`` or ``fidelity_violation`` returns no text. Inputs
+        over 16,000 characters must be split at headings, and each part is
+        rated on its own.
         """
         caller = _effective_consumer(consumer)
         provenance = InferenceProvenance()

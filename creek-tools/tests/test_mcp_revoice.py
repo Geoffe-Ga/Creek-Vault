@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
@@ -23,6 +24,7 @@ from creek.classify.llm.providers import OllamaProvider
 from creek.classify.llm.router import IntimateRoutingError
 from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.config import LLMConfig
+from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
 from creek.generate.skills import SkillTreeGenerator, render_voice_signature
 from creek.models import PrivacyTier
 from creek.progress import CompositionStage
@@ -40,6 +42,7 @@ from creek_mcp.tools.revoice import (
 from tests.test_revoice_evidence import (
     FIXTURES,
     install_fixture_samples,
+    install_owner_fingerprint,
     write_sample,
 )
 
@@ -48,6 +51,19 @@ FAILED_AFTER = (FIXTURES / "failed_after.md").read_text()
 OWNER_VOICED = (FIXTURES / "owner_voiced.md").read_text()
 INPUT = "Thanks for the invitation. I cannot make Thursday; could we try Friday?"
 OUTPUT = "Thank you for inviting me. Thursday won't work for me. Could we try Friday?"
+LINKED = INPUT + " Details: https://example.org/invite."
+"""An input carrying a link, so dropping it is a fidelity violation."""
+SLOP = (
+    "Moreover, we must delve into the rich tapestry of scheduling. It is a "
+    "testament to flexibility, and we delve deeper into Friday."
+)
+"""Generic model prose: off-voice against the fixture owner's fingerprint."""
+
+
+def _ledger(vault: Path) -> list[dict[str, Any]]:
+    """Return every voice-ratings ledger entry."""
+    path = vault / VOICE_RATINGS_RELPATH
+    return [json.loads(line) for line in path.read_text().splitlines()]
 
 
 class _Provider:
@@ -349,7 +365,9 @@ def test_happy_path_uses_skills_and_audits_only_character_counts(vault: Path) ->
         "register-conversational",
     ]
     assert response["usage"] == {"input_tokens": 42, "output_tokens": 17}
-    assert response["voice_check"]["voice_applied"] is True
+    # No fingerprint in this vault: the rewrite is returned, unrated.
+    assert response["voice_check"]["voice_applied"] is None
+    assert response["voice_check"]["voice_rating"] is None
     assert response["voice_check"]["owner_style_skills"] == [
         "voice-core",
         "phase-rising",
@@ -376,6 +394,12 @@ def test_happy_path_uses_skills_and_audits_only_character_counts(vault: Path) ->
     assert INPUT not in json.dumps(entries)
     assert OUTPUT not in json.dumps(entries)
     assert not (vault / "07-Voice").exists()
+    [rating] = _ledger(vault)
+    assert {k: rating[k] for k in ("tool", "rated", "attempts")} == {
+        "tool": "creek.revoice",
+        "rated": False,
+        "attempts": 1,
+    }
     verify_mcp_audit_chain(vault)
 
 
@@ -439,11 +463,15 @@ def test_an_ai_draft_sample_cannot_supply_owner_voice(vault: Path) -> None:
     ],
     ids=["echo", "punctuation-and-a-word", "compression"],
 )
-def test_cosmetic_output_is_refused_after_one_bounded_retry(
+def test_a_light_touch_on_an_in_voice_passage_succeeds_first_time(
     vault: Path, output: str
 ) -> None:
-    """Regression: a near-copy is refused, never returned as the owner's voice."""
+    """The end state decides: few changed words is not a failure (#1945 follow-up).
+
+    The pre-rating gate refused every one of these as a copyedit.
+    """
     _skills(vault)
+    install_owner_fingerprint(vault)
     provider = _Provider(text=output)
     response = revoice_tool(
         vault_path=vault,
@@ -451,21 +479,65 @@ def test_cosmetic_output_is_refused_after_one_bounded_retry(
         llm_factory=provider.factory,
         register="conversational",
     )
-    assert response["status"] == "refused"
-    assert response["reason"] == "insufficient_transformation"
-    assert "text" not in response
-    assert "copyedit_only" in response["voice_check"]["diagnostics"]
-    assert response["voice_check"]["attempts"] == 2
+    assert response["status"] == "ok"
+    assert response["text"] == output
+    assert response["voice_check"]["voice_applied"] is True
+    assert response["voice_check"]["voice_rating"]["in_voice"] is True
+    assert response["voice_check"]["attempts"] == 1
+    assert len(provider.prompts) == 1
+
+
+def test_off_voice_output_is_returned_after_one_retry_and_logged(
+    vault: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Off-voice is never refused: retried once, returned, rated and warned."""
+    _skills(vault)
+    install_owner_fingerprint(vault)
+    provider = _Provider(text=SLOP)
+    with caplog.at_level(logging.WARNING, logger="creek.generate.ai_style.rating"):
+        response = revoice_tool(
+            vault_path=vault,
+            text=INPUT,
+            llm_factory=provider.factory,
+            register="conversational",
+        )
+    assert response["status"] == "ok"
+    assert response["text"] == SLOP
+    check = response["voice_check"]
+    assert check["voice_applied"] is False
+    assert check["diagnostics"] == ["off_voice"]
+    assert check["voice_rating"]["in_voice"] is False
+    assert "ai_vocab_density" in check["voice_rating"]["diverging"]
+    assert check["attempts"] == 2
     assert response["usage"] == {"input_tokens": 84, "output_tokens": 34}
-    assert len(provider.prompts) == 2
     assert "## What the previous attempt got wrong" not in provider.prompts[0][1]
-    assert "The attempt was a copyedit." in provider.prompts[1][1]
-    assert INPUT not in json.dumps(response)
+    retry = provider.prompts[1][1]
+    assert "The attempt read as generic prose, not my voice." in retry
+    assert "(over-use)" in retry
+    [rating] = _ledger(vault)
+    assert rating["in_voice"] is False
+    assert rating["attempts"] == 2
+    assert "off-voice result from creek.revoice" in caplog.text
+    assert INPUT not in json.dumps(response["voice_check"])
+    assert SLOP not in json.dumps(_ledger(vault))
+
+
+def test_the_better_rated_attempt_is_returned(vault: Path) -> None:
+    """When the retry is worse, the first attempt answers."""
+    _skills(vault)
+    install_owner_fingerprint(vault)
+    worse = SLOP + " Furthermore, it underscores a vibrant, multifaceted Friday."
+    provider = _Provider(texts=[SLOP, worse])
+    response = revoice_tool(vault_path=vault, text=INPUT, llm_factory=provider.factory)
+    assert response["status"] == "ok"
+    assert response["text"] == SLOP
+    assert response["voice_check"]["attempts"] == 2
 
 
 def test_fixture_failed_after_is_refused_end_to_end(vault: Path) -> None:
     """Acceptance: the reported Before/After pair is refused by the live path."""
     install_fixture_samples(vault)
+    install_owner_fingerprint(vault)
     provider = _Provider(text=FAILED_AFTER)
     response = revoice_tool(
         vault_path=vault,
@@ -473,10 +545,15 @@ def test_fixture_failed_after_is_refused_end_to_end(vault: Path) -> None:
         llm_factory=provider.factory,
         register="analytical",
     )
+    # It lost citations, which refuses; it is also off-voice, which alone would not.
     assert response["status"] == "refused"
-    assert response["reason"] == "insufficient_transformation"
-    assert response["voice_check"]["unchanged_sections"] == [0, 2]
-    assert "opening_unchanged" in response["voice_check"]["diagnostics"]
+    assert response["reason"] == "fidelity_violation"
+    assert "text" not in response
+    assert response["voice_check"]["diagnostics"] == [
+        "off_voice",
+        "citations_dropped",
+    ]
+    assert response["voice_check"]["voice_rating"]["in_voice"] is False
     assert response["voice_check"]["owner_samples"] == 3
     retry = provider.prompts[1][1]
     assert "## My own writing" in retry
@@ -492,6 +569,7 @@ def test_fixture_failed_after_is_refused_end_to_end(vault: Path) -> None:
 def test_fixture_owner_voiced_rewrite_passes_first_time(vault: Path) -> None:
     """Positive: a substantive owner-voiced rewrite returns ``ok`` in one call."""
     install_fixture_samples(vault)
+    install_owner_fingerprint(vault)
     provider = _Provider(text=OWNER_VOICED)
     response = revoice_tool(
         vault_path=vault,
@@ -504,7 +582,7 @@ def test_fixture_owner_voiced_rewrite_passes_first_time(vault: Path) -> None:
     check = response["voice_check"]
     assert check["voice_applied"] is True
     assert check["attempts"] == 1
-    assert check["style_distance_output"] < check["style_distance_source"]
+    assert check["voice_rating"]["voice_distance"] == 0.0
     first = provider.prompts[0][1]
     assert "## Owner style profile" in first
     assert "## My own writing" not in first
@@ -514,6 +592,7 @@ def test_fixture_owner_voiced_rewrite_passes_first_time(vault: Path) -> None:
 def test_a_rejected_first_attempt_can_succeed_on_the_retry(vault: Path) -> None:
     """The one retry is real: a passing second attempt returns ``ok``."""
     install_fixture_samples(vault)
+    install_owner_fingerprint(vault)
     provider = _Provider(texts=[FAILED_AFTER, OWNER_VOICED])
     response = revoice_tool(vault_path=vault, text=SOURCE, llm_factory=provider.factory)
     assert response["status"] == "ok"
@@ -640,20 +719,21 @@ def test_registered_tool_round_trip_and_desk_grant(vault: Path) -> None:
     )
     assert response["status"] == "ok"
     assert response["text"] == OUTPUT
-    assert response["voice_check"]["voice_applied"] is True
+    assert response["voice_check"]["voice_applied"] is None
     assert provider.prompts
 
 
 @pytest.mark.parametrize(
-    ("output", "status"), [(OUTPUT, "ok"), (INPUT, "refused")], ids=["ok", "refused"]
+    ("text", "status"), [(INPUT, "ok"), (LINKED, "refused")], ids=["ok", "refused"]
 )
 def test_detached_rewrite_is_readable_but_never_persisted(
-    vault: Path, monkeypatch: pytest.MonkeyPatch, output: str, status: str
+    vault: Path, monkeypatch: pytest.MonkeyPatch, text: str, status: str
 ) -> None:
-    """A detached verdict, success or voice refusal, is readable but unpersisted."""
+    """A detached verdict, success or fidelity refusal, is readable but unpersisted."""
     monkeypatch.setenv("CREEK_MCP_SYNC_DEADLINE_SECONDS", "0.01")
     _skills(vault)
-    provider = _Provider(text=output)
+    install_owner_fingerprint(vault)
+    provider = _Provider(text=OUTPUT)
     provider.gate = threading.Event()
     server = build_server(
         transport=Transport.STDIO,
@@ -662,7 +742,7 @@ def test_detached_rewrite_is_readable_but_never_persisted(
     )
 
     async def run() -> dict[str, Any]:
-        accepted = _structured(await server.call_tool("creek.revoice", {"text": INPUT}))
+        accepted = _structured(await server.call_tool("creek.revoice", {"text": text}))
         assert accepted["status"] == "accepted"
         provider.gate.set()
         for _ in range(200):
@@ -679,11 +759,11 @@ def test_detached_rewrite_is_readable_but_never_persisted(
     result = asyncio.run(run())
     body = result["result"]
     assert body["status"] == status
-    assert body["voice_check"]["voice_applied"] is (status == "ok")
+    assert body["voice_check"]["voice_applied"] is True
     if status == "ok":
         assert body["text"] == OUTPUT
     else:
-        assert body["reason"] == "insufficient_transformation"
+        assert body["reason"] == "fidelity_violation"
         assert "text" not in body
         assert body["voice_check"]["attempts"] == 2
     assert not (vault / "07-Voice").exists()
