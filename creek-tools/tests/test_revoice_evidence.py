@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -75,6 +76,40 @@ def install_fixture_samples(vault: Path) -> None:
         (FIXTURES / "owner-samples" / "personal.txt").read_text(),
         tier=PrivacyTier.PERSONAL,
     )
+
+
+OWNER_RULE_OF_THREE_RATE = 3.0
+"""The fixture owner's triads per 1000 words: their only non-zero habit."""
+
+
+def install_owner_fingerprint(vault: Path) -> Path:
+    """Persist the fixture owner's voice fingerprint (v3, 50 fragments).
+
+    Every measured rate is zero except triads, so the owner-voiced rewrite
+    scores ``0.0`` while ``failed_after.md``'s generic prose (AI vocabulary,
+    transition openers, didactic disclaimers) rates off-voice.
+    """
+    from creek.config import AIStyleConfig
+    from creek.generate.ai_style.features import FINGERPRINT_FEATURES
+    from creek.generate.ai_style.fingerprint import FINGERPRINT_VERSION
+
+    path = vault / AIStyleConfig().fingerprint_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rates = dict.fromkeys(FINGERPRINT_FEATURES, 0.0)
+    rates["rule_of_three_rate"] = OWNER_RULE_OF_THREE_RATE
+    path.write_text(
+        json.dumps(
+            {
+                "version": FINGERPRINT_VERSION,
+                "fragment_count": 50,
+                "features": {
+                    key: {"rate": rate, "support": 50} for key, rate in rates.items()
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 @pytest.fixture

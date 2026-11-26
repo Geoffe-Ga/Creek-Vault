@@ -20,8 +20,25 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.37.0"
+CONTRACT_VERSION: Final[str] = "0.38.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.38.0: ``creek.revoice`` is judged on its end state, not on how many words
+changed. Each rewrite is rated against the vault's voice fingerprint
+(``voice_distance`` against ``ai_style.voice_distance_upper``) and checked for
+fidelity (headings, citations). An off-voice rewrite gets the one bounded
+retry, then the better-rated attempt is **returned**, never refused:
+``voice_check.voice_applied`` is the rating's ``in_voice`` and the new
+``voice_check.voice_rating`` carries ``in_voice``, ``voice_distance``,
+``voice_distance_upper``, ``diverging`` and ``signature_gaps`` (closed
+feature keys only). Both are ``null`` when the vault has no usable
+fingerprint. ``voice_check`` loses ``rewritten_ratio``,
+``copied_sentence_ratio``, ``opening_similarity``, ``unchanged_sections``,
+``style_distance_source`` and ``style_distance_output``. The refusal reason
+``insufficient_transformation`` is retired; ``no_owner_voice`` and
+``fidelity_violation`` remain. Every rating is appended to the vault's
+content-free ``00-Creek-Meta/voice-ratings.jsonl`` for monitoring. No
+``/v1`` route, wire model or capability moves; ``0.37`` stays served.
 
 0.37.0 (#2147): ``GET /v1/pipeline/status`` counts the caller's whole corpus
 per stage. ``PipelineStatusResponse`` gains ``totals``: ``documents`` (every

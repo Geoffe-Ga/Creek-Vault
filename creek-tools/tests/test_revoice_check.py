@@ -1,10 +1,9 @@
-"""Creek, not its clients, decides whether a revoice actually applied a voice.
+"""Creek, not its clients, judges whether a revoice delivered the owner's voice.
 
-Regression for the 22 KB *Scattered Minds* analytical essay that came back
-``ok``. Its opening was nearly identical, its edits were citation removal,
-punctuation, spelling and compression, and one section was generically
-rewritten, giving it a large aggregate diff. ``tests/fixtures/revoice/``
-reproduces that pair (see its README).
+Judged on the end state: the finished rewrite's rating against the vault's
+voice fingerprint, plus fidelity (headings and citations survive). Changed
+words are not counted. Regression fixtures for the 22 KB *Scattered Minds*
+analytical essay live in ``tests/fixtures/revoice/`` (see its README).
 """
 
 from __future__ import annotations
@@ -15,13 +14,10 @@ from pathlib import Path
 import pytest
 
 from creek.author.revoice_check import (
-    MIN_REWRITTEN_RATIO,
     Diagnostic,
     RevoiceReason,
     check_revoice,
-    copied_sentence_ratio,
     main,
-    rewritten_ratio,
 )
 from creek.author.revoice_style import (
     StyleVector,
@@ -29,12 +25,11 @@ from creek.author.revoice_style import (
     headings,
     render_profile,
     sentences,
-    split_sections,
-    style_distance,
     style_vector,
     tokens,
 )
-from tests.test_revoice_evidence import install_fixture_samples
+from creek.generate.ai_style.rating import VoiceRating, load_voice_scorer
+from tests.test_revoice_evidence import install_owner_fingerprint
 
 FIXTURES = Path(__file__).parent / "fixtures" / "revoice"
 SOURCE = (FIXTURES / "source.md").read_text()
@@ -53,127 +48,95 @@ def owner() -> StyleVector:
     )
 
 
-def test_the_failed_after_is_refused_as_insufficient_transformation(
-    owner: StyleVector,
-) -> None:
+@pytest.fixture
+def rate(tmp_path: Path):
+    """Rate text against the fixture owner's fingerprint."""
+    install_owner_fingerprint(tmp_path)
+    scorer = load_voice_scorer(tmp_path)
+    assert scorer is not None
+    return scorer.rate
+
+
+def test_the_failed_after_rates_off_voice_and_loses_citations(rate) -> None:
     """Acceptance: the reported failure is not a successful revoice."""
-    check = check_revoice(SOURCE, FAILED_AFTER, owner=owner)
-    assert check.reason is RevoiceReason.INSUFFICIENT_TRANSFORMATION
-    assert check.diagnostics == (
-        Diagnostic.OPENING_UNCHANGED,
-        Diagnostic.SECTION_UNCHANGED,
-        Diagnostic.COPYEDIT_ONLY,
-        Diagnostic.NO_STYLE_SHIFT,
-        Diagnostic.CITATIONS_DROPPED,
-    )
-    assert check.as_dict()["unchanged_sections"] == [0, 2]
+    check = check_revoice(SOURCE, FAILED_AFTER, rating=rate(FAILED_AFTER))
+    assert check.diagnostics == (Diagnostic.OFF_VOICE, Diagnostic.CITATIONS_DROPPED)
+    assert check.reason is RevoiceReason.FIDELITY_VIOLATION
+    assert check.as_dict()["voice_applied"] is False
+    rating = check.as_dict()["voice_rating"]
+    assert rating["voice_distance"] > rating["voice_distance_upper"]
+    assert "ai_vocab_density" in rating["diverging"]
 
 
-def test_the_failed_after_would_pass_a_raw_diff_criterion(owner: StyleVector) -> None:
-    """Why the gate cannot be a raw diff: this failure clears that floor."""
-    check = check_revoice(SOURCE, FAILED_AFTER, owner=owner)
-    assert check.rewritten_ratio > MIN_REWRITTEN_RATIO
-    rewritten_section = check.sections[1]
-    assert not rewritten_section.unchanged
-    assert rewritten_section.rewritten_ratio > 0.6
-
-
-def test_a_strong_section_cannot_hide_unchanged_ones(owner: StyleVector) -> None:
-    """Each section is judged on its own; the opening is judged too."""
-    check = check_revoice(SOURCE, FAILED_AFTER, owner=owner)
-    assert [s.unchanged for s in check.sections] == [True, False, True]
-    assert check.opening_similarity >= 0.95
-
-
-def test_a_genuinely_owner_voiced_rewrite_passes(owner: StyleVector) -> None:
-    """Positive case: same claims, headings and citations; the owner's cadence."""
-    check = check_revoice(SOURCE, OWNER_VOICED, owner=owner)
+def test_a_genuinely_owner_voiced_rewrite_is_clean(rate) -> None:
+    """Positive case: same claims, headings and citations; the owner's voice."""
+    check = check_revoice(SOURCE, OWNER_VOICED, rating=rate(OWNER_VOICED))
+    assert check.clean
     assert check.reason is None
-    assert check.diagnostics == ()
-    assert check.copied_sentence_ratio == pytest.approx(0.0)
-    assert check.style_distance_output is not None
-    assert check.style_distance_source is not None
-    assert check.style_distance_output < check.style_distance_source * 0.6
+    assert check.as_dict()["voice_applied"] is True
+    assert check.distance == 0.0
+
+
+def test_an_echo_of_an_in_voice_passage_succeeds(rate) -> None:
+    """The end state decides, not the edit: an unchanged owner passage is in voice.
+
+    The pre-rating gate refused this as a copyedit.
+    """
+    check = check_revoice(OWNER_VOICED, OWNER_VOICED, rating=rate(OWNER_VOICED))
+    assert check.clean
     assert check.as_dict()["voice_applied"] is True
 
 
-def test_generic_model_prose_does_not_count_as_the_owner(owner: StyleVector) -> None:
-    """A fluent rewrite that moves away from the owner fails the style shift."""
-    source = split_sections(SOURCE)[1]
-    generic = split_sections(FAILED_AFTER)[1]
-    check = check_revoice(source, generic, owner=owner)
-    assert check.reason is RevoiceReason.INSUFFICIENT_TRANSFORMATION
-    assert check.diagnostics == (
-        Diagnostic.NO_STYLE_SHIFT,
-        Diagnostic.CITATIONS_DROPPED,
-    )
+def test_off_voice_is_reported_but_never_refused(rate) -> None:
+    """A faithful rewrite in generic prose is diagnosed, not refused."""
+    generic = OWNER_VOICED + "\n\nMoreover, we must delve into this rich tapestry."
+    check = check_revoice(SOURCE, generic, rating=rate(generic))
+    assert check.diagnostics == (Diagnostic.OFF_VOICE,)
+    assert check.reason is None
+    assert not check.clean
+    assert check.as_dict()["voice_applied"] is False
 
 
-@pytest.mark.parametrize(
-    "edit",
-    [
-        lambda text: text.replace("behaviour", "behavior").replace(";", "."),
-        lambda text: text.replace(" (Maté, 1999)", "").replace(" [1]", ""),
-        lambda text: "\n\n".join(text.split("\n\n")[::2]),
-    ],
-    ids=["spelling-and-punctuation", "citation-cleanup", "compression"],
-)
-def test_cosmetic_edits_cannot_satisfy_the_gate(
-    edit: object, owner: StyleVector
-) -> None:
-    """Copyediting, citation cleanup and shortening are never a voice."""
-    assert callable(edit)
-    check = check_revoice(SOURCE, edit(SOURCE), owner=owner)
-    assert check.reason is RevoiceReason.INSUFFICIENT_TRANSFORMATION
-    assert Diagnostic.OPENING_UNCHANGED in check.diagnostics
-
-
-def test_identity_reports_every_transformation_finding(owner: StyleVector) -> None:
-    """An echo fails every transformation check and no fidelity check."""
-    check = check_revoice(SOURCE, SOURCE, owner=owner)
-    assert check.diagnostics == (
-        Diagnostic.OPENING_UNCHANGED,
-        Diagnostic.SECTION_UNCHANGED,
-        Diagnostic.COPYEDIT_ONLY,
-        Diagnostic.NO_STYLE_SHIFT,
-    )
-
-
-def test_fidelity_alone_is_its_own_reason() -> None:
-    """A real rewrite that loses a heading is a fidelity violation."""
+def test_fidelity_alone_is_its_own_reason(rate) -> None:
+    """An in-voice rewrite that loses a heading is a fidelity violation."""
     output = OWNER_VOICED.replace("## What Follows From This", "## So What?")
-    check = check_revoice(SOURCE, output, owner=None)
+    check = check_revoice(SOURCE, output, rating=rate(output))
     assert check.reason is RevoiceReason.FIDELITY_VIOLATION
     assert check.diagnostics == (Diagnostic.HEADINGS_CHANGED,)
-    assert len(check.sections) == 1  # misaligned headings: judged as a whole
 
 
-def test_without_a_profile_the_style_shift_is_not_measured() -> None:
-    """Skill-only grounding is judged on transformation and fidelity alone."""
-    check = check_revoice(SOURCE, OWNER_VOICED, owner=None)
-    assert check.reason is None
-    assert check.style_distance_output is None
+def test_an_unrated_rewrite_is_judged_on_fidelity_only() -> None:
+    """Without a fingerprint nothing is claimed about the voice."""
+    check = check_revoice(SOURCE, OWNER_VOICED, rating=None)
+    assert check.clean
+    assert check.distance == 0.0
+    assert check.as_dict() == {
+        "voice_applied": None,
+        "diagnostics": [],
+        "voice_rating": None,
+    }
 
 
-def test_rewritten_ratio_counts_only_new_words() -> None:
-    """Deletion is not rewriting; an empty output divides by nothing."""
-    assert rewritten_ratio(SOURCE, "\n\n".join(SOURCE.split("\n\n")[:2])) == 0.0
-    assert rewritten_ratio(SOURCE, "") == 0.0
-    assert copied_sentence_ratio(SOURCE, "") == 0.0
+def test_the_boundary_is_inclusive() -> None:
+    """A rating exactly at the ceiling is in voice."""
+    at = VoiceRating(0.35, 0.35, (), ())
+    over = VoiceRating(0.3501, 0.35, ("ai_vocab_density",), ())
+    assert check_revoice(SOURCE, OWNER_VOICED, rating=at).clean
+    assert check_revoice(SOURCE, OWNER_VOICED, rating=over).diagnostics == (
+        Diagnostic.OFF_VOICE,
+    )
 
 
-def test_verdict_projection_is_content_free(owner: StyleVector) -> None:
+def test_verdict_projection_is_content_free(rate) -> None:
     """The wire shape carries numbers and closed codes, never prose."""
-    payload = check_revoice(SOURCE, FAILED_AFTER, owner=owner).as_dict()
-    assert set(payload) == {
-        "voice_applied",
-        "diagnostics",
-        "rewritten_ratio",
-        "copied_sentence_ratio",
-        "opening_similarity",
-        "unchanged_sections",
-        "style_distance_source",
-        "style_distance_output",
+    payload = check_revoice(SOURCE, FAILED_AFTER, rating=rate(FAILED_AFTER)).as_dict()
+    assert set(payload) == {"voice_applied", "diagnostics", "voice_rating"}
+    assert set(payload["voice_rating"]) == {
+        "in_voice",
+        "voice_distance",
+        "voice_distance_upper",
+        "diverging",
+        "signature_gaps",
     }
     assert "Maté" not in json.dumps(payload)
     assert "attention" not in json.dumps(payload).lower()
@@ -220,7 +183,6 @@ def test_style_vector_measures_cadence_and_habits() -> None:
     empty = style_vector("")
     assert empty.words == 0
     assert empty.mean_sentence_words == 0.0
-    assert style_distance(empty, empty) == 0.0
 
 
 def test_profile_rendering_carries_no_owner_words(owner: StyleVector) -> None:
@@ -234,12 +196,24 @@ def test_profile_rendering_carries_no_owner_words(owner: StyleVector) -> None:
 def test_local_command_reports_the_verdict(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``python -m creek.author.revoice_check`` judges a local pair."""
-    install_fixture_samples(tmp_path)
+    """``python -m creek.author.revoice_check`` rates a local pair."""
+    install_owner_fingerprint(tmp_path)
     source, after = str(FIXTURES / "source.md"), str(FIXTURES / "failed_after.md")
     assert main([source, after, "--vault", str(tmp_path)]) == 1
     report = json.loads(capsys.readouterr().out)
-    assert report["reason"] == "insufficient_transformation"
-    assert report["voice_check"]["style_distance_output"] is not None
-    assert main([source, str(FIXTURES / "owner_voiced.md")]) == 0
-    assert json.loads(capsys.readouterr().out)["reason"] is None
+    assert report["reason"] == "fidelity_violation"
+    assert report["voice_check"]["voice_applied"] is False
+    assert report["voice_check"]["voice_rating"]["in_voice"] is False
+    voiced = str(FIXTURES / "owner_voiced.md")
+    assert main([source, voiced, "--vault", str(tmp_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["voice_check"]["voice_applied"] is True
+
+
+def test_local_command_without_a_fingerprint_is_unrated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No fingerprint: the pair is checked for fidelity only and left unrated."""
+    source, voiced = str(FIXTURES / "source.md"), str(FIXTURES / "owner_voiced.md")
+    assert main([source, voiced, "--vault", str(tmp_path)]) == 0
+    check = json.loads(capsys.readouterr().out)["voice_check"]
+    assert check == {"voice_applied": None, "diagnostics": [], "voice_rating": None}

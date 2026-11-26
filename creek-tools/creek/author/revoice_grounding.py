@@ -12,9 +12,11 @@ sounding like the owner. Grounding therefore comes from one of two sources:
   :func:`creek.generate.voice.load_owner_voice_samples`.
 
 From the samples comes a numeric :class:`~creek.author.revoice_style.StyleVector`
-profile. It is used in the prompt and by the quality gate, and it carries no
-owner words. Short excerpts are added only on the one stronger retry, and only
-from samples already admitted at the caller's ceiling.
+profile. It is used in the prompt, and it carries no owner words. The gate
+itself rates the finished rewrite against the vault's voice fingerprint
+(:mod:`creek.author.revoice_check`). Short excerpts are added only on the
+one stronger retry, and only from samples already admitted at the caller's
+ceiling.
 """
 
 from __future__ import annotations
@@ -41,20 +43,10 @@ MAX_EXCERPT_CHARS: Final = 600
 """Characters kept from each excerpt, cut back to a sentence end."""
 
 RETRY_FEEDBACK: Final[dict[Diagnostic, str]] = {
-    Diagnostic.OPENING_UNCHANGED: (
-        "The opening was nearly a copy of the source. Rewrite the opening "
-        "sentences in my voice."
-    ),
-    Diagnostic.SECTION_UNCHANGED: (
-        "At least one section was left essentially unchanged. Rewrite every "
-        "section, not only some."
-    ),
-    Diagnostic.COPYEDIT_ONLY: (
-        "The attempt was a copyedit. Rebuild the sentences rather than polishing them."
-    ),
-    Diagnostic.NO_STYLE_SHIFT: (
-        "The attempt read as generic prose. Match the owner style profile and "
-        "the samples of my own writing."
+    Diagnostic.OFF_VOICE: (
+        "The attempt read as generic prose, not my voice. Match the owner style "
+        "profile and the samples of my own writing, and repair the voice "
+        "divergences listed here."
     ),
     Diagnostic.HEADINGS_CHANGED: "A heading changed. Keep every heading exactly.",
     Diagnostic.CITATIONS_DROPPED: (

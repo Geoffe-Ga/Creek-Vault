@@ -4,9 +4,10 @@ Two consumers need the same view of a passage:
 
 * the **owner profile** (:class:`StyleVector` over owner-authored samples),
   rendered into the prompt as numeric, source-free style guidance; and
-* the **quality gate** (:mod:`creek.author.revoice_check`), which compares
-  source, rewrite and owner on those same axes, sentence by sentence and
-  section by section.
+* the **fidelity check** (:mod:`creek.author.revoice_check`), which compares
+  the source's and rewrite's headings and citation apparatus. Whether the
+  rewrite reads as the owner is judged by the vault's voice fingerprint
+  instead (:mod:`creek.generate.ai_style.rating`).
 
 Measurements run on *prose*: headings, citations, footnotes and link targets
 are scholarly apparatus that a revoice must preserve. They say nothing about
@@ -18,7 +19,6 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from itertools import pairwise
 from typing import Final
 
 _FOOTNOTE_DEFINITION: Final = re.compile(r"^\[\^[^\]]+\]:.*$", re.MULTILINE)
@@ -87,21 +87,6 @@ def sentences(text: str) -> list[str]:
     return [part for part in _SENTENCE_END.split(flat) if _WORD.search(part)]
 
 
-def split_sections(text: str) -> list[str]:
-    """Split *text* at Markdown headings; the opening is section zero.
-
-    Args:
-        text: Markdown prose.
-
-    Returns:
-        The opening (possibly empty) followed by one entry per heading, each
-        starting with its heading line.
-    """
-    starts = [match.start() for match in _HEADING.finditer(text)]
-    bounds = [0, *starts, len(text)]
-    return [text[a:b] for a, b in pairwise(bounds)]
-
-
 @dataclass(frozen=True)
 class StyleVector:
     """Cadence, sentence construction and habit rates of one passage.
@@ -128,22 +113,6 @@ class StyleVector:
     first_person_per_k: float
     contractions_per_k: float
     words: int
-
-
-_SCALES: Final[dict[str, float]] = {
-    "mean_sentence_words": 6.0,
-    "sentence_length_spread": 0.3,
-    "short_sentence_share": 0.2,
-    "question_share": 0.1,
-    "em_dashes_per_k": 5.0,
-    "parentheticals_per_k": 5.0,
-    "first_person_per_k": 15.0,
-    "contractions_per_k": 10.0,
-}
-"""Difference on each axis that counts as one unit of style distance."""
-
-_MAX_AXIS_DISTANCE: Final = 3.0
-"""Cap per axis, so one extreme habit cannot dominate the distance."""
 
 
 def _per_k(count: int, words: int) -> float:
@@ -185,18 +154,6 @@ def style_vector(text: str) -> StyleVector:
         contractions_per_k=_per_k(sum("'" in w for w in words), count),
         words=count,
     )
-
-
-def style_distance(a: StyleVector, b: StyleVector) -> float:
-    """Return the mean scaled, capped per-axis difference between two passages."""
-    gaps = [
-        min(
-            abs(float(getattr(a, axis)) - float(getattr(b, axis))) / scale,
-            _MAX_AXIS_DISTANCE,
-        )
-        for axis, scale in _SCALES.items()
-    ]
-    return sum(gaps) / len(gaps)
 
 
 def render_profile(profile: StyleVector) -> str:
