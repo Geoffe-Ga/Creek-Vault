@@ -302,6 +302,10 @@ def build_letter_prompt(
     return f"{CARE_POLICY}\n\n{head}\n\n{material}"
 
 
+LETTER_RATING_TOOL: Final = "creek.letter"
+"""The writing path an owner-voiced letter's rating is logged under."""
+
+
 def letter_voice(record: VoiceDraftRecord) -> ReplyVoice:
     """Return the voice a stored letter was written in.
 
@@ -460,7 +464,28 @@ def _admitted_outcome(call: LetterCall, source: LetterSource) -> LetterOutcome:
     letter = _generate(call, source, style)
     if isinstance(letter, LetterRefusal):
         return letter
-    return _store(call, source, letter, style.voice)
+    stored = _store(call, source, letter, style.voice)
+    if style.voice is ReplyVoice.OWNER and not isinstance(stored, LetterRefusal):
+        _log_voice_rating(call.vault_path, letter)
+    return stored
+
+
+def _log_voice_rating(vault_path: Path, letter: str) -> None:
+    """Rate an owner-voiced letter and append it to the voice-ratings ledger.
+
+    Monitoring only: nothing is refused or returned, and the wire shape is
+    unchanged. Only letters written in the owner's style are rated; the
+    generic Higher Self voice is not meant to match the owner's fingerprint.
+    Imported here for the same cold-start reason as :func:`_letter_style`.
+    """
+    from creek.generate.ai_style.rating import load_voice_scorer, record_voice_rating
+
+    scorer = load_voice_scorer(vault_path)
+    record_voice_rating(
+        vault_path,
+        tool=LETTER_RATING_TOOL,
+        rating=None if scorer is None else scorer.rate(letter),
+    )
 
 
 def write_letter(call: LetterCall, source: LetterSource) -> LetterOutcome:

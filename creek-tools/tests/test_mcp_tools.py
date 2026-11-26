@@ -1147,3 +1147,52 @@ def test_author_tool_wraps_desk_errors(
     assert result["tier_ceiling_enforced"] is False
     assert result["reason"] == AUTHOR_PROVIDER_FAILED_REASON
     assert "provider unavailable" not in result["reason"]
+
+
+@pytest.mark.parametrize(
+    ("body", "in_voice"),
+    [
+        ("I went to the shop. It was shut. I walked home and made tea.", True),
+        (
+            "Moreover, we must delve into the rich tapestry of this journey. It is "
+            "a testament to resilience, and we delve deeper into the tapestry.",
+            False,
+        ),
+    ],
+    ids=["in-voice", "off-voice"],
+)
+def test_author_tool_reports_and_logs_the_end_state_voice_rating(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, body: str, in_voice: bool
+) -> None:
+    """The desk's body is rated, never refused for voice, and logged."""
+    from creek.author import AuthoredDraft
+    from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
+    from creek_mcp.tools.author import save_authored_draft
+    from tests.test_revoice_evidence import install_owner_fingerprint
+
+    install_owner_fingerprint(vault)
+
+    def desk(**_kwargs: object) -> AuthoredDraft:
+        return AuthoredDraft(
+            medium="research", query="q", body=body, verdict="PASS", rounds=2
+        )
+
+    monkeypatch.setattr("creek_mcp.tools.author.run_author", desk)
+
+    response = author_tool(
+        vault_path=vault, query="q", medium="research", consumer="test"
+    )
+
+    assert response["status"] == "ok"
+    assert response["body"] == body
+    assert response["voice_rating"]["in_voice"] is in_voice
+    [entry] = [
+        json.loads(line)
+        for line in (vault / VOICE_RATINGS_RELPATH).read_text().splitlines()
+    ]
+    assert entry["tool"] == "creek.author"
+    assert entry["attempts"] == 2
+    assert entry["in_voice"] is in_voice
+    assert body not in json.dumps(entry)
+    saved = save_authored_draft(vault, response)
+    assert frontmatter.load(saved)["voice_rating"] == response["voice_rating"]

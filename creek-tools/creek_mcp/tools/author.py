@@ -42,6 +42,11 @@ from creek.classify.llm.providers import (
     RequestKeyRejectedError,
 )
 from creek.classify.llm.router import IntimateRoutingError
+from creek.generate.ai_style.rating import (
+    VOICE_RATING_KEY,
+    load_voice_scorer,
+    record_voice_rating,
+)
 from creek.generate.drafts import INFERENCE_SOURCE_FRONTMATTER_KEY, reserve_draft_path
 from creek.models import PrivacyTier
 from creek.progress import CompositionStage, StageCallback, ignore_stage
@@ -447,7 +452,23 @@ def author_tool(
     source = None if provenance is None else provenance.source
     if response["status"] == "ok" and source is not None:
         response[INFERENCE_SOURCE_FRONTMATTER_KEY] = source
+    if response["status"] == "ok":
+        response[VOICE_RATING_KEY] = _rate_and_log(vault_path, draft)
     return response
+
+
+def _rate_and_log(vault_path: Path, draft: AuthoredDraft) -> dict[str, Any] | None:
+    """Rate the desk's finished body, log it, and return the rating mapping.
+
+    Off-voice is reported and logged, never refused. ``None`` when the
+    vault's voice cannot be judged.
+    """
+    scorer = load_voice_scorer(vault_path)
+    rating = None if scorer is None else scorer.rate(draft.body)
+    record_voice_rating(
+        vault_path, tool=TOOL_NAME, rating=rating, attempts=max(draft.rounds, 1)
+    )
+    return None if rating is None else rating.as_dict()
 
 
 def _desk_failure_reason(exc: Exception) -> str:
@@ -515,6 +536,8 @@ def save_authored_draft(vault_path: Path, response: dict[str, Any]) -> Path:
         generated_date=generated.isoformat(),
         privacy_tier=_saved_tier(response).value,
     )
+    if response.get(VOICE_RATING_KEY) is not None:
+        post[VOICE_RATING_KEY] = response[VOICE_RATING_KEY]
     if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
         post[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[
             INFERENCE_SOURCE_FRONTMATTER_KEY
@@ -606,6 +629,7 @@ def author_job_result(
         "claim_count": len(response["claims"]),
         "source_count": len(_cited_fragment_ids(response)),
         "warnings": list(response["warnings"]),
+        "voice_rating": response.get(VOICE_RATING_KEY),
     }
     if INFERENCE_SOURCE_FRONTMATTER_KEY in response:
         result[INFERENCE_SOURCE_FRONTMATTER_KEY] = response[

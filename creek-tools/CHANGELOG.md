@@ -9,6 +9,18 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Every essay writing path reports its end-state voice rating, and logs
+  off-voice instead of refusing it (contract 0.39).** `creek.draft`,
+  `creek.author` and `creek.mission` responses (and draft/author job results)
+  gain `voice_rating`; saved drafts and missions carry it in frontmatter, and
+  each rating goes to `00-Creek-Meta/voice-ratings.jsonl`. Owner-voiced
+  letters are rated into the ledger with no wire change. `creek.draft` over
+  MCP now runs the voice-fidelity guard like `creek draft`: it was never
+  given the owner's fingerprint, so every MCP draft read `skipped:disabled`.
+  The ledger now appends through `creek.audit.log.append_locked_line`, the
+  MCP audit log's per-path thread lock plus `flock`, so the writers sharing it
+  never interleave a line (#2168).
+
 - **`creek.revoice` is judged on its end state, and off-voice is logged, not
   refused (contract 0.38).** The 0.30 gate counted changed words, rebuilt
   sentences and a changed opening. It refused a light touch on a passage that

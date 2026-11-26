@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, ClassVar
 
@@ -3967,3 +3968,100 @@ class TestDraftLoadersStepOverUnreadableNotes:
             encoding="utf-8",
         )
         return path
+
+
+class TestEndStateVoiceRating:
+    """Every saved draft carries its end-state voice rating, and it is logged.
+
+    Off-voice is recorded for monitoring, never refused: the draft is saved
+    either way.
+    """
+
+    def test_an_off_voice_draft_is_saved_stamped_and_logged(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """The tropey body rates off-voice, yet the file is written."""
+        from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
+
+        gen = DraftGenerator(
+            llm=llm_echo,
+            skills_root=skills_root,
+            fingerprint=_voice_fingerprint(),
+            ai_style_config=AIStyleConfig(),
+            voice_guard_no_llm=True,
+        )
+        path = gen.save_draft(_tropey_draft(), vault)
+
+        rating = frontmatter.load(str(path)).metadata["voice_rating"]
+        assert rating["in_voice"] is False
+        assert rating["voice_distance"] > rating["voice_distance_upper"]
+        assert rating["diverging"]
+        [entry] = [
+            json.loads(line)
+            for line in (vault / VOICE_RATINGS_RELPATH).read_text().splitlines()
+        ]
+        assert entry["tool"] == "creek draft"
+        assert entry["artifact"] == path.relative_to(vault).as_posix()
+        assert entry["in_voice"] is False
+        assert _TROPEY_BODY not in json.dumps(entry)
+
+    def test_an_in_voice_outline_draft_is_stamped_in_voice(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """The outline path rates too; plain prose sits at zero."""
+        gen = DraftGenerator(
+            llm=llm_echo,
+            skills_root=skills_root,
+            fingerprint=_voice_fingerprint(),
+            ai_style_config=AIStyleConfig(),
+            voice_guard_no_llm=True,
+        )
+        rating = gen._voice_rating("I went to the shop. It was shut. I walked home.")
+        assert rating is not None
+        assert rating.in_voice
+        assert rating.voice_distance == 0.0
+
+    def test_an_unmeasurable_vault_stamps_nothing_and_logs_unrated(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """No fingerprint: no rating key, never a false in-voice claim."""
+        from creek.generate.ai_style.rating import VOICE_RATINGS_RELPATH
+
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        path = gen.save_draft(_tropey_draft(), vault)
+
+        assert "voice_rating" not in frontmatter.load(str(path)).metadata
+        [entry] = [
+            json.loads(line)
+            for line in (vault / VOICE_RATINGS_RELPATH).read_text().splitlines()
+        ]
+        assert entry["rated"] is False
+
+    @pytest.mark.parametrize(
+        "config",
+        [AIStyleConfig(enabled=False), AIStyleConfig(min_fingerprint_fragments=50)],
+        ids=["disabled", "thin"],
+    )
+    def test_a_disabled_or_thin_scorer_rates_nothing(
+        self,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+        config: AIStyleConfig,
+    ) -> None:
+        """The same conditions the guard skips under."""
+        gen = DraftGenerator(
+            llm=llm_echo,
+            skills_root=skills_root,
+            fingerprint=_voice_fingerprint(),
+            ai_style_config=config,
+        )
+        assert gen._voice_rating(_TROPEY_BODY) is None

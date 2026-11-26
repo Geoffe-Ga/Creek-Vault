@@ -448,6 +448,35 @@ To judge a local pair the same way, run
 `python -m creek.author.revoice_check SOURCE OUTPUT --vault VAULT`. It prints
 the verdict and exits `0` (clean) or `1` (off-voice or lost apparatus).
 
+### The end-state voice rating on every writing tool (contracts 0.38, 0.39)
+
+Every tool that writes in the owner's voice is judged the same way: the
+finished text's `voice_distance` against the vault's voice fingerprint
+(`creek report --type fingerprint`), held against
+`ai_style.voice_distance_upper`. The rating is
+`voice_rating: {in_voice, voice_distance, voice_distance_upper, diverging,
+signature_gaps}`, numbers and closed feature keys only, or `null` when the
+vault has no usable fingerprint (none built, thinner than
+`min_fingerprint_fragments`, or `ai_style.enabled: false`).
+
+| Tool | Where the rating appears |
+|---|---|
+| `creek.revoice` | `voice_check.voice_rating`, and `voice_check.voice_applied` |
+| `creek.draft` | `voice_rating` on the response, its job result, and the saved draft's frontmatter |
+| `creek.author` | `voice_rating` on the response, its job result, and a detached run's saved draft |
+| `creek.mission` | `voice_rating` on the response |
+| Letters (`PUT /v1/voice-drafts/{id}`) | the ledger only, and only for a letter written in the owner's own style |
+
+**Off-voice is never refused.** It is reported, and every rating is appended
+to `00-Creek-Meta/voice-ratings.jsonl` (one JSON line: `timestamp`, `tool`,
+`rated`, `attempts`, the rating fields, and a vault-relative `artifact` path
+when something was saved), with a `WARNING` from
+`creek.generate.ai_style.rating` when the text is off-voice. Monitor and alert
+on the ledger. The tools that already had a bounded voice pass keep it:
+revoice's one retry, the draft guard's one rewrite (now also over MCP; before
+0.39 `creek.draft` never received the fingerprint and always read
+`skipped:disabled`), and the desk's reflection rounds.
+
 ### Author from vault evidence
 
 Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
@@ -574,9 +603,9 @@ edge drops an idle connection long before a cold model finishes). So
   has succeeded. `result` is the composing tool's success envelope with every
   content-bearing key dropped — for `creek.draft`: `status`, `tool`,
   `tier_ceiling`, `draft_path`, `idea_strategy`, `source_count`,
-  `voice_guard_status`; for `creek.author`: `status`, `tool`, `tier_ceiling`,
-  `medium`, `verdict`, `rounds`, `draft_path`, `claim_count`, `source_count`,
-  `warnings`. Never the body, title, query, claims or fragment ids. A refused
+  `voice_guard_status`, `voice_rating`; for `creek.author`: `status`, `tool`,
+  `tier_ceiling`, `medium`, `verdict`, `rounds`, `draft_path`, `claim_count`,
+  `source_count`, `warnings`, `voice_rating`. Never the body, title, query, claims or fragment ids. A refused
   or failed composition is `state: "failed"` with no `result`, as on `/v1`.
   The synchronous `creek.draft` envelope gained `source_count` and
   `voice_guard_status` alongside its existing keys.

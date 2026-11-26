@@ -208,3 +208,49 @@ class TestLedger:
             record_voice_rating(tmp_path, tool="creek.revoice", rating=None)
 
         assert "could not record a voice rating for creek.revoice" in caplog.text
+
+
+def test_concurrent_appends_never_interleave(tmp_path: Path) -> None:
+    """Many writers, one ledger: every line whole, none lost (#2168)."""
+    import threading
+
+    writers = 16
+    per_writer = 25
+    rating = VoiceRating(0.1, 0.35, ("a" * 200,), ("b" * 200,))
+    start = threading.Barrier(writers)
+
+    def write() -> None:
+        start.wait()
+        for _ in range(per_writer):
+            record_voice_rating(tmp_path, tool="creek.revoice", rating=rating)
+
+    threads = [threading.Thread(target=write) for _ in range(writers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    entries = _ledger(tmp_path)
+    assert len(entries) == writers * per_writer
+    assert {entry["diverging"][0] for entry in entries} == {"a" * 200}
+
+
+def test_the_ledger_appends_through_the_shared_locked_primitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One locked-append helper for every JSONL log, not a second copy."""
+    calls: list[str] = []
+    import creek.audit.log as audit_log
+
+    real = audit_log.append_locked_line
+
+    def spy(path: Path, line: str) -> None:
+        calls.append(path.name)
+        real(path, line)
+
+    monkeypatch.setattr(audit_log, "append_locked_line", spy)
+
+    record_voice_rating(tmp_path, tool="creek.revoice", rating=None)
+
+    assert calls == ["voice-ratings.jsonl"]
+    assert len(_ledger(tmp_path)) == 1

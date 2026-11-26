@@ -91,6 +91,17 @@ Two defects compounded:
 
 ## Verification
 
+> **Retired in contract 0.38 (2026-11-26, #2167).** The diagnostics this
+> section names (`opening_unchanged`, `section_unchanged`, `copyedit_only`,
+> `no_style_shift`) and the `insufficient_transformation` reason no longer
+> exist. Revoice is now judged on its end state, the finished rewrite's voice
+> rating against the vault's fingerprint, plus the unchanged fidelity check.
+> An off-voice rewrite is returned and logged, never refused. See
+> [`docs/mcp.md`](../mcp.md#owner-grounding-and-the-end-state-voice-rating-contracts-030-038)
+> for the current checks and the exit codes of
+> `python -m creek.author.revoice_check`. The steps below are kept as the
+> record of how the 0.30 gate was verified.
+
 `tests/fixtures/revoice/` reproduces the failed pair (the real artifacts are
 outside the repository, per FEAT-019). The failed After clears a 25%
 raw-diff floor (33% new words) yet is refused with `opening_unchanged`,

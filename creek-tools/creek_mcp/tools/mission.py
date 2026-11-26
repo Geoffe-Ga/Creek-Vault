@@ -44,6 +44,11 @@ from creek.classify.llm.router import IntimateRoutingError
 from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
 from creek.generate.ai_style.fingerprint import load_fingerprint
 from creek.generate.ai_style.preamble import build_style_preamble
+from creek.generate.ai_style.rating import (
+    VOICE_RATING_KEY,
+    load_voice_scorer,
+    record_voice_rating,
+)
 from creek.generate.drafts import INFERENCE_SOURCE_FRONTMATTER_KEY
 from creek.generate.mission import (
     DEFAULT_MISSION_LIMIT,
@@ -195,10 +200,28 @@ def _ok_response(
         "source_fragments": [source.fragment_id for source in result.sources],
         "source_count": len(result.sources),
         "value_count": len(result.document.values),
+        VOICE_RATING_KEY: _rate_and_log(vault_path, result),
     }
     if provenance is not None and provenance.source is not None:
         response[INFERENCE_SOURCE_FRONTMATTER_KEY] = provenance.source
     return response
+
+
+def _rate_and_log(vault_path: Path, result: MissionResult) -> dict[str, Any] | None:
+    """Rate the saved mission's markdown, log it, and return the rating mapping.
+
+    Off-voice is reported and logged, never refused. ``None`` when the
+    vault's voice cannot be judged.
+    """
+    scorer = load_voice_scorer(vault_path)
+    rating = None if scorer is None else scorer.rate(result.markdown)
+    record_voice_rating(
+        vault_path,
+        tool=TOOL_NAME,
+        rating=rating,
+        artifact=result.path.relative_to(vault_path).as_posix(),
+    )
+    return None if rating is None else rating.as_dict()
 
 
 def _write(

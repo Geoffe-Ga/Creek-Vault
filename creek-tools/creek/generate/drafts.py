@@ -58,6 +58,12 @@ from creek.generate.ai_style.guard import (
     run_voice_fidelity_guard,
     status_in_words,
 )
+from creek.generate.ai_style.rating import (
+    VOICE_RATING_KEY,
+    VoiceRating,
+    VoiceScorer,
+    record_voice_rating,
+)
 from creek.generate.cohesion import run_cohesion_pass
 from creek.generate.compile_routing import (
     NO_COMPILED_SOURCES,
@@ -1025,6 +1031,10 @@ def reserve_dated_path(directory: Path, title: str, generated: datetime) -> Path
     return _next_available_draft_path(
         directory, generated.strftime("%Y-%m-%d"), _slugify(title)
     )
+
+
+DRAFT_RATING_TOOL = "creek draft"
+"""The writing path a draft's voice rating is logged under, CLI or MCP alike."""
 
 
 class DraftGenerator:
@@ -2760,6 +2770,49 @@ class DraftGenerator:
         print(report.summary_line(), file=sys.stderr)
         return report.body, report.to_frontmatter()
 
+    def _voice_rating(self, body: str) -> VoiceRating | None:
+        """Rate the finished *body* against the owner's fingerprint.
+
+        The same fingerprint and config the guard used, under the same
+        conditions: ``None`` when the subsystem is disabled or the fingerprint
+        is absent or thin, so an unmeasured draft is never stamped in voice.
+        """
+        config = self._ai_style_config
+        fingerprint = self._fingerprint
+        if (
+            config is None
+            or not config.enabled
+            or fingerprint is None
+            or fingerprint.fragment_count == 0
+            or fingerprint.is_thin(config.min_fingerprint_fragments)
+        ):
+            return None
+        return VoiceScorer(fingerprint, config).rate(body)
+
+    def _stamp_voice_rating(
+        self, post: frontmatter.Post, body: str
+    ) -> VoiceRating | None:
+        """Stamp *body*'s end-state rating on *post*, and return it.
+
+        Off-voice is recorded, never refused: the draft is saved either way.
+        """
+        rating = self._voice_rating(body)
+        if rating is not None:
+            post[VOICE_RATING_KEY] = rating.as_dict()
+        return rating
+
+    @staticmethod
+    def _log_voice_rating(
+        vault_path: Path, target: Path, rating: VoiceRating | None
+    ) -> None:
+        """Append the saved draft's rating to the vault's voice-ratings ledger."""
+        record_voice_rating(
+            vault_path,
+            tool=DRAFT_RATING_TOOL,
+            rating=rating,
+            artifact=target.relative_to(vault_path).as_posix(),
+        )
+
     def save_outline_draft(
         self,
         draft: OutlineDraft,
@@ -2805,7 +2858,9 @@ class DraftGenerator:
         )
         for key, value in voice_fields.items():
             post[key] = value
+        rating = self._stamp_voice_rating(post, body)
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
+        self._log_voice_rating(vault_path, target, rating)
         return target
 
     def save_draft(
@@ -2885,7 +2940,9 @@ class DraftGenerator:
             post[INFERENCE_SOURCE_FRONTMATTER_KEY] = inference_source
         if privacy_tier is not None:
             post["privacy_tier"] = PrivacyTier(privacy_tier).value
+        rating = self._stamp_voice_rating(post, body)
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
+        self._log_voice_rating(vault_path, target, rating)
         self._on_stage(CompositionStage.SAVED)
         return target
 

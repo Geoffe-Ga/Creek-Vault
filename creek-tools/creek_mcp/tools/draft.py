@@ -94,7 +94,9 @@ from creek.classify.llm.providers import (
 from creek.classify.llm.router import IntimateRoutingError
 from creek.classify.privacy_filter import max_source_tier, source_tiers
 from creek.config import CONFIG_LOAD_FAILURES, load_vault_config
+from creek.generate.ai_style.fingerprint import load_fingerprint
 from creek.generate.ai_style.guard import VOICE_GUARD_STATUS_KEY
+from creek.generate.ai_style.rating import VOICE_RATING_KEY
 from creek.generate.compile_routing import (
     NO_COMPILED_SOURCES,
     CompiledSources,
@@ -165,6 +167,7 @@ _JOB_RESULT_KEYS: Final[tuple[str, ...]] = (
     "idea_strategy",
     "source_count",
     "voice_guard_status",
+    "voice_rating",
 )
 """The content-free keys of a success envelope a job record always keeps.
 
@@ -433,6 +436,13 @@ def draft_tool(
         # ``DraftGenerator`` skips the guard when either is missing (#1040).
         embedding_fn=default_embedding_fn(config.embeddings),
         grounding_thresholds=GroundingThresholds.from_config(config.draft),
+        # The owner's fingerprint and AI-style config, as ``creek draft``
+        # passes them: without them the voice-fidelity guard and the
+        # end-state voice rating never ran on an MCP draft, which was stamped
+        # ``skipped:disabled`` whatever the vault's config said. The guard's
+        # one bounded rewrite goes through the same routed ``llm``.
+        fingerprint=load_fingerprint(vault_path, config.ai_style),
+        ai_style_config=config.ai_style,
         on_stage=on_stage,
     )
     try:
@@ -458,6 +468,7 @@ def draft_tool(
         "source_fragments": list(draft.source_fragments),
         "source_count": len(draft.source_fragments),
         "voice_guard_status": _voice_guard_status(saved),
+        "voice_rating": _voice_rating(saved),
     }
     if source is not None:
         response[INFERENCE_SOURCE_FRONTMATTER_KEY] = source
@@ -531,6 +542,26 @@ def _voice_guard_status(saved: Path) -> str | None:
     except FRONTMATTER_LOAD_ERRORS:
         return None
     return status if isinstance(status, str) else None
+
+
+def _voice_rating(saved: Path) -> dict[str, Any] | None:
+    """Return the end-state ``voice_rating`` the generator stamped on *saved*.
+
+    Numbers and closed feature keys only. ``None`` when the vault's voice
+    could not be judged, or the file is unreadable. Off-voice is reported
+    here, never refused.
+
+    Args:
+        saved: The draft file the generator just wrote.
+
+    Returns:
+        The stamped rating mapping, or ``None``.
+    """
+    try:
+        rating = frontmatter.load(saved).get(VOICE_RATING_KEY)
+    except FRONTMATTER_LOAD_ERRORS:
+        return None
+    return rating if isinstance(rating, dict) else None
 
 
 def draft_job_result(response: dict[str, Any]) -> dict[str, Any] | None:

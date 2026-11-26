@@ -118,9 +118,9 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.38.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.39.0.json"
 )
-"""The published document at contract 0.38.0.
+"""The published document at contract 0.39.0.
 
 0.37.0 (#2147) adds the optional ``totals`` to ``PipelineStatusResponse``, with
 the ``PipelineTotals`` and ``PipelineStageTotal`` models; no path or status
