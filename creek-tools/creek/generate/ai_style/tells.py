@@ -169,8 +169,9 @@ def effective_polarity(
       the user's rate scores ``0``) is unchanged.
     * **signature** tells (genuine authentic-voice features, e.g. the one-line
       rhythm) derive per-user: at or above ``signature_threshold`` the user
-      characteristically employs it → ``signature`` (under-use raises voice
-      distance, reinforcing the voice); below the threshold the tell is
+      characteristically employs it → ``signature`` (under-use is reported
+      as a signature gap that the rewrite restores, but is not scored in
+      voice distance since #1945); below the threshold the tell is
       **inert** (``None``) — the user does not use it, so neither over- nor
       under-use is *their* concern, and it never fires spuriously on a draft
       that happens to use the feature.

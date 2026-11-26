@@ -280,10 +280,10 @@ def build_voice_rewrite_prompt(
     parts: list[str] = []
     if style_preamble.strip():
         parts.append(style_preamble.strip())
-    if report.findings:
+    flagged = [*report.findings, *report.signature_gaps]
+    if flagged:
         divergences = "\n".join(
-            f"- ({finding.direction}-use) {finding.message}"
-            for finding in report.findings
+            f"- ({finding.direction}-use) {finding.message}" for finding in flagged
         )
         parts.append(f"## Voice divergences to repair\n{divergences}")
     parts.extend(

@@ -187,6 +187,13 @@ class ScanReport:
             which are legal and both of which mean "do not score this".
         thin_fingerprint: ``True`` when the fingerprint was below the
             configured ``min_fingerprint_fragments`` and flagging was softened.
+        signature_gaps: Every *signature* feature the owner characteristically
+            uses and this text under-uses past its margin (#1945). Reported for
+            review and for the rewrite prompt, but never scored: an essay is
+            not a stack of one-line journal entries, and counting the gap made
+            the owner's own long-form writing fail the voice gate. So these
+            are not in :attr:`findings`, and :attr:`family_evidence` is
+            ``0.0`` for them.
     """
 
     findings: list[Finding] = field(default_factory=list)
@@ -194,3 +201,4 @@ class ScanReport:
     family_evidence: dict[str, float] = field(default_factory=dict)
     voice_distance: float = 0.0
     thin_fingerprint: bool = False
+    signature_gaps: list[Finding] = field(default_factory=list)

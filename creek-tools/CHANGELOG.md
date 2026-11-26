@@ -9,6 +9,24 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+- **Your own writing no longer fails the voice check (#1945, no contract
+  change).** `voice_distance` scored a real journaler's own register samples
+  at a median 0.91 against the 0.35 ceiling, and every Writing Desk essay
+  failed, because one signature family, `one_line_fragment_density`, counted
+  its *under-use*: an essay has no standalone journal one-liners. The 0.25
+  weight meant to cap it was erased by any vault config reading
+  `feature_weights: {}`.
+  - Signature under-use is now reported in `ScanReport.signature_gaps` (and
+    `creek voice-check` text and `--json`, and the de-slop rewrite prompt)
+    but never scored. `voice_distance` measures slop only; `0.0` still holds
+    exactly when `findings` is empty. The stopgap weight is retired.
+  - The fingerprint pools rates by words instead of averaging per fragment,
+    and markdown headings no longer count as one-line paragraphs.
+    `FINGERPRINT_VERSION` is 3; a v2 file is ignored until
+    `creek report --type fingerprint` rebuilds it.
+  - Measured on a 33k-fragment vault: own register samples passing went
+    from 9/122 to 110/122; generic AI prose still scores 0.99.
+
 - **A loose Substack export's subscriber lists are refused, not ingested
   (#2133, no contract change).** Sent one file per `POST /v1/uploads`, an
   export's `email_list*.csv`, `*.delivers.csv` and `*.opens.csv` were read as
