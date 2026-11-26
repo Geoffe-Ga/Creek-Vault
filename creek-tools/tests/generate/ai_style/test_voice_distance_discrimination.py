@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from creek.config import ONE_LINE_FRAGMENT_WEIGHT, AIStyleConfig
+from creek.config import AIStyleConfig
 from creek.generate.ai_style import build_fingerprint, scan
 from creek.generate.ai_style.distance import (
     SATURATION_SCALE,
@@ -534,18 +534,19 @@ class TestFamilyEvidenceSurface:
 class TestOwnWritingDoesNotFlag:
     """The invariant on ``voice_distance_upper``, tested where it nearly broke.
 
-    ``one_line_fragment`` is the one tell whose measured *user* rate is an
-    artifact rather than a habit: it counts any single-line block of at most
-    20 words (a markdown heading included), and the fingerprint averages
-    per-fragment rates rather than pooling words, so a corpus of short
-    journal entries measures 50-200 per 1000 words by construction and the
-    family becomes a live *signature* for that voice. Under-use is then the
-    concern, and a long-form draft with no standalone short paragraph
-    under-uses it by the user's entire rate — which, before the family was
-    down-weighted, scored 0.8794 and flagged a draft that *was itself one of
-    the corpus fragments*. Creek's users are journalers, so that is the
-    median vault, and ``creek voice-check`` is documented as a gate that
-    exits non-zero on divergence.
+    ``one_line_fragment`` is a *signature* tell for any journal vault: a
+    corpus of short entries uses standalone one-line paragraphs heavily, and
+    a long-form draft with none under-uses that rhythm by the user's entire
+    rate. Under #1936's union aggregation that alone scored 0.8794 and
+    flagged a draft that *was itself one of the corpus fragments*; a 0.25
+    weight then capped it, until a vault config's ``feature_weights: {}``
+    erased the cap and the owner's real register samples scored a median
+    0.91. #1945 resolved it structurally: under-use of a signature is
+    reported in ``ScanReport.signature_gaps`` and never scored, and the
+    fingerprint pools rates by words and skips headings, so the rate is no
+    longer a fragment-length artifact. Creek's users are journalers, so this
+    is the median vault, and ``creek voice-check`` is documented as a gate
+    that exits non-zero on divergence.
 
     The fixture voice in the rest of this module has the family inert
     (its rate is under ``signature_polarity_threshold``), so nothing else
@@ -599,33 +600,26 @@ class TestOwnWritingDoesNotFlag:
             )
         return build_fingerprint(tmp_path, AIStyleConfig())
 
-    def test_the_signature_family_cannot_flag_a_draft_by_itself(
+    def test_the_signature_family_scores_nothing_at_any_weight(
         self,
-        config: AIStyleConfig,
+        live_signature_fingerprint: VoiceFingerprint,
     ) -> None:
-        """Structural, so it holds at any magnitude: its weight is the cap.
+        """Structural since #1945: under-use is a gap, so no weight scores it.
 
-        A family's evidence is strictly below 1, so its contribution is
-        strictly below its relative weight. At 0.25 against a heaviest weight
-        of 1.0, ``one_line_fragment`` tops out under the 0.35 ceiling however
-        extreme the under-use — it can add to a union beside real slop, but
-        it can never carry a verdict alone.
+        Until #1945 the family shipped down-weighted to 0.25 so that it capped
+        under the ceiling. A vault whose config read ``feature_weights: {}``
+        erased that default and put it back at full weight, and on a real
+        journal vault the owner's own register samples then scored a median
+        0.91. Now even an explicit full weight cannot make it count.
         """
-        assert config.feature_weights["one_line_fragment_density"] == pytest.approx(
-            ONE_LINE_FRAGMENT_WEIGHT
+        config = AIStyleConfig(feature_weights={_SIGNATURE_FAMILY: 1.0})
+        report = scan(
+            self._LONG_FORM, fingerprint=live_signature_fingerprint, config=config
         )
-        assert max(config.category_weights.values()) == pytest.approx(1.0)
-        assert config.voice_distance_upper > ONE_LINE_FRAGMENT_WEIGHT
-        saturated = FeatureContribution(
-            "one_line_fragment_density",
-            weight=ONE_LINE_FRAGMENT_WEIGHT,
-            magnitude=1e6,
-            margin=0.5,
-        )
-        clean_heaviest = FeatureContribution(
-            "ai_vocab_density", weight=1.0, magnitude=0.0, margin=2.0
-        )
-        assert voice_distance([saturated, clean_heaviest]) < config.voice_distance_upper
+
+        assert report.voice_distance == 0.0
+        assert report.family_evidence[_SIGNATURE_FAMILY] == 0.0
+        assert {gap.feature_key for gap in report.signature_gaps} == {_SIGNATURE_FAMILY}
 
     def test_a_long_form_draft_in_the_users_own_voice_is_not_flagged(
         self,
@@ -636,10 +630,10 @@ class TestOwnWritingDoesNotFlag:
 
         The signature really is live here and the family really does diverge
         — asserted, so the test cannot pass by the tell being inert — yet the
-        draft sits under the ceiling, which is what
-        ``voice_distance_upper``'s "the user's own writing must not flag"
-        promises. The divergence is still *reported*: down-weighting changed
-        what carries a verdict, not what gets surfaced for review.
+        draft scores exactly zero, which is what ``voice_distance_upper``'s
+        "the user's own writing must not flag" promises. The divergence is
+        still *reported*, in ``signature_gaps``: #1945 changed what carries a
+        verdict, not what gets surfaced for review.
         """
         rate = live_signature_fingerprint.rate_for(_SIGNATURE_FAMILY)
         assert rate is not None
@@ -648,9 +642,9 @@ class TestOwnWritingDoesNotFlag:
             self._LONG_FORM, fingerprint=live_signature_fingerprint, config=config
         )
         assert not live_signature_fingerprint.is_thin(config.min_fingerprint_fragments)
-        assert _families(report) == {_SIGNATURE_FAMILY}
-        assert report.family_evidence[_SIGNATURE_FAMILY] > 0.0
-        assert report.voice_distance < config.voice_distance_upper
+        assert _families(report) == set()
+        assert [gap.feature_key for gap in report.signature_gaps] == [_SIGNATURE_FAMILY]
+        assert report.voice_distance == 0.0
 
 
 class TestFlagBoundary:

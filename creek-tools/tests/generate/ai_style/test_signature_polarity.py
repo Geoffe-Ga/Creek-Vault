@@ -2,7 +2,8 @@
 
 The scrub must reinforce authentic signatures, not sand them off. These tests
 pin: (1) polarity is derived per-user — a feature the user characteristically
-uses becomes a ``signature`` so stripping it RAISES voice distance; (2) the new
+uses becomes a ``signature`` so stripping it is reported as a signature gap
+(scored no longer, since #1945); (2) the new
 one-line-fragment extractor; (3) existing avoid-tell behaviour and the
 curly-quote/em-dash typography protection are preserved.
 """
@@ -45,6 +46,11 @@ def _fingerprint(**rates: float) -> VoiceFingerprint:
 def _finding(report, tell_id: str):
     """Return the first finding for *tell_id*, or ``None``."""
     return next((f for f in report.findings if f.tell_id == tell_id), None)
+
+
+def _gap(report, tell_id: str):
+    """Return the first signature gap for *tell_id*, or ``None``."""
+    return next((f for f in report.signature_gaps if f.tell_id == tell_id), None)
 
 
 # --- effective_polarity (unit) ---------------------------------------------
@@ -131,24 +137,27 @@ class TestOneLineFragmentDensity:
 
 
 class TestSignatureReinforcement:
-    """Stripping a user's over-used signature raises voice distance."""
+    """Stripping a user's over-used signature is surfaced as a gap (#1945)."""
 
-    def test_stripping_signature_raises_distance(self) -> None:
-        """A flattened draft diverges *more* than a punchy one for a punchy user."""
+    def test_stripping_signature_is_reported_not_scored(self) -> None:
+        """A flattened draft carries the gap; neither draft's distance moves.
+
+        #635 made the stripped signature visible. #1945 keeps it visible in
+        ``signature_gaps`` but out of ``voice_distance``, which measures slop.
+        """
         fp = _fingerprint(**{_KEY: 12.0})
         config = AIStyleConfig()
 
         punchy = scan(_PUNCHY, fingerprint=fp, config=config)
         flattened = scan(_FLATTENED, fingerprint=fp, config=config)
 
-        # The flattened draft under-uses the signature, so it is the divergent
-        # one — the whole point of #635.
-        assert flattened.voice_distance > punchy.voice_distance
-        under = _finding(flattened, "one_line_fragment")
+        assert flattened.voice_distance == punchy.voice_distance == 0.0
+        under = _gap(flattened, "one_line_fragment")
         assert under is not None
         assert under.direction == "under"
-        # And the matching punchy draft is not flagged for the signature.
-        assert _finding(punchy, "one_line_fragment") is None
+        assert _finding(flattened, "one_line_fragment") is None
+        # And the matching punchy draft has no gap for the signature.
+        assert _gap(punchy, "one_line_fragment") is None
 
     def test_derivation_gated_by_threshold(self) -> None:
         """Raise the threshold above the user's rate and the flip does not happen."""
@@ -158,6 +167,7 @@ class TestSignatureReinforcement:
         config = AIStyleConfig(signature_polarity_threshold=100.0)
         flattened = scan(_FLATTENED, fingerprint=fp, config=config)
         assert _finding(flattened, "one_line_fragment") is None
+        assert _gap(flattened, "one_line_fragment") is None
 
 
 # --- existing protections preserved (acceptance #3) ------------------------

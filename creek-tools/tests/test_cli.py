@@ -5951,6 +5951,59 @@ def test_voice_check_json_survives_square_brackets_in_findings(
     assert payload["findings"][0]["message"] == bracketed
 
 
+def test_voice_check_reports_signature_gaps_without_failing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stripped signature is printed for review but does not fail (#1945).
+
+    The report carries one under-used signature and no finding, so the
+    distance is ``0.0``, the command exits ``0``, and both outputs name it.
+    """
+    import json
+
+    from creek.generate.ai_style.model import Finding, ScanReport, Span
+
+    gap = Finding(
+        tell_id="one_line_fragment",
+        category="discourse",
+        feature_key="one_line_fragment_density",
+        span=Span(0, 0),
+        line=1,
+        excerpt="",
+        draft_rate=0.0,
+        user_rate=40.0,
+        direction="under",
+        message="short one-line beats under-used",
+    )
+    crafted = ScanReport(voice_distance=0.0, signature_gaps=[gap])
+    monkeypatch.setattr(
+        "creek.generate.ai_style.scanner.scan",
+        lambda *_args, **_kwargs: crafted,
+    )
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)
+    _build_and_persist_fingerprint(vault)
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    target = tmp_path / "essay.md"
+    target.write_text("one dense paragraph\n", encoding="utf-8")
+
+    as_json = runner.invoke(
+        app, ["voice-check", str(target), "--vault", str(vault), "--json"]
+    )
+    as_text = runner.invoke(app, ["voice-check", str(target), "--vault", str(vault)])
+
+    assert as_json.exit_code == 0, as_json.output
+    assert json.loads(as_json.output)["signature_gaps"] == [
+        {
+            "feature_key": "one_line_fragment_density",
+            "message": "short one-line beats under-used",
+        }
+    ]
+    assert as_text.exit_code == 0, as_text.output
+    assert "short one-line beats under-used" in _strip_ansi(as_text.output)
+
+
 def _write_voice_distance_config(vault: Path, upper: float) -> Path:
     """Write a vault ``creek_config.yaml`` overriding ``voice_distance_upper``.
 

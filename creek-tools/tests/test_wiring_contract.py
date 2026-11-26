@@ -1350,13 +1350,11 @@ CLI_CONTRACT: Final[Mapping[str, Surface]] = {
         # tell live for this voice; the essay is one dense block, so it
         # "under-uses" that rhythm by the user's whole rate. Under #1936's
         # union aggregation at full weight that alone scored 0.8794 and the
-        # command exited 1 on the corpus's own prose. The family ships
-        # down-weighted to 0.25 (``AIStyleConfig.feature_weights``) for
-        # exactly this reason, capping it under the ceiling, and the
-        # under-use is still *reported* in the findings — surfaced for
-        # review, not turned into a verdict. The deeper defect (the measure
-        # counts headings, and the fingerprint averages per-fragment rates,
-        # so the "rhythm" is a fragment-length artifact) is #1945.
+        # command exited 1 on the corpus's own prose. Since #1945 signature
+        # under-use is reported in ``ScanReport.signature_gaps`` and never
+        # scored, so the essay scores 0.0 at any weight, and the fingerprint
+        # pools rates by words, so the rhythm is no longer a fragment-length
+        # artifact.
         effect=Effect(prints=("voice_distance",), absent=("Skipping the check",)),
         contrast=Contrast(
             why=(

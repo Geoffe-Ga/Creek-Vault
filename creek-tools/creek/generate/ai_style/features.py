@@ -431,6 +431,8 @@ def comm_boilerplate_density(text: str) -> float:
 
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
 _ONE_LINE_MAX_WORDS = 20
+_HEADING_LINE_RE = re.compile(r"#{1,6}\s")
+"""A markdown ATX heading: structure, not the owner's short-beat rhythm (#1945)."""
 """Word ceiling for a paragraph to count as a punchy one-line fragment.
 
 A single-line paragraph longer than this reads as a normal (merely
@@ -444,7 +446,8 @@ def one_line_fragment_density(text: str) -> float:
     Counts blank-line-delimited paragraphs that are a single line of at most
     :data:`_ONE_LINE_MAX_WORDS` words — the user's punchy single-sentence-
     paragraph rhythm. An authentic signature: previously unmeasured, so it was
-    neither protected from scrubbing nor reinforced. Pure and deterministic.
+    neither protected from scrubbing nor reinforced. Markdown headings are not
+    counted (#1945). Pure and deterministic.
 
     Args:
         text: The body of text to measure.
@@ -458,6 +461,7 @@ def one_line_fragment_density(text: str) -> float:
         for para in paragraphs
         if (stripped := para.strip())
         and "\n" not in stripped
+        and not _HEADING_LINE_RE.match(stripped)
         and len(stripped.split()) <= _ONE_LINE_MAX_WORDS
     )
     return rate_per_kwords(one_liners, text)

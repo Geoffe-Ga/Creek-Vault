@@ -166,7 +166,10 @@ def _score_tell(
     contribution = FeatureContribution(
         feature_key=tell.feature_key,
         weight=config.weight_for(category=tell.category, feature_key=tell.feature_key),
-        magnitude=magnitude,
+        # Under-use of a signature is reported, never scored (#1945): the
+        # distance measures slop, and a long-form draft without the owner's
+        # short journal beats is not slop.
+        magnitude=0.0 if polarity == "signature" else magnitude,
         # The score gates each family at the same margin the finding does
         # (#1936), so the two can never disagree about whether it diverged.
         margin=margin,
@@ -219,6 +222,7 @@ def scan(
     softening = config.thin_fingerprint_softening if thin else 1.0
 
     findings: list[Finding] = []
+    gaps: list[Finding] = []
     deltas: dict[str, float] = {}
     contributions: list[FeatureContribution] = []
 
@@ -235,7 +239,8 @@ def scan(
         )
         deltas[tell.feature_key] = delta
         contributions.append(contribution)
-        findings.extend(tell_findings)
+        for finding in tell_findings:
+            (gaps if finding.direction == "under" else findings).append(finding)
 
     distance = voice_distance(contributions, softening=softening)
     return ScanReport(
@@ -244,4 +249,5 @@ def scan(
         family_evidence={c.feature_key: evidence_for(c) for c in contributions},
         voice_distance=distance,
         thin_fingerprint=thin,
+        signature_gaps=gaps,
     )

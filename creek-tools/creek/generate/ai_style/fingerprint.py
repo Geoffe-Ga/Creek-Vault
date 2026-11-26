@@ -50,6 +50,7 @@ import frontmatter
 from creek.classify.privacy_filter import raw_privacy_tier
 from creek.generate.ai_style.features import FINGERPRINT_FEATURES
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
+from creek.generate.ai_style.tells import word_count
 from creek.ingest.turns import CONVERSATION_PLATFORMS, split_conversation_body
 from creek.models import PrivacyTier
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
@@ -61,8 +62,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FINGERPRINT_VERSION = 2
+FINGERPRINT_VERSION = 3
 """Schema version stamped into the persisted fingerprint JSON.
+
+v3 is #1945: rates are pooled by words rather than averaged per fragment,
+and headings no longer count as one-line fragments. Under the per-fragment
+mean a five-word note weighed as much as a 3,000-word essay, so a journal
+vault measured a one-line-fragment rate of ~68 per 1000 words that no essay
+could reach, and short notes skewed every other family the same way. A v2
+artifact's rates are on that skewed scale, so it is ignored until rebuilt.
 
 v2 is #1426: the *corpus* changed, not the JSON layout. Split-era human
 chat turns now contribute where they were previously dropped, so every
@@ -326,7 +334,10 @@ def build_fingerprint(
     """Build a :class:`VoiceFingerprint` from the user's own vault writing.
 
     Each feature in :data:`FINGERPRINT_FEATURES` is measured per eligible
-    fragment and combined into a weighted mean. When *audience_weighting* is
+    fragment and combined into a mean weighted by each fragment's authorship
+    weight *times its word count* (#1945). For a per-1000-words rate that is
+    exactly the pooled rate over the whole corpus, so many short notes cannot
+    outvote a few long documents. When *audience_weighting* is
     supplied, audience-facing documents (essays, Substack) dominate over private
     journals/DMs/chats, so the fingerprint encodes the user's audience-facing
     voice rather than their texting average (#633). Omitting it preserves the
@@ -374,10 +385,11 @@ def build_fingerprint(
     if not texts:
         return VoiceFingerprint(features={}, fragment_count=0)
 
-    total_weight = sum(weight for weight, _ in texts)
+    pooled = [(weight * word_count(text), text) for weight, text in texts]
+    total_weight = sum(weight for weight, _ in pooled)
     features: dict[str, FeatureStat] = {}
     for key, extractor in FINGERPRINT_FEATURES.items():
-        weighted = sum(weight * extractor(text) for weight, text in texts)
+        weighted = sum(weight * extractor(text) for weight, text in pooled)
         features[key] = FeatureStat(
             rate=weighted / total_weight,
             support=len(texts),

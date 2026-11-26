@@ -4857,12 +4857,15 @@ def _print_voice_check_summary(
         f"(max {max_distance:.4f}) → {verdict}"
         f"{thin if report.thin_fingerprint else ''}",
     )
-    if not report.findings:
-        return
-    noun = "finding" if len(report.findings) == 1 else "findings"
-    console.print(f"[bold]{len(report.findings)} {noun}:[/bold]")
-    for finding in report.findings:
-        console.print(f"  [dim]L{finding.line}:[/dim] {finding.message}")
+    if report.findings:
+        noun = "finding" if len(report.findings) == 1 else "findings"
+        console.print(f"[bold]{len(report.findings)} {noun}:[/bold]")
+        for finding in report.findings:
+            console.print(f"  [dim]L{finding.line}:[/dim] {finding.message}")
+    if report.signature_gaps:
+        console.print("[bold]Signature moves under-used (not scored):[/bold]")
+        for gap in report.signature_gaps:
+            console.print(f"  {gap.message}")
 
 
 def _emit_voice_check_json(
@@ -4898,6 +4901,10 @@ def _emit_voice_check_json(
                 "message": finding.message,
             }
             for finding in report.findings
+        ],
+        "signature_gaps": [
+            {"feature_key": gap.feature_key, "message": gap.message}
+            for gap in report.signature_gaps
         ],
     }
     # Emit raw so Rich never interprets ``[...]`` in the content as markup

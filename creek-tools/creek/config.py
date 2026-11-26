@@ -1666,54 +1666,6 @@ def _default_category_weights() -> dict[AIStyleCategory, float]:
     return weights
 
 
-ONE_LINE_FRAGMENT_WEIGHT: float = 0.25
-"""Default weight for the ``one_line_fragment_density`` family (#1936).
-
-The one tell whose *measured user rate* is dominated by an artifact rather
-than by a habit, which the union aggregation made load-bearing. Two facts
-combine:
-
-* ``features.one_line_fragment_density`` counts any blank-line-delimited
-  block that is a single line of at most 20 words — a markdown heading
-  counts, and a whole short fragment counts as one.
-* ``fingerprint.build_fingerprint`` averages **per-fragment rates**, not
-  pooled words. So a 41-word fragment that is one short block measures
-  1000/41 ≈ 24 per 1000 words on its own, and a corpus where even 6-10% of
-  fragments are short notes averages past the 3.0
-  :attr:`AIStyleConfig.signature_polarity_threshold` and makes the family a
-  live *signature* for that voice.
-
-Under-use is then the concern, and a long-form draft with no standalone
-short paragraph under-uses it by the user's whole rate: measured against a
-corpus of five short entries, one essay — *itself one of those five
-fragments* — scored 0.8794 on this family alone and was flagged, which
-contradicts the invariant stated on
-:attr:`AIStyleConfig.voice_distance_upper` that the user's own writing must
-not flag. Creek's users are journalers; short entries are the normal corpus
-shape, so at full weight ``creek voice-check`` would fail on essentially
-every long-form draft they ever write.
-
-At 0.25 this family's lone evidence caps at ``0.25 x 36.47/41.47 = 0.2199``
-for the measured worst case — under the 0.35 ceiling, so it can no longer
-flag a draft by itself, while it still accumulates in a union beside real
-divergences and still reports its own evidence in
-``ScanReport.family_evidence``. This is a weight, not a repair: the artifact
-in the measure and the fingerprint aggregation is the actual bug and is
-tracked by #1945.
-"""
-
-
-def _default_feature_weights() -> dict[str, float]:
-    """Return the default per-feature weight overrides.
-
-    Replaced wholesale when a vault configures ``feature_weights`` — like
-    every weight map here, this is a default value and not a merge base — so
-    a vault that sets any entry re-states the one it wants to keep. See
-    :data:`ONE_LINE_FRAGMENT_WEIGHT` for why the default is not empty.
-    """
-    return {"one_line_fragment_density": ONE_LINE_FRAGMENT_WEIGHT}
-
-
 def _default_authorship_weights() -> dict[str, float]:
     """Return default per-platform weights for fingerprint aggregation.
 
@@ -1988,13 +1940,14 @@ class AIStyleConfig(BaseModel):
     against the heaviest family in play, so scaling every entry changes
     nothing (#1936)."""
 
-    feature_weights: dict[str, float] = Field(
-        default_factory=_default_feature_weights,
-    )
+    feature_weights: dict[str, float] = Field(default_factory=dict)
     """Per-``feature_key`` weight overrides. A key present here wins over its
-    category weight. Not empty by default: see
-    :data:`ONE_LINE_FRAGMENT_WEIGHT` for the one family that ships
-    down-weighted and the measurements behind it.
+    category weight. Empty by default. Until #1945 the default down-weighted
+    ``one_line_fragment_density`` to 0.25, a stopgap a vault's own
+    ``feature_weights: {}`` silently erased; signature under-use is no longer
+    scored at all (:attr:`ScanReport.signature_gaps
+    <creek.generate.ai_style.model.ScanReport.signature_gaps>`), so no family
+    needs a weight to keep the owner's own writing under the ceiling.
 
     **Raising one entry lowers every other family**, because weights are
     taken relative to the heaviest in play: setting
