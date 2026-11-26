@@ -413,7 +413,12 @@ constraint-dependencies = [
     # the cryptography floor documents (#1167). The September boundary
     # this replaces was PYSEC-2026-4011 through -4014, first fully fixed
     # in 21.7.13 (#1823); that wave is covered a fortiori here.
-    "virtualenv>=21.14.9",
+    #
+    # Superseded again (2026-11): PYSEC-2026-4402 / GHSA-cx6f-vjhg-g3cc
+    # reaches 21.14.12, the release the lock then held. OSV lists it for
+    # 21.14.12 and nothing for 21.14.13, the first clean release, so the
+    # floor moves to 21.14.13 and every earlier wave is covered a fortiori.
+    "virtualenv>=21.14.13",
     # Security: certifi below 2026.10.19 ships an emSign CA root whose
     # intermediate keys are compromised — PYSEC-2026-4320
     # (GHSA-6q48-6c7w-9gw2). Transitive via requests/httpx; 2026.10.19
