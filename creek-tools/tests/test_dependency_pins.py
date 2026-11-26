@@ -396,7 +396,9 @@ _SEPTEMBER_AUDIT_FLOORS = (
     # than appending a second entry follows the pattern the cryptography floor
     # documents (#1167), and is what keeps 21.7.13..21.14.8 -- every one of them
     # still vulnerable -- from staying admissible behind a guard that passes.
-    _AuditFloor("virtualenv", Version("21.14.8"), Version("21.14.9")),
+    # Superseded in place again (2026-11): PYSEC-2026-4402 reaches 21.14.12,
+    # and OSV lists no advisory for 21.14.13.
+    _AuditFloor("virtualenv", Version("21.14.12"), Version("21.14.13")),
 )
 
 #: The anyio floor. No CVE here — the floor simply records the version
